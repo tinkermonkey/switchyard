@@ -1,0 +1,27 @@
+# This IS in git as an example
+projects:
+  example-project:
+    repo_url: git@github.com:USERNAME/PROJECT.git
+    # Everything else is auto-derived or auto-configured:
+    # - local_path: projects/PROJECT (from repo URL)
+    # - branch: main (default)
+    # - kanban_board_id: auto-discovered or auto-created
+    # - kanban_columns: auto-configured with agent mappings
+
+    # Optional overrides:
+    branch: main  # Only if different from 'main'
+    tech_stacks:
+      frontend: react
+      backend: python
+
+    # Auto-configured by setup script (example):
+    kanban_board_id: 123
+    kanban_columns:
+      "Backlog": null
+      "Requirements Analysis": "business_analyst"
+      "Design": "software_architect"
+      "Ready for Development": null
+      "In Development": "senior_software_engineer"
+      "Code Review": "code_reviewer"
+      "Testing": "senior_qa_engineer"
+      "Done": null

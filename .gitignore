@@ -1,0 +1,49 @@
+# Environment variables
+.env
+.env.local
+*.env
+
+# Orchestrator runtime data (these are ephemeral and project-specific)
+orchestrator_data/
+*.checkpoint
+*.log
+
+# Old state directories (deprecated - now using orchestrator_data/)
+state/
+.claude/state/
+.claude/checkpoints/
+.claude/logs/
+
+# Project mounts (never commit actual project code here)
+projects/
+mounted_projects/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+*.egg-info/
+venv/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Secrets (use environment variables instead)
+config/secrets.yaml
+config/projects.yaml
+config/*.key
+config/*.pem
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# But DO track these:
+!config/pipelines.yaml
+!config/agents.yaml
+!config/projects.example.yaml

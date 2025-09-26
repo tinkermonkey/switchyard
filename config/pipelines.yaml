@@ -1,0 +1,34 @@
+# Basic single-agent pipeline for testing
+pipelines:
+  business_analyst_only:
+    name: "Business Analyst Pipeline"
+    description: "Single agent pipeline for requirements analysis"
+    agents:
+      - name: business_analyst
+        timeout: 300
+        retries: 3
+        circuit_breaker:
+          failure_threshold: 3
+          recovery_timeout: 180
+
+  default: business_analyst_only
+
+agent_configs:
+  business_analyst:
+    claude_model: "claude-3-5-sonnet-20241022"
+    working_directory: "./projects/{project_name}"
+    output_format: "structured_json"
+    tools_enabled:
+      - file_operations
+      - git_integration
+      - web_search
+    mcp_servers:
+      - name: context7
+        url: "${CONTEXT7_MCP_URL}"
+        capabilities: ["library_documentation", "api_references"]
+      - name: serena
+        url: "${SERENA_MCP_URL}"
+        capabilities: ["codebase_analysis", "semantic_search", "code_understanding"]
+      - name: puppeteer
+        url: "${PUPPETEER_MCP_URL}"
+        capabilities: ["browser_automation", "web_scraping"]

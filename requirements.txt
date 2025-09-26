@@ -1,0 +1,26 @@
+# Core dependencies
+asyncio-throttle>=1.0.2
+aiofiles>=23.2.1
+redis>=5.0.1
+pydantic>=2.4.2
+python-dotenv>=1.0.0
+
+# Monitoring
+prometheus-client>=0.17.1
+python-json-logger>=2.0.7
+psutil>=5.9.6
+
+# Web/API
+flask>=3.0.0
+requests>=2.31.0
+httpx>=0.25.0  # For MCP server communication
+
+# YAML processing
+pyyaml>=6.0.1
+
+# Date/time handling
+python-dateutil>=2.8.2
+
+# Testing
+pytest>=8.0.0
+pytest-asyncio>=1.0.0

@@ -1,0 +1,34 @@
+git_workflow:
+  branch_strategy:
+    main_branch: main
+    #develop_branch: develop  # optional
+    feature_prefix: feature/
+    hotfix_prefix: hotfix/
+    
+  auto_create_branch:
+    triggers:
+      - column: "In Development"
+      - column: "Ready for Development"
+    
+  auto_create_pr:
+    triggers:
+      - column: "Code Review"
+    require_tests: true
+    require_lint: true
+    draft_if_failing: true
+    
+  auto_merge:
+    enabled: false  # Require human approval
+    conditions:
+      - all_checks_passing: true
+      - approved_reviews: 1
+      - no_requested_changes: true
+    
+  cleanup:
+    delete_branch_after_merge: true
+    close_issue_after_merge: true
+    
+  commit_rules:
+    conventional_commits: true
+    sign_commits: true
+    max_commit_message_length: 72

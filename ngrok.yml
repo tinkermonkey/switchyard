@@ -1,0 +1,16 @@
+version: 2
+tunnels:
+  webhook:
+    proto: http
+    addr: webhook:3000
+    inspect: true
+    bind_tls: true
+    # Optional: reserve a subdomain if you have a paid account
+    # subdomain: your-subdomain
+    
+    # Add basic auth if you want extra security
+    # auth: "username:password"
+    
+    # Request headers to add
+    headers:
+      X-Forwarded-Proto: https
