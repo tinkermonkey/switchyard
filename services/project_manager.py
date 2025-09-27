@@ -11,7 +11,7 @@ from typing import Dict, Any, Optional
 from urllib.parse import urlparse
 
 class ProjectManager:
-    def __init__(self, projects_config_path: str = "config/projects.yaml", base_projects_dir: str = "/projects"):
+    def __init__(self, projects_config_path: str = "config/projects.yaml", base_projects_dir: str = "/workspace"):
         self.projects_config_path = projects_config_path
         self.base_projects_dir = Path(base_projects_dir)
         self.projects_config = self._load_projects_config()
@@ -70,7 +70,7 @@ class ProjectManager:
         # Extract repo name from URL
         repo_name = self.extract_repo_name(repo_url)
 
-        # Use standard path: /projects/{repo_name}
+        # Use standard path: /workspace/{repo_name} (sibling to orchestrator)
         return self.base_projects_dir / repo_name
 
     def ensure_project_cloned(self, project_name: str) -> Path:

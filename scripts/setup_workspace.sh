@@ -18,8 +18,8 @@ fi
 # Source environment variables
 source .env
 
-# Create projects directory if it doesn't exist
-mkdir -p ./projects
+# Projects will be cloned as siblings to orchestrator, not inside it
+# No need to create ./projects directory
 
 echo "📋 Setting up project configuration..."
 
@@ -86,5 +86,5 @@ echo ""
 echo "📝 Next steps:"
 echo "   1. Review config/projects.yaml and customize tech_stacks"
 echo "   2. Start the orchestrator: docker-compose up orchestrator"
-echo "   3. Projects are available in: ./projects/"
+echo "   3. Projects are available in: ../ (sibling directories)"
 echo "   4. Monitor with: docker-compose logs -f"

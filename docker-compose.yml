@@ -58,7 +58,7 @@ services:
       - orchestrator-net
     volumes:
       - ./:/workspace:ro  # Read-only access to orchestrator codebase
-      - ./projects:/projects:ro  # Read-only access to managed projects
+      - ../:/workspace:ro  # Read-only access to managed projects (siblings of orchestrator)
 
   puppeteer-mcp:
     image: modelcontextprotocol/puppeteer:latest
@@ -77,8 +77,8 @@ services:
       # Mount the orchestrator code
       - ./:/app
 
-      # Mount projects directory for auto-cloning
-      - ./projects:/projects
+      # Mount parent directory for project management (projects will be siblings of orchestrator)
+      - ../:/workspace
 
       # Mount SSH keys for git operations
       - ~/.ssh:/root/.ssh:ro

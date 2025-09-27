@@ -6,6 +6,7 @@ import os
 import json
 import yaml
 import subprocess
+import requests
 from typing import Dict, Any, List, Optional, Tuple
 
 class GitHubProjectManager:
@@ -20,7 +21,7 @@ class GitHubProjectManager:
                 return yaml.safe_load(f)
         except FileNotFoundError:
             print(f"⚠️ Templates config not found: {self.templates_config_path}")
-            return {"templates": {}, "default_template": "simple"}
+            return {"standard_workflow": {"columns": []}}
 
     def discover_project_boards(self, repo_name: str) -> List[Dict[str, Any]]:
         """Discover existing project boards for a repository"""
@@ -80,8 +81,8 @@ class GitHubProjectManager:
     def create_project_board(self, repo_name: str, template_name: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """Create a new project board with standard columns"""
 
-        template_name = template_name or self.templates.get('default_template', 'simple')
-        template = self.templates.get('templates', {}).get(template_name)
+        template_name = template_name or 'standard_workflow'
+        template = self.templates.get(template_name)
 
         if not template:
             print(f"❌ Template '{template_name}' not found")
@@ -95,7 +96,7 @@ class GitHubProjectManager:
         try:
             # Create the project
             project_title = f"{repo_name} - {template['name']}"
-            project_description = template.get('description', self.templates.get('github_project_settings', {}).get('description_template', ''))
+            project_description = template.get('description', self.templates.get('github_project_settings', {}).get('description_template', 'Automated project board managed by Claude Code Orchestrator'))
 
             cmd = [
                 'gh', 'project', 'create',
@@ -114,7 +115,7 @@ class GitHubProjectManager:
             print(f"✅ Created project board: {project_title}")
 
             # Configure the Status field with our columns
-            self._configure_project_columns(project_id, template['columns'])
+            self._configure_project_columns(project_id, template['columns'], github_org)
 
             return {
                 'id': project_id,
@@ -128,51 +129,211 @@ class GitHubProjectManager:
             print(f"❌ Failed to create project board for {repo_name}: {e}")
             return None
 
-    def _configure_project_columns(self, project_id: str, columns: List[Dict[str, Any]]):
-        """Configure project columns using GitHub CLI"""
+    def create_project_board_with_columns(self, repo_name: str, columns: List[Dict[str, Any]], github_org: str) -> Optional[Dict[str, Any]]:
+        """Create a new project board with custom columns from project config"""
+
         try:
-            # First, get the current Status field
-            cmd = ['gh', 'project', 'view', project_id, '--format', 'json']
+            # Create the project
+            project_title = f"{repo_name} - Orchestrator"
+            project_description = "Automated project board managed by Claude Code Orchestrator"
+
+            cmd = [
+                'gh', 'project', 'create',
+                '--owner', github_org,
+                '--title', project_title,
+                '--body', project_description,
+                '--format', 'json'
+            ]
+
             result = subprocess.run(cmd, capture_output=True, text=True, check=True)
             project_data = json.loads(result.stdout)
 
-            # Find the Status field
-            status_field_id = None
-            for field in project_data.get('fields', []):
+            project_id = project_data.get('id')
+            project_number = project_data.get('number')
+
+            print(f"✅ Created project board: {project_title}")
+
+            # Configure the Status field with project's columns
+            self._configure_project_columns(project_id, columns, github_org)
+
+            return {
+                'id': project_id,
+                'number': project_number,
+                'title': project_title,
+                'url': project_data.get('url'),
+                'columns_configured': True
+            }
+
+        except (subprocess.CalledProcessError, json.JSONDecodeError) as e:
+            print(f"❌ Failed to create project board for {repo_name}: {e}")
+            return None
+
+    def _configure_project_columns(self, project_id: str, columns: List[Dict[str, Any]], github_org: str):
+        """Configure project columns using GitHub CLI"""
+        try:
+
+            # First, check if Status field exists
+            cmd = ['gh', 'project', 'field-list', str(project_id), '--owner', github_org, '--format', 'json']
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            fields_data = json.loads(result.stdout)
+
+            # First, try to update the built-in Status field using GraphQL
+            status_field = None
+            for field in fields_data.get('fields', []):
                 if field.get('name') == 'Status':
-                    status_field_id = field.get('id')
+                    status_field = field
                     break
 
-            if not status_field_id:
-                print("⚠️ Could not find Status field in project")
-                return
+            if status_field:
+                print("🔧 Found built-in Status field - attempting to update via GraphQL...")
 
-            # Clear existing options and add our columns
-            # Note: This is a simplified approach - GitHub's API for this is complex
-            # In practice, you might need to use the GraphQL API directly
+                # Try to update the Status field with our columns
+                if self._update_status_field_via_graphql(project_id, status_field['id'], columns, github_org):
+                    print("✅ Successfully updated built-in Status field")
+                    return
+                else:
+                    print("⚠️ GraphQL update failed, falling back to custom Workflow Status field...")
 
-            for column in columns:
-                try:
-                    # Add column option to Status field
-                    cmd = [
-                        'gh', 'project', 'field-option-create',
-                        project_id,
-                        status_field_id,
-                        '--name', column['name']
-                    ]
-                    subprocess.run(cmd, capture_output=True, text=True, check=True)
+            # Fallback: Look for our custom "Workflow Status" field
+            workflow_field = None
+            for field in fields_data.get('fields', []):
+                if field.get('name') == 'Workflow Status':
+                    workflow_field = field
+                    break
+
+            if not workflow_field:
+                # Create Workflow Status field with all column options
+                column_names = [col['name'] for col in columns]
+                options_str = ','.join(column_names)
+
+                cmd = [
+                    'gh', 'project', 'field-create', str(project_id),
+                    '--owner', github_org,
+                    '--name', 'Workflow Status',
+                    '--data-type', 'SINGLE_SELECT',
+                    '--single-select-options', options_str
+                ]
+
+                subprocess.run(cmd, capture_output=True, text=True, check=True)
+                print(f"✅ Created Workflow Status field with {len(columns)} columns")
+
+                for column in columns:
                     print(f"   ✅ Added column: {column['name']}")
+            else:
+                # Workflow Status field exists - check if we need to add missing columns
+                existing_options = [opt['name'] for opt in workflow_field.get('options', [])]
+                needed_columns = [col['name'] for col in columns if col['name'] not in existing_options]
 
-                except subprocess.CalledProcessError:
-                    print(f"   ⚠️ Could not add column: {column['name']} (might already exist)")
+                if needed_columns:
+                    print(f"🔧 Workflow Status field exists but missing {len(needed_columns)} columns")
+
+                    # Delete and recreate the custom Workflow Status field
+                    try:
+                        field_id = workflow_field.get('id')
+                        cmd = ['gh', 'project', 'field-delete', '--id', field_id]
+                        subprocess.run(cmd, capture_output=True, text=True, check=True)
+                        print("🗑️ Deleted existing Workflow Status field")
+
+                        # Now create new Workflow Status field with all columns
+                        column_names = [col['name'] for col in columns]
+                        options_str = ','.join(column_names)
+
+                        cmd = [
+                            'gh', 'project', 'field-create', str(project_id),
+                            '--owner', github_org,
+                            '--name', 'Workflow Status',
+                            '--data-type', 'SINGLE_SELECT',
+                            '--single-select-options', options_str
+                        ]
+
+                        subprocess.run(cmd, capture_output=True, text=True, check=True)
+                        print(f"✅ Recreated Workflow Status field with {len(columns)} columns")
+
+                        for column in columns:
+                            print(f"   ✅ Added column: {column['name']}")
+
+                    except subprocess.CalledProcessError as e:
+                        print(f"⚠️ Could not delete/recreate Workflow Status field: {e}")
+                        print("🔧 Manual column management may be needed")
+                else:
+                    print("✅ Workflow Status field already has all required columns")
 
         except (subprocess.CalledProcessError, json.JSONDecodeError) as e:
             print(f"⚠️ Could not configure project columns: {e}")
 
+    def _update_status_field_via_graphql(self, project_id: str, field_id: str, columns: List[Dict[str, Any]], github_org: str):
+        """Update existing Status field options using GitHub GraphQL API"""
+        try:
+            # Get GitHub token from gh CLI
+            result = subprocess.run(['gh', 'auth', 'token'], capture_output=True, text=True, check=True)
+            token = result.stdout.strip()
+
+            # GraphQL mutation to update field options
+            mutation = """
+            mutation UpdateProjectV2Field($input: UpdateProjectV2FieldInput!) {
+              updateProjectV2Field(input: $input) {
+                projectV2Field {
+                  ... on ProjectV2SingleSelectField {
+                    id
+                    name
+                    options {
+                      id
+                      name
+                    }
+                  }
+                }
+              }
+            }
+            """
+
+            # Prepare the options for the field
+            options = []
+            for column in columns:
+                options.append({
+                    "name": column['name'],
+                    "description": column.get('description', f"Workflow stage: {column['name']}"),
+                    "color": "GRAY"  # Default color, could be made configurable
+                })
+
+            variables = {
+                "input": {
+                    "fieldId": field_id,
+                    "singleSelectOptions": options
+                }
+            }
+
+            # Make the GraphQL request
+            headers = {
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json"
+            }
+
+            response = requests.post(
+                "https://api.github.com/graphql",
+                json={"query": mutation, "variables": variables},
+                headers=headers
+            )
+
+            if response.status_code == 200:
+                result = response.json()
+                if "errors" in result:
+                    print(f"⚠️ GraphQL errors: {result['errors']}")
+                    return False
+                else:
+                    print(f"✅ Updated Status field with {len(columns)} columns via GraphQL")
+                    return True
+            else:
+                print(f"⚠️ GraphQL request failed: {response.status_code} - {response.text}")
+                return False
+
+        except Exception as e:
+            print(f"⚠️ GraphQL update failed: {e}")
+            return False
+
     def generate_kanban_config(self, project_data: Dict[str, Any], template_name: str) -> Dict[str, Any]:
         """Generate kanban_columns configuration for projects.yaml"""
 
-        template = self.templates.get('templates', {}).get(template_name, {})
+        template = self.templates.get(template_name, {})
         columns_config = {}
 
         for column in template.get('columns', []):
@@ -183,10 +344,6 @@ class GitHubProjectManager:
             'kanban_columns': columns_config
         }
 
-    def list_templates(self) -> List[str]:
-        """List available Kanban templates"""
-        return list(self.templates.get('templates', {}).keys())
-
     def get_template_info(self, template_name: str) -> Optional[Dict[str, Any]]:
         """Get detailed information about a template"""
-        return self.templates.get('templates', {}).get(template_name)
+        return self.templates.get(template_name)

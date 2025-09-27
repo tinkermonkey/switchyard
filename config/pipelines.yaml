@@ -16,7 +16,7 @@ pipelines:
 agent_configs:
   business_analyst:
     claude_model: "claude-3-5-sonnet-20241022"
-    working_directory: "./projects/{project_name}"
+    working_directory: "/workspace/{project_name}"
     output_format: "structured_json"
     tools_enabled:
       - file_operations

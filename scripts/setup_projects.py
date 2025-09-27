@@ -28,6 +28,11 @@ def main():
         # Ask if user wants to add discovered projects
         response = input("\n🔍 Auto-discover additional GitHub projects? (y/N): ")
         if response.lower() != 'y':
+            # Automatically sync Kanban boards for existing projects (required for orchestrator)
+            print("\n📋 Syncing Kanban project boards for existing projects...")
+            with open("config/projects.yaml", 'r') as f:
+                config = yaml.safe_load(f) or {"projects": {}}
+            configure_kanban_boards(config, github_pm)
             return
 
     # Discover GitHub projects
@@ -79,36 +84,41 @@ def main():
     print("\n📝 Next steps:")
     print("   1. Edit config/projects.yaml to specify tech_stacks for each project")
     print("   2. Run the orchestrator - projects will be auto-cloned as needed")
-    print("   3. Projects will be cloned to: ./projects/{repo-name}/")
+    print("   3. Projects will be cloned to: ../{repo-name}/ (sibling directories to orchestrator)")
 
 def configure_kanban_boards(config: dict, github_pm: GitHubProjectManager):
     """Configure Kanban boards for projects"""
     print("\n📋 Configuring Kanban project boards...")
-
-    # Show available templates
-    templates = github_pm.list_templates()
-    print(f"\n🎨 Available Kanban templates:")
-    for i, template_name in enumerate(templates, 1):
-        template_info = github_pm.get_template_info(template_name)
-        print(f"   {i}. {template_name}: {template_info.get('description', 'No description')}")
-
-    # Let user choose template
-    try:
-        choice = input(f"\n🎯 Choose template (1-{len(templates)}) or press Enter for default: ").strip()
-        if choice:
-            template_name = templates[int(choice) - 1]
-        else:
-            template_name = None  # Will use default
-    except (ValueError, IndexError):
-        template_name = None
-
-    print(f"\n🚀 Using template: {template_name or 'default'}")
+    print("🚀 Using standard orchestrator workflow")
 
     updated_projects = 0
 
     for project_name, project_config in config.get('projects', {}).items():
         if 'kanban_board_id' in project_config:
-            print(f"⏭️  {project_name} already has Kanban configuration")
+            print(f"🔧 {project_name} has existing Kanban configuration - syncing columns...")
+
+            # Get the existing board
+            board_id = project_config['kanban_board_id']
+
+            # Sync columns based on project config
+            if 'kanban_columns' in project_config:
+                columns_to_create = []
+                for column_name, agent in project_config['kanban_columns'].items():
+                    columns_to_create.append({
+                        'name': column_name,
+                        'agent': agent,
+                        'description': f"Managed by {agent}" if agent else "Manual management"
+                    })
+
+                # Configure columns on existing board
+                github_org = project_config.get('github_org')
+                if github_org:
+                    github_pm._configure_project_columns(board_id, columns_to_create, github_org)
+                else:
+                    print(f"⚠️ No github_org specified for {project_name} - skipping column sync")
+                print(f"✅ Synced {len(columns_to_create)} columns for {project_name}")
+                updated_projects += 1
+
             continue
 
         print(f"\n📋 Setting up Kanban board for: {project_name}")
@@ -128,16 +138,37 @@ def configure_kanban_boards(config: dict, github_pm: GitHubProjectManager):
                     board_index = int(use_existing) - 1
                     selected_board = existing_boards[board_index]
 
-                    # Get columns from existing board
-                    columns = github_pm.get_project_columns(selected_board['id'])
+                    # Automatically sync columns based on project config
+                    print(f"🔧 Syncing columns for existing board based on project configuration...")
 
-                    # Generate configuration
+                    # If project already has kanban_columns defined, use those
+                    if 'kanban_columns' in project_config:
+                        print(f"📋 Using columns from existing project config...")
+                        # Create column structure from existing config
+                        columns_to_create = []
+                        for column_name, agent in project_config['kanban_columns'].items():
+                            columns_to_create.append({
+                                'name': column_name,
+                                'agent': agent,
+                                'description': f"Managed by {agent}" if agent else "Manual management"
+                            })
+
+                        # Configure columns on existing board
+                        github_org = project_config.get('github_org')
+                        if github_org:
+                            github_pm._configure_project_columns(selected_board['id'], columns_to_create, github_org)
+                        else:
+                            print(f"⚠️ No github_org specified for {project_name} - skipping column sync")
+                        print(f"✅ Synced {len(columns_to_create)} columns to existing board")
+                        continue
+
+                    # Fallback: use existing board structure if no config exists
+                    columns = github_pm.get_project_columns(selected_board['id'])
                     kanban_config = {
                         'kanban_board_id': selected_board['number'],
                         'kanban_columns': {col['name']: None for col in columns}  # User can manually assign agents
                     }
 
-                    # Update project config
                     project_config.update(kanban_config)
                     updated_projects += 1
 
@@ -147,13 +178,35 @@ def configure_kanban_boards(config: dict, github_pm: GitHubProjectManager):
                 except (ValueError, IndexError):
                     print("⚠️ Invalid selection, creating new board...")
 
-        # Create new project board
-        board_data = github_pm.create_project_board(project_name, template_name)
+        # Create new project board using project's column configuration if available
+        if 'kanban_columns' in project_config:
+            # Use existing project column configuration
+            columns_to_create = []
+            for column_name, agent in project_config['kanban_columns'].items():
+                columns_to_create.append({
+                    'name': column_name,
+                    'agent': agent,
+                    'description': f"Managed by {agent}" if agent else "Manual management"
+                })
+            github_org = project_config.get('github_org')
+            if github_org:
+                board_data = github_pm.create_project_board_with_columns(project_name, columns_to_create, github_org)
+            else:
+                print(f"⚠️ No github_org specified for {project_name} - cannot create board")
+                board_data = None
+
+            # Configuration is already defined in project_config
+            kanban_config = {
+                'kanban_board_id': board_data.get('number'),
+                'kanban_columns': project_config['kanban_columns']
+            }
+        else:
+            # Fallback to standard template for new projects
+            board_data = github_pm.create_project_board(project_name, 'standard_workflow')
+            if board_data:
+                kanban_config = github_pm.generate_kanban_config(board_data, 'standard_workflow')
 
         if board_data:
-            # Generate kanban configuration
-            kanban_config = github_pm.generate_kanban_config(board_data, template_name or github_pm.templates.get('default_template', 'simple'))
-
             # Update project config
             project_config.update(kanban_config)
             updated_projects += 1

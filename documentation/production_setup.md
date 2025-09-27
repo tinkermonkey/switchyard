@@ -78,7 +78,7 @@ This script will:
 
 **Option B: Manual Configuration**
 
-Create `config/projects.yaml` manually (projects are auto-cloned to `./projects/`):
+Create `config/projects.yaml` manually (projects are auto-cloned as siblings to the orchestrator):
 
 ```yaml
 projects:
@@ -110,7 +110,7 @@ projects:
 ```
 
 **Key Changes from Previous Versions:**
-- **No more `local_path`**: Auto-derived as `./projects/{repo-name}/`
+- **No more `local_path`**: Auto-derived as `../{repo-name}/` (sibling to orchestrator)
 - **Auto-cloning**: Projects are cloned automatically when accessed
 - **Kanban auto-setup**: Project boards created with standard agent workflow columns
 
@@ -136,7 +136,7 @@ pipelines:
 agent_configs:
   business_analyst:
     claude_model: "claude-3-5-sonnet-20241022"
-    working_directory: "./projects/{project_name}"
+    working_directory: "/workspace/{project_name}"
     output_format: "structured_json"
     tools_enabled:
       - file_operations
@@ -251,7 +251,7 @@ pip install -r requirements.txt
 redis-server
 
 # Terminal 2: Start Serena MCP server
-uvx --from git+https://github.com/oraios/serena serena start-mcp-server --context ide-assistant --project ./projects
+uvx --from git+https://github.com/oraios/serena serena start-mcp-server --context ide-assistant --project /workspace
 
 # Terminal 3: Start webhook server
 python services/simple_webhook_server.py
@@ -311,7 +311,7 @@ docker stats
 # Check disk usage (important for projects directory)
 df -h
 docker system df
-du -sh ./projects/*  # Check project directories
+du -sh ../*  # Check sibling project directories
 
 # Check MCP server resource usage
 docker stats serena-mcp puppeteer-mcp
@@ -432,7 +432,7 @@ tar -czf orchestrator-backup-$(date +%Y%m%d).tar.gz orchestrator_data/
 tar -czf config-backup-$(date +%Y%m%d).tar.gz config/ .env
 
 # Backup projects (if needed - these are auto-cloned from Git)
-tar -czf projects-backup-$(date +%Y%m%d).tar.gz projects/
+tar -czf projects-backup-$(date +%Y%m%d).tar.gz ../
 
 # Backup Redis data
 docker exec $(docker-compose ps -q redis) redis-cli BGSAVE
@@ -543,8 +543,8 @@ docker-compose restart serena-mcp puppeteer-mcp
 ssh -T git@github.com
 
 # Check projects directory permissions
-ls -la ./projects/
-docker-compose exec orchestrator ls -la /projects/
+ls -la ../  # Check sibling directories
+docker-compose exec orchestrator ls -la /workspace/
 
 # Manually test project cloning
 python -c "
@@ -642,7 +642,7 @@ docker-compose logs orchestrator | grep -E "(cloning|project|repository)"
 
 #### Daily
 - Check service health endpoints (including MCP servers)
-- Monitor disk space usage (especially `./projects/` directory)
+- Monitor disk space usage (especially sibling project directories)
 - Review error logs across all services
 - Verify GitHub webhook delivery status
 

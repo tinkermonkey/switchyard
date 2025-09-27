@@ -1,87 +1,44 @@
-# Kanban Board Templates for Claude Code Orchestrator
-# Define standard column structures and agent mappings
+# Kanban Board Template for Claude Code Orchestrator
+# Standard workflow that matches the orchestrator's agent configuration
 
-templates:
-  # Full SDLC Pipeline (recommended)
-  full_sdlc:
-    name: "Full SDLC Pipeline"
-    description: "Complete software development lifecycle with all stages"
-    columns:
-      - name: "Backlog"
-        agent: null
-        description: "New issues and feature requests"
-      - name: "Requirements Analysis"
-        agent: "business_analyst"
-        description: "Business analysis and requirements gathering"
-      - name: "Design"
-        agent: "software_architect"
-        description: "System design and architecture"
-      - name: "Ready for Development"
-        agent: null
-        description: "Issues ready to be picked up by developers"
-      - name: "In Development"
-        agent: "senior_software_engineer"
-        description: "Active development work"
-      - name: "Code Review"
-        agent: "code_reviewer"
-        description: "Code review and quality assurance"
-      - name: "Testing"
-        agent: "senior_qa_engineer"
-        description: "Testing and validation"
-      - name: "Done"
-        agent: null
-        description: "Completed work"
-
-  # Simplified Pipeline (for smaller projects)
-  simple:
-    name: "Simple Pipeline"
-    description: "Streamlined workflow for smaller projects"
-    columns:
-      - name: "To Do"
-        agent: null
-        description: "Pending work"
-      - name: "In Progress"
-        agent: "senior_software_engineer"
-        description: "Active development"
-      - name: "Review"
-        agent: "code_reviewer"
-        description: "Code review"
-      - name: "Done"
-        agent: null
-        description: "Completed"
-
-  # Requirements Focus (for early stage projects)
-  requirements_focus:
-    name: "Requirements Focus"
-    description: "Heavy emphasis on requirements and design before development"
-    columns:
-      - name: "Backlog"
-        agent: null
-        description: "Ideas and requests"
-      - name: "Requirements Analysis"
-        agent: "business_analyst"
-        description: "Requirements gathering"
-      - name: "Requirements Review"
-        agent: "requirements_reviewer"
-        description: "Requirements validation"
-      - name: "Design"
-        agent: "software_architect"
-        description: "System design"
-      - name: "Architecture Review"
-        agent: "architecture_reviewer"
-        description: "Architecture validation"
-      - name: "Ready for Development"
-        agent: null
-        description: "Approved for development"
-      - name: "In Development"
-        agent: "senior_software_engineer"
-        description: "Implementation"
-      - name: "Done"
-        agent: null
-        description: "Complete"
-
-# Default template to use when auto-creating boards
-default_template: "full_sdlc"
+# Standard orchestrator workflow
+standard_workflow:
+  name: "Claude Code Orchestrator Workflow"
+  description: "Complete SDLC workflow for automated agent orchestration"
+  columns:
+    - name: "Backlog"
+      agent: null
+      description: "New issues and feature requests"
+    - name: "Requirements Development"
+      agent: "idea_researcher"
+      description: "Initial research and idea development"
+    - name: "Requirements Analysis"
+      agent: "business_analyst"
+      description: "Business analysis and requirements gathering"
+    - name: "Design"
+      agent: "software_architect"
+      description: "System design and architecture"
+    - name: "Ready for Development"
+      agent: null
+      description: "Issues ready to be picked up by developers"
+    - name: "In Development"
+      agent: "senior_software_engineer"
+      description: "Active development work"
+    - name: "Code Review"
+      agent: "code_reviewer"
+      description: "Code review and quality assurance"
+    - name: "Testing"
+      agent: "senior_qa_engineer"
+      description: "Testing and validation"
+    - name: "Documentation"
+      agent: "technical_writer"
+      description: "Technical documentation creation"
+    - name: "Documentation Review"
+      agent: "documentation_editor"
+      description: "Documentation review and editing"
+    - name: "Done"
+      agent: null
+      description: "Completed work"
 
 # GitHub Project Board settings
 github_project_settings:
