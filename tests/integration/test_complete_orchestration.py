@@ -37,7 +37,7 @@ async def test_complete_orchestration():
     print("✅ Task dequeued successfully")
 
     # 5. Process through pipeline (simulating main.py behavior)
-    from agents.agent_stages import process_task_integrated
+    from agents.orchestrator_integration import process_task_integrated
     from state_management.manager import StateManager
     from monitoring.logging import OrchestratorLogger
 

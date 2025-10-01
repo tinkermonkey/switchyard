@@ -1,7 +1,7 @@
 # state/git_state.py
 import subprocess
 from pathlib import Path
-from manager import StateManager
+from .manager import StateManager
 from typing import Dict, Any, List, Optional
 from datetime import datetime
 import json

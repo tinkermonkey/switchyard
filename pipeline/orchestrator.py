@@ -11,28 +11,45 @@ class SequentialPipeline:
         self.current_stage_index = 0
         
     async def execute(self, initial_context: Dict[str, Any]) -> Dict[str, Any]:
+        import logging
+        logger = logging.getLogger(__name__)
+
+        logger.info("SequentialPipeline.execute() called")
+        logger.info(f"Number of stages: {len(self.stages)}")
+
         context = initial_context.copy()
         context['pipeline_id'] = f"pipeline_{datetime.now().isoformat()}"
-        
+
+        logger.info(f"Pipeline ID: {context['pipeline_id']}")
+
         # Load from checkpoint if resuming
+        logger.info("Checking for checkpoint")
         checkpoint = await self.state_manager.get_latest_checkpoint(context['pipeline_id'])
         if checkpoint:
+            logger.info(f"Resuming from checkpoint at stage {checkpoint['stage_index']}")
             self.current_stage_index = checkpoint['stage_index']
             context = checkpoint['context']
-        
+        else:
+            logger.info("No checkpoint found, starting from beginning")
+
         while self.current_stage_index < len(self.stages):
             stage = self.stages[self.current_stage_index]
-            
+            logger.info(f"Executing stage {self.current_stage_index}: {stage.name}")
+
             try:
                 # Create checkpoint before stage execution
+                logger.info("Creating checkpoint")
                 await self.state_manager.checkpoint(
                     pipeline_id=context['pipeline_id'],
                     stage_index=self.current_stage_index,
                     context=context
                 )
-                
+                logger.info("Checkpoint created")
+
                 # Execute stage with circuit breaker
+                logger.info(f"Running stage with circuit breaker: {stage.name}")
                 context = await stage.run_with_circuit_breaker(context)
+                logger.info(f"Stage {stage.name} completed successfully")
                 
                 # Log successful completion
                 await self.state_manager.log_stage_completion(

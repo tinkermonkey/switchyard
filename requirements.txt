@@ -3,6 +3,7 @@ asyncio-throttle>=1.0.2
 aiofiles>=23.2.1
 redis>=5.0.1
 pydantic>=2.4.2
+pydantic-settings>=2.0.0
 python-dotenv>=1.0.0
 
 # Monitoring
@@ -12,6 +13,8 @@ psutil>=5.9.6
 
 # Web/API
 flask>=3.0.0
+flask-socketio>=5.3.0
+flask-cors>=4.0.0
 requests>=2.31.0
 httpx>=0.25.0  # For MCP server communication
 
@@ -24,3 +27,22 @@ python-dateutil>=2.8.2
 # Testing
 pytest>=8.0.0
 pytest-asyncio>=1.0.0
+
+# GitHub Integration
+PyGithub>=1.59.1
+PyJWT>=2.8.0
+
+# Anthropic Claude
+anthropic>=0.7.7
+
+# Development Tools
+black>=23.11.0
+isort>=5.12.0
+mypy>=1.7.1
+
+# Security
+cryptography>=41.0.7
+
+# CLI Tools
+click>=8.1.7
+rich>=13.7.0

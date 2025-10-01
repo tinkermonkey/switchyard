@@ -1,108 +1,124 @@
 """
-GitHub Project Board Manager - Auto-discover and configure Kanban boards
+GitHub Project Board Manager with Configuration Reconciliation
+
+This manager ensures that GitHub project boards match the desired configuration
+defined in the project configuration files. It implements the reconciliation
+pattern where the orchestrator becomes the authoritative source for project structure.
 """
 
 import os
 import json
-import yaml
 import subprocess
 import requests
+import time
 from typing import Dict, Any, List, Optional, Tuple
+import logging
+
+from config.manager import ConfigManager, ProjectConfig, WorkflowTemplate
+from config.state_manager import GitHubStateManager
+
+logger = logging.getLogger(__name__)
+
 
 class GitHubProjectManager:
-    def __init__(self, templates_config_path: str = "config/kanban_templates.yaml"):
-        self.templates_config_path = templates_config_path
-        self.templates = self._load_templates()
+    """
+    GitHub Project Manager with Configuration Reconciliation
 
-    def _load_templates(self) -> Dict[str, Any]:
-        """Load Kanban templates configuration"""
+    This class manages GitHub project boards by ensuring they match the
+    configuration defined in project configuration files. It implements
+    a reconciliation loop that creates, updates, and maintains project
+    boards based on declarative configuration.
+    """
+
+    def __init__(self, config_manager: ConfigManager, state_manager: GitHubStateManager):
+        self.config_manager = config_manager
+        self.state_manager = state_manager
+
+    async def reconcile_project(self, project_name: str) -> bool:
+        """
+        Reconcile a project's GitHub state with its configuration
+
+        This is the main entry point for configuration reconciliation.
+        It ensures GitHub projects match the desired configuration.
+
+        Args:
+            project_name: Name of the project to reconcile
+
+        Returns:
+            True if reconciliation was successful, False otherwise
+        """
         try:
-            with open(self.templates_config_path, 'r') as f:
-                return yaml.safe_load(f)
-        except FileNotFoundError:
-            print(f"⚠️ Templates config not found: {self.templates_config_path}")
-            return {"standard_workflow": {"columns": []}}
+            logger.info(f"Starting reconciliation for project: {project_name}")
 
-    def discover_project_boards(self, repo_name: str) -> List[Dict[str, Any]]:
-        """Discover existing project boards for a repository"""
+            # Load project configuration
+            project_config = self.config_manager.get_project_config(project_name)
+
+            # Backup current state before making changes
+            backup_path = self.state_manager.backup_state(project_name)
+            if backup_path:
+                logger.info(f"Created state backup: {backup_path}")
+
+            # Reconcile each enabled pipeline
+            for pipeline in project_config.pipelines:
+                if not pipeline.active:
+                    continue
+
+                success = await self._reconcile_pipeline_board(project_name, pipeline, project_config)
+                if not success:
+                    logger.error(f"Failed to reconcile pipeline '{pipeline.name}' for project '{project_name}'")
+                    return False
+
+            # Create repository labels
+            await self._reconcile_labels(project_name, project_config)
+
+            # Mark project as synchronized
+            self.state_manager.mark_synchronized(project_name)
+
+            logger.info(f"Successfully reconciled project: {project_name}")
+            return True
+
+        except Exception as e:
+            logger.error(f"Failed to reconcile project '{project_name}': {e}")
+            return False
+
+    async def _reconcile_pipeline_board(self, project_name: str, pipeline_config, project_config: ProjectConfig) -> bool:
+        """Reconcile a single pipeline board with configuration"""
         try:
-            # List project boards associated with the repository
-            cmd = ['gh', 'project', 'list', '--owner', os.environ.get('GITHUB_ORG', ''), '--format', 'json']
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            # Check if board already exists in state
+            existing_board = self.state_manager.get_board_by_name(project_name, pipeline_config.board_name)
 
-            projects = json.loads(result.stdout)
+            if existing_board is None:
+                # Create new board
+                logger.info(f"Creating board: {pipeline_config.board_name}")
+                board_data = await self._create_project_board(
+                    project_name,
+                    pipeline_config,
+                    project_config
+                )
+                if not board_data:
+                    return False
+            else:
+                logger.info(f"Board exists: {pipeline_config.board_name}")
+                # TODO: Update existing board if needed
+                board_data = existing_board
 
-            # Filter projects that might be related to this repo
-            repo_projects = []
-            for project in projects.get('projects', []):
-                title = project.get('title', '').lower()
-                if repo_name.lower() in title or title.startswith(repo_name.lower()):
-                    repo_projects.append({
-                        'id': project.get('id'),
-                        'number': project.get('number'),
-                        'title': project.get('title'),
-                        'url': project.get('url')
-                    })
+            return True
 
-            return repo_projects
+        except Exception as e:
+            logger.error(f"Failed to reconcile pipeline board {pipeline_config.board_name}: {e}")
+            return False
 
-        except (subprocess.CalledProcessError, json.JSONDecodeError) as e:
-            print(f"⚠️ Could not discover project boards for {repo_name}: {e}")
-            return []
-
-    def get_project_columns(self, project_id: str) -> List[Dict[str, Any]]:
-        """Get columns for a specific project board"""
+    async def _create_project_board(self, project_name: str, pipeline_config, project_config: ProjectConfig) -> Optional[Dict[str, Any]]:
+        """Create a new project board based on configuration"""
         try:
-            # Use GitHub CLI to get project details
-            cmd = ['gh', 'project', 'view', project_id, '--format', 'json']
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            # Get workflow template
+            workflow_template = self.config_manager.get_workflow_template(pipeline_config.workflow)
 
-            project_data = json.loads(result.stdout)
-
-            # Extract column information
-            columns = []
-            fields = project_data.get('fields', [])
-
-            for field in fields:
-                if field.get('name') == 'Status' and field.get('type') == 'single_select':
-                    for option in field.get('options', []):
-                        columns.append({
-                            'name': option.get('name'),
-                            'id': option.get('id')
-                        })
-                    break
-
-            return columns
-
-        except (subprocess.CalledProcessError, json.JSONDecodeError) as e:
-            print(f"⚠️ Could not get columns for project {project_id}: {e}")
-            return []
-
-    def create_project_board(self, repo_name: str, template_name: Optional[str] = None) -> Optional[Dict[str, Any]]:
-        """Create a new project board with standard columns"""
-
-        template_name = template_name or 'standard_workflow'
-        template = self.templates.get(template_name)
-
-        if not template:
-            print(f"❌ Template '{template_name}' not found")
-            return None
-
-        github_org = os.environ.get('GITHUB_ORG')
-        if not github_org:
-            print("❌ GITHUB_ORG environment variable not set")
-            return None
-
-        try:
-            # Create the project
-            project_title = f"{repo_name} - {template['name']}"
-            project_description = template.get('description', self.templates.get('github_project_settings', {}).get('description_template', 'Automated project board managed by Claude Code Orchestrator'))
-
+            # Create the GitHub project (note: --body flag not supported in all gh versions)
             cmd = [
                 'gh', 'project', 'create',
-                '--owner', github_org,
-                '--title', project_title,
-                '--body', project_description,
+                '--owner', project_config.github['org'],
+                '--title', f"{project_name} - {pipeline_config.description}",
                 '--format', 'json'
             ]
 
@@ -111,162 +127,103 @@ class GitHubProjectManager:
 
             project_id = project_data.get('id')
             project_number = project_data.get('number')
+            node_id = project_data.get('node_id')
 
-            print(f"✅ Created project board: {project_title}")
+            logger.info(f"Created project board: {pipeline_config.board_name} (#{project_number})")
 
-            # Configure the Status field with our columns
-            self._configure_project_columns(project_id, template['columns'], github_org)
+            # Configure columns
+            columns = await self._configure_board_columns(project_number, workflow_template, project_config.github['org'])
 
-            return {
-                'id': project_id,
-                'number': project_number,
-                'title': project_title,
-                'url': project_data.get('url'),
-                'template_used': template_name
-            }
-
-        except (subprocess.CalledProcessError, json.JSONDecodeError) as e:
-            print(f"❌ Failed to create project board for {repo_name}: {e}")
-            return None
-
-    def create_project_board_with_columns(self, repo_name: str, columns: List[Dict[str, Any]], github_org: str) -> Optional[Dict[str, Any]]:
-        """Create a new project board with custom columns from project config"""
-
-        try:
-            # Create the project
-            project_title = f"{repo_name} - Orchestrator"
-            project_description = "Automated project board managed by Claude Code Orchestrator"
-
-            cmd = [
-                'gh', 'project', 'create',
-                '--owner', github_org,
-                '--title', project_title,
-                '--body', project_description,
-                '--format', 'json'
-            ]
-
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-            project_data = json.loads(result.stdout)
-
-            project_id = project_data.get('id')
-            project_number = project_data.get('number')
-
-            print(f"✅ Created project board: {project_title}")
-
-            # Configure the Status field with project's columns
-            self._configure_project_columns(project_id, columns, github_org)
+            # Update state
+            self.state_manager.update_board_state(
+                project_name,
+                pipeline_config.board_name,
+                project_number,
+                project_id,
+                node_id,
+                columns
+            )
 
             return {
                 'id': project_id,
                 'number': project_number,
-                'title': project_title,
-                'url': project_data.get('url'),
-                'columns_configured': True
+                'node_id': node_id,
+                'title': f"{project_name} - {pipeline_config.description}"
             }
 
-        except (subprocess.CalledProcessError, json.JSONDecodeError) as e:
-            print(f"❌ Failed to create project board for {repo_name}: {e}")
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Failed to create GitHub project board '{pipeline_config.board_name}' for {project_name}")
+            logger.error(f"GitHub CLI command failed with exit code {e.returncode}")
+            logger.error(f"Command: {' '.join(e.cmd)}")
+            if e.stdout:
+                logger.error(f"STDOUT: {e.stdout}")
+            if e.stderr:
+                logger.error(f"STDERR: {e.stderr}")
+
+            # Automatically diagnose the issue
+            logger.error("AUTOMATIC DIAGNOSTICS:")
+            await self._diagnose_github_issue(project_config.github['org'])
+
+            logger.error("Orchestrator cannot manage GitHub projects without successful board creation")
+            return None
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse GitHub CLI response for board '{pipeline_config.board_name}': {e}")
             return None
 
-    def _configure_project_columns(self, project_id: str, columns: List[Dict[str, Any]], github_org: str):
-        """Configure project columns using GitHub CLI"""
+    async def _configure_board_columns(self, project_number: int, workflow_template: WorkflowTemplate, github_org: str) -> List[Dict[str, str]]:
+        """Configure project board columns using GraphQL"""
         try:
-
-            # First, check if Status field exists
-            cmd = ['gh', 'project', 'field-list', str(project_id), '--owner', github_org, '--format', 'json']
+            # Get the project's field information using project number
+            cmd = ['gh', 'project', 'field-list', str(project_number), '--owner', github_org, '--format', 'json']
             result = subprocess.run(cmd, capture_output=True, text=True, check=True)
             fields_data = json.loads(result.stdout)
 
-            # First, try to update the built-in Status field using GraphQL
+            # Find the Status field
             status_field = None
             for field in fields_data.get('fields', []):
                 if field.get('name') == 'Status':
                     status_field = field
                     break
 
-            if status_field:
-                print("🔧 Found built-in Status field - attempting to update via GraphQL...")
+            if not status_field:
+                logger.error("Status field not found")
+                return []
 
-                # Try to update the Status field with our columns
-                if self._update_status_field_via_graphql(project_id, status_field['id'], columns, github_org):
-                    print("✅ Successfully updated built-in Status field")
-                    return
-                else:
-                    print("⚠️ GraphQL update failed, falling back to custom Workflow Status field...")
+            # Prepare column options from workflow template
+            options = []
+            for column in workflow_template.columns:
+                options.append({
+                    "name": column.name,
+                    "description": column.description,
+                    "color": "GRAY"
+                })
 
-            # Fallback: Look for our custom "Workflow Status" field
-            workflow_field = None
-            for field in fields_data.get('fields', []):
-                if field.get('name') == 'Workflow Status':
-                    workflow_field = field
-                    break
+            # Update the Status field with GraphQL
+            success = await self._update_status_field_graphql(status_field['id'], options)
 
-            if not workflow_field:
-                # Create Workflow Status field with all column options
-                column_names = [col['name'] for col in columns]
-                options_str = ','.join(column_names)
-
-                cmd = [
-                    'gh', 'project', 'field-create', str(project_id),
-                    '--owner', github_org,
-                    '--name', 'Workflow Status',
-                    '--data-type', 'SINGLE_SELECT',
-                    '--single-select-options', options_str
+            if success:
+                # Return column data for state management
+                return [
+                    {
+                        'name': column.name,
+                        'id': f"status_{i}",  # Placeholder - would need actual IDs from GraphQL response
+                        'node_id': f"node_{i}"  # Placeholder
+                    }
+                    for i, column in enumerate(workflow_template.columns)
                 ]
-
-                subprocess.run(cmd, capture_output=True, text=True, check=True)
-                print(f"✅ Created Workflow Status field with {len(columns)} columns")
-
-                for column in columns:
-                    print(f"   ✅ Added column: {column['name']}")
             else:
-                # Workflow Status field exists - check if we need to add missing columns
-                existing_options = [opt['name'] for opt in workflow_field.get('options', [])]
-                needed_columns = [col['name'] for col in columns if col['name'] not in existing_options]
+                return []
 
-                if needed_columns:
-                    print(f"🔧 Workflow Status field exists but missing {len(needed_columns)} columns")
+        except Exception as e:
+            logger.error(f"Failed to configure columns: {e}")
+            return []
 
-                    # Delete and recreate the custom Workflow Status field
-                    try:
-                        field_id = workflow_field.get('id')
-                        cmd = ['gh', 'project', 'field-delete', '--id', field_id]
-                        subprocess.run(cmd, capture_output=True, text=True, check=True)
-                        print("🗑️ Deleted existing Workflow Status field")
-
-                        # Now create new Workflow Status field with all columns
-                        column_names = [col['name'] for col in columns]
-                        options_str = ','.join(column_names)
-
-                        cmd = [
-                            'gh', 'project', 'field-create', str(project_id),
-                            '--owner', github_org,
-                            '--name', 'Workflow Status',
-                            '--data-type', 'SINGLE_SELECT',
-                            '--single-select-options', options_str
-                        ]
-
-                        subprocess.run(cmd, capture_output=True, text=True, check=True)
-                        print(f"✅ Recreated Workflow Status field with {len(columns)} columns")
-
-                        for column in columns:
-                            print(f"   ✅ Added column: {column['name']}")
-
-                    except subprocess.CalledProcessError as e:
-                        print(f"⚠️ Could not delete/recreate Workflow Status field: {e}")
-                        print("🔧 Manual column management may be needed")
-                else:
-                    print("✅ Workflow Status field already has all required columns")
-
-        except (subprocess.CalledProcessError, json.JSONDecodeError) as e:
-            print(f"⚠️ Could not configure project columns: {e}")
-
-    def _update_status_field_via_graphql(self, project_id: str, field_id: str, columns: List[Dict[str, Any]], github_org: str):
-        """Update existing Status field options using GitHub GraphQL API"""
+    async def _update_status_field_graphql(self, field_id: str, options: List[Dict[str, str]]) -> bool:
+        """Update Status field options using GraphQL"""
         try:
-            # Get GitHub token from gh CLI
-            result = subprocess.run(['gh', 'auth', 'token'], capture_output=True, text=True, check=True)
-            token = result.stdout.strip()
+            # Get GitHub token
+            token_result = subprocess.run(['gh', 'auth', 'token'], capture_output=True, text=True, check=True)
+            token = token_result.stdout.strip()
 
             # GraphQL mutation to update field options
             mutation = """
@@ -286,15 +243,6 @@ class GitHubProjectManager:
             }
             """
 
-            # Prepare the options for the field
-            options = []
-            for column in columns:
-                options.append({
-                    "name": column['name'],
-                    "description": column.get('description', f"Workflow stage: {column['name']}"),
-                    "color": "GRAY"  # Default color, could be made configurable
-                })
-
             variables = {
                 "input": {
                     "fieldId": field_id,
@@ -302,7 +250,7 @@ class GitHubProjectManager:
                 }
             }
 
-            # Make the GraphQL request
+            # Make GraphQL request
             headers = {
                 "Authorization": f"Bearer {token}",
                 "Content-Type": "application/json"
@@ -315,35 +263,176 @@ class GitHubProjectManager:
             )
 
             if response.status_code == 200:
-                result = response.json()
-                if "errors" in result:
-                    print(f"⚠️ GraphQL errors: {result['errors']}")
+                result_data = response.json()
+                if "errors" in result_data:
+                    logger.error(f"GraphQL errors: {result_data['errors']}")
                     return False
                 else:
-                    print(f"✅ Updated Status field with {len(columns)} columns via GraphQL")
+                    logger.info(f"Configured {len(options)} columns via GraphQL")
                     return True
             else:
-                print(f"⚠️ GraphQL request failed: {response.status_code} - {response.text}")
+                logger.error(f"GraphQL request failed: {response.status_code}")
                 return False
 
         except Exception as e:
-            print(f"⚠️ GraphQL update failed: {e}")
+            logger.error(f"Failed to update status field: {e}")
             return False
 
-    def generate_kanban_config(self, project_data: Dict[str, Any], template_name: str) -> Dict[str, Any]:
-        """Generate kanban_columns configuration for projects.yaml"""
+    async def _reconcile_labels(self, project_name: str, project_config: ProjectConfig) -> bool:
+        """Create repository labels for pipeline routing"""
+        try:
+            # Get workflow templates for enabled pipelines
+            workflow_templates = self.config_manager.get_workflow_templates()
 
-        template = self.templates.get(template_name, {})
-        columns_config = {}
+            labels_to_create = []
 
-        for column in template.get('columns', []):
-            columns_config[column['name']] = column['agent']
+            # Collect all labels from enabled pipelines
+            for pipeline in project_config.pipelines:
+                if not pipeline.active:
+                    continue
 
-        return {
-            'kanban_board_id': project_data.get('number'),  # Use project number, not ID
-            'kanban_columns': columns_config
-        }
+                workflow_template = workflow_templates.get(pipeline.workflow)
+                if not workflow_template:
+                    continue
 
-    def get_template_info(self, template_name: str) -> Optional[Dict[str, Any]]:
-        """Get detailed information about a template"""
-        return self.templates.get(template_name)
+                # Add pipeline label
+                labels_to_create.append({
+                    'name': f'pipeline:{pipeline.name}',
+                    'color': '0075ca',
+                    'description': f'{pipeline.description} workflow'
+                })
+
+                # Add stage labels
+                for column in workflow_template.columns:
+                    if column.stage_mapping:
+                        labels_to_create.append({
+                            'name': f'stage:{column.stage_mapping}',
+                            'color': 'cfd3d7',
+                            'description': f'Stage: {column.name}'
+                        })
+
+            # Create labels in repository
+            created_labels = []
+            for label_config in labels_to_create:
+                try:
+                    cmd = [
+                        'gh', 'label', 'create',
+                        label_config['name'],
+                        '--description', label_config['description'],
+                        '--color', label_config['color'],
+                        '--force'  # Update if exists
+                    ]
+
+                    subprocess.run(cmd, capture_output=True, text=True, check=True)
+                    created_labels.append(label_config['name'])
+                    logger.info(f"Created label: {label_config['name']}")
+
+                except subprocess.CalledProcessError:
+                    # Label might already exist, that's fine
+                    pass
+
+            # Update state with created labels
+            if created_labels:
+                self.state_manager.mark_labels_created(project_name, created_labels)
+
+            return True
+
+        except Exception as e:
+            logger.error(f"Failed to reconcile labels for {project_name}: {e}")
+            return False
+
+    def get_project_state(self, project_name: str):
+        """Get the current GitHub state for a project"""
+        return self.state_manager.load_project_state(project_name)
+
+    def cleanup_project(self, project_name: str):
+        """Remove all GitHub state for a project"""
+        self.state_manager.cleanup_project_state(project_name)
+
+    async def _diagnose_github_issue(self, org: str):
+        """Automatically diagnose GitHub connectivity and permissions issues"""
+
+        # 1. Check GitHub CLI authentication
+        try:
+            auth_result = subprocess.run(['gh', 'auth', 'status'], capture_output=True, text=True)
+            if auth_result.returncode == 0:
+                logger.info("GitHub CLI authentication: SUCCESS")
+                # Parse the output to get token info
+                if "Token:" in auth_result.stderr:
+                    logger.error(f"Auth details: {auth_result.stderr.strip()}")
+            else:
+                logger.error("GitHub CLI authentication: FAILED")
+                logger.error(f"Auth error: {auth_result.stderr.strip()}")
+                logger.error("Fix: Run 'gh auth login' to authenticate")
+                return
+        except Exception as e:
+            logger.error(f"Cannot check GitHub CLI authentication: {e}")
+            return
+
+        # 2. Check if user can access the organization
+        try:
+            org_result = subprocess.run(['gh', 'api', f'orgs/{org}'], capture_output=True, text=True)
+            if org_result.returncode == 0:
+                logger.info(f"Organization access ({org}): SUCCESS")
+            else:
+                logger.error(f"Organization access ({org}): FAILED")
+                logger.error(f"Org error: {org_result.stderr.strip()}")
+                logger.error(f"Fix: Check if you have access to organization '{org}'")
+                return
+        except Exception as e:
+            logger.error(f"Cannot check organization access: {e}")
+
+        # 3. Check GitHub Projects v2 permissions specifically
+        try:
+            projects_result = subprocess.run(['gh', 'project', 'list', '--owner', org, '--format', 'json'],
+                                           capture_output=True, text=True)
+            if projects_result.returncode == 0:
+                logger.info(f"GitHub Projects v2 access ({org}): SUCCESS")
+                try:
+                    projects_data = json.loads(projects_result.stdout)
+                    project_count = len(projects_data.get('projects', []))
+                    logger.error(f"Found {project_count} existing projects in {org}")
+                except:
+                    logger.error("Projects list returned but could not parse JSON")
+            else:
+                logger.error(f"GitHub Projects v2 access ({org}): FAILED")
+                logger.error(f"Projects error: {projects_result.stderr.strip()}")
+                if "Resource not accessible by personal access token" in projects_result.stderr:
+                    logger.error("DIAGNOSIS: Token missing 'project' scope")
+                    logger.error("Fix: Add 'project' scope at https://github.com/settings/tokens")
+                elif "Not Found" in projects_result.stderr:
+                    logger.error(f"DIAGNOSIS: No access to organization '{org}' or org doesn't exist")
+                    logger.error("Fix: Check organization name and your membership")
+        except Exception as e:
+            logger.error(f"Cannot check GitHub Projects access: {e}")
+
+        # 4. Test a simple project creation to see what specific error we get
+        try:
+            logger.error("Testing project creation permissions...")
+            test_result = subprocess.run([
+                'gh', 'project', 'create',
+                '--owner', org,
+                '--title', f'orchestrator-test-{int(time.time())}',
+                '--format', 'json'
+            ], capture_output=True, text=True, timeout=30)
+
+            if test_result.returncode == 0:
+                logger.info("Test project creation: SUCCESS")
+                # Clean up the test project
+                try:
+                    test_data = json.loads(test_result.stdout)
+                    test_project_id = test_data.get('id')
+                    if test_project_id:
+                        subprocess.run(['gh', 'project', 'delete', test_project_id, '--confirm'],
+                                     capture_output=True, timeout=10)
+                        logger.info("Cleaned up test project")
+                except:
+                    logger.error("Test project created but cleanup failed - may need manual deletion")
+            else:
+                logger.error("Test project creation: FAILED")
+                logger.error(f"Creation error: {test_result.stderr.strip()}")
+
+        except subprocess.TimeoutExpired:
+            logger.error("Test project creation: TIMEOUT")
+        except Exception as e:
+            logger.error(f"Cannot test project creation: {e}")

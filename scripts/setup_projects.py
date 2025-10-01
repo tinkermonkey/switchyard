@@ -4,7 +4,14 @@ Setup script to auto-discover GitHub projects and create projects.yaml
 """
 
 import os
+import sys
 import yaml
+
+# Add the project root to Python path and change working directory
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, project_root)
+os.chdir(project_root)
+
 from services.project_manager import ProjectManager
 from services.github_project_manager import GitHubProjectManager
 
@@ -72,7 +79,7 @@ def main():
     # Write updated configuration
     os.makedirs("config", exist_ok=True)
     with open("config/projects.yaml", 'w') as f:
-        yaml.dump(config, f, default_flow_style=False, sort_keys=True)
+        yaml.dump(config, f, default_flow_style=False, sort_keys=False)
 
     print(f"\n✅ Added {added_count} new projects to config/projects.yaml")
 
@@ -218,7 +225,7 @@ def configure_kanban_boards(config: dict, github_pm: GitHubProjectManager):
     if updated_projects > 0:
         # Save updated configuration
         with open("config/projects.yaml", 'w') as f:
-            yaml.dump(config, f, default_flow_style=False, sort_keys=True)
+            yaml.dump(config, f, default_flow_style=False, sort_keys=False)
 
         print(f"\n🎉 Updated {updated_projects} projects with Kanban configuration!")
         print("📋 You can now customize agent assignments in config/projects.yaml")

@@ -1,5 +1,8 @@
 import requests
 import time
+import logging
+
+logger = logging.getLogger(__name__)
 
 class NgrokMonitor:
     """Monitor ngrok tunnel health"""
@@ -34,8 +37,8 @@ class NgrokMonitor:
             status = self.get_tunnel_status()
             
             if status['status'] == 'connected':
-                print(f"✅ ngrok connected: {status['url']}")
+                logger.info(f"ngrok connected: {status['url']}")
             else:
-                print(f"⚠️ ngrok issue: {status}")
+                logger.warning(f"ngrok issue: {status}")
             
             time.sleep(self.check_interval)

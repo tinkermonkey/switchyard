@@ -4,15 +4,90 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Repository Architecture
 
-This repository is a Claude Code Agent Orchestrator designed to faciliate automated code development and testing.
+This repository is a Claude Code Agent Orchestrator designed to facilitate automated code development and testing.
+
+## Workspace Isolation and File System Safety
+
+**CRITICAL**: The orchestrator MUST be isolated to its own workspace directory tree to prevent accidental modification of user's personal repositories.
+
+### Workspace Structure
+
+The orchestrator operates within a dedicated workspace directory that contains:
+- `clauditoreum/` - The orchestrator codebase itself (this repository)
+- `<project-name>/` - Managed project checkouts (e.g., `context-studio/`)
+
+Example directory structure on the host machine:
+```
+~/workspace/orchestrator/          # Orchestrator workspace root
+├── clauditoreum/                  # This codebase
+│   ├── config/
+│   ├── agents/
+│   ├── pipeline/
+│   └── ...
+└── context-studio/                # Managed project checkout
+    ├── src/
+    ├── tests/
+    └── ...
+```
+
+### File System Boundaries
+
+**The orchestrator MUST NEVER access files outside its workspace directory.**
+
+User's personal repositories exist as siblings to the orchestrator workspace:
+```
+~/workspace/                       # User's workspace (OFF LIMITS to orchestrator)
+├── orchestrator/                  # Orchestrator's isolated workspace (SAFE)
+│   ├── clauditoreum/
+│   └── context-studio/           # Orchestrator-managed copy
+├── context-studio/                # User's personal copy (OFF LIMITS)
+├── other-project/                 # User's personal copy (OFF LIMITS)
+└── ...
+```
+
+### Container Volume Mounts
+
+In Docker, the isolation is enforced by mounting only the orchestrator workspace:
+```yaml
+volumes:
+  - ./:/app                        # Mount clauditoreum/ as /app
+  - ..:/workspace                  # Mount orchestrator/ as /workspace
+```
+
+Inside the container:
+- `/workspace/` = Host's `~/workspace/orchestrator/`
+- `/app/` = Host's `~/workspace/orchestrator/clauditoreum/`
+- `/workspace/context-studio/` = Host's `~/workspace/orchestrator/context-studio/`
+
+The orchestrator **cannot** see `/workspace/orchestrator/` from the host level - it only sees its own isolated workspace.
+
+### Project Checkout and Management
+
+When a project is configured in `config/projects/`, the orchestrator:
+1. Checks if project directory exists in workspace (e.g., `/workspace/context-studio/`)
+2. If not found, clones the repository to the workspace directory
+3. Manages git operations (branches, commits, pushes) within this checkout
+4. Launches agents in Docker containers with this project directory mounted
+
+This ensures:
+- User's personal repositories remain untouched
+- All agent work happens in isolated, managed checkouts
+- File system operations are contained within the orchestrator workspace
+
+## Best Practices
+
+- Don't use emojis in comments, code, or documentation.
+- Never use absolute paths that could escape the workspace boundary
+- Always use workspace-relative paths for project operations
 
 ## File structure
 
 ```
 ├── pipeline/                         # Pipeline definition
 │   ├── base.py
-│   └── orchestrator.py
-├── state/                            # State management
+│   ├── orchestrator.py
+│   └── factory.py                    # Pipeline factory with new config system
+├── state_management/                 # Legacy state management
 │   ├── manager.py
 │   └── git_state.py
 ├── handoff/                          # Handoff management
@@ -23,12 +98,24 @@ This repository is a Claude Code Agent Orchestrator designed to faciliate automa
 │   ├── product_manager.py
 │   ├── software_engineer.py
 │   └── ...
-├── listeners/                        # Webhook listeners
-│   ├── github_webhook.py
-│   └── kanban_monitor.py
-├── config/                           # Configuration files
-│   └── pipelines.yaml
-
+├── services/                         # Service layer
+│   ├── github_project_manager.py    # GitHub reconciliation manager
+│   └── project_monitor.py           # GitHub project monitoring
+├── config/                           # Configuration system
+│   ├── foundations/                  # Foundational configurations
+│   │   ├── agents.yaml              # Agent definitions and capabilities
+│   │   ├── pipelines.yaml           # Pipeline templates
+│   │   └── workflows.yaml           # Kanban workflow templates
+│   ├── projects/                     # Project-specific configurations
+│   │   └── context-studio.yaml      # Example project configuration
+│   ├── manager.py                    # Configuration loading and management
+│   ├── state_manager.py             # GitHub state management
+│   └── git_workflow.yaml            # Git automation settings
+├── state/                            # Runtime state (not version controlled)
+│   ├── projects/                     # Project-specific state
+│   │   └── context-studio/
+│   │       └── github_state.yaml    # GitHub project IDs, sync status
+│   └── orchestrator/                 # Global orchestrator state
 ├── .claude/
 │   └── CLAUDE.md                     # This file, the Orchestrator's own Claude instructions
 └── requirements.txt                  # Python requirements
@@ -65,6 +152,38 @@ Effective prompt engineering balances conciseness with clarity. **Token reductio
 Essential prompt elements that must always be retained include role definition, core objectives, output format specifications, critical constraints, and success criteria. Nice-to-have elements like verbose examples or philosophical explanations should be compressed or removed. The STAR framework (Situation, Task, Action, Result) provides structure for technical tasks while maintaining brevity.
 
 **Reviewer agents implement the maker-checker loop pattern**, where maker agents create initial outputs and checker agents validate quality. This multi-layer review architecture progresses through syntax validation, logic review, context validation, and security assessment before final human review. Each layer catches different issue categories, ensuring comprehensive quality assurance.
+
+## Configuration Management Architecture
+
+The orchestrator uses a three-layer configuration architecture that separates foundational capabilities, project-specific choices, and runtime state.
+
+### Foundational Layer (`config/foundations/`)
+
+**Agent Definitions (`agents.yaml`)**: Defines what agents exist and their capabilities including models, timeouts, tools, and MCP server connections. This is the authoritative source for all available agents in the system.
+
+**Pipeline Templates (`pipelines.yaml`)**: Defines reusable pipeline stage sequences with quality gates, timeouts, and maker-checker patterns. Templates can be instantiated by projects with customizations.
+
+**Workflow Templates (`workflows.yaml`)**: Defines kanban board structures and automation rules including column definitions, agent assignments, and trigger conditions.
+
+### Project Layer (`config/projects/`)
+
+Project-specific configurations that reference foundational templates and apply customizations. Each project defines which pipelines to enable, GitHub repository settings, and agent customizations.
+
+### State Layer (`state/projects/`)
+
+Runtime GitHub state including project IDs, board IDs, column IDs, and sync status. This layer is managed automatically by the orchestrator and enables configuration reconciliation.
+
+### Configuration Reconciliation
+
+The orchestrator implements a reconciliation loop that ensures GitHub project boards match the desired configuration. On startup and when configuration changes, the system:
+
+1. Compares current GitHub state with desired configuration
+2. Creates missing project boards and columns
+3. Updates existing boards to match configuration
+4. Creates repository labels for pipeline routing
+5. Marks state as synchronized
+
+This eliminates the need for manual setup scripts and makes the orchestrator the authoritative source for project structure.
 
 ## Sequential pipeline architecture
 

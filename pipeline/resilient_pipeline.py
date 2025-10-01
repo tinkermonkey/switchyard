@@ -96,7 +96,7 @@ class ResilientPipeline:
                     print(f"🛑 Aborting pipeline due to critical failure in {stage.name}")
                     raise
                 else:
-                    print(f"⚠️ Stage {stage.name} failed but continuing pipeline")
+                    print(f"Stage {stage.name} failed but continuing pipeline")
                     context['failed_stages'] = context.get('failed_stages', [])
                     context['failed_stages'].append({
                         'stage': stage.name,

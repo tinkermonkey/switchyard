@@ -29,7 +29,7 @@ async def test_pipeline_integration():
     )
 
     # Import the process_task function
-    from agents.agent_stages import process_task_integrated
+    from agents.orchestrator_integration import process_task_integrated
 
     # Execute
     try:

@@ -3,6 +3,10 @@ from pipeline.base import PipelineStage
 from claude.claude_integration import run_claude_code
 from datetime import datetime
 import json
+import logging
+from handoff.collaboration import ReviewStatus, ReviewFeedback
+
+logger = logging.getLogger(__name__)
 
 class RequirementsReviewerAgent(PipelineStage):
     def __init__(self, agent_config: Dict[str, Any] = None):
@@ -79,9 +83,9 @@ Return response as structured JSON with review_result and feedback sections.
                     if search_results:
                         enhanced_context['similar_patterns'] = search_results[:2]
 
-                    print(f"Enhanced review context with {len(search_results)} similar patterns from Serena")
+                    logger.info(f"Enhanced review context with {len(search_results)} similar patterns from Serena")
                 except Exception as e:
-                    print(f"Warning: Serena search failed: {e}")
+                    logger.warning(f"Serena search failed: {e}")
 
             result = await run_claude_code(prompt, enhanced_context)
 
@@ -165,7 +169,7 @@ Return response as structured JSON with review_result and feedback sections.
                 context['next_action'] = 'proceed_to_next_stage'
                 context['approved_artifacts'] = original_handoff.artifacts
 
-            print(f"Requirements review completed: {status.value}")
+            logger.info(f"Requirements review completed: {status.value}")
             print(f"Overall score: {overall_score:.2f}")
             print(f"Blocking issues: {blocking_issues}")
 
@@ -248,4 +252,4 @@ Return response as structured JSON with review_result and feedback sections.
         elif status == ReviewStatus.CHANGES_REQUESTED:
             return "🔄 **Please address the feedback above and update the requirements.** Non-critical improvements suggested."
         else:
-            return "✅ **Requirements approved!** Ready to proceed to the design phase."
+            return "**Requirements approved!** Ready to proceed to the design phase."

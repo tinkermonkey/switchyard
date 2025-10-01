@@ -22,7 +22,7 @@ def test_kanban_automation():
         "action": "moved",
         "project_card": {
             "id": 123,
-            "content_url": "https://api.github.com/repos/austinsand/test-repo/issues/1",
+            "content_url": "https://api.github.com/repos/example_user/test-repo/issues/1",
             "column_id": 456
         },
         "repository": {
@@ -106,7 +106,7 @@ def test_issue_creation_automation():
             "number": 456,
             "title": "Test Kanban Issue",
             "body": "This is a test issue for Kanban automation testing",
-            "html_url": "https://github.com/austinsand/test-repo/issues/456"
+            "html_url": "https://github.com/example_user/test-repo/issues/456"
         },
         "repository": {
             "name": "test-repo"

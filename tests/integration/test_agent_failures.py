@@ -2,7 +2,7 @@ import asyncio
 import time
 from datetime import datetime
 from pathlib import Path
-from agents.agent_stages import process_task_integrated, business_analyst_agent
+from agents.orchestrator_integration import process_task_integrated, business_analyst_agent
 from state_management.manager import StateManager
 from monitoring.logging import OrchestratorLogger
 from task_queue.task_manager import Task, TaskPriority

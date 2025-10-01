@@ -5,7 +5,7 @@ from datetime import datetime
 from task_queue.task_manager import Task, TaskPriority
 from state_management.manager import StateManager
 from monitoring.logging import OrchestratorLogger
-from agents.agent_stages import process_task_integrated
+from agents.orchestrator_integration import process_task_integrated
 
 @pytest.mark.asyncio
 async def test_pipeline_execution():

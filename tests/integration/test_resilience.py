@@ -22,7 +22,7 @@ async def test_circuit_breaker():
     )
 
     # Attempt multiple executions to trigger circuit breaker
-    from agents.agent_stages import process_task_integrated
+    from agents.orchestrator_integration import process_task_integrated
     from state_management.manager import StateManager
     from monitoring.logging import OrchestratorLogger
 

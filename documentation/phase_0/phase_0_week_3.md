@@ -273,7 +273,7 @@ if __name__ == "__main__":
 # Replace example with real project configuration
 projects:
   clauditoreum:
-    repo_url: git@github.com:austinsand/clauditoreum.git
+    repo_url: git@github.com:example_user/clauditoreum.git
     local_path: /projects/clauditoreum
     branch: main
     kanban_board_id: YOUR_PROJECT_BOARD_ID
@@ -324,10 +324,10 @@ gh project create --title "SDLC Orchestrator Test" --body "Testing orchestrator 
 gh project field-create PROJECT_ID --name "Status" --single-select-options "Backlog,Requirements Analysis,Design,Ready for Development,In Development,Code Review,Testing,Done"
 
 # 4. Create test issue
-gh issue create --title "Test Orchestrator Integration" --body "This issue tests the orchestrator GitHub integration" --repo austinsand/orchestrator-test
+gh issue create --title "Test Orchestrator Integration" --body "This issue tests the orchestrator GitHub integration" --repo example_user/orchestrator-test
 
 # 5. Add issue to project board
-gh project item-add PROJECT_ID --url https://github.com/austinsand/orchestrator-test/issues/1
+gh project item-add PROJECT_ID --url https://github.com/example_user/orchestrator-test/issues/1
 ```
 
 ### Task 3.2: Test Card Movement Triggers
@@ -353,7 +353,7 @@ def test_kanban_automation():
         "action": "moved",
         "project_card": {
             "id": 123,
-            "content_url": "https://api.github.com/repos/austinsand/orchestrator-test/issues/1",
+            "content_url": "https://api.github.com/repos/example_user/orchestrator-test/issues/1",
             "column_id": 456
         },
         "repository": {
@@ -430,7 +430,7 @@ Moving to design phase...
         subprocess.run([
             'gh', 'issue', 'comment', str(issue_number),
             '--body', comment,
-            '--repo', f"austinsand/{project}"
+            '--repo', f"example_user/{project}"
         ])
 
         print(f" Updated GitHub issue #{issue_number}")

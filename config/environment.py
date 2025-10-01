@@ -11,6 +11,7 @@ class Environment(BaseSettings):
     anthropic_api_key: Optional[SecretStr] = None
     github_token: Optional[SecretStr] = None
     openai_api_key: Optional[SecretStr] = None  # For GPT-based reviews
+    context7_api_key: Optional[SecretStr] = None  # For Context7 MCP server
 
     # Webhook Configuration
     webhook_secret: Optional[SecretStr] = None
@@ -19,17 +20,28 @@ class Environment(BaseSettings):
     webhook_host: str = "0.0.0.0"
 
     # Redis Configuration
-    redis_url: str = "redis://localhost:6379"
+    redis_url: str = "redis://redis:6379"
     redis_password: Optional[SecretStr] = None
 
     # Claude Configuration
-    claude_model: str = "claude-3-5-sonnet-20241022"
+    claude_model: str = "claude-sonnet-4-5-20250929"
     max_tokens: int = 100000
     temperature: float = 0.3
 
     # GitHub Configuration
     github_org: Optional[str] = None
     github_default_branch: str = "main"
+
+    # GitHub App Authentication (optional - falls back to PAT)
+    github_app_id: Optional[str] = None
+    github_app_installation_id: Optional[str] = None
+    github_app_private_key_path: Optional[str] = None
+    github_app_private_key: Optional[SecretStr] = None
+
+    # MCP Server Configuration
+    context7_mcp_url: Optional[str] = None
+    serena_mcp_url: Optional[str] = None
+    puppeteer_mcp_url: Optional[str] = None
 
     # ngrok Configuration
     ngrok_authtoken: Optional[SecretStr] = None

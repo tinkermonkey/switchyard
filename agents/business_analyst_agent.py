@@ -3,6 +3,9 @@ from pipeline.base import PipelineStage
 from claude.claude_integration import run_claude_code
 from datetime import datetime
 import json
+import logging
+
+logger = logging.getLogger(__name__)
 
 class BusinessAnalystAgent(PipelineStage):
     def __init__(self, agent_config: Dict[str, Any] = None):
@@ -14,12 +17,41 @@ class BusinessAnalystAgent(PipelineStage):
         issue = context.get('context', {}).get('issue', {})
         project = context.get('project', 'unknown')
 
+        # Check if there's previous stage context
+        previous_stage = context.get('context', {}).get('previous_stage_output', '')
+        previous_stage_prompt = ""
+
+        if previous_stage:
+            previous_stage_prompt = f"""
+
+PREVIOUS STAGE OUTPUT:
+{previous_stage}
+
+Build upon this previous analysis in your work.
+"""
+
+        # Check if this is a feedback loop
+        feedback_data = context.get('context', {}).get('feedback')
+        feedback_prompt = ""
+
+        if feedback_data:
+            feedback_prompt = f"""
+
+HUMAN FEEDBACK RECEIVED:
+{feedback_data.get('formatted_text', '')}
+
+Please review your previous analysis and update it based on this feedback.
+Address all concerns and questions raised by the human reviewer.
+"""
+
         prompt = f"""
 Analyze the following issue/requirement for project {project}:
 
 Title: {issue.get('title', 'No title')}
 Description: {issue.get('body', 'No description')}
 Labels: {issue.get('labels', [])}
+{previous_stage_prompt}
+{feedback_prompt}
 
 Provide a comprehensive business analysis following the format specified in your configuration.
 Focus on extracting clear functional requirements and creating actionable user stories.
@@ -51,9 +83,9 @@ Return the response as structured JSON with requirements_analysis and quality_me
                     if search_results:
                         enhanced_context['related_patterns'] = search_results[:3]  # Top 3 results
 
-                    print(f"Enhanced context with {len(search_results)} related patterns from Serena")
+                    logger.info(f"Enhanced context with {len(search_results)} related patterns from Serena")
                 except Exception as e:
-                    print(f"Warning: Serena search failed: {e}")
+                    logger.warning(f"Serena search failed: {e}")
 
             result = await run_claude_code(prompt, enhanced_context)
 
@@ -114,6 +146,7 @@ Return the response as structured JSON with requirements_analysis and quality_me
             # Prepare collaborative handoff
             github_issue = context.get('context', {}).get('issue_number')
             project = context.get('project', 'unknown')
+            repository = context.get('context', {}).get('repository', project)
 
             # Create collaborative handoff with review workflow
             artifacts = {
@@ -122,25 +155,9 @@ Return the response as structured JSON with requirements_analysis and quality_me
                 "quality_metrics": analysis.get('quality_metrics', {})
             }
 
-            # Post work summary to GitHub
-            if github_issue:
-                status_update = AgentCommentFormatter.format_agent_status_update(
-                    agent_name="business_analyst",
-                    status="completed",
-                    details={
-                        'summary': f"Requirements analysis completed for {issue.get('title', 'issue')}",
-                        'findings': [
-                            f"Generated {len(artifacts.get('user_stories', []))} user stories",
-                            f"Identified {len(analysis.get('requirements_analysis', {}).get('functional_requirements', []))} functional requirements",
-                            f"Quality score: {analysis.get('quality_metrics', {}).get('completeness_score', 0) * 100:.1f}%"
-                        ],
-                        'next_steps': ["Requirements review requested"],
-                        'artifacts': list(artifacts.keys()),
-                        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                    }
-                )
-
-                await github.post_issue_comment(github_issue, status_update, project)
+            # GitHub comment will be posted in update_github_status method
+            # Store the raw result for the comment
+            context['raw_analysis_result'] = result
 
             # Determine next agents based on pipeline configuration
             next_agents = ["requirements_reviewer"]  # Could be configured
@@ -188,14 +205,14 @@ Return the response as structured JSON with requirements_analysis and quality_me
             passed, issues = quality_gate.evaluate(handoff)
             if not passed:
                 context['warnings'] = issues
-                print(f"Warning: Quality gate issues: {issues}")
+                logger.warning(f"Quality gate issues: {issues}")
 
             context['handoff_id'] = handoff.handoff_id
             context['collaboration_active'] = True
             context['pending_reviews'] = next_agents
 
-            print(f"Collaborative handoff created: {handoff.handoff_id}")
-            print(f"Review requested from: {', '.join(next_agents)}")
+            logger.info(f"Collaborative handoff created: {handoff.handoff_id}")
+            logger.info(f"Review requested from: {', '.join(next_agents)}")
 
             # Update GitHub status when task completes
             await self.update_github_status(context)
@@ -213,39 +230,63 @@ Return the response as structured JSON with requirements_analysis and quality_me
             issue_number = task_context['issue_number']
             project = context.get('project', '')
 
-            # Add comment to issue
+            # Get the actual analysis output from Claude
+            raw_analysis = context.get('raw_analysis_result', 'No analysis available')
             requirements_analysis = context.get('requirements_analysis', {})
             user_stories = requirements_analysis.get('user_stories', [])
             quality_metrics = context.get('quality_metrics', {})
 
-            comment = f"""
-🔍 **Business Analysis Complete**
+            # Use AgentCommentFormatter for consistent formatting
+            from services.github_integration import AgentCommentFormatter
 
-Requirements analysis has been completed by the orchestrator.
-
-**Summary:**
-- {len(user_stories)} user stories generated
-- Quality score: {quality_metrics.get('completeness_score', 0) * 100:.1f}%
-
-**Next Steps:**
-Moving to design phase...
-
-_Generated by Orchestrator Bot 🤖_
-            """.strip()
+            comment = AgentCommentFormatter.format_agent_completion(
+                agent_name='business_analyst',
+                output=raw_analysis,
+                summary_stats={
+                    'user_stories_generated': len(user_stories),
+                    'functional_requirements_identified': len(requirements_analysis.get('functional_requirements', [])),
+                    'non_functional_requirements_identified': len(requirements_analysis.get('non_functional_requirements', [])),
+                    'completeness_score': quality_metrics.get('completeness_score', 0),
+                    'clarity_score': quality_metrics.get('clarity_score', 0),
+                    'testability_score': quality_metrics.get('testability_score', 0)
+                },
+                next_steps='Moving to requirements review phase...'
+            )
 
             try:
                 import subprocess
+                from config.manager import config_manager
+                from services.feedback_manager import FeedbackManager
+
+                # Get proper GitHub org/repo from project config
+                project_config = config_manager.get_project_config(project)
+                github_org = project_config.github.get('org')
+                github_repo = project_config.github.get('repo')
+
+                if not github_repo or not github_org:
+                    logger.error(f"GitHub org/repo not configured for project {project}")
+                    return
+
                 result = subprocess.run([
                     'gh', 'issue', 'comment', str(issue_number),
                     '--body', comment,
-                    '--repo', f"austinsand/{project}"
+                    '--repo', f"{github_org}/{github_repo}"
                 ], capture_output=True, text=True)
 
                 if result.returncode == 0:
-                    print(f"✅ Updated GitHub issue #{issue_number}")
+                    logger.info(f"Updated GitHub issue #{issue_number}")
+
+                    # Track comment timestamp for feedback loop
+                    feedback_manager = FeedbackManager()
+                    from datetime import timezone
+                    feedback_manager.set_last_agent_comment_time(
+                        issue_number,
+                        'business_analyst',
+                        datetime.now(timezone.utc).isoformat()
+                    )
                 else:
-                    print(f"⚠️ Failed to update GitHub issue: {result.stderr}")
+                    logger.error(f"Failed to update GitHub issue: {result.stderr}")
 
             except Exception as e:
-                print(f"⚠️ Could not update GitHub status: {e}")
+                logger.error(f"Could not update GitHub status: {e}")
                 # Don't fail the task if GitHub update fails

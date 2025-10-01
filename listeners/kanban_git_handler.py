@@ -133,5 +133,5 @@ class KanbanGitWorkflow:
             self._update_issue_labels(issue['number'], ['completed'])
             self._comment_on_issue(
                 issue['number'],
-                f"✅ Merged to main and deleted feature branch"
+                f"Merged to main and deleted feature branch"
             )

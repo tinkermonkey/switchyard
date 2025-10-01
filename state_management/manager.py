@@ -15,15 +15,28 @@ class StateManager:
         
     async def checkpoint(self, pipeline_id: str, stage_index: int, context: Dict[str, Any]):
         """Create a checkpoint for pipeline recovery"""
+        # Filter out non-serializable objects from context
+        serializable_context = {}
+        for key, value in context.items():
+            if key in ['state_manager', 'logger', 'mcp_integration']:
+                # Skip non-serializable objects
+                continue
+            try:
+                json.dumps(value)  # Test if serializable
+                serializable_context[key] = value
+            except (TypeError, ValueError):
+                # Skip non-serializable values
+                pass
+
         checkpoint_data = {
             "pipeline_id": pipeline_id,
             "stage_index": stage_index,
             "timestamp": datetime.now().isoformat(),
-            "context": context
+            "context": serializable_context
         }
-        
+
         checkpoint_file = self.checkpoints_dir / f"{pipeline_id}_stage_{stage_index}.json"
-        
+
         async with aiofiles.open(checkpoint_file, 'w') as f:
             await f.write(json.dumps(checkpoint_data, indent=2))
     

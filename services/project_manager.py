@@ -6,9 +6,12 @@ import os
 import re
 import subprocess
 import yaml
+import logging
 from pathlib import Path
 from typing import Dict, Any, Optional
 from urllib.parse import urlparse
+
+logger = logging.getLogger(__name__)
 
 class ProjectManager:
     def __init__(self, projects_config_path: str = "config/projects.yaml", base_projects_dir: str = "/workspace"):
@@ -24,7 +27,7 @@ class ProjectManager:
             # Fall back to example config
             example_path = Path(self.projects_config_path.replace('.yaml', '.example.yaml'))
             if example_path.exists():
-                print(f"Using example config: {example_path}")
+                logger.info(f"Using example config: {example_path}")
                 config_path = example_path
             else:
                 return {"projects": {}}
@@ -89,25 +92,25 @@ class ProjectManager:
         self.base_projects_dir.mkdir(parents=True, exist_ok=True)
 
         if project_path.exists() and (project_path / '.git').exists():
-            print(f"✅ Project {project_name} already cloned at {project_path}")
+            logger.info(f"Project {project_name} already cloned at {project_path}")
 
             # Ensure we're on the correct branch and pull latest
             try:
                 subprocess.run(['git', 'checkout', branch], cwd=project_path, check=True, capture_output=True)
                 subprocess.run(['git', 'pull'], cwd=project_path, check=True, capture_output=True)
-                print(f"✅ Updated {project_name} to latest {branch}")
+                logger.info(f"Updated {project_name} to latest {branch}")
             except subprocess.CalledProcessError as e:
-                print(f"⚠️ Could not update {project_name}: {e}")
+                logger.warning(f"Could not update {project_name}: {e}")
 
             return project_path
 
         # Clone the repository
-        print(f"📦 Cloning {project_name} from {repo_url}...")
+        logger.info(f"Cloning {project_name} from {repo_url}...")
 
         try:
             cmd = ['git', 'clone', '--branch', branch, repo_url, str(project_path)]
             result = subprocess.run(cmd, check=True, capture_output=True, text=True)
-            print(f"✅ Successfully cloned {project_name}")
+            logger.info(f"Successfully cloned {project_name}")
             return project_path
 
         except subprocess.CalledProcessError as e:
@@ -120,9 +123,9 @@ class ProjectManager:
                 try:
                     subprocess.run(['git', 'checkout', branch], cwd=project_path, check=True, capture_output=True)
                 except subprocess.CalledProcessError:
-                    print(f"⚠️ Branch '{branch}' not found, staying on default branch")
+                    logger.warning(f"Branch '{branch}' not found, staying on default branch")
 
-                print(f"✅ Successfully cloned {project_name}")
+                logger.info(f"Successfully cloned {project_name}")
                 return project_path
 
             except subprocess.CalledProcessError as clone_error:
@@ -159,12 +162,12 @@ class ProjectManager:
             github_token = os.environ.get('GITHUB_TOKEN')
 
         if not github_token:
-            print("⚠️ No GitHub token available for project discovery")
+            logger.warning("No GitHub token available for project discovery")
             return {}
 
         github_org = os.environ.get('GITHUB_ORG')
         if not github_org:
-            print("⚠️ No GITHUB_ORG configured for project discovery")
+            logger.warning("No GITHUB_ORG configured for project discovery")
             return {}
 
         try:
@@ -179,9 +182,9 @@ class ProjectManager:
             for repo in repos:
                 discovered[repo['name']] = repo['sshUrl']
 
-            print(f"🔍 Discovered {len(discovered)} repositories in {github_org}")
+            logger.info(f"Discovered {len(discovered)} repositories in {github_org}")
             return discovered
 
         except (subprocess.CalledProcessError, json.JSONDecodeError) as e:
-            print(f"⚠️ Could not discover GitHub projects: {e}")
+            logger.error(f"Could not discover GitHub projects: {e}")
             return {}

@@ -60,3 +60,19 @@ class OrchestratorLogger:
 
     def log_warning(self, message: str, extra: dict = None):
         self.logger.warning(message, extra=extra)
+
+    # Compatibility methods for standard logger interface
+    def info(self, message: str, extra: dict = None):
+        self.logger.info(message, extra=extra)
+
+    def error(self, message: str, extra: dict = None):
+        self.logger.error(message, extra=extra)
+
+    def warning(self, message: str, extra: dict = None):
+        self.logger.warning(message, extra=extra)
+
+    def debug(self, message: str, extra: dict = None):
+        self.logger.debug(message, extra=extra)
+
+    def log_debug(self, message: str, extra: dict = None):
+        self.logger.debug(message, extra=extra)

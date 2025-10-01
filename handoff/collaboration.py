@@ -214,7 +214,7 @@ class CollaborationOrchestrator:
     async def format_maker_comment(self, maker_agent: str, handoff: CollaborativeHandoff) -> str:
         """Format maker agent's work as GitHub comment"""
 
-        completed_work = '\n'.join(f"✅ {work}" for work in handoff.completed_work)
+        completed_work = '\n'.join(f"{work}" for work in handoff.completed_work)
         decisions = '\n'.join(f"🔹 **{d.get('topic', 'Decision')}**: {d.get('decision', '')}" for d in handoff.decisions_made)
 
         artifacts_summary = ""

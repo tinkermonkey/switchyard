@@ -4,7 +4,10 @@ from typing import Callable, Any, Optional
 from functools import wraps
 import random
 import time
+import logging
 from .circuit_breaker import CircuitBreaker
+
+logger = logging.getLogger(__name__)
 
 class RetryManager:
     """Manages retries with exponential backoff and circuit breaker integration"""
@@ -63,7 +66,7 @@ class RetryManager:
                             circuit_breaker.record_failure()
                         
                         if attempt >= max_attempts:
-                            print(f"❌ {func.__name__} failed after {max_attempts} attempts")
+                            logger.error(f"{func.__name__} failed after {max_attempts} attempts")
                             raise e
                         
                         # Calculate delay
@@ -71,8 +74,8 @@ class RetryManager:
                             attempt, initial_delay, backoff_factor, max_delay
                         )
                         
-                        print(f"⚠️ Attempt {attempt}/{max_attempts} failed: {e}")
-                        print(f"   Retrying in {delay:.2f} seconds...")
+                        logger.warning(f"Attempt {attempt}/{max_attempts} failed: {e}")
+                        logger.info(f"Retrying in {delay:.2f} seconds...")
                         
                         await asyncio.sleep(delay)
                 
