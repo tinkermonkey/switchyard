@@ -1,0 +1,391 @@
+# Workflow Templates - Define kanban board structures and automation rules
+# These templates define how GitHub project boards should be structured
+
+workflow_templates:
+  idea_development_workflow:
+    name: "Idea Development Pipeline"
+    description: "Research, analysis, and requirements validation workflow"
+    pipeline_mapping: "idea_development"
+    columns:
+      - name: "Backlog"
+        stage_mapping: null
+        agent: null
+        description: "New ideas and research requests"
+        automation_rules:
+          - trigger: "item_created"
+            action: "assign_label"
+            parameters:
+              labels: ["pipeline:idea-dev"]
+
+      - name: "Research"
+        stage_mapping: "research"
+        agent: "idea_researcher"
+        description: "Idea research and market analysis"
+        automation_rules:
+          - trigger: "item_moved_to_column"
+            action: "assign_label"
+            parameters:
+              labels: ["stage:research"]
+          - trigger: "item_moved_to_column"
+            action: "start_pipeline_stage"
+            parameters:
+              stage: "research"
+
+      - name: "Analysis"
+        stage_mapping: "analysis"
+        agent: "business_analyst"
+        description: "Business requirements analysis"
+        automation_rules:
+          - trigger: "item_moved_to_column"
+            action: "assign_label"
+            parameters:
+              labels: ["stage:analysis"]
+          - trigger: "item_moved_to_column"
+            action: "start_pipeline_stage"
+            parameters:
+              stage: "analysis"
+
+      - name: "Review"
+        stage_mapping: "review"
+        agent: "requirements_reviewer"
+        description: "Requirements validation and review"
+        automation_rules:
+          - trigger: "item_moved_to_column"
+            action: "assign_label"
+            parameters:
+              labels: ["stage:review"]
+          - trigger: "item_moved_to_column"
+            action: "start_pipeline_stage"
+            parameters:
+              stage: "review"
+
+      - name: "Done"
+        stage_mapping: null
+        agent: null
+        description: "Validated requirements ready for development"
+        automation_rules:
+          - trigger: "item_moved_to_column"
+            action: "assign_label"
+            parameters:
+              labels: ["status:completed"]
+
+  dev_workflow:
+    name: "Development Pipeline"
+    description: "Streamlined development workflow from requirements to code"
+    pipeline_mapping: "dev_pipeline"
+    columns:
+      - name: "Backlog"
+        stage_mapping: null
+        agent: null
+        description: "Features ready for development"
+        automation_rules:
+          - trigger: "item_created"
+            action: "assign_label"
+            parameters:
+              labels: ["pipeline:dev"]
+
+      - name: "Requirements"
+        stage_mapping: "requirements"
+        agent: "business_analyst"
+        description: "Business requirements analysis"
+        automation_rules:
+          - trigger: "item_moved_to_column"
+            action: "assign_label"
+            parameters:
+              labels: ["stage:requirements"]
+          - trigger: "item_moved_to_column"
+            action: "start_pipeline_stage"
+            parameters:
+              stage: "requirements"
+
+      - name: "Design"
+        stage_mapping: "design"
+        agent: "software_architect"
+        description: "Software architecture and design"
+        automation_rules:
+          - trigger: "item_moved_to_column"
+            action: "assign_label"
+            parameters:
+              labels: ["stage:design"]
+          - trigger: "item_moved_to_column"
+            action: "start_pipeline_stage"
+            parameters:
+              stage: "design"
+
+      - name: "Implementation"
+        stage_mapping: "implementation"
+        agent: "senior_software_engineer"
+        description: "Code development and implementation"
+        automation_rules:
+          - trigger: "item_moved_to_column"
+            action: "assign_label"
+            parameters:
+              labels: ["stage:implementation"]
+          - trigger: "item_moved_to_column"
+            action: "start_pipeline_stage"
+            parameters:
+              stage: "implementation"
+
+      - name: "Code Review"
+        stage_mapping: "implementation_review"
+        agent: "code_reviewer"
+        description: "Code quality review and validation"
+        automation_rules:
+          - trigger: "item_moved_to_column"
+            action: "assign_label"
+            parameters:
+              labels: ["stage:code-review"]
+          - trigger: "item_moved_to_column"
+            action: "start_review_process"
+            parameters:
+              stage: "implementation"
+
+      - name: "Done"
+        stage_mapping: null
+        agent: null
+        description: "Completed features ready for deployment"
+        automation_rules:
+          - trigger: "item_moved_to_column"
+            action: "assign_label"
+            parameters:
+              labels: ["status:completed"]
+
+  full_sdlc_workflow:
+    name: "Full SDLC Pipeline"
+    description: "Complete software development lifecycle with maker-checker patterns"
+    pipeline_mapping: "full_sdlc"
+    columns:
+      - name: "Backlog"
+        stage_mapping: null
+        agent: null
+        description: "New initiatives and complex features"
+        automation_rules:
+          - trigger: "item_created"
+            action: "assign_label"
+            parameters:
+              labels: ["pipeline:full-sdlc"]
+
+      - name: "Research"
+        stage_mapping: "research"
+        agent: "idea_researcher"
+        description: "Idea research and market analysis"
+        automation_rules:
+          - trigger: "item_moved_to_column"
+            action: "assign_label"
+            parameters:
+              labels: ["stage:research"]
+          - trigger: "item_moved_to_column"
+            action: "start_pipeline_stage"
+            parameters:
+              stage: "research"
+
+      - name: "Requirements"
+        stage_mapping: "requirements"
+        agent: "business_analyst"
+        description: "Business requirements analysis"
+        automation_rules:
+          - trigger: "item_moved_to_column"
+            action: "assign_label"
+            parameters:
+              labels: ["stage:requirements"]
+          - trigger: "item_moved_to_column"
+            action: "start_pipeline_stage"
+            parameters:
+              stage: "requirements"
+
+      - name: "Requirements Review"
+        stage_mapping: "requirements_review"
+        agent: "product_manager"
+        description: "Strategic validation of requirements"
+        automation_rules:
+          - trigger: "item_moved_to_column"
+            action: "assign_label"
+            parameters:
+              labels: ["stage:requirements-review"]
+          - trigger: "item_moved_to_column"
+            action: "start_review_process"
+            parameters:
+              stage: "requirements"
+
+      - name: "Design"
+        stage_mapping: "design"
+        agent: "software_architect"
+        description: "System design and architecture"
+        automation_rules:
+          - trigger: "item_moved_to_column"
+            action: "assign_label"
+            parameters:
+              labels: ["stage:design"]
+          - trigger: "item_moved_to_column"
+            action: "start_pipeline_stage"
+            parameters:
+              stage: "design"
+
+      - name: "Design Review"
+        stage_mapping: "design_review"
+        agent: "design_reviewer"
+        description: "Architecture validation and review"
+        automation_rules:
+          - trigger: "item_moved_to_column"
+            action: "assign_label"
+            parameters:
+              labels: ["stage:design-review"]
+          - trigger: "item_moved_to_column"
+            action: "start_review_process"
+            parameters:
+              stage: "design"
+
+      - name: "Test Planning"
+        stage_mapping: "test_planning"
+        agent: "test_planner"
+        description: "Test strategy and planning"
+        automation_rules:
+          - trigger: "item_moved_to_column"
+            action: "assign_label"
+            parameters:
+              labels: ["stage:test-planning"]
+          - trigger: "item_moved_to_column"
+            action: "start_pipeline_stage"
+            parameters:
+              stage: "test_planning"
+
+      - name: "Test Plan Review"
+        stage_mapping: "test_planning_review"
+        agent: "test_reviewer"
+        description: "Test plan validation"
+        automation_rules:
+          - trigger: "item_moved_to_column"
+            action: "assign_label"
+            parameters:
+              labels: ["stage:test-plan-review"]
+          - trigger: "item_moved_to_column"
+            action: "start_review_process"
+            parameters:
+              stage: "test_planning"
+
+      - name: "Implementation"
+        stage_mapping: "implementation"
+        agent: "senior_software_engineer"
+        description: "Software development and coding"
+        automation_rules:
+          - trigger: "item_moved_to_column"
+            action: "assign_label"
+            parameters:
+              labels: ["stage:implementation"]
+          - trigger: "item_moved_to_column"
+            action: "start_pipeline_stage"
+            parameters:
+              stage: "implementation"
+
+      - name: "Code Review"
+        stage_mapping: "implementation_review"
+        agent: "code_reviewer"
+        description: "Code quality review"
+        automation_rules:
+          - trigger: "item_moved_to_column"
+            action: "assign_label"
+            parameters:
+              labels: ["stage:code-review"]
+          - trigger: "item_moved_to_column"
+            action: "start_review_process"
+            parameters:
+              stage: "implementation"
+
+      - name: "QA Testing"
+        stage_mapping: "qa_testing"
+        agent: "senior_qa_engineer"
+        description: "End-to-end testing and validation"
+        automation_rules:
+          - trigger: "item_moved_to_column"
+            action: "assign_label"
+            parameters:
+              labels: ["stage:qa-testing"]
+          - trigger: "item_moved_to_column"
+            action: "start_pipeline_stage"
+            parameters:
+              stage: "qa_testing"
+
+      - name: "Documentation"
+        stage_mapping: "documentation"
+        agent: "technical_writer"
+        description: "Technical documentation creation"
+        automation_rules:
+          - trigger: "item_moved_to_column"
+            action: "assign_label"
+            parameters:
+              labels: ["stage:documentation"]
+          - trigger: "item_moved_to_column"
+            action: "start_pipeline_stage"
+            parameters:
+              stage: "documentation"
+
+      - name: "Documentation Review"
+        stage_mapping: "documentation_review"
+        agent: "documentation_editor"
+        description: "Documentation review and editing"
+        automation_rules:
+          - trigger: "item_moved_to_column"
+            action: "assign_label"
+            parameters:
+              labels: ["stage:documentation-review"]
+          - trigger: "item_moved_to_column"
+            action: "start_review_process"
+            parameters:
+              stage: "documentation"
+
+      - name: "Done"
+        stage_mapping: null
+        agent: null
+        description: "Completed work ready for production"
+        automation_rules:
+          - trigger: "item_moved_to_column"
+            action: "assign_label"
+            parameters:
+              labels: ["status:completed"]
+
+# GitHub Project Board settings
+github_project_settings:
+  visibility: "private"
+  description_template: "Automated project board managed by Claude Code Orchestrator"
+
+# Label definitions for pipeline routing
+pipeline_labels:
+  idea_development:
+    - name: "pipeline:idea-dev"
+      color: "0075ca"
+      description: "Idea development pipeline workflow"
+  dev_pipeline:
+    - name: "pipeline:dev"
+      color: "0e8a16"
+      description: "Development pipeline workflow"
+  full_sdlc:
+    - name: "pipeline:full-sdlc"
+      color: "d73a49"
+      description: "Full SDLC pipeline workflow"
+
+# Common stage labels
+stage_labels:
+  - name: "stage:research"
+    color: "cfd3d7"
+    description: "Research stage"
+  - name: "stage:analysis"
+    color: "cfd3d7"
+    description: "Analysis stage"
+  - name: "stage:requirements"
+    color: "cfd3d7"
+    description: "Requirements stage"
+  - name: "stage:design"
+    color: "cfd3d7"
+    description: "Design stage"
+  - name: "stage:implementation"
+    color: "cfd3d7"
+    description: "Implementation stage"
+  - name: "stage:code-review"
+    color: "cfd3d7"
+    description: "Code review stage"
+  - name: "stage:qa-testing"
+    color: "cfd3d7"
+    description: "QA testing stage"
+  - name: "stage:documentation"
+    color: "cfd3d7"
+    description: "Documentation stage"

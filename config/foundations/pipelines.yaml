@@ -1,0 +1,196 @@
+# Pipeline Templates - Define reusable pipeline stage sequences
+# These templates can be instantiated by projects with customizations
+
+pipeline_templates:
+  idea_development:
+    name: "Idea Development Pipeline"
+    description: "Research, analysis, and requirements validation pipeline"
+    workflow_type: "sequential"
+    stages:
+      - stage: "research"
+        name: "Idea Research & Market Analysis"
+        required_capabilities: ["research", "market_analysis"]
+        default_agent: "idea_researcher"
+        timeout: 300
+        retries: 2
+        quality_gates:
+          research_depth: 0.6
+          feasibility_confidence: 0.5
+        review_required: false
+
+      - stage: "analysis"
+        name: "Business Requirements Analysis"
+        required_capabilities: ["requirements_analysis", "user_story_creation"]
+        default_agent: "business_analyst"
+        timeout: 300
+        retries: 3
+        quality_gates:
+          completeness_score: 0.6
+          clarity_score: 0.6
+        review_required: false
+
+      - stage: "review"
+        name: "Requirements Validation"
+        required_capabilities: ["requirements_validation", "quality_assessment"]
+        default_agent: "requirements_reviewer"
+        timeout: 300
+        retries: 2
+        quality_gates:
+          validation_score: 0.7
+          accuracy_score: 0.7
+        review_required: false
+
+  dev_pipeline:
+    name: "Development Pipeline"
+    description: "Streamlined requirements analysis through code implementation"
+    workflow_type: "maker_checker"
+    stages:
+      - stage: "requirements"
+        name: "Business Requirements Analysis"
+        required_capabilities: ["requirements_analysis"]
+        default_agent: "business_analyst"
+        timeout: 300
+        retries: 3
+        quality_gates:
+          completeness_score: 0.6
+        review_required: false
+
+      - stage: "design"
+        name: "Software Architecture"
+        required_capabilities: ["system_architecture", "technical_design"]
+        default_agent: "software_architect"
+        timeout: 600
+        retries: 3
+        quality_gates:
+          architectural_soundness: 0.6
+        review_required: false
+
+      - stage: "implementation"
+        name: "Software Development"
+        required_capabilities: ["software_development", "code_implementation"]
+        default_agent: "senior_software_engineer"
+        timeout: 900
+        retries: 3
+        quality_gates:
+          code_quality: 0.7
+          test_coverage: 0.7
+        review_required: true
+        reviewer_agent: "code_reviewer"
+        reviewer_timeout: 300
+        reviewer_retries: 2
+
+  full_sdlc:
+    name: "Complete SDLC Pipeline"
+    description: "Full software development lifecycle with maker-checker patterns"
+    workflow_type: "maker_checker"
+    stages:
+      - stage: "research"
+        name: "Idea Research & Market Analysis"
+        required_capabilities: ["research", "market_analysis"]
+        default_agent: "idea_researcher"
+        timeout: 300
+        retries: 2
+        quality_gates:
+          research_depth: 0.7
+          feasibility_confidence: 0.6
+        review_required: false
+
+      - stage: "requirements"
+        name: "Business Requirements Analysis"
+        required_capabilities: ["requirements_analysis"]
+        default_agent: "business_analyst"
+        timeout: 300
+        retries: 3
+        quality_gates:
+          completeness_score: 0.7
+          clarity_score: 0.7
+        review_required: true
+        reviewer_agent: "product_manager"
+        reviewer_timeout: 300
+        reviewer_retries: 2
+        escalation:
+          blocking_threshold: 1
+
+      - stage: "design"
+        name: "Software Architecture & Design"
+        required_capabilities: ["system_architecture", "technical_design"]
+        default_agent: "software_architect"
+        timeout: 600
+        retries: 3
+        quality_gates:
+          architectural_soundness: 0.7
+          scalability_readiness: 0.6
+          security_compliance: 0.7
+        review_required: true
+        reviewer_agent: "design_reviewer"
+        reviewer_timeout: 300
+        reviewer_retries: 2
+        escalation:
+          blocking_threshold: 1
+
+      - stage: "test_planning"
+        name: "Test Strategy & Planning"
+        required_capabilities: ["test_strategy", "test_planning"]
+        default_agent: "test_planner"
+        timeout: 300
+        retries: 2
+        quality_gates:
+          test_coverage_target: 0.7
+          automation_coverage: 0.6
+          test_completeness: 0.7
+        review_required: true
+        reviewer_agent: "test_reviewer"
+        reviewer_timeout: 300
+        reviewer_retries: 2
+
+      - stage: "implementation"
+        name: "Software Development"
+        required_capabilities: ["software_development", "code_implementation"]
+        default_agent: "senior_software_engineer"
+        timeout: 900
+        retries: 3
+        quality_gates:
+          code_quality: 0.8
+          test_coverage: 0.8
+          security_score: 0.8
+        review_required: true
+        reviewer_agent: "code_reviewer"
+        reviewer_timeout: 300
+        reviewer_retries: 2
+        escalation:
+          blocking_threshold: 1
+          github_pr_required: true
+
+      - stage: "qa_testing"
+        name: "Quality Assurance & End-to-End Testing"
+        required_capabilities: ["qa_testing", "integration_testing"]
+        default_agent: "senior_qa_engineer"
+        timeout: 600
+        retries: 3
+        quality_gates:
+          overall_quality_score: 0.8
+          production_readiness: 0.8
+        review_required: false
+
+      - stage: "documentation"
+        name: "Technical Documentation"
+        required_capabilities: ["technical_writing", "documentation_creation"]
+        default_agent: "technical_writer"
+        timeout: 300
+        retries: 2
+        quality_gates:
+          documentation_completeness: 0.8
+          clarity_score: 0.8
+          accuracy_score: 0.85
+        review_required: true
+        reviewer_agent: "documentation_editor"
+        reviewer_timeout: 300
+        reviewer_retries: 2
+
+# Pipeline execution settings
+execution_defaults:
+  max_concurrent_stages: 1
+  stage_timeout: 1800
+  retry_backoff: 30
+  quality_gate_enforcement: true
+  automatic_progression: true

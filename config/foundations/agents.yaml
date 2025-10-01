@@ -1,0 +1,261 @@
+# Agent Definitions - What agents exist and their capabilities
+# This is the foundational layer defining all available agents in the orchestrator
+
+agents:
+  dev_environment_setup:
+    description: "Development environment configuration, Dockerfile generation, and validation with automated troubleshooting"
+    model: "claude-sonnet-4-5-20250929"
+    timeout: 1800  # 30 minutes for Docker builds and validation
+    retries: 2
+    makes_code_changes: true  # Modifies dependency files (requirements.txt, etc.)
+    requires_dev_container: false  # Runs locally in orchestrator to build the dev container
+    capabilities:
+      - environment_analysis
+      - dockerfile_generation
+      - dependency_detection
+      - dependency_troubleshooting
+      - docker_build_validation
+      - tech_stack_validation
+    tools_enabled:
+      - file_operations
+      - git_integration
+      - docker_operations
+      - web_search
+    mcp_servers:
+      - serena
+
+  idea_researcher:
+    description: "Market research and idea validation"
+    model: "claude-opus-4-1-20250514"
+    timeout: 300
+    retries: 2
+    makes_code_changes: true  # Creates research documents
+    requires_dev_container: false  # Documentation work doesn't need project dependencies
+    capabilities:
+      - research
+      - market_analysis
+      - feasibility_assessment
+    tools_enabled:
+      - file_operations
+      - git_integration
+      - web_search
+    mcp_servers:
+      - context7
+      - serena
+
+  business_analyst:
+    description: "Requirements analysis and user story development"
+    model: "claude-sonnet-4-5-20250929"
+    timeout: 300
+    retries: 3
+    makes_code_changes: true  # Creates requirements documents
+    requires_dev_container: false  # Documentation work doesn't need project dependencies
+    capabilities:
+      - requirements_analysis
+      - user_story_creation
+      - stakeholder_analysis
+      - process_modeling
+    tools_enabled:
+      - file_operations
+      - git_integration
+      - web_search
+    mcp_servers:
+      - context7
+      - serena
+
+  product_manager:
+    description: "Strategic product planning and prioritization"
+    model: "claude-sonnet-4-5-20250929"
+    timeout: 300
+    retries: 2
+    makes_code_changes: true  # Creates planning documents
+    requires_dev_container: false  # Documentation work doesn't need project dependencies
+    capabilities:
+      - product_strategy
+      - feature_prioritization
+      - stakeholder_management
+      - market_positioning
+    tools_enabled:
+      - file_operations
+      - git_integration
+      - web_search
+
+  requirements_reviewer:
+    description: "Requirements validation and quality assurance"
+    model: "claude-sonnet-4-5-20250929"
+    timeout: 300
+    retries: 2
+    makes_code_changes: false  # Review only, no changes
+    requires_dev_container: false
+    capabilities:
+      - requirements_validation
+      - quality_assessment
+      - gap_analysis
+      - compliance_review
+    tools_enabled:
+      - file_operations
+      - git_integration
+
+  software_architect:
+    description: "System architecture and technical design"
+    model: "claude-sonnet-4-5-20250929"
+    timeout: 600
+    retries: 3
+    makes_code_changes: true  # Creates architecture documents and diagrams
+    requires_dev_container: false  # Design work doesn't need project dependencies yet
+    capabilities:
+      - system_architecture
+      - technical_design
+      - performance_planning
+      - security_design
+    tools_enabled:
+      - file_operations
+      - git_integration
+      - web_search
+    mcp_servers:
+      - serena
+
+  design_reviewer:
+    description: "Architecture validation and technical review"
+    model: "claude-sonnet-4-5-20250929"
+    timeout: 300
+    retries: 2
+    makes_code_changes: false  # Review only, no changes
+    requires_dev_container: false
+    capabilities:
+      - architecture_validation
+      - security_review
+      - scalability_assessment
+      - compliance_validation
+    tools_enabled:
+      - file_operations
+      - git_integration
+
+  test_planner:
+    description: "Test strategy and planning"
+    model: "claude-sonnet-4-5-20250929"
+    timeout: 300
+    retries: 2
+    makes_code_changes: true  # Creates test plan documents
+    requires_dev_container: false  # Planning doesn't need dependencies yet
+    capabilities:
+      - test_strategy
+      - test_planning
+      - coverage_analysis
+      - automation_planning
+    tools_enabled:
+      - file_operations
+      - git_integration
+    mcp_servers:
+      - serena
+
+  test_reviewer:
+    description: "Test plan validation and review"
+    model: "claude-sonnet-4-5-20250929"
+    timeout: 300
+    retries: 2
+    makes_code_changes: false  # Review only, no changes
+    requires_dev_container: false
+    capabilities:
+      - test_validation
+      - coverage_review
+      - quality_assessment
+    tools_enabled:
+      - file_operations
+      - git_integration
+
+  senior_software_engineer:
+    description: "Software development and implementation"
+    model: "claude-sonnet-4-5-20250929"
+    timeout: 900
+    retries: 3
+    makes_code_changes: true  # Writes actual code
+    requires_dev_container: true  # NEEDS project dependencies to run/test code
+    capabilities:
+      - software_development
+      - code_implementation
+      - testing
+      - performance_optimization
+    tools_enabled:
+      - file_operations
+      - git_integration
+      - web_search
+    mcp_servers:
+      - context7
+      - serena
+
+  code_reviewer:
+    description: "Code quality review and validation"
+    model: "claude-sonnet-4-5-20250929"
+    timeout: 300
+    retries: 2
+    makes_code_changes: false  # Review only, no changes
+    requires_dev_container: false  # Can review code without running it
+    capabilities:
+      - code_review
+      - quality_assessment
+      - security_review
+      - best_practices_validation
+    tools_enabled:
+      - file_operations
+      - git_integration
+    mcp_servers:
+      - serena
+
+  senior_qa_engineer:
+    description: "Quality assurance and end-to-end testing"
+    model: "claude-sonnet-4-5-20250929"
+    timeout: 600
+    retries: 3
+    makes_code_changes: true  # Writes test code
+    requires_dev_container: true  # NEEDS project dependencies to run tests
+    capabilities:
+      - qa_testing
+      - integration_testing
+      - performance_testing
+      - production_readiness
+    tools_enabled:
+      - file_operations
+      - git_integration
+    mcp_servers:
+      - serena
+
+  technical_writer:
+    description: "Technical documentation creation"
+    model: "claude-sonnet-4-5-20250929"
+    timeout: 300
+    retries: 2
+    makes_code_changes: true  # Creates documentation files
+    requires_dev_container: false  # Documentation doesn't need dependencies
+    capabilities:
+      - technical_writing
+      - documentation_creation
+      - api_documentation
+      - user_guides
+    tools_enabled:
+      - file_operations
+      - git_integration
+
+  documentation_editor:
+    description: "Documentation review and editing"
+    model: "claude-sonnet-4-5-20250929"
+    timeout: 300
+    retries: 2
+    makes_code_changes: false  # Review only, no changes
+    requires_dev_container: false
+    capabilities:
+      - editorial_review
+      - content_optimization
+      - style_validation
+      - accuracy_verification
+    tools_enabled:
+      - file_operations
+      - git_integration
+
+# Default agent configuration applied to all agents
+default_config:
+  working_directory: "/workspace/{project_name}"
+  output_format: "structured_json"
+  quality_gates:
+    minimum_score: 0.7
+    validation_required: true

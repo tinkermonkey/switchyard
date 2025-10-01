@@ -1,0 +1,50 @@
+# MCP Server Definitions
+# Defines all available MCP servers and their connection configurations
+
+mcp_servers:
+  context7:
+    type: http
+    url: "${CONTEXT7_MCP_URL}"
+    capabilities:
+      - library_documentation
+      - api_references
+      - package_search
+    description: "Context7 MCP server for library documentation and API references"
+
+  puppeteer:
+    type: stdio
+    command: docker
+    args:
+      - run
+      - -i
+      - --rm
+      - -e
+      - DOCKER_CONTAINER
+      - mcp/puppeteer
+    env:
+      DOCKER_CONTAINER: "true"
+    capabilities:
+      - browser_automation
+      - web_scraping
+      - screenshot_capture
+      - page_navigation
+    description: "Puppeteer MCP server for browser automation and web scraping"
+
+  serena:
+    type: stdio
+    command: uvx
+    args:
+      - --from
+      - git+https://github.com/oraios/serena
+      - serena
+      - start-mcp-server
+      - --context
+      - ide-assistant
+      - --project
+      - "{work_dir}"
+    capabilities:
+      - codebase_analysis
+      - semantic_search
+      - code_understanding
+      - symbol_lookup
+    description: "Serena MCP server for codebase analysis and semantic search"
