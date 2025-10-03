@@ -86,10 +86,12 @@ class PipelineProgression:
                 logger.error(f"No board state found for {board_name}")
                 return False
 
-            # Get the field ID for Status (this is the single-select field in Projects v2)
-            # For now, we'll need to query this from GitHub
-            # The status field ID is project-specific but consistent within a project
-            status_field_id = "PVTSSF_lAHOABgBzM4BEUfQzgb5Vy4"  # This is project-specific
+            # Get the field ID for Status from board state
+            status_field_id = board_state.status_field_id
+            if not status_field_id:
+                logger.error(f"No status_field_id found in board state for {board_name}")
+                logger.error("Board may need to be re-reconciled to capture the status field ID")
+                return False
 
             # Get the option ID for the target column from the columns list
             column_option_id = None

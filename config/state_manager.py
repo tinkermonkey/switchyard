@@ -38,6 +38,7 @@ class GitHubBoard:
     node_id: str
     name: str
     columns: List[GitHubColumn]
+    status_field_id: Optional[str] = None  # GraphQL field ID for the Status field
 
 
 @dataclass
@@ -50,6 +51,8 @@ class GitHubProjectState:
     labels_created: List[str]
     last_sync: str
     sync_hash: str
+    issue_discussion_links: Optional[Dict[int, str]] = None  # issue_number -> discussion_id
+    discussion_issue_links: Optional[Dict[str, int]] = None  # discussion_id -> issue_number
 
 
 class GitHubStateManager:
@@ -120,8 +123,19 @@ class GitHubStateManager:
                     project_id=board_data['project_id'],
                     node_id=board_data['node_id'],
                     name=board_name,
-                    columns=columns
+                    columns=columns,
+                    status_field_id=board_data.get('status_field_id')
                 )
+
+            # Parse issue/discussion links
+            issue_discussion_links = {}
+            discussion_issue_links = {}
+            if 'issue_discussion_links' in data['github_state']:
+                for issue_num_str, discussion_id in data['github_state']['issue_discussion_links'].items():
+                    issue_discussion_links[int(issue_num_str)] = discussion_id
+            if 'discussion_issue_links' in data['github_state']:
+                for discussion_id, issue_num in data['github_state']['discussion_issue_links'].items():
+                    discussion_issue_links[discussion_id] = int(issue_num)
 
             return GitHubProjectState(
                 project_name=project_name,
@@ -130,7 +144,9 @@ class GitHubStateManager:
                 boards=boards,
                 labels_created=data['github_state'].get('labels_created', []),
                 last_sync=data['github_state']['last_sync'],
-                sync_hash=data['github_state']['sync_hash']
+                sync_hash=data['github_state']['sync_hash'],
+                issue_discussion_links=issue_discussion_links,
+                discussion_issue_links=discussion_issue_links
             )
 
         except Exception as e:
@@ -144,7 +160,7 @@ class GitHubStateManager:
         # Convert to serializable format
         boards_data = {}
         for board_name, board in state.boards.items():
-            boards_data[board_name] = {
+            board_dict = {
                 'project_number': board.project_number,
                 'project_id': board.project_id,
                 'node_id': board.node_id,
@@ -157,6 +173,17 @@ class GitHubStateManager:
                     for col in board.columns
                 ]
             }
+            if board.status_field_id:
+                board_dict['status_field_id'] = board.status_field_id
+            boards_data[board_name] = board_dict
+
+        # Convert issue/discussion links to serializable format
+        issue_discussion_links = {}
+        discussion_issue_links = {}
+        if state.issue_discussion_links:
+            issue_discussion_links = {str(k): v for k, v in state.issue_discussion_links.items()}
+        if state.discussion_issue_links:
+            discussion_issue_links = state.discussion_issue_links
 
         data = {
             'github_state': {
@@ -165,7 +192,9 @@ class GitHubStateManager:
                 'boards': boards_data,
                 'labels_created': state.labels_created,
                 'last_sync': state.last_sync,
-                'sync_hash': state.sync_hash
+                'sync_hash': state.sync_hash,
+                'issue_discussion_links': issue_discussion_links,
+                'discussion_issue_links': discussion_issue_links
             }
         }
 
@@ -205,7 +234,9 @@ class GitHubStateManager:
             boards={},
             labels_created=[],
             last_sync=datetime.utcnow().isoformat(),
-            sync_hash=current_hash
+            sync_hash=current_hash,
+            issue_discussion_links={},
+            discussion_issue_links={}
         )
 
     def update_board_state(self, project_name: str, board_name: str,
@@ -215,6 +246,11 @@ class GitHubStateManager:
         state = self.load_project_state(project_name)
         if state is None:
             state = self.create_initial_state(project_name)
+
+        # Extract status_field_id from the first column if present
+        status_field_id = None
+        if columns and 'status_field_id' in columns[0]:
+            status_field_id = columns[0]['status_field_id']
 
         github_columns = []
         for col in columns:
@@ -229,7 +265,8 @@ class GitHubStateManager:
             project_id=project_id,
             node_id=node_id,
             name=board_name,
-            columns=github_columns
+            columns=github_columns,
+            status_field_id=status_field_id
         )
 
         state.last_sync = datetime.utcnow().isoformat()
@@ -247,6 +284,61 @@ class GitHubStateManager:
 
         state.last_sync = datetime.utcnow().isoformat()
         self.save_project_state(state)
+
+    def refresh_board_field_ids(self, project_name: str, board_name: str) -> bool:
+        """Refresh the field and option IDs for a board by querying GitHub
+
+        This is used to update boards that were created with placeholder IDs
+        """
+        try:
+            import subprocess
+            import json
+
+            state = self.load_project_state(project_name)
+            if not state:
+                logger.error(f"No state found for project {project_name}")
+                return False
+
+            board = state.boards.get(board_name)
+            if not board:
+                logger.error(f"No board found: {board_name}")
+                return False
+
+            # Query GitHub for the project field list
+            cmd = ['gh', 'project', 'field-list', str(board.project_number),
+                   '--owner', state.org, '--format', 'json']
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            fields_data = json.loads(result.stdout)
+
+            # Find the Status field
+            status_field = None
+            for field in fields_data.get('fields', []):
+                if field.get('name') == 'Status' and field.get('type') == 'ProjectV2SingleSelectField':
+                    status_field = field
+                    break
+
+            if not status_field:
+                logger.error(f"Status field not found for board {board_name}")
+                return False
+
+            # Update the board's status_field_id
+            board.status_field_id = status_field['id']
+
+            # Update column IDs with actual option IDs
+            options = {opt['name']: opt['id'] for opt in status_field.get('options', [])}
+            for col in board.columns:
+                if col.name in options:
+                    col.id = options[col.name]
+                    col.node_id = options[col.name]
+
+            # Save updated state
+            self.save_project_state(state)
+            logger.info(f"Refreshed field IDs for board {board_name}")
+            return True
+
+        except Exception as e:
+            logger.error(f"Failed to refresh board field IDs: {e}")
+            return False
 
     def mark_synchronized(self, project_name: str):
         """Mark project as synchronized with current configuration"""
@@ -314,6 +406,55 @@ class GitHubStateManager:
         shutil.copy2(state_file, backup_file)
         logger.info(f"Created state backup: {backup_file}")
         return str(backup_file)
+
+    def link_issue_to_discussion(self, project_name: str, issue_number: int, discussion_id: str):
+        """Create bidirectional link between issue and discussion"""
+        state = self.load_project_state(project_name)
+        if state is None:
+            state = self.create_initial_state(project_name)
+
+        if state.issue_discussion_links is None:
+            state.issue_discussion_links = {}
+        if state.discussion_issue_links is None:
+            state.discussion_issue_links = {}
+
+        state.issue_discussion_links[issue_number] = discussion_id
+        state.discussion_issue_links[discussion_id] = issue_number
+
+        self.save_project_state(state)
+        logger.info(f"Linked issue #{issue_number} to discussion {discussion_id}")
+
+    def get_discussion_for_issue(self, project_name: str, issue_number: int) -> Optional[str]:
+        """Get discussion ID for an issue"""
+        state = self.load_project_state(project_name)
+        if state is None or state.issue_discussion_links is None:
+            return None
+
+        return state.issue_discussion_links.get(issue_number)
+
+    def get_issue_for_discussion(self, project_name: str, discussion_id: str) -> Optional[int]:
+        """Get issue number for a discussion"""
+        state = self.load_project_state(project_name)
+        if state is None or state.discussion_issue_links is None:
+            return None
+
+        return state.discussion_issue_links.get(discussion_id)
+
+    def unlink_issue_discussion(self, project_name: str, issue_number: int):
+        """Remove link between issue and discussion"""
+        state = self.load_project_state(project_name)
+        if state is None:
+            return
+
+        if state.issue_discussion_links and issue_number in state.issue_discussion_links:
+            discussion_id = state.issue_discussion_links[issue_number]
+            del state.issue_discussion_links[issue_number]
+
+            if state.discussion_issue_links and discussion_id in state.discussion_issue_links:
+                del state.discussion_issue_links[discussion_id]
+
+            self.save_project_state(state)
+            logger.info(f"Unlinked issue #{issue_number} from discussion")
 
 
 # Global state manager instance

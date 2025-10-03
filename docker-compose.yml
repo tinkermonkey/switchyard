@@ -42,7 +42,8 @@ services:
       - GITHUB_APP_INSTALLATION_ID=${GITHUB_APP_INSTALLATION_ID}
       - GITHUB_APP_PRIVATE_KEY_PATH=${GITHUB_APP_PRIVATE_KEY_PATH}
       - GITHUB_ORG=${GITHUB_ORG}
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
       - REDIS_URL=redis://redis:6379
       - LOG_LEVEL=INFO
       - CONTEXT7_MCP_URL=https://mcp.context7.com/mcp
@@ -60,7 +61,7 @@ services:
     working_dir: /app
     command: ["python", "main.py"]
 
-  observability:
+  observability-server:
     build: .
     volumes:
       - ./:/app
@@ -74,6 +75,15 @@ services:
       - "5001:5001"
     working_dir: /app
     command: ["python", "-m", "services.observability_server"]
+
+  web-ui:
+    build: ./web_ui_v2
+    depends_on:
+      - observability-server
+    networks:
+      - orchestrator-net
+    ports:
+      - "3000:80"
 
 
 volumes:

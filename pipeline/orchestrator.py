@@ -38,13 +38,13 @@ class SequentialPipeline:
 
             try:
                 # Create checkpoint before stage execution
-                logger.info("Creating checkpoint")
+                logger.debug("Creating checkpoint")
                 await self.state_manager.checkpoint(
                     pipeline_id=context['pipeline_id'],
                     stage_index=self.current_stage_index,
                     context=context
                 )
-                logger.info("Checkpoint created")
+                logger.debug("Checkpoint created")
 
                 # Execute stage with circuit breaker
                 logger.info(f"Running stage with circuit breaker: {stage.name}")

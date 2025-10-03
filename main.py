@@ -10,7 +10,6 @@ from config.state_manager import state_manager as github_state_manager
 from monitoring.logging import OrchestratorLogger
 from monitoring.metrics import MetricsCollector
 from state_management.manager import StateManager
-from state_management.git_state import GitStateManager
 from task_queue.task_manager import TaskQueue
 from claude.session_manager import ClaudeSessionManager
 from monitoring.health_monitor import HealthMonitor

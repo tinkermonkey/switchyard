@@ -199,18 +199,33 @@ class GitHubProjectManager:
                 })
 
             # Update the Status field with GraphQL
-            success = await self._update_status_field_graphql(status_field['id'], options)
+            graphql_options = await self._update_status_field_graphql(status_field['id'], options)
 
-            if success:
-                # Return column data for state management
-                return [
-                    {
-                        'name': column.name,
-                        'id': f"status_{i}",  # Placeholder - would need actual IDs from GraphQL response
-                        'node_id': f"node_{i}"  # Placeholder
-                    }
-                    for i, column in enumerate(workflow_template.columns)
-                ]
+            if graphql_options:
+                # Return column data for state management with actual GraphQL option IDs
+                columns = []
+                for column in workflow_template.columns:
+                    # Find matching option by name
+                    matching_option = next(
+                        (opt for opt in graphql_options if opt['name'] == column.name),
+                        None
+                    )
+                    if matching_option:
+                        columns.append({
+                            'name': column.name,
+                            'id': matching_option['id'],  # Actual GraphQL option ID
+                            'node_id': matching_option['id']  # Use same ID
+                        })
+                    else:
+                        logger.warning(f"No GraphQL option ID found for column '{column.name}'")
+
+                # Also store the status field ID for later use
+                if columns:
+                    logger.info(f"Stored Status field ID: {status_field['id']}")
+                    # Store this in the board state for later use in pipeline_progression
+                    columns[0]['status_field_id'] = status_field['id']
+
+                return columns
             else:
                 return []
 
@@ -218,8 +233,12 @@ class GitHubProjectManager:
             logger.error(f"Failed to configure columns: {e}")
             return []
 
-    async def _update_status_field_graphql(self, field_id: str, options: List[Dict[str, str]]) -> bool:
-        """Update Status field options using GraphQL"""
+    async def _update_status_field_graphql(self, field_id: str, options: List[Dict[str, str]]) -> Optional[List[Dict[str, str]]]:
+        """Update Status field options using GraphQL
+
+        Returns:
+            List of option dictionaries with 'id' and 'name' keys, or None on failure
+        """
         try:
             # Get GitHub token
             token_result = subprocess.run(['gh', 'auth', 'token'], capture_output=True, text=True, check=True)
@@ -266,17 +285,20 @@ class GitHubProjectManager:
                 result_data = response.json()
                 if "errors" in result_data:
                     logger.error(f"GraphQL errors: {result_data['errors']}")
-                    return False
+                    return None
                 else:
-                    logger.info(f"Configured {len(options)} columns via GraphQL")
-                    return True
+                    # Extract the option IDs from the response
+                    field_data = result_data.get('data', {}).get('updateProjectV2Field', {}).get('projectV2Field', {})
+                    returned_options = field_data.get('options', [])
+                    logger.info(f"Configured {len(returned_options)} columns via GraphQL")
+                    return returned_options
             else:
                 logger.error(f"GraphQL request failed: {response.status_code}")
-                return False
+                return None
 
         except Exception as e:
             logger.error(f"Failed to update status field: {e}")
-            return False
+            return None
 
     async def _reconcile_labels(self, project_name: str, project_config: ProjectConfig) -> bool:
         """Create repository labels for pipeline routing"""

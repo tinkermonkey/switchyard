@@ -4,7 +4,7 @@ from claude.claude_integration import run_claude_code
 from datetime import datetime
 import json
 import logging
-from handoff.collaboration import ReviewStatus, ReviewFeedback
+from services.review_parser import ReviewStatus
 
 logger = logging.getLogger(__name__)
 
@@ -16,33 +16,49 @@ class CodeReviewerAgent(PipelineStage):
     async def execute(self, context: Dict[str, Any]) -> Dict[str, Any]:
         """Execute comprehensive code review with security, performance, and quality analysis"""
 
-        # Check if this is a review request
-        is_review = context.get('review_request', False)
-        original_handoff = context.get('original_handoff')
+        # Extract from nested task context
+        task_context = context.get('context', {})
+        issue = task_context.get('issue', {})
+        project = context.get('project', 'unknown')
+        previous_stage = task_context.get('previous_stage_output', '')
 
-        if not is_review or not original_handoff:
-            raise Exception("Code Reviewer expects review request with handoff data from Senior Software Engineer")
+        # Check for feedback
+        feedback_data = task_context.get('feedback')
+        previous_output = task_context.get('previous_output')
 
-        # Get implementation artifacts
-        implementation_summary = original_handoff.artifacts.get('implementation_summary', {})
-        source_code = original_handoff.artifacts.get('source_code', {})
-        test_suite = original_handoff.artifacts.get('test_suite', [])
-        quality_metrics = original_handoff.artifacts.get('quality_metrics', {})
+        # Get implementation to review from previous stage
+        implementation_summary = context.get('implementation_summary', {})
+        code_artifacts = context.get('code_artifacts', {})
+
+        # Build feedback prompt if this is a refinement
+        feedback_prompt = ""
+        if feedback_data and previous_output:
+            feedback_prompt = f"""
+
+YOUR PREVIOUS REVIEW:
+{previous_output}
+
+HUMAN FEEDBACK RECEIVED:
+{feedback_data.get('formatted_text', '')}
+
+IMPORTANT: Review your previous review and refine it based on the feedback.
+Do NOT start from scratch - update and improve your existing review.
+
+CRITICAL: Output the COMPLETE, UPDATED review with all changes incorporated.
+"""
 
         prompt = f"""
 As a Senior Code Reviewer, conduct comprehensive code review focusing on security, performance, maintainability, and best practices.
 
-Implementation Summary:
-{json.dumps(implementation_summary, indent=2)}
+Original Issue:
+Title: {issue.get('title', 'No title')}
+Description: {issue.get('body', 'No description')}
 
-Source Code Artifacts:
-{json.dumps(source_code, indent=2)}
+Previous Stage Output (Implementation):
+{previous_stage}
+{feedback_prompt}
 
-Test Suite:
-{json.dumps(test_suite, indent=2)}
-
-Quality Metrics:
-{json.dumps(quality_metrics, indent=2)}
+IMPORTANT: Output your code review as text directly in your response. DO NOT create any files. This review will be posted to GitHub as a comment.
 
 Provide comprehensive code review with:
 
@@ -91,7 +107,17 @@ Return structured JSON with review_findings and recommendations sections.
 """
 
         try:
-            result = await run_claude_code(prompt, context)
+            # Enhance context with MCP server data if available
+            enhanced_context = context.copy()
+
+            # Add agent_config for security enforcement (requires_docker check)
+            if self.agent_config and 'agent_config' in self.agent_config:
+                enhanced_context['agent_config'] = self.agent_config['agent_config']
+            if self.agent_config and 'mcp_servers' in self.agent_config:
+                enhanced_context['mcp_servers'] = self.agent_config['mcp_servers']
+                logger.info(f"Added {len(enhanced_context['mcp_servers'])} MCP servers to context")
+
+            result = await run_claude_code(prompt, enhanced_context)
             
             # Parse review results
             if isinstance(result, str):
@@ -122,7 +148,7 @@ Return structured JSON with review_findings and recommendations sections.
                 review_data = result
 
             # Process review results
-            from handoff.collaboration import ReviewStatus, ReviewFeedback
+            from services.review_parser import ReviewStatus
             from services.github_integration import GitHubIntegration
 
             findings = review_data.get('review_findings', {})
@@ -161,36 +187,24 @@ Return structured JSON with review_findings and recommendations sections.
                 "suggestion": "Consider performance optimizations"
             })
             
-            review_feedback = ReviewFeedback(
-                reviewer_agent="code_reviewer",
-                status=status,
-                findings=detailed_findings,
-                blocking_issues=must_fix,
-                score=overall_score,
-                comments=f"Code review completed. Found {must_fix} critical and {should_fix} improvement items."
-            )
+            # Store result as markdown
+            if isinstance(result, str):
+                context['markdown_review'] = result
+            else:
+                context['markdown_review'] = json.dumps(review_data, indent=2)
 
             # Update context
             context['review_completed'] = True
-            context['review_feedback'] = review_feedback
             context['review_status'] = status.value
             context['quality_score'] = overall_score
             context['code_approved'] = status == ReviewStatus.APPROVED
             context['review_findings'] = findings
 
-            if status == ReviewStatus.APPROVED:
-                context['next_action'] = 'proceed_to_qa_testing'
-            elif status == ReviewStatus.BLOCKED:
-                context['next_action'] = 'return_to_development'
-                context['blocking_issues'] = review_data.get('recommendations', {}).get('critical_fixes', [])
-            else:
-                context['next_action'] = 'iterate_with_engineer'
-                context['improvement_items'] = review_data.get('recommendations', {}).get('improvements', [])
-
             logger.info(f"Code review completed: {status.value}")
             logger.info(f"Overall score: {overall_score:.2f}, Must fix: {must_fix}, Should fix: {should_fix}")
-            
+
             return context
 
         except Exception as e:
             raise Exception(f"Code review failed: {str(e)}")
+

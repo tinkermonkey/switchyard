@@ -32,7 +32,7 @@ pip install -r requirements.txt
 
 ```bash
 # Copy the template
-cp .env.template .env
+cp .env.example .env
 
 # Edit the .env file with your actual values
 nano .env
@@ -164,7 +164,7 @@ Runtime GitHub state is managed automatically - no manual configuration needed!
 
 1. **Configure Environment**
    ```bash
-   cp .env.template .env
+   cp .env.example .env
    # Edit .env with your GitHub settings
    ```
 

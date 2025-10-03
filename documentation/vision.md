@@ -113,7 +113,7 @@ These compressed prompts maintain effectiveness while minimizing token usage, de
 
 ## Implementation roadmap
 
-Start with foundation work: setting up the mono-repo structure with CLAUDE.md files, implementing basic pipeline patterns with circuit breakers, creating the state management layer, and establishing handoff protocols. This phase typically requires 3-4 weeks.
+Start with foundation work: setting up the mono-repo structure with CLAUDE.md files, implementing basic pipeline patterns, creating the state management layer, and establishing handoff protocols. This phase typically requires 3-4 weeks.
 
 Next, build core workflows by creating both Kanban boards with their respective agents, implementing coordinated checkpointing, and integrating monitoring systems. This phase adds another 4 weeks of development.
 

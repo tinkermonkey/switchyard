@@ -4,7 +4,7 @@ from claude.claude_integration import run_claude_code
 from datetime import datetime
 import json
 import logging
-from handoff.collaboration import ReviewStatus, ReviewFeedback
+from services.review_parser import ReviewStatus
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +40,8 @@ Test Cases:
 
 Automation Plan:
 {json.dumps(automation_plan, indent=2)}
+
+IMPORTANT: Output your test review as text directly in your response. DO NOT create any files. This review will be posted to GitHub as a comment.
 
 Provide comprehensive test plan review with:
 
@@ -100,7 +102,7 @@ Return structured JSON with review_assessment and recommendations sections.
                 review_data = result
 
             # Process review results using collaboration framework
-            from handoff.collaboration import ReviewStatus, ReviewFeedback
+            from services.review_parser import ReviewStatus
             from services.github_integration import GitHubIntegration
 
             assessment = review_data.get('review_assessment', {})
@@ -114,18 +116,8 @@ Return structured JSON with review_assessment and recommendations sections.
             else:
                 status = ReviewStatus.BLOCKED
 
-            review_feedback = ReviewFeedback(
-                reviewer_agent="test_reviewer",
-                status=status,
-                findings=[{"category": "test_plan", "severity": "low", "message": "Test plan review completed"}],
-                blocking_issues=0,
-                score=overall_score,
-                comments=f"Test plan review completed with {overall_score:.1%} confidence."
-            )
-
             # Update context
             context['review_completed'] = True
-            context['review_feedback'] = review_feedback
             context['review_status'] = status.value
             context['quality_score'] = overall_score
             context['test_plan_approved'] = status == ReviewStatus.APPROVED

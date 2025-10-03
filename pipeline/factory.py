@@ -29,7 +29,8 @@ class PipelineFactory:
             'working_directory': agent_config.working_directory,
             'output_format': agent_config.output_format,
             'tools_enabled': agent_config.tools_enabled,
-            'mcp_servers': []
+            'mcp_servers': [],
+            'agent_config': agent_config  # Pass full config for security checks
         }
 
         # Process MCP server configurations

@@ -162,6 +162,69 @@ class GitHubIntegration:
             logger.error(f"Failed to check issue comments: {e.stderr}")
             return False  # Default to not processed if we can't check
 
+    async def has_agent_processed_discussion(self, discussion_id: str, agent_name: str) -> bool:
+        """Check if an agent has already processed this discussion by looking for its signature in comments and replies"""
+        try:
+            from services.github_app import github_app
+
+            # GraphQL query to get discussion comments with replies
+            query = """
+            query($discussionId: ID!) {
+              node(id: $discussionId) {
+                ... on Discussion {
+                  number
+                  comments(first: 100) {
+                    nodes {
+                      id
+                      body
+                      author {
+                        login
+                      }
+                      replies(first: 50) {
+                        nodes {
+                          id
+                          body
+                          author {
+                            login
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+            """
+
+            result = github_app.graphql_request(query, {'discussionId': discussion_id})
+
+            if not result or 'node' not in result:
+                logger.error(f"Failed to get discussion {discussion_id} for processing check")
+                return False
+
+            comments = result['node']['comments']['nodes']
+
+            # Look for the agent processing signature in comments and replies
+            signature = f"_Processed by the {agent_name} agent_"
+
+            for comment in comments:
+                # Check top-level comment
+                if signature in comment.get('body', ''):
+                    logger.debug(f"Found agent signature for {agent_name} in discussion {discussion_id} (top-level comment)")
+                    return True
+
+                # Check replies
+                for reply in comment.get('replies', {}).get('nodes', []):
+                    if signature in reply.get('body', ''):
+                        logger.debug(f"Found agent signature for {agent_name} in discussion {discussion_id} (reply)")
+                        return True
+
+            return False
+
+        except Exception as e:
+            logger.error(f"Failed to check discussion comments: {e}")
+            return False  # Default to not processed if we can't check
+
     async def get_feedback_comments(self, issue_number: int, repo: Optional[str] = None,
                                     since_timestamp: Optional[str] = None) -> List[Dict[str, Any]]:
         """Get comments that mention @orchestrator-bot for feedback"""
@@ -309,6 +372,86 @@ class GitHubIntegration:
             logger.error(f"Failed to create issue: {e.stderr}")
             return {'success': False, 'error': str(e)}
 
+    async def post_agent_output(self, context: Dict[str, Any], comment: str,
+                               reply_to_id: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Post agent output to the appropriate workspace (Issues or Discussions)
+
+        Args:
+            context: Task context containing workspace information
+            comment: Formatted comment body
+            reply_to_id: Optional comment ID to reply to (for discussions)
+
+        Returns:
+            Dict with success status and comment metadata
+        """
+        workspace_type = context.get('workspace_type', 'issues')
+        discussion_id = context.get('discussion_id')
+
+        # Debug logging
+        logger.info(f"post_agent_output - workspace_type: {workspace_type}, discussion_id: {discussion_id}, context keys: {list(context.keys())}")
+
+        # If we have a discussion_id, use discussions regardless of workspace_type
+        # (hybrid workspaces have discussions for some issues)
+        if discussion_id or workspace_type in ['discussions', 'hybrid']:
+            if discussion_id:
+                return await self._post_discussion_comment(context, comment, reply_to_id)
+            else:
+                logger.warning(f"workspace_type is '{workspace_type}' but no discussion_id provided, falling back to issues")
+                return await self._post_issue_comment(context, comment)
+        else:
+            return await self._post_issue_comment(context, comment)
+
+    async def _post_discussion_comment(self, context: Dict[str, Any], comment: str,
+                                      reply_to_id: Optional[str] = None) -> Dict[str, Any]:
+        """Post comment to a GitHub Discussion"""
+        try:
+            from services.github_discussions import GitHubDiscussions
+
+            discussion_id = context.get('discussion_id')
+            if not discussion_id:
+                logger.error("No discussion_id in context for discussion post")
+                return {'success': False, 'error': 'No discussion_id'}
+
+            discussions = GitHubDiscussions()
+            comment_id = discussions.add_discussion_comment(
+                discussion_id=discussion_id,
+                body=comment,
+                reply_to_id=reply_to_id
+            )
+
+            if comment_id:
+                logger.info(f"Posted comment to discussion {discussion_id}")
+                return {
+                    'success': True,
+                    'comment_id': comment_id,
+                    'workspace_type': 'discussions'
+                }
+            else:
+                logger.error(f"Failed to post to discussion {discussion_id}")
+                return {'success': False, 'error': 'API call failed'}
+
+        except Exception as e:
+            logger.error(f"Error posting discussion comment: {e}")
+            return {'success': False, 'error': str(e)}
+
+    async def _post_issue_comment(self, context: Dict[str, Any], comment: str) -> Dict[str, Any]:
+        """Post comment to a GitHub Issue"""
+        try:
+            issue_number = context.get('issue_number')
+            repository = context.get('repository')
+
+            if not issue_number:
+                logger.error("No issue_number in context for issue post")
+                return {'success': False, 'error': 'No issue_number'}
+
+            return await self.post_issue_comment(issue_number, comment, repository)
+
+        except Exception as e:
+            logger.error(f"Error posting issue comment: {e}")
+            return {'success': False, 'error': str(e)}
+
+
 class AgentCommentFormatter:
     """Formats agent communications for GitHub"""
 
@@ -347,38 +490,30 @@ class AgentCommentFormatter:
 
         emoji, title = agent_info.get(agent_name, ('📋', agent_name.replace('_', ' ').title()))
 
-        # Build summary section
-        summary_section = "**Summary:**\n"
-        for key, value in summary_stats.items():
-            # Format the key nicely
-            label = key.replace('_', ' ').title()
-            if isinstance(value, float) and value < 1:
-                # Assume it's a percentage
-                summary_section += f"- {label}: {value * 100:.1f}%\n"
-            else:
-                summary_section += f"- {label}: {value}\n"
+        # Build summary section (only if stats are provided)
+        summary_section = ""
+        if summary_stats:
+            summary_section = "**Summary:**\n"
+            for key, value in summary_stats.items():
+                # Format the key nicely
+                label = key.replace('_', ' ').title()
+                if isinstance(value, float) and value < 1:
+                    # Assume it's a percentage
+                    summary_section += f"- {label}: {value * 100:.1f}%\n"
+                else:
+                    summary_section += f"- {label}: {value}\n"
+            summary_section += "---\n\n"
 
         # Build next steps section
         next_steps_section = ""
         if next_steps:
-            next_steps_section = f"\n**Next Steps:**\n{next_steps}\n"
+            next_steps_section = f"\n**Next Steps:**\n{next_steps}\n---\n"
 
         # Convert output to markdown if it's JSON/dict
         formatted_output = AgentCommentFormatter._format_output_as_markdown(output)
 
-        return f"""## {emoji} {title} Complete
+        return f"""{formatted_output}
 
-{title} has been completed by the orchestrator.
-
-{summary_section}
----
-
-## Analysis Output
-
-{formatted_output}
-
----
-{next_steps_section}
 ---
 _Generated by Orchestrator Bot 🤖_
 _Processed by the {agent_name} agent_

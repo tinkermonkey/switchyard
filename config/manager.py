@@ -33,6 +33,8 @@ class AgentConfig:
     output_format: str
     makes_code_changes: bool = False
     requires_dev_container: bool = False
+    requires_docker: bool = True  # CRITICAL: Default to True for security, only dev_environment_setup should be False
+    filesystem_write_allowed: bool = True  # Default to True for backward compatibility
 
 
 @dataclass
@@ -59,6 +61,10 @@ class PipelineTemplate:
     description: str
     workflow_type: str
     stages: List[PipelineStage]
+    workspace: str = "issues"  # "issues", "discussions", or "hybrid"
+    discussion_category: Optional[str] = None
+    discussion_stages: Optional[List[str]] = None
+    issue_stages: Optional[List[str]] = None
 
 
 @dataclass
@@ -69,6 +75,11 @@ class WorkflowColumn:
     agent: Optional[str]
     description: str
     automation_rules: List[Dict[str, Any]]
+    type: Optional[str] = None  # "maker", "review", or None
+    maker_agent: Optional[str] = None  # For review columns: which agent to send feedback to
+    max_iterations: int = 3  # For review columns: max revision cycles
+    auto_advance_on_approval: bool = True  # For review columns: auto-move on approval
+    escalate_on_blocked: bool = True  # For review columns: escalate blocking issues
 
 
 @dataclass
@@ -89,6 +100,14 @@ class ProjectPipeline:
     description: str
     workflow: str
     active: bool
+    workspace: str = "issues"  # "issues", "discussions", or "hybrid"
+    discussion_category: Optional[str] = None  # For discussions workspace
+    discussion_stages: Optional[List[str]] = None  # For hybrid workspace
+    issue_stages: Optional[List[str]] = None  # For hybrid workspace
+    auto_create_from_issues: bool = True  # Auto-create discussion when issue added
+    update_issue_on_completion: bool = True  # Update issue with final requirements
+    discussion_title_prefix: str = "Requirements: "  # Prefix for discussion titles
+    transition_stage: Optional[str] = None  # Stage at which to transition (for hybrid)
 
 
 @dataclass
@@ -233,7 +252,11 @@ class ConfigManager:
                 name=template_data['name'],
                 description=template_data['description'],
                 workflow_type=template_data['workflow_type'],
-                stages=stages
+                stages=stages,
+                workspace=template_data.get('workspace', 'issues'),
+                discussion_category=template_data.get('discussion_category'),
+                discussion_stages=template_data.get('discussion_stages'),
+                issue_stages=template_data.get('issue_stages')
             )
 
         return templates
@@ -253,7 +276,12 @@ class ConfigManager:
                     stage_mapping=column_data.get('stage_mapping'),
                     agent=column_data.get('agent'),
                     description=column_data['description'],
-                    automation_rules=column_data.get('automation_rules', [])
+                    automation_rules=column_data.get('automation_rules', []),
+                    type=column_data.get('type'),
+                    maker_agent=column_data.get('maker_agent'),
+                    max_iterations=column_data.get('max_iterations', 3),
+                    auto_advance_on_approval=column_data.get('auto_advance_on_approval', True),
+                    escalate_on_blocked=column_data.get('escalate_on_blocked', True)
                 ))
 
             templates[name] = WorkflowTemplate(
@@ -275,13 +303,40 @@ class ConfigManager:
         # Parse pipeline configurations
         pipelines = []
         for pipeline_data in project_data['pipelines']['enabled']:
+            # Get template to inherit workspace settings if not overridden
+            template_name = pipeline_data['template']
+            template = self.get_pipeline_templates().get(template_name)
+
+            # Inherit from template if not specified in project config
+            workspace = pipeline_data.get('workspace')
+            if workspace is None and template:
+                workspace = template.workspace
+            if workspace is None:
+                workspace = 'issues'
+
+            discussion_category = pipeline_data.get('discussion_category')
+            if discussion_category is None and template:
+                discussion_category = template.discussion_category
+
+            discussion_stages = pipeline_data.get('discussion_stages')
+            if discussion_stages is None and template:
+                discussion_stages = template.discussion_stages
+
+            issue_stages = pipeline_data.get('issue_stages')
+            if issue_stages is None and template:
+                issue_stages = template.issue_stages
+
             pipelines.append(ProjectPipeline(
-                template=pipeline_data['template'],
+                template=template_name,
                 name=pipeline_data['name'],
                 board_name=pipeline_data['board_name'],
                 description=pipeline_data['description'],
                 workflow=pipeline_data['workflow'],
-                active=pipeline_data['active']
+                active=pipeline_data['active'],
+                workspace=workspace,
+                discussion_category=discussion_category,
+                discussion_stages=discussion_stages,
+                issue_stages=issue_stages
             ))
 
         return ProjectConfig(
@@ -368,6 +423,22 @@ class ConfigManager:
         """Get enabled pipelines for a project"""
         project_config = self.get_project_config(project_name)
         return [p for p in project_config.pipelines if p.active]
+
+    def get_project_workflow(self, project_name: str, board_name: str) -> WorkflowTemplate:
+        """Get workflow template for a specific project board"""
+        project_config = self.get_project_config(project_name)
+
+        # Find the pipeline with matching board_name
+        pipeline = next(
+            (p for p in project_config.pipelines if p.board_name == board_name),
+            None
+        )
+
+        if not pipeline:
+            raise ConfigurationError(f"No pipeline found for board '{board_name}' in project '{project_name}'")
+
+        # Get the workflow template for this pipeline
+        return self.get_workflow_template(pipeline.workflow)
 
     def validate_project_config(self, project_name: str) -> List[str]:
         """Validate project configuration and return list of errors"""

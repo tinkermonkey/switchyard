@@ -35,6 +35,12 @@ class ProjectMonitor:
         from services.feedback_manager import FeedbackManager
         self.feedback_manager = FeedbackManager()
 
+        # Initialize workspace router for discussions
+        from services.workspace_router import WorkspaceRouter
+        from services.github_discussions import GitHubDiscussions
+        self.workspace_router = WorkspaceRouter()
+        self.discussions = GitHubDiscussions()
+
         # Get polling interval from first project's orchestrator config (for now)
         projects = self.config_manager.list_projects()
         if projects:
@@ -183,11 +189,23 @@ class ProjectMonitor:
             return {'title': f'Issue #{issue_number}', 'body': '', 'labels': []}
 
     def get_previous_stage_context(self, repository: str, issue_number: int, org: str,
-                                   current_column: str, workflow_template) -> str:
+                                   current_column: str, workflow_template,
+                                   workspace_type: str = 'issues',
+                                   discussion_id: Optional[str] = None) -> str:
         """
         Fetch comments from the previous workflow stage agent and user comments since then.
+        Works with both issues and discussions workspaces.
         Returns formatted context string.
         """
+        # Route to appropriate workspace
+        if workspace_type == 'discussions' and discussion_id:
+            return self._get_discussion_context(discussion_id, current_column, workflow_template)
+        else:
+            return self._get_issue_context(repository, issue_number, org, current_column, workflow_template)
+
+    def _get_issue_context(self, repository: str, issue_number: int, org: str,
+                           current_column: str, workflow_template) -> str:
+        """Get previous stage context from issue comments"""
         try:
             # Find previous column in workflow
             column_names = [col.name for col in workflow_template.columns]
@@ -203,6 +221,8 @@ class ProjectMonitor:
 
             if not previous_agent or previous_agent == 'null':
                 return ""  # No agent in previous stage
+
+            repository = repository  # Already have this parameter
 
             # Fetch all comments
             result = subprocess.run(
@@ -262,8 +282,134 @@ class ProjectMonitor:
             logger.error(f"Error fetching previous stage context: {e}")
             return ""
 
+    def _get_discussion_context(self, discussion_id: str, current_column: str, workflow_template) -> str:
+        """Get previous stage context from discussion comments and threaded replies"""
+        try:
+            # Find previous column in workflow
+            column_names = [col.name for col in workflow_template.columns]
+            if current_column not in column_names:
+                return ""
+
+            current_index = column_names.index(current_column)
+            if current_index == 0:
+                return ""  # First column, no previous stage
+
+            previous_column = workflow_template.columns[current_index - 1]
+            previous_agent = previous_column.agent
+
+            if not previous_agent or previous_agent == 'null':
+                return ""  # No agent in previous stage
+
+            # Get discussion with all comments AND REPLIES
+            from services.github_app import github_app
+            from dateutil import parser as date_parser
+            from datetime import timezone
+
+            query = """
+            query($discussionId: ID!) {
+              node(id: $discussionId) {
+                ... on Discussion {
+                  number
+                  comments(first: 100) {
+                    nodes {
+                      id
+                      body
+                      author {
+                        login
+                      }
+                      createdAt
+                      replies(first: 50) {
+                        nodes {
+                          id
+                          body
+                          author {
+                            login
+                          }
+                          createdAt
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+            """
+
+            result = github_app.graphql_request(query, {'discussionId': discussion_id})
+            if not result or 'node' not in result:
+                logger.error(f"Failed to get discussion {discussion_id}")
+                return ""
+
+            all_comments = result['node']['comments']['nodes']
+
+            # Find the last top-level comment from the previous agent
+            # We only want the specific comment thread, not replies buried in other threads
+            previous_agent_comment = None
+            previous_agent_timestamp = None
+            agent_signature = f"_Processed by the {previous_agent} agent_"
+
+            for comment in reversed(all_comments):
+                # Only check top-level comments for the agent's output
+                if agent_signature in comment.get('body', ''):
+                    comment_time = date_parser.parse(comment.get('createdAt'))
+                    if previous_agent_timestamp is None or comment_time > previous_agent_timestamp:
+                        previous_agent_comment = comment
+                        previous_agent_timestamp = comment_time
+
+            if not previous_agent_comment:
+                return ""  # Previous agent hasn't processed yet
+
+            # Make timezone-aware if naive
+            if previous_agent_timestamp.tzinfo is None:
+                previous_agent_timestamp = previous_agent_timestamp.replace(tzinfo=timezone.utc)
+
+            # Get the agent's output
+            previous_agent_output = previous_agent_comment.get('body', '')
+
+            # Collect ONLY replies to this specific comment (threaded replies)
+            user_feedback = []
+            for reply in previous_agent_comment.get('replies', {}).get('nodes', []):
+                reply_author = reply.get('author', {})
+                reply_author_login = reply_author.get('login', '') if reply_author else ''
+                reply_is_bot = 'bot' in reply_author_login.lower()
+
+                # Only include non-bot replies
+                if not reply_is_bot:
+                    reply_time = date_parser.parse(reply.get('createdAt'))
+                    if reply_time.tzinfo is None:
+                        reply_time = reply_time.replace(tzinfo=timezone.utc)
+
+                    user_feedback.append({
+                        'author': reply_author_login,
+                        'body': reply.get('body', ''),
+                        'type': 'reply',
+                        'time': reply_time
+                    })
+
+            # Sort feedback chronologically
+            user_feedback.sort(key=lambda x: x['time'])
+
+            # Format context
+            context_parts = []
+            context_parts.append(f"## Output from {previous_agent.replace('_', ' ').title()}")
+            context_parts.append(previous_agent_output)
+
+            if user_feedback:
+                context_parts.append("\n## User Feedback Since Then")
+                for feedback in user_feedback:
+                    feedback_type = " (reply)" if feedback['type'] == 'reply' else ""
+                    context_parts.append(f"**@{feedback['author']}**{feedback_type}: {feedback['body']}")
+
+            return "\n\n".join(context_parts)
+
+        except Exception as e:
+            logger.error(f"Error fetching discussion context: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return ""
+
     def trigger_agent_for_status(self, project_name: str, board_name: str, issue_number: int, status: str, repository: str) -> Optional[str]:
-        """Determine which agent should handle this status and create a task"""
+        """Determine which agent should handle this status and create a task or review cycle"""
         try:
             # Get workflow template for this board
             project_config = self.config_manager.get_project_config(project_name)
@@ -284,9 +430,11 @@ class ProjectMonitor:
 
             # Find the column that matches this status
             agent = None
-            for column in workflow_template.columns:
-                if column.name == status:
-                    agent = column.agent
+            column = None
+            for col in workflow_template.columns:
+                if col.name == status:
+                    agent = col.agent
+                    column = col
                     break
 
             if agent and agent != 'null':
@@ -301,10 +449,18 @@ class ProjectMonitor:
                         logger.info(f"Task already exists for {agent} on issue #{issue_number} - skipping duplicate")
                         return None
 
-                # Check if agent has already processed this issue (synchronous check using subprocess)
+                # Determine workspace type and get discussion ID FIRST, before checking if processed
+                from config.state_manager import state_manager
+                workspace_type = pipeline_config.workspace
+                discussion_id = None
+
+                if workspace_type in ['discussions', 'hybrid']:
+                    discussion_id = state_manager.get_discussion_for_issue(project_name, issue_number)
+
+                # Check if agent has already processed this issue/discussion
+                # This check must happen BEFORE column type routing to prevent duplicate runs
                 import asyncio
                 try:
-                    # Check if agent has already processed this issue
                     # Create a new event loop for this thread if needed
                     try:
                         loop = asyncio.get_event_loop()
@@ -315,24 +471,113 @@ class ProjectMonitor:
                     from services.github_integration import GitHubIntegration
                     github = GitHubIntegration()
 
-                    already_processed = loop.run_until_complete(
-                        github.has_agent_processed_issue(issue_number, agent, repository)
-                    )
+                    already_processed = False
+
+                    # Check the appropriate workspace
+                    if workspace_type in ['discussions', 'hybrid'] and discussion_id:
+                        # For discussions, check discussion comments
+                        already_processed = loop.run_until_complete(
+                            github.has_agent_processed_discussion(discussion_id, agent)
+                        )
+                        if already_processed:
+                            logger.info(f"Agent {agent} has already processed discussion for issue #{issue_number}")
+
+                            # For review columns, attempt to resume the review cycle in background thread
+                            if column and hasattr(column, 'type') and column.type == 'review':
+                                logger.info(f"Attempting to resume review cycle for issue #{issue_number} in background thread")
+                                try:
+                                    from services.review_cycle import review_cycle_executor
+                                    import threading
+
+                                    def resume_in_thread():
+                                        """Resume review cycle in background thread (non-blocking)"""
+                                        try:
+                                            loop = asyncio.new_event_loop()
+                                            asyncio.set_event_loop(loop)
+
+                                            next_column, success = loop.run_until_complete(
+                                                review_cycle_executor.resume_review_cycle(
+                                                    issue_number=issue_number,
+                                                    repository=repository,
+                                                    project_name=project_name,
+                                                    board_name=board_name,
+                                                    org=project_config.github['org'],
+                                                    discussion_id=discussion_id,
+                                                    column=column,
+                                                    issue_data=self.get_issue_details(repository, issue_number, project_config.github['org']),
+                                                    workflow_columns=workflow_template.columns
+                                                )
+                                            )
+
+                                            if success:
+                                                logger.info(f"Review cycle resumed successfully for issue #{issue_number}")
+                                                if next_column and next_column != column.name:
+                                                    logger.info(f"Review cycle complete, ready to advance to: {next_column}")
+                                            else:
+                                                logger.info(f"Review cycle could not be resumed for issue #{issue_number}")
+
+                                            loop.close()
+                                        except Exception as e:
+                                            logger.error(f"Failed to resume review cycle: {e}")
+                                            import traceback
+                                            logger.error(traceback.format_exc())
+
+                                    thread = threading.Thread(target=resume_in_thread, daemon=True)
+                                    thread.start()
+                                    logger.info(f"Review cycle resume thread started for issue #{issue_number}")
+
+                                except Exception as e:
+                                    logger.error(f"Failed to start review cycle resume thread: {e}")
+                                    import traceback
+                                    logger.error(traceback.format_exc())
+                            else:
+                                logger.info(f"Not a review column, skipping resume attempt")
+                    else:
+                        # For issues, check issue comments
+                        already_processed = loop.run_until_complete(
+                            github.has_agent_processed_issue(issue_number, agent, repository)
+                        )
+                        if already_processed:
+                            logger.info(f"Agent {agent} has already processed issue #{issue_number} - skipping reprocessing")
 
                     if already_processed:
-                        logger.info(f"Agent {agent} has already processed issue #{issue_number} - skipping reprocessing")
                         return None
+
                 except Exception as e:
                     logger.warning(f"Could not check if issue was already processed: {e}")
+                    import traceback
+                    logger.warning(traceback.format_exc())
                     # Continue anyway if we can't check
+
+            # Check column type and route appropriately
+            # This happens AFTER the "already processed" check to prevent duplicate runs
+            if column and hasattr(column, 'type'):
+                if column.type == 'conversational':
+                    logger.info(f"Starting conversational loop for issue #{issue_number} in {status}")
+                    return self._start_conversational_loop_for_issue(
+                        project_name, board_name, issue_number, status,
+                        repository, project_config, pipeline_config,
+                        workflow_template, column
+                    )
+                elif column.type == 'review':
+                    logger.info(f"Starting review cycle for issue #{issue_number} in {status}")
+                    return self._start_review_cycle_for_issue(
+                        project_name, board_name, issue_number, status,
+                        repository, project_config, pipeline_config,
+                        workflow_template, column
+                    )
+
+            if agent and agent != 'null':
 
                 # Fetch full issue details from GitHub
                 issue_data = self.get_issue_details(repository, issue_number, project_config.github['org'])
 
-                # Fetch context from previous workflow stage
+                # Fetch context from previous workflow stage (workspace-aware)
                 previous_stage_context = self.get_previous_stage_context(
                     repository, issue_number, project_config.github['org'],
-                    status, workflow_template
+                    status, workflow_template,
+                    workspace_type=workspace_type,
+                    discussion_id=discussion_id
                 )
 
                 # Create task for the agent
@@ -346,8 +591,13 @@ class ProjectMonitor:
                     'previous_stage_output': previous_stage_context,  # Include previous agent's work
                     'column': status,
                     'trigger': 'project_monitor',
+                    'workspace_type': workspace_type,
                     'timestamp': datetime.now().isoformat()
                 }
+
+                # Add discussion_id if working in discussions
+                if discussion_id:
+                    task_context['discussion_id'] = discussion_id
 
                 task = Task(
                     id=f"{agent}_{project_name}_{board_name}_{issue_number}_{int(time.time())}",
@@ -369,14 +619,241 @@ class ProjectMonitor:
             logger.error(f"Error triggering agent for status: {e}")
             return None
 
+    def _start_conversational_loop_for_issue(
+        self,
+        project_name: str,
+        board_name: str,
+        issue_number: int,
+        status: str,
+        repository: str,
+        project_config,
+        pipeline_config,
+        workflow_template,
+        column
+    ) -> Optional[str]:
+        """Start a conversational loop (human feedback mode) for an issue"""
+        try:
+            import asyncio
+            from services.human_feedback_loop import human_feedback_loop_executor
+
+            # Get issue details
+            issue_data = self.get_issue_details(repository, issue_number, project_config.github['org'])
+
+            # Get workspace info
+            workspace_type = pipeline_config.workspace
+            from config.state_manager import state_manager
+            discussion_id = None
+
+            if workspace_type in ['discussions', 'hybrid']:
+                discussion_id = state_manager.get_discussion_for_issue(project_name, issue_number)
+
+            # Get previous stage output if available
+            previous_stage_context = self.get_previous_stage_context(
+                repository, issue_number, project_config.github['org'],
+                status, workflow_template,
+                workspace_type=workspace_type,
+                discussion_id=discussion_id
+            )
+
+            # Start conversational loop in background thread
+            logger.info(
+                f"Starting conversational loop for {column.agent} on issue #{issue_number} "
+                f"(workspace: {workspace_type})"
+            )
+
+            import threading
+
+            def run_loop_in_thread():
+                """Run the async loop in a background thread"""
+                try:
+                    # Create new event loop for this thread
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+
+                    next_column, success = loop.run_until_complete(
+                        human_feedback_loop_executor.start_loop(
+                            issue_number=issue_number,
+                            repository=repository,
+                            project_name=project_name,
+                            board_name=board_name,
+                            column=column,
+                            issue_data=issue_data,
+                            previous_stage_output=previous_stage_context,
+                            org=project_config.github['org'],
+                            workflow_columns=workflow_template.columns,
+                            workspace_type=workspace_type,
+                            discussion_id=discussion_id
+                        )
+                    )
+
+                    logger.info(
+                        f"Conversational loop completed for issue #{issue_number}, "
+                        f"success={success}, next_column={next_column}"
+                    )
+
+                    loop.close()
+                except Exception as e:
+                    logger.error(f"Error in conversational loop thread: {e}")
+                    import traceback
+                    logger.error(traceback.format_exc())
+
+            # Start in background thread
+            thread = threading.Thread(target=run_loop_in_thread, daemon=True)
+            thread.start()
+
+            logger.info(f"Conversational loop thread started for issue #{issue_number}")
+
+            return column.agent
+
+        except Exception as e:
+            logger.error(f"Conversational loop failed: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return None
+
+    def _start_review_cycle_for_issue(
+        self,
+        project_name: str,
+        board_name: str,
+        issue_number: int,
+        status: str,
+        repository: str,
+        project_config,
+        pipeline_config,
+        workflow_template,
+        column
+    ) -> Optional[str]:
+        """Start an automated review cycle for an issue in a review column (non-blocking)"""
+        try:
+            import asyncio
+            import threading
+            from services.review_cycle import review_cycle_executor
+
+            # Get issue details
+            issue_data = self.get_issue_details(repository, issue_number, project_config.github['org'])
+
+            # Get previous stage context (maker's output)
+            workspace_type = pipeline_config.workspace
+            from config.state_manager import state_manager
+            discussion_id = None
+
+            if workspace_type in ['discussions', 'hybrid']:
+                discussion_id = state_manager.get_discussion_for_issue(project_name, issue_number)
+
+            previous_stage_context = self.get_previous_stage_context(
+                repository, issue_number, project_config.github['org'],
+                status, workflow_template,
+                workspace_type=workspace_type,
+                discussion_id=discussion_id
+            )
+
+            if not previous_stage_context:
+                logger.warning(f"No previous stage output found for issue #{issue_number} - cannot start review cycle")
+                return None
+
+            logger.info(
+                f"Starting review cycle for issue #{issue_number} in background thread "
+                f"(reviewer: {column.agent}, maker: {column.maker_agent})"
+            )
+
+            def run_cycle_in_thread():
+                """Run the review cycle in a background thread"""
+                try:
+                    # Create new event loop for this thread
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+
+                    # Post initial comment (workspace-aware)
+                    from services.github_integration import GitHubIntegration
+                    github = GitHubIntegration()
+
+                    start_context = {
+                        'issue_number': issue_number,
+                        'repository': repository,
+                        'workspace_type': workspace_type,
+                        'discussion_id': discussion_id
+                    }
+
+                    loop.run_until_complete(
+                        github.post_agent_output(
+                            start_context,
+                            f"""## 🔄 Starting Review Cycle
+
+**Reviewer**: {column.agent.replace('_', ' ').title()}
+**Maker**: {column.maker_agent.replace('_', ' ').title()}
+**Max Iterations**: {column.max_iterations}
+
+The automated maker-checker review cycle is now starting. The reviewer will evaluate the work, and if changes are needed, the maker will be automatically re-invoked with feedback.
+
+---
+_Review cycle initiated by Claude Code Orchestrator_
+"""
+                        )
+                    )
+
+                    # Execute review cycle
+                    next_column, success = loop.run_until_complete(
+                        review_cycle_executor.start_review_cycle(
+                            issue_number=issue_number,
+                            repository=repository,
+                            project_name=project_name,
+                            board_name=board_name,
+                            column=column,
+                            issue_data=issue_data,
+                            previous_stage_output=previous_stage_context,
+                            org=project_config.github['org'],
+                            workflow_columns=workflow_template.columns,
+                            workspace_type=workspace_type,
+                            discussion_id=discussion_id
+                        )
+                    )
+
+                    logger.info(
+                        f"Review cycle completed for issue #{issue_number}, "
+                        f"success={success}, next_column={next_column}"
+                    )
+
+                    loop.close()
+                except Exception as e:
+                    logger.error(f"Error in review cycle thread: {e}")
+                    import traceback
+                    logger.error(traceback.format_exc())
+
+            # Start in background thread (non-blocking)
+            thread = threading.Thread(target=run_cycle_in_thread, daemon=True)
+            thread.start()
+
+            logger.info(f"Review cycle thread started for issue #{issue_number}")
+
+            return column.agent
+
+        except Exception as e:
+            logger.error(f"Error starting review cycle: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return None
 
     def monitor_projects(self):
         """Main monitoring loop using new configuration system"""
         import sys
+        import asyncio
         from config.state_manager import state_manager
 
         logger.info("Starting GitHub Projects v2 monitor...")
         sys.stdout.flush()
+
+        # Resume any active review cycles from before restart
+        logger.info("Checking for active review cycles to resume...")
+        from services.review_cycle import review_cycle_executor
+
+        for project_name in self.config_manager.list_projects():
+            project_config = self.config_manager.get_project_config(project_name)
+            org = project_config.github['org']
+
+            # Run async resume method
+            asyncio.run(review_cycle_executor.resume_active_cycles(project_name, org))
+
+        logger.info("Review cycle recovery complete, starting main monitoring loop...")
 
         while True:
             try:
@@ -423,7 +900,7 @@ class ProjectMonitor:
                             else:
                                 logger.debug(f"No changes in {project_name}/{pipeline.board_name}")
 
-                            # Check all items for feedback comments
+                            # Check all items for feedback comments (in issues)
                             for item in current_items:
                                 self.check_for_feedback(
                                     project_name,
@@ -433,6 +910,15 @@ class ProjectMonitor:
                                 )
                         else:
                             logger.debug(f"No items found in {project_name}/{pipeline.board_name}")
+
+                        # Monitor discussions if pipeline uses discussions workspace
+                        if pipeline.workspace in ['discussions', 'hybrid']:
+                            self.monitor_discussions(
+                                project_name,
+                                pipeline.board_name,
+                                project_config.github['org'],
+                                project_config.github['repo']
+                            )
 
                 logger.debug(f"Sleeping for {self.poll_interval} seconds...")
                 time.sleep(self.poll_interval)
@@ -445,6 +931,13 @@ class ProjectMonitor:
                 time.sleep(10)  # Wait before retrying
 
     def check_for_feedback(self, project_name: str, board_name: str, issue_number: int, repository: str):
+        """
+        DELETED: Old feedback manager - replaced by conversational_loop and review_cycle
+        """
+        logger.debug("Old feedback manager disabled")
+        return
+
+    def _check_for_feedback_OLD_DELETED(self, project_name: str, board_name: str, issue_number: int, repository: str):
         """Check if there are new feedback comments mentioning @orchestrator-bot"""
         try:
             # Get project config
@@ -463,8 +956,6 @@ class ProjectMonitor:
             # Get workflow template
             workflow_template = self.config_manager.get_workflow_template(pipeline_config.workflow)
 
-            # Find which agent is assigned to current column
-            # For now, we'll check all agents that have processed this issue
             from services.github_integration import GitHubIntegration
             import asyncio
 
@@ -477,44 +968,142 @@ class ProjectMonitor:
 
             github = GitHubIntegration()
 
-            # Check each agent defined in the workflow
-            for column in workflow_template.columns:
-                agent = column.agent
-                if not agent or agent == 'null':
-                    continue
+            # Get all comments to find which agent the user is responding to
+            all_feedback_comments = loop.run_until_complete(
+                github.get_feedback_comments(issue_number, repository, since_timestamp=None)
+            )
 
-                # Get last time this agent commented
-                last_comment_time = self.feedback_manager.get_last_agent_comment_time(issue_number, agent)
+            # Filter to unprocessed comments only
+            new_feedback = []
+            for comment in all_feedback_comments:
+                if not self.feedback_manager.is_comment_processed(issue_number, comment['id']):
+                    new_feedback.append(comment)
 
-                # Get feedback comments since then
-                feedback_comments = loop.run_until_complete(
-                    github.get_feedback_comments(issue_number, repository, last_comment_time)
-                )
+            if not new_feedback:
+                return
 
-                if feedback_comments:
-                    # Filter out already processed comments
-                    new_feedback = []
-                    for comment in feedback_comments:
-                        if not self.feedback_manager.is_comment_processed(issue_number, comment['id']):
-                            new_feedback.append(comment)
+            # Fetch all issue comments to find the most recent agent output before user feedback
+            result = subprocess.run(
+                ['gh', 'issue', 'view', str(issue_number), '--repo',
+                 f"{project_config.github['org']}/{repository}", '--json', 'comments'],
+                capture_output=True, text=True, check=True
+            )
+            all_comments_data = json.loads(result.stdout)
+            all_comments = all_comments_data.get('comments', [])
 
-                    if new_feedback:
-                        logger.info(f"Found {len(new_feedback)} new feedback comment(s) for {agent} on issue #{issue_number}")
+            # For each new feedback comment, find which agent it's responding to
+            from dateutil import parser as date_parser
+            from datetime import timezone
 
-                        # Create a feedback task for the agent
-                        self.create_feedback_task(
-                            project_name, board_name, issue_number,
-                            repository, agent, new_feedback, project_config
+            for feedback_comment in new_feedback:
+                feedback_time = date_parser.parse(feedback_comment['created_at'])
+                if feedback_time.tzinfo is None:
+                    feedback_time = feedback_time.replace(tzinfo=timezone.utc)
+
+                # Find the most recent agent comment before this feedback
+                target_agent = None
+                agent_comment_body = None
+                most_recent_agent_time = None
+
+                for comment in all_comments:
+                    comment_time = date_parser.parse(comment.get('createdAt'))
+                    if comment_time.tzinfo is None:
+                        comment_time = comment_time.replace(tzinfo=timezone.utc)
+
+                    # Only consider comments before the feedback
+                    if comment_time >= feedback_time:
+                        continue
+
+                    # Check if this is an agent comment
+                    body = comment.get('body', '')
+                    for column in workflow_template.columns:
+                        agent = column.agent
+                        if agent and agent != 'null':
+                            # Look for agent signature in comment
+                            if f"_Processed by the {agent} agent_" in body:
+                                # Track the most recent agent comment
+                                if most_recent_agent_time is None or comment_time > most_recent_agent_time:
+                                    target_agent = agent
+                                    agent_comment_body = body
+                                    most_recent_agent_time = comment_time
+                                break
+
+                if target_agent:
+                    # If the target agent is a reviewer, feedback should go to the maker agent instead
+                    final_target_agent = target_agent
+                    if 'reviewer' in target_agent or 'review' in target_agent:
+                        # Find the maker agent that this reviewer was reviewing
+                        maker_agent = self._find_maker_for_reviewer(
+                            target_agent, workflow_template, all_comments, most_recent_agent_time
                         )
-                        # Only process feedback for the first matching agent to avoid duplicates
-                        break
+                        if maker_agent:
+                            logger.info(f"Routing feedback from {target_agent} review to maker agent {maker_agent}")
+                            final_target_agent = maker_agent
+                            # Get the maker's output as previous_output instead of reviewer's
+                            for comment in reversed(all_comments):
+                                if f"_Processed by the {maker_agent} agent_" in comment.get('body', ''):
+                                    agent_comment_body = comment.get('body', '')
+                                    break
+                        else:
+                            logger.warning(f"Could not find maker for reviewer {target_agent}, sending feedback to reviewer")
+
+                    logger.info(f"Found feedback for {final_target_agent} on issue #{issue_number}")
+
+                    # Create a feedback task for this specific agent
+                    self.create_feedback_task(
+                        project_name, board_name, issue_number,
+                        repository, final_target_agent, [feedback_comment], project_config,
+                        previous_output=agent_comment_body
+                    )
+                else:
+                    logger.warning(f"Could not determine which agent to route feedback to for issue #{issue_number}")
+                    # Mark as processed anyway to avoid repeated attempts
+                    self.feedback_manager.mark_comment_processed(issue_number, feedback_comment['id'], project_name)
 
         except Exception as e:
             logger.error(f"Error checking for feedback: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+
+    def _find_maker_for_reviewer(self, reviewer_agent, workflow_template, all_comments, reviewer_time):
+        """Find the maker agent that a reviewer was reviewing"""
+        from dateutil import parser as date_parser
+        from datetime import timezone
+
+        # Look backwards through comments before the reviewer's comment
+        # to find the most recent non-reviewer agent
+        most_recent_maker = None
+        most_recent_maker_time = None
+
+        for comment in all_comments:
+            comment_time = date_parser.parse(comment.get('createdAt'))
+            if comment_time.tzinfo is None:
+                comment_time = comment_time.replace(tzinfo=timezone.utc)
+
+            # Only consider comments before the reviewer
+            if comment_time >= reviewer_time:
+                continue
+
+            # Check if this is an agent comment
+            body = comment.get('body', '')
+            for column in workflow_template.columns:
+                agent = column.agent
+                if agent and agent != 'null':
+                    # Look for agent signature
+                    if f"_Processed by the {agent} agent_" in body:
+                        # Skip if it's also a reviewer
+                        if 'reviewer' not in agent and 'review' not in agent:
+                            # Track the most recent maker
+                            if most_recent_maker_time is None or comment_time > most_recent_maker_time:
+                                most_recent_maker = agent
+                                most_recent_maker_time = comment_time
+                        break
+
+        return most_recent_maker
 
     def create_feedback_task(self, project_name: str, board_name: str, issue_number: int,
                             repository: str, agent: str, feedback_comments: List[Dict[str, Any]],
-                            project_config):
+                            project_config, previous_output: str = None):
         """Create a task to handle feedback for an agent"""
         try:
             # Fetch full issue details
@@ -540,6 +1129,7 @@ class ProjectMonitor:
                     'comments': feedback_comments,
                     'formatted_text': feedback_text
                 },
+                'previous_output': previous_output,  # Include agent's previous work
                 'timestamp': datetime.now().isoformat()
             }
 
@@ -571,6 +1161,16 @@ class ProjectMonitor:
             if change['type'] == 'status_changed':
                 logger.info(f"   Status: {change['old_status']} → {change['new_status']}")
                 logger.info(f"   Board: {board_name}")
+
+                # Check if this issue needs a discussion created BEFORE triggering agent
+                # (Important for discussions workspaces)
+                self._check_and_create_discussion(
+                    project_name,
+                    board_name,
+                    change['issue_number'],
+                    change['repository']
+                )
+
                 self.trigger_agent_for_status(
                     project_name,
                     board_name,
@@ -581,6 +1181,15 @@ class ProjectMonitor:
             elif change['type'] == 'item_added':
                 logger.info(f"   Added to: {change['status']}")
                 logger.info(f"   Board: {board_name}")
+
+                # Check if this issue needs a discussion created
+                self._check_and_create_discussion(
+                    project_name,
+                    board_name,
+                    change['issue_number'],
+                    change['repository']
+                )
+
                 self.trigger_agent_for_status(
                     project_name,
                     board_name,
@@ -588,6 +1197,993 @@ class ProjectMonitor:
                     change['status'],
                     change['repository']
                 )
+
+    def _check_and_create_discussion(self, project_name: str, board_name: str,
+                                     issue_number: int, repository: str):
+        """Check if issue needs a discussion and create it if configured"""
+        try:
+            from config.state_manager import state_manager
+
+            # Check if discussion already exists for this issue
+            if state_manager.get_discussion_for_issue(project_name, issue_number):
+                logger.debug(f"Discussion already exists for issue #{issue_number}")
+                return
+
+            # Get project config
+            project_config = self.config_manager.get_project_config(project_name)
+
+            # Find pipeline config
+            pipeline_config = None
+            for pipeline in project_config.pipelines:
+                if pipeline.board_name == board_name:
+                    pipeline_config = pipeline
+                    break
+
+            if not pipeline_config:
+                return
+
+            # Check if this pipeline uses discussions
+            workspace = pipeline_config.workspace
+            if workspace not in ['discussions', 'hybrid']:
+                return
+
+            # Check if auto-creation is enabled (default to True for discussion workspaces)
+            auto_create = getattr(pipeline_config, 'auto_create_from_issues', True)
+            if not auto_create:
+                return
+
+            logger.info(f"Creating discussion for issue #{issue_number} (workspace: {workspace})")
+
+            # Create the discussion
+            self._create_discussion_from_issue(
+                project_name,
+                issue_number,
+                repository,
+                pipeline_config,
+                project_config
+            )
+
+        except Exception as e:
+            logger.error(f"Error checking/creating discussion: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+
+    def _create_discussion_from_issue(self, project_name: str, issue_number: int,
+                                     repository: str, pipeline_config, project_config):
+        """Auto-create discussion from issue"""
+        try:
+            # Fetch issue details
+            issue_data = self.get_issue_details(repository, issue_number, project_config.github['org'])
+
+            # Get discussion category
+            workspace_type, category_id = self.workspace_router.determine_workspace(
+                project_name,
+                pipeline_config.board_name,
+                'initial'  # Use first stage
+            )
+
+            if not category_id:
+                logger.error(f"Could not determine discussion category for {project_name}/{pipeline_config.board_name}")
+                return
+
+            # Get repository ID for GraphQL
+            repo_id = self.discussions.get_repository_id(
+                project_config.github['org'],
+                repository
+            )
+
+            if not repo_id:
+                logger.error(f"Could not get repository ID for {project_config.github['org']}/{repository}")
+                return
+
+            # Format discussion title
+            title_prefix = getattr(pipeline_config, 'discussion_title_prefix', 'Requirements: ')
+            discussion_title = f"{title_prefix}{issue_data['title']}"
+
+            # Format discussion body
+            discussion_body = self._format_discussion_from_issue(issue_data, issue_number)
+
+            # Create discussion
+            discussion_id = self.discussions.create_discussion(
+                owner=project_config.github['org'],
+                repo=repository,
+                repository_id=repo_id,
+                category_id=category_id,
+                title=discussion_title,
+                body=discussion_body
+            )
+
+            if not discussion_id:
+                logger.error(f"Failed to create discussion for issue #{issue_number}")
+                return
+
+            # Get discussion number for user-friendly reference
+            discussion_details = self.discussions.get_discussion(discussion_id)
+            discussion_number = discussion_details.get('number') if discussion_details else '?'
+
+            logger.info(f"Created discussion #{discussion_number} (ID: {discussion_id}) for issue #{issue_number}")
+
+            # Store link in state
+            from config.state_manager import state_manager
+            state_manager.link_issue_to_discussion(project_name, issue_number, discussion_id)
+
+            # Add comment to issue linking to discussion
+            discussion_url = discussion_details.get('url', '') if discussion_details else ''
+            comment_body = f"""📋 Requirements analysis moved to Discussion #{discussion_number}
+
+This issue will be updated with final requirements when ready for implementation.
+
+_Link: {discussion_url}_"""
+
+            subprocess.run(
+                ['gh', 'issue', 'comment', str(issue_number),
+                 '--repo', f"{project_config.github['org']}/{repository}",
+                 '--body', comment_body],
+                capture_output=True, text=True, check=True
+            )
+
+            logger.info(f"Added link comment to issue #{issue_number}")
+
+        except Exception as e:
+            logger.error(f"Failed to create discussion from issue: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+
+    def _format_discussion_from_issue(self, issue_data: Dict[str, Any], issue_number: int) -> str:
+        """Format discussion body from issue data"""
+        labels = ', '.join([label['name'] for label in issue_data.get('labels', [])])
+        author = issue_data.get('author', {}).get('login', 'unknown')
+
+        return f"""# Requirements Analysis
+
+Auto-created from Issue #{issue_number}
+
+## User Request
+
+{issue_data.get('body', '_No description provided_')}
+
+---
+
+**Labels**: {labels if labels else '_None_'}
+**Requested by**: @{author}
+
+---
+
+The orchestrator will analyze this request and develop detailed requirements.
+When complete, Issue #{issue_number} will be updated with final requirements.
+"""
+
+    def finalize_requirements_to_issue(self, project_name: str, board_name: str,
+                                      issue_number: int, repository: str,
+                                      discussion_id: Optional[str] = None):
+        """
+        Extract final requirements from discussion and update issue body.
+        Called when requirements are approved or at transition stage.
+        """
+        try:
+            from config.state_manager import state_manager
+
+            # Get project config
+            project_config = self.config_manager.get_project_config(project_name)
+
+            # Get discussion ID from state if not provided
+            if not discussion_id:
+                discussion_id = state_manager.get_discussion_for_issue(project_name, issue_number)
+                if not discussion_id:
+                    logger.error(f"No discussion found for issue #{issue_number}")
+                    return
+
+            logger.info(f"Finalizing requirements from discussion to issue #{issue_number}")
+
+            # Get full discussion with all comments
+            discussion = self.discussions.get_discussion(discussion_id)
+            if not discussion:
+                logger.error(f"Could not retrieve discussion {discussion_id}")
+                return
+
+            # Extract requirements from agent comments
+            requirements = self._extract_requirements_from_discussion(discussion_id, project_config, repository)
+
+            if not requirements:
+                logger.warning(f"No requirements found in discussion for issue #{issue_number}")
+                return
+
+            # Format new issue body
+            discussion_number = discussion.get('number', '?')
+            discussion_url = discussion.get('url', '')
+            new_issue_body = self._format_finalized_requirements(
+                discussion_number,
+                discussion_url,
+                requirements
+            )
+
+            # Update issue body
+            result = subprocess.run(
+                ['gh', 'issue', 'edit', str(issue_number),
+                 '--repo', f"{project_config.github['org']}/{repository}",
+                 '--body', new_issue_body],
+                capture_output=True, text=True, check=True
+            )
+
+            logger.info(f"Updated issue #{issue_number} with finalized requirements")
+
+            # Add "ready-for-implementation" label
+            subprocess.run(
+                ['gh', 'issue', 'edit', str(issue_number),
+                 '--repo', f"{project_config.github['org']}/{repository}",
+                 '--add-label', 'ready-for-implementation'],
+                capture_output=True, text=True
+            )
+
+            # Post completion comment to discussion
+            completion_comment = f"""✅ Requirements finalized and posted to Issue #{issue_number}
+
+The issue has been updated with the final requirements from this discussion.
+Moving to implementation phase.
+
+[View Issue →]({discussion.get('url', '').replace(f'/discussions/{discussion_number}', f'/issues/{issue_number}')})"""
+
+            self.discussions.add_discussion_comment(discussion_id, completion_comment)
+
+            logger.info(f"Finalization complete for issue #{issue_number}")
+
+        except Exception as e:
+            logger.error(f"Failed to finalize requirements to issue: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+
+    def _extract_requirements_from_discussion(self, discussion_id: str,
+                                             project_config, repository: str) -> Dict[str, Any]:
+        """
+        Extract structured requirements from discussion comments.
+        Looks for outputs from business_analyst, architect, and other agents.
+        """
+        try:
+            # Get full discussion with comments
+            org = project_config.github['org']
+
+            # Use GraphQL to get discussion with all comments
+            query = """
+            query($discussionId: ID!) {
+              node(id: $discussionId) {
+                ... on Discussion {
+                  number
+                  comments(first: 100) {
+                    nodes {
+                      id
+                      body
+                      author {
+                        login
+                      }
+                      createdAt
+                    }
+                  }
+                }
+              }
+            }
+            """
+
+            from services.github_app import github_app
+            result = github_app.graphql_request(query, {'discussionId': discussion_id})
+
+            if not result or 'node' not in result:
+                logger.error(f"Failed to get discussion comments for {discussion_id}")
+                return {}
+
+            comments = result['node']['comments']['nodes']
+
+            # Extract agent outputs
+            requirements = {
+                'executive_summary': '',
+                'functional': [],
+                'non_functional': [],
+                'user_stories': [],
+                'architecture': '',
+                'acceptance_criteria': []
+            }
+
+            # Find the most recent business analyst output
+            ba_output = None
+            architect_output = None
+
+            for comment in reversed(comments):
+                body = comment.get('body', '')
+                author = comment.get('author', {}).get('login', '')
+
+                # Look for agent signatures
+                if '_Processed by the business_analyst agent_' in body:
+                    if not ba_output:
+                        ba_output = body
+                elif '_Processed by the software_architect agent_' in body:
+                    if not architect_output:
+                        architect_output = body
+
+            # Parse business analyst output
+            if ba_output:
+                requirements['executive_summary'] = self._extract_section(ba_output, 'Executive Summary', 'Functional Requirements')
+                requirements['functional'] = self._extract_list_items(ba_output, 'Functional Requirements')
+                requirements['non_functional'] = self._extract_list_items(ba_output, 'Non-Functional Requirements')
+                requirements['user_stories'] = self._extract_user_stories(ba_output)
+                requirements['acceptance_criteria'] = self._extract_list_items(ba_output, 'Acceptance Criteria')
+
+            # Parse architect output
+            if architect_output:
+                requirements['architecture'] = self._extract_section(architect_output, 'Architecture Overview', 'Component Design')
+
+            return requirements
+
+        except Exception as e:
+            logger.error(f"Error extracting requirements from discussion: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return {}
+
+    def _extract_section(self, text: str, start_marker: str, end_marker: str) -> str:
+        """Extract text between two section markers"""
+        try:
+            start = text.find(f"## {start_marker}")
+            if start == -1:
+                start = text.find(f"### {start_marker}")
+            if start == -1:
+                return ""
+
+            end = text.find(f"## {end_marker}", start + 1)
+            if end == -1:
+                end = text.find(f"### {end_marker}", start + 1)
+            if end == -1:
+                end = len(text)
+
+            section = text[start:end].strip()
+            # Remove the header line
+            lines = section.split('\n', 1)
+            return lines[1].strip() if len(lines) > 1 else ""
+        except Exception:
+            return ""
+
+    def _extract_list_items(self, text: str, section_name: str) -> List[str]:
+        """Extract bullet point list items from a section"""
+        try:
+            section_text = self._extract_section(text, section_name, '---')
+            if not section_text:
+                return []
+
+            items = []
+            for line in section_text.split('\n'):
+                line = line.strip()
+                if line.startswith('- ') or line.startswith('* '):
+                    items.append(line[2:].strip())
+                elif line.startswith('• '):
+                    items.append(line[2:].strip())
+            return items
+        except Exception:
+            return []
+
+    def _extract_user_stories(self, text: str) -> List[str]:
+        """Extract user stories from business analyst output"""
+        try:
+            stories = []
+            # Look for "As a..." patterns
+            lines = text.split('\n')
+            current_story = []
+
+            for line in lines:
+                line = line.strip()
+                if line.startswith('**As a') or line.startswith('As a'):
+                    if current_story:
+                        stories.append(' '.join(current_story))
+                    current_story = [line]
+                elif current_story and (line.startswith('I want') or line.startswith('So that')):
+                    current_story.append(line)
+                elif current_story and not line:
+                    stories.append(' '.join(current_story))
+                    current_story = []
+
+            if current_story:
+                stories.append(' '.join(current_story))
+
+            return stories
+        except Exception:
+            return []
+
+    def _format_finalized_requirements(self, discussion_number: int, discussion_url: str,
+                                      requirements: Dict[str, Any]) -> str:
+        """Format the finalized requirements for issue body"""
+        parts = []
+
+        # Executive summary
+        if requirements.get('executive_summary'):
+            parts.append(requirements['executive_summary'])
+            parts.append('')
+
+        # Background section
+        parts.append('## Background')
+        parts.append(f'Full requirements analysis available in [Discussion #{discussion_number}]({discussion_url})')
+        parts.append('')
+
+        # Functional requirements
+        if requirements.get('functional'):
+            parts.append('## Functional Requirements')
+            for item in requirements['functional']:
+                parts.append(f'- {item}')
+            parts.append('')
+
+        # Non-functional requirements
+        if requirements.get('non_functional'):
+            parts.append('## Non-Functional Requirements')
+            for item in requirements['non_functional']:
+                parts.append(f'- {item}')
+            parts.append('')
+
+        # User stories
+        if requirements.get('user_stories'):
+            parts.append('## User Stories')
+            for story in requirements['user_stories']:
+                parts.append(f'- {story}')
+            parts.append('')
+
+        # Architecture notes
+        if requirements.get('architecture'):
+            parts.append('## Architecture Notes')
+            parts.append(requirements['architecture'])
+            parts.append('')
+
+        # Acceptance criteria
+        if requirements.get('acceptance_criteria'):
+            parts.append('## Acceptance Criteria')
+            for item in requirements['acceptance_criteria']:
+                parts.append(f'- {item}')
+            parts.append('')
+
+        # Footer
+        parts.append('---')
+        parts.append(f'📋 Requirements finalized from [Discussion #{discussion_number}]({discussion_url})')
+        parts.append('Ready for implementation.')
+        parts.append('---')
+
+        return '\n'.join(parts)
+
+    def monitor_discussions(self, project_name: str, board_name: str, org: str, repo: str):
+        """Monitor discussions for activity and feedback"""
+        try:
+            from config.state_manager import state_manager
+
+            # Get project state to find linked discussions
+            project_state = state_manager.load_project_state(project_name)
+            if not project_state or not project_state.issue_discussion_links:
+                logger.debug(f"No discussions linked for {project_name}")
+                return
+
+            # Get recent discussions (updated in last poll interval * 2)
+            from datetime import datetime, timedelta, timezone
+            since = datetime.now(timezone.utc) - timedelta(seconds=self.poll_interval * 2)
+
+            # Check each linked discussion for new activity
+            for issue_number, discussion_id in list(project_state.issue_discussion_links.items()):
+                try:
+                    # Get discussion details
+                    discussion = self.discussions.get_discussion(discussion_id)
+                    if not discussion:
+                        # Discussion was deleted - remove from state
+                        from config.state_manager import state_manager
+                        logger.info(f"Discussion {discussion_id} for issue #{issue_number} no longer exists, removing from state")
+                        state_manager.unlink_issue_discussion(project_name, int(issue_number))
+                        continue
+
+                    # Check if discussion has been updated recently
+                    updated_at = datetime.fromisoformat(discussion['updatedAt'].replace('Z', '+00:00'))
+                    if updated_at < since:
+                        continue  # No recent activity
+
+                    logger.debug(f"Checking discussion #{discussion.get('number')} for new activity")
+
+                    # Check for feedback in discussion comments
+                    self.check_for_feedback_in_discussion(
+                        project_name,
+                        board_name,
+                        discussion_id,
+                        issue_number,
+                        repo
+                    )
+
+                except Exception as e:
+                    logger.error(f"Error monitoring discussion {discussion_id}: {e}")
+                    continue
+
+        except Exception as e:
+            logger.error(f"Error in monitor_discussions: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+
+
+    def get_full_thread_history(self, all_comments: List[Dict], parent_comment_id: str) -> List[Dict]:
+        """
+        Extract complete thread history for conversational context
+
+        Args:
+            all_comments: All comments from the discussion (with replies)
+            parent_comment_id: The ID of the parent comment to extract thread from
+
+        Returns:
+            List of messages in chronological order with role, author, body, timestamp
+        """
+        thread_history = []
+
+        # Find the parent comment
+        for comment in all_comments:
+            if comment['id'] == parent_comment_id:
+                # Add parent comment (the agent's initial output or previous reply)
+                author_login = comment.get('author', {}).get('login', 'unknown')
+                is_bot = 'bot' in author_login.lower()
+
+                thread_history.append({
+                    'role': 'agent' if is_bot else 'user',
+                    'author': author_login,
+                    'body': comment.get('body', ''),
+                    'timestamp': comment.get('createdAt'),
+                    'is_agent': is_bot
+                })
+
+                # Add all replies in chronological order
+                for reply in comment.get('replies', {}).get('nodes', []):
+                    reply_author = reply.get('author', {})
+                    reply_author_login = reply_author.get('login', '') if reply_author else 'unknown'
+                    reply_is_bot = 'bot' in reply_author_login.lower()
+
+                    thread_history.append({
+                        'role': 'agent' if reply_is_bot else 'user',
+                        'author': reply_author_login,
+                        'body': reply.get('body', ''),
+                        'timestamp': reply.get('createdAt'),
+                        'is_agent': reply_is_bot
+                    })
+
+                break
+
+        return thread_history
+
+    def check_for_feedback_in_discussion(self, project_name: str, board_name: str,
+                                         discussion_id: str, issue_number: int, repository: str):
+        """
+        Check if there's an escalated review cycle waiting for human feedback on this discussion.
+        If so, check for new human comments and resume the cycle.
+
+        Note: Regular feedback for conversational columns is handled by human_feedback_loop.
+        This method only checks for escalated review cycles.
+        """
+        try:
+            from services.review_cycle import review_cycle_executor
+            from services.github_app import github_app
+            from dateutil import parser as date_parser
+            from datetime import datetime
+
+            # Check if there's an escalated cycle for this issue (in-memory)
+            if issue_number not in review_cycle_executor.active_cycles:
+                return
+
+            cycle_state = review_cycle_executor.active_cycles[issue_number]
+            if cycle_state.status != 'awaiting_human_feedback':
+                return
+
+            # There's an escalated cycle waiting for feedback on this discussion
+            logger.debug(f"Checking for human feedback on escalated cycle for issue #{issue_number}")
+
+            # Get project config for org
+            project_config = self.config_manager.get_project_config(project_name)
+            org = project_config.github['org']
+
+            # Query for recent comments
+            query = """
+            query($discussionId: ID!) {
+              node(id: $discussionId) {
+                ... on Discussion {
+                  comments(last: 20) {
+                    nodes {
+                      id
+                      author {
+                        login
+                      }
+                      body
+                      createdAt
+                    }
+                  }
+                }
+              }
+            }
+            """
+
+            result = github_app.graphql_request(query, {'discussionId': discussion_id})
+
+            if result and 'node' in result and result['node']:
+                comments = result['node']['comments']['nodes']
+
+                # Get escalation time
+                escalation_time = datetime.fromisoformat(cycle_state.escalation_time)
+                if escalation_time.tzinfo:
+                    escalation_time = escalation_time.replace(tzinfo=None)
+
+                # Look for human feedback after escalation
+                human_feedback = None
+                for comment in reversed(comments):  # Most recent first
+                    author = comment['author']['login']
+                    created_at = date_parser.parse(comment['createdAt'])
+
+                    # Convert to naive datetime
+                    if created_at.tzinfo:
+                        created_at = created_at.replace(tzinfo=None)
+
+                    # Check if this is a human comment after escalation
+                    if author != 'orchestrator-bot' and created_at > escalation_time:
+                        human_feedback = comment['body']
+                        logger.info(
+                            f"Human feedback detected for escalated cycle #{issue_number} "
+                            f"from {author}, resuming review cycle..."
+                        )
+                        break
+
+                if human_feedback:
+                    # Human feedback detected! Resume the review cycle in background thread
+                    import asyncio
+                    import threading
+
+                    def resume_cycle_in_thread():
+                        """Resume review cycle in background thread (non-blocking)"""
+                        try:
+                            loop = asyncio.new_event_loop()
+                            asyncio.set_event_loop(loop)
+
+                            loop.run_until_complete(
+                                review_cycle_executor.resume_review_cycle_with_feedback(
+                                    cycle_state=cycle_state,
+                                    human_feedback=human_feedback,
+                                    org=org
+                                )
+                            )
+                            loop.close()
+
+                            logger.info(f"Review cycle #{issue_number} resumed successfully")
+                        except Exception as e:
+                            logger.error(f"Error resuming review cycle #{issue_number}: {e}")
+                            import traceback
+                            logger.error(traceback.format_exc())
+
+                    # Start in background thread
+                    thread = threading.Thread(target=resume_cycle_in_thread, daemon=True)
+                    thread.start()
+
+                    logger.info(f"Review cycle resume thread started for issue #{issue_number}")
+
+        except Exception as e:
+            logger.error(f"Error checking escalated cycle for issue #{issue_number}: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+
+        # OLD CODE BELOW (disabled)
+        """Check discussion comments for user feedback mentioning @orchestrator-bot"""
+        try:
+            from config.state_manager import state_manager
+            from dateutil import parser as date_parser
+            from datetime import timezone
+
+            # Get project config
+            project_config = self.config_manager.get_project_config(project_name)
+
+            # Find the pipeline config for this board
+            pipeline_config = None
+            for pipeline in project_config.pipelines:
+                if pipeline.board_name == board_name:
+                    pipeline_config = pipeline
+                    break
+
+            if not pipeline_config:
+                return
+
+            # Get workflow template
+            workflow_template = self.config_manager.get_workflow_template(pipeline_config.workflow)
+
+            # Get discussion with all comments and replies
+            from services.github_app import github_app
+            query = """
+            query($discussionId: ID!) {
+              node(id: $discussionId) {
+                ... on Discussion {
+                  number
+                  comments(first: 100) {
+                    nodes {
+                      id
+                      body
+                      author {
+                        login
+                        ... on User {
+                          login
+                        }
+                        ... on Bot {
+                          login
+                        }
+                      }
+                      createdAt
+                      replies(first: 50) {
+                        nodes {
+                          id
+                          body
+                          author {
+                            login
+                          }
+                          createdAt
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+            """
+
+            result = github_app.graphql_request(query, {'discussionId': discussion_id})
+            if not result or 'node' not in result:
+                return
+
+            all_comments = result['node']['comments']['nodes']
+
+            # Find new feedback comments/replies (mentioning @orchestrator-bot from non-bot users)
+            new_feedback = []
+
+            for comment in all_comments:
+                # Check top-level comment
+                comment_id = comment['id']
+                body = comment.get('body', '')
+                author = comment.get('author', {})
+                author_login = author.get('login', '') if author else ''
+
+                # Skip bot comments
+                if 'bot' not in author_login.lower():
+                    # Check if this comment mentions the bot
+                    if '@orchestrator-bot' in body:
+                        # Check if we've already processed this comment
+                        if not self.feedback_manager.is_comment_processed(issue_number, comment_id):
+                            new_feedback.append({
+                                'id': comment_id,
+                                'body': body,
+                                'author': author_login,
+                                'created_at': comment['createdAt'],
+                                'parent_comment_id': None,  # Top-level comment
+                                'is_reply': False
+                            })
+
+                # Check replies to this comment
+                for reply in comment.get('replies', {}).get('nodes', []):
+                    reply_id = reply['id']
+                    reply_body = reply.get('body', '')
+                    reply_author = reply.get('author', {})
+                    reply_author_login = reply_author.get('login', '') if reply_author else ''
+
+                    # Skip bot replies
+                    if 'bot' in reply_author_login.lower():
+                        continue
+
+                    # Check if this reply mentions the bot
+                    if '@orchestrator-bot' not in reply_body:
+                        continue
+
+                    # Check if we've already processed this reply
+                    if self.feedback_manager.is_comment_processed(issue_number, reply_id):
+                        continue
+
+                    new_feedback.append({
+                        'id': reply_id,
+                        'body': reply_body,
+                        'author': reply_author_login,
+                        'created_at': reply['createdAt'],
+                        'parent_comment_id': comment_id,  # This is a reply to a comment
+                        'is_reply': True
+                    })
+
+            if not new_feedback:
+                return
+
+            # For each feedback comment/reply, determine which agent to route to
+            for feedback_comment in new_feedback:
+                feedback_time = date_parser.parse(feedback_comment['created_at'])
+                if feedback_time.tzinfo is None:
+                    feedback_time = feedback_time.replace(tzinfo=timezone.utc)
+
+                target_agent = None
+                agent_comment_body = None
+                agent_comment_id = None
+                most_recent_agent_time = None
+
+                # If this is a reply to a comment, check if the parent is an agent comment
+                if feedback_comment['is_reply'] and feedback_comment['parent_comment_id']:
+                    parent_id = feedback_comment['parent_comment_id']
+
+                    # Find the parent comment
+                    for comment in all_comments:
+                        if comment['id'] == parent_id:
+                            # Check if parent is an agent comment
+                            body = comment.get('body', '')
+                            for column in workflow_template.columns:
+                                agent = column.agent
+                                if agent and agent != 'null':
+                                    if f"_Processed by the {agent} agent_" in body:
+                                        target_agent = agent
+                                        agent_comment_body = body
+                                        agent_comment_id = parent_id
+                                        logger.info(f"Reply is threaded to {agent} agent comment")
+                                        break
+                            break
+
+                # If no agent found (not a reply or parent wasn't agent), use chronological search
+                if not target_agent:
+                    for comment in all_comments:
+                        comment_time = date_parser.parse(comment.get('createdAt'))
+                        if comment_time.tzinfo is None:
+                            comment_time = comment_time.replace(tzinfo=timezone.utc)
+
+                        # Only consider comments before the feedback
+                        if comment_time >= feedback_time:
+                            continue
+
+                        # Check if this is an agent comment
+                        body = comment.get('body', '')
+                        for column in workflow_template.columns:
+                            agent = column.agent
+                            if agent and agent != 'null':
+                                # Look for agent signature in comment
+                                if f"_Processed by the {agent} agent_" in body:
+                                    # Track the most recent agent comment
+                                    if most_recent_agent_time is None or comment_time > most_recent_agent_time:
+                                        target_agent = agent
+                                        agent_comment_body = body
+                                        agent_comment_id = comment['id']
+                                        most_recent_agent_time = comment_time
+                                    break
+
+                if target_agent:
+                    # If the target agent is a reviewer, feedback should go to the maker agent instead
+                    final_target_agent = target_agent
+                    if 'reviewer' in target_agent or 'review' in target_agent:
+                        # Find the maker agent that this reviewer was reviewing
+                        maker_agent = self._find_maker_for_reviewer_in_discussion(
+                            target_agent, workflow_template, all_comments, most_recent_agent_time
+                        )
+                        if maker_agent:
+                            logger.info(f"Routing feedback from {target_agent} review to maker agent {maker_agent}")
+                            final_target_agent = maker_agent
+                            # Get the maker's output as previous_output instead of reviewer's
+                            for comment in reversed(all_comments):
+                                if f"_Processed by the {maker_agent} agent_" in comment.get('body', ''):
+                                    agent_comment_body = comment.get('body', '')
+                                    break
+                        else:
+                            logger.warning(f"Could not find maker for reviewer {target_agent}, sending feedback to reviewer")
+
+                    logger.info(f"Found feedback for {final_target_agent} in discussion for issue #{issue_number}")
+
+                    # Extract full thread history if this is a threaded reply
+                    thread_history = []
+                    conversation_mode = None
+
+                    if feedback_comment['is_reply'] and feedback_comment['parent_comment_id']:
+                        thread_history = self.get_full_thread_history(
+                            all_comments,
+                            feedback_comment['parent_comment_id']
+                        )
+                        conversation_mode = 'threaded'
+                        logger.info(f"Extracted thread history with {len(thread_history)} messages for conversational mode")
+
+                    # Create a feedback task for this specific agent
+                    self.create_feedback_task_for_discussion(
+                        project_name, board_name, issue_number,
+                        repository, final_target_agent, [feedback_comment], project_config,
+                        discussion_id, previous_output=agent_comment_body,
+                        reply_to_comment_id=agent_comment_id,  # For threaded replies
+                        thread_history=thread_history,  # For conversational mode
+                        conversation_mode=conversation_mode  # Signal conversational mode
+                    )
+                else:
+                    logger.warning(f"Could not determine which agent to route feedback to in discussion for issue #{issue_number}")
+                    # Mark as processed anyway to avoid repeated attempts
+                    self.feedback_manager.mark_comment_processed(issue_number, feedback_comment['id'], project_name)
+
+        except Exception as e:
+            logger.error(f"Error checking for feedback in discussion: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+
+    def _find_maker_for_reviewer_in_discussion(self, reviewer_agent, workflow_template, all_comments, reviewer_time):
+        """Find the maker agent that a reviewer was reviewing (for discussions)"""
+        from dateutil import parser as date_parser
+        from datetime import timezone
+
+        # Look backwards through comments before the reviewer's comment
+        # to find the most recent non-reviewer agent
+        most_recent_maker = None
+        most_recent_maker_time = None
+
+        for comment in all_comments:
+            comment_time = date_parser.parse(comment.get('createdAt'))
+            if comment_time.tzinfo is None:
+                comment_time = comment_time.replace(tzinfo=timezone.utc)
+
+            # Only consider comments before the reviewer
+            if comment_time >= reviewer_time:
+                continue
+
+            # Check if this is an agent comment
+            body = comment.get('body', '')
+            for column in workflow_template.columns:
+                agent = column.agent
+                if agent and agent != 'null':
+                    # Look for agent signature
+                    if f"_Processed by the {agent} agent_" in body:
+                        # Skip if it's also a reviewer
+                        if 'reviewer' not in agent and 'review' not in agent:
+                            # Track the most recent maker
+                            if most_recent_maker_time is None or comment_time > most_recent_maker_time:
+                                most_recent_maker = agent
+                                most_recent_maker_time = comment_time
+                        break
+
+        return most_recent_maker
+
+    def create_feedback_task_for_discussion(self, project_name: str, board_name: str, issue_number: int,
+                                           repository: str, agent: str, feedback_comments: List[Dict[str, Any]],
+                                           project_config, discussion_id: str, previous_output: str = None,
+                                           reply_to_comment_id: str = None, thread_history: List[Dict] = None,
+                                           conversation_mode: str = None):
+        """Create a task to handle feedback for an agent (from discussion)"""
+        try:
+            # Fetch full issue details
+            issue_data = self.get_issue_details(repository, issue_number, project_config.github['org'])
+
+            # Prepare feedback context
+            feedback_text = "\n\n".join([
+                f"**Feedback from @{comment['author']} at {comment['created_at']}:**\n{comment['body']}"
+                for comment in feedback_comments
+            ])
+
+            # Create task context with feedback and discussion info
+            task_context = {
+                'project': project_name,
+                'board': board_name,
+                'pipeline': board_name,
+                'repository': repository,
+                'issue_number': issue_number,
+                'issue': issue_data,
+                'column': 'feedback',
+                'trigger': 'feedback_loop',
+                'workspace_type': 'discussions',
+                'discussion_id': discussion_id,
+                'reply_to_comment_id': reply_to_comment_id,  # For threaded replies
+                'conversation_mode': conversation_mode,  # 'threaded' for conversational mode
+                'thread_history': thread_history or [],  # Full conversation history
+                'feedback': {
+                    'comments': feedback_comments,
+                    'formatted_text': feedback_text
+                },
+                'previous_output': previous_output,
+                'timestamp': datetime.now().isoformat()
+            }
+
+            from task_queue.task_manager import Task, TaskPriority
+            task = Task(
+                id=f"{agent}_feedback_{project_name}_{board_name}_{issue_number}_{int(time.time())}",
+                agent=agent,
+                project=project_name,
+                priority=TaskPriority.HIGH,
+                context=task_context,
+                created_at=datetime.now().isoformat()
+            )
+
+            self.task_queue.enqueue(task)
+
+            # Mark comments as processed
+            for comment in feedback_comments:
+                self.feedback_manager.mark_comment_processed(issue_number, comment['id'], project_name)
+
+            logger.info(f"Created feedback task for {agent} on discussion for issue #{issue_number}")
+
+        except Exception as e:
+            logger.error(f"Failed to create feedback task for discussion: {e}")
 
 if __name__ == "__main__":
     # Initialize task queue and start monitoring

@@ -194,32 +194,6 @@ asyncio.exceptions.TimeoutError: Agent execution timed out
    python tests/integration/test_performance.py
    ```
 
-#### Issue: Circuit Breaker Activated
-**Symptoms:**
-```
-Exception: Circuit breaker is OPEN (failures: 3)
-```
-
-**Solutions:**
-1. Check recent failure logs:
-   ```bash
-   grep -A5 -B5 "Circuit breaker" orchestrator.log
-   ```
-
-2. Wait for recovery timeout or manually reset:
-   ```python
-   from resilience.circuit_breaker import CircuitBreaker
-   cb = CircuitBreaker()
-   cb._state = "closed"  # Manual reset
-   ```
-
-3. Adjust circuit breaker settings:
-   ```yaml
-   circuit_breaker:
-     failure_threshold: 5  # Increase threshold
-     recovery_timeout: 300  # Increase timeout
-   ```
-
 ### Performance Issues
 
 #### Issue: High Memory Usage
@@ -591,14 +565,6 @@ redis-cli LREM tasks:high 1 "stuck_task_id"
 redis-cli FLUSHDB  # Clears all Redis data
 # Or selectively:
 redis-cli DEL tasks:high tasks:medium tasks:low
-```
-
-### Q: How do I check circuit breaker status?
-**A:** Add logging to your agent or check in Python:
-```python
-from pipeline.resilient_pipeline import ResilientPipeline
-# Check pipeline health report
-pipeline.get_health_report()
 ```
 
 ### Q: How do I update agent configuration without restart?

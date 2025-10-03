@@ -6,6 +6,8 @@ pipeline_templates:
     name: "Idea Development Pipeline"
     description: "Research, analysis, and requirements validation pipeline"
     workflow_type: "sequential"
+    workspace: "discussions"
+    discussion_category: "Ideas"
     stages:
       - stage: "research"
         name: "Idea Research & Market Analysis"
@@ -44,6 +46,10 @@ pipeline_templates:
     name: "Development Pipeline"
     description: "Streamlined requirements analysis through code implementation"
     workflow_type: "maker_checker"
+    workspace: "hybrid"
+    discussion_category: "Ideas"
+    discussion_stages: ["requirements", "design"]
+    issue_stages: ["implementation"]
     stages:
       - stage: "requirements"
         name: "Business Requirements Analysis"
@@ -83,6 +89,10 @@ pipeline_templates:
     name: "Complete SDLC Pipeline"
     description: "Full software development lifecycle with maker-checker patterns"
     workflow_type: "maker_checker"
+    workspace: "hybrid"
+    discussion_category: "Ideas"
+    discussion_stages: ["research", "requirements", "design", "test_planning"]
+    issue_stages: ["implementation", "qa_testing", "documentation"]
     stages:
       - stage: "research"
         name: "Idea Research & Market Analysis"

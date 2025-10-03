@@ -9,6 +9,7 @@ agents:
     retries: 2
     makes_code_changes: true  # Modifies dependency files (requirements.txt, etc.)
     requires_dev_container: false  # Runs locally in orchestrator to build the dev container
+    requires_docker: false  # ONLY agent allowed to run outside Docker (needs to build containers)
     capabilities:
       - environment_analysis
       - dockerfile_generation
@@ -22,15 +23,17 @@ agents:
       - docker_operations
       - web_search
     mcp_servers:
+      - context7
       - serena
 
   idea_researcher:
     description: "Market research and idea validation"
-    model: "claude-opus-4-1-20250514"
+    model: "claude-opus-4-20250514"
     timeout: 300
     retries: 2
     makes_code_changes: true  # Creates research documents
     requires_dev_container: false  # Documentation work doesn't need project dependencies
+    requires_docker: true  # MUST run in Docker for security isolation
     capabilities:
       - research
       - market_analysis
@@ -48,8 +51,10 @@ agents:
     model: "claude-sonnet-4-5-20250929"
     timeout: 300
     retries: 3
-    makes_code_changes: true  # Creates requirements documents
+    makes_code_changes: false  # Posts to GitHub discussions, doesn't create files
     requires_dev_container: false  # Documentation work doesn't need project dependencies
+    requires_docker: true  # MUST run in Docker for security isolation
+    filesystem_write_allowed: false  # CRITICAL: Must post to GitHub, not create local files
     capabilities:
       - requirements_analysis
       - user_story_creation
@@ -70,6 +75,7 @@ agents:
     retries: 2
     makes_code_changes: true  # Creates planning documents
     requires_dev_container: false  # Documentation work doesn't need project dependencies
+    requires_docker: true  # MUST run in Docker for security isolation
     capabilities:
       - product_strategy
       - feature_prioritization
@@ -79,6 +85,9 @@ agents:
       - file_operations
       - git_integration
       - web_search
+    mcp_servers:
+      - context7
+      - serena
 
   requirements_reviewer:
     description: "Requirements validation and quality assurance"
@@ -87,6 +96,8 @@ agents:
     retries: 2
     makes_code_changes: false  # Review only, no changes
     requires_dev_container: false
+    requires_docker: true  # MUST run in Docker for security isolation
+    filesystem_write_allowed: false  # Posts reviews to GitHub, doesn't create files
     capabilities:
       - requirements_validation
       - quality_assessment
@@ -95,6 +106,9 @@ agents:
     tools_enabled:
       - file_operations
       - git_integration
+    mcp_servers:
+      - context7
+      - serena
 
   software_architect:
     description: "System architecture and technical design"
@@ -103,6 +117,7 @@ agents:
     retries: 3
     makes_code_changes: true  # Creates architecture documents and diagrams
     requires_dev_container: false  # Design work doesn't need project dependencies yet
+    requires_docker: true  # MUST run in Docker for security isolation
     capabilities:
       - system_architecture
       - technical_design
@@ -113,6 +128,7 @@ agents:
       - git_integration
       - web_search
     mcp_servers:
+      - context7
       - serena
 
   design_reviewer:
@@ -122,6 +138,8 @@ agents:
     retries: 2
     makes_code_changes: false  # Review only, no changes
     requires_dev_container: false
+    requires_docker: true  # MUST run in Docker for security isolation
+    filesystem_write_allowed: false  # Posts reviews to GitHub, doesn't create files
     capabilities:
       - architecture_validation
       - security_review
@@ -130,6 +148,9 @@ agents:
     tools_enabled:
       - file_operations
       - git_integration
+    mcp_servers:
+      - context7
+      - serena
 
   test_planner:
     description: "Test strategy and planning"
@@ -138,6 +159,7 @@ agents:
     retries: 2
     makes_code_changes: true  # Creates test plan documents
     requires_dev_container: false  # Planning doesn't need dependencies yet
+    requires_docker: true  # MUST run in Docker for security isolation
     capabilities:
       - test_strategy
       - test_planning
@@ -147,6 +169,7 @@ agents:
       - file_operations
       - git_integration
     mcp_servers:
+      - context7
       - serena
 
   test_reviewer:
@@ -156,6 +179,7 @@ agents:
     retries: 2
     makes_code_changes: false  # Review only, no changes
     requires_dev_container: false
+    requires_docker: true  # MUST run in Docker for security isolation
     capabilities:
       - test_validation
       - coverage_review
@@ -163,6 +187,9 @@ agents:
     tools_enabled:
       - file_operations
       - git_integration
+    mcp_servers:
+      - context7
+      - serena
 
   senior_software_engineer:
     description: "Software development and implementation"
@@ -171,6 +198,7 @@ agents:
     retries: 3
     makes_code_changes: true  # Writes actual code
     requires_dev_container: true  # NEEDS project dependencies to run/test code
+    requires_docker: true  # MUST run in Docker for security isolation
     capabilities:
       - software_development
       - code_implementation
@@ -191,6 +219,8 @@ agents:
     retries: 2
     makes_code_changes: false  # Review only, no changes
     requires_dev_container: false  # Can review code without running it
+    requires_docker: true  # MUST run in Docker for security isolation
+    filesystem_write_allowed: false  # Posts reviews to GitHub, doesn't create files
     capabilities:
       - code_review
       - quality_assessment
@@ -200,6 +230,7 @@ agents:
       - file_operations
       - git_integration
     mcp_servers:
+      - context7
       - serena
 
   senior_qa_engineer:
@@ -209,6 +240,7 @@ agents:
     retries: 3
     makes_code_changes: true  # Writes test code
     requires_dev_container: true  # NEEDS project dependencies to run tests
+    requires_docker: true  # MUST run in Docker for security isolation
     capabilities:
       - qa_testing
       - integration_testing
@@ -227,6 +259,7 @@ agents:
     retries: 2
     makes_code_changes: true  # Creates documentation files
     requires_dev_container: false  # Documentation doesn't need dependencies
+    requires_docker: true  # MUST run in Docker for security isolation
     capabilities:
       - technical_writing
       - documentation_creation
@@ -243,6 +276,7 @@ agents:
     retries: 2
     makes_code_changes: false  # Review only, no changes
     requires_dev_container: false
+    requires_docker: true  # MUST run in Docker for security isolation
     capabilities:
       - editorial_review
       - content_optimization

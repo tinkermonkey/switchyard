@@ -30,8 +30,20 @@ async def run_claude_code(prompt: str, context: Dict[str, Any]) -> str:
     # Get MCP server configuration from context
     mcp_servers = context.get('mcp_servers', [])
 
-    # Determine if this is a project-specific task that should run in Docker
-    use_docker = context.get('use_docker', False)
+    # Get agent configuration to determine if Docker is required
+    agent_config = context.get('agent_config')
+
+    # CRITICAL: Agent's requires_docker setting takes precedence over context
+    # Only dev_environment_setup should have requires_docker=False
+    if agent_config and hasattr(agent_config, 'requires_docker'):
+        use_docker = agent_config.requires_docker
+        if not use_docker:
+            logger.warning(f"Agent {agent} is configured to run LOCALLY (requires_docker=False) - this should ONLY be dev_environment_setup!")
+    else:
+        # Fallback to context, but default to True for security
+        use_docker = context.get('use_docker', True)
+        logger.warning(f"Agent config missing requires_docker field, using context value: {use_docker}")
+
     if use_docker and project != 'unknown':
         logger.info(f"Running agent in Docker container for project {project}")
 
@@ -147,9 +159,13 @@ Files: {context.get('files', [])}
             if 'CONTEXT7_API_KEY' in os.environ:
                 env['CONTEXT7_API_KEY'] = os.environ['CONTEXT7_API_KEY']
 
-            if 'ANTHROPIC_API_KEY' not in env:
-                logger.error("ANTHROPIC_API_KEY not found in environment")
-                raise Exception("ANTHROPIC_API_KEY is required to run Claude Code")
+            # ANTHROPIC_API_KEY is optional - if not provided, Claude Code CLI will use
+            # your authenticated Claude.ai session, which uses your subscription
+            if 'ANTHROPIC_API_KEY' in os.environ:
+                env['ANTHROPIC_API_KEY'] = os.environ['ANTHROPIC_API_KEY']
+                logger.info("Using ANTHROPIC_API_KEY for authentication (API billing)")
+            else:
+                logger.info("No ANTHROPIC_API_KEY found - Claude Code will use claude.ai session (subscription billing)")
 
             logger.info(f"Executing Claude CLI in {work_dir}")
             logger.info(f"Command: {' '.join(cmd[:3])}...")  # Don't log full prompt
@@ -206,12 +222,9 @@ Files: {context.get('files', [])}
                             input_tokens = event['usage'].get('input_tokens', input_tokens)
                             output_tokens = event['usage'].get('output_tokens', output_tokens)
 
-                        # Collect result text from various event types
-                        # Claude Code stream-json format has several event types with text:
-                        # - "assistant" events have message.content[].text
-                        # - "result" events have a "result" string field
-                        text_collected = False
-
+                        # Collect result text from assistant events only
+                        # Note: stream_callback above gets ALL events (including 'result') for observability
+                        # We only collect text from 'assistant' events to avoid duplication in final output
                         if event_type == 'assistant':
                             # Extract text from assistant message content
                             message = event.get('message', {})
@@ -221,15 +234,7 @@ Files: {context.get('files', [])}
                                     text = item.get('text', '')
                                     if text:
                                         result_parts.append(text)
-                                        text_collected = True
-                        elif event_type == 'result':
-                            # Extract from result field (final summary)
-                            if isinstance(event.get('result'), str):
-                                result_parts.append(event['result'])
-                                text_collected = True
-
-                        if text_collected:
-                            logger.debug(f"Collected text from {event_type} event, total length: {sum(len(p) for p in result_parts)}")
+                                        logger.debug(f"Collected text from assistant event, total length: {sum(len(p) for p in result_parts)}")
 
                     except json.JSONDecodeError:
                         # Non-JSON output, just log it

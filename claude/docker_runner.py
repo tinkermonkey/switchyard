@@ -49,11 +49,16 @@ class DockerAgentRunner:
 
         # Build docker run command
         container_name = f"claude-agent-{project}-{task_id}"
+
+        # Determine if we'll need stdin (for large prompts)
+        use_stdin = len(prompt) > 50000
+
         docker_cmd = self._build_docker_command(
             container_name=container_name,
             project_dir=project_dir,
             mcp_config=mcp_config,
-            context=context
+            context=context,
+            use_stdin=use_stdin
         )
 
         try:
@@ -114,7 +119,8 @@ class DockerAgentRunner:
         container_name: str,
         project_dir: Path,
         mcp_config: Optional[Dict],
-        context: Dict[str, Any]
+        context: Dict[str, Any],
+        use_stdin: bool = False
     ) -> list:
         """Build the docker run command"""
 
@@ -134,18 +140,31 @@ class DockerAgentRunner:
 
         logger.info(f"Mounting project: container={container_path_str}, host={host_project_path}")
 
+        # Get agent config to check filesystem write permission
+        from config.manager import config_manager
+        agent_config = config_manager.get_project_agent_config(context.get('project', 'unknown'), agent)
+        filesystem_write_allowed = getattr(agent_config, 'filesystem_write_allowed', True)
+
+        # Determine mount mode for workspace
+        workspace_mount_mode = 'rw' if filesystem_write_allowed else 'ro'
+        if not filesystem_write_allowed:
+            logger.warning(f"Agent {agent} has filesystem_write_allowed=false, mounting workspace as READ-ONLY")
+
         # Get host home directory for SSH/git mounts
         host_home = os.environ.get("HOST_HOME", os.environ.get("HOME", "/root"))
 
-        # Base docker command
-        cmd = [
-            'docker', 'run',
-            '--rm',  # Remove container when done
-            '--name', container_name,
-            '--network', self.network_name,
+        # Base docker command - build list dynamically to conditionally add -i flag
+        cmd = ['docker', 'run', '--rm', '--name', container_name, '--network', self.network_name]
 
-            # Mount project directory (using host path)
-            '-v', f'{host_project_path}:/workspace',
+        # Add -i (interactive) flag if we need stdin for large prompts
+        if use_stdin:
+            cmd.append('-i')
+            logger.info("Adding -i flag for stdin support")
+
+        # Add volume mounts, working directory, and environment variables
+        cmd.extend([
+            # Mount project directory (read-only or read-write based on config)
+            '-v', f'{host_project_path}:/workspace:{workspace_mount_mode}',
 
             # Mount SSH keys for git operations (read-only)
             '-v', f'{host_home}/.ssh:/root/.ssh:ro',
@@ -157,9 +176,21 @@ class DockerAgentRunner:
             '-w', '/workspace',
 
             # Environment variables
-            '-e', f'ANTHROPIC_API_KEY={os.environ.get("ANTHROPIC_API_KEY", "")}',
             '-e', f'GITHUB_TOKEN={os.environ.get("GITHUB_TOKEN", "")}',
-        ]
+        ])
+
+        # Pass CLAUDE_CODE_OAUTH_TOKEN if available (subscription), else ANTHROPIC_API_KEY (pay-per-use)
+        oauth_token = os.environ.get('CLAUDE_CODE_OAUTH_TOKEN', '').strip()
+        anthropic_key = os.environ.get('ANTHROPIC_API_KEY', '').strip()
+
+        if oauth_token:
+            cmd.extend(['-e', f'CLAUDE_CODE_OAUTH_TOKEN={oauth_token}'])
+            logger.info("Using CLAUDE_CODE_OAUTH_TOKEN (subscription billing)")
+        elif anthropic_key:
+            cmd.extend(['-e', f'ANTHROPIC_API_KEY={anthropic_key}'])
+            logger.info("Using ANTHROPIC_API_KEY (API billing)")
+        else:
+            logger.warning("No authentication token found - agent will likely fail")
 
         # Special handling for dev_environment_setup agent: mount Docker socket for image building
         if agent == 'dev_environment_setup':
@@ -234,6 +265,21 @@ class DockerAgentRunner:
 
         # Build the Claude command to run inside container
         agent = context.get('agent', 'unknown')
+
+        # For large prompts, write to a temp file and mount it into container
+        import tempfile
+        import os
+
+        prompt_file = None
+        use_file_mount = len(prompt) > 50000  # Use file mount for prompts > 50KB
+
+        if use_file_mount:
+            # Create a temporary file for the prompt
+            prompt_file = tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt', dir='/tmp')
+            prompt_file.write(prompt)
+            prompt_file.close()
+            logger.info(f"Prompt is large ({len(prompt)} chars), using mounted file: {prompt_file.name}")
+
         claude_cmd = [
             'claude',
             '--print',
@@ -247,7 +293,13 @@ class DockerAgentRunner:
         if agent != 'dev_environment_setup':
             claude_cmd.append('--dangerously-skip-permissions')
 
-        claude_cmd.append(prompt)
+        if use_file_mount:
+            # Large prompt - will be sent via stdin
+            # Use '-' to tell claude to read from stdin
+            claude_cmd.append('-')
+        else:
+            # Small prompt - pass directly
+            claude_cmd.append(prompt)
 
         # Combine docker command with claude command
         full_cmd = docker_cmd + claude_cmd
@@ -265,22 +317,75 @@ class DockerAgentRunner:
             api_start_time = time.time()
             obs.emit_claude_call_started(agent, task_id, project, claude_model)
 
+        prompt_input = None
         try:
+            # Prepare stdin if using prompt file
+            if use_file_mount and prompt_file:
+                with open(prompt_file.name, 'r') as f:
+                    prompt_input = f.read()
+                logger.info(f"DOCKER DEBUG - Prompt file size: {len(prompt_input)} chars")
+                logger.info(f"DOCKER DEBUG - Prompt starts with: {prompt_input[:200]}")
+
             # Run the container
-            process = subprocess.Popen(
-                full_cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                stdin=subprocess.DEVNULL
-            )
+            if use_file_mount and prompt_input:
+                # For stdin input, use communicate() to avoid broken pipe
+                process = subprocess.Popen(
+                    full_cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    stdin=subprocess.PIPE,
+                    text=True
+                )
+                # Note: We'll handle stdin in the streaming loop below
+            else:
+                process = subprocess.Popen(
+                    full_cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    stdin=subprocess.DEVNULL
+                )
 
             # Collect output
             result_parts = []
+            stderr_parts = []
             input_tokens = 0
             output_tokens = 0
 
-            # Stream output
+            # Read both stdout and stderr using threads to avoid deadlock
+            import threading
+
+            def read_stderr():
+                for line in iter(process.stderr.readline, ''):
+                    if line:
+                        stderr_parts.append(line)
+                        logger.error(f"Container stderr: {line.strip()}")
+
+            def write_stdin():
+                """Write prompt to stdin in a separate thread"""
+                if use_file_mount and prompt_input and process.stdin:
+                    try:
+                        logger.info(f"STDIN DEBUG - Writing {len(prompt_input)} chars to stdin")
+                        process.stdin.write(prompt_input)
+                        process.stdin.flush()
+                        logger.info("STDIN DEBUG - Stdin write completed, closing stdin")
+                        process.stdin.close()
+                        logger.info("STDIN DEBUG - Stdin closed successfully")
+                    except BrokenPipeError:
+                        logger.warning("STDIN DEBUG - Broken pipe while writing to stdin (process may have exited early)")
+                    except Exception as e:
+                        logger.error(f"STDIN DEBUG - Error writing to stdin: {e}")
+
+            # Start stderr reader thread
+            stderr_thread = threading.Thread(target=read_stderr, daemon=True)
+            stderr_thread.start()
+
+            # Start stdin writer thread if needed
+            if use_file_mount and prompt_input:
+                stdin_thread = threading.Thread(target=write_stdin, daemon=True)
+                stdin_thread.start()
+
+            # Stream stdout
             for line in iter(process.stdout.readline, ''):
                 if not line:
                     break
@@ -302,7 +407,8 @@ class DockerAgentRunner:
                         input_tokens = event['usage'].get('input_tokens', input_tokens)
                         output_tokens = event['usage'].get('output_tokens', output_tokens)
 
-                    # Collect result text
+                    # Collect result text from assistant messages only
+                    # Note: Do not collect from 'result' events as they duplicate the assistant content
                     if event_type == 'assistant':
                         message = event.get('message', {})
                         content = message.get('content', [])
@@ -311,15 +417,17 @@ class DockerAgentRunner:
                                 text = item.get('text', '')
                                 if text:
                                     result_parts.append(text)
-                    elif event_type == 'result':
-                        if isinstance(event.get('result'), str):
-                            result_parts.append(event['result'])
 
                 except json.JSONDecodeError:
-                    logger.debug(f"Non-JSON output: {line[:100]}")
+                    # Non-JSON output might be error messages
+                    logger.warning(f"Non-JSON stdout: {line}")
+                    stderr_parts.append(f"STDOUT: {line}\n")
 
             # Wait for completion
             process.wait(timeout=600)
+
+            # Wait for stderr thread to finish
+            stderr_thread.join(timeout=1)
 
             # Emit completion
             if obs:
@@ -333,9 +441,9 @@ class DockerAgentRunner:
                 logger.info(f"Agent completed successfully in container, result length: {len(result_text)}")
                 return result_text
             else:
-                stderr = process.stderr.read() if process.stderr else "Unknown error"
-                logger.error(f"Agent failed in container: {stderr}")
-                raise Exception(f"Agent execution failed: {stderr}")
+                stderr_text = ''.join(stderr_parts) if stderr_parts else "No error output captured"
+                logger.error(f"Agent failed in container (returncode={process.returncode}): {stderr_text}")
+                raise Exception(f"Agent execution failed (returncode={process.returncode}): {stderr_text}")
 
         except subprocess.TimeoutExpired:
             logger.error("Agent execution timed out")
@@ -344,6 +452,14 @@ class DockerAgentRunner:
         except Exception as e:
             logger.error(f"Agent execution error: {e}")
             raise
+        finally:
+            # Clean up temp prompt file
+            if prompt_file and os.path.exists(prompt_file.name):
+                try:
+                    os.unlink(prompt_file.name)
+                    logger.debug(f"Cleaned up temp prompt file: {prompt_file.name}")
+                except Exception as e:
+                    logger.warning(f"Failed to clean up temp file: {e}")
 
     def _cleanup_container(self, container_name: str):
         """Clean up the container if it's still running"""

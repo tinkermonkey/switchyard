@@ -4,7 +4,7 @@ from claude.claude_integration import run_claude_code
 from datetime import datetime
 import json
 import logging
-from handoff.collaboration import ReviewStatus, ReviewFeedback
+from services.review_parser import ReviewStatus
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +48,8 @@ Quality Metrics from Software Architect:
 {json.dumps(quality_metrics, indent=2)}
 
 Focus Areas: {', '.join(focus_areas)}
+
+IMPORTANT: Output your review as text directly in your response. DO NOT create any files. This review will be posted to GitHub as a comment.
 
 Provide comprehensive architecture review with:
 
@@ -105,6 +107,10 @@ Return structured JSON with review_assessment and improvement_recommendations se
             # Enhance context with MCP server data if available
             enhanced_context = context.copy()
 
+            # Add agent_config for security enforcement (requires_docker check)
+            if self.agent_config and 'agent_config' in self.agent_config:
+                enhanced_context['agent_config'] = self.agent_config['agent_config']
+
             # Add MCP server configuration to context for Claude Code
             if hasattr(self, 'mcp_integration') and self.mcp_integration:
                 enhanced_context['mcp_servers'] = []
@@ -158,7 +164,7 @@ Return structured JSON with review_assessment and improvement_recommendations se
                 review_data = result
 
             # Process review results using collaboration framework
-            from handoff.collaboration import ReviewStatus, ReviewFeedback, CollaborationOrchestrator
+            from services.review_parser import ReviewStatus, CollaborationOrchestrator
             from services.github_integration import GitHubIntegration, AgentCommentFormatter
 
             # Initialize collaboration components
@@ -219,26 +225,11 @@ Return structured JSON with review_assessment and improvement_recommendations se
                     "suggestion": "Must be resolved before proceeding"
                 })
 
-            review_feedback = ReviewFeedback(
-                reviewer_agent="design_reviewer",
-                status=status,
-                findings=findings,
-                blocking_issues=critical_issues,
-                score=overall_score,
-                comments=f"Architecture review completed. Overall design quality: {overall_score:.1%}"
-            )
-
-            # Post review to GitHub if issue specified
-            github_issue = context.get('github_issue')
-            if github_issue:
-                review_comment = self.format_design_review(review_feedback, review_data)
-
-                project = context.get('project', original_handoff.task_context.get('project', 'unknown'))
-                await github.post_issue_comment(github_issue, review_comment, project)
+                        # Note: GitHub posting handled by centralized GitHub integration
+            # Legacy code path - github_issue is no longer set in context
 
             # Update context for orchestrator
             context['review_completed'] = True
-            context['review_feedback'] = review_feedback
             context['review_status'] = status.value
             context['quality_score'] = overall_score
             context['review_assessment'] = assessment

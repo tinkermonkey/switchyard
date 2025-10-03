@@ -5,7 +5,6 @@ from enum import Enum
 from dataclasses import dataclass
 from typing import Optional, Dict, Any
 from abc import ABC, abstractmethod
-from mcp import create_mcp_integration, MCPIntegration
 
 class PipelineState(Enum):
     IDLE = "idle"

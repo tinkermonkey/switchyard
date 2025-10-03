@@ -18,8 +18,10 @@ workflow_templates:
               labels: ["pipeline:idea-dev"]
 
       - name: "Research"
+        type: "conversational"
         stage_mapping: "research"
         agent: "idea_researcher"
+        feedback_timeout_seconds: 3600  # 1 hour - wait for human feedback
         description: "Idea research and market analysis"
         automation_rules:
           - trigger: "item_moved_to_column"
@@ -27,13 +29,15 @@ workflow_templates:
             parameters:
               labels: ["stage:research"]
           - trigger: "item_moved_to_column"
-            action: "start_pipeline_stage"
+            action: "start_conversational_loop"
             parameters:
               stage: "research"
 
       - name: "Analysis"
+        type: "conversational"
         stage_mapping: "analysis"
         agent: "business_analyst"
+        feedback_timeout_seconds: 3600  # 1 hour - wait for human feedback
         description: "Business requirements analysis"
         automation_rules:
           - trigger: "item_moved_to_column"
@@ -41,13 +45,18 @@ workflow_templates:
             parameters:
               labels: ["stage:analysis"]
           - trigger: "item_moved_to_column"
-            action: "start_pipeline_stage"
+            action: "start_conversational_loop"
             parameters:
               stage: "analysis"
 
       - name: "Review"
+        type: "review"
         stage_mapping: "review"
         agent: "requirements_reviewer"
+        maker_agent: "business_analyst"
+        max_iterations: 3
+        auto_advance_on_approval: true
+        escalate_on_blocked: true
         description: "Requirements validation and review"
         automation_rules:
           - trigger: "item_moved_to_column"
@@ -55,7 +64,7 @@ workflow_templates:
             parameters:
               labels: ["stage:review"]
           - trigger: "item_moved_to_column"
-            action: "start_pipeline_stage"
+            action: "start_review_cycle"
             parameters:
               stage: "review"
 
@@ -127,8 +136,13 @@ workflow_templates:
               stage: "implementation"
 
       - name: "Code Review"
+        type: "review"
         stage_mapping: "implementation_review"
         agent: "code_reviewer"
+        maker_agent: "senior_software_engineer"
+        max_iterations: 3
+        auto_advance_on_approval: true
+        escalate_on_blocked: true
         description: "Code quality review and validation"
         automation_rules:
           - trigger: "item_moved_to_column"
@@ -136,7 +150,7 @@ workflow_templates:
             parameters:
               labels: ["stage:code-review"]
           - trigger: "item_moved_to_column"
-            action: "start_review_process"
+            action: "start_review_cycle"
             parameters:
               stage: "implementation"
 
@@ -194,8 +208,13 @@ workflow_templates:
               stage: "requirements"
 
       - name: "Requirements Review"
+        type: "review"
         stage_mapping: "requirements_review"
         agent: "product_manager"
+        maker_agent: "business_analyst"
+        max_iterations: 3
+        auto_advance_on_approval: true
+        escalate_on_blocked: true
         description: "Strategic validation of requirements"
         automation_rules:
           - trigger: "item_moved_to_column"
@@ -203,7 +222,7 @@ workflow_templates:
             parameters:
               labels: ["stage:requirements-review"]
           - trigger: "item_moved_to_column"
-            action: "start_review_process"
+            action: "start_review_cycle"
             parameters:
               stage: "requirements"
 
@@ -222,8 +241,13 @@ workflow_templates:
               stage: "design"
 
       - name: "Design Review"
+        type: "review"
         stage_mapping: "design_review"
         agent: "design_reviewer"
+        maker_agent: "software_architect"
+        max_iterations: 3
+        auto_advance_on_approval: true
+        escalate_on_blocked: true
         description: "Architecture validation and review"
         automation_rules:
           - trigger: "item_moved_to_column"
@@ -231,7 +255,7 @@ workflow_templates:
             parameters:
               labels: ["stage:design-review"]
           - trigger: "item_moved_to_column"
-            action: "start_review_process"
+            action: "start_review_cycle"
             parameters:
               stage: "design"
 
@@ -250,8 +274,13 @@ workflow_templates:
               stage: "test_planning"
 
       - name: "Test Plan Review"
+        type: "review"
         stage_mapping: "test_planning_review"
         agent: "test_reviewer"
+        maker_agent: "test_planner"
+        max_iterations: 3
+        auto_advance_on_approval: true
+        escalate_on_blocked: true
         description: "Test plan validation"
         automation_rules:
           - trigger: "item_moved_to_column"
@@ -259,7 +288,7 @@ workflow_templates:
             parameters:
               labels: ["stage:test-plan-review"]
           - trigger: "item_moved_to_column"
-            action: "start_review_process"
+            action: "start_review_cycle"
             parameters:
               stage: "test_planning"
 
@@ -278,8 +307,13 @@ workflow_templates:
               stage: "implementation"
 
       - name: "Code Review"
+        type: "review"
         stage_mapping: "implementation_review"
         agent: "code_reviewer"
+        maker_agent: "senior_software_engineer"
+        max_iterations: 3
+        auto_advance_on_approval: true
+        escalate_on_blocked: true
         description: "Code quality review"
         automation_rules:
           - trigger: "item_moved_to_column"
@@ -287,7 +321,7 @@ workflow_templates:
             parameters:
               labels: ["stage:code-review"]
           - trigger: "item_moved_to_column"
-            action: "start_review_process"
+            action: "start_review_cycle"
             parameters:
               stage: "implementation"
 
@@ -320,8 +354,13 @@ workflow_templates:
               stage: "documentation"
 
       - name: "Documentation Review"
+        type: "review"
         stage_mapping: "documentation_review"
         agent: "documentation_editor"
+        maker_agent: "technical_writer"
+        max_iterations: 3
+        auto_advance_on_approval: true
+        escalate_on_blocked: true
         description: "Documentation review and editing"
         automation_rules:
           - trigger: "item_moved_to_column"
@@ -329,7 +368,7 @@ workflow_templates:
             parameters:
               labels: ["stage:documentation-review"]
           - trigger: "item_moved_to_column"
-            action: "start_review_process"
+            action: "start_review_cycle"
             parameters:
               stage: "documentation"
 

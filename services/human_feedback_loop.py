@@ -1,0 +1,395 @@
+"""
+Human Feedback Loop
+
+Handles conversational workflows where agents respond to human feedback in discussion threads.
+Pattern: agent produces output → monitor for human feedback → agent responds to feedback → repeat
+
+For automated maker-checker review workflows, see review_cycle.py instead.
+"""
+
+import asyncio
+import logging
+from typing import Dict, Any, Optional, Tuple
+from datetime import datetime
+from config.manager import WorkflowColumn
+from services.review_parser import ReviewParser, ReviewStatus
+from services.github_integration import GitHubIntegration
+
+logger = logging.getLogger(__name__)
+
+
+class HumanFeedbackState:
+    """Tracks state for an active human feedback loop"""
+
+    def __init__(
+        self,
+        issue_number: int,
+        repository: str,
+        agent: str,
+        project_name: str,
+        board_name: str,
+        workspace_type: str = 'discussions',
+        discussion_id: Optional[str] = None
+    ):
+        self.issue_number = issue_number
+        self.repository = repository
+        self.agent = agent
+        self.project_name = project_name
+        self.board_name = board_name
+        self.workspace_type = workspace_type
+        self.discussion_id = discussion_id
+        self.current_iteration = 0
+        self.agent_outputs = []
+        self.created_at = datetime.now().isoformat()
+
+
+class HumanFeedbackLoopExecutor:
+    """Executor for human feedback loops in discussion threads"""
+
+    def __init__(self):
+        self.review_parser = ReviewParser()
+        self.github = GitHubIntegration()
+        self.active_loops = {}  # Track active loops by issue number
+
+    async def start_loop(
+        self,
+        issue_number: int,
+        repository: str,
+        project_name: str,
+        board_name: str,
+        column: WorkflowColumn,
+        issue_data: Dict[str, Any],
+        previous_stage_output: Optional[str],
+        org: str,
+        workflow_columns: list = None,
+        workspace_type: str = 'discussions',
+        discussion_id: Optional[str] = None
+    ) -> Tuple[str, bool]:
+        """
+        Start a human feedback loop where agent responds to human comments
+
+        Returns:
+            Tuple of (next_column_name, success)
+        """
+        logger.info(
+            f"Starting human feedback loop for issue #{issue_number} "
+            f"with agent {column.agent}"
+        )
+
+        # Create state
+        state = HumanFeedbackState(
+            issue_number=issue_number,
+            repository=repository,
+            agent=column.agent,
+            project_name=project_name,
+            board_name=board_name,
+            workspace_type=workspace_type,
+            discussion_id=discussion_id
+        )
+
+        # Register active loop
+        self.active_loops[issue_number] = state
+        self.workflow_columns = workflow_columns
+
+        try:
+            # Step 1: Execute the agent (initial output)
+            await self._execute_agent(
+                state,
+                column,
+                issue_data,
+                previous_stage_output,
+                org,
+                is_initial=True
+            )
+
+            # Step 2: Monitor for human feedback
+            result = await self._conversational_loop(state, column, issue_data, org)
+
+            return result
+
+        except Exception as e:
+            logger.error(f"Conversational loop failed for issue #{issue_number}: {e}")
+            raise
+        finally:
+            # Clean up
+            if issue_number in self.active_loops:
+                del self.active_loops[issue_number]
+
+    async def _conversational_loop(
+        self,
+        state: HumanFeedbackState,
+        column: WorkflowColumn,
+        issue_data: Dict[str, Any],
+        org: str
+    ) -> Tuple[str, bool]:
+        """
+        Monitor for human feedback and respond (runs indefinitely until card moves)
+
+        Returns when:
+        - Card is moved to a different column (detected via project state)
+        - Process terminates (daemon thread)
+        """
+        poll_interval = 30  # Check every 30 seconds
+        poll_count = 0
+
+        logger.info(
+            f"Monitoring discussion {state.discussion_id} for human feedback "
+            f"(will poll indefinitely until card moves to different column)"
+        )
+
+        while True:
+            await asyncio.sleep(poll_interval)
+            poll_count += 1
+
+            # Check for human feedback
+            try:
+                human_feedback = self._get_human_feedback_since_last_agent(
+                    state,
+                    org
+                )
+            except Exception as e:
+                logger.error(f"Error checking for feedback: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
+                human_feedback = None
+
+            if human_feedback:
+                logger.info(f"Human feedback detected from {human_feedback['author']}")
+                state.current_iteration += 1
+
+                # Execute agent with human feedback
+                await self._execute_agent(
+                    state,
+                    column,
+                    issue_data,
+                    None,  # No previous stage output
+                    org,
+                    is_initial=False,
+                    human_feedback=human_feedback['body']
+                )
+
+                logger.debug("Agent responded to feedback, continuing to monitor")
+
+            # Log progress every 5 minutes
+            if poll_count % 10 == 0:  # Every 10 polls = 5 minutes
+                logger.debug(
+                    f"Still monitoring for feedback "
+                    f"(polls: {poll_count}, iterations: {state.current_iteration})"
+                )
+
+            # Check if card has moved to a different column
+            # This would indicate human intervention or workflow progression
+            # For now, we rely on the daemon thread terminating with the process
+            # In the future, we could query GitHub to check current column
+            # and exit gracefully if the card has moved
+
+    async def _execute_agent(
+        self,
+        state: HumanFeedbackState,
+        column: WorkflowColumn,
+        issue_data: Dict[str, Any],
+        previous_stage_output: Optional[str],
+        org: str,
+        is_initial: bool = False,
+        human_feedback: Optional[str] = None
+    ):
+        """Execute the agent and post output to discussion"""
+        from pipeline.factory import PipelineFactory
+
+        # Build context for agent
+        context = {
+            'project': state.project_name,
+            'board': state.board_name,
+            'repository': state.repository,
+            'issue_number': state.issue_number,
+            'issue': issue_data,
+            'column': column.name,
+            'trigger': 'feedback_loop' if human_feedback else 'conversational_loop',
+            'workspace_type': state.workspace_type,
+            'discussion_id': state.discussion_id,
+            'timestamp': datetime.now().isoformat(),
+            'use_docker': True,  # Run agents in Docker for filesystem isolation
+            'agent': state.agent  # Pass agent name for observability
+        }
+
+        if previous_stage_output:
+            context['previous_stage_output'] = previous_stage_output
+
+        if human_feedback:
+            # Add feedback context
+            context['feedback'] = {
+                'formatted_text': human_feedback
+            }
+            context['conversational_loop'] = {
+                'iteration': state.current_iteration,
+                'has_human_feedback': True
+            }
+            # Add previous output so agent can reference it
+            if state.agent_outputs:
+                context['previous_output'] = state.agent_outputs[-1]['output']
+
+        # Execute agent via centralized executor (ensures observability)
+        logger.info(f"Executing {state.agent} (iteration {state.current_iteration})")
+
+        from services.agent_executor import get_agent_executor
+
+        executor = get_agent_executor()
+        result = await executor.execute_agent(
+            agent_name=state.agent,
+            project_name=state.project_name,
+            task_context=context,
+            task_id_prefix="conversational"
+        )
+
+        # Store output
+        state.agent_outputs.append({
+            'iteration': state.current_iteration,
+            'output': result,
+            'is_initial': is_initial,
+            'has_feedback': human_feedback is not None,
+            'timestamp': datetime.now().isoformat()
+        })
+
+        logger.info(f"Agent {state.agent} completed successfully")
+
+    def _get_human_feedback_since_last_agent(
+        self,
+        state: HumanFeedbackState,
+        org: str
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Check for human feedback since the last agent output
+
+        Returns:
+            Dict with author and body, or None if no feedback
+        """
+        from services.github_app import github_app
+        from dateutil import parser as date_parser
+
+        try:
+            logger.debug(f"Fetching comments from discussion {state.discussion_id}")
+
+            query = """
+            query($discussionId: ID!) {
+              node(id: $discussionId) {
+                ... on Discussion {
+                  comments(last: 20) {
+                    nodes {
+                      author { login }
+                      body
+                      createdAt
+                      replies(last: 20) {
+                        nodes {
+                          author { login }
+                          body
+                          createdAt
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+            """
+
+            result = github_app.graphql_request(query, {'discussionId': state.discussion_id})
+
+            logger.debug(f"GraphQL result: {result is not None}")
+
+            if not result:
+                logger.warning(f"No result from GraphQL query for discussion {state.discussion_id}")
+                return None
+
+            # GitHub App graphql_request returns direct data, not wrapped in 'data' key
+            if 'node' not in result:
+                logger.error(f"GraphQL query missing 'node' key: {result}")
+                return None
+
+            if not result['node']:
+                logger.warning(f"Discussion {state.discussion_id} not found")
+                return None
+
+            comments = result['node']['comments']['nodes']
+
+            # Get timestamp of last agent output
+            if state.agent_outputs:
+                last_agent_time = datetime.fromisoformat(
+                    state.agent_outputs[-1]['timestamp']
+                )
+            else:
+                # No agent output yet, use loop start time
+                last_agent_time = datetime.fromisoformat(state.created_at)
+
+            # Flatten comments and replies, look for human comments after last agent output
+            logger.debug(f"Checking {len(comments)} comments for feedback (last_agent_time: {last_agent_time})")
+
+            for comment in comments:
+                # Check top-level comment
+                if 'author' in comment and 'createdAt' in comment:
+                    author = comment['author']['login']
+                    created_at = date_parser.parse(comment['createdAt'])
+                    if created_at.tzinfo:
+                        created_at = created_at.replace(tzinfo=None)
+
+                    if author != 'orchestrator-bot' and created_at > last_agent_time:
+                        logger.info(f"Found human feedback in top-level comment from {author}")
+                        return {
+                            'author': author,
+                            'body': comment.get('body', ''),
+                            'created_at': created_at.isoformat()
+                        }
+
+                # Check replies
+                replies = comment.get('replies', {}).get('nodes', [])
+                logger.debug(f"Comment has {len(replies)} replies")
+
+                for reply in replies:
+                    author = reply['author']['login']
+                    created_at = date_parser.parse(reply['createdAt'])
+
+                    # Convert to naive datetime
+                    if created_at.tzinfo:
+                        created_at = created_at.replace(tzinfo=None)
+
+                    logger.debug(f"Reply from {author} at {created_at} (last_agent: {last_agent_time})")
+
+                    # Check if human comment after last agent output
+                    if author != 'orchestrator-bot' and created_at > last_agent_time:
+                        logger.info(f"Found human feedback in reply from {author}")
+                        return {
+                            'author': author,
+                            'body': reply['body'],
+                            'created_at': created_at.isoformat()
+                        }
+
+            return None
+
+        except Exception as e:
+            logger.error(f"Error checking for human feedback: {e}")
+            return None
+
+    def _get_next_column_name(self, current_column: WorkflowColumn) -> str:
+        """Determine next column name"""
+        if not hasattr(self, 'workflow_columns') or not self.workflow_columns:
+            logger.warning("No workflow columns available")
+            return current_column.name
+
+        # Find current column index
+        current_index = -1
+        for i, col in enumerate(self.workflow_columns):
+            if col.name == current_column.name:
+                current_index = i
+                break
+
+        if current_index == -1 or current_index >= len(self.workflow_columns) - 1:
+            logger.warning(f"Cannot determine next column for {current_column.name}")
+            return current_column.name
+
+        # Return next column name
+        next_col = self.workflow_columns[current_index + 1]
+        logger.info(f"Next column after {current_column.name}: {next_col.name}")
+        return next_col.name
+
+
+# Global singleton
+human_feedback_loop_executor = HumanFeedbackLoopExecutor()

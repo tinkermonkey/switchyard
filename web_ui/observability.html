@@ -400,9 +400,11 @@
             background: #161b22;
             border: 1px solid #30363d;
             border-radius: 6px;
-            max-width: 90%;
-            max-height: 90%;
-            overflow: auto;
+            width: 95vw;
+            max-width: 1400px;
+            height: 90vh;
+            display: flex;
+            flex-direction: column;
             padding: 20px;
             position: relative;
         }
@@ -443,6 +445,10 @@
 
         .modal-body {
             color: #c9d1d9;
+            flex: 1;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
         }
 
         .json-viewer {
@@ -768,9 +774,26 @@
             `;
         }
 
+        // Store prompts separately to avoid data attribute size limits
+        const promptCache = new Map();
+
         function renderPromptConstructed(event, timestamp) {
             const tokens = event.data.estimated_tokens || Math.floor(event.data.prompt_length / 4);
             const promptId = 'prompt_' + Date.now();
+            const promptText = event.data.prompt || event.data.prompt_preview || '';
+
+            // Debug: Log prompt info
+            console.log(`Prompt event - ID: ${promptId}`);
+            console.log(`  - Has full prompt: ${!!event.data.prompt}`);
+            console.log(`  - Has preview: ${!!event.data.prompt_preview}`);
+            console.log(`  - Full prompt length: ${event.data.prompt ? event.data.prompt.length : 'N/A'}`);
+            console.log(`  - Preview length: ${event.data.prompt_preview ? event.data.prompt_preview.length : 'N/A'}`);
+            console.log(`  - Reported length: ${event.data.prompt_length}`);
+            console.log(`  - Using: ${event.data.prompt ? 'full prompt' : 'preview'}`);
+
+            // Store prompt in cache instead of data attribute (avoids size limits)
+            promptCache.set(promptId, promptText);
+
             return `
                 <div class="event-template">
                     <div class="event-template-header">
@@ -790,11 +813,8 @@
                                 <span class="event-metric-value">~${tokens.toLocaleString()}</span>
                             </div>
                         </div>
-                        <div class="expandable-section" onclick="toggleExpand('${promptId}')">
-                            ▶ View prompt preview
-                        </div>
-                        <div id="${promptId}" class="expandable-content">
-                            <pre>${escapeHtml(event.data.prompt_preview || event.data.prompt || '')}</pre>
+                        <div class="expandable-section" onclick="showPromptModal('${promptId}')">
+                            📄 View full prompt
                         </div>
                     </div>
                 </div>
@@ -870,7 +890,10 @@
 
         function renderAgentCompleted(event, timestamp) {
             const isSuccess = event.event_type === 'agent_completed';
-            const duration = event.data?.duration_seconds ? (event.data.duration_seconds / 60).toFixed(1) : 'N/A';
+            const durationMs = event.data?.duration_ms || 0;
+            const durationMinutes = (durationMs / 1000 / 60).toFixed(1);
+            const durationSeconds = (durationMs / 1000).toFixed(1);
+            const duration = durationMs > 0 ? (durationMs > 60000 ? `${durationMinutes} min` : `${durationSeconds} sec`) : 'N/A';
             return `
                 <div class="event-template">
                     <div class="event-template-header">
@@ -882,7 +905,7 @@
                     <div class="event-details">
                         <div class="event-detail-row">
                             <span class="event-detail-label">Duration</span>
-                            <span class="event-detail-value">${duration} minutes</span>
+                            <span class="event-detail-value">${duration}</span>
                         </div>
                         <div class="event-detail-row">
                             <span class="event-detail-label">Status</span>
@@ -1252,12 +1275,44 @@
             if (event.target.id === 'logModal') {
                 closeLogModal();
             }
+            if (event.target.id === 'promptModal') {
+                closePromptModal();
+            }
+        }
+
+        function showPromptModal(promptId) {
+            // Get prompt from cache
+            const promptText = promptCache.get(promptId);
+            if (!promptText) {
+                console.error('Prompt not found in cache:', promptId);
+                return;
+            }
+
+            const modal = document.getElementById('promptModal');
+            const content = document.getElementById('modalPromptContent');
+
+            // Render markdown
+            try {
+                const rendered = marked.parse(promptText);
+                content.innerHTML = rendered;
+            } catch (e) {
+                console.error('Error rendering markdown:', e);
+                content.textContent = promptText;
+            }
+
+            modal.classList.add('active');
+        }
+
+        function closePromptModal() {
+            const modal = document.getElementById('promptModal');
+            modal.classList.remove('active');
         }
 
         // Close modal on Escape key
         document.addEventListener('keydown', (e) => {
             if (e.key === 'Escape') {
                 closeLogModal();
+                closePromptModal();
             }
         });
 
@@ -1469,6 +1524,20 @@
             <div class="modal-body">
                 <div id="modalLogContent" class="json-viewer">
                     <pre></pre>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Modal for prompt viewing -->
+    <div id="promptModal" class="modal-overlay" onclick="closeModalOnOverlay(event)">
+        <div class="modal-content" onclick="event.stopPropagation()">
+            <div class="modal-header">
+                <h3>Full Prompt</h3>
+                <button class="modal-close" onclick="closePromptModal()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div id="modalPromptContent" class="log-content" style="flex: 1; overflow-y: auto; padding: 15px; background: #0d1117; border-radius: 6px; font-size: 14px; line-height: 1.6;">
                 </div>
             </div>
         </div>

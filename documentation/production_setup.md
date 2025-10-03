@@ -127,9 +127,6 @@ pipelines:
       - name: business_analyst
         timeout: 300
         retries: 3
-        circuit_breaker:
-          failure_threshold: 3
-          recovery_timeout: 180
 
   default: business_analyst_only
 
@@ -673,7 +670,6 @@ docker-compose logs orchestrator | grep -E "(cloning|project|repository)"
 
 #### Optimization Strategies
 - Adjust Redis memory settings for handoff storage
-- Tune circuit breaker thresholds for agent reliability
 - Scale orchestrator instances for parallel processing
 - Optimize Docker resource limits for MCP servers
 - Configure project cleanup policies

@@ -134,25 +134,15 @@ def create_single_agent_pipeline(agent_name: str, state_manager: StateManager) -
 
 async def process_task_integrated(task, state_manager, logger):
     """
-    Process task using the new agent architecture
+    Process task from task queue with branch management and auto-commit support.
 
-    This function maintains compatibility with the legacy interface while using
-    the new agent system.
+    This is the entry point for task queue-based agent execution.
+    Uses centralized AgentExecutor for consistent observability.
     """
-    from datetime import datetime
-    from config.manager import config_manager
-    from pipeline.factory import PipelineFactory
-    from monitoring.observability import get_observability_manager
     from services.project_workspace import workspace_manager
-    import time
-    import json
+    from services.agent_executor import get_agent_executor
+    from config.manager import config_manager
 
-    obs = get_observability_manager()
-
-    # Emit task received event
-    obs.emit_task_received(task.agent, task.id, task.project, task.context)
-
-    # Manage branch for dev and full-sdlc pipelines
     task_context = task.context
     board_name = task_context.get('board', '')
     issue_number = task_context.get('issue_number')
@@ -166,57 +156,6 @@ async def process_task_integrated(task, state_manager, logger):
         else:
             logger.log_warning(f"Failed to create feature branch for issue #{issue_number}")
 
-    # Create stream callback that publishes to Redis
-    # The observability server will pick it up and forward to websockets
-    def stream_callback(event):
-        """Publish Claude stream events to Redis for websocket forwarding and history"""
-        try:
-            if obs and obs.enabled:
-                import time
-                event_data = {
-                    'agent': task.agent,
-                    'task_id': task.id,
-                    'project': task.project,
-                    'timestamp': event.get('timestamp') or time.time(),
-                    'event': event
-                }
-                event_json = json.dumps(event_data)
-
-                # Publish to pub/sub for real-time delivery
-                obs.redis.publish('orchestrator:claude_stream', event_json)
-
-                # Also add to Redis Stream for history (with automatic trimming)
-                claude_stream_key = "orchestrator:claude_logs_stream"
-                obs.redis.xadd(
-                    claude_stream_key,
-                    {'log': event_json},
-                    maxlen=500,  # Keep last 500 log entries
-                    approximate=True
-                )
-
-                # Set 2-hour TTL on the stream
-                obs.redis.expire(claude_stream_key, 7200)
-        except Exception as e:
-            logger.log_error(f"Error publishing stream event: {e}")
-
-    # Convert Task object to pipeline context
-    pipeline_context = {
-        'pipeline_id': f"pipeline_{task.id}_{datetime.now().timestamp()}",
-        'task_id': task.id,
-        'agent': task.agent,
-        'project': task.project,
-        'context': task.context,
-        'work_dir': f"./projects/{task.project}",
-        'completed_work': [],
-        'decisions': [],
-        'metrics': {},
-        'validation': {},
-        'state_manager': state_manager,
-        'observability': obs,  # Pass observability manager to agents
-        'stream_callback': stream_callback,  # Pass stream callback for live logs
-        'use_docker': task.context.get('use_docker', True)  # Respect task context, default to True for project isolation
-    }
-
     # Validate task can run (check dev container requirements)
     validation_result = await validate_task_can_run(task, logger)
     if not validation_result['can_run']:
@@ -226,81 +165,40 @@ async def process_task_integrated(task, state_manager, logger):
             await queue_dev_environment_setup(task.project, logger)
         raise Exception(f"Task blocked: {validation_result['reason']}")
 
-    # Create pipeline using the factory (which loads agent config including MCP servers)
-    factory = PipelineFactory(config_manager)
-    agent_stage = factory.create_agent(task.agent, task.project)
+    # Execute agent using centralized executor
+    executor = get_agent_executor()
+    result = await executor.execute_agent(
+        agent_name=task.agent,
+        project_name=task.project,
+        task_context=task.context,
+        task_id_prefix=task.id  # Use actual task ID from queue
+    )
 
-    # Emit agent initialized event
-    agent_config = agent_stage.agent_config or {}
-    obs.emit_agent_initialized(task.agent, task.id, task.project, agent_config)
+    # Auto-commit changes if agent makes code changes
+    agent_config = config_manager.get_project_agent_config(task.project, task.agent)
+    makes_code_changes = getattr(agent_config, 'makes_code_changes', False)
+    if makes_code_changes:
+        logger.info(f"Agent {task.agent} makes code changes, attempting auto-commit")
+        from services.auto_commit import auto_commit_service
 
-    # Add claude_model from agent config to pipeline context for claude_integration
-    if 'claude_model' in agent_config:
-        pipeline_context['claude_model'] = agent_config['claude_model']
-        logger.info(f"Using configured model for {task.agent}: {agent_config['claude_model']}")
+        commit_success = await auto_commit_service.commit_agent_changes(
+            project=task.project,
+            agent=task.agent,
+            task_id=task.id,
+            issue_number=issue_number
+        )
 
-    pipeline = SequentialPipeline([agent_stage], state_manager)
+        if commit_success:
+            logger.info(f"Successfully auto-committed changes for task {task.id}")
+        else:
+            logger.log_warning(f"Failed to auto-commit changes for task {task.id}")
 
-    start_time = time.time()
-
-    try:
-        logger.info(f"Starting pipeline execution for task {task.id} with agent {task.agent}")
-        result = await pipeline.execute(pipeline_context)
-
-        duration_ms = (time.time() - start_time) * 1000
-        obs.emit_agent_completed(task.agent, task.id, task.project, duration_ms, True)
-
-        logger.info(f"Pipeline completed for task {task.id}")
-
-        # Auto-commit changes if agent makes code changes
-        makes_code_changes = getattr(agent_config, 'makes_code_changes', False)
-        if makes_code_changes:
-            logger.info(f"Agent {task.agent} makes code changes, attempting auto-commit")
-            from services.auto_commit import auto_commit_service
-
-            issue_number = task_context.get('issue_number')
-            commit_success = await auto_commit_service.commit_agent_changes(
-                project=task.project,
-                agent=task.agent,
-                task_id=task.id,
-                issue_number=issue_number
-            )
-
-            if commit_success:
-                logger.info(f"Successfully auto-committed changes for task {task.id}")
-            else:
-                logger.log_warning(f"Failed to auto-commit changes for task {task.id}")
-
-        return result
-
-    except Exception as e:
-        duration_ms = (time.time() - start_time) * 1000
-        obs.emit_agent_completed(task.agent, task.id, task.project, duration_ms, False, str(e))
-
-        logger.log_error(f"Pipeline execution failed for task {task.id}: {e}")
-        raise
-
-
-# Legacy function aliases for backward compatibility
-async def business_analyst_agent(context: Dict[str, Any]) -> Dict[str, Any]:
-    """Legacy compatibility function"""
-    agent_class = get_agent_class("business_analyst")
-    agent = agent_class()
-    return await agent.execute(context)
-
-
-async def code_reviewer_agent(context: Dict[str, Any]) -> Dict[str, Any]:
-    """Legacy compatibility function"""
-    agent_class = get_agent_class("code_reviewer")
-    agent = agent_class()
-    return await agent.execute(context)
+    return result
 
 
 # Export the main integration function
 __all__ = [
     'process_task_integrated',
-    'business_analyst_agent',
-    'code_reviewer_agent',
     'create_agent_pipeline',
     'create_single_agent_pipeline',
     'AgentStage'

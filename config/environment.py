@@ -9,6 +9,7 @@ class Environment(BaseSettings):
 
     # API Keys
     anthropic_api_key: Optional[SecretStr] = None
+    claude_code_oauth_token: Optional[SecretStr] = None  # For Claude subscription billing
     github_token: Optional[SecretStr] = None
     openai_api_key: Optional[SecretStr] = None  # For GPT-based reviews
     context7_api_key: Optional[SecretStr] = None  # For Context7 MCP server
