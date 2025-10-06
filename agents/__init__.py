@@ -15,9 +15,11 @@ from .software_architect_agent import SoftwareArchitectAgent
 from .design_reviewer_agent import DesignReviewerAgent
 from .test_planner_agent import TestPlannerAgent
 from .test_reviewer_agent import TestReviewerAgent
+from .work_breakdown_agent import WorkBreakdownAgent
 from .senior_software_engineer_agent import SeniorSoftwareEngineerAgent
 from .code_reviewer_agent import CodeReviewerAgent
 from .senior_qa_engineer_agent import SeniorQAEngineerAgent
+from .qa_reviewer_agent import QAReviewerAgent
 from .technical_writer_agent import TechnicalWriterAgent
 from .documentation_editor_agent import DocumentationEditorAgent
 
@@ -32,9 +34,11 @@ AGENT_REGISTRY = {
     "design_reviewer": DesignReviewerAgent,
     "test_planner": TestPlannerAgent,
     "test_reviewer": TestReviewerAgent,
+    "work_breakdown_agent": WorkBreakdownAgent,
     "senior_software_engineer": SeniorSoftwareEngineerAgent,
     "code_reviewer": CodeReviewerAgent,
     "senior_qa_engineer": SeniorQAEngineerAgent,
+    "qa_reviewer": QAReviewerAgent,
     "technical_writer": TechnicalWriterAgent,
     "documentation_editor": DocumentationEditorAgent,
 }
@@ -50,9 +54,11 @@ __all__ = [
     "DesignReviewerAgent",
     "TestPlannerAgent",
     "TestReviewerAgent",
+    "WorkBreakdownAgent",
     "SeniorSoftwareEngineerAgent",
     "CodeReviewerAgent",
     "SeniorQAEngineerAgent",
+    "QAReviewerAgent",
     "TechnicalWriterAgent",
     "DocumentationEditorAgent",
     "AGENT_REGISTRY",

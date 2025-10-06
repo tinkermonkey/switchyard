@@ -6,11 +6,12 @@ Implements the synchronous maker-checker review loop with iteration tracking.
 
 import asyncio
 import logging
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, Optional, Tuple, List
 from datetime import datetime
 from config.manager import WorkflowColumn
 from services.review_parser import ReviewParser, ReviewStatus
 from services.github_integration import GitHubIntegration
+from services.review_outcome_correlator import get_review_outcome_correlator
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +52,7 @@ class ReviewCycleState:
         self.last_maker_comment_id = None  # Last comment ID from maker
         self.last_review_comment_id = None  # Last comment ID from reviewer
         self.last_escalation_comment_id = None  # Escalation comment ID for feedback tracking
+        self.last_approved_commit = None  # Git commit hash of last approved review (for scoped diffs)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -73,6 +75,7 @@ class ReviewCycleState:
             'last_maker_comment_id': self.last_maker_comment_id,
             'last_review_comment_id': self.last_review_comment_id,
             'last_escalation_comment_id': self.last_escalation_comment_id,
+            'last_approved_commit': self.last_approved_commit,
         }
 
     @classmethod
@@ -99,6 +102,7 @@ class ReviewCycleState:
         state.last_maker_comment_id = data.get('last_maker_comment_id')
         state.last_review_comment_id = data.get('last_review_comment_id')
         state.last_escalation_comment_id = data.get('last_escalation_comment_id')
+        state.last_approved_commit = data.get('last_approved_commit')
         return state
 
 
@@ -110,6 +114,22 @@ class ReviewCycleExecutor:
         self.github = GitHubIntegration()
         self.active_cycles = {}  # Track active review cycles by issue number
         self.state_dir = None  # Will be set per project
+        self.outcome_correlator = get_review_outcome_correlator()
+
+    async def _analyze_review_cycle_outcomes(self, cycle_state: ReviewCycleState):
+        """
+        Analyze completed review cycle for learning.
+
+        Extracts review outcomes to feed into the pattern detection and learning system.
+        This runs asynchronously in the background to not block cycle completion.
+        """
+        try:
+            logger.info(f"Analyzing review cycle outcomes for issue #{cycle_state.issue_number}")
+            outcomes = await self.outcome_correlator.analyze_review_cycle_outcome(cycle_state)
+            logger.info(f"Extracted {len(outcomes)} review outcomes for learning")
+        except Exception as e:
+            logger.warning(f"Failed to analyze review outcomes (non-critical): {e}")
+            # Don't fail the cycle if learning fails
 
     def _get_state_file_path(self, project_name: str) -> str:
         """Get path to active cycles state file for a project"""
@@ -158,7 +178,7 @@ class ReviewCycleExecutor:
 
         logger.info(f"Saved cycle state for issue {cycle_state.issue_number} (status: {cycle_state.status})")
 
-    def _load_active_cycles(self, project_name: str) -> Dict[int, ReviewCycleState]:
+    def _load_active_cycles(self, project_name: str) -> List[ReviewCycleState]:
         """Load active cycles from disk for a project"""
         import yaml
         import os
@@ -167,15 +187,15 @@ class ReviewCycleExecutor:
 
         if not os.path.exists(state_file):
             logger.info(f"No active cycles state file found for {project_name}")
-            return {}
+            return []
 
         with open(state_file, 'r') as f:
             data = yaml.safe_load(f) or {}
 
-        cycles = {}
+        cycles = []
         for cycle_data in data.get('active_cycles', []):
             cycle_state = ReviewCycleState.from_dict(cycle_data)
-            cycles[cycle_state.issue_number] = cycle_state
+            cycles.append(cycle_state)
 
         logger.info(f"Loaded {len(cycles)} active cycles for {project_name}")
         return cycles
@@ -225,13 +245,13 @@ class ReviewCycleExecutor:
         logger.info(f"Found {len(active_cycles)} active cycles to resume")
 
         # Populate in-memory cache
-        for issue_number, cycle_state in active_cycles.items():
-            self.active_cycles[issue_number] = cycle_state
+        for cycle_state in active_cycles:
+            self.active_cycles[cycle_state.issue_number] = cycle_state
 
         # Resume each cycle based on its state
-        for issue_number, cycle_state in active_cycles.items():
+        for cycle_state in active_cycles:
             logger.info(
-                f"Resuming cycle for issue #{issue_number} "
+                f"Resuming cycle for issue #{cycle_state.issue_number} "
                 f"(status: {cycle_state.status}, iteration: {cycle_state.current_iteration}/{cycle_state.max_iterations})"
             )
 
@@ -244,21 +264,33 @@ class ReviewCycleExecutor:
 
                     if not discussion:
                         logger.warning(
-                            f"Discussion {cycle_state.discussion_id} for issue #{issue_number} "
+                            f"Discussion {cycle_state.discussion_id} for issue #{cycle_state.issue_number} "
                             f"no longer exists. Removing cycle from active state."
                         )
                         self._remove_cycle_state(cycle_state)
                         continue
 
             except Exception as e:
-                logger.error(f"Failed to resume cycle for issue #{issue_number}: {e}")
+                logger.error(f"Failed to resume cycle for issue #{cycle_state.issue_number}: {e}")
                 continue
 
             try:
-                if cycle_state.status == 'awaiting_human_feedback':
+                if cycle_state.status == 'initialized':
+                    # Cycle is initialized - check if there's pending work to continue
+                    if cycle_state.review_outputs and len(cycle_state.review_outputs) > 0:
+                        # Reviewer has completed at least one iteration
+                        logger.info(f"Cycle in initialized state with pending review - continuing")
+                        await self._continue_cycle_from_review(cycle_state, org)
+                        continue
+                    else:
+                        # No work done yet, needs to be triggered by column movement
+                        logger.info(f"Cycle in initialized state with no outputs - waiting for trigger")
+                        continue
+
+                elif cycle_state.status == 'awaiting_human_feedback':
                     # Cycle is awaiting human feedback
                     logger.info(
-                        f"Cycle for issue #{issue_number} is awaiting human feedback. "
+                        f"Cycle for issue #{cycle_state.issue_number} is awaiting human feedback. "
                         f"Project monitor will check periodically and resume when feedback is detected."
                     )
                     # State is already saved, project_monitor.check_escalated_review_cycles() will handle this
@@ -266,12 +298,37 @@ class ReviewCycleExecutor:
 
                 elif cycle_state.status in ['maker_working', 'reviewer_working']:
                     # Agents were working when restart happened
-                    # We'll wait for manual intervention or restart the work
+                    # Check if they actually completed (state wasn't updated before restart)
                     logger.warning(
                         f"Cycle was in {cycle_state.status} state during restart. "
-                        f"Manual intervention may be required to resume."
+                        f"Checking if work completed..."
                     )
-                    # Could implement: check GitHub for new comments from agents and continue
+
+                    # If reviewer was working, check if there's a review output for this iteration
+                    if (cycle_state.status == 'reviewer_working' and
+                        cycle_state.review_outputs and
+                        any(r['iteration'] == cycle_state.current_iteration for r in cycle_state.review_outputs)):
+                        logger.info(f"Reviewer completed iteration {cycle_state.current_iteration}, resuming cycle")
+                        cycle_state.status = 'initialized'
+                        self._save_cycle_state(cycle_state)
+
+                        # Resume the cycle from the review point
+                        await self._continue_cycle_from_review(cycle_state, org)
+                        continue
+
+                    # If maker was working, check if there's a maker output for this iteration
+                    if (cycle_state.status == 'maker_working' and
+                        cycle_state.maker_outputs and
+                        any(m['iteration'] == cycle_state.current_iteration for m in cycle_state.maker_outputs)):
+                        logger.info(f"Maker completed iteration {cycle_state.current_iteration}, resuming cycle")
+                        cycle_state.status = 'initialized'
+                        self._save_cycle_state(cycle_state)
+
+                        # Resume the cycle from the maker point
+                        await self._continue_cycle_from_maker(cycle_state, org)
+                        continue
+
+                    logger.warning("Agent didn't complete before restart, manual intervention may be required.")
 
                 elif cycle_state.status == 'completed':
                     # Shouldn't happen, but clean up if it does
@@ -282,7 +339,7 @@ class ReviewCycleExecutor:
                     logger.warning(f"Unknown cycle status: {cycle_state.status}")
 
             except Exception as e:
-                logger.error(f"Failed to resume cycle for issue #{issue_number}: {e}", exc_info=True)
+                logger.error(f"Failed to resume cycle for issue #{cycle_state.issue_number}: {e}", exc_info=True)
 
         logger.info("Finished resuming active cycles")
 
@@ -320,11 +377,35 @@ class ReviewCycleExecutor:
         """
         # Check if there's already an active cycle for this issue
         if issue_number in self.active_cycles:
-            logger.warning(
-                f"Review cycle already active for issue #{issue_number}, "
-                f"using existing cycle (status: {self.active_cycles[issue_number].status})"
-            )
-            cycle_state = self.active_cycles[issue_number]
+            existing_cycle = self.active_cycles[issue_number]
+            # Check if the existing cycle is for the same agents
+            if (existing_cycle.maker_agent == column.maker_agent and
+                existing_cycle.reviewer_agent == column.agent):
+                logger.info(
+                    f"Review cycle already active for issue #{issue_number}, "
+                    f"using existing cycle (status: {existing_cycle.status})"
+                )
+                cycle_state = existing_cycle
+            else:
+                # Different review column - remove old cycle and create new one
+                logger.info(
+                    f"Removing old review cycle for issue #{issue_number} "
+                    f"(was: {existing_cycle.reviewer_agent}/{existing_cycle.maker_agent}, "
+                    f"now: {column.agent}/{column.maker_agent})"
+                )
+                self._remove_cycle_state(existing_cycle)
+                # Create new review cycle state
+                cycle_state = ReviewCycleState(
+                    issue_number=issue_number,
+                    repository=repository,
+                    maker_agent=column.maker_agent,
+                    reviewer_agent=column.agent,
+                    max_iterations=column.max_iterations,
+                    project_name=project_name,
+                    board_name=board_name,
+                    workspace_type=workspace_type,
+                    discussion_id=discussion_id
+                )
         else:
             # Create new review cycle state
             cycle_state = ReviewCycleState(
@@ -390,6 +471,180 @@ class ReviewCycleExecutor:
 
             raise
 
+    async def _continue_cycle_from_review(self, cycle_state: ReviewCycleState, org: str):
+        """Continue a stuck cycle that completed a review but state wasn't updated"""
+        from config.manager import config_manager
+
+        try:
+            # Get the review output for this iteration
+            review_output = next(
+                (r['output'] for r in cycle_state.review_outputs if r['iteration'] == cycle_state.current_iteration),
+                None
+            )
+
+            if not review_output:
+                logger.error(f"No review output found for iteration {cycle_state.current_iteration}")
+                return
+
+            # Parse the review to determine next action
+            review_result = self.review_parser.parse_review(review_output)
+
+            # Get necessary context
+            project_config = config_manager.get_project_config(cycle_state.project_name)
+            workflow_template = config_manager.get_project_workflow(cycle_state.project_name, cycle_state.board_name)
+            column = next((c for c in workflow_template.columns if c.type == 'review'), None)
+
+            if not column:
+                logger.error(f"No review column found for {cycle_state.board_name}")
+                return
+
+            issue_data = await self.github.get_issue_details(cycle_state.issue_number, cycle_state.repository)
+
+            # Continue with appropriate action based on review status
+            if review_result.status == ReviewStatus.APPROVED:
+                logger.info(f"Review was approved, completing cycle")
+
+                # Store current commit hash for future scoped reviews (issues workspace)
+                if cycle_state.workspace_type == 'issues':
+                    from services.project_workspace import workspace_manager
+                    project_dir = workspace_manager.get_project_dir(cycle_state.project_name)
+                    current_commit = self._get_git_commit_hash(str(project_dir))
+                    if current_commit:
+                        cycle_state.last_approved_commit = current_commit
+                        logger.info(f"Stored approved commit {current_commit[:8]} for future scoped reviews")
+
+                cycle_state.status = 'completed'
+                self._save_cycle_state(cycle_state)
+
+                # Analyze review cycle outcomes for learning (async, non-blocking)
+                await self._analyze_review_cycle_outcomes(cycle_state)
+
+                self._remove_cycle_state(cycle_state)
+
+                # Update PR status if using git workflow
+                if cycle_state.workspace_type == 'issues':
+                    from services.git_workflow_manager import git_workflow_manager
+                    from services.project_workspace import workspace_manager
+
+                    project_dir = workspace_manager.get_project_dir(cycle_state.project_name)
+                    await git_workflow_manager.update_pr_status(
+                        project=cycle_state.project_name,
+                        issue_number=cycle_state.issue_number,
+                        project_dir=project_dir,
+                        status='approved',
+                        org=org,
+                        repo=cycle_state.repository
+                    )
+
+            elif review_result.status == ReviewStatus.CHANGES_REQUESTED:
+                logger.info(f"Changes requested, executing maker for revision")
+
+                # Get fresh context for maker (for discussions workspace)
+                fresh_context = ""
+                if cycle_state.workspace_type == 'discussions' and cycle_state.discussion_id:
+                    fresh_context = await self._get_fresh_discussion_context(
+                        cycle_state,
+                        org,
+                        cycle_state.current_iteration
+                    )
+
+                # Create maker revision context
+                maker_task_context = self._create_maker_revision_task_context(
+                    cycle_state,
+                    column,
+                    issue_data,
+                    review_output,  # review_feedback
+                    cycle_state.current_iteration,  # iteration
+                    full_discussion_context=fresh_context
+                )
+
+                # Ensure we're on the correct branch (for issues workspace)
+                if cycle_state.workspace_type == 'issues':
+                    from services.project_workspace import workspace_manager
+                    from services.git_workflow_manager import git_workflow_manager
+
+                    branch_info = git_workflow_manager.get_branch_info(
+                        cycle_state.project_name,
+                        cycle_state.issue_number
+                    )
+
+                    if branch_info:
+                        workspace_manager.ensure_branch(
+                            cycle_state.project_name,
+                            branch_info.branch_name
+                        )
+                        logger.info(f"Switched to branch {branch_info.branch_name} for maker revision")
+
+                # Execute maker agent
+                cycle_state.status = 'maker_working'
+                self._save_cycle_state(cycle_state)
+
+                await self._execute_agent_directly(
+                    cycle_state.maker_agent,
+                    maker_task_context,
+                    cycle_state.project_name
+                )
+
+                # Auto-commit changes (for issues workspace)
+                if cycle_state.workspace_type == 'issues':
+                    from services.auto_commit import auto_commit_service
+                    from config.manager import config_manager
+
+                    agent_config = config_manager.get_project_agent_config(
+                        cycle_state.project_name,
+                        cycle_state.maker_agent
+                    )
+                    makes_code_changes = getattr(agent_config, 'makes_code_changes', False)
+
+                    if makes_code_changes:
+                        await auto_commit_service.commit_agent_changes(
+                            project=cycle_state.project_name,
+                            agent=cycle_state.maker_agent,
+                            task_id=f"review_cycle_iter_{cycle_state.current_iteration}",
+                            issue_number=cycle_state.issue_number,
+                            custom_message=f"Address code review feedback (iteration {cycle_state.current_iteration})\n\nIssue #{cycle_state.issue_number}"
+                        )
+
+                # Get maker output
+                maker_output = await self._get_latest_agent_comment(
+                    cycle_state.issue_number,
+                    cycle_state.repository,
+                    cycle_state.maker_agent,
+                    cycle_state.workspace_type,
+                    cycle_state.discussion_id,
+                    org
+                )
+
+                # Store maker output and increment iteration
+                cycle_state.maker_outputs.append({
+                    'iteration': cycle_state.current_iteration,
+                    'output': maker_output,
+                    'timestamp': datetime.now().isoformat()
+                })
+                cycle_state.current_iteration += 1
+                cycle_state.status = 'initialized'
+                self._save_cycle_state(cycle_state)
+
+                logger.info(f"Maker completed revision, incremented to iteration {cycle_state.current_iteration}")
+
+            elif review_result.status == ReviewStatus.BLOCKED:
+                logger.info(f"Review blocked, escalating")
+                await self._escalate_blocked(cycle_state, review_result)
+
+        except Exception as e:
+            logger.error(f"Failed to continue cycle from review: {e}", exc_info=True)
+
+    async def _continue_cycle_from_maker(self, cycle_state: ReviewCycleState, org: str):
+        """Continue a stuck cycle that completed maker work but state wasn't updated"""
+        try:
+            logger.info(f"Continuing cycle from completed maker work")
+            # Maker completed, now run reviewer
+            # For now, just mark as ready and let next resume iteration handle it
+            cycle_state.status = 'initialized'
+            self._save_cycle_state(cycle_state)
+        except Exception as e:
+            logger.error(f"Failed to continue cycle from maker: {e}", exc_info=True)
+
     async def resume_review_cycle_with_feedback(
         self,
         cycle_state: ReviewCycleState,
@@ -422,7 +677,7 @@ class ReviewCycleExecutor:
                 return
 
             # Get issue data
-            issue_data = self.github.get_issue_details(cycle_state.repository, cycle_state.issue_number, org)
+            issue_data = await self.github.get_issue_details(cycle_state.issue_number, cycle_state.repository)
 
             # Update state: human feedback received, reviewer working
             cycle_state.status = 'reviewer_working'
@@ -448,20 +703,26 @@ class ReviewCycleExecutor:
             reviewer_task_context['review_cycle']['post_human_feedback'] = True
             reviewer_task_context['review_cycle']['human_feedback'] = human_feedback
 
-            await self._execute_agent_directly(
+            reviewer_context = await self._execute_agent_directly(
                 cycle_state.reviewer_agent,
                 reviewer_task_context,
                 cycle_state.project_name
             )
 
-            # Get updated review
-            updated_review = await self._get_latest_agent_comment(
-                cycle_state.issue_number,
-                cycle_state.repository,
-                cycle_state.reviewer_agent,
-                cycle_state.workspace_type,
-                cycle_state.discussion_id
-            )
+            # Get updated review from context (avoids GitHub API timing issues)
+            updated_review = reviewer_context.get('markdown_review', '')
+
+            # Fallback: if no markdown_review in context, fetch from GitHub
+            if not updated_review:
+                logger.warning(f"No markdown_review in context, fetching from GitHub for {cycle_state.reviewer_agent}")
+                updated_review = await self._get_latest_agent_comment(
+                    cycle_state.issue_number,
+                    cycle_state.repository,
+                    cycle_state.reviewer_agent,
+                    cycle_state.workspace_type,
+                    cycle_state.discussion_id,
+                    org
+                )
 
             # Store updated review
             cycle_state.review_outputs.append({
@@ -496,6 +757,9 @@ class ReviewCycleExecutor:
                 cycle_state.status = 'completed'
                 self._save_cycle_state(cycle_state)
 
+                # Analyze review cycle outcomes for learning (async, non-blocking)
+                await self._analyze_review_cycle_outcomes(cycle_state)
+
                 if column.auto_advance_on_approval:
                     next_column = self._get_next_column_name(column)
                     logger.info(f"Review cycle completed, advancing to {next_column}")
@@ -524,20 +788,30 @@ class ReviewCycleExecutor:
                 cycle_state.status = 'maker_working'
                 self._save_cycle_state(cycle_state)
 
-                await self._execute_agent_directly(
+                maker_context = await self._execute_agent_directly(
                     cycle_state.maker_agent,
                     maker_task_context,
                     cycle_state.project_name
                 )
 
-                # Get maker output
-                maker_output = await self._get_latest_agent_comment(
-                    cycle_state.issue_number,
-                    cycle_state.repository,
-                    cycle_state.maker_agent,
-                    cycle_state.workspace_type,
-                    cycle_state.discussion_id
-                )
+                # Get maker output from context (avoids GitHub API timing issues)
+                # Maker agents typically use 'completed_work' key for their output
+                maker_output = maker_context.get('markdown_output', '')
+                if not maker_output:
+                    # Some maker agents might use completed_work instead
+                    maker_output = str(maker_context.get('completed_work', ''))
+
+                # Fallback: if no output in context, fetch from GitHub
+                if not maker_output:
+                    logger.warning(f"No output in context, fetching from GitHub for {cycle_state.maker_agent}")
+                    maker_output = await self._get_latest_agent_comment(
+                        cycle_state.issue_number,
+                        cycle_state.repository,
+                        cycle_state.maker_agent,
+                        cycle_state.workspace_type,
+                        cycle_state.discussion_id,
+                        org
+                    )
 
                 # Store maker output
                 cycle_state.maker_outputs.append({
@@ -615,10 +889,10 @@ class ReviewCycleExecutor:
 
             result = github_app.graphql_request(query, {'discussionId': discussion_id})
 
-            if not result or 'data' not in result or not result['data']['node']:
+            if not result or 'node' not in result or not result['node']:
                 raise Exception(f"Could not fetch discussion {discussion_id}")
 
-            all_comments = result['data']['node']['comments']['nodes']
+            all_comments = result['node']['comments']['nodes']
 
             # Flatten comments and replies into chronological order
             timeline = []
@@ -686,6 +960,97 @@ class ReviewCycleExecutor:
             # Step 3: Determine next action
             logger.info(f"State detected - Last escalation: {bool(last_escalation)}, Human feedback: {len(human_feedback_after_escalation)}, Iteration: {iteration}")
 
+            # Check if there's a recent reviewer comment with status
+            last_reviewer_comment = None
+            for item in reversed(timeline):
+                if item['author'] == 'orchestrator-bot':
+                    body = item['body']
+                    # Check if this is a reviewer output
+                    if any(status in body for status in ['APPROVED', 'CHANGES REQUESTED', 'CHANGES NEEDED', 'BLOCKED']) or '## Issues Found' in body or '### Issues Found' in body:
+                        last_reviewer_comment = {
+                            'body': body,
+                            'created_at': item['created_at']
+                        }
+                        break
+
+            # Case 1: Recent review with CHANGES_REQUESTED (not escalated) → Resume maker-checker cycle
+            if last_reviewer_comment and not last_escalation:
+                # Parse the review to determine status
+                logger.info(f"Found reviewer comment from {last_reviewer_comment['created_at']}, parsing status...")
+                comment_body = last_reviewer_comment['body']
+                logger.info(f"Comment body has 'BLOCKED': {'BLOCKED' in comment_body}")
+                logger.info(f"Comment body has 'CHANGES NEEDED': {'CHANGES NEEDED' in comment_body}")
+                status_lines = [line for line in comment_body.split('\n') if 'Status' in line]
+                logger.info(f"Status line in comment: {status_lines[:2] if status_lines else 'None found'}")
+                review_result = self.review_parser.parse_review(comment_body)
+
+                logger.info(f"Parser returned status: {review_result.status.value}, blocking_count: {len([f for f in review_result.findings if f.severity == 'blocking'])}")
+                logger.info(f"Detected recent review with status: {review_result.status.value}")
+
+                if review_result.status == ReviewStatus.APPROVED:
+                    logger.info("Review already approved - advancing to next column")
+                    if column.auto_advance_on_approval:
+                        next_column = self._get_next_column_name(column)
+                        return next_column, True
+                    else:
+                        return column.name, True
+
+                elif review_result.status == ReviewStatus.CHANGES_REQUESTED:
+                    logger.info("Detected: Changes requested - resuming maker-checker cycle")
+
+                    # Create cycle state
+                    cycle_state = ReviewCycleState(
+                        issue_number=issue_number,
+                        repository=repository,
+                        maker_agent=maker_agent,
+                        reviewer_agent=reviewer_agent,
+                        max_iterations=column.max_iterations if hasattr(column, 'max_iterations') else 3,
+                        project_name=project_name,
+                        board_name=board_name,
+                        workspace_type='discussions',
+                        discussion_id=discussion_id
+                    )
+                    cycle_state.current_iteration = iteration
+
+                    # Reconstruct outputs from timeline
+                    maker_signature = f"_Processed by the {maker_agent} agent_"
+                    reviewer_signature = f"_Processed by the {reviewer_agent} agent_"
+
+                    for item in timeline:
+                        body = item['body']
+                        if maker_signature in body:
+                            cycle_state.maker_outputs.append({
+                                'iteration': len(cycle_state.maker_outputs),
+                                'output': body,
+                                'timestamp': item['created_at'].isoformat()
+                            })
+                        elif reviewer_signature in body or '## Issues Found' in body:
+                            cycle_state.review_outputs.append({
+                                'iteration': len(cycle_state.review_outputs),
+                                'output': body,
+                                'timestamp': item['created_at'].isoformat()
+                            })
+
+                    # Register in active cycles
+                    self.active_cycles[issue_number] = cycle_state
+                    self.workflow_columns = workflow_columns
+                    self._save_cycle_state(cycle_state)
+
+                    logger.info(f"Resuming review cycle - iteration {iteration + 1}/{cycle_state.max_iterations}")
+
+                    # Continue the review loop
+                    next_column, cycle_complete = await self._execute_review_loop(
+                        cycle_state,
+                        column,
+                        issue_data,
+                        org
+                    )
+
+                    return next_column, cycle_complete
+
+                # BLOCKED status handled by escalation logic below
+
+            # Case 2: Escalation with human feedback
             if last_escalation and human_feedback_after_escalation:
                 # State: Escalated + Human responded → Re-invoke reviewer
                 logger.info("Detected: Escalation with human feedback - re-invoking reviewer")
@@ -722,20 +1087,26 @@ class ReviewCycleExecutor:
                 reviewer_task_context['review_cycle']['human_feedback'] = combined_feedback
 
                 # Execute reviewer
-                await self._execute_agent_directly(
+                reviewer_context = await self._execute_agent_directly(
                     reviewer_agent,
                     reviewer_task_context,
                     project_name
                 )
 
-                # Get updated review
-                updated_review = await self._get_latest_agent_comment(
-                    issue_number,
-                    repository,
-                    reviewer_agent,
-                    'discussions',
-                    discussion_id
-                )
+                # Get updated review from context (avoids GitHub API timing issues)
+                updated_review = reviewer_context.get('markdown_review', '')
+
+                # Fallback: if no markdown_review in context, fetch from GitHub
+                if not updated_review:
+                    logger.warning(f"No markdown_review in context, fetching from GitHub for {reviewer_agent}")
+                    updated_review = await self._get_latest_agent_comment(
+                        issue_number,
+                        repository,
+                        reviewer_agent,
+                        'discussions',
+                        discussion_id,
+                        org
+                    )
 
                 # Parse updated review
                 review_result = self.review_parser.parse_review(updated_review)
@@ -785,8 +1156,73 @@ class ReviewCycleExecutor:
                     logger.error("Review still blocked after human feedback")
                     return column.name, False
 
+            elif last_escalation and not human_feedback_after_escalation:
+                # State: Escalated but no human feedback yet → Recreate awaiting state
+                logger.info("Detected: Escalation without human feedback - recreating awaiting_human_feedback state")
+
+                # Create cycle state and save as awaiting feedback
+                cycle_state = ReviewCycleState(
+                    issue_number=issue_number,
+                    repository=repository,
+                    maker_agent=maker_agent,
+                    reviewer_agent=reviewer_agent,
+                    max_iterations=column.max_iterations if hasattr(column, 'max_iterations') else 3,
+                    project_name=project_name,
+                    board_name=board_name,
+                    workspace_type='discussions',
+                    discussion_id=discussion_id
+                )
+                cycle_state.current_iteration = iteration
+                cycle_state.status = 'awaiting_human_feedback'
+                cycle_state.escalation_time = last_escalation['created_at'].isoformat()
+
+                # Reconstruct outputs from discussion timeline
+                maker_signature = f"_Processed by the {maker_agent} agent_"
+                reviewer_signature = f"_Processed by the {reviewer_agent} agent_"
+
+                for item in timeline:
+                    body = item['body']
+                    if maker_signature in body:
+                        cycle_state.maker_outputs.append({
+                            'iteration': len(cycle_state.maker_outputs),
+                            'output': body,
+                            'timestamp': item['created_at'].isoformat()
+                        })
+                    elif reviewer_signature in body or 'Review of' in body:
+                        cycle_state.review_outputs.append({
+                            'iteration': len(cycle_state.review_outputs),
+                            'output': body,
+                            'timestamp': item['created_at'].isoformat()
+                        })
+
+                logger.info(
+                    f"Reconstructed cycle state: {len(cycle_state.maker_outputs)} maker outputs, "
+                    f"{len(cycle_state.review_outputs)} reviewer outputs"
+                )
+
+                # Register in active cycles and save state
+                self.active_cycles[issue_number] = cycle_state
+                self.workflow_columns = workflow_columns
+                self._save_cycle_state(cycle_state)
+
+                logger.info(
+                    f"Review cycle state restored for issue #{issue_number}. "
+                    f"Status: awaiting_human_feedback. "
+                    f"Project monitor will check periodically and resume when feedback is detected."
+                )
+
+                # Don't try to resume yet - wait for human feedback
+                return column.name, False
+
             else:
-                logger.warning("Could not determine resume action - no escalation or no human feedback detected")
+                # Check if there's a BLOCKED review that needs escalation
+                if last_reviewer_comment:
+                    review_result = self.review_parser.parse_review(last_reviewer_comment['body'])
+                    if review_result.status == ReviewStatus.BLOCKED:
+                        logger.warning("Review is BLOCKED but no escalation detected - may need manual intervention")
+                        return column.name, False
+
+                logger.warning("Could not determine resume action - no review output or escalation detected")
                 return column.name, False
 
         except Exception as e:
@@ -837,20 +1273,26 @@ class ReviewCycleExecutor:
             )
 
             # Execute reviewer agent
-            await self._execute_agent_directly(
+            reviewer_context = await self._execute_agent_directly(
                 cycle_state.reviewer_agent,
                 review_task_context,
                 cycle_state.project_name
             )
 
-            # Get reviewer's comment from GitHub (workspace-aware)
-            review_comment = await self._get_latest_agent_comment(
-                cycle_state.issue_number,
-                cycle_state.repository,
-                cycle_state.reviewer_agent,
-                cycle_state.workspace_type,
-                cycle_state.discussion_id
-            )
+            # Get reviewer's output from context (avoids GitHub API timing issues)
+            review_comment = reviewer_context.get('markdown_review', '')
+
+            # Fallback: if no markdown_review in context, fetch from GitHub
+            if not review_comment:
+                logger.warning(f"No markdown_review in context, fetching from GitHub for {cycle_state.reviewer_agent}")
+                review_comment = await self._get_latest_agent_comment(
+                    cycle_state.issue_number,
+                    cycle_state.repository,
+                    cycle_state.reviewer_agent,
+                    cycle_state.workspace_type,
+                    cycle_state.discussion_id,
+                    org
+                )
 
             # Store review output
             cycle_state.review_outputs.append({
@@ -871,6 +1313,10 @@ class ReviewCycleExecutor:
                 f"high: {review_result_parsed.high_severity_count}"
             )
 
+            # Update state after reviewer completes
+            cycle_state.status = 'initialized'  # Reset to initialized, ready for next action
+            self._save_cycle_state(cycle_state)
+
             # Step 3: Make decision based on review status
             if review_result_parsed.status == ReviewStatus.APPROVED:
                 # Success! Move to next column
@@ -881,10 +1327,41 @@ class ReviewCycleExecutor:
                     f"Review approved after {iteration} iteration(s)"
                 )
 
+                # Store current commit hash for future scoped reviews (issues workspace)
+                if cycle_state.workspace_type == 'issues':
+                    from services.project_workspace import workspace_manager
+                    project_dir = workspace_manager.get_project_dir(cycle_state.project_name)
+                    current_commit = self._get_git_commit_hash(str(project_dir))
+                    if current_commit:
+                        cycle_state.last_approved_commit = current_commit
+                        logger.info(f"Stored approved commit {current_commit[:8]} for future scoped reviews")
+
                 # Mark cycle as completed and remove from active state
                 cycle_state.status = 'completed'
                 self._save_cycle_state(cycle_state)
                 self._remove_cycle_state(cycle_state)
+
+                # Update PR status to approved if using git workflow
+                if cycle_state.workspace_type == 'issues':
+                    from services.git_workflow_manager import git_workflow_manager
+                    from services.project_workspace import workspace_manager
+
+                    project_dir = workspace_manager.get_project_dir(cycle_state.project_name)
+
+                    # Mark PR as ready for review (remove draft status)
+                    pr_updated = await git_workflow_manager.update_pr_status(
+                        project=cycle_state.project_name,
+                        issue_number=cycle_state.issue_number,
+                        project_dir=project_dir,
+                        status='approved',
+                        org=org,
+                        repo=cycle_state.repository
+                    )
+
+                    if pr_updated:
+                        logger.info(f"PR marked as approved for issue #{cycle_state.issue_number}")
+                    else:
+                        logger.warning(f"Failed to update PR status for issue #{cycle_state.issue_number}")
 
                 if column.auto_advance_on_approval:
                     next_column = self._get_next_column_name(column)
@@ -926,15 +1403,34 @@ class ReviewCycleExecutor:
                     # Continue iteration to invoke maker
                     pass
 
-            # Status is CHANGES_REQUESTED or BLOCKED (without escalation)
-            # Check if we've hit max iterations
-            if iteration >= cycle_state.max_iterations:
-                logger.warning(
-                    f"Max iterations ({cycle_state.max_iterations}) reached for "
-                    f"issue #{cycle_state.issue_number}"
+            elif review_result_parsed.status == ReviewStatus.CHANGES_REQUESTED:
+                # Changes requested - check if we've hit max iterations
+                if iteration >= cycle_state.max_iterations:
+                    logger.warning(
+                        f"Max iterations ({cycle_state.max_iterations}) reached for "
+                        f"issue #{cycle_state.issue_number}"
+                    )
+                    await self._escalate_max_iterations(cycle_state, review_result_parsed)
+                    return ReviewStatus.CHANGES_REQUESTED, column.name
+                # Continue to Step 4 to invoke maker with feedback
+
+            elif review_result_parsed.status == ReviewStatus.UNKNOWN:
+                # Could not parse review status - escalate
+                logger.error(
+                    f"Could not determine review status from reviewer output for issue #{cycle_state.issue_number}. "
+                    f"Review text length: {len(review_comment)} chars. Escalating."
                 )
-                await self._escalate_max_iterations(cycle_state, review_result_parsed)
-                return ReviewStatus.CHANGES_REQUESTED, column.name
+                await self._escalate_blocked(cycle_state, review_result_parsed)
+                return ReviewStatus.BLOCKED, column.name
+
+            else:
+                # Unexpected status (PENDING, etc.) - log and escalate
+                logger.error(
+                    f"Unexpected review status '{review_result_parsed.status.value}' for issue #{cycle_state.issue_number}. "
+                    f"Escalating."
+                )
+                await self._escalate_blocked(cycle_state, review_result_parsed)
+                return ReviewStatus.BLOCKED, column.name
 
             # Step 4: Re-invoke maker agent with feedback
             logger.info(f"Re-invoking {cycle_state.maker_agent} with reviewer feedback")
@@ -957,6 +1453,39 @@ class ReviewCycleExecutor:
                 full_discussion_context=fresh_context
             )
 
+            # Ensure we're on the correct branch for git workflow
+            if cycle_state.workspace_type == 'issues':
+                from services.project_workspace import workspace_manager
+                from services.git_workflow_manager import git_workflow_manager
+
+                # Get or create feature branch
+                branch_info = git_workflow_manager.get_branch_info(
+                    cycle_state.project_name,
+                    cycle_state.issue_number
+                )
+
+                if branch_info:
+                    # Switch to existing branch
+                    project_dir = workspace_manager.get_project_dir(cycle_state.project_name)
+                    workspace_manager.ensure_branch(
+                        cycle_state.project_name,
+                        branch_info.branch_name
+                    )
+                    logger.info(f"Switched to branch {branch_info.branch_name} for maker revision")
+                else:
+                    # Create branch if it doesn't exist (shouldn't happen, but handle it)
+                    branch_name = workspace_manager.create_feature_branch(
+                        cycle_state.project_name,
+                        cycle_state.issue_number
+                    )
+                    if branch_name:
+                        git_workflow_manager.track_branch(
+                            cycle_state.project_name,
+                            cycle_state.issue_number,
+                            branch_name
+                        )
+                        logger.info(f"Created branch {branch_name} for maker revision")
+
             # Execute maker agent directly
             await self._execute_agent_directly(
                 cycle_state.maker_agent,
@@ -964,13 +1493,40 @@ class ReviewCycleExecutor:
                 cycle_state.project_name
             )
 
+            # Auto-commit changes if maker makes code changes
+            if cycle_state.workspace_type == 'issues':
+                from services.auto_commit import auto_commit_service
+                from config.manager import config_manager
+
+                agent_config = config_manager.get_project_agent_config(
+                    cycle_state.project_name,
+                    cycle_state.maker_agent
+                )
+                makes_code_changes = getattr(agent_config, 'makes_code_changes', False)
+
+                if makes_code_changes:
+                    logger.info(f"Agent {cycle_state.maker_agent} makes code changes, attempting auto-commit")
+                    commit_success = await auto_commit_service.commit_agent_changes(
+                        project=cycle_state.project_name,
+                        agent=cycle_state.maker_agent,
+                        task_id=f"review_cycle_iter_{iteration}",
+                        issue_number=cycle_state.issue_number,
+                        custom_message=f"Address code review feedback (iteration {iteration})\n\nIssue #{cycle_state.issue_number}"
+                    )
+
+                    if commit_success:
+                        logger.info(f"Auto-committed changes for iteration {iteration}")
+                    else:
+                        logger.warning(f"No changes to commit for iteration {iteration}")
+
             # Get maker's revised output from GitHub (workspace-aware)
             maker_comment = await self._get_latest_agent_comment(
                 cycle_state.issue_number,
                 cycle_state.repository,
                 cycle_state.maker_agent,
                 cycle_state.workspace_type,
-                cycle_state.discussion_id
+                cycle_state.discussion_id,
+                org
             )
 
             # Verify maker responded
@@ -993,6 +1549,38 @@ class ReviewCycleExecutor:
         logger.error(f"Review loop exited unexpectedly for issue #{cycle_state.issue_number}")
         return ReviewStatus.UNKNOWN, column.name
 
+    def _get_git_commit_hash(self, project_dir: str) -> str:
+        """Get current git commit hash"""
+        import subprocess
+        try:
+            result = subprocess.run(
+                ['git', 'rev-parse', 'HEAD'],
+                cwd=project_dir,
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            return result.stdout.strip()
+        except Exception as e:
+            logger.warning(f"Failed to get git commit hash: {e}")
+            return ""
+
+    def _get_git_diff_since_commit(self, project_dir: str, since_commit: str) -> str:
+        """Get git diff from a specific commit to HEAD"""
+        import subprocess
+        try:
+            result = subprocess.run(
+                ['git', 'diff', since_commit, 'HEAD'],
+                cwd=project_dir,
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            return result.stdout
+        except Exception as e:
+            logger.warning(f"Failed to get git diff: {e}")
+            return ""
+
     def _create_review_task_context(
         self,
         cycle_state: ReviewCycleState,
@@ -1007,6 +1595,18 @@ class ReviewCycleExecutor:
 
         # Use full discussion context if provided, otherwise fall back to just the maker output
         context_for_review = full_discussion_context if full_discussion_context else latest_maker_output
+
+        # Get scoped git diff for issues workspace
+        scoped_diff = ""
+        if cycle_state.workspace_type == 'issues' and cycle_state.last_approved_commit:
+            from services.project_workspace import workspace_manager
+            project_dir = workspace_manager.get_project_dir(cycle_state.project_name)
+            scoped_diff = self._get_git_diff_since_commit(
+                str(project_dir),
+                cycle_state.last_approved_commit
+            )
+            if scoped_diff:
+                logger.info(f"Generated scoped git diff ({len(scoped_diff)} chars) since commit {cycle_state.last_approved_commit[:8]}")
 
         return {
             'project': cycle_state.project_name,
@@ -1026,6 +1626,7 @@ class ReviewCycleExecutor:
                 'is_rereviewing': iteration > 1
             },
             'previous_stage_output': context_for_review,  # Full discussion context
+            'scoped_git_diff': scoped_diff,  # Git diff since last approval (issues workspace only)
             'timestamp': datetime.now().isoformat()
         }
 
@@ -1129,26 +1730,10 @@ class ReviewCycleExecutor:
 
             all_comments = result['node']['comments']['nodes']
 
-            # Determine which agent's comment we should extract
-            # On iteration 0: reviewer sees initial maker's comment
-            # On iteration 1+: maker sees last reviewer's comment, reviewer sees last maker's comment
-            if iteration == 0:
-                # First review - reviewer sees initial maker comment
-                previous_agent = cycle_state.maker_agent
-            else:
-                # Subsequent iterations - depends on current role
-                # If we're about to run maker, get reviewer's last comment
-                # If we're about to run reviewer, get maker's last comment
-                # Since this is called before execution, we need to determine next agent
-                # In practice, cycles alternate: maker -> reviewer -> maker -> reviewer
-                # On odd iterations (1, 3, 5), maker runs and needs reviewer's feedback
-                # On even iterations (2, 4, 6), reviewer runs and needs maker's revision
-                if iteration % 2 == 1:
-                    # Maker's turn - get reviewer's last comment
-                    previous_agent = cycle_state.reviewer_agent
-                else:
-                    # Reviewer's turn - get maker's last comment
-                    previous_agent = cycle_state.maker_agent
+            # This function is called right before the REVIEWER executes at the start of each iteration
+            # The reviewer ALWAYS needs to see the maker's latest output
+            # The loop structure is: reviewer → (if changes needed) → maker → next iteration
+            previous_agent = cycle_state.maker_agent
 
             # Find the last comment from the previous agent
             agent_signature = f"_Processed by the {previous_agent} agent_"
@@ -1223,7 +1808,8 @@ class ReviewCycleExecutor:
         repository: str,
         agent_name: str,
         workspace_type: str = 'issues',
-        discussion_id: Optional[str] = None
+        discussion_id: Optional[str] = None,
+        org: str = None
     ) -> str:
         """Get the most recent comment from a specific agent (workspace-aware)"""
         import subprocess
@@ -1296,8 +1882,10 @@ class ReviewCycleExecutor:
 
             else:
                 # Fetch from issue (original behavior)
+                # Build repo string in org/repo format for gh CLI
+                repo_arg = f"{org}/{repository}" if org else repository
                 result = subprocess.run(
-                    ['gh', 'issue', 'view', str(issue_number), '--repo', f"{repository}", '--json', 'comments'],
+                    ['gh', 'issue', 'view', str(issue_number), '--repo', repo_arg, '--json', 'comments'],
                     capture_output=True,
                     text=True,
                     check=True

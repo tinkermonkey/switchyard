@@ -85,9 +85,108 @@ services:
     ports:
       - "3000:80"
 
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:9.0.0
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+    volumes:
+      - elasticsearch_data:/usr/share/elasticsearch/data
+    networks:
+      - orchestrator-net
+    ports:
+      - "9200:9200"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9200/_cluster/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  pattern-ingestion:
+    build: .
+    volumes:
+      - ./:/app
+    environment:
+      # Redis (log collection)
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      # Elasticsearch (shared)
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+      # Log collector
+      - LOG_BATCH_SIZE=50
+      - LOG_BATCH_TIMEOUT=5.0
+      # Pattern detector
+      - PATTERNS_DIR=config/patterns
+      - DETECTION_INTERVAL=60
+      - LOOKBACK_MINUTES=5
+    depends_on:
+      redis:
+        condition: service_started
+      elasticsearch:
+        condition: service_healthy
+    networks:
+      - orchestrator-net
+    working_dir: /app
+    command: ["python", "-m", "services.pattern_ingestion_service"]
+    restart: unless-stopped
+
+  pattern-github-processor:
+    build: .
+    volumes:
+      - ./:/app
+      - ~/.orchestrator:/home/orchestrator/.orchestrator:ro
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+      - GITHUB_ORG=${GITHUB_ORG}
+      - GITHUB_REPO=orchestrator
+      - GITHUB_APP_ID=${GITHUB_APP_ID}
+      - GITHUB_APP_INSTALLATION_ID=${GITHUB_APP_INSTALLATION_ID}
+      - GITHUB_APP_PRIVATE_KEY_PATH=${GITHUB_APP_PRIVATE_KEY_PATH}
+      - GITHUB_PROCESSING_INTERVAL=300
+      - GITHUB_DISCUSSION_CATEGORY=Ideas
+      - MIN_OCCURRENCES_FOR_DISCUSSION=5
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    networks:
+      - orchestrator-net
+    working_dir: /app
+    command: ["python", "-m", "services.pattern_github_processor_es"]
+    restart: unless-stopped
+
+  pattern-analysis:
+    build: .
+    volumes:
+      - ./:/app
+    environment:
+      # Elasticsearch
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+      # Daily Aggregator
+      - AGGREGATION_INTERVAL_HOURS=24
+      - LOOKBACK_DAYS=7
+      # LLM Analyzer
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - LLM_ANALYSIS_INTERVAL_HOURS=168
+      - MIN_OCCURRENCES_FOR_LLM=20
+      - MAX_PATTERNS_PER_LLM_RUN=5
+      # Similarity Analyzer
+      - SIMILARITY_ANALYSIS_INTERVAL_HOURS=24
+      - SIMILARITY_THRESHOLD=0.75
+      - MIN_OCCURRENCES_FOR_SIMILARITY=5
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    networks:
+      - orchestrator-net
+    working_dir: /app
+    command: ["python", "-m", "services.pattern_analysis_service"]
+    restart: unless-stopped
+
 
 volumes:
   redis_data:
+  elasticsearch_data:
 
 networks:
   orchestrator-net:

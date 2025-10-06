@@ -2,9 +2,7 @@ from typing import Dict, Any
 from pipeline.base import PipelineStage
 from claude.claude_integration import run_claude_code
 from datetime import datetime
-import json
 import logging
-from services.review_parser import ReviewStatus
 
 logger = logging.getLogger(__name__)
 
@@ -13,94 +11,213 @@ class DesignReviewerAgent(PipelineStage):
     def __init__(self, agent_config: Dict[str, Any] = None):
         super().__init__("design_reviewer", agent_config=agent_config)
 
+    async def _get_filter_instructions(self) -> str:
+        """
+        Get learned filter instructions to inject into review prompt.
+
+        Returns filter guidance based on historical review outcomes.
+        """
+        try:
+            from services.review_filter_manager import get_review_filter_manager
+
+            filter_manager = get_review_filter_manager()
+
+            # Get active filters for this agent with high confidence
+            filters = await filter_manager.get_agent_filters(
+                agent_name='design_reviewer',
+                min_confidence=0.75,  # 75%+ confidence
+                active_only=True
+            )
+
+            if not filters:
+                return ""
+
+            # Build filter instructions using manager's formatter
+            filter_text = filter_manager.build_filter_instructions(filters)
+
+            return filter_text
+
+        except Exception as e:
+            logger.warning(f"Failed to load review filters (non-critical): {e}")
+            return ""
+
+    def _get_output_format_instructions(self, is_rereviewing: bool = False) -> str:
+        """Get output format instructions"""
+        if is_rereviewing:
+            resolved_section = """
+### Previous Issues Status
+
+**IMPORTANT**: Start by listing each issue from your previous review and its status:
+- ✅ **[Previous Issue Title]** - RESOLVED: [Brief note on how it was addressed]
+- ⚠️ **[Previous Issue Title]** - PARTIALLY RESOLVED: [What's still missing]
+- ❌ **[Previous Issue Title]** - NOT RESOLVED: [What still needs to be done]
+
+This section is **MANDATORY** in re-reviews. It shows you're tracking progress.
+
+### New Issues Found (if any)
+
+Only list NEW issues discovered in THIS revision that are:
+- Critical technical problems introduced by the changes
+- Directly related to how previous issues were addressed
+- NOT just additional nice-to-have improvements
+"""
+        else:
+            resolved_section = "### Issues Found"
+
+        return f"""
+**Review Format**:
+```
+### Status
+**APPROVED** or **CHANGES NEEDED** or **BLOCKED**
+
+{resolved_section}
+
+#### Critical (BLOCKING)
+**IMPORTANT**: Only use this category for issues that:
+- Cannot be addressed by the architect in a revision
+- Require fundamental changes to requirements or business decisions
+- Have no clear implementation path without human/stakeholder input
+
+Most technical issues (missing validations, unclear patterns, performance concerns) should be **High Priority**, not BLOCKING.
+
+List blocking issues here, or write "None" if all issues can be addressed by architect revision.
+
+#### High Priority
+- **[Issue Title]**: [Description and recommendation]
+
+List important technical issues that must be addressed but CAN be fixed by the architect.
+
+#### Medium Priority
+- **[Issue Title]**: [Description and recommendation]
+
+#### Low Priority / Suggestions
+- **[Issue Title]**: [Description and recommendation]
+
+### Summary
+Brief summary of overall assessment and next steps
+```
+
+**Decision Criteria**:
+- APPROVED: Design meets all requirements, no significant issues
+- CHANGES NEEDED: Issues found that architect can address in revision
+- BLOCKED: True blocking issues that require human intervention
+
+**Use CHANGES NEEDED unless there are truly un-addressable issues that need human decisions.**
+
+REQUIRED: Include "**Status**: X" at the top for automation parsing."""
+
     async def execute(self, context: Dict[str, Any]) -> Dict[str, Any]:
         """Execute architecture design review focusing on patterns, security, and scalability"""
 
-        # Check if this is a review request
-        is_review = context.get('review_request', False)
-        original_handoff = context.get('original_handoff')
+        # Extract from nested task context
+        task_context = context.get('context', {})
 
-        if not is_review or not original_handoff:
-            raise Exception("Design Reviewer expects review request with handoff data from Software Architect")
+        # Get the previous stage output (from software_architect)
+        previous_stage = task_context.get('previous_stage_output', '')
 
-        # Get the architecture design from handoff
-        architecture_document = original_handoff.artifacts.get('architecture_document', {})
-        technical_decisions = original_handoff.artifacts.get('technical_decisions', {})
-        implementation_plan = original_handoff.artifacts.get('implementation_plan', {})
-        quality_metrics = original_handoff.artifacts.get('quality_metrics', {})
+        if not previous_stage:
+            raise Exception("Design Reviewer needs previous stage output from Software Architect")
+
+        architecture_design = previous_stage
+        review_cycle = task_context.get('review_cycle', {})
+        issue = task_context.get('issue', {})
 
         # Extract focus areas for review
         focus_areas = context.get('focus_areas', ['security', 'scalability', 'patterns', 'performance'])
 
+        # Build iteration context similar to other reviewers
+        iteration_context = ""
+        is_rereviewing = False
+        if review_cycle:
+            iteration = review_cycle.get('iteration', 0)
+            max_iterations = review_cycle.get('max_iterations', 3)
+            maker_agent = review_cycle.get('maker_agent', 'software_architect')
+            is_rereviewing = review_cycle.get('is_rereviewing', False)
+            post_human_feedback = review_cycle.get('post_human_feedback', False)
+
+            if post_human_feedback:
+                iteration_context = f"""
+
+## Post-Escalation Review Update
+
+You previously escalated this review due to **blocking issues** that required human intervention.
+
+**The human has now responded with feedback.** Your task is to:
+
+1. **Read the human feedback** in the discussion context below
+2. **Incorporate their guidance** into your review assessment
+3. **Update your review** based on their corrections, clarifications, or directions
+
+**Current Iteration**: {iteration}/{max_iterations}
+
+"""
+            elif is_rereviewing:
+                iteration_context = f"""
+
+## Review Cycle Context - Re-Review Mode
+
+This is **Re-Review Iteration {iteration} of {max_iterations}**.
+
+**Maker**: {maker_agent.replace('_', ' ').title()} has revised their work based on your previous feedback.
+
+**Your Task**: Verify previous issues are resolved. Be concise.
+
+**Keep Feedback CONCISE**:
+- 1-2 sentences per issue maximum
+- Focus on WHAT is wrong, not explaining WHY
+- Only include items that genuinely need fixing
+
+After {max_iterations} iterations, escalates to human review.
+
+"""
+            else:
+                iteration_context = f"""
+
+## Review Cycle Context - Initial Review
+
+This is **Initial Review (Iteration {iteration} of {max_iterations})**.
+
+**Your Task**: Identify issues that need fixing. Be specific and concise.
+
+**Keep Feedback CONCISE**:
+- State WHAT is wrong and HOW to fix it
+- Don't explain WHY (maker understands quality standards)
+- 1-2 sentences per issue
+
+"""
+
+        # Inject learned review filters
+        filter_instructions = await self._get_filter_instructions()
+
         prompt = f"""
-As an Architecture Reviewer, conduct a comprehensive review of the software architecture design using industry best practices and security standards.
+Review the architecture design provided by the Software Architect.
+{iteration_context}
+{filter_instructions}
 
-Architecture Document:
-{json.dumps(architecture_document, indent=2)}
+Original Issue:
+Title: {issue.get('title', 'No title')}
+Description: {issue.get('body', 'No description')}
 
-Technical Decisions:
-{json.dumps(technical_decisions, indent=2)}
-
-Implementation Plan:
-{json.dumps(implementation_plan, indent=2)}
-
-Quality Metrics from Software Architect:
-{json.dumps(quality_metrics, indent=2)}
+Architecture Design to Review:
+{architecture_design}
 
 Focus Areas: {', '.join(focus_areas)}
 
-IMPORTANT: Output your review as text directly in your response. DO NOT create any files. This review will be posted to GitHub as a comment.
+IMPORTANT: Output your review as markdown text directly in your response. DO NOT create any files. This review will be posted to GitHub as a comment.
 
-Provide comprehensive architecture review with:
+**Review Philosophy**: This is an iterative maker-checker process. Reserve BLOCKING status only for issues that truly cannot be addressed through iteration. Most technical gaps should be High Priority issues that trigger another iteration, not blockers.
 
-1. Design Pattern Analysis:
-   - Architectural patterns evaluation (MVC, microservices, event-driven, etc.)
-   - Design principles compliance (SOLID, DRY, KISS, YAGNI)
-   - Anti-pattern identification
-   - Pattern consistency assessment
+{self._get_output_format_instructions(is_rereviewing)}
 
-2. Security Assessment:
-   - OWASP Top 10 compliance
-   - Authentication and authorization design review
-   - Data protection and encryption strategies
-   - API security considerations
-   - Vulnerability risk assessment
+Provide comprehensive architecture review covering:
 
-3. Scalability Review:
-   - Horizontal and vertical scaling capabilities
-   - Performance bottleneck identification
-   - Load balancing and distribution strategies
-   - Database scaling approach validation
-   - Caching strategy effectiveness
-
-4. Performance Analysis:
-   - Performance targets feasibility
-   - Resource utilization efficiency
-   - Critical path analysis
-   - Monitoring and observability adequacy
-   - Optimization opportunities
-
-5. Maintainability Assessment:
-   - Code organization and modularity
-   - Dependency management strategy
-   - Configuration and deployment approach
-   - Documentation completeness
-   - Team productivity considerations
-
-6. Technical Risk Assessment:
-   - Implementation risks and mitigation
-   - Technology choices validation
-   - Integration complexity analysis
-   - External dependency risks
-   - Rollback and recovery strategies
-
-7. Compliance and Standards:
-   - Industry standards adherence
-   - Best practices implementation
-   - Quality attribute trade-offs
-   - Non-functional requirements coverage
-
-Return structured JSON with review_assessment and improvement_recommendations sections.
+1. **Design Pattern Analysis**: Architectural patterns, SOLID principles, anti-patterns, consistency
+2. **Security Assessment**: OWASP compliance, auth/authz, data protection, API security
+3. **Scalability Review**: Horizontal/vertical scaling, bottlenecks, load balancing, caching
+4. **Performance Analysis**: Targets feasibility, resource efficiency, monitoring, optimization
+5. **Maintainability**: Code organization, dependencies, deployment, documentation
+6. **Technical Risk**: Implementation risks, technology choices, integration complexity
+7. **Compliance**: Industry standards, best practices, quality attributes
 """
 
         try:
@@ -136,208 +253,15 @@ Return structured JSON with review_assessment and improvement_recommendations se
 
             result = await run_claude_code(prompt, enhanced_context)
 
-            # Parse Claude's response
-            if isinstance(result, str):
-                try:
-                    review_data = json.loads(result)
-                except json.JSONDecodeError:
-                    # If not valid JSON, create a structured response
-                    review_data = {
-                        "review_assessment": {
-                            "overall_score": 0.75,
-                            "security_score": 0.8,
-                            "scalability_score": 0.7,
-                            "maintainability_score": 0.8,
-                            "performance_score": 0.75,
-                            "status": "approved_with_recommendations"
-                        },
-                        "improvement_recommendations": {
-                            "critical_issues": [],
-                            "high_priority": ["Consider adding rate limiting", "Enhance monitoring coverage"],
-                            "medium_priority": ["Optimize database queries", "Add circuit breakers"],
-                            "low_priority": ["Documentation updates", "Code style consistency"],
-                            "security_recommendations": ["Implement security headers", "Add input validation"],
-                            "performance_optimizations": ["Add caching layer", "Optimize API responses"]
-                        }
-                    }
-            else:
-                review_data = result
+            # Result is the review in markdown format
+            review_text = result if isinstance(result, str) else str(result)
 
-            # Process review results using collaboration framework
-            from services.review_parser import ReviewStatus, CollaborationOrchestrator
-            from services.github_integration import GitHubIntegration, AgentCommentFormatter
-
-            # Initialize collaboration components
-            github = GitHubIntegration()
-
-            # Extract assessment and categorize issues
-            assessment = review_data.get('review_assessment', {})
-            recommendations = review_data.get('improvement_recommendations', {})
-
-            overall_score = assessment.get('overall_score', 0.5)
-            critical_issues = len(recommendations.get('critical_issues', []))
-            high_priority = len(recommendations.get('high_priority', []))
-
-            # Determine review status based on findings
-            if critical_issues > 0:
-                status = ReviewStatus.BLOCKED
-            elif high_priority > 3 or overall_score < 0.6:
-                status = ReviewStatus.CHANGES_REQUESTED
-            else:
-                status = ReviewStatus.APPROVED
-
-            # Create structured findings
-            findings = []
-
-            # Add security findings
-            security_score = assessment.get('security_score', 0.5)
-            findings.append({
-                "category": "security",
-                "severity": "high" if security_score < 0.6 else "medium" if security_score < 0.8 else "low",
-                "message": f"Security assessment score: {security_score:.1%}",
-                "suggestion": "Review and implement security recommendations"
-            })
-
-            # Add scalability findings
-            scalability_score = assessment.get('scalability_score', 0.5)
-            findings.append({
-                "category": "scalability",
-                "severity": "high" if scalability_score < 0.6 else "medium" if scalability_score < 0.8 else "low",
-                "message": f"Scalability readiness: {scalability_score:.1%}",
-                "suggestion": "Address scalability bottlenecks identified"
-            })
-
-            # Add performance findings
-            performance_score = assessment.get('performance_score', 0.5)
-            findings.append({
-                "category": "performance",
-                "severity": "medium" if performance_score < 0.7 else "low",
-                "message": f"Performance design score: {performance_score:.1%}",
-                "suggestion": "Implement performance optimizations"
-            })
-
-            # Add critical issues as blocking findings
-            for issue in recommendations.get('critical_issues', []):
-                findings.append({
-                    "category": "critical",
-                    "severity": "blocking",
-                    "message": issue,
-                    "suggestion": "Must be resolved before proceeding"
-                })
-
-                        # Note: GitHub posting handled by centralized GitHub integration
-            # Legacy code path - github_issue is no longer set in context
-
-            # Update context for orchestrator
+            # Store the markdown output for GitHub comment
+            context['markdown_review'] = review_text
             context['review_completed'] = True
-            context['review_status'] = status.value
-            context['quality_score'] = overall_score
-            context['review_assessment'] = assessment
-            context['improvement_recommendations'] = recommendations
 
-            # Handle different review outcomes
-            if status == ReviewStatus.BLOCKED:
-                context['next_action'] = 'return_to_software_architect'
-                context['blocking_issues'] = recommendations.get('critical_issues', [])
-            elif status == ReviewStatus.CHANGES_REQUESTED:
-                context['next_action'] = 'iterate_with_software_architect'
-                context['suggested_changes'] = recommendations.get('high_priority', []) + recommendations.get('medium_priority', [])
-            else:
-                context['next_action'] = 'proceed_to_test_planning'
-                context['approved_architecture'] = original_handoff.artifacts
-
-            logger.info(f"Architecture design review completed: {status.value}")
-            print(f"Overall score: {overall_score:.2f}")
-            print(f"Critical issues: {critical_issues}")
-
+            logger.info(f"Architecture design review completed (length: {len(review_text)} chars)")
             return context
 
         except Exception as e:
             raise Exception(f"Architecture design review failed: {str(e)}")
-
-    def format_design_review(self, feedback: ReviewFeedback, detailed_data: Dict[str, Any]) -> str:
-        """Format architecture design review for GitHub comment"""
-
-        status_emoji = {
-            ReviewStatus.APPROVED: "✅",
-            ReviewStatus.CHANGES_REQUESTED: "🔄",
-            ReviewStatus.BLOCKED: "🚫"
-        }
-
-        emoji = status_emoji.get(feedback.status, "🏗️")
-
-        # Format assessment scores
-        assessment = detailed_data.get('review_assessment', {})
-        scores_text = f"""
-#### Assessment Scores
-- **Security:** {assessment.get('security_score', 0):.1%}
-- **Scalability:** {assessment.get('scalability_score', 0):.1%}
-- **Performance:** {assessment.get('performance_score', 0):.1%}
-- **Maintainability:** {assessment.get('maintainability_score', 0):.1%}
-"""
-
-        # Format recommendations by priority
-        recommendations = detailed_data.get('improvement_recommendations', {})
-        rec_text = ""
-
-        if recommendations.get('critical_issues'):
-            rec_text += "\n#### 🚫 Critical Issues\n"
-            for issue in recommendations['critical_issues']:
-                rec_text += f"- {issue}\n"
-
-        if recommendations.get('high_priority'):
-            rec_text += "\n#### ❗ High Priority\n"
-            for item in recommendations['high_priority']:
-                rec_text += f"- {item}\n"
-
-        if recommendations.get('medium_priority'):
-            rec_text += "\n#### ⚠️ Medium Priority\n"
-            for item in recommendations['medium_priority']:
-                rec_text += f"- {item}\n"
-
-        # Format findings by category
-        findings_text = ""
-        findings_by_category = {}
-        for finding in feedback.findings:
-            category = finding.get('category', 'general')
-            if category not in findings_by_category:
-                findings_by_category[category] = []
-            findings_by_category[category].append(finding)
-
-        if findings_by_category:
-            findings_text = "\n#### Review Findings\n"
-            for category, findings in findings_by_category.items():
-                if category != 'critical':  # Critical issues already shown above
-                    findings_text += f"\n**{category.title()}:**\n"
-                    for finding in findings:
-                        severity_emoji = {"low": "ℹ️", "medium": "⚠️", "high": "❗", "blocking": "🚫"}
-                        severity = finding.get('severity', 'medium')
-                        emoji_icon = severity_emoji.get(severity, "•")
-                        findings_text += f"{emoji_icon} {finding.get('message', 'No message')}\n"
-
-        return f"""## {emoji} Architecture Design Review - {feedback.status.value.replace('_', ' ').title()}
-
-**Overall Score:** {feedback.score:.1%}
-**Critical Issues:** {feedback.blocking_issues}
-
-### Review Summary
-{feedback.comments}
-{scores_text}
-{rec_text}
-{findings_text}
-
-### Next Steps
-{self.get_next_steps_text(feedback.status)}
-
----
-*Architecture review by Claude Code Orchestrator*
-"""
-
-    def get_next_steps_text(self, status: ReviewStatus) -> str:
-        """Get next steps text based on review status"""
-        if status == ReviewStatus.BLOCKED:
-            return "🛑 **Critical architecture issues identified.** Please address blocking issues before proceeding to development."
-        elif status == ReviewStatus.CHANGES_REQUESTED:
-            return "🔄 **Architecture improvements recommended.** Please address the feedback to strengthen the design."
-        else:
-            return "**Architecture approved!** Ready to proceed to test planning and implementation."

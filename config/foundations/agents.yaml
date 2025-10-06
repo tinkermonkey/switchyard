@@ -191,6 +191,27 @@ agents:
       - context7
       - serena
 
+  work_breakdown_agent:
+    description: "Break approved designs into phase-based sub-issues for implementation"
+    model: "claude-sonnet-4-5-20250929"
+    timeout: 300
+    retries: 2
+    makes_code_changes: false  # Creates GitHub issues, not files
+    requires_dev_container: false
+    requires_docker: true  # MUST run in Docker for security isolation
+    filesystem_write_allowed: false  # Creates GitHub issues via API only
+    capabilities:
+      - work_decomposition
+      - task_estimation
+      - dependency_analysis
+      - issue_creation
+    tools_enabled:
+      - file_operations
+      - git_integration
+    mcp_servers:
+      - context7
+      - serena
+
   senior_software_engineer:
     description: "Software development and implementation"
     model: "claude-sonnet-4-5-20250929"
@@ -250,6 +271,27 @@ agents:
       - file_operations
       - git_integration
     mcp_servers:
+      - serena
+
+  qa_reviewer:
+    description: "QA work validation and test execution review"
+    model: "claude-sonnet-4-5-20250929"
+    timeout: 300
+    retries: 2
+    makes_code_changes: false  # Review only, no changes
+    requires_dev_container: false  # Can review test results without running them
+    requires_docker: true  # MUST run in Docker for security isolation
+    filesystem_write_allowed: false  # Posts reviews to GitHub, doesn't create files
+    capabilities:
+      - qa_validation
+      - test_execution_review
+      - coverage_analysis
+      - production_readiness_review
+    tools_enabled:
+      - file_operations
+      - git_integration
+    mcp_servers:
+      - context7
       - serena
 
   technical_writer:

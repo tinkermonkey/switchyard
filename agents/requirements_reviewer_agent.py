@@ -12,6 +12,36 @@ class RequirementsReviewerAgent(PipelineStage):
     def __init__(self, agent_config: Dict[str, Any] = None):
         super().__init__("requirements_reviewer", agent_config=agent_config)
 
+    async def _get_filter_instructions(self) -> str:
+        """
+        Get learned filter instructions to inject into review prompt.
+
+        Returns filter guidance based on historical review outcomes.
+        """
+        try:
+            from services.review_filter_manager import get_review_filter_manager
+
+            filter_manager = get_review_filter_manager()
+
+            # Get active filters for this agent with high confidence
+            filters = await filter_manager.get_agent_filters(
+                agent_name='requirements_reviewer',
+                min_confidence=0.75,  # 75%+ confidence
+                active_only=True
+            )
+
+            if not filters:
+                return ""
+
+            # Build filter instructions using manager's formatter
+            filter_text = filter_manager.build_filter_instructions(filters)
+
+            return filter_text
+
+        except Exception as e:
+            logger.warning(f"Failed to load review filters (non-critical): {e}")
+            return ""
+
     async def execute(self, context: Dict[str, Any]) -> Dict[str, Any]:
         """Execute requirements review on the Business Analyst's output"""
 
@@ -72,7 +102,7 @@ You previously escalated this review due to **blocking issues** that required hu
 - If the human provided additional context, incorporate it into your evaluation
 - If the human gave directions to the business analyst, those will be handled separately
 - Your updated review should be a **complete, standalone review** (not just changes)
-- Set the appropriate status: APPROVED, CHANGES_REQUESTED, or BLOCKED (if still unresolved)
+- Set the appropriate status: APPROVED, CHANGES NEEDED, or BLOCKED (if still unresolved)
 
 **Current Iteration**: {iteration}/{max_iterations}
 
@@ -101,7 +131,7 @@ This is **Re-Review Iteration {iteration} of {max_iterations}**.
 
 **Status Decision**:
 - **APPROVED**: All critical issues resolved (minor issues OK)
-- **CHANGES_REQUESTED**: Specific fixable issues remain
+- **CHANGES NEEDED**: Specific fixable issues remain
 - **BLOCKED**: Critical issues persist OR maker didn't address previous feedback
 
 After {max_iterations} iterations, escalates to human review.
@@ -130,7 +160,7 @@ This is **Initial Review (Iteration {iteration} of {max_iterations})**.
 
 **Status Decision**:
 - **APPROVED**: No critical issues, work is adequate
-- **CHANGES_REQUESTED**: Specific issues that can be fixed
+- **CHANGES NEEDED**: Specific issues that can be fixed
 - **BLOCKED**: Critical issues that might need human input
 
 """
@@ -164,9 +194,13 @@ HUMAN FEEDBACK:
 Please incorporate this feedback into your review.
 """
 
+        # Inject learned review filters
+        filter_instructions = await self._get_filter_instructions()
+
         prompt = f"""
 Review the requirements analysis provided by the Business Analyst.
 {iteration_context}
+{filter_instructions}
 
 Original Issue:
 Title: {issue.get('title', 'No title')}
@@ -199,23 +233,27 @@ IMPORTANT GUIDELINES - BE CONCISE:
 
 **Review Format**:
 ```
-## Issues Found
+### Status
+**APPROVED** or **CHANGES NEEDED** or **BLOCKED**
 
-### Critical (BLOCKING)
+### Issues Found
+
+#### Critical (BLOCKING)
 - [Only genuinely blocking issues - be selective]
 
-### High Priority
+#### High Priority
 - [Issues that should be fixed]
 
-### Questions
+#### Questions
 - [Only if unclear - be specific]
 
-**Status**: [APPROVED / CHANGES_REQUESTED / BLOCKED]
+### Summary
+Brief summary of overall assessment and next steps
 ```
 
 **Decision Criteria**:
 - APPROVED: No critical gaps, work is adequate for next stage
-- CHANGES_REQUESTED: Specific fixable issues exist
+- CHANGES NEEDED: Specific fixable issues exist
 - BLOCKED: Critical issues OR maker ignored previous feedback
 
 Before submitting, verify each issue is:
@@ -223,7 +261,7 @@ Before submitting, verify each issue is:
 2. Specific (clear what to fix)
 3. Actionable (maker can fix it)
 
-REQUIRED: Include "**Status**: X" at the end for automation parsing.
+REQUIRED: Include "**Status**: X" at the top for automation parsing.
 """
 
         # PROMPT DEBUG LOGGING

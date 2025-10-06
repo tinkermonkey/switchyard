@@ -2,9 +2,7 @@ from typing import Dict, Any
 from pipeline.base import PipelineStage
 from claude.claude_integration import run_claude_code
 from datetime import datetime
-import json
 import logging
-from services.review_parser import ReviewStatus
 
 logger = logging.getLogger(__name__)
 
@@ -13,104 +11,295 @@ class CodeReviewerAgent(PipelineStage):
     def __init__(self, agent_config: Dict[str, Any] = None):
         super().__init__("code_reviewer", agent_config=agent_config)
 
+    async def _get_filter_instructions(self) -> str:
+        """
+        Get learned filter instructions to inject into review prompt.
+
+        Returns filter guidance based on historical review outcomes.
+        """
+        try:
+            from services.review_filter_manager import get_review_filter_manager
+
+            filter_manager = get_review_filter_manager()
+
+            # Get active filters for this agent with high confidence
+            filters = await filter_manager.get_agent_filters(
+                agent_name='code_reviewer',
+                min_confidence=0.75,  # 75%+ confidence
+                active_only=True
+            )
+
+            if not filters:
+                return ""
+
+            # Build filter instructions using manager's formatter
+            filter_text = filter_manager.build_filter_instructions(filters)
+
+            return filter_text
+
+        except Exception as e:
+            logger.warning(f"Failed to load review filters (non-critical): {e}")
+            return ""
+
+    def _get_output_format_instructions(self, is_rereviewing: bool = False) -> str:
+        """Get output format instructions"""
+        if is_rereviewing:
+            resolved_section = """
+### Previous Issues Status
+
+**IMPORTANT**: Start by listing each issue from your previous review and its status:
+- ✅ **[Previous Issue Title]** - RESOLVED: [Brief note on how it was addressed]
+- ⚠️ **[Previous Issue Title]** - PARTIALLY RESOLVED: [What's still missing]
+- ❌ **[Previous Issue Title]** - NOT RESOLVED: [What still needs to be done]
+
+This section is **MANDATORY** in re-reviews. It shows you're tracking progress.
+
+### New Issues Found (if any)
+
+Only list NEW issues discovered in THIS revision that are:
+- Critical problems introduced by the changes
+- Directly related to how previous issues were addressed
+- NOT just additional nice-to-have improvements
+"""
+        else:
+            resolved_section = "### Issues Found"
+
+        return f"""
+**Review Format**:
+```
+### Status
+**APPROVED** or **CHANGES NEEDED** or **BLOCKED**
+
+{resolved_section}
+
+#### Critical (Must Fix)
+**IMPORTANT**: Only use this category for issues that:
+- Have critical security vulnerabilities (OWASP Top 10)
+- Will cause data loss or corruption
+- Break core functionality completely
+- Violate fundamental requirements
+
+Most code quality issues should be **High Priority**, not Critical.
+
+List critical issues here, or write "None" if no critical security/data issues found.
+
+#### High Priority (Should Fix)
+- **[Issue Title]**: [Description and recommendation]
+
+List important issues that must be addressed but are not critical security vulnerabilities.
+
+#### Medium Priority (Consider)
+- **[Issue Title]**: [Description and recommendation]
+
+#### Low Priority / Nitpicks
+- **[Issue Title]**: [Description and recommendation]
+
+### Summary
+Brief summary of overall code quality and next steps
+```
+
+**Decision Criteria**:
+- APPROVED: Code meets quality standards, no significant issues, ready for testing
+- CHANGES NEEDED: Issues found that developer can address in revision
+- BLOCKED: Critical security vulnerabilities or fundamental issues requiring human intervention
+
+**Use CHANGES NEEDED unless there are truly un-addressable critical issues that need human decisions.**
+
+REQUIRED: Include "**Status**: X" at the top for automation parsing."""
+
     async def execute(self, context: Dict[str, Any]) -> Dict[str, Any]:
         """Execute comprehensive code review with security, performance, and quality analysis"""
 
         # Extract from nested task context
         task_context = context.get('context', {})
-        issue = task_context.get('issue', {})
-        project = context.get('project', 'unknown')
+
+        # Get the previous stage output (from maker agent)
         previous_stage = task_context.get('previous_stage_output', '')
 
-        # Check for feedback
-        feedback_data = task_context.get('feedback')
-        previous_output = task_context.get('previous_output')
+        if not previous_stage:
+            raise Exception("Code Reviewer needs previous stage output from maker agent")
 
-        # Get implementation to review from previous stage
-        implementation_summary = context.get('implementation_summary', {})
-        code_artifacts = context.get('code_artifacts', {})
+        implementation = previous_stage
+        review_cycle = task_context.get('review_cycle', {})
+        issue = task_context.get('issue', {})
 
-        # Build feedback prompt if this is a refinement
-        feedback_prompt = ""
-        if feedback_data and previous_output:
-            feedback_prompt = f"""
+        # Get scoped git diff if available (for issues workspace)
+        scoped_diff = task_context.get('scoped_git_diff', '')
 
-YOUR PREVIOUS REVIEW:
-{previous_output}
+        # Build iteration context for re-reviews
+        iteration_context = ""
+        is_rereviewing = False
 
-HUMAN FEEDBACK RECEIVED:
-{feedback_data.get('formatted_text', '')}
+        if review_cycle:
+            iteration = review_cycle.get('iteration', 0)
+            max_iterations = review_cycle.get('max_iterations', 3)
+            maker_agent = review_cycle.get('maker_agent', 'unknown')
+            is_rereviewing = review_cycle.get('is_rereviewing', False)
+            post_human_feedback = review_cycle.get('post_human_feedback', False)
 
-IMPORTANT: Review your previous review and refine it based on the feedback.
-Do NOT start from scratch - update and improve your existing review.
+            if post_human_feedback:
+                iteration_context = f"""
 
-CRITICAL: Output the COMPLETE, UPDATED review with all changes incorporated.
+## Post-Escalation Review Update
+
+You previously escalated this review due to **blocking issues** that required human intervention.
+
+**The human has now responded with feedback.** Your task is to:
+
+1. **Read the human feedback** in the discussion/issue context
+2. **Incorporate their guidance** into your review assessment
+3. **Update your review** based on their corrections, clarifications, or directions
+4. **Post your UPDATED review** that reflects the human's input
+
+**Important Guidelines**:
+- If the human corrected your assessment, update your review accordingly
+- If the human provided additional context, incorporate it into your evaluation
+- Your updated review should be a **complete, standalone review** (not just changes)
+- Set the appropriate status: APPROVED, CHANGES NEEDED, or BLOCKED (if still unresolved)
+
+**Current Iteration**: {iteration}/{max_iterations}
+
+"""
+            elif is_rereviewing:
+                iteration_context = f"""
+
+## Review Cycle Context - Re-Review Mode
+
+This is **Re-Review Iteration {iteration} of {max_iterations}**.
+
+**Maker Agent**: {maker_agent.replace('_', ' ').title()} has revised their code based on your previous feedback.
+
+**IMPORTANT - Review Scope**:
+- You are reviewing ONLY the changes made by {maker_agent.replace('_', ' ').title()} in response to feedback
+- DO NOT re-review code that was previously approved by other review cycles
+- Focus on the commits made by {maker_agent.replace('_', ' ').title()} since the last review
+
+**Your Task**: Verify previous issues are resolved. Be concise.
+
+**Review Approach**:
+1. Check if your PREVIOUS feedback items were addressed (don't re-raise if fixed)
+2. Note any NEW issues discovered in the maker's changes
+3. Make your decision
+
+**Keep Feedback CONCISE**:
+- 1-2 sentences per issue maximum
+- Focus on WHAT is wrong, not explaining WHY it's important (developer already knows)
+- Only include items that genuinely need fixing
+- Don't repeat issues that were already addressed
+
+**Escalation**: After {max_iterations} iterations, unresolved issues will escalate to human review.
+"""
+            else:
+                iteration_context = f"""
+
+## Review Cycle Context - Initial Review
+
+This is **Review Iteration {iteration} of {max_iterations}**.
+
+**Maker Agent**: {maker_agent.replace('_', ' ').title()} has implemented the code.
+
+**IMPORTANT - Review Scope**:
+- You are reviewing ONLY the changes made by {maker_agent.replace('_', ' ').title()}
+- If this is QA testing phase, focus on test code and test-related changes
+- If previous agents (e.g., software engineer) already had their code approved, do NOT re-review their work
+- Focus on commits made by {maker_agent.replace('_', ' ').title()} for this specific task
+
+**Your Task**: Conduct comprehensive code review of {maker_agent.replace('_', ' ').title()}'s work.
+
+**After Review**: If issues found, maker will revise. Up to {max_iterations} review cycles.
+"""
+
+        # Get output format instructions
+        format_instructions = self._get_output_format_instructions(is_rereviewing)
+
+        # Inject learned review filters
+        filter_instructions = await self._get_filter_instructions()
+
+        # Build git diff section if available
+        git_diff_section = ""
+        if scoped_diff:
+            git_diff_section = f"""
+
+## Code Changes (Git Diff)
+
+**IMPORTANT**: These are the ONLY changes you should review. Do not review unchanged code.
+
+```diff
+{scoped_diff}
+```
+
+**Review Focus**: Analyze ONLY the lines marked with `+` (additions) and `-` (deletions) in the diff above.
 """
 
         prompt = f"""
-As a Senior Code Reviewer, conduct comprehensive code review focusing on security, performance, maintainability, and best practices.
+You are a **Senior Code Reviewer** conducting comprehensive code review.
 
-Original Issue:
-Title: {issue.get('title', 'No title')}
-Description: {issue.get('body', 'No description')}
+Your expertise includes: security (OWASP Top 10), performance optimization, SOLID principles, test coverage, and maintainability.
+{iteration_context}{filter_instructions}
+## Original Requirements
 
-Previous Stage Output (Implementation):
-{previous_stage}
-{feedback_prompt}
+**Title**: {issue.get('title', 'No title')}
+**Description**: {issue.get('body', 'No description')}
+{git_diff_section}
+## Implementation to Review
 
-IMPORTANT: Output your code review as text directly in your response. DO NOT create any files. This review will be posted to GitHub as a comment.
+{implementation}
 
-Provide comprehensive code review with:
+## Your Review Task
 
-1. Code Quality Assessment:
-   - SOLID principles adherence
+Conduct a comprehensive code review covering:
+
+1. **Code Quality Assessment**:
+   - SOLID principles adherence (Single Responsibility, Open/Closed, Liskov Substitution, Interface Segregation, Dependency Inversion)
    - Clean code practices (DRY, KISS, YAGNI)
    - Code readability and maintainability
    - Naming conventions and structure
    - Error handling completeness
 
-2. Security Analysis:
-   - OWASP Top 10 vulnerability assessment
-   - Input validation and sanitization
-   - Authentication and authorization implementation
-   - Data protection and encryption
+2. **Security Analysis** (OWASP Top 10):
    - SQL injection and XSS prevention
+   - Authentication and authorization implementation
+   - Input validation and sanitization
+   - Data protection and encryption
+   - Security misconfigurations
+   - Vulnerable dependencies
 
-3. Performance Review:
-   - Algorithm efficiency analysis
-   - Database query optimization
+3. **Performance Review**:
+   - Algorithm efficiency (time/space complexity)
+   - Database query optimization (N+1 queries, indexes)
    - Memory usage and resource management
    - Caching strategy implementation
    - API response time optimization
 
-4. Testing Evaluation:
-   - Test coverage analysis
+4. **Testing Evaluation**:
+   - Test coverage analysis (should be >80%)
    - Test quality and effectiveness
    - Integration test completeness
    - Edge case coverage
    - Mock and stub usage appropriateness
 
-5. Architecture Compliance:
+5. **Architecture Compliance**:
    - Design pattern implementation
    - Dependency management
    - Configuration management
    - Logging and monitoring integration
    - Documentation quality
 
-6. Issue Categorization:
-   - Must Fix: Critical security vulnerabilities, major bugs
-   - Should Fix: Performance issues, maintainability concerns
-   - Consider: Code style improvements, optimizations
-   - Nitpick: Minor style or convention issues
+{format_instructions}
 
-Return structured JSON with review_findings and recommendations sections.
+**IMPORTANT**:
+- Output your review as **markdown text** directly in your response
+- DO NOT create any files - this review will be posted to GitHub as a comment
+- DO NOT include project name, feature name, or date headers
+- Start directly with "### Status"
+- Be specific and actionable in your feedback
+- Categorize issues by severity correctly (most issues are High Priority, not Critical)
 """
 
         try:
-            # Enhance context with MCP server data if available
+            # Enhance context with agent config
             enhanced_context = context.copy()
 
-            # Add agent_config for security enforcement (requires_docker check)
             if self.agent_config and 'agent_config' in self.agent_config:
                 enhanced_context['agent_config'] = self.agent_config['agent_config']
             if self.agent_config and 'mcp_servers' in self.agent_config:
@@ -118,93 +307,15 @@ Return structured JSON with review_findings and recommendations sections.
                 logger.info(f"Added {len(enhanced_context['mcp_servers'])} MCP servers to context")
 
             result = await run_claude_code(prompt, enhanced_context)
-            
-            # Parse review results
-            if isinstance(result, str):
-                try:
-                    review_data = json.loads(result)
-                except json.JSONDecodeError:
-                    review_data = {
-                        "review_findings": {
-                            "overall_score": 0.85,
-                            "security_score": 0.9,
-                            "performance_score": 0.8,
-                            "maintainability_score": 0.85,
-                            "test_quality_score": 0.8,
-                            "issues_found": {
-                                "must_fix": 0,
-                                "should_fix": 2,
-                                "consider": 3,
-                                "nitpick": 5
-                            }
-                        },
-                        "recommendations": {
-                            "critical_fixes": [],
-                            "improvements": ["Add input validation", "Optimize database queries"],
-                            "optimizations": ["Consider caching layer", "Improve error messages"]
-                        }
-                    }
-            else:
-                review_data = result
 
-            # Process review results
-            from services.review_parser import ReviewStatus
-            from services.github_integration import GitHubIntegration
-
-            findings = review_data.get('review_findings', {})
-            issues = findings.get('issues_found', {})
-            overall_score = findings.get('overall_score', 0.5)
-            
-            must_fix = issues.get('must_fix', 0)
-            should_fix = issues.get('should_fix', 0)
-            
-            # Determine review status
-            if must_fix > 0:
-                status = ReviewStatus.BLOCKED
-            elif should_fix > 5 or overall_score < 0.7:
-                status = ReviewStatus.CHANGES_REQUESTED
-            else:
-                status = ReviewStatus.APPROVED
-
-            # Create detailed findings
-            detailed_findings = []
-            
-            # Security findings
-            security_score = findings.get('security_score', 0.5)
-            detailed_findings.append({
-                "category": "security",
-                "severity": "high" if security_score < 0.7 else "medium" if security_score < 0.9 else "low",
-                "message": f"Security assessment: {security_score:.1%}",
-                "suggestion": "Review security recommendations"
-            })
-            
-            # Performance findings
-            performance_score = findings.get('performance_score', 0.5)
-            detailed_findings.append({
-                "category": "performance",
-                "severity": "medium" if performance_score < 0.8 else "low",
-                "message": f"Performance score: {performance_score:.1%}",
-                "suggestion": "Consider performance optimizations"
-            })
-            
             # Store result as markdown
-            if isinstance(result, str):
-                context['markdown_review'] = result
-            else:
-                context['markdown_review'] = json.dumps(review_data, indent=2)
+            markdown_output = result if isinstance(result, str) else str(result)
+            context['markdown_review'] = markdown_output
+            context['raw_review_result'] = markdown_output
 
-            # Update context
-            context['review_completed'] = True
-            context['review_status'] = status.value
-            context['quality_score'] = overall_score
-            context['code_approved'] = status == ReviewStatus.APPROVED
-            context['review_findings'] = findings
-
-            logger.info(f"Code review completed: {status.value}")
-            logger.info(f"Overall score: {overall_score:.2f}, Must fix: {must_fix}, Should fix: {should_fix}")
+            logger.info(f"Code review completed, output length: {len(markdown_output)}")
 
             return context
 
         except Exception as e:
             raise Exception(f"Code review failed: {str(e)}")
-

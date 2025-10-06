@@ -98,8 +98,29 @@ class GitHubProjectManager:
                 if not board_data:
                     return False
             else:
-                logger.info(f"Board exists: {pipeline_config.board_name}")
-                # TODO: Update existing board if needed
+                logger.info(f"Board exists: {pipeline_config.board_name}, updating columns")
+                # Update existing board columns
+                workflow_template = self.config_manager.get_workflow_template(pipeline_config.workflow)
+                project_number = existing_board.project_number
+
+                if project_number:
+                    columns = await self._configure_board_columns(
+                        project_number,
+                        workflow_template,
+                        project_config.github['org']
+                    )
+
+                    # Update state with new columns
+                    self.state_manager.update_board_state(
+                        project_name,
+                        pipeline_config.board_name,
+                        existing_board.project_number,
+                        existing_board.project_id,
+                        existing_board.node_id,
+                        columns
+                    )
+                    logger.info(f"Updated {len(columns)} columns for board: {pipeline_config.board_name}")
+
                 board_data = existing_board
 
             return True

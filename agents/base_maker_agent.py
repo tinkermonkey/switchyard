@@ -111,6 +111,62 @@ class MakerAgent(PipelineStage, ABC):
         return 'initial'
 
     # ==================================================================================
+    # OUTPUT INSTRUCTION BUILDER - Conditional based on agent capabilities
+    # ==================================================================================
+
+    def _get_output_instructions(self) -> str:
+        """
+        Build output instructions based on agent configuration.
+
+        Agents that make code changes get different instructions than
+        agents that only produce analysis/reviews.
+        """
+        from config.manager import config_manager
+
+        # Check if agent makes code changes
+        makes_code_changes = False
+        filesystem_write_allowed = True
+
+        if self.agent_config:
+            # Try to get from agent_config dict
+            if isinstance(self.agent_config, dict):
+                makes_code_changes = self.agent_config.get('makes_code_changes', False)
+                filesystem_write_allowed = self.agent_config.get('filesystem_write_allowed', True)
+            # Try to get from agent_config object attributes
+            elif hasattr(self.agent_config, 'get'):
+                agent_cfg = self.agent_config.get('agent_config', {})
+                makes_code_changes = agent_cfg.get('makes_code_changes', False)
+                filesystem_write_allowed = agent_cfg.get('filesystem_write_allowed', True)
+
+        # Agents that modify files get permissive instructions
+        if makes_code_changes or filesystem_write_allowed:
+            return """
+
+**IMPORTANT**:
+- **PROJECT-SPECIFIC CONVENTIONS OVERRIDE**: Read `/workspace/CLAUDE.md` first. The project's CLAUDE.md file defines project-specific conventions, file organization, and documentation requirements that take precedence over these general instructions.
+- You may create, edit, or modify files as needed to complete your task
+- Use the Write, Edit, and other file manipulation tools
+- Your changes will be auto-committed to git
+- Also provide a summary of your work as markdown for the GitHub comment
+- Use proper markdown formatting (headers, lists, code blocks)
+"""
+
+        # Agents that only analyze/review get restrictive instructions
+        else:
+            return """
+
+**IMPORTANT**:
+- **PROJECT-SPECIFIC CONVENTIONS OVERRIDE**: Read `/workspace/CLAUDE.md` first. The project's CLAUDE.md file defines project-specific conventions and documentation requirements that take precedence over these general instructions.
+- Output your analysis as markdown text directly in your response
+- DO NOT create any files - this will be posted to GitHub as a comment
+- DO NOT include project name, feature name, or date headers (this info is already in the discussion)
+- Start directly with your first section (e.g., "## Executive Summary" or "## Problem Abstraction")
+- Focus on WHAT needs to be done, not HOW or WHEN
+- Be specific and factual, avoid hypotheticals and hyperbole
+- Use proper markdown formatting (headers, lists, code blocks)
+"""
+
+    # ==================================================================================
     # PROMPT BUILDERS - One for each mode
     # ==================================================================================
 
@@ -138,6 +194,9 @@ Build upon this previous analysis in your work.
 {quality_standards}
 """ if quality_standards else ""
 
+        # Build output instructions based on agent capabilities
+        output_instructions = self._get_output_instructions()
+
         prompt = f"""
 You are a {self.agent_display_name}.
 
@@ -156,13 +215,7 @@ Analyze the following requirement for project {project}:
 Provide a comprehensive analysis with the following sections:
 {chr(10).join(f'- {section}' for section in self.output_sections)}
 {guidelines_section}
-
-**IMPORTANT**:
-- Output your analysis as markdown text directly in your response
-- DO NOT create any files - this will be posted to GitHub as a comment
-- Focus on WHAT needs to be done, not HOW or WHEN
-- Be specific and factual, avoid hypotheticals and hyperbole
-- Use proper markdown formatting (headers, lists, code blocks)
+{output_instructions}
 """
         return prompt
 
@@ -175,14 +228,22 @@ Provide a comprehensive analysis with the following sections:
         # Format conversation history
         formatted_history = self._format_thread_history(thread_history)
 
+        # Include initial guidelines so agent knows its capabilities
+        guidelines = self.get_initial_guidelines()
+        guidelines_section = f"\n{guidelines}" if guidelines else ""
+
+        # Include output instructions so agent knows it can take action
+        output_instructions = self._get_output_instructions()
+
         prompt = f"""
 You are the {self.agent_display_name} continuing a conversation.
 
 {self.agent_role_description}
 
 ## Original Context
-**Topic**: {issue.get('title', 'No title')}
-
+**Title**: {issue.get('title', 'No title')}
+**Description**: {issue.get('body', 'No description')}
+{guidelines_section}
 ## Conversation History
 {formatted_history}
 
@@ -193,11 +254,12 @@ You are the {self.agent_display_name} continuing a conversation.
 
 You are in **conversational mode**:
 
-1. **Be Direct & Concise**: 200-500 words unless the question needs more
-2. **Reference Prior Discussion**: Build on what's been said
-3. **Natural Tone**: Professional but approachable ("I", "you")
-4. **Stay Focused**: Answer the specific question
-5. **Clarify if Needed**: Ask follow-up questions if unclear
+1. **Take Action When Requested**: If the user is asking you to proceed, DO IT - don't ask for permission again
+2. **Be Direct & Concise**: 200-500 words unless the question needs more
+3. **Reference Prior Discussion**: Build on what's been said
+4. **Natural Tone**: Professional but approachable ("I", "you")
+5. **Stay Focused**: Answer the specific question
+6. **Clarify if Needed**: Ask follow-up questions if unclear
 
 **Response Format**:
 - Use markdown for clarity (bold, lists, code blocks)
@@ -209,6 +271,8 @@ You are in **conversational mode**:
 - "What about Y?" → Explain Y, connect to previous points
 - "Compare X and Y?" → Direct comparison with key differences
 - "Confused about Z" → Clarify with simpler explanation/examples
+- "Yes, do it" / "Please proceed" → TAKE ACTION immediately without asking again
+{output_instructions}
 
 Your response will be posted as a threaded reply.
 """
@@ -266,26 +330,39 @@ You are the {self.agent_display_name} revising your work based on feedback.
 ## Revision Guidelines
 
 **CRITICAL - How to Revise**:
-1. Read feedback carefully - identify SPECIFIC issues raised
-2. Make TARGETED changes to address each issue
-3. Keep everything that wasn't criticized (don't rewrite everything)
-4. Expand sections only where feedback requested
-5. Fix ambiguities, gaps, or errors pointed out
-6. Maintain overall structure and quality
+1. **Read feedback systematically**: List each distinct issue raised
+2. **Address EVERY feedback point**: Don't leave any issues unresolved
+3. **Make TARGETED changes**: Modify only what was criticized
+4. **Keep working content**: Don't rewrite sections that weren't criticized
+5. **Stay focused**: Don't add new content unless specifically requested
 
-**What to Output**:
-- Your COMPLETE, REVISED document (not just changes)
+**Required Output Structure**:
+
+**MUST START WITH**:
+```
+## Revision Notes
+- ✅ [Issue 1 Title]: [Brief description of what you changed]
+- ✅ [Issue 2 Title]: [Brief description of what you changed]
+- ✅ [Issue 3 Title]: [Brief description of what you changed]
+...
+```
+
+This checklist is **CRITICAL** - it helps the reviewer see you addressed each point.
+
+**Then provide your COMPLETE, REVISED document**:
 - All sections: {', '.join(self.output_sections)}
-- A brief "## Revision Notes" at the TOP (2-3 bullets max)
+- Full content (not just changes)
+- DO NOT include project name, feature name, or date headers (already in discussion)
 
-**Important - Don't**:
-- Start from scratch (this is a REVISION, not rewrite)
-- Remove content that wasn't criticized
-- Add new sections unless requested
-- Change things that were working fine
-- Ignore any feedback points
+**Important Don'ts**:
+- ❌ Start from scratch (this is a REVISION, not complete rewrite)
+- ❌ Skip any feedback point without addressing it
+- ❌ Remove content that wasn't criticized
+- ❌ Add new sections unless specifically requested
+- ❌ Make changes to sections that weren't mentioned in feedback
+- ❌ Ignore subtle feedback ("clarify X" means "add more detail about X")
 
-**Format**: Output as markdown text (will be posted to GitHub).
+**Format**: Markdown text for GitHub posting.
 """
         return prompt
 
@@ -302,7 +379,16 @@ You are the {self.agent_display_name} revising your work based on feedback.
         for msg in history:
             role = msg.get('role', 'user')
             author = msg.get('author', 'unknown')
-            body = msg.get('body', '').strip()
+
+            # Handle body being either string or dict (e.g., {'formatted_text': '...'})
+            body_raw = msg.get('body', '')
+            if isinstance(body_raw, dict):
+                # Extract text from dict (common patterns)
+                body = body_raw.get('formatted_text', '') or body_raw.get('text', '') or str(body_raw)
+            else:
+                body = str(body_raw)
+
+            body = body.strip()
 
             if role == 'agent':
                 formatted.append(f"**You** ({author}):\n{body}\n")
@@ -346,8 +432,18 @@ You are the {self.agent_display_name} revising your work based on feedback.
             # Execute with Claude Code SDK
             result = await run_claude_code(prompt, enhanced_context)
 
-            # Process result
-            analysis_text = result if isinstance(result, str) else str(result)
+            # Process result (handle both old string format and new dict format)
+            if isinstance(result, dict):
+                analysis_text = result.get('result', '')
+                session_id = result.get('session_id')
+
+                # Store session_id in context for session continuity
+                if session_id:
+                    context['claude_session_id'] = session_id
+                    logger.info(f"Stored Claude Code session_id: {session_id}")
+            else:
+                # Backward compatibility: old string format
+                analysis_text = result if isinstance(result, str) else str(result)
 
             # Store markdown output for GitHub comment
             context['markdown_analysis'] = analysis_text

@@ -485,7 +485,7 @@ function PipelineView() {
     <div className="min-h-screen p-5 bg-gh-canvas text-gh-fg">
       <Header />
 
-      <div className="flex gap-3 mb-5">
+      <div className="flex gap-3 my-3">
         <Link
           to="/"
           className="px-4 py-2 bg-gh-canvas-subtle border border-gh-border rounded-md hover:bg-gh-border-muted transition-colors text-sm"

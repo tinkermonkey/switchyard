@@ -1,0 +1,140 @@
+# Git Operation Pattern Rules
+
+patterns:
+  - name: "git_directory_confusion"
+    description: "Agent attempts git operation outside repository"
+    severity: "medium"
+    category: "workspace_navigation"
+
+    detection:
+      event_sequence:
+        - event_category: "tool_result"
+          tool_name: "Bash"
+          tool_params_text_contains: "git "
+          error_message_contains: "fatal: not a git repository"
+
+    proposed_fix:
+      section: "Git Operations"
+      content: |
+        ### Git Operations Safety
+        Before running git commands, verify you are in the correct directory:
+        - Project repos are in `/workspace/<project-name>/`
+        - The orchestrator itself is in `/workspace/clauditoreum/`
+        - Always use `pwd` to confirm location before git operations
+
+        Example workflow:
+        ```bash
+        cd /workspace/context-studio
+        pwd  # Verify location
+        git status
+        ```
+
+  - name: "git_merge_without_pull"
+    description: "Merge fails due to outdated local branch"
+    severity: "low"
+    category: "git_workflow"
+
+    detection:
+      event_sequence:
+        - event_category: "tool_result"
+          tool_name: "Bash"
+          tool_params_text_contains: "git merge"
+          error_message_contains: ["CONFLICT", "divergent branches"]
+
+    proposed_fix:
+      section: "Git Workflow"
+      content: |
+        Before merging, always pull latest changes:
+        ```bash
+        git fetch origin
+        git pull origin $(git branch --show-current)
+        git merge <branch>
+        ```
+
+  - name: "git_commit_without_stage"
+    description: "Attempting to commit without staging files"
+    severity: "low"
+    category: "git_workflow"
+
+    detection:
+      event_sequence:
+        - event_category: "tool_result"
+          tool_name: "Bash"
+          tool_params_text_contains: "git commit"
+          error_message_contains: "nothing to commit"
+
+    proposed_fix:
+      section: "Git Workflow"
+      content: |
+        Always stage files before committing:
+        ```bash
+        git add <files>
+        git status  # Verify what will be committed
+        git commit -m "message"
+        ```
+
+  - name: "git_push_rejected"
+    description: "Push rejected due to remote changes"
+    severity: "medium"
+    category: "git_workflow"
+
+    detection:
+      event_sequence:
+        - event_category: "tool_result"
+          tool_name: "Bash"
+          tool_params_text_contains: "git push"
+          error_message_contains: ["rejected", "non-fast-forward"]
+
+    proposed_fix:
+      section: "Git Workflow"
+      content: |
+        When push is rejected, pull and rebase first:
+        ```bash
+        git pull --rebase origin <branch>
+        git push origin <branch>
+        ```
+
+  - name: "git_branch_not_found"
+    description: "Attempting to checkout non-existent branch"
+    severity: "low"
+    category: "git_workflow"
+
+    detection:
+      event_sequence:
+        - event_category: "tool_result"
+          tool_name: "Bash"
+          tool_params_text_contains: "git checkout"
+          error_message_contains: "did not match any file(s) known to git"
+
+    proposed_fix:
+      section: "Git Workflow"
+      content: |
+        Check if branch exists before checkout:
+        ```bash
+        git branch -a  # List all branches
+        git checkout -b <new-branch>  # Create new branch
+        # or
+        git checkout <existing-branch>  # Switch to existing
+        ```
+
+  - name: "git_permission_denied"
+    description: "Git operation fails due to permission issues"
+    severity: "high"
+    category: "permissions"
+
+    detection:
+      event_sequence:
+        - event_category: "tool_result"
+          tool_name: "Bash"
+          tool_params_text_contains: "git "
+          error_message_contains: ["Permission denied", "publickey"]
+
+    proposed_fix:
+      section: "Git Configuration"
+      content: |
+        Ensure SSH keys are properly configured:
+        1. Check SSH key is mounted: `ls ~/.ssh/id_ed25519`
+        2. Verify SSH agent: `ssh-add -l`
+        3. Test GitHub connection: `ssh -T git@github.com`
+
+        If issues persist, verify SSH key is added to GitHub account.

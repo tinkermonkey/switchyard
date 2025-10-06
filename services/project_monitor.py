@@ -191,14 +191,47 @@ class ProjectMonitor:
     def get_previous_stage_context(self, repository: str, issue_number: int, org: str,
                                    current_column: str, workflow_template,
                                    workspace_type: str = 'issues',
-                                   discussion_id: Optional[str] = None) -> str:
+                                   discussion_id: Optional[str] = None,
+                                   pipeline_config=None,
+                                   current_stage_config=None) -> str:
         """
         Fetch comments from the previous workflow stage agent and user comments since then.
         Works with both issues and discussions workspaces.
+
+        If current_stage_config has inputs_from defined, will gather outputs from those
+        specific agents instead of just the previous stage.
+
         Returns formatted context string.
         """
+        # Check if this stage has specific input requirements
+        if current_stage_config and hasattr(current_stage_config, 'inputs_from') and current_stage_config.inputs_from:
+            # Use discussion-based approach for gathering specific agent outputs
+            if (workspace_type == 'discussions' or workspace_type == 'hybrid') and discussion_id:
+                logger.info(f"Gathering inputs from specific agents: {current_stage_config.inputs_from}")
+                return self._get_agent_outputs_from_discussion(discussion_id, current_stage_config.inputs_from)
+            else:
+                logger.warning(f"inputs_from specified but not in discussion workspace, falling back to previous stage")
+
+        # For hybrid pipelines, determine if previous stage was in discussions or issues
+        should_use_discussion = False
+
+        if workspace_type == 'hybrid' and pipeline_config:
+            # Find previous column
+            column_names = [col.name for col in workflow_template.columns]
+            if current_column in column_names:
+                current_index = column_names.index(current_column)
+                if current_index > 0:
+                    previous_column_name = workflow_template.columns[current_index - 1].name
+                    # Check if previous stage is in discussion_stages
+                    discussion_stages = getattr(pipeline_config, 'discussion_stages', [])
+                    # Convert column name to stage key (e.g., "Design" -> "design")
+                    previous_stage_key = previous_column_name.lower().replace(' ', '_')
+                    if previous_stage_key in [s.lower() for s in discussion_stages]:
+                        should_use_discussion = True
+                        logger.info(f"Hybrid pipeline: previous stage '{previous_column_name}' is in discussion_stages, will use discussion context")
+
         # Route to appropriate workspace
-        if workspace_type == 'discussions' and discussion_id:
+        if (workspace_type == 'discussions' or should_use_discussion) and discussion_id:
             return self._get_discussion_context(discussion_id, current_column, workflow_template)
         else:
             return self._get_issue_context(repository, issue_number, org, current_column, workflow_template)
@@ -408,6 +441,76 @@ class ProjectMonitor:
             logger.error(traceback.format_exc())
             return ""
 
+    def _get_agent_outputs_from_discussion(self, discussion_id: str, agent_names: List[str]) -> str:
+        """
+        Get outputs from specific agents in a discussion.
+        Used when a stage has inputs_from specified.
+
+        Args:
+            discussion_id: The discussion ID
+            agent_names: List of agent names to get outputs from
+
+        Returns:
+            Formatted context string with all specified agent outputs
+        """
+        try:
+            from services.github_app import github_app
+            from dateutil import parser as date_parser
+
+            query = """
+            query($discussionId: ID!) {
+              node(id: $discussionId) {
+                ... on Discussion {
+                  number
+                  comments(first: 100) {
+                    nodes {
+                      id
+                      body
+                      author {
+                        login
+                      }
+                      createdAt
+                    }
+                  }
+                }
+              }
+            }
+            """
+
+            result = github_app.graphql_request(query, {'discussionId': discussion_id})
+            if not result or 'node' not in result:
+                logger.error(f"Failed to get discussion {discussion_id}")
+                return ""
+
+            all_comments = result['node']['comments']['nodes']
+
+            # Find outputs from each requested agent
+            context_parts = []
+
+            for agent_name in agent_names:
+                agent_signature = f"_Processed by the {agent_name} agent_"
+
+                # Find the last comment from this agent
+                agent_comment = None
+                for comment in reversed(all_comments):
+                    if agent_signature in comment.get('body', ''):
+                        agent_comment = comment
+                        break
+
+                if agent_comment:
+                    context_parts.append(f"## Output from {agent_name.replace('_', ' ').title()}")
+                    context_parts.append(agent_comment.get('body', ''))
+                else:
+                    logger.warning(f"No output found from agent '{agent_name}' in discussion {discussion_id}")
+
+            return "\n\n".join(context_parts) if context_parts else ""
+
+        except Exception as e:
+            logger.error(f"Error fetching agent outputs from discussion: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return ""
+
     def trigger_agent_for_status(self, project_name: str, board_name: str, issue_number: int, status: str, repository: str) -> Optional[str]:
         """Determine which agent should handle this status and create a task or review cycle"""
         try:
@@ -457,7 +560,7 @@ class ProjectMonitor:
                 if workspace_type in ['discussions', 'hybrid']:
                     discussion_id = state_manager.get_discussion_for_issue(project_name, issue_number)
 
-                # Check if agent has already processed this issue/discussion
+                # Check if agent should execute work using execution state tracker
                 # This check must happen BEFORE column type routing to prevent duplicate runs
                 import asyncio
                 try:
@@ -468,19 +571,43 @@ class ProjectMonitor:
                         loop = asyncio.new_event_loop()
                         asyncio.set_event_loop(loop)
 
-                    from services.github_integration import GitHubIntegration
-                    github = GitHubIntegration()
+                    from services.work_execution_state import work_execution_tracker
 
+                    # Determine trigger source (manual move from GitHub)
+                    trigger_source = 'manual'
+
+                    # Track if this issue has already been handled (don't start fresh work):
+                    # 1. Work already executed (per execution state tracker)
+                    # 2. Resume thread already started (for review/conversational columns)
+                    already_handled = False
+
+                    # Check if work should be executed using the new execution state logic
+                    should_execute, reason = work_execution_tracker.should_execute_work(
+                        issue_number=issue_number,
+                        column=status,
+                        agent=agent,
+                        trigger_source=trigger_source,
+                        project_name=project_name
+                    )
+
+                    if not should_execute:
+                        already_handled = True  # Work was already executed
+                        logger.info(
+                            f"Skipping {agent} on issue #{issue_number} in {status}: {reason}"
+                        )
+
+                    # For backward compatibility, also check comment signatures for discussions
                     already_processed = False
-
-                    # Check the appropriate workspace
                     if workspace_type in ['discussions', 'hybrid'] and discussion_id:
-                        # For discussions, check discussion comments
+                        from services.github_integration import GitHubIntegration
+                        github = GitHubIntegration()
+
+                        # For discussions, also check discussion comments (fallback)
                         already_processed = loop.run_until_complete(
                             github.has_agent_processed_discussion(discussion_id, agent)
                         )
                         if already_processed:
-                            logger.info(f"Agent {agent} has already processed discussion for issue #{issue_number}")
+                            logger.info(f"Agent {agent} has already processed discussion for issue #{issue_number} (comment signature found)")
 
                             # For review columns, attempt to resume the review cycle in background thread
                             if column and hasattr(column, 'type') and column.type == 'review':
@@ -526,21 +653,170 @@ class ProjectMonitor:
                                     thread.start()
                                     logger.info(f"Review cycle resume thread started for issue #{issue_number}")
 
+                                    # Resume thread is monitoring - don't start fresh work
+                                    already_handled = True
+
                                 except Exception as e:
                                     logger.error(f"Failed to start review cycle resume thread: {e}")
                                     import traceback
                                     logger.error(traceback.format_exc())
-                            else:
-                                logger.info(f"Not a review column, skipping resume attempt")
-                    else:
-                        # For issues, check issue comments
-                        already_processed = loop.run_until_complete(
-                            github.has_agent_processed_issue(issue_number, agent, repository)
-                        )
-                        if already_processed:
-                            logger.info(f"Agent {agent} has already processed issue #{issue_number} - skipping reprocessing")
+                            # For conversational columns, resume the feedback monitoring loop
+                            elif column and hasattr(column, 'type') and column.type == 'conversational':
+                                logger.info(f"Resuming conversational feedback loop for issue #{issue_number} in background thread")
+                                try:
+                                    from services.human_feedback_loop import human_feedback_loop_executor
+                                    import threading
 
-                    if already_processed:
+                                    def resume_feedback_loop():
+                                        """Resume conversational feedback loop in background thread"""
+                                        try:
+                                            loop = asyncio.new_event_loop()
+                                            asyncio.set_event_loop(loop)
+
+                                            # Just start monitoring - no initial execution needed
+                                            from services.human_feedback_loop import HumanFeedbackState
+
+                                            state = HumanFeedbackState(
+                                                issue_number=issue_number,
+                                                repository=repository,
+                                                agent=agent,
+                                                project_name=project_name,
+                                                board_name=board_name,
+                                                workspace_type=workspace_type,
+                                                discussion_id=discussion_id
+                                            )
+
+                                            # Load persisted session_id for continuity across restarts
+                                            from services.conversational_session_state import conversational_session_state
+                                            persisted_session = conversational_session_state.load_session(
+                                                project_name=project_name,
+                                                issue_number=issue_number,
+                                                max_age_hours=24
+                                            )
+                                            if persisted_session:
+                                                state.claude_session_id = persisted_session.session_id
+                                                logger.info(f"Restored Claude Code session for #{issue_number}: {state.claude_session_id}")
+
+                                            # Load previous outputs from discussion to rebuild conversation history
+                                            loop.run_until_complete(
+                                                human_feedback_loop_executor._load_previous_outputs_from_discussion(
+                                                    state,
+                                                    project_config.github['org']
+                                                )
+                                            )
+
+                                            # Register and start monitoring
+                                            human_feedback_loop_executor.active_loops[issue_number] = state
+                                            human_feedback_loop_executor.workflow_columns = workflow_template.columns
+
+                                            issue_data = self.get_issue_details(repository, issue_number, project_config.github['org'])
+
+                                            loop.run_until_complete(
+                                                human_feedback_loop_executor._conversational_loop(
+                                                    state, column, issue_data, project_config.github['org']
+                                                )
+                                            )
+
+                                            loop.close()
+                                        except Exception as e:
+                                            logger.error(f"Failed to resume feedback loop: {e}")
+                                            import traceback
+                                            logger.error(traceback.format_exc())
+
+                                    thread = threading.Thread(target=resume_feedback_loop, daemon=True)
+                                    thread.start()
+                                    logger.info(f"Conversational feedback loop monitoring resumed for issue #{issue_number}")
+
+                                    # Resume thread is monitoring - don't start fresh work
+                                    already_handled = True
+
+                                except Exception as e:
+                                    logger.error(f"Failed to start conversational feedback loop thread: {e}")
+                                    import traceback
+                                    logger.error(traceback.format_exc())
+                            else:
+                                logger.info(f"Not a review or conversational column, skipping resume attempt")
+                    else:
+                        # For issues workspace, check deduplication
+                        # BUT skip this check for review and conversational columns
+                        if column and column.type == 'review':
+                            # Review columns are handled by review cycle executor
+                            # Don't use deduplication - cycles need reviewers to run multiple times
+                            logger.debug(f"Skipping deduplication check for review column")
+                        elif column and column.type == 'conversational':
+                            # Conversational columns need to resume monitoring after restart
+                            logger.info(f"Resuming conversational feedback loop for issue #{issue_number} in issues workspace")
+                            try:
+                                from services.human_feedback_loop import human_feedback_loop_executor
+                                import threading
+
+                                def resume_feedback_loop():
+                                    """Resume conversational feedback loop in background thread"""
+                                    try:
+                                        loop_new = asyncio.new_event_loop()
+                                        asyncio.set_event_loop(loop_new)
+
+                                        # Create state for this feedback loop
+                                        from services.human_feedback_loop import HumanFeedbackState
+
+                                        state = HumanFeedbackState(
+                                            issue_number=issue_number,
+                                            repository=repository,
+                                            agent=agent,
+                                            project_name=project_name,
+                                            board_name=board_name,
+                                            workspace_type='issues',
+                                            discussion_id=None  # Issues don't have discussion IDs
+                                        )
+
+                                        # Load persisted session_id for continuity across restarts
+                                        from services.conversational_session_state import conversational_session_state
+                                        persisted_session = conversational_session_state.load_session(
+                                            project_name=project_name,
+                                            issue_number=issue_number,
+                                            max_age_hours=24
+                                        )
+                                        if persisted_session:
+                                            state.claude_session_id = persisted_session.session_id
+                                            logger.info(f"Restored Claude Code session for #{issue_number}: {state.claude_session_id}")
+
+                                        # Register and start monitoring
+                                        human_feedback_loop_executor.active_loops[issue_number] = state
+                                        human_feedback_loop_executor.workflow_columns = workflow_template.columns
+
+                                        issue_data = self.get_issue_details(repository, issue_number, project_config.github['org'])
+
+                                        loop_new.run_until_complete(
+                                            human_feedback_loop_executor._conversational_loop(
+                                                state, column, issue_data, project_config.github['org']
+                                            )
+                                        )
+
+                                        loop_new.close()
+                                    except Exception as e:
+                                        logger.error(f"Failed to resume feedback loop: {e}")
+                                        import traceback
+                                        logger.error(traceback.format_exc())
+
+                                thread = threading.Thread(target=resume_feedback_loop, daemon=True)
+                                thread.start()
+                                logger.info(f"Conversational feedback loop monitoring resumed for issue #{issue_number}")
+
+                                # Return early - we've started the monitoring loop
+                                return agent
+
+                            except Exception as e:
+                                logger.error(f"Failed to start conversational feedback loop thread: {e}")
+                                import traceback
+                                logger.error(traceback.format_exc())
+                                # If resume fails, allow normal startup below
+                        else:
+                            # For non-review, non-conversational columns in issues workspace
+                            # Rely on execution state tracker (already checked above)
+                            pass
+
+                    # If already handled (work executed or resume thread started), don't start fresh work
+                    if already_handled:
                         return None
 
                 except Exception as e:
@@ -572,12 +848,27 @@ class ProjectMonitor:
                 # Fetch full issue details from GitHub
                 issue_data = self.get_issue_details(repository, issue_number, project_config.github['org'])
 
+                # Get the stage config from pipeline template for this column
+                pipeline_template = self.config_manager.get_pipeline_template(pipeline_config.template)
+                current_stage_config = None
+                if column:
+                    # Map column name to stage - column.stage_mapping should give us the stage name
+                    stage_name = column.stage_mapping if hasattr(column, 'stage_mapping') else None
+                    if stage_name and pipeline_template:
+                        # Find the stage config in the pipeline template
+                        for stage in pipeline_template.stages:
+                            if stage.stage == stage_name:
+                                current_stage_config = stage
+                                break
+
                 # Fetch context from previous workflow stage (workspace-aware)
                 previous_stage_context = self.get_previous_stage_context(
                     repository, issue_number, project_config.github['org'],
                     status, workflow_template,
                     workspace_type=workspace_type,
-                    discussion_id=discussion_id
+                    discussion_id=discussion_id,
+                    pipeline_config=pipeline_config,
+                    current_stage_config=current_stage_config
                 )
 
                 # Create task for the agent
@@ -609,6 +900,17 @@ class ProjectMonitor:
                 )
 
                 self.task_queue.enqueue(task)
+
+                # Record execution start in work execution state
+                from services.work_execution_state import work_execution_tracker
+                work_execution_tracker.record_execution_start(
+                    issue_number=issue_number,
+                    column=status,
+                    agent=agent,
+                    trigger_source='manual',  # Triggered from project monitor
+                    project_name=project_name
+                )
+
                 logger.info(f"Created task for {agent} - Issue #{issue_number} moved to {status} on {board_name}")
                 return agent
             else:
@@ -647,12 +949,27 @@ class ProjectMonitor:
             if workspace_type in ['discussions', 'hybrid']:
                 discussion_id = state_manager.get_discussion_for_issue(project_name, issue_number)
 
+            # Get the stage config from pipeline template for this column
+            pipeline_template_data = self.config_manager.get_pipeline_template(pipeline_config.template)
+            current_stage_config = None
+            if column:
+                # Map column name to stage - column.stage_mapping should give us the stage name
+                stage_name = column.stage_mapping if hasattr(column, 'stage_mapping') else None
+                if stage_name and pipeline_template_data:
+                    # Find the stage config in the pipeline template
+                    for stage in pipeline_template_data.stages:
+                        if stage.stage == stage_name:
+                            current_stage_config = stage
+                            break
+
             # Get previous stage output if available
             previous_stage_context = self.get_previous_stage_context(
                 repository, issue_number, project_config.github['org'],
                 status, workflow_template,
                 workspace_type=workspace_type,
-                discussion_id=discussion_id
+                discussion_id=discussion_id,
+                pipeline_config=pipeline_config,
+                current_stage_config=current_stage_config
             )
 
             # Start conversational loop in background thread
@@ -740,11 +1057,26 @@ class ProjectMonitor:
             if workspace_type in ['discussions', 'hybrid']:
                 discussion_id = state_manager.get_discussion_for_issue(project_name, issue_number)
 
+            # Get the stage config from pipeline template for this column
+            pipeline_template_data = self.config_manager.get_pipeline_template(pipeline_config.template)
+            current_stage_config = None
+            if column:
+                # Map column name to stage - column.stage_mapping should give us the stage name
+                stage_name = column.stage_mapping if hasattr(column, 'stage_mapping') else None
+                if stage_name and pipeline_template_data:
+                    # Find the stage config in the pipeline template
+                    for stage in pipeline_template_data.stages:
+                        if stage.stage == stage_name:
+                            current_stage_config = stage
+                            break
+
             previous_stage_context = self.get_previous_stage_context(
                 repository, issue_number, project_config.github['org'],
                 status, workflow_template,
                 workspace_type=workspace_type,
-                discussion_id=discussion_id
+                discussion_id=discussion_id,
+                pipeline_config=pipeline_config,
+                current_stage_config=current_stage_config
             )
 
             if not previous_stage_context:
@@ -791,6 +1123,36 @@ _Review cycle initiated by Claude Code Orchestrator_
                         )
                     )
 
+                    # Create or update PR for code review if using git workflow
+                    # Find the pipeline to check workspace type
+                    pipeline = next(
+                        (p for p in project_config.pipelines if p.board_name == board_name),
+                        None
+                    )
+                    if pipeline and pipeline.workspace == 'issues':
+                        from services.git_workflow_manager import git_workflow_manager
+                        from services.project_workspace import workspace_manager
+
+                        project_dir = workspace_manager.get_project_dir(project_name)
+
+                        pr_result = loop.run_until_complete(
+                            git_workflow_manager.create_or_update_pr(
+                                project=project_name,
+                                issue_number=issue_number,
+                                project_dir=project_dir,
+                                org=project_config.github['org'],
+                                repo=project_config.github['repo'],
+                                issue_title=issue_data.get('title', f'Issue #{issue_number}'),
+                                issue_body=issue_data.get('body', ''),
+                                draft=True  # Start as draft
+                            )
+                        )
+
+                        if pr_result.get('success'):
+                            logger.info(f"PR created/updated for issue #{issue_number}: {pr_result.get('pr_url')}")
+                        else:
+                            logger.warning(f"Failed to create PR: {pr_result.get('error')}")
+
                     # Execute review cycle
                     next_column, success = loop.run_until_complete(
                         review_cycle_executor.start_review_cycle(
@@ -812,6 +1174,41 @@ _Review cycle initiated by Claude Code Orchestrator_
                         f"Review cycle completed for issue #{issue_number}, "
                         f"success={success}, next_column={next_column}"
                     )
+
+                    # Move card to next column if successful and next column specified
+                    if success and next_column and next_column != status:
+                        try:
+                            logger.info(f"Moving issue #{issue_number} from {status} to {next_column}")
+
+                            # Get the project and card IDs
+                            project_state = state_manager.load_project_state(project_name)
+
+                            # project_state is a GitHubProjectState object with boards attribute
+                            board = project_state.boards.get(board_name) if project_state else None
+                            project_id = board.project_id if board else None
+
+                            if not project_id:
+                                logger.error(f"No project ID found for {board_name}")
+                            else:
+                                # Find the target column
+                                target_column = next((c for c in workflow_template.columns if c.name == next_column), None)
+                                if not target_column:
+                                    logger.error(f"Target column {next_column} not found in workflow")
+                                else:
+                                    # Move the card
+                                    from services.pipeline_progression import PipelineProgression
+                                    progression_service = PipelineProgression(self.task_queue)
+                                    progression_service.move_issue_to_column(
+                                        project_name=project_name,
+                                        board_name=board_name,
+                                        issue_number=issue_number,
+                                        target_column=next_column
+                                    )
+                                    logger.info(f"Successfully moved issue #{issue_number} to {next_column}")
+                        except Exception as move_error:
+                            logger.error(f"Failed to move issue to next column: {move_error}")
+                            import traceback
+                            logger.error(traceback.format_exc())
 
                     loop.close()
                 except Exception as e:
@@ -1162,6 +1559,16 @@ _Review cycle initiated by Claude Code Orchestrator_
                 logger.info(f"   Status: {change['old_status']} → {change['new_status']}")
                 logger.info(f"   Board: {board_name}")
 
+                # Record status change in work execution state
+                from services.work_execution_state import work_execution_tracker
+                work_execution_tracker.record_status_change(
+                    issue_number=change['issue_number'],
+                    from_status=change['old_status'],
+                    to_status=change['new_status'],
+                    trigger='manual',  # Status changes from GitHub are manual
+                    project_name=project_name
+                )
+
                 # Check if this issue needs a discussion created BEFORE triggering agent
                 # (Important for discussions workspaces)
                 self._check_and_create_discussion(
@@ -1256,10 +1663,14 @@ _Review cycle initiated by Claude Code Orchestrator_
             issue_data = self.get_issue_details(repository, issue_number, project_config.github['org'])
 
             # Get discussion category
+            # Use first discussion stage if available, otherwise 'initial'
+            stage = (pipeline_config.discussion_stages[0]
+                    if hasattr(pipeline_config, 'discussion_stages') and pipeline_config.discussion_stages
+                    else 'initial')
             workspace_type, category_id = self.workspace_router.determine_workspace(
                 project_name,
                 pipeline_config.board_name,
-                'initial'  # Use first stage
+                stage
             )
 
             if not category_id:

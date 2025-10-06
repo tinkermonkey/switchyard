@@ -73,39 +73,21 @@ class ReviewParser:
     """Parse agent review output to extract structured feedback"""
 
     # Status detection patterns
-    # IMPORTANT: Patterns are checked in order. Explicit status declarations come first.
+    # CRITICAL: ONLY match explicit "Status: VALUE" declarations.
+    # Do NOT use fuzzy keyword matching - it causes false positives.
+    # If no explicit status is found, we infer from findings count in parse_review().
     STATUS_PATTERNS = {
         ReviewStatus.APPROVED: [
-            # Explicit status declarations (highest priority)
-            r'(?i)status:\s*approved',
-            r'(?i)✅\s*approved',
-            # Positive indicators
-            r'(?i)all\s+(?:checks|criteria)\s+(?:have\s+)?passed',
-            r'(?i)ready\s+to\s+proceed',
-            r'(?i)no\s+(?:blocking\s+)?issues?\s+found',
-            # Past issues now resolved (should be APPROVED not BLOCKED)
-            r'(?i)(?:all|successfully)\s+(?:addressed|addressing|resolved|resolving)\s+(?:all\s+)?(?:critical\s+)?blocking\s+issues?',
+            # ONLY explicit status declarations anchored to "status" keyword
+            r'(?i)status[\s:]+\*{0,2}approved\*{0,2}',  # Matches "Status: APPROVED", "### Status\n**APPROVED**", etc.
         ],
         ReviewStatus.BLOCKED: [
-            # Explicit status declarations (highest priority)
-            r'(?i)status:\s*blocked',
-            r'(?i)🚫\s*blocked',
-            # Current blocking issues ONLY (not past issues)
-            # MUST use present tense or future tense, NOT past tense
-            r'(?i)(?:current|remaining|outstanding)\s+blocking\s+issues?',
-            r'(?i)blocking\s+issues?\s+(?:remain|exist|present)',
-            r'(?i)critical\s+(?:issues?|problems?)\s+(?:remain|exist|present)',
-            r'(?i)cannot\s+proceed',
-            r'(?i)must\s+(?:fix|address|resolve)\s+before\s+proceeding',
+            # ONLY explicit status declarations anchored to "status" keyword
+            r'(?i)status[\s:]+\*{0,2}blocked\*{0,2}',  # Matches "Status: BLOCKED", "### Status\n**BLOCKED**", etc.
         ],
         ReviewStatus.CHANGES_REQUESTED: [
-            # Explicit status declarations (highest priority)
-            r'(?i)status:\s*changes?\s+requested',
-            r'(?i)🔄\s*changes?\s+requested',
-            # Non-blocking issues
-            r'(?i)(?:non-blocking\s+)?issues?\s+(?:identified|found)',
-            r'(?i)requires?\s+(?:minor\s+)?(?:changes?|revisions?)',
-            r'(?i)please\s+address',
+            # ONLY explicit status declarations anchored to "status" keyword
+            r'(?i)status[\s:]+\*{0,2}changes?\s+(?:requested|needed)\*{0,2}',  # Matches "Status: CHANGES NEEDED", "### Status\n**CHANGES REQUESTED**", etc.
         ]
     }
 
@@ -170,42 +152,26 @@ class ReviewParser:
         """
         Extract review status from text
 
-        IMPORTANT: Checks patterns in a specific order to prioritize:
-        1. Explicit status declarations (e.g., "Status: APPROVED")
-        2. APPROVED indicators (including resolved issues)
-        3. BLOCKED indicators (only current blocking issues)
-        4. CHANGES_REQUESTED indicators
+        CRITICAL: ONLY matches explicit "Status: VALUE" declarations.
+        No fuzzy keyword matching to prevent false positives.
 
-        This ordering prevents false positives where text like "successfully
-        addressing all blocking issues" would incorrectly match BLOCKED.
+        If no explicit status declaration is found, returns UNKNOWN,
+        which triggers inference from findings count in parse_review().
         """
-        # First pass: Check for explicit status declarations in all categories
+        # Remove inline markdown formatting (bold, italic) to match patterns
+        # e.g., "**Status**: **BLOCKED**" becomes "Status: BLOCKED"
+        text_clean = re.sub(r'\*\*([^*]+)\*\*', r'\1', text)  # Remove **bold**
+        text_clean = re.sub(r'\*([^*]+)\*', r'\1', text_clean)      # Remove *italic*
+        text_clean = re.sub(r'_([^_]+)_', r'\1', text_clean)        # Remove _italic_
+
+        # Check for explicit status declarations ONLY
         for status in [ReviewStatus.APPROVED, ReviewStatus.BLOCKED, ReviewStatus.CHANGES_REQUESTED]:
-            patterns = self.STATUS_PATTERNS[status]
-            # First pattern is always the explicit "Status: <value>" declaration
-            if re.search(patterns[0], text):
-                logger.info(f"Matched explicit status declaration: {status.value}")
+            pattern = self.STATUS_PATTERNS[status][0]  # Only one pattern per status now
+            if re.search(pattern, text_clean):
+                logger.info(f"Matched explicit status declaration: {status.value} (pattern: {pattern})")
                 return status
 
-        # Second pass: Check APPROVED patterns (to catch resolved issues before BLOCKED)
-        for pattern in self.STATUS_PATTERNS[ReviewStatus.APPROVED]:
-            if re.search(pattern, text):
-                logger.info(f"Matched APPROVED pattern: {pattern}")
-                return ReviewStatus.APPROVED
-
-        # Third pass: Check BLOCKED patterns (only current issues now)
-        for pattern in self.STATUS_PATTERNS[ReviewStatus.BLOCKED]:
-            if re.search(pattern, text):
-                logger.info(f"Matched BLOCKED pattern: {pattern}")
-                return ReviewStatus.BLOCKED
-
-        # Fourth pass: Check CHANGES_REQUESTED patterns
-        for pattern in self.STATUS_PATTERNS[ReviewStatus.CHANGES_REQUESTED]:
-            if re.search(pattern, text):
-                logger.info(f"Matched CHANGES_REQUESTED pattern: {pattern}")
-                return ReviewStatus.CHANGES_REQUESTED
-
-        logger.warning("No status pattern matched, returning UNKNOWN")
+        logger.info("No explicit status declaration found, will infer from findings")
         return ReviewStatus.UNKNOWN
 
     def _extract_findings(self, text: str) -> List[ReviewFinding]:
@@ -213,18 +179,31 @@ class ReviewParser:
         findings = []
 
         # Look for structured findings sections
-        # Pattern 1: Markdown headings with "Issues", "Findings", "Problems", etc.
-        sections = re.split(r'(?m)^#{1,3}\s+(?:Review\s+)?(?:Issues?|Findings?|Problems?|Concerns?)', text)
+        # Pattern 1: Severity-based headers (our agent's format)
+        # e.g., "### Critical (Must Fix)", "#### High Priority (Should Fix)"
+        has_severity_sections = bool(re.search(
+            r'(?m)^\s*#{1,6}\s+(?:Critical|High\s+Priority|Medium\s+Priority|Low\s+Priority)',
+            text
+        ))
 
-        if len(sections) > 1:
-            # Parse findings from the issues section
-            findings_text = sections[1]
-            findings.extend(self._parse_findings_list(findings_text))
+        # Pattern 2: Generic issue sections
+        # e.g., "## Issues Found", "### Review Findings"
+        has_generic_sections = bool(re.search(
+            r'(?m)^\s*#{1,6}\s+(?:Review\s+)?(?:Issues?|Findings?|Problems?|Concerns?)',
+            text
+        ))
 
-        # Pattern 2: Look for bullet points with severity markers anywhere in text
-        findings.extend(self._parse_inline_findings(text))
+        # Pattern 3: Emoji-based structured sections (e.g., "🚫 One blocking issue:")
+        has_emoji_structure = bool(re.search(r'(?m)^\s*(?:🚫|⚠️|⚡)\s+.*?:\s*$.*?^\s*[•\-\*]\s+', text, re.DOTALL))
 
-        # Deduplicate findings by message
+        if has_severity_sections or has_generic_sections or has_emoji_structure:
+            # Parse as structured findings (handles severity sections natively)
+            findings.extend(self._parse_findings_list(text))
+        else:
+            # No structured section found, look for inline findings
+            findings.extend(self._parse_inline_findings(text))
+
+        # Deduplicate findings by message (in case of any overlap)
         unique_findings = []
         seen_messages = set()
         for finding in findings:
@@ -241,9 +220,27 @@ class ReviewParser:
         # Match bullet points
         lines = text.split('\n')
         current_finding = None
+        current_section_severity = None  # Track severity from section headers
 
         for line in lines:
             line = line.strip()
+
+            # Check if this is a section header:
+            # Case 1: Emoji-based header (e.g., "🚫 One blocking issue:" or "### 🚫 Blocking Issues")
+            emoji_header_match = re.match(r'^(?:#{1,6}\s*)?(?:🚫|⚠️|⚡|✅)\s+(.*)', line)
+            if emoji_header_match:
+                section_title = emoji_header_match.group(1).strip().rstrip(':')
+                current_section_severity = self._extract_severity(section_title)
+                continue
+
+            # Case 2: Markdown header with severity keywords (e.g., "### Blocking Issues")
+            markdown_header_match = re.match(r'^#{1,6}\s+(.+)', line)
+            if markdown_header_match:
+                section_title = markdown_header_match.group(1).strip()
+                severity = self._extract_severity(section_title)
+                if severity != 'medium':  # Has a severity keyword (blocking/high/low)
+                    current_section_severity = severity
+                    continue
 
             # Check if this is a new finding (starts with bullet point)
             if re.match(r'^[•\-\*]\s+', line):
@@ -254,8 +251,20 @@ class ReviewParser:
                 # Parse this finding
                 finding_text = re.sub(r'^[•\-\*]\s+', '', line)
 
-                # Extract severity
-                severity = self._extract_severity(finding_text)
+                # Extract severity from finding text
+                finding_severity = self._extract_severity(finding_text)
+
+                # Use section severity if it's higher priority than finding severity
+                # Priority order: blocking > high > medium > low
+                severity_priority = {'blocking': 4, 'high': 3, 'medium': 2, 'low': 1}
+                section_priority = severity_priority.get(current_section_severity, 0)
+                finding_priority = severity_priority.get(finding_severity, 0)
+
+                # Use the higher priority severity
+                if section_priority > finding_priority:
+                    severity = current_section_severity
+                else:
+                    severity = finding_severity
 
                 # Extract category (usually in bold or at start)
                 category_match = re.match(r'\*\*([^:*]+)\*\*:?\s*', finding_text)
@@ -273,9 +282,9 @@ class ReviewParser:
                     suggestion=None
                 )
 
-            # Check if this is a suggestion for the current finding
-            elif current_finding and re.match(r'^\s+(?:💡|Suggestion:|Recommended:)', line, re.IGNORECASE):
-                suggestion_text = re.sub(r'^\s+(?:💡|Suggestion:|Recommended:)\s*', '', line, flags=re.IGNORECASE)
+            # Check if this is a suggestion for the current finding (line already stripped)
+            elif current_finding and re.match(r'^(?:💡|Suggestion:|Recommended:)', line, re.IGNORECASE):
+                suggestion_text = re.sub(r'^(?:💡|Suggestion:|Recommended:)\s*', '', line, flags=re.IGNORECASE)
                 current_finding.suggestion = suggestion_text.strip()
 
         # Don't forget the last finding
@@ -288,6 +297,21 @@ class ReviewParser:
         """Parse findings from inline text (less structured)"""
         findings = []
 
+        # Patterns that indicate issues are RESOLVED, not current findings
+        resolved_patterns = [
+            r'(?i)\b(?:addressed|addressing|resolved|resolving|fixed|fixing)\b.*\b(?:blocking|critical|issues?)\b',
+            r'(?i)\b(?:blocking|critical|issues?)\b.*\b(?:addressed|resolved|fixed|have been|has been)\b',
+            r'(?i)\ball\s+(?:blocking|critical)?\s*issues?\s+(?:addressed|resolved|fixed)',
+        ]
+
+        # Negative indicators that suggest an actual problem/finding
+        negative_indicators = [
+            r'(?i)\b(?:missing|lacking|unclear|insufficient|ambiguous|incomplete|undefined|unspecified)\b',
+            r'(?i)\b(?:needs?|requires?|must|should)\s+(?:to\s+)?(?:fix|address|add|define|specify|clarify)\b',
+            r'(?i)\b(?:no|not|without|fails?\s+to)\b',
+            r'(?i)\b(?:gap|problem|issue|concern|risk)\b',
+        ]
+
         # Look for lines with severity markers
         lines = text.split('\n')
         for line in lines:
@@ -295,11 +319,19 @@ class ReviewParser:
             if not line.strip() or re.match(r'^#{1,6}\s', line):
                 continue
 
+            # Skip lines that talk about resolved issues
+            if any(re.search(pattern, line) for pattern in resolved_patterns):
+                continue
+
             # Check if line contains a severity marker
             severity = self._extract_severity(line)
 
-            # Only include if we found a severity marker (indicates a finding)
-            if severity in ['blocking', 'high']:  # Only extract high-priority findings
+            # Only include if we found a severity marker AND negative indicator
+            # (prevents false positives like "All critical requirements now specified")
+            if severity in ['blocking', 'high']:
+                has_negative = any(re.search(pattern, line) for pattern in negative_indicators)
+                if not has_negative:
+                    continue  # Skip positive statements with severity keywords
                 # Try to extract category and message
                 # Look for patterns like "**Category**: message" or "emoji Category: message"
                 category_patterns = [
@@ -342,28 +374,30 @@ class ReviewParser:
     def _extract_score(self, text: str) -> float:
         """Extract quality score if present"""
         # Look for patterns like "Score: 85%", "Quality: 0.85", "8.5/10"
+        # Check /10 pattern first as it's more specific
         patterns = [
-            r'(?i)(?:score|quality|rating):\s*(\d+(?:\.\d+)?)%',  # "Score: 85%"
-            r'(?i)(?:score|quality|rating):\s*(\d+(?:\.\d+)?)',   # "Score: 0.85"
-            r'(\d+(?:\.\d+)?)\s*/\s*10',                         # "8.5/10"
+            (r'(?i)(?:score|quality|rating):\s*(\d+(?:\.\d+)?)\s*/\s*10', 10),  # "Rating: 8.5/10" -> divide by 10
+            (r'(?i)(?:score|quality|rating):\s*(\d+(?:\.\d+)?)%', 100),  # "Score: 85%" -> divide by 100
+            (r'(?i)(?:score|quality|rating):\s*(\d+(?:\.\d+)?)', 100),   # "Score: 0.85" -> divide by 100 if > 1
+            (r'(\d+(?:\.\d+)?)\s*/\s*10', 10),                           # "8.5/10" -> divide by 10
         ]
 
-        for pattern in patterns:
+        for pattern, divisor in patterns:
             match = re.search(pattern, text)
             if match:
                 value = float(match.group(1))
                 # Normalize to 0-1 range
                 if value > 1:
-                    value = value / 100
+                    value = value / divisor
                 return value
 
         return 0.0
 
     def _extract_summary(self, text: str) -> str:
         """Extract review summary"""
-        # Look for summary section
+        # Look for summary section (allow leading whitespace for indented markdown)
         summary_match = re.search(
-            r'(?m)^#{1,3}\s+(?:Summary|Overall|Conclusion)\s*\n\s*(.+?)(?=\n#{1,3}\s|\Z)',
+            r'(?m)^\s*#{1,3}\s+(?:Summary|Overall|Conclusion)\s*\n\s*(.+?)(?=\n\s*#{1,3}\s|\Z)',
             text,
             re.DOTALL
         )

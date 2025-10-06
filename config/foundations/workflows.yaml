@@ -2,27 +2,27 @@
 # These templates define how GitHub project boards should be structured
 
 workflow_templates:
-  idea_development_workflow:
-    name: "Idea Development Pipeline"
-    description: "Research, analysis, and requirements validation workflow"
-    pipeline_mapping: "idea_development"
+  planning_design_workflow:
+    name: "Planning & Design Workflow"
+    description: "Pre-SDLC planning, design, and work breakdown workflow"
+    pipeline_mapping: "planning_design"
     columns:
       - name: "Backlog"
         stage_mapping: null
         agent: null
-        description: "New ideas and research requests"
+        description: "Complex features and initiatives requiring full planning"
         automation_rules:
           - trigger: "item_created"
             action: "assign_label"
             parameters:
-              labels: ["pipeline:idea-dev"]
+              labels: ["pipeline:planning-design"]
 
       - name: "Research"
         type: "conversational"
         stage_mapping: "research"
         agent: "idea_researcher"
-        feedback_timeout_seconds: 3600  # 1 hour - wait for human feedback
-        description: "Idea research and market analysis"
+        feedback_timeout_seconds: 3600
+        description: "Market research and idea validation"
         automation_rules:
           - trigger: "item_moved_to_column"
             action: "assign_label"
@@ -33,177 +33,19 @@ workflow_templates:
             parameters:
               stage: "research"
 
-      - name: "Analysis"
+      - name: "Requirements"
         type: "conversational"
-        stage_mapping: "analysis"
+        stage_mapping: "requirements"
         agent: "business_analyst"
-        feedback_timeout_seconds: 3600  # 1 hour - wait for human feedback
+        feedback_timeout_seconds: 3600
         description: "Business requirements analysis"
         automation_rules:
           - trigger: "item_moved_to_column"
             action: "assign_label"
             parameters:
-              labels: ["stage:analysis"]
+              labels: ["stage:requirements"]
           - trigger: "item_moved_to_column"
             action: "start_conversational_loop"
-            parameters:
-              stage: "analysis"
-
-      - name: "Review"
-        type: "review"
-        stage_mapping: "review"
-        agent: "requirements_reviewer"
-        maker_agent: "business_analyst"
-        max_iterations: 3
-        auto_advance_on_approval: true
-        escalate_on_blocked: true
-        description: "Requirements validation and review"
-        automation_rules:
-          - trigger: "item_moved_to_column"
-            action: "assign_label"
-            parameters:
-              labels: ["stage:review"]
-          - trigger: "item_moved_to_column"
-            action: "start_review_cycle"
-            parameters:
-              stage: "review"
-
-      - name: "Done"
-        stage_mapping: null
-        agent: null
-        description: "Validated requirements ready for development"
-        automation_rules:
-          - trigger: "item_moved_to_column"
-            action: "assign_label"
-            parameters:
-              labels: ["status:completed"]
-
-  dev_workflow:
-    name: "Development Pipeline"
-    description: "Streamlined development workflow from requirements to code"
-    pipeline_mapping: "dev_pipeline"
-    columns:
-      - name: "Backlog"
-        stage_mapping: null
-        agent: null
-        description: "Features ready for development"
-        automation_rules:
-          - trigger: "item_created"
-            action: "assign_label"
-            parameters:
-              labels: ["pipeline:dev"]
-
-      - name: "Requirements"
-        stage_mapping: "requirements"
-        agent: "business_analyst"
-        description: "Business requirements analysis"
-        automation_rules:
-          - trigger: "item_moved_to_column"
-            action: "assign_label"
-            parameters:
-              labels: ["stage:requirements"]
-          - trigger: "item_moved_to_column"
-            action: "start_pipeline_stage"
-            parameters:
-              stage: "requirements"
-
-      - name: "Design"
-        stage_mapping: "design"
-        agent: "software_architect"
-        description: "Software architecture and design"
-        automation_rules:
-          - trigger: "item_moved_to_column"
-            action: "assign_label"
-            parameters:
-              labels: ["stage:design"]
-          - trigger: "item_moved_to_column"
-            action: "start_pipeline_stage"
-            parameters:
-              stage: "design"
-
-      - name: "Implementation"
-        stage_mapping: "implementation"
-        agent: "senior_software_engineer"
-        description: "Code development and implementation"
-        automation_rules:
-          - trigger: "item_moved_to_column"
-            action: "assign_label"
-            parameters:
-              labels: ["stage:implementation"]
-          - trigger: "item_moved_to_column"
-            action: "start_pipeline_stage"
-            parameters:
-              stage: "implementation"
-
-      - name: "Code Review"
-        type: "review"
-        stage_mapping: "implementation_review"
-        agent: "code_reviewer"
-        maker_agent: "senior_software_engineer"
-        max_iterations: 3
-        auto_advance_on_approval: true
-        escalate_on_blocked: true
-        description: "Code quality review and validation"
-        automation_rules:
-          - trigger: "item_moved_to_column"
-            action: "assign_label"
-            parameters:
-              labels: ["stage:code-review"]
-          - trigger: "item_moved_to_column"
-            action: "start_review_cycle"
-            parameters:
-              stage: "implementation"
-
-      - name: "Done"
-        stage_mapping: null
-        agent: null
-        description: "Completed features ready for deployment"
-        automation_rules:
-          - trigger: "item_moved_to_column"
-            action: "assign_label"
-            parameters:
-              labels: ["status:completed"]
-
-  full_sdlc_workflow:
-    name: "Full SDLC Pipeline"
-    description: "Complete software development lifecycle with maker-checker patterns"
-    pipeline_mapping: "full_sdlc"
-    columns:
-      - name: "Backlog"
-        stage_mapping: null
-        agent: null
-        description: "New initiatives and complex features"
-        automation_rules:
-          - trigger: "item_created"
-            action: "assign_label"
-            parameters:
-              labels: ["pipeline:full-sdlc"]
-
-      - name: "Research"
-        stage_mapping: "research"
-        agent: "idea_researcher"
-        description: "Idea research and market analysis"
-        automation_rules:
-          - trigger: "item_moved_to_column"
-            action: "assign_label"
-            parameters:
-              labels: ["stage:research"]
-          - trigger: "item_moved_to_column"
-            action: "start_pipeline_stage"
-            parameters:
-              stage: "research"
-
-      - name: "Requirements"
-        stage_mapping: "requirements"
-        agent: "business_analyst"
-        description: "Business requirements analysis"
-        automation_rules:
-          - trigger: "item_moved_to_column"
-            action: "assign_label"
-            parameters:
-              labels: ["stage:requirements"]
-          - trigger: "item_moved_to_column"
-            action: "start_pipeline_stage"
             parameters:
               stage: "requirements"
 
@@ -227,16 +69,18 @@ workflow_templates:
               stage: "requirements"
 
       - name: "Design"
+        type: "conversational"
         stage_mapping: "design"
         agent: "software_architect"
-        description: "System design and architecture"
+        feedback_timeout_seconds: 3600
+        description: "System architecture and design"
         automation_rules:
           - trigger: "item_moved_to_column"
             action: "assign_label"
             parameters:
               labels: ["stage:design"]
           - trigger: "item_moved_to_column"
-            action: "start_pipeline_stage"
+            action: "start_conversational_loop"
             parameters:
               stage: "design"
 
@@ -260,8 +104,10 @@ workflow_templates:
               stage: "design"
 
       - name: "Test Planning"
+        type: "conversational"
         stage_mapping: "test_planning"
         agent: "test_planner"
+        feedback_timeout_seconds: 3600
         description: "Test strategy and planning"
         automation_rules:
           - trigger: "item_moved_to_column"
@@ -269,7 +115,7 @@ workflow_templates:
             parameters:
               labels: ["stage:test-planning"]
           - trigger: "item_moved_to_column"
-            action: "start_pipeline_stage"
+            action: "start_conversational_loop"
             parameters:
               stage: "test_planning"
 
@@ -292,57 +138,40 @@ workflow_templates:
             parameters:
               stage: "test_planning"
 
-      - name: "Implementation"
-        stage_mapping: "implementation"
-        agent: "senior_software_engineer"
-        description: "Software development and coding"
+      - name: "Work Breakdown"
+        type: "conversational"
+        stage_mapping: "work_breakdown"
+        agent: "work_breakdown_agent"
+        feedback_timeout_seconds: 3600
+        description: "Break epic into phase-based sub-issues"
         automation_rules:
           - trigger: "item_moved_to_column"
             action: "assign_label"
             parameters:
-              labels: ["stage:implementation"]
+              labels: ["stage:work-breakdown"]
           - trigger: "item_moved_to_column"
-            action: "start_pipeline_stage"
+            action: "start_conversational_loop"
             parameters:
-              stage: "implementation"
+              stage: "work_breakdown"
 
-      - name: "Code Review"
-        type: "review"
-        stage_mapping: "implementation_review"
-        agent: "code_reviewer"
-        maker_agent: "senior_software_engineer"
-        max_iterations: 3
-        auto_advance_on_approval: true
-        escalate_on_blocked: true
-        description: "Code quality review"
+      - name: "In Development"
+        stage_mapping: null
+        agent: null
+        description: "Tracking epic progress via sub-issue tasklist"
         automation_rules:
           - trigger: "item_moved_to_column"
             action: "assign_label"
             parameters:
-              labels: ["stage:code-review"]
-          - trigger: "item_moved_to_column"
-            action: "start_review_cycle"
+              labels: ["status:in-development"]
+          - trigger: "all_subtasks_completed"
+            action: "move_to_column"
             parameters:
-              stage: "implementation"
-
-      - name: "QA Testing"
-        stage_mapping: "qa_testing"
-        agent: "senior_qa_engineer"
-        description: "End-to-end testing and validation"
-        automation_rules:
-          - trigger: "item_moved_to_column"
-            action: "assign_label"
-            parameters:
-              labels: ["stage:qa-testing"]
-          - trigger: "item_moved_to_column"
-            action: "start_pipeline_stage"
-            parameters:
-              stage: "qa_testing"
+              target_column: "Documentation"
 
       - name: "Documentation"
         stage_mapping: "documentation"
         agent: "technical_writer"
-        description: "Technical documentation creation"
+        description: "Generate comprehensive epic documentation"
         automation_rules:
           - trigger: "item_moved_to_column"
             action: "assign_label"
@@ -375,7 +204,155 @@ workflow_templates:
       - name: "Done"
         stage_mapping: null
         agent: null
-        description: "Completed work ready for production"
+        description: "Fully completed epic with documentation"
+        automation_rules:
+          - trigger: "item_moved_to_column"
+            action: "assign_label"
+            parameters:
+              labels: ["status:completed"]
+
+  sdlc_execution_workflow:
+    name: "SDLC Execution Workflow"
+    description: "Implementation-focused workflow for sub-issues"
+    pipeline_mapping: "sdlc_execution"
+    columns:
+      - name: "Backlog"
+        stage_mapping: null
+        agent: null
+        description: "Phase-specific implementation tasks"
+        automation_rules:
+          - trigger: "item_created"
+            action: "assign_label"
+            parameters:
+              labels: ["pipeline:sdlc-execution"]
+
+      - name: "Development"
+        stage_mapping: "implementation"
+        agent: "senior_software_engineer"
+        auto_advance_on_approval: true
+        description: "Code implementation"
+        automation_rules:
+          - trigger: "item_moved_to_column"
+            action: "assign_label"
+            parameters:
+              labels: ["stage:implementation"]
+          - trigger: "item_moved_to_column"
+            action: "start_pipeline_stage"
+            parameters:
+              stage: "implementation"
+
+      - name: "Code Review"
+        type: "review"
+        stage_mapping: "implementation_review"
+        agent: "code_reviewer"
+        maker_agent: "senior_software_engineer"
+        max_iterations: 3
+        auto_advance_on_approval: true
+        escalate_on_blocked: true
+        description: "Code quality validation"
+        automation_rules:
+          - trigger: "item_moved_to_column"
+            action: "assign_label"
+            parameters:
+              labels: ["stage:code-review"]
+          - trigger: "item_moved_to_column"
+            action: "start_review_cycle"
+            parameters:
+              stage: "implementation"
+
+      - name: "Testing"
+        stage_mapping: "qa_testing"
+        agent: "senior_qa_engineer"
+        auto_advance_on_approval: true
+        description: "QA test creation"
+        automation_rules:
+          - trigger: "item_moved_to_column"
+            action: "assign_label"
+            parameters:
+              labels: ["stage:qa-testing"]
+
+      - name: "QA Review"
+        type: "review"
+        stage_mapping: "qa_testing_review"
+        agent: "qa_reviewer"
+        maker_agent: "senior_qa_engineer"
+        max_iterations: 3
+        auto_advance_on_approval: true
+        escalate_on_blocked: true
+        description: "QA test review"
+        automation_rules:
+          - trigger: "item_moved_to_column"
+            action: "assign_label"
+            parameters:
+              labels: ["stage:qa-review"]
+          - trigger: "item_moved_to_column"
+            action: "start_review_cycle"
+            parameters:
+              stage: "qa_testing"
+
+      - name: "Staged"
+        type: "conversational"
+        stage_mapping: "staging"
+        agent: "senior_software_engineer"
+        feedback_timeout_seconds: 7200
+        description: "Staged for production - human review and feedback"
+        automation_rules:
+          - trigger: "item_moved_to_column"
+            action: "assign_label"
+            parameters:
+              labels: ["status:staged"]
+          - trigger: "item_moved_to_column"
+            action: "start_conversational_loop"
+            parameters:
+              stage: "staging"
+
+      - name: "Done"
+        stage_mapping: null
+        agent: null
+        description: "Completed implementation task"
+        automation_rules:
+          - trigger: "item_moved_to_column"
+            action: "assign_label"
+            parameters:
+              labels: ["status:completed"]
+
+  # Simple environment support workflow
+  environment_support_workflow:
+    name: "Environment Support Workflow"
+    description: "Environment troubleshooting and configuration workflow"
+    pipeline_mapping: "environment_support"
+    columns:
+      - name: "Backlog"
+        stage_mapping: null
+        agent: null
+        description: "Environment issues awaiting triage"
+        automation_rules:
+          - trigger: "item_moved_to_column"
+            action: "assign_label"
+            parameters:
+              labels: ["status:backlog"]
+
+      - name: "In Progress"
+        type: "conversational"
+        stage_mapping: "environment_setup"
+        agent: "dev_environment_setup"
+        auto_advance_on_approval: false
+        feedback_timeout_seconds: 7200
+        description: "Environment setup in progress - conversational mode enabled"
+        automation_rules:
+          - trigger: "item_moved_to_column"
+            action: "assign_label"
+            parameters:
+              labels: ["stage:environment-setup"]
+          - trigger: "item_moved_to_column"
+            action: "execute_stage"
+            parameters:
+              stage: "environment_setup"
+
+      - name: "Done"
+        stage_mapping: null
+        agent: null
+        description: "Environment issue resolved"
         automation_rules:
           - trigger: "item_moved_to_column"
             action: "assign_label"
@@ -389,33 +366,45 @@ github_project_settings:
 
 # Label definitions for pipeline routing
 pipeline_labels:
-  idea_development:
-    - name: "pipeline:idea-dev"
-      color: "0075ca"
-      description: "Idea development pipeline workflow"
-  dev_pipeline:
-    - name: "pipeline:dev"
+  planning_design:
+    - name: "pipeline:planning-design"
+      color: "5319e7"
+      description: "Planning & Design Workflow"
+  sdlc_execution:
+    - name: "pipeline:sdlc-execution"
       color: "0e8a16"
-      description: "Development pipeline workflow"
-  full_sdlc:
-    - name: "pipeline:full-sdlc"
-      color: "d73a49"
-      description: "Full SDLC pipeline workflow"
+      description: "SDLC Execution Workflow"
+  environment_support:
+    - name: "pipeline:environment-support"
+      color: "d73a4a"
+      description: "Environment Support Workflow"
 
 # Common stage labels
 stage_labels:
   - name: "stage:research"
     color: "cfd3d7"
     description: "Research stage"
-  - name: "stage:analysis"
-    color: "cfd3d7"
-    description: "Analysis stage"
   - name: "stage:requirements"
     color: "cfd3d7"
     description: "Requirements stage"
+  - name: "stage:requirements-review"
+    color: "cfd3d7"
+    description: "Requirements review stage"
   - name: "stage:design"
     color: "cfd3d7"
     description: "Design stage"
+  - name: "stage:design-review"
+    color: "cfd3d7"
+    description: "Design review stage"
+  - name: "stage:test-planning"
+    color: "cfd3d7"
+    description: "Test planning stage"
+  - name: "stage:test-plan-review"
+    color: "cfd3d7"
+    description: "Test plan review stage"
+  - name: "stage:work-breakdown"
+    color: "cfd3d7"
+    description: "Work breakdown stage"
   - name: "stage:implementation"
     color: "cfd3d7"
     description: "Implementation stage"
@@ -425,6 +414,24 @@ stage_labels:
   - name: "stage:qa-testing"
     color: "cfd3d7"
     description: "QA testing stage"
+  - name: "stage:staging"
+    color: "cfd3d7"
+    description: "Staging stage"
   - name: "stage:documentation"
     color: "cfd3d7"
     description: "Documentation stage"
+  - name: "stage:documentation-review"
+    color: "cfd3d7"
+    description: "Documentation review stage"
+  - name: "stage:environment-setup"
+    color: "cfd3d7"
+    description: "Environment setup stage"
+  - name: "status:in-development"
+    color: "fbca04"
+    description: "Epic in development - tracking sub-issues"
+  - name: "status:staged"
+    color: "2ea44f"
+    description: "Staged for production - awaiting human review"
+  - name: "status:completed"
+    color: "6f42c1"
+    description: "Completed work"

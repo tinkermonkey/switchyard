@@ -9,27 +9,28 @@ export default {
   theme: {
     extend: {
       colors: {
-        // GitHub dark theme colors from the original UI
+        // GitHub theme colors using CSS custom properties
         'gh-canvas': {
-          DEFAULT: '#0d1117',
-          subtle: '#161b22',
+          DEFAULT: 'var(--gh-canvas)',
+          subtle: 'var(--gh-canvas-subtle)',
         },
         'gh-border': {
-          DEFAULT: '#30363d',
-          muted: '#21262d',
+          DEFAULT: 'var(--gh-border)',
+          muted: 'var(--gh-border-muted)',
         },
         'gh-fg': {
-          DEFAULT: '#c9d1d9',
-          muted: '#8b949e',
-          subtle: '#6e7681',
+          DEFAULT: 'var(--gh-fg)',
+          muted: 'var(--gh-fg-muted)',
+          subtle: 'var(--gh-fg-subtle)',
         },
         'gh-accent': {
-          primary: '#58a6ff',
-          emphasis: '#1f6feb',
+          primary: 'var(--gh-accent-primary)',
+          emphasis: 'var(--gh-accent-emphasis)',
         },
-        'gh-success': '#238636',
-        'gh-danger': '#da3633',
-        'gh-warning': '#9e6a03',
+        'gh-success': 'var(--gh-success)',
+        'gh-danger': 'var(--gh-danger)',
+        'gh-warning': 'var(--gh-warning)',
+        'gh-warning-subtle': 'var(--gh-warning-subtle)',
         'gh-severe': '#da7633',
         'gh-done': '#8957e5',
       },

@@ -46,12 +46,12 @@ class PipelineStage:
     default_agent: str
     timeout: int
     retries: int
-    quality_gates: Dict[str, float]
     review_required: bool
     reviewer_agent: Optional[str] = None
     reviewer_timeout: Optional[int] = None
     reviewer_retries: Optional[int] = None
     escalation: Optional[Dict[str, Any]] = None
+    inputs_from: Optional[List[str]] = None  # List of agent names to gather outputs from
 
 
 @dataclass
@@ -218,7 +218,9 @@ class ConfigManager:
                 working_directory=merged_config.get('working_directory', '/workspace/{project_name}'),
                 output_format=merged_config.get('output_format', 'structured_json'),
                 makes_code_changes=config.get('makes_code_changes', False),
-                requires_dev_container=config.get('requires_dev_container', False)
+                requires_dev_container=config.get('requires_dev_container', False),
+                requires_docker=config.get('requires_docker', True),  # Default True for security
+                filesystem_write_allowed=config.get('filesystem_write_allowed', True)
             )
 
         return agents
@@ -240,12 +242,12 @@ class ConfigManager:
                     default_agent=stage_data['default_agent'],
                     timeout=stage_data['timeout'],
                     retries=stage_data['retries'],
-                    quality_gates=stage_data['quality_gates'],
                     review_required=stage_data.get('review_required', False),
                     reviewer_agent=stage_data.get('reviewer_agent'),
                     reviewer_timeout=stage_data.get('reviewer_timeout'),
                     reviewer_retries=stage_data.get('reviewer_retries'),
-                    escalation=stage_data.get('escalation')
+                    escalation=stage_data.get('escalation'),
+                    inputs_from=stage_data.get('inputs_from')
                 ))
 
             templates[name] = PipelineTemplate(
@@ -416,7 +418,9 @@ class ConfigManager:
             working_directory=base_agent.working_directory.replace('{project_name}', project_name),
             output_format=base_agent.output_format,
             makes_code_changes=base_agent.makes_code_changes,
-            requires_dev_container=base_agent.requires_dev_container
+            requires_dev_container=base_agent.requires_dev_container,
+            requires_docker=base_agent.requires_docker,
+            filesystem_write_allowed=base_agent.filesystem_write_allowed
         )
 
     def get_project_pipelines(self, project_name: str) -> List[ProjectPipeline]:

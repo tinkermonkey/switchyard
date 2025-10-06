@@ -10,14 +10,29 @@ export default defineConfig({
   ],
   server: {
     port: 3000,
+    host: '0.0.0.0',
     proxy: {
       '/socket.io': {
-        target: 'http://localhost:5001',
+        target: 'http://observability-server:5001',
         ws: true,
+        changeOrigin: true,
       },
-      '/history': 'http://localhost:5001',
-      '/claude-logs-history': 'http://localhost:5001',
-      '/current-pipeline': 'http://localhost:5001',
+      '/history': {
+        target: 'http://observability-server:5001',
+        changeOrigin: true,
+      },
+      '/claude-logs-history': {
+        target: 'http://observability-server:5001',
+        changeOrigin: true,
+      },
+      '/current-pipeline': {
+        target: 'http://observability-server:5001',
+        changeOrigin: true,
+      },
+      '/api': {
+        target: 'http://observability-server:5001',
+        changeOrigin: true,
+      },
     }
   }
 })

@@ -2,6 +2,7 @@ import subprocess
 import json
 import logging
 import os
+import re
 from typing import Dict, Any, Optional, Callable
 from pathlib import Path
 
@@ -14,6 +15,30 @@ class DockerAgentRunner:
     def __init__(self, network_name: str = "clauditoreum_orchestrator-net"):
         # Docker Compose prefixes network names with project directory name
         self.network_name = network_name
+
+    @staticmethod
+    def _sanitize_container_name(name: str) -> str:
+        """
+        Sanitize container name to only contain valid Docker container name characters.
+
+        Docker allows: [a-zA-Z0-9][a-zA-Z0-9_.-]
+
+        Args:
+            name: Raw container name that may contain invalid characters
+
+        Returns:
+            Sanitized container name with invalid characters replaced by dashes
+        """
+        # Replace any character that's not alphanumeric, underscore, period, or dash
+        sanitized = re.sub(r'[^a-zA-Z0-9_.-]', '-', name)
+
+        # Ensure it starts with alphanumeric (not dash/period)
+        sanitized = re.sub(r'^[^a-zA-Z0-9]+', '', sanitized)
+
+        # Remove any consecutive dashes
+        sanitized = re.sub(r'-+', '-', sanitized)
+
+        return sanitized
 
     async def run_agent_in_container(
         self,
@@ -48,7 +73,8 @@ class DockerAgentRunner:
             mcp_config = self._prepare_mcp_config(mcp_servers, project_dir)
 
         # Build docker run command
-        container_name = f"claude-agent-{project}-{task_id}"
+        raw_container_name = f"claude-agent-{project}-{task_id}"
+        container_name = self._sanitize_container_name(raw_container_name)
 
         # Determine if we'll need stdin (for large prompts)
         use_stdin = len(prompt) > 50000
@@ -280,6 +306,9 @@ class DockerAgentRunner:
             prompt_file.close()
             logger.info(f"Prompt is large ({len(prompt)} chars), using mounted file: {prompt_file.name}")
 
+        # Check for existing session to resume
+        existing_session_id = context.get('claude_session_id')
+
         claude_cmd = [
             'claude',
             '--print',
@@ -288,10 +317,21 @@ class DockerAgentRunner:
             '--model', claude_model,
         ]
 
-        # Only add --dangerously-skip-permissions if not running as root
-        # dev_environment_setup runs as root for Docker access, so skip this flag
-        if agent != 'dev_environment_setup':
-            claude_cmd.append('--dangerously-skip-permissions')
+        # Choose permission mode based on whether running as root
+        # bypassPermissions is blocked when running as root, so use acceptEdits instead
+        if agent == 'dev_environment_setup':
+            # dev_environment_setup runs as root (needs Docker socket), use acceptEdits
+            claude_cmd.extend(['--permission-mode', 'acceptEdits'])
+            logger.info("Using --permission-mode acceptEdits (running as root)")
+        else:
+            # Other agents run as non-root, can use bypassPermissions
+            claude_cmd.extend(['--permission-mode', 'bypassPermissions'])
+            logger.info("Using --permission-mode bypassPermissions")
+
+        # Add --resume flag if continuing an existing session
+        if existing_session_id:
+            claude_cmd.extend(['--resume', existing_session_id])
+            logger.info(f"Resuming Claude Code session: {existing_session_id}")
 
         if use_file_mount:
             # Large prompt - will be sent via stdin
@@ -305,6 +345,7 @@ class DockerAgentRunner:
         full_cmd = docker_cmd + claude_cmd
 
         logger.info(f"Executing: docker run ... claude ...")
+        logger.info(f"Full command (sanitized): {' '.join(full_cmd[:10])} ... {' '.join(full_cmd[-5:])}")
 
         obs = context.get('observability')
         agent = context.get('agent', 'unknown')
@@ -351,6 +392,7 @@ class DockerAgentRunner:
             stderr_parts = []
             input_tokens = 0
             output_tokens = 0
+            session_id = None  # Track session ID for continuity
 
             # Read both stdout and stderr using threads to avoid deadlock
             import threading
@@ -398,6 +440,11 @@ class DockerAgentRunner:
                     event = json.loads(line)
                     event_type = event.get('type', 'unknown')
 
+                    # Capture session_id for session continuity
+                    if 'session_id' in event and not session_id:
+                        session_id = event['session_id']
+                        logger.info(f"Captured Claude Code session_id: {session_id}")
+
                     # Stream to callback if provided
                     if stream_callback:
                         stream_callback(event)
@@ -438,7 +485,13 @@ class DockerAgentRunner:
 
             if process.returncode == 0:
                 result_text = ''.join(result_parts)
-                logger.info(f"Agent completed successfully in container, result length: {len(result_text)}")
+                logger.info(f"Agent completed successfully in container, result length: {len(result_text)}, session_id: {session_id}")
+
+                # Store session_id in context for session continuity
+                if session_id:
+                    context['claude_session_id'] = session_id
+
+                # Return just the result text (callers expect string, not dict)
                 return result_text
             else:
                 stderr_text = ''.join(stderr_parts) if stderr_parts else "No error output captured"

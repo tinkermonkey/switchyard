@@ -1,0 +1,530 @@
+"""
+Integration tests for complete review cycle flow
+
+Tests the full review cycle from initialization through approval,
+including state transitions, agent invocations, and GitHub interactions.
+
+CRITICAL: This tests the end-to-end workflow that processes requirements
+through the maker-checker pattern.
+"""
+
+import pytest
+import os
+import tempfile
+from datetime import datetime
+from services.review_cycle import ReviewCycleExecutor, ReviewCycleState
+from services.review_parser import ReviewStatus
+from tests.utils.assertions import assert_state_transition
+
+
+@pytest.fixture
+def temp_state_dir():
+    """Create temporary directory for state files"""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        yield tmpdir
+
+
+@pytest.fixture
+def executor_with_mocks(temp_state_dir, monkeypatch, mock_github_app, mock_agent_executor):
+    """Create executor with mocked dependencies"""
+    executor = ReviewCycleExecutor()
+
+    # Mock GitHub
+    from services import github_app
+    monkeypatch.setattr(github_app, 'github_app', mock_github_app)
+
+    # Mock agent executor
+    from services import agent_executor
+    monkeypatch.setattr(agent_executor, 'get_agent_executor', lambda: mock_agent_executor)
+
+    # Mock state file path to use temp directory
+    def mock_get_state_file_path(project_name: str) -> str:
+        state_dir = os.path.join(temp_state_dir, 'projects', project_name, 'review_cycles')
+        os.makedirs(state_dir, exist_ok=True)
+        return os.path.join(state_dir, 'active_cycles.yaml')
+
+    monkeypatch.setattr(executor, '_get_state_file_path', mock_get_state_file_path)
+
+    return executor
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+class TestReviewCycleHappyPath:
+    """Test successful review cycle with approval"""
+
+    async def test_complete_cycle_first_review_approved(
+        self,
+        executor_with_mocks,
+        mock_github_app,
+        mock_agent_executor,
+        sample_ba_output,
+        sample_reviewer_approval
+    ):
+        """
+        Test: Complete review cycle - reviewer approves on first iteration
+
+        Flow:
+        1. Start cycle (trigger reviewer)
+        2. Reviewer reviews initial requirements → APPROVED
+        3. Cycle completes successfully
+        """
+        # Setup mocks
+        mock_agent_executor.set_response('requirements_reviewer', sample_reviewer_approval)
+
+        # Create discussion with initial BA output
+        mock_github_app.create_discussion(
+            'D_test123',
+            title='Feature requirements',
+            body='Initial requirements'
+        )
+        mock_github_app.add_discussion_comment(
+            'D_test123',
+            f"{sample_ba_output}\n\n_Processed by the business_analyst agent_"
+        )
+
+        # Create cycle state
+        cycle_state = ReviewCycleState(
+            issue_number=96,
+            repository='context-studio',
+            maker_agent='business_analyst',
+            reviewer_agent='requirements_reviewer',
+            max_iterations=3,
+            project_name='context-studio',
+            board_name='idea-development',
+            workspace_type='discussions',
+            discussion_id='D_test123'
+        )
+        cycle_state.current_iteration = 1
+        cycle_state.status = 'reviewer_working'
+
+        # Mock column config
+        class MockColumn:
+            name = 'Requirements Review'
+            agent = 'requirements_reviewer'
+            maker_agent = 'business_analyst'
+            escalate_on_blocked = True
+            max_review_iterations = 3
+
+        # Execute review cycle iteration
+        status, next_column = await executor_with_mocks._execute_review_iteration(
+            cycle_state,
+            MockColumn(),
+            'tinkermonkey'
+        )
+
+        # Assertions
+        assert status == ReviewStatus.APPROVED
+        assert cycle_state.status == 'completed'
+        assert len(cycle_state.review_outputs) == 1
+        assert 'approved' in cycle_state.review_outputs[0]['output'].lower()
+
+        # Verify reviewer was invoked
+        assert mock_agent_executor.call_count('requirements_reviewer') == 1
+
+    async def test_complete_cycle_with_revision(
+        self,
+        executor_with_mocks,
+        mock_github_app,
+        mock_agent_executor,
+        sample_ba_output,
+        sample_reviewer_feedback,
+        sample_ba_revision,
+        sample_reviewer_approval
+    ):
+        """
+        Test: Complete review cycle - revision then approval
+
+        Flow:
+        1. Start cycle (trigger reviewer)
+        2. Reviewer reviews → CHANGES_REQUESTED
+        3. Maker revises based on feedback
+        4. Reviewer reviews revision → APPROVED
+        5. Cycle completes successfully
+        """
+        # Setup mock responses in sequence
+        mock_agent_executor.set_responses('requirements_reviewer', [
+            sample_reviewer_feedback,  # First review: changes requested
+            sample_reviewer_approval   # Second review: approved
+        ])
+        mock_agent_executor.set_response('business_analyst', sample_ba_revision)
+
+        # Create discussion with initial BA output
+        mock_github_app.create_discussion(
+            'D_test123',
+            title='Feature requirements',
+            body='Initial requirements'
+        )
+        mock_github_app.add_discussion_comment(
+            'D_test123',
+            f"{sample_ba_output}\n\n_Processed by the business_analyst agent_"
+        )
+
+        # Create cycle state
+        cycle_state = ReviewCycleState(
+            issue_number=96,
+            repository='context-studio',
+            maker_agent='business_analyst',
+            reviewer_agent='requirements_reviewer',
+            max_iterations=3,
+            project_name='context-studio',
+            board_name='idea-development',
+            workspace_type='discussions',
+            discussion_id='D_test123'
+        )
+
+        class MockColumn:
+            name = 'Requirements Review'
+            agent = 'requirements_reviewer'
+            maker_agent = 'business_analyst'
+            escalate_on_blocked = True
+            max_review_iterations = 3
+
+        # Iteration 1: Reviewer requests changes
+        cycle_state.current_iteration = 1
+        cycle_state.status = 'reviewer_working'
+        status1, _ = await executor_with_mocks._execute_review_iteration(
+            cycle_state,
+            MockColumn(),
+            'tinkermonkey'
+        )
+
+        assert status1 == ReviewStatus.CHANGES_REQUESTED
+        assert cycle_state.status == 'maker_working'
+        assert len(cycle_state.review_outputs) == 1
+
+        # Iteration 2: Maker revises
+        # (This would normally be triggered by moving card, simulating state)
+        cycle_state.status = 'reviewer_working'
+        cycle_state.current_iteration = 2
+        cycle_state.maker_outputs.append({
+            'iteration': 2,
+            'output': sample_ba_revision,
+            'timestamp': datetime.now().isoformat()
+        })
+
+        # Iteration 2: Reviewer approves
+        status2, _ = await executor_with_mocks._execute_review_iteration(
+            cycle_state,
+            MockColumn(),
+            'tinkermonkey'
+        )
+
+        assert status2 == ReviewStatus.APPROVED
+        assert cycle_state.status == 'completed'
+        assert len(cycle_state.review_outputs) == 2
+        assert len(cycle_state.maker_outputs) == 1
+
+        # Verify all agents were invoked correctly
+        assert mock_agent_executor.call_count('requirements_reviewer') == 2
+        assert mock_agent_executor.call_count('business_analyst') == 0  # Not called in this test flow
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+class TestReviewCycleWithBlocking:
+    """Test review cycle with blocking issues and escalation"""
+
+    async def test_escalation_on_second_blocking_review(
+        self,
+        executor_with_mocks,
+        mock_github_app,
+        mock_agent_executor,
+        sample_ba_output,
+        sample_reviewer_blocked
+    ):
+        """
+        Test: Escalation when blocking issues persist
+
+        Flow:
+        1. Reviewer finds blocking issues (iteration 1)
+        2. Maker revises
+        3. Reviewer still finds blocking issues (iteration 2)
+        4. Escalate to human
+        """
+        # Setup mocks
+        mock_agent_executor.set_response('requirements_reviewer', sample_reviewer_blocked)
+
+        # Create discussion
+        mock_github_app.create_discussion(
+            'D_test123',
+            title='Feature requirements',
+            body='Initial requirements'
+        )
+        mock_github_app.add_discussion_comment(
+            'D_test123',
+            f"{sample_ba_output}\n\n_Processed by the business_analyst agent_"
+        )
+
+        # Create cycle state at iteration 2 (second blocking review)
+        cycle_state = ReviewCycleState(
+            issue_number=96,
+            repository='context-studio',
+            maker_agent='business_analyst',
+            reviewer_agent='requirements_reviewer',
+            max_iterations=3,
+            project_name='context-studio',
+            board_name='idea-development',
+            workspace_type='discussions',
+            discussion_id='D_test123'
+        )
+        cycle_state.current_iteration = 2
+        cycle_state.status = 'reviewer_working'
+
+        # Add previous outputs
+        cycle_state.maker_outputs.append({
+            'iteration': 0,
+            'output': sample_ba_output,
+            'timestamp': datetime.now().isoformat()
+        })
+        cycle_state.review_outputs.append({
+            'iteration': 1,
+            'output': sample_reviewer_blocked,
+            'timestamp': datetime.now().isoformat()
+        })
+
+        class MockColumn:
+            name = 'Requirements Review'
+            agent = 'requirements_reviewer'
+            maker_agent = 'business_analyst'
+            escalate_on_blocked = True
+            max_review_iterations = 3
+
+        # Execute review iteration
+        status, _ = await executor_with_mocks._execute_review_iteration(
+            cycle_state,
+            MockColumn(),
+            'tinkermonkey'
+        )
+
+        # Assertions
+        assert status == ReviewStatus.BLOCKED
+        assert cycle_state.status == 'awaiting_human_feedback'
+        assert cycle_state.escalation_time is not None
+
+        # Verify escalation comment was posted
+        comments = mock_github_app.get_discussion_comments('D_test123')
+        escalation_comments = [c for c in comments if 'Review Blocked' in c['body']]
+        assert len(escalation_comments) == 1
+        assert 'Human Review Required' in escalation_comments[0]['body']
+
+    async def test_max_iterations_escalation(
+        self,
+        executor_with_mocks,
+        mock_github_app,
+        mock_agent_executor,
+        sample_reviewer_feedback
+    ):
+        """
+        Test: Escalation when max iterations reached
+
+        Flow:
+        1. Cycle goes through 3 iterations without approval
+        2. Max iterations (3) reached
+        3. Escalate to human
+        """
+        # Setup mocks
+        mock_agent_executor.set_response('requirements_reviewer', sample_reviewer_feedback)
+
+        # Create discussion
+        mock_github_app.create_discussion('D_test123', 'Requirements', 'Initial')
+
+        # Create cycle state at max iterations
+        cycle_state = ReviewCycleState(
+            issue_number=96,
+            repository='context-studio',
+            maker_agent='business_analyst',
+            reviewer_agent='requirements_reviewer',
+            max_iterations=3,
+            project_name='context-studio',
+            board_name='idea-development',
+            workspace_type='discussions',
+            discussion_id='D_test123'
+        )
+        cycle_state.current_iteration = 3  # At max
+        cycle_state.status = 'reviewer_working'
+
+        class MockColumn:
+            name = 'Requirements Review'
+            agent = 'requirements_reviewer'
+            maker_agent = 'business_analyst'
+            escalate_on_blocked = True
+            max_review_iterations = 3
+
+        # Execute review iteration
+        status, _ = await executor_with_mocks._execute_review_iteration(
+            cycle_state,
+            MockColumn(),
+            'tinkermonkey'
+        )
+
+        # Should escalate due to max iterations
+        comments = mock_github_app.get_discussion_comments('D_test123')
+        escalation_comments = [c for c in comments if 'Max Review Iterations' in c['body']]
+        assert len(escalation_comments) == 1
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+class TestReviewCycleStateManagement:
+    """Test state persistence throughout review cycle"""
+
+    async def test_state_persists_between_iterations(
+        self,
+        executor_with_mocks,
+        temp_state_dir
+    ):
+        """
+        Test: State is saved and can be loaded between iterations
+
+        Flow:
+        1. Start review cycle
+        2. Save state after iteration 1
+        3. Load state
+        4. Verify all data preserved
+        """
+        # Create cycle state
+        cycle_state = ReviewCycleState(
+            issue_number=96,
+            repository='context-studio',
+            maker_agent='business_analyst',
+            reviewer_agent='requirements_reviewer',
+            max_iterations=3,
+            project_name='context-studio',
+            board_name='idea-development',
+            workspace_type='discussions',
+            discussion_id='D_test123'
+        )
+        cycle_state.current_iteration = 1
+        cycle_state.status = 'reviewer_working'
+        cycle_state.maker_outputs.append({
+            'iteration': 0,
+            'output': 'Initial BA output',
+            'timestamp': datetime.now().isoformat()
+        })
+
+        # Save state
+        executor_with_mocks._save_cycle_state(cycle_state)
+
+        # Load state
+        loaded_cycles = executor_with_mocks._load_active_cycles('context-studio')
+
+        # Verify
+        assert len(loaded_cycles) == 1
+        loaded = loaded_cycles[0]
+        assert loaded.issue_number == 96
+        assert loaded.current_iteration == 1
+        assert loaded.status == 'reviewer_working'
+        assert len(loaded.maker_outputs) == 1
+
+    async def test_state_updated_after_each_iteration(
+        self,
+        executor_with_mocks
+    ):
+        """
+        Test: State is updated after each iteration
+
+        Flow:
+        1. Iteration 1: reviewer requests changes
+        2. Verify state updated with review output
+        3. Iteration 2: maker revises
+        4. Verify state updated with maker output
+        """
+        cycle_state = ReviewCycleState(
+            issue_number=96,
+            repository='context-studio',
+            maker_agent='business_analyst',
+            reviewer_agent='requirements_reviewer',
+            max_iterations=3,
+            project_name='context-studio',
+            board_name='idea-development',
+            workspace_type='discussions',
+            discussion_id='D_test123'
+        )
+
+        # Iteration 1: Add reviewer output
+        cycle_state.current_iteration = 1
+        cycle_state.status = 'reviewer_working'
+        cycle_state.review_outputs.append({
+            'iteration': 1,
+            'output': 'Reviewer feedback',
+            'timestamp': datetime.now().isoformat()
+        })
+        executor_with_mocks._save_cycle_state(cycle_state)
+
+        # Load and verify
+        loaded = executor_with_mocks._load_active_cycles('context-studio')[0]
+        assert len(loaded.review_outputs) == 1
+
+        # Iteration 2: Add maker output
+        cycle_state.current_iteration = 2
+        cycle_state.status = 'maker_working'
+        cycle_state.maker_outputs.append({
+            'iteration': 2,
+            'output': 'Maker revision',
+            'timestamp': datetime.now().isoformat()
+        })
+        executor_with_mocks._save_cycle_state(cycle_state)
+
+        # Load and verify
+        loaded = executor_with_mocks._load_active_cycles('context-studio')[0]
+        assert len(loaded.review_outputs) == 1
+        assert len(loaded.maker_outputs) == 1
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+class TestReviewCycleContextPassing:
+    """Test context passed to agents throughout cycle"""
+
+    async def test_reviewer_receives_maker_output_in_context(
+        self,
+        executor_with_mocks,
+        mock_github_app,
+        mock_agent_executor,
+        sample_ba_output
+    ):
+        """
+        Test: Reviewer receives maker's latest output in context
+
+        This is a regression test for the iteration 3 bug where
+        reviewer was receiving its own output instead of maker's.
+        """
+        # Create discussion with BA output
+        mock_github_app.create_discussion('D_test123', 'Requirements', 'Initial')
+        mock_github_app.add_discussion_comment(
+            'D_test123',
+            f"{sample_ba_output}\n\n_Processed by the business_analyst agent_"
+        )
+
+        # Create cycle state
+        cycle_state = ReviewCycleState(
+            issue_number=96,
+            repository='context-studio',
+            maker_agent='business_analyst',
+            reviewer_agent='requirements_reviewer',
+            max_iterations=3,
+            project_name='context-studio',
+            board_name='idea-development',
+            workspace_type='discussions',
+            discussion_id='D_test123'
+        )
+        cycle_state.current_iteration = 1
+
+        # Get context for reviewer
+        context = await executor_with_mocks._get_fresh_discussion_context(
+            cycle_state,
+            org='tinkermonkey',
+            iteration=1
+        )
+
+        # Verify context contains BA output
+        assert '_Processed by the business_analyst agent_' in context
+        assert sample_ba_output in context
+
+        # Verify context does NOT contain reviewer output
+        assert '_Processed by the requirements_reviewer agent_' not in context
+
+
+if __name__ == '__main__':
+    pytest.main([__file__, '-v', '-s'])

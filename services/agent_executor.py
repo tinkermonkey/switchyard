@@ -78,6 +78,37 @@ class AgentExecutor:
         agent_config = agent_stage.agent_config or {}
         self.obs.emit_agent_initialized(agent_name, task_id, project_name, agent_config)
 
+        # Prepare feature branch if issue_number present
+        branch_name = None
+        if 'issue_number' in task_context:
+            try:
+                from services.feature_branch_manager import feature_branch_manager
+                from services.github_integration import GitHubIntegration
+
+                # Get project config to determine repo info
+                project_config = config_manager.get_project_config(project_name)
+                if project_config and hasattr(project_config, 'github'):
+                    repo_owner = project_config.github.get('org')
+                    repo_name = project_config.github.get('repo')
+                    if repo_owner and repo_name:
+                        gh_integration = GitHubIntegration(repo_owner=repo_owner, repo_name=repo_name)
+
+                        issue_title = task_context.get('issue_title', '')
+                        branch_name = await feature_branch_manager.prepare_feature_branch(
+                            project=project_name,
+                            issue_number=task_context['issue_number'],
+                            github_integration=gh_integration,
+                            issue_title=issue_title
+                        )
+
+                        # Add branch name to context so agent can use it
+                        task_context['branch_name'] = branch_name
+                        logger.info(f"Prepared feature branch: {branch_name}")
+
+            except Exception as e:
+                logger.warning(f"Failed to prepare feature branch: {e}")
+                # Continue execution even if branch preparation fails
+
         # Execute agent
         start_time = time.time()
         try:
@@ -89,12 +120,66 @@ class AgentExecutor:
             # Post agent output to GitHub (centralized posting)
             await self._post_agent_output_to_github(agent_name, task_context, result)
 
+            # Finalize feature branch work if issue_number present
+            if 'issue_number' in task_context and branch_name:
+                try:
+                    from services.feature_branch_manager import feature_branch_manager
+
+                    # Get project config for repo info
+                    project_config = config_manager.get_project_config(project_name)
+                    if project_config and hasattr(project_config, 'github'):
+                        repo_owner = project_config.github.get('org')
+                        repo_name = project_config.github.get('repo')
+                        if repo_owner and repo_name:
+                            gh_integration = GitHubIntegration(repo_owner=repo_owner, repo_name=repo_name)
+
+                            commit_message = f"Complete work for issue #{task_context['issue_number']}\n\nAgent: {agent_name}\nTask: {task_id}"
+
+                            finalize_result = await feature_branch_manager.finalize_feature_branch_work(
+                                project=project_name,
+                                issue_number=task_context['issue_number'],
+                                commit_message=commit_message,
+                                github_integration=gh_integration
+                            )
+
+                            if finalize_result.get('success'):
+                                logger.info(f"Finalized feature branch work: {finalize_result}")
+                            else:
+                                logger.warning(f"Failed to finalize feature branch work: {finalize_result}")
+
+                except Exception as e:
+                    logger.warning(f"Failed to finalize feature branch: {e}")
+                    # Continue execution even if finalization fails
+
+            # Record successful execution outcome
+            if 'issue_number' in task_context and 'column' in task_context:
+                from services.work_execution_state import work_execution_tracker
+                work_execution_tracker.record_execution_outcome(
+                    issue_number=task_context['issue_number'],
+                    column=task_context['column'],
+                    agent=agent_name,
+                    outcome='success',
+                    project_name=project_name
+                )
+
             logger.info(f"Agent {agent_name} completed successfully (duration: {duration_ms:.0f}ms)")
             return result
 
         except Exception as e:
             duration_ms = (time.time() - start_time) * 1000
             self.obs.emit_agent_completed(agent_name, task_id, project_name, duration_ms, False, str(e))
+
+            # Record failed execution outcome
+            if 'issue_number' in task_context and 'column' in task_context:
+                from services.work_execution_state import work_execution_tracker
+                work_execution_tracker.record_execution_outcome(
+                    issue_number=task_context['issue_number'],
+                    column=task_context['column'],
+                    agent=agent_name,
+                    outcome='failure',
+                    project_name=project_name,
+                    error=str(e)
+                )
 
             logger.error(f"Agent {agent_name} failed after {duration_ms:.0f}ms: {e}")
             raise
@@ -165,10 +250,16 @@ class AgentExecutor:
             'use_docker': task_context.get('use_docker', True)
         }
 
-        # Add claude_model from agent config if available
+        # Add claude_model and use_docker from agent config if available
         agent_config = config_manager.get_project_agent_config(project_name, agent_name)
         if hasattr(agent_config, 'model'):
             context['claude_model'] = agent_config.model
+
+        # Override use_docker if agent explicitly requires or forbids Docker
+        if hasattr(agent_config, 'requires_docker'):
+            # Agent config takes precedence over task context
+            context['use_docker'] = agent_config.requires_docker
+            logger.info(f"Agent {agent_name} requires_docker={agent_config.requires_docker}, overriding task context")
 
         return context
 

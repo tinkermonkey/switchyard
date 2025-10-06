@@ -1,0 +1,80 @@
+# Pattern Detection System Configuration
+
+# Elasticsearch Configuration
+elasticsearch:
+  hosts:
+    - "http://elasticsearch:9200"
+  index_prefix: "agent-logs"
+  retention_days: 90
+  batch_size: 50
+  batch_timeout_seconds: 5.0
+
+# Redis Configuration
+redis:
+  host: "redis"
+  port: 6379
+  event_stream: "orchestrator:event_stream"
+  claude_stream: "orchestrator:claude_logs_stream"
+  consumer_group: "log_collector"
+
+# Pattern Detection Thresholds
+detection_thresholds:
+  # Minimum occurrences to create a Discussion
+  discussion_creation:
+    min_occurrences: 5
+    min_severity: "medium"
+
+  # Minimum occurrences to create an Issue
+  issue_creation:
+    min_occurrences: 20
+    min_severity: "medium"
+    min_impact_score: 100
+
+  # Requirements for auto-creating PR
+  auto_pr_creation:
+    required_approvals: 1
+    review_period_days: 7
+
+# Metrics Configuration
+metrics:
+  measurement_window_days: 14
+  min_improvement_threshold: 0.20  # 20% reduction required to consider change effective
+
+# CLAUDE.md Management
+claude_md_management:
+  max_lines: 500
+  consolidation_similarity_threshold: 0.85
+  pruning_days_without_occurrence: 30
+
+# GitHub Integration
+github:
+  discussion_category: "Pattern Observations"
+  issue_labels:
+    - "pattern-improvement"
+    - "auto-generated"
+  pr_labels:
+    - "claude-md-update"
+    - "auto-generated"
+
+# Pattern Rule Files
+pattern_rules:
+  enabled: true
+  rule_files:
+    - "config/patterns/git_patterns.yaml"
+    - "config/patterns/file_system_patterns.yaml"
+    - "config/patterns/permission_patterns.yaml"
+    - "config/patterns/docker_patterns.yaml"
+
+# Statistical Analysis
+statistical_analysis:
+  enabled: true
+  schedule: "0 2 * * *"  # Run daily at 2 AM
+  min_sample_size: 10
+
+# LLM Meta-Analysis
+llm_analysis:
+  enabled: false  # Enable in Phase 4
+  schedule: "0 3 * * 0"  # Run weekly on Sunday at 3 AM
+  model: "claude-3-5-sonnet-20241022"
+  max_tokens: 4096
+  temperature: 0.3

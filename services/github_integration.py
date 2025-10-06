@@ -13,8 +13,10 @@ logger = logging.getLogger(__name__)
 class GitHubIntegration:
     """Handles GitHub API interactions for agent collaboration"""
 
-    def __init__(self):
+    def __init__(self, repo_owner: Optional[str] = None, repo_name: Optional[str] = None):
         self.github_org = os.environ.get('GITHUB_ORG')
+        self.repo_owner = repo_owner or self.github_org
+        self.repo_name = repo_name
 
         # Try to use GitHub App auth, fall back to PAT
         from services.github_app_auth import get_github_app_auth
@@ -451,6 +453,181 @@ class GitHubIntegration:
             logger.error(f"Error posting issue comment: {e}")
             return {'success': False, 'error': str(e)}
 
+    async def graphql_query(self, query: str, variables: Dict[str, Any]) -> Dict[str, Any]:
+        """Execute a GraphQL query using gh CLI"""
+        try:
+            query_json = json.dumps({'query': query, 'variables': variables})
+
+            cmd = ['gh', 'api', 'graphql', '-f', f'query={query}']
+
+            # Add variables
+            for key, value in variables.items():
+                if isinstance(value, int):
+                    cmd.extend(['-F', f'{key}={value}'])
+                else:
+                    cmd.extend(['-f', f'{key}={value}'])
+
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=True,
+                env=self._get_gh_env()
+            )
+
+            return json.loads(result.stdout)
+
+        except subprocess.CalledProcessError as e:
+            logger.error(f"GraphQL query failed: {e.stderr}")
+            return {}
+
+    async def get_issue(self, issue_number: int) -> Dict[str, Any]:
+        """Get issue details (simplified wrapper)"""
+        return await self.get_issue_details(issue_number, self.repo_name)
+
+    async def post_comment(self, issue_number: int, comment: str) -> Dict[str, Any]:
+        """Post comment to issue (simplified wrapper)"""
+        return await self.post_issue_comment(issue_number, comment, self.repo_name)
+
+    async def create_pr(
+        self,
+        branch: str,
+        title: str,
+        body: str,
+        draft: bool = True
+    ) -> Dict[str, Any]:
+        """Create a pull request"""
+        try:
+            repo_arg = f"{self.repo_owner}/{self.repo_name}"
+
+            cmd = [
+                'gh', 'pr', 'create',
+                '--repo', repo_arg,
+                '--base', 'main',
+                '--head', branch,
+                '--title', title,
+                '--body', body
+            ]
+
+            if draft:
+                cmd.append('--draft')
+
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                env=self._get_gh_env()
+            )
+
+            if result.returncode == 0:
+                pr_url = result.stdout.strip()
+                pr_number = int(pr_url.rstrip('/').split('/')[-1])
+
+                logger.info(f"Created PR #{pr_number}: {pr_url}")
+
+                return {
+                    'success': True,
+                    'pr_number': pr_number,
+                    'pr_url': pr_url
+                }
+            else:
+                logger.error(f"Failed to create PR: {result.stderr}")
+                return {'success': False, 'error': result.stderr}
+
+        except Exception as e:
+            logger.error(f"Failed to create PR: {e}")
+            return {'success': False, 'error': str(e)}
+
+    async def update_pr_body(self, pr_number: int, body: str) -> bool:
+        """Update PR description"""
+        try:
+            repo_arg = f"{self.repo_owner}/{self.repo_name}"
+
+            cmd = [
+                'gh', 'pr', 'edit', str(pr_number),
+                '--repo', repo_arg,
+                '--body', body
+            ]
+
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                env=self._get_gh_env()
+            )
+
+            if result.returncode == 0:
+                logger.info(f"Updated PR #{pr_number} body")
+                return True
+            else:
+                logger.error(f"Failed to update PR body: {result.stderr}")
+                return False
+
+        except Exception as e:
+            logger.error(f"Failed to update PR body: {e}")
+            return False
+
+    async def mark_pr_ready(self, pr_number: int) -> bool:
+        """Mark a draft PR as ready for review"""
+        try:
+            repo_arg = f"{self.repo_owner}/{self.repo_name}"
+
+            cmd = [
+                'gh', 'pr', 'ready', str(pr_number),
+                '--repo', repo_arg
+            ]
+
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                env=self._get_gh_env()
+            )
+
+            if result.returncode == 0:
+                logger.info(f"Marked PR #{pr_number} as ready for review")
+                return True
+            else:
+                logger.error(f"Failed to mark PR ready: {result.stderr}")
+                return False
+
+        except Exception as e:
+            logger.error(f"Failed to mark PR ready: {e}")
+            return False
+
+    async def delete_branch(self, branch_name: str) -> bool:
+        """Delete a remote branch"""
+        try:
+            repo_arg = f"{self.repo_owner}/{self.repo_name}"
+
+            cmd = [
+                'gh', 'api',
+                f'repos/{repo_arg}/git/refs/heads/{branch_name}',
+                '-X', 'DELETE'
+            ]
+
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                env=self._get_gh_env()
+            )
+
+            if result.returncode == 0:
+                logger.info(f"Deleted remote branch {branch_name}")
+                return True
+            else:
+                logger.warning(f"Failed to delete branch {branch_name}: {result.stderr}")
+                return False
+
+        except Exception as e:
+            logger.error(f"Failed to delete branch: {e}")
+            return False
+
 
 class AgentCommentFormatter:
     """Formats agent communications for GitHub"""
@@ -481,7 +658,8 @@ class AgentCommentFormatter:
             'design_reviewer': ('👁️', 'Design Review'),
             'senior_software_engineer': ('💻', 'Implementation'),
             'code_reviewer': ('🔍', 'Code Review'),
-            'senior_qa_engineer': ('🧪', 'Testing'),
+            'senior_qa_engineer': ('🧪', 'QA Testing'),
+            'qa_reviewer': ('✅', 'QA Review'),
             'test_planner': ('📋', 'Test Planning'),
             'test_reviewer': ('✔️', 'Test Review'),
             'technical_writer': ('📝', 'Documentation'),
@@ -489,6 +667,12 @@ class AgentCommentFormatter:
         }
 
         emoji, title = agent_info.get(agent_name, ('📋', agent_name.replace('_', ' ').title()))
+
+        # Agent header with H1 and horizontal rule (no emoji)
+        agent_header = f"""# {title}
+
+---
+"""
 
         # Build summary section (only if stats are provided)
         summary_section = ""
@@ -512,7 +696,8 @@ class AgentCommentFormatter:
         # Convert output to markdown if it's JSON/dict
         formatted_output = AgentCommentFormatter._format_output_as_markdown(output)
 
-        return f"""{formatted_output}
+        return f"""{agent_header}
+{formatted_output}
 
 ---
 _Generated by Orchestrator Bot 🤖_

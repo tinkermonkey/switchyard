@@ -16,6 +16,7 @@ from monitoring.health_monitor import HealthMonitor
 from services.github_project_manager import GitHubProjectManager
 from services.project_monitor import ProjectMonitor
 from services.project_workspace import workspace_manager
+from services.scheduled_tasks import get_scheduled_tasks_service
 from agents.orchestrator_integration import process_task_integrated
 
 async def main():
@@ -115,7 +116,12 @@ async def main():
         daemon=True
     )
     monitor_thread.start()
-    
+
+    # Start scheduled tasks service for periodic maintenance
+    scheduler = get_scheduled_tasks_service()
+    scheduler.start()
+    logger.info("Scheduled tasks service started")
+
     # Main orchestration loop
     logger.info("Entering main orchestration loop")
 

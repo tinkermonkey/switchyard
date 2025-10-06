@@ -169,6 +169,17 @@ class PipelineProgression:
                 capture_output=True, text=True, check=True
             )
 
+            # Record status change with 'auto' trigger (from pipeline progression)
+            from services.work_execution_state import work_execution_tracker
+            # Note: We don't have the old status here, but the tracker will handle it
+            work_execution_tracker.record_status_change(
+                issue_number=issue_number,
+                from_status=None,  # Could track this if needed
+                to_status=target_column,
+                trigger='auto',  # Automatic progression
+                project_name=project_name
+            )
+
             logger.info(f"Moved issue #{issue_number} to column '{target_column}' in {board_name}")
             return True
 
@@ -238,6 +249,17 @@ class PipelineProgression:
             )
 
             self.task_queue.enqueue(task)
+
+            # Record execution start with 'pipeline_progression' trigger
+            from services.work_execution_state import work_execution_tracker
+            work_execution_tracker.record_execution_start(
+                issue_number=issue_number,
+                column=next_column,
+                agent=next_agent,
+                trigger_source='pipeline_progression',
+                project_name=project_name
+            )
+
             logger.info(f"Queued {next_agent} for issue #{issue_number} in column '{next_column}'")
             return True
 

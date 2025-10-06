@@ -49,3 +49,106 @@ class SeniorSoftwareEngineerAgent(MakerAgent):
 - Clear variable/function naming and code documentation
 - Performance optimized for the use case
 """
+
+    def get_initial_guidelines(self) -> str:
+        """Override to provide code implementation guidelines"""
+        return """
+## Implementation Guidelines
+
+**CRITICAL**: You are implementing actual code, NOT writing analysis documents.
+
+### Your Task:
+1. **READ existing code** to understand the codebase structure
+2. **WRITE new code files** or **EDIT existing files** to implement the requirements
+3. **CREATE test files** with comprehensive test coverage
+4. **UPDATE configuration** files as needed
+
+### Tools You Must Use:
+- `Read` - Read existing files to understand patterns
+- `Write` - Create new files for implementation
+- `Edit` - Modify existing files
+- `Bash` - Run tests, check syntax, verify installation
+
+### File Creation Requirements:
+- Place files in the correct directory structure
+- Follow existing naming conventions
+- Include docstrings and comments
+- Write corresponding test files
+
+### DO NOT:
+- Write analysis documents or design specifications
+- Describe what you would do - DO IT
+- Post markdown explanations - POST CODE
+
+### Success Criteria:
+- New/modified files exist in the repository
+- Code is syntactically correct
+- Tests are included and pass
+- Implementation matches requirements
+
+**OUTPUT FORMAT**: After implementing, provide a brief summary of what you did (2-3 sentences) and list the files you created/modified.
+"""
+
+    def _build_initial_prompt(self, task_context: Dict[str, Any]) -> str:
+        """Override to provide code implementation prompt instead of analysis"""
+        issue = task_context.get('issue', {})
+        project = task_context.get('project', 'unknown')
+        previous_stage = task_context.get('previous_stage_output', '')
+
+        previous_stage_prompt = ""
+        if previous_stage:
+            previous_stage_prompt = f"""
+## Previous Stage Output
+
+The following analysis was completed in a previous stage:
+
+{previous_stage}
+
+Build upon this analysis in your implementation.
+"""
+
+        quality_standards = self.get_quality_standards()
+        quality_section = f"""
+## Quality Standards
+
+Your implementation must meet these standards:
+{quality_standards}
+"""
+
+        prompt = f"""
+You are a {self.agent_display_name}.
+
+{self.agent_role_description}
+
+## Task: Code Implementation
+
+Implement the following requirement for project {project}:
+
+**Title**: {issue.get('title', 'No title')}
+**Description**: {issue.get('body', 'No description')}
+**Labels**: {issue.get('labels', [])}
+{previous_stage_prompt}{quality_section}
+
+{self.get_initial_guidelines()}
+
+**CRITICAL INSTRUCTIONS**:
+- You are running in a Docker container with the project mounted at `/workspace/`
+- **IMPORTANT**: The project's CLAUDE.md file contains project-specific conventions and requirements that OVERRIDE these general instructions. Read and follow all guidance in `/workspace/CLAUDE.md` (and subdirectory CLAUDE.md files when working in subdirectories).
+- You MUST use the Write and Edit tools to create/modify files
+- Read existing code first to understand patterns and structure
+- Create both implementation AND test files
+- Verify your code by reading it back after writing
+- DO NOT just describe what to do - IMPLEMENT IT
+- Your changes will be automatically committed to a feature branch
+
+**Working Directory**: `/workspace/` (the project root)
+
+**Expected Deliverables**:
+1. Implementation files (Python, JS, etc.)
+2. Test files with >80% coverage
+3. Updated configuration if needed
+4. Brief summary (posted to GitHub) listing files created/modified
+
+Begin implementation now.
+"""
+        return prompt

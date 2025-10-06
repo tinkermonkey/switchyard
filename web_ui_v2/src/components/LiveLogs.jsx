@@ -104,8 +104,9 @@ export default function LiveLogs() {
         for (const item of contents) {
           if (item.type === 'tool_result') {
             logType = 'result'
-            const preview = item.content?.substring(0, 60) || ''
-            logContent = `Tool result${item.is_error ? ' (error)' : ''}: ${preview}${item.content?.length > 60 ? '...' : ''}`
+            const contentStr = typeof item.content === 'string' ? item.content : JSON.stringify(item.content)
+            const preview = contentStr?.substring(0, 60) || ''
+            logContent = `Tool result${item.is_error ? ' (error)' : ''}: ${preview}${contentStr?.length > 60 ? '...' : ''}`
             break
           }
         }
@@ -166,7 +167,7 @@ export default function LiveLogs() {
                   className="flex gap-3 p-2 border-b border-gh-border-muted hover:bg-gh-canvas transition-colors items-start"
                 >
                   <span className="text-gh-fg-subtle whitespace-nowrap">
-                    {log.timestamp ? new Date(log.timestamp).toLocaleTimeString('en-US', { timeZone: 'UTC', hour12: false }) + ' UTC' : new Date().toLocaleTimeString('en-US', { timeZone: 'UTC', hour12: false }) + ' UTC'}
+                    {log.timestamp ? new Date(log.timestamp * 1000).toLocaleTimeString('en-US', { timeZone: 'UTC', hour12: false }) + ' UTC' : new Date().toLocaleTimeString('en-US', { timeZone: 'UTC', hour12: false }) + ' UTC'}
                   </span>
                   <span className={`px-2 py-0.5 rounded text-[10px] font-semibold uppercase whitespace-nowrap ${getLogTypeColor(logType)} text-white`}>
                     {logType}

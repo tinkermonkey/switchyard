@@ -80,6 +80,16 @@ class AutoCommitService:
                 return False
 
             logger.info(f"Successfully committed changes for {project} (agent: {agent})")
+
+            # Push branch to remote
+            current_branch = self._get_current_branch(project_dir)
+            if current_branch and current_branch not in ['main', 'master']:
+                push_success = self._push_branch(project_dir, current_branch)
+                if push_success:
+                    logger.info(f"Successfully pushed branch {current_branch} to remote")
+                else:
+                    logger.warning(f"Failed to push branch {current_branch}, continuing anyway")
+
             return True
 
         except Exception as e:
@@ -188,6 +198,29 @@ class AutoCommitService:
 
         except Exception as e:
             logger.error(f"Failed to create commit: {e}")
+            return False
+
+    def _push_branch(self, project_dir: Path, branch_name: str) -> bool:
+        """Push branch to remote"""
+        try:
+            # First, set upstream if not already set
+            result = subprocess.run(
+                ['git', 'push', '-u', 'origin', branch_name],
+                cwd=project_dir,
+                capture_output=True,
+                text=True,
+                timeout=60
+            )
+
+            if result.returncode == 0:
+                logger.info(f"Pushed branch {branch_name} to origin")
+                return True
+            else:
+                logger.error(f"Failed to push branch: {result.stderr}")
+                return False
+
+        except Exception as e:
+            logger.error(f"Failed to push branch {branch_name}: {e}")
             return False
 
     def _generate_commit_message(

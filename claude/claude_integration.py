@@ -33,16 +33,22 @@ async def run_claude_code(prompt: str, context: Dict[str, Any]) -> str:
     # Get agent configuration to determine if Docker is required
     agent_config = context.get('agent_config')
 
+    # DEBUG: Log decision-making process
+    logger.info(f"Agent {agent}: use_docker from context={context.get('use_docker')}, agent_config present={agent_config is not None}")
+    if agent_config:
+        logger.info(f"Agent {agent}: agent_config type={type(agent_config)}, has requires_docker={hasattr(agent_config, 'requires_docker')}")
+
     # CRITICAL: Agent's requires_docker setting takes precedence over context
     # Only dev_environment_setup should have requires_docker=False
     if agent_config and hasattr(agent_config, 'requires_docker'):
         use_docker = agent_config.requires_docker
+        logger.info(f"Agent {agent}: Using agent_config.requires_docker={use_docker}")
         if not use_docker:
             logger.warning(f"Agent {agent} is configured to run LOCALLY (requires_docker=False) - this should ONLY be dev_environment_setup!")
     else:
         # Fallback to context, but default to True for security
         use_docker = context.get('use_docker', True)
-        logger.warning(f"Agent config missing requires_docker field, using context value: {use_docker}")
+        logger.warning(f"Agent {agent}: No agent_config.requires_docker, using context value: {use_docker}")
 
     if use_docker and project != 'unknown':
         logger.info(f"Running agent in Docker container for project {project}")
@@ -93,15 +99,25 @@ Files: {context.get('files', [])}
             claude_model = context.get('claude_model', 'claude-sonnet-4-5-20250929')
             logger.info(f"Using Claude model: {claude_model}")
 
+            # Check for existing session to resume
+            existing_session_id = context.get('claude_session_id')
+
             cmd = [
                 'claude',
                 '--print',
                 '--verbose',
                 '--output-format', 'stream-json',
                 '--model', claude_model,
-                '--dangerously-skip-permissions',
-                prompt
+                '--permission-mode', 'bypassPermissions'
             ]
+
+            # Add --resume flag if continuing an existing session
+            if existing_session_id:
+                cmd.extend(['--resume', existing_session_id])
+                logger.info(f"Resuming Claude Code session: {existing_session_id}")
+
+            # Add prompt last
+            cmd.append(prompt)
 
             # Ensure working directory exists or use current directory
             if not work_dir.exists():
@@ -163,12 +179,12 @@ Files: {context.get('files', [])}
             # your authenticated Claude.ai session, which uses your subscription
             if 'ANTHROPIC_API_KEY' in os.environ:
                 env['ANTHROPIC_API_KEY'] = os.environ['ANTHROPIC_API_KEY']
-                logger.info("Using ANTHROPIC_API_KEY for authentication (API billing)")
+                logger.warning("Using ANTHROPIC_API_KEY for authentication (API billing)")
             else:
                 logger.info("No ANTHROPIC_API_KEY found - Claude Code will use claude.ai session (subscription billing)")
 
-            logger.info(f"Executing Claude CLI in {work_dir}")
-            logger.info(f"Command: {' '.join(cmd[:3])}...")  # Don't log full prompt
+            logger.debug(f"Executing Claude CLI in {work_dir}")
+            logger.debug(f"Command: {' '.join(cmd[:3])}...")  # Don't log full prompt
 
             # Emit Claude API call started event
             api_start_time = time.time()
@@ -193,6 +209,7 @@ Files: {context.get('files', [])}
             result_parts = []
             input_tokens = 0
             output_tokens = 0
+            session_id = None  # Track session ID for continuity
 
             # Stream output line by line
             try:
@@ -212,6 +229,11 @@ Files: {context.get('files', [])}
                         # Log event structure for debugging
                         if event_type not in ['progress', 'status']:
                             logger.debug(f"Stream event type: {event_type}, keys: {list(event.keys())}")
+
+                        # Capture session_id for session continuity
+                        if 'session_id' in event and not session_id:
+                            session_id = event['session_id']
+                            logger.info(f"Captured Claude Code session_id: {session_id}")
 
                         # Stream event to websocket if callback provided
                         if stream_callback:
@@ -251,7 +273,13 @@ Files: {context.get('files', [])}
 
                 if process.returncode == 0:
                     result_text = ''.join(result_parts)
-                    logger.info(f"Claude CLI completed successfully, result length: {len(result_text)}")
+                    logger.info(f"Claude CLI completed successfully, result length: {len(result_text)}, session_id: {session_id}")
+
+                    # Store session_id in context for session continuity
+                    if session_id:
+                        context['claude_session_id'] = session_id
+
+                    # Return just the result text (callers expect string, not dict)
                     return result_text
                 else:
                     stderr = process.stderr.read() if process.stderr else "Unknown error"

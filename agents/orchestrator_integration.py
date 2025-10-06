@@ -148,13 +148,21 @@ async def process_task_integrated(task, state_manager, logger):
     issue_number = task_context.get('issue_number')
 
     # For development pipelines, create/switch to feature branch
-    if issue_number and board_name in ['development', 'full-sdlc']:
-        logger.info(f"Creating/switching to feature branch for issue #{issue_number}")
-        branch_name = workspace_manager.create_feature_branch(task.project, issue_number)
-        if branch_name:
-            logger.info(f"Working on branch: {branch_name}")
-        else:
-            logger.log_warning(f"Failed to create feature branch for issue #{issue_number}")
+    # Check if this pipeline uses issue-based workflow (has workspace type 'issues')
+    try:
+        project_config = config_manager.get_project_config(task.project)
+        # Find the pipeline with matching board_name
+        pipeline = next(
+            (p for p in project_config.pipelines if p.board_name == board_name),
+            None
+        )
+        uses_git_workflow = pipeline and pipeline.workspace == 'issues'
+    except Exception as e:
+        logger.warning(f"Could not determine workspace type for board {board_name}: {e}")
+        uses_git_workflow = False
+
+    # Feature branch management handled by AgentExecutor's FeatureBranchManager
+    # This provides hierarchical parent/sub-issue branch support
 
     # Validate task can run (check dev container requirements)
     validation_result = await validate_task_can_run(task, logger)
@@ -174,24 +182,68 @@ async def process_task_integrated(task, state_manager, logger):
         task_id_prefix=task.id  # Use actual task ID from queue
     )
 
-    # Auto-commit changes if agent makes code changes
-    agent_config = config_manager.get_project_agent_config(task.project, task.agent)
-    makes_code_changes = getattr(agent_config, 'makes_code_changes', False)
-    if makes_code_changes:
-        logger.info(f"Agent {task.agent} makes code changes, attempting auto-commit")
-        from services.auto_commit import auto_commit_service
+    # Auto-commit handled by FeatureBranchManager in AgentExecutor
+    # This ensures commits are properly associated with parent/sub-issue branches
 
-        commit_success = await auto_commit_service.commit_agent_changes(
-            project=task.project,
-            agent=task.agent,
-            task_id=task.id,
-            issue_number=issue_number
-        )
+    # Auto-advance to next column if configured
+    current_column_name = task_context.get('column')
+    if current_column_name and issue_number:
+        try:
+            # Get workflow configuration
+            from config.state_manager import state_manager
 
-        if commit_success:
-            logger.info(f"Successfully auto-committed changes for task {task.id}")
-        else:
-            logger.log_warning(f"Failed to auto-commit changes for task {task.id}")
+            project_config = config_manager.get_project_config(task.project)
+            pipeline = next(
+                (p for p in project_config.pipelines if p.board_name == board_name),
+                None
+            )
+
+            if pipeline:
+                workflow_template = config_manager.get_workflow_template(pipeline.workflow)
+
+                # Find current column
+                current_column = next(
+                    (c for c in workflow_template.columns if c.name == current_column_name),
+                    None
+                )
+
+                # Check if auto-advance is enabled
+                if current_column and getattr(current_column, 'auto_advance_on_approval', False):
+                    # Find next column
+                    current_index = workflow_template.columns.index(current_column)
+                    if current_index + 1 < len(workflow_template.columns):
+                        next_column = workflow_template.columns[current_index + 1]
+
+                        logger.info(
+                            f"Auto-advancing issue #{issue_number} from {current_column_name} to {next_column.name}"
+                        )
+
+                        # Move the card
+                        from services.pipeline_progression import PipelineProgression
+                        from task_queue.task_manager import TaskQueue
+
+                        task_queue = TaskQueue()
+                        progression_service = PipelineProgression(task_queue)
+
+                        moved = progression_service.move_issue_to_column(
+                            project_name=task.project,
+                            board_name=board_name,
+                            issue_number=issue_number,
+                            target_column=next_column.name
+                        )
+
+                        if moved:
+                            logger.info(
+                                f"Successfully auto-advanced issue #{issue_number} to {next_column.name}"
+                            )
+                        else:
+                            logger.warning(
+                                f"Failed to auto-advance issue #{issue_number} to {next_column.name}"
+                            )
+        except Exception as e:
+            logger.error(f"Error during auto-advancement: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
 
     return result
 
