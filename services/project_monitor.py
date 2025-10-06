@@ -50,7 +50,7 @@ class ProjectMonitor:
             self.poll_interval = 30
 
     def get_project_items(self, project_owner: str, project_number: int) -> List[ProjectItem]:
-        """Query GitHub Projects v2 API to get current project items"""
+        """Query GitHub Projects v2 API to get current project items (excludes closed issues)"""
         query = f'''{{
             user(login: "{project_owner}") {{
                 projectV2(number: {project_number}) {{
@@ -64,6 +64,7 @@ class ProjectMonitor:
                                     id
                                     number
                                     title
+                                    state
                                     repository {{
                                         name
                                     }}
@@ -101,6 +102,12 @@ class ProjectMonitor:
             for node in project_data['items']['nodes']:
                 content = node.get('content')
                 if not content:  # Skip draft items
+                    continue
+
+                # Skip closed issues - they should not trigger any agents
+                issue_state = content.get('state', '').upper()
+                if issue_state == 'CLOSED':
+                    logger.debug(f"Skipping closed issue #{content['number']} in project query")
                     continue
 
                 # Find status field
@@ -516,6 +523,14 @@ class ProjectMonitor:
         try:
             # Get workflow template for this board
             project_config = self.config_manager.get_project_config(project_name)
+
+            # DEFENSIVE: Check if issue is open before triggering any agents
+            issue_data = self.get_issue_details(repository, issue_number, project_config.github['org'])
+            issue_state = issue_data.get('state', '').upper()
+
+            if issue_state == 'CLOSED':
+                logger.info(f"Skipping agent trigger for issue #{issue_number}: issue is CLOSED")
+                return None
 
             # Find the pipeline config for this board
             pipeline_config = None
@@ -1505,6 +1520,12 @@ _Review cycle initiated by Claude Code Orchestrator_
         try:
             # Fetch full issue details
             issue_data = self.get_issue_details(repository, issue_number, project_config.github['org'])
+
+            # DEFENSIVE: Check if issue is open before creating feedback task
+            issue_state = issue_data.get('state', '').upper()
+            if issue_state == 'CLOSED':
+                logger.info(f"Skipping feedback task for issue #{issue_number}: issue is CLOSED")
+                return
 
             # Prepare feedback context
             feedback_text = "\n\n".join([
@@ -2545,6 +2566,12 @@ Moving to implementation phase.
         try:
             # Fetch full issue details
             issue_data = self.get_issue_details(repository, issue_number, project_config.github['org'])
+
+            # DEFENSIVE: Check if issue is open before creating feedback task
+            issue_state = issue_data.get('state', '').upper()
+            if issue_state == 'CLOSED':
+                logger.info(f"Skipping feedback task for issue #{issue_number}: issue is CLOSED")
+                return
 
             # Prepare feedback context
             feedback_text = "\n\n".join([

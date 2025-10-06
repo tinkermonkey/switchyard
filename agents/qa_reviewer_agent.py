@@ -188,6 +188,12 @@ This is **Re-Review Iteration {iteration} of {max_iterations}**.
 - Only include items that genuinely need fixing
 - Don't repeat issues that were already addressed
 
+**Common Issues**:
+- Markdown files with developer notes and explanations -> These need to be removed
+- Test and debug scripts that are not in the test folder tree -> These need to be evaluated and cleaned up
+- Leaving in or commenting out code that was meant to be replaced or removed -> These need to be cleaned up
+- Code with names including "Phase X" or "Step Y" -> These need to be renamed to meaningful names
+
 **CRITICAL**: You MUST mark as CHANGES NEEDED if any tests are still failing.
 
 **Escalation**: After {max_iterations} iterations, unresolved issues will escalate to human review.
@@ -256,7 +262,7 @@ Your expertise includes: test strategy validation, test execution analysis, qual
    **If integration/e2e tests are missing, you MUST mark as CHANGES NEEDED with Critical priority.**
 
 2. **Test Execution Validation** (BLOCKING if not met):
-   - ✅ Did the QA Engineer actually RUN the tests (not just analyze)?
+   - ✅ Did the QA Engineer actually RUN ALL of the tests (not just analyze)?
    - ✅ Are ALL unit tests passing?
    - ✅ Are ALL integration tests passing?
    - ✅ Are ALL e2e tests passing?
@@ -265,7 +271,6 @@ Your expertise includes: test strategy validation, test execution analysis, qual
    **If ANY test is failing, you MUST mark as CHANGES NEEDED with Critical priority.**
 
 3. **Test Results Analysis**:
-   - Are test execution commands and outputs clearly documented?
    - For any test failures: Are root causes identified?
    - For any test failures: Are fix recommendations specific and actionable?
    - Are test results properly categorized (unit, integration, e2e)?
@@ -274,7 +279,6 @@ Your expertise includes: test strategy validation, test execution analysis, qual
    - Is overall coverage percentage reported?
    - Is new/changed code coverage ≥80%?
    - Are new/changed files with <80% coverage identified?
-   - Are uncovered critical code paths in new/changed code documented?
 
 5. **Code Changes Review** (if QA Engineer made code changes):
    - Are bug fixes correct and well-tested?

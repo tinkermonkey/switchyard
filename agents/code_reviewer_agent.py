@@ -187,6 +187,12 @@ This is **Re-Review Iteration {iteration} of {max_iterations}**.
 - Only include items that genuinely need fixing
 - Don't repeat issues that were already addressed
 
+**Common Issues**:
+- Markdown files with developer notes and explanations -> These need to be removed
+- Test and debug scripts that are not in the test folder tree -> These need to be evaluated and cleaned up
+- Leaving in or commenting out code that was meant to be replaced or removed -> These need to be cleaned up
+- Code with names including "Phase X" or "Step Y" -> These need to be renamed to meaningful names
+
 **Escalation**: After {max_iterations} iterations, unresolved issues will escalate to human review.
 """
             else:
@@ -253,7 +259,7 @@ Conduct a comprehensive code review covering:
    - SOLID principles adherence (Single Responsibility, Open/Closed, Liskov Substitution, Interface Segregation, Dependency Inversion)
    - Clean code practices (DRY, KISS, YAGNI)
    - Code readability and maintainability
-   - Naming conventions and structure
+   - Naming conventions and structure -> No "Phase X" of "Enhanced" or "Improved" etc
    - Error handling completeness
 
 2. **Security Analysis** (OWASP Top 10):
@@ -273,6 +279,7 @@ Conduct a comprehensive code review covering:
 
 4. **Testing Evaluation**:
    - Test coverage analysis (should be >80%)
+   - Test organization and clarity
    - Test quality and effectiveness
    - Integration test completeness
    - Edge case coverage
@@ -283,7 +290,6 @@ Conduct a comprehensive code review covering:
    - Dependency management
    - Configuration management
    - Logging and monitoring integration
-   - Documentation quality
 
 {format_instructions}
 

@@ -34,7 +34,7 @@ class SeniorQAEngineerAgent(MakerAgent):
             "Integration Test Results",
             "End-to-End Test Results",
             "Test Coverage Analysis",
-            "Production Readiness Assessment"
+            "Production Readiness Assessment",
         ]
 
     # ==================================================================================
@@ -46,7 +46,7 @@ class SeniorQAEngineerAgent(MakerAgent):
 ## QA Testing Requirements
 
 **CRITICAL**: Your role has TWO phases:
-1. **WRITE missing tests** (integration, e2e, performance)
+1. **WRITE any missing tests** (integration, e2e, performance)
 2. **EXECUTE all tests** and report results
 
 ### Phase 1: Write Missing Tests
@@ -73,44 +73,13 @@ The Senior Software Engineer wrote unit tests for their implementation. You must
 
 ### Phase 2: Execute All Tests
 
-After writing your tests, execute the full test suite:
+After writing your tests, execute the full test suite, including:
+- Unit tests (written by Software Engineer)
+- Integration tests (written by you)
+- End-to-end tests (written by you)
 
-1. **Run Unit Tests** (written by Software Engineer):
-   ```bash
-   pytest tests/unit/ -v --tb=short
-   ```
-   - Report: Total tests, passed, failed, skipped
-   - For ANY failures: Include full stack trace and error message
-
-2. **Run Integration Tests** (written by you):
-   ```bash
-   pytest tests/integration/ -v --tb=short
-   ```
-   - Report: Total tests, passed, failed, skipped
-   - For ANY failures: Include full stack trace and error message
-
-3. **Run End-to-End Tests** (written by you):
-   ```bash
-   pytest tests/e2e/ -v --tb=short  # or tests/integration/test_e2e_*.py
-   ```
-   - Report: Total tests, passed, failed, skipped
-   - For ANY failures: Include full stack trace and error message
-
-4. **Run Test Coverage Analysis**:
-   ```bash
-   pytest tests/ --cov=. --cov-report=term-missing
-   ```
-   - Report: Overall coverage percentage
-   - **IMPORTANT**: New/changed code must have ≥80% coverage
-   - Identify new/changed files with <80% coverage
-   - List uncovered lines in new/changed code
-
-5. **Run All Tests Together** (final validation):
-   ```bash
-   pytest tests/ -v
-   ```
-   - Confirm all tests pass in full suite
-   - Verify no conflicts between test categories
+Ensure that all tests pass successfully.
+If any fail, think about whether the test needs to be fixed or if the code has a bug that needs to be fixed.
 
 ### Output Format for Test Results:
 
@@ -156,6 +125,5 @@ After running all tests, assess:
 - New/changed code has ≥80% test coverage
 - Performance benchmarks are met
 - Security vulnerabilities are identified and addressed
-- Production deployment checklist is complete
 - ALL tests (unit, integration, e2e) must pass before work is considered complete
 """
