@@ -1,6 +1,9 @@
 # Main orchestrator Dockerfile
 FROM python:3.11-slim
 
+# Accept docker GID as build arg (defaults to 984 for Linux, override for macOS)
+ARG DOCKER_GID=984
+
 WORKDIR /app
 
 # Install Node.js and Claude CLI
@@ -57,10 +60,17 @@ RUN git config --global user.name "Orchestrator Bot" && \
 # Ensure Python path includes the app directory
 ENV PYTHONPATH=/app
 
-# Create docker group with GID 999 (typical docker socket GID on host)
-# and add orchestrator user to it for Docker socket access
-RUN groupadd -g 999 docker || true && \
-    useradd -m -u 1000 -G docker orchestrator && \
+# Create docker group with host's docker GID and add orchestrator user to it
+# This enables docker socket access for dev_environment_setup agent
+# On macOS, DOCKER_GID=0 (root group), so we add user to root group
+# On Linux, DOCKER_GID is typically 984-999, so we create a docker group
+# Also add to nogroup (65534) as a workaround for userns issues
+RUN if [ "${DOCKER_GID}" = "0" ]; then \
+        useradd -m -u 1000 -G root,nogroup orchestrator; \
+    else \
+        groupadd -g ${DOCKER_GID} docker || true && \
+        useradd -m -u 1000 -G docker,nogroup orchestrator; \
+    fi && \
     chown -R orchestrator:orchestrator /app orchestrator_data projects && \
     mkdir -p /home/orchestrator/.ssh && \
     chown orchestrator:orchestrator /home/orchestrator/.ssh && \

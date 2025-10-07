@@ -10,10 +10,15 @@ services:
       - orchestrator-net
 
   orchestrator:
-    build: .
-    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"  # Run as host user
+    build:
+      context: .
+      args:
+        DOCKER_GID: "${DOCKER_GID:-984}"  # Pass host docker GID to Dockerfile
+    user: "1000:1000"  # Run as UID/GID 1000
     group_add:
-      - "${DOCKER_GID:-0}"  # Add docker group for container management (0 on macOS, 984+ on Linux)
+      - "${DOCKER_GID:-984}"  # Add host docker group at runtime
+    userns_mode: "host"  # Disable user namespace remapping so socket UIDs match
+    privileged: true  # Required for Docker socket access when userns is globally enabled
     volumes:
       # Mount the orchestrator code (this is clauditoreum/)
       - ./:/app
@@ -42,7 +47,8 @@ services:
       #- ~/.config/claude:/home/orchestrator/.config/claude:ro
 
       # Share Docker socket for nested containers if needed
-      - /var/run/docker.sock:/var/run/docker.sock
+      # Use rootless Docker socket if COMPOSE_DOCKER_SOCK is set, otherwise use root socket
+      - ${COMPOSE_DOCKER_SOCK:-/var/run/docker.sock}:/var/run/docker.sock
 
     environment:
       - GITHUB_TOKEN=${GITHUB_TOKEN}
