@@ -172,7 +172,7 @@ export default function Header() {
   return (
     <div className="space-y-3">
       {/* System Health Alert Banner */}
-      {systemHealth && (systemHealth.status === 'unhealthy' || systemHealth.status === 'starting' || systemHealth.status === 'error') && (
+      {systemHealth && (systemHealth.status === 'unhealthy' || systemHealth.status === 'degraded' || systemHealth.status === 'starting' || systemHealth.status === 'error') && (
         <div className={`p-4 rounded-md border ${systemHealth.status === 'error' || systemHealth.status === 'unhealthy'
             ? 'bg-red-50 dark:bg-red-900/20 border-gh-danger'
             : 'bg-yellow-50 dark:bg-yellow-900/20 border-yellow-500'
@@ -190,11 +190,13 @@ export default function Header() {
                 {systemHealth.status === 'starting' && 'System Starting Up'}
                 {systemHealth.status === 'error' && 'Health Check Error'}
                 {systemHealth.status === 'unhealthy' && 'System Health Issues Detected'}
+                {systemHealth.status === 'degraded' && 'System Running with Reduced Functionality'}
               </h3>
               <p className="text-sm text-gh-fg-default mb-2">
                 {systemHealth.status === 'starting' && 'Orchestrator is initializing, health checks not yet complete.'}
                 {systemHealth.status === 'error' && (systemHealth.message || systemHealth.error || 'Unable to retrieve system health status.')}
                 {systemHealth.status === 'unhealthy' && `${unhealthyComponents.length} component${unhealthyComponents.length > 1 ? 's are' : ' is'} reporting issues.`}
+                {systemHealth.status === 'degraded' && 'Core functionality is operational, but some features are unavailable due to authentication configuration.'}
               </p>
               {unhealthyComponents.length > 0 && (
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
@@ -207,6 +209,16 @@ export default function Header() {
                       <div className="text-xs text-gh-fg-muted">
                         {getHealthComponentDetails(key, check)}
                       </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+              {systemHealth.status === 'degraded' && systemHealth.orchestrator?.checks?.github?.warnings && (
+                <div className="mt-2 space-y-1">
+                  {systemHealth.orchestrator.checks.github.warnings.map((warning, idx) => (
+                    <div key={idx} className="text-sm text-yellow-800 dark:text-yellow-300 flex items-start gap-2">
+                      <AlertCircle className="w-4 h-4 mt-0.5 flex-shrink-0" />
+                      <span>{warning}</span>
                     </div>
                   ))}
                 </div>
@@ -292,11 +304,14 @@ export default function Header() {
               {systemHealth && (
                 <span className={`inline-block px-3 py-1 rounded-full text-xs font-semibold ${systemHealth.status === 'healthy'
                     ? 'bg-gh-success text-white'
-                    : systemHealth.status === 'starting'
+                    : systemHealth.status === 'degraded'
                       ? 'bg-yellow-500 text-white'
-                      : 'bg-gh-danger text-white'
+                      : systemHealth.status === 'starting'
+                        ? 'bg-yellow-500 text-white'
+                        : 'bg-gh-danger text-white'
                   }`}>
                   {systemHealth.status === 'healthy' && 'System Healthy'}
+                  {systemHealth.status === 'degraded' && 'Degraded Mode'}
                   {systemHealth.status === 'starting' && 'Starting...'}
                   {(systemHealth.status === 'unhealthy' || systemHealth.status === 'error') && `${unhealthyComponents.length} Component${unhealthyComponents.length > 1 ? 's' : ''} Down`}
                 </span>

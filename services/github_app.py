@@ -37,7 +37,7 @@ class GitHubApp:
             self.enabled = True
             logger.info(f"GitHub App initialized (App ID: {self.app_id}, Installation ID: {self.installation_id})")
         except Exception as e:
-            logger.error(f"Failed to load GitHub App private key: {e}")
+            logger.debug(f"Failed to load GitHub App private key: {e}")
             self.enabled = False
 
         self._installation_token = None
@@ -91,9 +91,13 @@ class GitHubApp:
 
     def graphql_request(self, query: str, variables: Dict[str, Any] = None) -> Optional[Dict]:
         """Execute a GraphQL request using GitHub App authentication"""
+        if not self.enabled:
+            logger.debug("GitHub App not configured, cannot execute GraphQL request")
+            return None
+
         token = self.get_installation_token()
         if not token:
-            logger.error("No installation token available for GraphQL request")
+            logger.debug("No installation token available for GraphQL request")
             return None
 
         headers = {
@@ -133,9 +137,13 @@ class GitHubApp:
 
     def rest_request(self, method: str, path: str, data: Dict = None) -> Optional[Dict]:
         """Execute a REST API request using GitHub App authentication"""
+        if not self.enabled:
+            logger.debug("GitHub App not configured, cannot execute REST request")
+            return None
+
         token = self.get_installation_token()
         if not token:
-            logger.error("No installation token available for REST request")
+            logger.debug("No installation token available for REST request")
             return None
 
         headers = {

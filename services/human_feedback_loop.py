@@ -370,6 +370,11 @@ class HumanFeedbackLoopExecutor:
             }
             """
 
+            # Check if GitHub App is configured before attempting GraphQL
+            if not github_app.enabled:
+                logger.debug(f"Cannot check issue #{state.issue_number} for feedback - GitHub App not configured")
+                return None
+
             result = github_app.graphql_request(query, {
                 'org': org,
                 'repo': state.repository,
@@ -377,7 +382,7 @@ class HumanFeedbackLoopExecutor:
             })
 
             if not result or 'repository' not in result or not result['repository']:
-                logger.warning(f"Issue #{state.issue_number} not found")
+                logger.warning(f"Issue #{state.issue_number} could not be accessed via GraphQL (may not exist or insufficient permissions)")
                 return None
 
             comments = result['repository']['issue']['comments']['nodes']

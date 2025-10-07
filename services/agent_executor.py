@@ -228,9 +228,13 @@ class AgentExecutor:
     ) -> Dict[str, Any]:
         """Build standardized execution context for agent"""
         from state_management.manager import StateManager
+        from services.project_workspace import workspace_manager
 
         # Create state manager
         state_manager = StateManager(Path("orchestrator_data/state"))
+
+        # Get project directory from workspace manager
+        project_dir = workspace_manager.get_project_dir(project_name)
 
         # Build context with ALL required fields for agents
         context = {
@@ -239,7 +243,7 @@ class AgentExecutor:
             'agent': agent_name,
             'project': project_name,
             'context': task_context,  # Nest task context here
-            'work_dir': f"./projects/{project_name}",
+            'work_dir': str(project_dir),  # Use absolute path from workspace manager
             'completed_work': [],
             'decisions': [],
             'metrics': {},

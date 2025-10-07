@@ -759,72 +759,86 @@ class ProjectMonitor:
                             # Don't use deduplication - cycles need reviewers to run multiple times
                             logger.debug(f"Skipping deduplication check for review column")
                         elif column and column.type == 'conversational':
-                            # Conversational columns need to resume monitoring after restart
-                            logger.info(f"Resuming conversational feedback loop for issue #{issue_number} in issues workspace")
-                            try:
-                                from services.human_feedback_loop import human_feedback_loop_executor
-                                import threading
+                            # Check if there's existing work to resume
+                            # Only resume if there's evidence of prior agent activity
+                            from services.github_integration import GitHubIntegration
+                            github = GitHubIntegration()
 
-                                def resume_feedback_loop():
-                                    """Resume conversational feedback loop in background thread"""
-                                    try:
-                                        loop_new = asyncio.new_event_loop()
-                                        asyncio.set_event_loop(loop_new)
+                            # Check for existing agent comments on the issue
+                            has_prior_work = loop.run_until_complete(
+                                github.has_agent_processed_issue(issue_number, agent, repository)
+                            )
 
-                                        # Create state for this feedback loop
-                                        from services.human_feedback_loop import HumanFeedbackState
+                            if has_prior_work:
+                                # Resume existing conversational feedback loop
+                                logger.info(f"Resuming conversational feedback loop for issue #{issue_number} in issues workspace")
+                                try:
+                                    from services.human_feedback_loop import human_feedback_loop_executor
+                                    import threading
 
-                                        state = HumanFeedbackState(
-                                            issue_number=issue_number,
-                                            repository=repository,
-                                            agent=agent,
-                                            project_name=project_name,
-                                            board_name=board_name,
-                                            workspace_type='issues',
-                                            discussion_id=None  # Issues don't have discussion IDs
-                                        )
+                                    def resume_feedback_loop():
+                                        """Resume conversational feedback loop in background thread"""
+                                        try:
+                                            loop_new = asyncio.new_event_loop()
+                                            asyncio.set_event_loop(loop_new)
 
-                                        # Load persisted session_id for continuity across restarts
-                                        from services.conversational_session_state import conversational_session_state
-                                        persisted_session = conversational_session_state.load_session(
-                                            project_name=project_name,
-                                            issue_number=issue_number,
-                                            max_age_hours=24
-                                        )
-                                        if persisted_session:
-                                            state.claude_session_id = persisted_session.session_id
-                                            logger.info(f"Restored Claude Code session for #{issue_number}: {state.claude_session_id}")
+                                            # Create state for this feedback loop
+                                            from services.human_feedback_loop import HumanFeedbackState
 
-                                        # Register and start monitoring
-                                        human_feedback_loop_executor.active_loops[issue_number] = state
-                                        human_feedback_loop_executor.workflow_columns = workflow_template.columns
-
-                                        issue_data = self.get_issue_details(repository, issue_number, project_config.github['org'])
-
-                                        loop_new.run_until_complete(
-                                            human_feedback_loop_executor._conversational_loop(
-                                                state, column, issue_data, project_config.github['org']
+                                            state = HumanFeedbackState(
+                                                issue_number=issue_number,
+                                                repository=repository,
+                                                agent=agent,
+                                                project_name=project_name,
+                                                board_name=board_name,
+                                                workspace_type='issues',
+                                                discussion_id=None  # Issues don't have discussion IDs
                                             )
-                                        )
 
-                                        loop_new.close()
-                                    except Exception as e:
-                                        logger.error(f"Failed to resume feedback loop: {e}")
-                                        import traceback
-                                        logger.error(traceback.format_exc())
+                                            # Load persisted session_id for continuity across restarts
+                                            from services.conversational_session_state import conversational_session_state
+                                            persisted_session = conversational_session_state.load_session(
+                                                project_name=project_name,
+                                                issue_number=issue_number,
+                                                max_age_hours=24
+                                            )
+                                            if persisted_session:
+                                                state.claude_session_id = persisted_session.session_id
+                                                logger.info(f"Restored Claude Code session for #{issue_number}: {state.claude_session_id}")
 
-                                thread = threading.Thread(target=resume_feedback_loop, daemon=True)
-                                thread.start()
-                                logger.info(f"Conversational feedback loop monitoring resumed for issue #{issue_number}")
+                                            # Register and start monitoring
+                                            human_feedback_loop_executor.active_loops[issue_number] = state
+                                            human_feedback_loop_executor.workflow_columns = workflow_template.columns
 
-                                # Return early - we've started the monitoring loop
-                                return agent
+                                            issue_data = self.get_issue_details(repository, issue_number, project_config.github['org'])
 
-                            except Exception as e:
-                                logger.error(f"Failed to start conversational feedback loop thread: {e}")
-                                import traceback
-                                logger.error(traceback.format_exc())
-                                # If resume fails, allow normal startup below
+                                            loop_new.run_until_complete(
+                                                human_feedback_loop_executor._conversational_loop(
+                                                    state, column, issue_data, project_config.github['org']
+                                                )
+                                            )
+
+                                            loop_new.close()
+                                        except Exception as e:
+                                            logger.error(f"Failed to resume feedback loop: {e}")
+                                            import traceback
+                                            logger.error(traceback.format_exc())
+
+                                    thread = threading.Thread(target=resume_feedback_loop, daemon=True)
+                                    thread.start()
+                                    logger.info(f"Conversational feedback loop monitoring resumed for issue #{issue_number}")
+
+                                    # Return early - we've started the monitoring loop
+                                    return agent
+
+                                except Exception as e:
+                                    logger.error(f"Failed to start conversational feedback loop thread: {e}")
+                                    import traceback
+                                    logger.error(traceback.format_exc())
+                                    # If resume fails, allow normal startup below
+                            else:
+                                # No prior work found, will start fresh conversational loop below
+                                logger.debug(f"No prior work found for conversational column, will start fresh loop")
                         else:
                             # For non-review, non-conversational columns in issues workspace
                             # Rely on execution state tracker (already checked above)
@@ -1695,7 +1709,7 @@ _Review cycle initiated by Claude Code Orchestrator_
             )
 
             if not category_id:
-                logger.error(f"Could not determine discussion category for {project_name}/{pipeline_config.board_name}")
+                logger.warning(f"Could not determine discussion category for {project_name}/{pipeline_config.board_name} (GitHub App not configured)")
                 return
 
             # Get repository ID for GraphQL

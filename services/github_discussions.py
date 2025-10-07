@@ -310,7 +310,7 @@ class GitHubDiscussions:
         if result and 'repository' in result:
             return result['repository']['discussionCategories']['nodes']
 
-        logger.error(f"Failed to get discussion categories for {owner}/{repo}")
+        logger.debug(f"Could not get discussion categories for {owner}/{repo} (GitHub App not configured)")
         return []
 
     def find_category_by_name(self, owner: str, repo: str, category_name: str) -> Optional[str]:

@@ -11,7 +11,9 @@ services:
 
   orchestrator:
     build: .
-    user: "1000:0"  # Run as orchestrator user with docker group (GID 0 on macOS Docker Desktop)
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"  # Run as host user
+    group_add:
+      - "${DOCKER_GID:-0}"  # Add docker group for container management (0 on macOS, 984+ on Linux)
     volumes:
       # Mount the orchestrator code (this is clauditoreum/)
       - ./:/app
@@ -31,10 +33,13 @@ services:
       - ~/.gitconfig:/home/orchestrator/.gitconfig:ro
 
       # Mount GitHub App private key directory (optional - accessible by orchestrator user)
-      - ~/.orchestrator:/home/orchestrator/.orchestrator:ro
+      - ~/.orchestrator:/home/orchestrator/.orchestrator
 
-      # Mount Claude Code data directory for usage tracking
-      - ~/.claude:/home/orchestrator/.claude:ro
+      # Mount Claude Code config directory for authentication (Linux: ~/.config/claude, macOS: ~/.claude)
+      # On macOS, config is in ~/.claude; on Linux it's in ~/.config/claude
+      # We mount both to support both platforms (one will be empty/missing on each platform)
+      #- ~/.claude:/home/orchestrator/.claude:ro
+      #- ~/.config/claude:/home/orchestrator/.config/claude:ro
 
       # Share Docker socket for nested containers if needed
       - /var/run/docker.sock:/var/run/docker.sock

@@ -87,18 +87,55 @@ class GitHubProjectManager:
             # Check if board already exists in state
             existing_board = self.state_manager.get_board_by_name(project_name, pipeline_config.board_name)
 
+            # If we have state, verify the board still exists in GitHub
+            if existing_board is not None:
+                logger.info(f"Verifying board exists in GitHub: {pipeline_config.board_name} (#{existing_board.project_number})")
+                board_exists = await self._verify_board_exists(existing_board.project_number, project_config.github['org'])
+
+                if not board_exists:
+                    logger.warning(f"Board #{existing_board.project_number} no longer exists in GitHub, will search for existing board by name")
+                    existing_board = None
+
+            # If no state or board doesn't exist, try to discover existing board by name
             if existing_board is None:
-                # Create new board
-                logger.info(f"Creating board: {pipeline_config.board_name}")
-                board_data = await self._create_project_board(
-                    project_name,
-                    pipeline_config,
-                    project_config
+                logger.info(f"Searching for existing board by name: {pipeline_config.board_name}")
+                discovered_board = await self._discover_board_by_name(
+                    project_config.github['org'],
+                    f"{project_name} - {pipeline_config.description}"
                 )
-                if not board_data:
-                    return False
+
+                if discovered_board:
+                    logger.info(f"Found existing board: {pipeline_config.board_name} (#{discovered_board['number']})")
+                    # Update state with discovered board
+                    workflow_template = self.config_manager.get_workflow_template(pipeline_config.workflow)
+                    columns = await self._configure_board_columns(
+                        discovered_board['number'],
+                        workflow_template,
+                        project_config.github['org']
+                    )
+
+                    self.state_manager.update_board_state(
+                        project_name,
+                        pipeline_config.board_name,
+                        discovered_board['number'],
+                        discovered_board['id'],
+                        discovered_board['node_id'],
+                        columns
+                    )
+                    logger.info(f"Discovered and updated board: {pipeline_config.board_name}")
+                    return True
+                else:
+                    # No existing board found, create new one
+                    logger.info(f"No existing board found, creating new board: {pipeline_config.board_name}")
+                    board_data = await self._create_project_board(
+                        project_name,
+                        pipeline_config,
+                        project_config
+                    )
+                    if not board_data:
+                        return False
             else:
-                logger.info(f"Board exists: {pipeline_config.board_name}, updating columns")
+                logger.info(f"Board exists in GitHub: {pipeline_config.board_name}, updating columns")
                 # Update existing board columns
                 workflow_template = self.config_manager.get_workflow_template(pipeline_config.workflow)
                 project_number = existing_board.project_number
@@ -120,8 +157,6 @@ class GitHubProjectManager:
                         columns
                     )
                     logger.info(f"Updated {len(columns)} columns for board: {pipeline_config.board_name}")
-
-                board_data = existing_board
 
             return True
 
@@ -210,17 +245,29 @@ class GitHubProjectManager:
                 logger.error("Status field not found")
                 return []
 
+            # Get current options from the status field
+            current_options = status_field.get('options', [])
+            current_option_names = set(opt.get('name') for opt in current_options if opt.get('name'))
+
             # Prepare column options from workflow template
-            options = []
+            desired_options = []
+            desired_option_names = set()
             for column in workflow_template.columns:
-                options.append({
+                desired_options.append({
                     "name": column.name,
                     "description": column.description,
                     "color": "GRAY"
                 })
+                desired_option_names.add(column.name)
 
-            # Update the Status field with GraphQL
-            graphql_options = await self._update_status_field_graphql(status_field['id'], options)
+            # Check if options match - if they do, skip the update to preserve statuses
+            if current_option_names == desired_option_names:
+                logger.info(f"Status field options already match configuration, skipping update to preserve item statuses")
+                graphql_options = current_options
+            else:
+                logger.info(f"Status field options differ from configuration, updating: {current_option_names} -> {desired_option_names}")
+                # Update the Status field with GraphQL
+                graphql_options = await self._update_status_field_graphql(status_field['id'], desired_options)
 
             if graphql_options:
                 # Return column data for state management with actual GraphQL option IDs
@@ -479,3 +526,67 @@ class GitHubProjectManager:
             logger.error("Test project creation: TIMEOUT")
         except Exception as e:
             logger.error(f"Cannot test project creation: {e}")
+
+    async def _verify_board_exists(self, project_number: int, org: str) -> bool:
+        """Verify that a project board still exists in GitHub
+
+        Args:
+            project_number: The project number to verify
+            org: GitHub organization
+
+        Returns:
+            True if the board exists, False otherwise
+        """
+        try:
+            cmd = ['gh', 'project', 'view', str(project_number), '--owner', org, '--format', 'json']
+            result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+
+            if result.returncode == 0:
+                return True
+            else:
+                logger.debug(f"Board #{project_number} not found: {result.stderr}")
+                return False
+        except Exception as e:
+            logger.error(f"Error verifying board existence: {e}")
+            return False
+
+    async def _discover_board_by_name(self, org: str, title: str) -> Optional[Dict[str, Any]]:
+        """Discover an existing project board by its title
+
+        Args:
+            org: GitHub organization
+            title: Project board title to search for
+
+        Returns:
+            Dictionary with board info (number, id, node_id) if found, None otherwise
+        """
+        try:
+            # List all projects in the organization
+            cmd = ['gh', 'project', 'list', '--owner', org, '--format', 'json']
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            projects_data = json.loads(result.stdout)
+
+            # Search for a project with matching title
+            projects = projects_data.get('projects', [])
+            for project in projects:
+                if project.get('title') == title:
+                    logger.info(f"Discovered existing board: {title} (#{project.get('number')})")
+                    return {
+                        'number': project.get('number'),
+                        'id': project.get('id'),
+                        'node_id': project.get('id'),  # Use same ID for node_id
+                        'title': project.get('title')
+                    }
+
+            logger.debug(f"No existing board found with title: {title}")
+            return None
+
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Failed to list projects: {e.stderr if e.stderr else str(e)}")
+            return None
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse project list response: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"Error discovering board by name: {e}")
+            return None

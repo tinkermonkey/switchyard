@@ -2,6 +2,8 @@ import subprocess
 import json
 import os
 import logging
+import threading
+import time
 from typing import Dict, Any
 from pathlib import Path
 from claude.docker_runner import docker_runner
@@ -11,8 +13,6 @@ logger = logging.getLogger(__name__)
 
 async def run_claude_code(prompt: str, context: Dict[str, Any]) -> str:
     """Execute Claude Code with given prompt and context"""
-    import time
-
     logger.info("run_claude_code called")
     logger.info(f"Context project: {context.get('project', 'unknown')}")
     logger.info(f"Prompt length: {len(prompt)}")
@@ -175,13 +175,15 @@ Files: {context.get('files', [])}
             if 'CONTEXT7_API_KEY' in os.environ:
                 env['CONTEXT7_API_KEY'] = os.environ['CONTEXT7_API_KEY']
 
-            # ANTHROPIC_API_KEY is optional - if not provided, Claude Code CLI will use
-            # your authenticated Claude.ai session, which uses your subscription
-            if 'ANTHROPIC_API_KEY' in os.environ:
+            # Authentication: CLAUDE_CODE_OAUTH_TOKEN (subscription) or ANTHROPIC_API_KEY (pay-per-use)
+            if 'CLAUDE_CODE_OAUTH_TOKEN' in os.environ:
+                env['CLAUDE_CODE_OAUTH_TOKEN'] = os.environ['CLAUDE_CODE_OAUTH_TOKEN']
+                logger.info("Using CLAUDE_CODE_OAUTH_TOKEN for authentication (subscription billing)")
+            elif 'ANTHROPIC_API_KEY' in os.environ:
                 env['ANTHROPIC_API_KEY'] = os.environ['ANTHROPIC_API_KEY']
                 logger.warning("Using ANTHROPIC_API_KEY for authentication (API billing)")
             else:
-                logger.info("No ANTHROPIC_API_KEY found - Claude Code will use claude.ai session (subscription billing)")
+                logger.warning("No authentication token found - Claude Code may fail if not authenticated")
 
             logger.debug(f"Executing Claude CLI in {work_dir}")
             logger.debug(f"Command: {' '.join(cmd[:3])}...")  # Don't log full prompt
@@ -210,6 +212,24 @@ Files: {context.get('files', [])}
             input_tokens = 0
             output_tokens = 0
             session_id = None  # Track session ID for continuity
+            stderr_lines = []  # Collect stderr for error reporting
+            stdout_raw_lines = []  # Collect all stdout for debugging
+            error_events = []  # Collect error events from stream
+
+            # Read stderr in a separate thread to prevent blocking
+            def read_stderr():
+                try:
+                    for line in iter(process.stderr.readline, ''):
+                        if not line:
+                            break
+                        stderr_lines.append(line.strip())
+                        if line.strip():
+                            logger.warning(f"Claude CLI stderr: {line.strip()}")
+                except Exception as e:
+                    logger.error(f"Error reading stderr: {e}")
+
+            stderr_thread = threading.Thread(target=read_stderr, daemon=True)
+            stderr_thread.start()
 
             # Stream output line by line
             try:
@@ -222,6 +242,9 @@ Files: {context.get('files', [])}
                     if not line:
                         continue
 
+                    # Always capture raw stdout for debugging
+                    stdout_raw_lines.append(line)
+
                     try:
                         event = json.loads(line)
                         event_type = event.get('type', 'unknown')
@@ -229,6 +252,12 @@ Files: {context.get('files', [])}
                         # Log event structure for debugging
                         if event_type not in ['progress', 'status']:
                             logger.debug(f"Stream event type: {event_type}, keys: {list(event.keys())}")
+
+                        # Capture error events
+                        if event_type == 'error':
+                            error_events.append(event)
+                            error_msg = event.get('error', event.get('message', 'Unknown error'))
+                            logger.error(f"Claude CLI error event: {error_msg}")
 
                         # Capture session_id for session continuity
                         if 'session_id' in event and not session_id:
@@ -260,10 +289,14 @@ Files: {context.get('files', [])}
 
                     except json.JSONDecodeError:
                         # Non-JSON output, just log it
-                        logger.debug(f"Non-JSON output: {line[:100]}")
+                        logger.warning(f"Non-JSON stdout line: {line[:200]}")
 
                 # Wait for process to complete
                 process.wait(timeout=600)
+
+                # Wait for stderr thread to finish (with timeout)
+                stderr_thread.join(timeout=5)
+
                 api_duration_ms = (time.time() - api_start_time) * 1000
 
                 # Emit completion event
@@ -282,9 +315,26 @@ Files: {context.get('files', [])}
                     # Return just the result text (callers expect string, not dict)
                     return result_text
                 else:
-                    stderr = process.stderr.read() if process.stderr else "Unknown error"
-                    logger.error(f"Claude CLI failed: {stderr}")
-                    raise Exception(f"Claude Code failed: {stderr}")
+                    # Build comprehensive error message
+                    error_parts = [f"Claude CLI failed with exit code {process.returncode}"]
+
+                    if stderr_lines:
+                        error_parts.append(f"STDERR: {' '.join(stderr_lines)}")
+
+                    if error_events:
+                        error_msgs = [e.get('error', e.get('message', str(e))) for e in error_events]
+                        error_parts.append(f"ERROR EVENTS: {' | '.join(error_msgs)}")
+
+                    # Log last few stdout lines for context
+                    if stdout_raw_lines:
+                        last_lines = stdout_raw_lines[-10:]
+                        logger.error(f"Last {len(last_lines)} stdout lines:")
+                        for i, line in enumerate(last_lines, 1):
+                            logger.error(f"  {i}: {line[:500]}")
+
+                    error_message = ' | '.join(error_parts)
+                    logger.error(error_message)
+                    raise Exception(error_message)
 
             except subprocess.TimeoutExpired:
                 process.kill()

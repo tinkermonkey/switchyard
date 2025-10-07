@@ -123,6 +123,8 @@ class PatternGitHubProcessor:
 async def main():
     """Main entry point"""
     import os
+    from elasticsearch import Elasticsearch
+    from services.elasticsearch_pattern_indices import create_all_indices
 
     # Configure logging
     logging.basicConfig(
@@ -134,6 +136,16 @@ async def main():
     es_hosts = os.getenv("ELASTICSEARCH_HOSTS", "http://elasticsearch:9200").split(",")
     github_owner = os.getenv("GITHUB_ORG", "your-org")
     github_repo = os.getenv("GITHUB_REPO", "orchestrator")
+
+    # Initialize Elasticsearch indices
+    logger.info("Initializing Elasticsearch indices...")
+    try:
+        es_client = Elasticsearch(es_hosts)
+        create_all_indices(es_client)
+        logger.info("Elasticsearch indices initialized")
+    except Exception as e:
+        logger.error(f"Failed to initialize Elasticsearch indices: {e}")
+        logger.warning("Continuing anyway - indices may be created elsewhere")
 
     # Create and run processor
     processor = PatternGitHubProcessor(

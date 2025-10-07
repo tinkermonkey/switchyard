@@ -9,9 +9,15 @@
 // Additionally, you should also exclude this file from your linter and/or formatter to prevent it from being checked or modified.
 
 import { Route as rootRouteImport } from './routes/__root'
+import { Route as ReviewLearningRouteImport } from './routes/review-learning'
 import { Route as PipelineRouteImport } from './routes/pipeline'
 import { Route as IndexRouteImport } from './routes/index'
 
+const ReviewLearningRoute = ReviewLearningRouteImport.update({
+  id: '/review-learning',
+  path: '/review-learning',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const PipelineRoute = PipelineRouteImport.update({
   id: '/pipeline',
   path: '/pipeline',
@@ -26,31 +32,42 @@ const IndexRoute = IndexRouteImport.update({
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/pipeline': typeof PipelineRoute
+  '/review-learning': typeof ReviewLearningRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/pipeline': typeof PipelineRoute
+  '/review-learning': typeof ReviewLearningRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
   '/pipeline': typeof PipelineRoute
+  '/review-learning': typeof ReviewLearningRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
-  fullPaths: '/' | '/pipeline'
+  fullPaths: '/' | '/pipeline' | '/review-learning'
   fileRoutesByTo: FileRoutesByTo
-  to: '/' | '/pipeline'
-  id: '__root__' | '/' | '/pipeline'
+  to: '/' | '/pipeline' | '/review-learning'
+  id: '__root__' | '/' | '/pipeline' | '/review-learning'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   PipelineRoute: typeof PipelineRoute
+  ReviewLearningRoute: typeof ReviewLearningRoute
 }
 
 declare module '@tanstack/react-router' {
   interface FileRoutesByPath {
+    '/review-learning': {
+      id: '/review-learning'
+      path: '/review-learning'
+      fullPath: '/review-learning'
+      preLoaderRoute: typeof ReviewLearningRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/pipeline': {
       id: '/pipeline'
       path: '/pipeline'
@@ -71,6 +88,7 @@ declare module '@tanstack/react-router' {
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   PipelineRoute: PipelineRoute,
+  ReviewLearningRoute: ReviewLearningRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)

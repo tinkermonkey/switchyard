@@ -199,6 +199,9 @@ class PatternAnalysisService:
 
 async def main():
     """Main entry point"""
+    from elasticsearch import Elasticsearch
+    from services.elasticsearch_pattern_indices import create_all_indices
+
     # Configure logging
     logging.basicConfig(
         level=logging.INFO,
@@ -209,6 +212,16 @@ async def main():
     elasticsearch_hosts = [
         os.getenv("ELASTICSEARCH_HOSTS", "http://elasticsearch:9200")
     ]
+
+    # Initialize Elasticsearch indices
+    logger.info("Initializing Elasticsearch indices...")
+    try:
+        es_client = Elasticsearch(elasticsearch_hosts)
+        create_all_indices(es_client)
+        logger.info("Elasticsearch indices initialized")
+    except Exception as e:
+        logger.error(f"Failed to initialize Elasticsearch indices: {e}")
+        logger.warning("Continuing anyway - indices may be created elsewhere")
 
     # Create and run consolidated service
     service = PatternAnalysisService(

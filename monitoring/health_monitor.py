@@ -37,8 +37,12 @@ class HealthMonitor:
 
         overall_health = all(r.get('healthy', False) for r in results.values())
 
+        # Check if any subsystem is degraded
+        degraded = any(r.get('degraded', False) for r in results.values())
+
         health_result = {
             'healthy': overall_health,
+            'degraded': degraded,
             'checks': results,
             'timestamp': datetime.now().isoformat()
         }
@@ -67,18 +71,47 @@ class HealthMonitor:
     async def check_github(self) -> Dict[str, Any]:
         """Check GitHub connectivity and project management permissions"""
         import json
+        from services.github_capabilities import github_capabilities, GitHubCapability
 
-        # Check basic authentication first
+        # Check all capabilities
+        capability_status = github_capabilities.check_capabilities()
+
+        # Check GitHub App authentication status for detailed reporting
+        from services.github_app import github_app
+
+        github_app_status = {
+            'enabled': github_app.enabled
+        }
+
+        if github_app.enabled:
+            # Try to get installation token to verify it works
+            token = github_app.get_installation_token()
+            github_app_status['working'] = token is not None
+            if not token:
+                github_app_status['reason'] = 'Failed to get installation token'
+        else:
+            github_app_status['working'] = False
+            github_app_status['reason'] = 'Not configured (missing app_id, installation_id, or private_key)'
+
+        # Check PAT authentication via gh CLI
         auth_result = subprocess.run(
             ['gh', 'auth', 'status'],
             capture_output=True, text=True
         )
 
+        pat_status = {
+            'authenticated': auth_result.returncode == 0
+        }
+
         if auth_result.returncode != 0:
             return {
                 'healthy': False,
-                'error': f'GitHub authentication failed: {auth_result.stderr}',
-                'auth_status': 'failed'
+                'error': f'GitHub PAT authentication failed: {auth_result.stderr}',
+                'auth_methods': {
+                    'pat': pat_status,
+                    'github_app': github_app_status
+                },
+                'critical': 'At least PAT authentication is required for orchestrator to function'
             }
 
         # Check if we can access user info
@@ -91,7 +124,10 @@ class HealthMonitor:
             return {
                 'healthy': False,
                 'error': f'GitHub API access failed: {user_result.stderr}',
-                'auth_status': 'failed'
+                'auth_methods': {
+                    'pat': {'authenticated': False},
+                    'github_app': github_app_status
+                }
             }
 
         # Load projects from new config system
@@ -130,7 +166,10 @@ class HealthMonitor:
             return {
                 'healthy': False,
                 'error': f'Repository access failed for {org}/{repo}: {repo_result.stderr}',
-                'auth_status': 'authenticated',
+                'auth_methods': {
+                    'pat': {'authenticated': True, 'repo_access': False},
+                    'github_app': github_app_status
+                },
                 'repo_access': 'failed'
             }
 
@@ -145,7 +184,10 @@ class HealthMonitor:
             return {
                 'healthy': False,
                 'error': f'GitHub Projects access failed: {projects_result.stderr}',
-                'auth_status': 'authenticated',
+                'auth_methods': {
+                    'pat': {'authenticated': True, 'repo_access': True, 'projects_access': False},
+                    'github_app': github_app_status
+                },
                 'repo_access': 'granted',
                 'projects_access': 'failed',
                 'critical': 'GitHub Projects v2 access is required for orchestrator to function'
@@ -161,9 +203,18 @@ class HealthMonitor:
                 'projects_access': 'invalid_response'
             }
 
+        # Determine if we have degraded functionality
+        degraded = not github_capabilities.has_capability(GitHubCapability.GITHUB_APP_AUTH)
+
         return {
-            'healthy': True,
-            'auth_status': 'authenticated',
+            'healthy': True,  # Core functionality works with PAT
+            'degraded': degraded,  # Some features unavailable
+            'auth_methods': {
+                'pat': pat_status,
+                'github_app': github_app_status
+            },
+            'capabilities': capability_status['capabilities'],
+            'warnings': capability_status['warnings'],
             'repo_access': 'granted',
             'projects_access': 'granted',
             'tested_org': org,

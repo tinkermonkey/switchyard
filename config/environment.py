@@ -57,6 +57,11 @@ class Environment(BaseSettings):
     metrics_port: int = 8000
     log_level: str = "INFO"
 
+    # Docker/Host Configuration (used by docker-compose for file permissions)
+    host_uid: Optional[int] = 1000
+    host_gid: Optional[int] = 1000
+    docker_gid: Optional[int] = 0
+
     class Config:
         env_file = ".env"
         env_file_encoding = 'utf-8'

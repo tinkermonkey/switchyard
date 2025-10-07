@@ -62,13 +62,20 @@ def health():
         health_data = json.loads(health_json)
 
         # Return the full health check data
+        # Determine status: healthy, degraded, or unhealthy
+        if health_data.get('healthy'):
+            status = 'degraded' if health_data.get('degraded') else 'healthy'
+            status_code = 200
+        else:
+            status = 'unhealthy'
+            status_code = 503
+
         response = {
-            'status': 'healthy' if health_data.get('healthy') else 'unhealthy',
+            'status': status,
             'connected_clients': len(connected_clients),
             'orchestrator': health_data
         }
 
-        status_code = 200 if health_data.get('healthy') else 503
         return jsonify(response), status_code
 
     except Exception as e:

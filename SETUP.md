@@ -47,12 +47,20 @@ GITHUB_TOKEN=ghp_xxxxxxxxxxxxx
 # Anthropic (Required)
 ANTHROPIC_API_KEY=sk-ant-xxxxxxxxxxxxx
 
+# Host Configuration (Auto-detected on Linux, defaults work on macOS)
+HOST_UID=1000                    # Your user ID (run: id -u)
+HOST_GID=1000                    # Your group ID (run: id -g)
+DOCKER_GID=984                   # Docker group ID (run: getent group docker | cut -d: -f3)
+                                 # On macOS, use DOCKER_GID=0
+
 # MCP Servers (Optional but recommended)
 CONTEXT7_MCP_URL=http://localhost:3001
 CONTEXT7_API_KEY=your-context7-key
 SERENA_MCP_URL=http://localhost:3002
 PUPPETEER_MCP_URL=http://localhost:3003
 ```
+
+**Note on HOST_UID/HOST_GID/DOCKER_GID**: These ensure the container can read mounted files like the GitHub App private key. On Linux, set them to your actual IDs. On macOS Docker Desktop, the defaults (1000/1000/0) usually work.
 
 ### 3. GitHub Authentication Setup
 
@@ -81,22 +89,46 @@ You can authenticate with GitHub using either a Personal Access Token (simple) o
 - Better rate limits (5000 req/hour per installation)
 - Granular permissions model
 - Professional appearance
+- Enables Discussions API and advanced GraphQL features
 
 **Quick Setup:**
 
 1. **Create GitHub App**: See [documentation/github_app_setup.md](documentation/github_app_setup.md) for complete guide
-2. **Configure environment**:
+
+2. **Install Private Key**:
+   - **REQUIRED**: Place your GitHub App private key (`.pem` file) at `~/.orchestrator/orchestrator-bot.pem`
+   - The private key file is generated when you create the GitHub App
+   - This file is **required** for GitHub App authentication to work
+   - The orchestrator mounts `~/.orchestrator/` into the container automatically
+
+   ```bash
+   # Create directory and place your .pem file there
+   mkdir -p ~/.orchestrator
+   # Copy your .pem file to ~/.orchestrator/
+   chmod 644 ~/.orchestrator/orchestrator-bot.*.pem
+   ```
+
+   **Important**: The file needs `644` permissions (owner read/write, world read) so the container can read it, especially when using rootless Docker.
+
+3. **Configure environment** in `.env`:
    ```bash
    GITHUB_APP_ID=123456
    GITHUB_APP_INSTALLATION_ID=12345678
-   GITHUB_APP_PRIVATE_KEY_PATH=/path/to/orchestrator-bot.pem
+   GITHUB_APP_PRIVATE_KEY_PATH=/home/orchestrator/.orchestrator/orchestrator-bot.2025-09-30.private-key.pem
    ```
-3. **Test authentication**:
+
+4. **Test authentication**:
    ```bash
    PYTHONPATH=. python scripts/test_github_app.py
    ```
 
 The orchestrator automatically uses GitHub App auth if configured, falling back to PAT if not available.
+
+**⚠️ Important Notes:**
+- GitHub App installations are **organization/repository-specific**, not server-specific
+- You can reuse the same GitHub App and private key across multiple servers
+- Without the `.pem` file, GitHub App authentication will fail and the system runs in degraded mode
+- Check system status at http://localhost:5001/health to verify authentication configuration
 
 ### 4. GitHub CLI Setup
 

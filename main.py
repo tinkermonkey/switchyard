@@ -95,14 +95,20 @@ async def main():
     projects = config_manager.list_projects()
     for project_name in projects:
         failure_count = 0
-        if github_state_manager.needs_reconciliation(project_name):
-            logger.info(f"Reconciling project configuration: {project_name}")
-            success = await github_project_manager.reconcile_project(project_name)
-            if not success:
-                logger.log_error(f"Failed to reconcile project '{project_name}' - GitHub project management is not working")
-                failure_count += 1
+        # Always verify boards exist in GitHub, even if config hasn't changed
+        # This handles the case where the orchestrator is moved to a new system
+        needs_reconcile = github_state_manager.needs_reconciliation(project_name)
+
+        if needs_reconcile:
+            logger.info(f"Reconciling project configuration: {project_name} (config changed)")
         else:
-            logger.info(f"Project '{project_name}' is already synchronized")
+            logger.info(f"Verifying project boards exist in GitHub: {project_name}")
+
+        # Always run reconciliation - it will discover existing boards if they exist
+        success = await github_project_manager.reconcile_project(project_name)
+        if not success:
+            logger.log_error(f"Failed to reconcile project '{project_name}' - GitHub project management is not working")
+            failure_count += 1
 
     # If all of the projects failed to reconcile, exit
     if failure_count == len(projects) and failure_count > 0:
