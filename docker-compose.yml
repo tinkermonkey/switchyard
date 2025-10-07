@@ -33,6 +33,9 @@ services:
       # Mount GitHub App private key directory (optional - accessible by orchestrator user)
       - ~/.orchestrator:/home/orchestrator/.orchestrator:ro
 
+      # Mount Claude Code data directory for usage tracking
+      - ~/.claude:/home/orchestrator/.claude:ro
+
       # Share Docker socket for nested containers if needed
       - /var/run/docker.sock:/var/run/docker.sock
 

@@ -123,32 +123,63 @@ async def main():
     logger.info("Scheduled tasks service started")
 
     # Main orchestration loop
-    logger.info("Entering main orchestration loop")
+    logger.debug("Entering main orchestration loop")
+
+    # Health check state and retry tracking
+    consecutive_health_failures = 0
+    max_consecutive_failures = 10  # Exit only after 10 consecutive failures (transient issues should recover)
+    health_check_backoff = 10  # Start with 10 second backoff
+    max_backoff = 300  # Max 5 minutes between health checks
+    last_health_check = 0
 
     while True:
         try:
-            logger.debug("Loop iteration starting - checking health")
-            # Check health - GitHub failures are FATAL
-            health = await health_monitor.check_health()
-            logger.debug(f"Health check complete: healthy={health['healthy']}")
-            if not health['healthy']:
-                logger.log_error(f"System health check failed: {health}")
+            # Periodic health check with exponential backoff on failures
+            current_time = time.time()
+            if current_time - last_health_check >= health_check_backoff:
+                logger.debug("Running health check")
+                health = await health_monitor.check_health()
+                last_health_check = current_time
+                logger.debug(f"Health check complete: healthy={health['healthy']}")
 
-                # Check specifically for GitHub project management failures
-                github_check = health['checks'].get('github', {})
-                if not github_check.get('healthy', False):
-                    logger.log_error("GitHub connectivity/permissions failed")
-                    if github_check.get('critical'):
-                        logger.log_error(f"Fatal issue: {github_check['critical']}")
-                    if 'projects_access' in github_check and github_check['projects_access'] == 'failed':
-                        logger.log_error("GitHub Projects v2 access is required")
-                        exit(1)
+                if not health['healthy']:
+                    consecutive_health_failures += 1
+                    logger.log_warning(f"System health check failed (attempt {consecutive_health_failures}/{max_consecutive_failures}): {health}")
+
+                    # Check specifically for GitHub project management failures
+                    github_check = health['checks'].get('github', {})
+                    if not github_check.get('healthy', False):
+                        error_msg = github_check.get('error', 'Unknown error')
+
+                        # Check if this is a transient network error
+                        is_transient = any(keyword in error_msg.lower() for keyword in [
+                            'eof', 'timeout', 'connection', 'network', 'temporary'
+                        ])
+
+                        if is_transient:
+                            logger.log_warning(f"Transient GitHub connectivity issue detected: {error_msg}")
+                            logger.log_warning(f"Will retry with {health_check_backoff}s backoff")
+                            # Exponential backoff for transient errors
+                            health_check_backoff = min(health_check_backoff * 2, max_backoff)
+                        else:
+                            logger.log_error(f"GitHub connectivity/permissions failed: {error_msg}")
+                            if github_check.get('critical'):
+                                logger.log_error(f"Critical issue: {github_check['critical']}")
+
+                            # Only exit if we've failed consistently (not a transient issue)
+                            if consecutive_health_failures >= max_consecutive_failures:
+                                logger.log_error(f"GitHub access has failed {max_consecutive_failures} consecutive times")
+                                logger.log_error("Exiting due to persistent GitHub connectivity failure")
+                                exit(1)
                     else:
-                        logger.log_error("GitHub access is required for core functionality")
-                        exit(1)
-
-                # Non-GitHub health issues can continue with warnings
-                logger.log_warning("Non-critical health check failures detected - monitoring for issues")
+                        # Non-GitHub health issues can continue with warnings
+                        logger.log_warning("Non-critical health check failures detected - continuing with degraded functionality")
+                else:
+                    # Health check passed - reset counters and backoff
+                    if consecutive_health_failures > 0:
+                        logger.info(f"Health check recovered after {consecutive_health_failures} failures")
+                    consecutive_health_failures = 0
+                    health_check_backoff = 10  # Reset to 10 seconds
 
             # Process next task
             logger.debug("Checking task queue for new tasks")

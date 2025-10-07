@@ -28,6 +28,8 @@ class Environment(BaseSettings):
     claude_model: str = "claude-sonnet-4-5-20250929"
     max_tokens: int = 100000
     temperature: float = 0.3
+    claude_code_weekly_token_quota: Optional[int] = 630000000  # Weekly token quota (630M tokens, resets Wed 5PM)
+    claude_code_session_token_quota: Optional[int] = 50000000  # Session token quota (50M tokens per 5-hour block)
 
     # GitHub Configuration
     github_org: Optional[str] = None

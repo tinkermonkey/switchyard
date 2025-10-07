@@ -43,11 +43,40 @@ def handle_disconnect():
 
 @app.route('/health')
 def health():
-    """Health check endpoint"""
-    return jsonify({
-        'status': 'healthy',
-        'connected_clients': len(connected_clients)
-    })
+    """Health check endpoint - returns orchestrator health status"""
+    import json
+
+    # Get last health check result from Redis (cross-process shared state)
+    try:
+        redis_client = redis.Redis(host='redis', port=6379, decode_responses=True)
+        health_json = redis_client.get('orchestrator:health')
+
+        if health_json is None:
+            # No health check has run yet
+            return jsonify({
+                'status': 'starting',
+                'message': 'Orchestrator is starting, no health check completed yet',
+                'connected_clients': len(connected_clients)
+            }), 503
+
+        health_data = json.loads(health_json)
+
+        # Return the full health check data
+        response = {
+            'status': 'healthy' if health_data.get('healthy') else 'unhealthy',
+            'connected_clients': len(connected_clients),
+            'orchestrator': health_data
+        }
+
+        status_code = 200 if health_data.get('healthy') else 503
+        return jsonify(response), status_code
+
+    except Exception as e:
+        return jsonify({
+            'status': 'error',
+            'message': f'Failed to retrieve health status: {str(e)}',
+            'connected_clients': len(connected_clients)
+        }), 503
 
 @app.route('/history')
 def get_history():
