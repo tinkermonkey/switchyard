@@ -79,6 +79,7 @@ services:
     build: .
     volumes:
       - ./:/app
+      - ..:/workspace:ro  # Mount workspace read-only for git branch monitoring
     environment:
       - REDIS_URL=redis://redis:6379
     depends_on:

@@ -511,8 +511,31 @@ git push --force-with-lease
         feature_branch = self.get_feature_branch_for_issue(project, issue_number)
 
         if not feature_branch:
-            logger.error(f"No feature branch found for issue #{issue_number}")
-            return {"success": False}
+            # This is a standalone issue without parent tracking
+            # Still commit and push, but skip state management
+            logger.info(f"No feature branch state for issue #{issue_number} - handling as standalone")
+
+            try:
+                # Commit and push standalone branch
+                await self.git_add_all(project_dir)
+                await self.git_commit(project_dir, commit_message)
+
+                # Determine standalone branch name
+                from services.git_workflow_manager import git_workflow_manager
+                branch_name = await git_workflow_manager.get_current_branch(project_dir)
+
+                await self.git_push(project_dir, branch_name)
+
+                logger.info(f"Pushed standalone changes for issue #{issue_number} to {branch_name}")
+
+                return {
+                    "success": True,
+                    "branch_name": branch_name,
+                    "standalone": True
+                }
+            except Exception as e:
+                logger.error(f"Failed to finalize standalone branch for issue #{issue_number}: {e}")
+                return {"success": False, "error": str(e)}
 
         # Step 1: Commit changes
         await self.git_add_all(project_dir)

@@ -349,6 +349,21 @@ workflow_templates:
             parameters:
               stage: "environment_setup"
 
+      - name: "Verification"
+        stage_mapping: "environment_verification"
+        agent: "dev_environment_verifier"
+        auto_advance_on_approval: true
+        description: "Verify Docker image built successfully"
+        automation_rules:
+          - trigger: "item_moved_to_column"
+            action: "assign_label"
+            parameters:
+              labels: ["stage:environment-verification"]
+          - trigger: "item_moved_to_column"
+            action: "execute_stage"
+            parameters:
+              stage: "environment_verification"
+
       - name: "Done"
         stage_mapping: null
         agent: null
@@ -381,6 +396,9 @@ pipeline_labels:
 
 # Common stage labels
 stage_labels:
+  - name: "stage:backlog-refinement"
+    color: "cfd3d7"
+    description: "Backlog refinement stage"
   - name: "stage:research"
     color: "cfd3d7"
     description: "Research stage"
@@ -426,6 +444,9 @@ stage_labels:
   - name: "stage:environment-setup"
     color: "cfd3d7"
     description: "Environment setup stage"
+  - name: "stage:environment-verification"
+    color: "cfd3d7"
+    description: "Environment verification stage"
   - name: "status:in-development"
     color: "fbca04"
     description: "Epic in development - tracking sub-issues"

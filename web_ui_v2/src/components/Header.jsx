@@ -174,18 +174,18 @@ export default function Header() {
       {/* System Health Alert Banner */}
       {systemHealth && (systemHealth.status === 'unhealthy' || systemHealth.status === 'degraded' || systemHealth.status === 'starting' || systemHealth.status === 'error') && (
         <div className={`p-4 rounded-md border ${systemHealth.status === 'error' || systemHealth.status === 'unhealthy'
-            ? 'bg-red-50 dark:bg-red-900/20 border-gh-danger'
-            : 'bg-yellow-50 dark:bg-yellow-900/20 border-yellow-500'
+          ? 'bg-red-50 dark:bg-red-900/20 border-gh-danger'
+          : 'bg-yellow-50 dark:bg-yellow-900/20 border-yellow-500'
           }`}>
           <div className="flex items-start gap-3">
             <AlertTriangle className={`w-5 h-5 mt-0.5 ${systemHealth.status === 'error' || systemHealth.status === 'unhealthy'
-                ? 'text-gh-danger'
-                : 'text-yellow-600 dark:text-yellow-500'
+              ? 'text-gh-danger'
+              : 'text-yellow-600 dark:text-yellow-500'
               }`} />
             <div className="flex-1">
               <h3 className={`font-semibold mb-1 ${systemHealth.status === 'error' || systemHealth.status === 'unhealthy'
-                  ? 'text-gh-danger'
-                  : 'text-yellow-800 dark:text-yellow-300'
+                ? 'text-gh-danger'
+                : 'text-yellow-800 dark:text-yellow-300'
                 }`}>
                 {systemHealth.status === 'starting' && 'System Starting Up'}
                 {systemHealth.status === 'error' && 'Health Check Error'}
@@ -231,8 +231,8 @@ export default function Header() {
       {/* Circuit Breaker Alert Banner */}
       {(cbSummary.open > 0 || cbSummary.half_open > 0) && (
         <div className={`p-4 rounded-md border ${cbSummary.open > 0
-            ? 'bg-red-50 dark:bg-red-900/20 border-gh-danger'
-            : 'bg-yellow-50 dark:bg-yellow-900/20 border-yellow-500'
+          ? 'bg-red-50 dark:bg-red-900/20 border-gh-danger'
+          : 'bg-yellow-50 dark:bg-yellow-900/20 border-yellow-500'
           }`}>
           <div className="flex items-start gap-3">
             <AlertTriangle className={`w-5 h-5 mt-0.5 ${cbSummary.open > 0 ? 'text-gh-danger' : 'text-yellow-600 dark:text-yellow-500'
@@ -294,21 +294,21 @@ export default function Header() {
             </h1>
             <div className="flex gap-2 flex-wrap">
               <span className={`inline-block px-3 py-1 rounded-full text-xs font-semibold ${connected
-                  ? 'bg-gh-success text-white'
-                  : 'bg-gh-danger text-white'
+                ? 'bg-gh-success text-white'
+                : 'bg-gh-danger text-white'
                 }`}>
                 {connected ? 'Connected' : 'Disconnected'}
               </span>
 
-              {/* System Health Badge */}
-              {systemHealth && (
+              {/* Only show health if connected */}
+              {connected && systemHealth && (
                 <span className={`inline-block px-3 py-1 rounded-full text-xs font-semibold ${systemHealth.status === 'healthy'
-                    ? 'bg-gh-success text-white'
-                    : systemHealth.status === 'degraded'
+                  ? 'bg-gh-success text-white'
+                  : systemHealth.status === 'degraded'
+                    ? 'bg-yellow-500 text-white'
+                    : systemHealth.status === 'starting'
                       ? 'bg-yellow-500 text-white'
-                      : systemHealth.status === 'starting'
-                        ? 'bg-yellow-500 text-white'
-                        : 'bg-gh-danger text-white'
+                      : 'bg-gh-danger text-white'
                   }`}>
                   {systemHealth.status === 'healthy' && 'System Healthy'}
                   {systemHealth.status === 'degraded' && 'Degraded Mode'}
@@ -318,13 +318,16 @@ export default function Header() {
               )}
 
               {/* Circuit Breaker Badge */}
-              {cbSummary.open === 0 && cbSummary.half_open === 0 && (
+              {connected && (cbSummary.open === 0 && cbSummary.half_open === 0) && (
                 <span className="inline-block px-3 py-1 rounded-full text-xs font-semibold bg-gh-success text-white">
                   All Breakers Closed
                 </span>
               )}
-
-
+              {connected && (cbSummary.open > 0 || cbSummary.half_open > 0) && (
+                <span className={`inline-block px-3 py-1 rounded-full text-xs font-semibold ${cbSummary.open > 0 ? 'bg-gh-danger text-white' : 'bg-yellow-500 text-white'}`}>
+                  {cbSummary.open > 0 ? `${cbSummary.open} Breaker${cbSummary.open > 1 ? 's' : ''} Open` : 'Some Breakers Half Open'}
+                </span>
+              )}
             </div>
           </div>
 

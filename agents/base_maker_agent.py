@@ -149,6 +149,7 @@ class MakerAgent(PipelineStage, ABC):
 - Your changes will be auto-committed to git
 - Also provide a summary of your work as markdown for the GitHub comment
 - Use proper markdown formatting (headers, lists, code blocks)
+- **DO NOT include internal planning dialog**: Do not include statements like "Let me research...", "I'll examine...", "Now let me check...", etc. in your GitHub comment summary. Only include the final summary of what you did.
 """
 
         # Agents that only analyze/review get restrictive instructions
@@ -164,6 +165,7 @@ class MakerAgent(PipelineStage, ABC):
 - Focus on WHAT needs to be done, not HOW or WHEN
 - Be specific and factual, avoid hypotheticals and hyperbole
 - Use proper markdown formatting (headers, lists, code blocks)
+- **DO NOT include internal planning dialog**: Do not include statements like "Let me research...", "I'll examine...", "Now let me check...", etc. Only include the final analysis/findings.
 """
 
     # ==================================================================================
@@ -260,6 +262,7 @@ You are in **conversational mode**:
 4. **Natural Tone**: Professional but approachable ("I", "you")
 5. **Stay Focused**: Answer the specific question
 6. **Clarify if Needed**: Ask follow-up questions if unclear
+7. **NO Internal Planning Dialog**: Do not include statements like "Let me research...", "I'll examine...", "Now let me check...". Just provide the findings directly.
 
 **Response Format**:
 - Use markdown for clarity (bold, lists, code blocks)

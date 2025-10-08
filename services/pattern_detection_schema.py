@@ -350,13 +350,19 @@ def enrich_claude_log(log_data: dict) -> dict:
         Enriched log ready for Elasticsearch
     """
     from datetime import datetime
+    import copy
+
+    # Convert timestamp to ISO format for raw_event to avoid parsing issues
+    raw_event = copy.deepcopy(log_data)
+    if "timestamp" in raw_event and isinstance(raw_event["timestamp"], (int, float)):
+        raw_event["timestamp"] = datetime.fromtimestamp(raw_event["timestamp"]).isoformat()
 
     enriched = {
         "timestamp": datetime.fromtimestamp(log_data.get("timestamp", datetime.now().timestamp())).isoformat(),
         "agent_name": log_data.get("agent"),
         "project": log_data.get("project"),
         "task_id": log_data.get("task_id"),
-        "raw_event": log_data
+        "raw_event": raw_event
     }
 
     # Extract from nested event structure

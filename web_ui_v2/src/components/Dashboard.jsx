@@ -1,5 +1,5 @@
 import { Link } from '@tanstack/react-router'
-import { Activity, GitBranch, Sparkles } from 'lucide-react'
+import { Activity, GitBranch, Sparkles, FolderGit2 } from 'lucide-react'
 import Header from './Header'
 import AgentState from './AgentState'
 import LiveLogs from './LiveLogs'
@@ -46,6 +46,18 @@ export default function Dashboard() {
         >
           <Sparkles className="inline w-4 h-4 mr-2" />
           Review Learning
+        </Link>
+        <Link
+          to="/projects"
+          activeProps={{
+            className: "px-4 py-2 bg-gh-accent-emphasis border border-gh-accent-primary rounded-md hover:bg-gh-accent-primary transition-colors text-sm text-white"
+          }}
+          inactiveProps={{
+            className: "px-4 py-2 bg-gh-canvas-subtle border border-gh-border rounded-md hover:bg-gh-border-muted transition-colors text-sm"
+          }}
+        >
+          <FolderGit2 className="inline w-4 h-4 mr-2" />
+          Projects
         </Link>
       </div>
 

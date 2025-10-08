@@ -32,9 +32,7 @@ class BusinessAnalystAgent(MakerAgent):
         return [
             "Executive Summary",
             "Functional Requirements",
-            "Non-Functional Requirements",
-            "User Stories (INVEST + Given-When-Then)",
-            "Risks and Assumptions"
+            "User Stories",
         ]
 
     # ==================================================================================

@@ -12,6 +12,10 @@ from flask_cors import CORS
 import threading
 from elasticsearch import Elasticsearch
 from services.logging_config import setup_service_logging
+import subprocess
+from pathlib import Path
+from datetime import datetime
+import time
 
 # Setup logging with reduced verbosity
 logger = setup_service_logging('observability_server')
@@ -25,6 +29,10 @@ es_client = Elasticsearch(['http://elasticsearch:9200'])
 
 # Track connected clients
 connected_clients = set()
+
+# Git branch data cache
+git_branch_cache = {}
+git_branch_cache_lock = threading.Lock()
 
 @socketio.on('connect')
 def handle_connect():
@@ -857,6 +865,316 @@ def get_circuit_breakers():
             'circuit_breakers': []
         }), 500
 
+def collect_git_branch_data(project_name, workspace_path):
+    """Collect git branch information for a project"""
+    try:
+        if not workspace_path.exists() or not (workspace_path / '.git').exists():
+            return None
+
+        branch_data = {
+            'current_branch': None,
+            'branches': [],
+            'collected_at': datetime.now().isoformat()
+        }
+
+        # Set git config to trust the directory (handles ownership mismatches)
+        subprocess.run(
+            ['git', 'config', '--global', '--add', 'safe.directory', str(workspace_path)],
+            capture_output=True,
+            timeout=5
+        )
+
+        # Get current branch
+        result = subprocess.run(
+            ['git', '-C', str(workspace_path), 'rev-parse', '--abbrev-ref', 'HEAD'],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        if result.returncode == 0:
+            branch_data['current_branch'] = result.stdout.strip()
+
+        # Get all local branches with their tracking info
+        result = subprocess.run(
+            ['git', '-C', str(workspace_path), 'branch', '-vv'],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+
+        if result.returncode == 0:
+            for line in result.stdout.strip().split('\n'):
+                if not line.strip():
+                    continue
+
+                # Parse branch line (format: "* branch_name commit_hash [remote/branch] commit message")
+                is_current = line.startswith('*')
+                parts = line.strip().lstrip('* ').split(None, 1)
+
+                if not parts:
+                    continue
+
+                branch_name = parts[0]
+
+                # Extract tracking branch if present
+                tracking_branch = None
+                if '[' in line and ']' in line:
+                    tracking_start = line.index('[') + 1
+                    tracking_end = line.index(']')
+                    tracking_info = line[tracking_start:tracking_end]
+                    # Remove ahead/behind info if present
+                    tracking_branch = tracking_info.split(':')[0].strip()
+
+                # Get file changes for this branch
+                file_changes = []
+
+                # Compare to remote tracking branch or main/master
+                compare_target = tracking_branch if tracking_branch else 'origin/main'
+
+                # Get diff stat
+                diff_result = subprocess.run(
+                    ['git', '-C', str(workspace_path), 'diff', '--stat', compare_target, branch_name],
+                    capture_output=True,
+                    text=True,
+                    timeout=5
+                )
+
+                if diff_result.returncode == 0 and diff_result.stdout.strip():
+                    for diff_line in diff_result.stdout.strip().split('\n'):
+                        if '|' in diff_line and not diff_line.strip().endswith('changed'):
+                            # Parse git diff stat line (format: " file.txt | 10 +++++-----")
+                            file_part = diff_line.split('|')[0].strip()
+                            stat_part = diff_line.split('|')[1].strip() if '|' in diff_line else ''
+
+                            # Extract insertions/deletions from stat
+                            insertions = stat_part.count('+')
+                            deletions = stat_part.count('-')
+
+                            file_changes.append({
+                                'file': file_part,
+                                'insertions': insertions,
+                                'deletions': deletions,
+                                'change_type': 'modified'
+                            })
+
+                # Get untracked/new files
+                status_result = subprocess.run(
+                    ['git', '-C', str(workspace_path), 'diff', '--name-status', compare_target, branch_name],
+                    capture_output=True,
+                    text=True,
+                    timeout=5
+                )
+
+                if status_result.returncode == 0:
+                    for status_line in status_result.stdout.strip().split('\n'):
+                        if not status_line.strip():
+                            continue
+                        parts = status_line.split(None, 1)
+                        if len(parts) >= 2:
+                            status_char = parts[0]
+                            file_name = parts[1]
+
+                            # Check if we already have this file from diff stat
+                            if not any(fc['file'] == file_name for fc in file_changes):
+                                change_type = 'modified'
+                                if status_char == 'A':
+                                    change_type = 'added'
+                                elif status_char == 'D':
+                                    change_type = 'deleted'
+                                elif status_char == 'M':
+                                    change_type = 'modified'
+
+                                file_changes.append({
+                                    'file': file_name,
+                                    'insertions': 0,
+                                    'deletions': 0,
+                                    'change_type': change_type
+                                })
+
+                branch_info = {
+                    'name': branch_name,
+                    'is_current': is_current,
+                    'tracking_branch': tracking_branch,
+                    'file_changes': file_changes,
+                    'total_files_changed': len(file_changes)
+                }
+
+                branch_data['branches'].append(branch_info)
+
+        return branch_data
+
+    except subprocess.TimeoutExpired:
+        logger.error(f"Git command timeout for project {project_name}")
+        return None
+    except Exception as e:
+        logger.error(f"Error collecting git branch data for {project_name}: {e}")
+        return None
+
+def git_branch_collector_thread():
+    """Background thread that periodically collects git branch data"""
+    from config.manager import config_manager
+
+    while True:
+        try:
+            # Also check /app (clauditoreum itself) for git data
+            app_path = Path("/app")
+            if (app_path / '.git').exists():
+                branch_data = collect_git_branch_data('clauditoreum', app_path)
+                if branch_data:
+                    with git_branch_cache_lock:
+                        git_branch_cache['clauditoreum'] = branch_data
+                    logger.debug("Updated git branch cache for clauditoreum")
+
+            # Check configured projects in workspace
+            project_configs = config_manager.list_projects()
+
+            for project_name in project_configs:
+                workspace_path = Path(f"/workspace/{project_name}")
+
+                if workspace_path.exists():
+                    branch_data = collect_git_branch_data(project_name, workspace_path)
+
+                    if branch_data:
+                        with git_branch_cache_lock:
+                            git_branch_cache[project_name] = branch_data
+                        logger.debug(f"Updated git branch cache for {project_name}")
+
+            # Sleep for 30 seconds
+            time.sleep(30)
+
+        except Exception as e:
+            logger.error(f"Error in git branch collector: {e}")
+            time.sleep(30)
+
+@app.route('/api/projects', methods=['GET'])
+def get_projects():
+    """Get all configured projects with their dev container status and other metadata"""
+    try:
+        from config.manager import config_manager
+        from services.dev_container_state import dev_container_state
+        from pathlib import Path
+        import os
+
+        projects = []
+
+        # Add clauditoreum itself as a special project for git monitoring
+        app_path = Path("/app")
+        if (app_path / '.git').exists():
+            git_branches = None
+            with git_branch_cache_lock:
+                git_branches = git_branch_cache.get('clauditoreum')
+
+            projects.append({
+                'name': 'clauditoreum',
+                'github': {
+                    'org': 'tinkermonkey',
+                    'repo': 'clauditoreum',
+                    'url': 'https://github.com/tinkermonkey/clauditoreum'
+                },
+                'pipelines': [],
+                'workspace': {
+                    'path': '/app',
+                    'exists': True,
+                    'git_branches': git_branches
+                },
+                'dev_container': {
+                    'status': 'n/a',
+                    'image_name': None,
+                    'updated_at': None,
+                    'error_message': None
+                }
+            })
+
+        # Get all configured projects from config manager
+        project_configs = config_manager.list_projects()
+
+        for project_name in project_configs:
+            try:
+                # Get project config
+                project_config = config_manager.get_project_config(project_name)
+
+                if not project_config:
+                    continue
+
+                # Get dev container status
+                container_status = dev_container_state.get_status(project_name)
+                image_name = dev_container_state.get_image_name(project_name)
+
+                # Read state file for more details
+                state_file = dev_container_state.get_state_file(project_name)
+                state_details = {}
+                if state_file.exists():
+                    import yaml
+                    with open(state_file, 'r') as f:
+                        state_details = yaml.safe_load(f) or {}
+
+                # Check if project directory exists
+                workspace_path = Path(f"/workspace/{project_name}")
+                project_exists = workspace_path.exists()
+
+                # Get GitHub info
+                github_info = {}
+                if hasattr(project_config, 'github'):
+                    github_info = {
+                        'org': project_config.github.get('org'),
+                        'repo': project_config.github.get('repo'),
+                        'url': f"https://github.com/{project_config.github.get('org')}/{project_config.github.get('repo')}"
+                    }
+
+                # Get pipeline info
+                pipelines = []
+                if hasattr(project_config, 'pipelines') and project_config.pipelines:
+                    # pipelines is a list of ProjectPipeline objects
+                    pipelines = [p.name for p in project_config.pipelines if hasattr(p, 'name')]
+
+                # Get cached git branch data
+                git_branches = None
+                with git_branch_cache_lock:
+                    git_branches = git_branch_cache.get(project_name)
+
+                projects.append({
+                    'name': project_name,
+                    'github': github_info,
+                    'pipelines': pipelines,
+                    'workspace': {
+                        'path': str(workspace_path),
+                        'exists': project_exists,
+                        'git_branches': git_branches
+                    },
+                    'dev_container': {
+                        'status': container_status.value,
+                        'image_name': image_name,
+                        'updated_at': state_details.get('updated_at'),
+                        'error_message': state_details.get('error_message')
+                    }
+                })
+
+            except Exception as e:
+                logger.error(f"Error getting status for project {project_name}: {e}")
+                projects.append({
+                    'name': project_name,
+                    'error': str(e),
+                    'dev_container': {
+                        'status': 'error'
+                    }
+                })
+
+        return jsonify({
+            'success': True,
+            'projects': projects,
+            'count': len(projects)
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Error fetching project status: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return jsonify({
+            'success': False,
+            'error': str(e),
+            'projects': []
+        }), 500
+
 def redis_subscriber_thread():
     """Background thread that listens to Redis pub/sub and broadcasts to WebSocket clients"""
     try:
@@ -900,6 +1218,10 @@ def start_observability_server(host='0.0.0.0', port=5001):
     # Start Redis subscriber in background thread
     subscriber = threading.Thread(target=redis_subscriber_thread, daemon=True)
     subscriber.start()
+
+    # Start git branch collector in background thread
+    git_collector = threading.Thread(target=git_branch_collector_thread, daemon=True)
+    git_collector.start()
 
     logger.info(f"Starting observability server on {host}:{port}")
     socketio.run(app, host=host, port=port, debug=False, allow_unsafe_werkzeug=True)
