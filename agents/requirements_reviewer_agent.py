@@ -51,21 +51,12 @@ class RequirementsReviewerAgent(PipelineStage):
 
         # Debug logging
         logger.debug(f"Context keys: {list(context.keys())}")
-        logger.debug(f"Task context keys: {list(task_context.keys())}")
-        logger.debug(f"Has previous_stage_output in task_context: {'previous_stage_output' in task_context}")
         if 'previous_stage_output' in task_context:
             prev_out = task_context.get('previous_stage_output', '')
             logger.debug(f"previous_stage_output length: {len(prev_out)}")
-            logger.debug(f"previous_stage_output preview: {prev_out[:200] if prev_out else 'EMPTY'}")
 
         # Get the previous stage output (from business_analyst or revision)
         previous_stage = task_context.get('previous_stage_output', '')
-
-        # CRITICAL DEBUG LOGGING
-        logger.info(f"CONTEXT DEBUG - task_context keys: {list(task_context.keys())}")
-        logger.info(f"CONTEXT DEBUG - previous_stage_output present: {'previous_stage_output' in task_context}")
-        logger.info(f"CONTEXT DEBUG - previous_stage_output length: {len(previous_stage) if previous_stage else 0}")
-        logger.info(f"CONTEXT DEBUG - previous_stage_output preview: {previous_stage[:500] if previous_stage else 'EMPTY'}")
 
         if not previous_stage:
             logger.error(f"No previous_stage_output found. Task context: {json.dumps(task_context, indent=2)[:500]}")

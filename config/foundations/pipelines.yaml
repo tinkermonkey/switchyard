@@ -24,7 +24,7 @@ pipeline_templates:
         timeout: 300
         retries: 3
         review_required: true
-        reviewer_agent: "product_manager"
+        reviewer_agent: "requirements_reviewer"
         reviewer_timeout: 300
         reviewer_retries: 2
         escalation:
@@ -88,6 +88,15 @@ pipeline_templates:
         default_agent: "dev_environment_setup"
         timeout: 1800
         retries: 3
+        review_required: false
+
+      - stage: "environment_verification"
+        name: "Environment Verification"
+        required_capabilities: ["environment_verification", "docker_image_validation"]
+        default_agent: "dev_environment_verifier"
+        inputs_from: ["dev_environment_setup"]
+        timeout: 300
+        retries: 2
         review_required: false
 
   sdlc_execution:

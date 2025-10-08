@@ -473,6 +473,11 @@ class PatternDailyAggregator:
         try:
             response = self.es.search(index="agent-logs-*", body=query)
 
+            # Check if aggregations exist in response
+            if 'aggregations' not in response:
+                logger.debug(f"No aggregations in correlation response for pattern {pattern_name} (likely no matching logs)")
+                return None
+
             return {
                 "hourly_distribution": response['aggregations']['by_hour']['buckets'],
                 "project_errors": response['aggregations']['by_project']['buckets']

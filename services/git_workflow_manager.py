@@ -431,6 +431,24 @@ class GitWorkflowManager:
         except subprocess.TimeoutExpired:
             raise Exception("Pull rebase timed out")
 
+    async def get_current_branch(self, project_dir: str) -> str:
+        """Get the current branch name"""
+        try:
+            result = subprocess.run(
+                ['git', 'rev-parse', '--abbrev-ref', 'HEAD'],
+                cwd=project_dir,
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=True
+            )
+
+            return result.stdout.strip()
+
+        except Exception as e:
+            logger.error(f"Failed to get current branch: {e}")
+            raise
+
     async def branch_exists(self, project_dir: str, branch_name: str) -> bool:
         """Check if a branch exists locally"""
         try:

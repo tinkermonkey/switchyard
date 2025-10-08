@@ -7,6 +7,7 @@ of the Software Development Lifecycle (SDLC) based on the vision document.
 
 # Import all agent classes for easy access
 from .dev_environment_setup_agent import DevEnvironmentSetupAgent
+from .dev_environment_verifier_agent import DevEnvironmentVerifierAgent
 from .idea_researcher_agent import IdeaResearcherAgent
 from .business_analyst_agent import BusinessAnalystAgent
 from .product_manager_agent import ProductManagerAgent
@@ -26,6 +27,7 @@ from .documentation_editor_agent import DocumentationEditorAgent
 # Agent registry mapping agent names to classes
 AGENT_REGISTRY = {
     "dev_environment_setup": DevEnvironmentSetupAgent,
+    "dev_environment_verifier": DevEnvironmentVerifierAgent,
     "idea_researcher": IdeaResearcherAgent,
     "business_analyst": BusinessAnalystAgent,
     "product_manager": ProductManagerAgent,
@@ -46,6 +48,7 @@ AGENT_REGISTRY = {
 # Export all agents and registry
 __all__ = [
     "DevEnvironmentSetupAgent",
+    "DevEnvironmentVerifierAgent",
     "IdeaResearcherAgent",
     "BusinessAnalystAgent",
     "ProductManagerAgent",

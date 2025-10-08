@@ -78,11 +78,11 @@ class AgentExecutor:
         agent_config = agent_stage.agent_config or {}
         self.obs.emit_agent_initialized(agent_name, task_id, project_name, agent_config)
 
-        # Prepare feature branch if issue_number present
-        branch_name = None
+        # Prepare workspace using abstraction layer
+        workspace_context = None
         if 'issue_number' in task_context:
             try:
-                from services.feature_branch_manager import feature_branch_manager
+                from services.workspace import WorkspaceContextFactory
                 from services.github_integration import GitHubIntegration
 
                 # Get project config to determine repo info
@@ -93,21 +93,27 @@ class AgentExecutor:
                     if repo_owner and repo_name:
                         gh_integration = GitHubIntegration(repo_owner=repo_owner, repo_name=repo_name)
 
-                        issue_title = task_context.get('issue_title', '')
-                        branch_name = await feature_branch_manager.prepare_feature_branch(
+                        # Create workspace context based on type
+                        workspace_type = task_context.get('workspace_type', 'issues')
+                        workspace_context = WorkspaceContextFactory.create(
+                            workspace_type=workspace_type,
                             project=project_name,
                             issue_number=task_context['issue_number'],
-                            github_integration=gh_integration,
-                            issue_title=issue_title
+                            task_context=task_context,
+                            github_integration=gh_integration
                         )
 
-                        # Add branch name to context so agent can use it
-                        task_context['branch_name'] = branch_name
-                        logger.info(f"Prepared feature branch: {branch_name}")
+                        # Prepare workspace (git branch OR discussion context)
+                        prep_result = await workspace_context.prepare_execution()
+                        task_context.update(prep_result)
+
+                        logger.info(
+                            f"Prepared {workspace_type} workspace: {prep_result.get('branch_name', prep_result.get('discussion_id'))}"
+                        )
 
             except Exception as e:
-                logger.warning(f"Failed to prepare feature branch: {e}")
-                # Continue execution even if branch preparation fails
+                logger.warning(f"Failed to prepare workspace: {e}")
+                # Continue execution even if workspace preparation fails
 
         # Execute agent
         start_time = time.time()
@@ -120,35 +126,23 @@ class AgentExecutor:
             # Post agent output to GitHub (centralized posting)
             await self._post_agent_output_to_github(agent_name, task_context, result)
 
-            # Finalize feature branch work if issue_number present
-            if 'issue_number' in task_context and branch_name:
+            # Finalize workspace using abstraction layer
+            if workspace_context:
                 try:
-                    from services.feature_branch_manager import feature_branch_manager
+                    commit_message = f"Complete work for issue #{task_context['issue_number']}\n\nAgent: {agent_name}\nTask: {task_id}"
 
-                    # Get project config for repo info
-                    project_config = config_manager.get_project_config(project_name)
-                    if project_config and hasattr(project_config, 'github'):
-                        repo_owner = project_config.github.get('org')
-                        repo_name = project_config.github.get('repo')
-                        if repo_owner and repo_name:
-                            gh_integration = GitHubIntegration(repo_owner=repo_owner, repo_name=repo_name)
+                    finalize_result = await workspace_context.finalize_execution(
+                        result=result,
+                        commit_message=commit_message
+                    )
 
-                            commit_message = f"Complete work for issue #{task_context['issue_number']}\n\nAgent: {agent_name}\nTask: {task_id}"
-
-                            finalize_result = await feature_branch_manager.finalize_feature_branch_work(
-                                project=project_name,
-                                issue_number=task_context['issue_number'],
-                                commit_message=commit_message,
-                                github_integration=gh_integration
-                            )
-
-                            if finalize_result.get('success'):
-                                logger.info(f"Finalized feature branch work: {finalize_result}")
-                            else:
-                                logger.warning(f"Failed to finalize feature branch work: {finalize_result}")
+                    if finalize_result.get('success'):
+                        logger.info(f"Finalized workspace: {finalize_result}")
+                    else:
+                        logger.warning(f"Workspace finalization had issues: {finalize_result}")
 
                 except Exception as e:
-                    logger.warning(f"Failed to finalize feature branch: {e}")
+                    logger.warning(f"Failed to finalize workspace: {e}")
                     # Continue execution even if finalization fails
 
             # Record successful execution outcome

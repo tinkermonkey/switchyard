@@ -176,44 +176,65 @@ class WorkBreakdownAgent(MakerAgent):
 
         if workspace_type == 'discussions':
             # We're working on a discussion
-            # issue_number in this context is actually the discussion number
-            discussion_number = issue_number
-            discussion_url = f"{repo_url}/discussions/{discussion_number}"
-
-            # Look up parent issue from state using the internal discussion_id
+            # IMPORTANT: issue_number is actually the PARENT ISSUE number, not the discussion number
+            # We need to look up both the parent issue and get the discussion number
             try:
-                if not discussion_id:
-                    logger.warning(f"No discussion_id in task_context for discussion #{discussion_number}")
-                    # Fallback: try to look it up from issue number
-                    github_state = self.state_manager.load_project_state(project)
-                    if github_state and github_state.issue_discussion_links:
-                        # This is backwards - we need to find the issue that has this discussion
-                        for issue_num, disc_id in github_state.issue_discussion_links.items():
-                            # Get the discussion details to match the number
-                            # This is inefficient but a fallback
-                            logger.warning(f"Attempting fallback lookup for discussion #{discussion_number}")
-                            discussion_id = disc_id  # Might not work, but trying
-                            break
-
                 if discussion_id:
+                    # discussion_id is the internal GitHub node ID for the discussion
                     github_state = self.state_manager.load_project_state(project)
                     if github_state and github_state.discussion_issue_links:
                         parent_issue_number = github_state.discussion_issue_links.get(discussion_id)
                         if parent_issue_number:
                             parent_issue_url = f"{repo_url}/issues/{parent_issue_number}"
-                            logger.info(f"Found parent issue #{parent_issue_number} for discussion #{discussion_number} (ID: {discussion_id})")
+                            logger.info(f"Found parent issue #{parent_issue_number} for discussion (node_id: {discussion_id})")
                         else:
-                            logger.warning(f"No parent issue found for discussion_id {discussion_id}")
+                            logger.warning(f"No parent issue found for discussion node_id {discussion_id}")
+                    else:
+                        logger.warning(f"No discussion_issue_links in GitHub state for project {project}")
+
+                    # Get discussion number from GitHub using the discussion_id
+                    from services.discussions_integration import DiscussionsIntegration
+                    discussions = DiscussionsIntegration()
+                    discussion_details = discussions.get_discussion(discussion_id)
+                    if discussion_details:
+                        discussion_number = discussion_details.get('number', 'unknown')
+                        discussion_url = f"{repo_url}/discussions/{discussion_number}"
+                        logger.info(f"Discussion #{discussion_number} (node_id: {discussion_id})")
+                    else:
+                        logger.warning(f"Could not fetch discussion details for {discussion_id}")
                 else:
-                    logger.error(f"Could not determine discussion_id for discussion #{discussion_number}")
+                    logger.error(f"No discussion_id provided in task_context")
             except Exception as e:
-                logger.error(f"Error looking up parent issue: {e}", exc_info=True)
+                logger.error(f"Error looking up discussion/issue: {e}", exc_info=True)
         else:
             # We're working on an issue directly
             parent_issue_number = issue_number
             parent_issue_url = f"{repo_url}/issues/{issue_number}"
 
+            # If working on an issue, there might still be an associated discussion
+            # Look it up for the sub-issue body
+            try:
+                github_state = self.state_manager.load_project_state(project)
+                if github_state and github_state.issue_discussion_links:
+                    disc_id = github_state.issue_discussion_links.get(int(issue_number))
+                    if disc_id:
+                        # Get discussion number for this issue
+                        from services.discussions_integration import DiscussionsIntegration
+                        discussions = DiscussionsIntegration()
+                        discussion_details = discussions.get_discussion(disc_id)
+                        if discussion_details:
+                            discussion_number = discussion_details.get('number', 'unknown')
+                            discussion_url = f"{repo_url}/discussions/{discussion_number}"
+                            logger.info(f"Issue #{issue_number} has associated discussion #{discussion_number}")
+            except Exception as e:
+                logger.debug(f"Could not look up discussion for issue #{issue_number}: {e}")
+
         # Add sub-issue formatting instructions
+        # Build discussion reference based on what we have
+        discussion_reference = ""
+        if discussion_number != 'unknown':
+            discussion_reference = f"**Discussion**: This work is detailed in discussion [{discussion_number}]({discussion_url})"
+
         sub_issue_instructions = f"""
 
 ## CRITICAL: Sub-Issue Creation Format
@@ -249,7 +270,7 @@ Brief overview of this phase's goals.
 
 **Parent Issue**: #{parent_issue_number}
 
-**Discussion**: This work is detailed in discussion [{discussion_number}]({discussion_url})
+{discussion_reference}
 
 ---
 
@@ -403,11 +424,13 @@ Make sure to:
 
         Returns list of created issue metadata (number, url, etc.)
         """
-        from claude.claude_integration import run_claude_code
+        import subprocess
+        import json as json_lib
 
         # Get project configuration
         project_config = self.config_manager.get_project_config(project_name)
         github_config = project_config.github
+        repo = f"{github_config['org']}/{github_config['repo']}"
 
         # Get GitHub state to find SDLC board
         github_state = self.state_manager.load_project_state(project_name)
@@ -447,77 +470,92 @@ Make sure to:
                 parent_issue_number = match.group(1)
                 logger.info(f"Parent issue: #{parent_issue_number}")
 
+        # Get parent issue ID (node ID, not number) for GraphQL
+        parent_issue_id = None
+        if parent_issue_number:
+            try:
+                result = subprocess.run(
+                    ['gh', 'issue', 'view', parent_issue_number, '-R', repo, '--json', 'id'],
+                    capture_output=True,
+                    text=True,
+                    check=True
+                )
+                parent_data = json_lib.loads(result.stdout)
+                parent_issue_id = parent_data['id']
+                logger.info(f"Parent issue #{parent_issue_number} has ID: {parent_issue_id}")
+            except Exception as e:
+                logger.error(f"Failed to get parent issue ID: {e}")
+
         # Create each sub-issue
         created_issues = []
         for idx, sub_issue in enumerate(sub_issues, start=1):
             try:
                 # Create issue using GitHub CLI
-                create_prompt = f"""
-Create a GitHub issue with the following details:
+                result = subprocess.run(
+                    ['gh', 'issue', 'create',
+                     '-R', repo,
+                     '--title', sub_issue['title'],
+                     '--body', sub_issue['body'],
+                     '--json', 'number,url,id'],
+                    capture_output=True,
+                    text=True,
+                    check=True
+                )
 
-Repository: {github_config['org']}/{github_config['repo']}
-Title: {sub_issue['title']}
+                issue_data = json_lib.loads(result.stdout)
+                issue_number = str(issue_data['number'])
+                issue_url = issue_data['url']
+                issue_id = issue_data['id']
 
-Body:
-{sub_issue['body']}
+                # Add issue to SDLC board's Backlog column
+                subprocess.run(
+                    ['gh', 'project', 'item-add', str(sdlc_board.project_number),
+                     '--owner', github_config['org'],
+                     '--url', issue_url],
+                    capture_output=True,
+                    text=True,
+                    check=True
+                )
 
-Use the `gh issue create` command to create this issue.
-After creating the issue, add it to project {sdlc_board.project_number} in the Backlog column using `gh project item-add`.
+                # Link as sub-issue to parent using GraphQL
+                if parent_issue_id:
+                    graphql_query = f"""
+                    mutation {{
+                      addSubIssue(input: {{
+                        issueId: "{parent_issue_id}",
+                        subIssueId: "{issue_id}"
+                      }}) {{
+                        issue {{
+                          title
+                        }}
+                        subIssue {{
+                          title
+                        }}
+                      }}
+                    }}
+                    """
 
-Return ONLY the issue number and URL in this format:
-Issue #123: https://github.com/org/repo/issues/123
-"""
+                    subprocess.run(
+                        ['gh', 'api', 'graphql',
+                         '-H', 'GraphQL-Features: sub_issues',
+                         '-f', f'query={graphql_query}'],
+                        capture_output=True,
+                        text=True,
+                        check=True
+                    )
+                    logger.info(f"Linked issue #{issue_number} as sub-issue of #{parent_issue_number}")
 
-                # Execute with Claude Code SDK to create the issue
-                result = await run_claude_code(create_prompt, {})
+                created_issues.append({
+                    'number': issue_number,
+                    'url': issue_url,
+                    'title': sub_issue['title'],
+                    'phase': sub_issue['phase']
+                })
 
-                # Parse the result to extract issue number and URL
-                issue_match = re.search(r'Issue #(\d+):\s*(https://\S+)', result)
-                if issue_match:
-                    issue_number = issue_match.group(1)
-                    issue_url = issue_match.group(2)
-
-                    created_issues.append({
-                        'number': issue_number,
-                        'url': issue_url,
-                        'title': sub_issue['title'],
-                        'phase': sub_issue['phase']
-                    })
-
-                    logger.info(f"Created sub-issue #{issue_number}: {sub_issue['title']}")
-                else:
-                    logger.warning(f"Could not parse issue creation result: {result}")
+                logger.info(f"Created sub-issue #{issue_number}: {sub_issue['title']}")
 
             except Exception as e:
                 logger.error(f"Failed to create sub-issue '{sub_issue['title']}': {e}")
                 # Continue with other issues
-
-        # Update parent issue with task list of all sub-issues
-        if parent_issue_number and created_issues:
-            try:
-                task_list = "\n".join([
-                    f"- [ ] #{issue['number']} {issue['title']}"
-                    for issue in created_issues
-                ])
-
-                update_prompt = f"""
-Update GitHub issue #{parent_issue_number} in repository {github_config['org']}/{github_config['repo']}.
-
-Add the following task list to the issue body (append to existing content):
-
-## Implementation Tasks
-
-{task_list}
-
-Use `gh issue edit #{parent_issue_number} --body-file -` with a heredoc or temp file to preserve existing content and append the task list.
-
-Return "Updated issue #{parent_issue_number} with task list" when done.
-"""
-                result = await run_claude_code(update_prompt, {})
-                logger.info(f"Updated parent issue #{parent_issue_number} with {len(created_issues)} sub-tasks")
-
-            except Exception as e:
-                logger.error(f"Failed to update parent issue #{parent_issue_number}: {e}")
-                # Don't fail the whole operation if parent update fails
 
         return created_issues

@@ -32,9 +32,8 @@ class IdeaResearcherAgent(MakerAgent):
     def output_sections(self) -> List[str]:
         return [
             "Problem Abstraction",
-            "Solution Landscape Research",
-            "Prior Art and Examples",
-            "Capability Impact Analysis",
+            "Executive Summary",
+            "References and Prior Art",
             "Technical Considerations"
         ]
 
@@ -54,13 +53,12 @@ class IdeaResearcherAgent(MakerAgent):
 - Document trade-offs between different solution strategies
 
 Focus on understanding the landscape before implementation decisions.
+
+**Important:** Your reports should returned as markdown content, don't create any files. Provide a succinct, insightful summary and analyses that demonstrate a progression of the idea.
+
 """
 
     def get_quality_standards(self) -> str:
         return """
-- Research is thorough and covers multiple solution approaches
-- Prior art is documented with specific examples and references
-- Technical analysis is grounded in concrete examples
-- Trade-offs are clearly articulated
-- Capability impact is clearly defined
+- The idea is built out and progressed with research
 """

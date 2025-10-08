@@ -26,14 +26,37 @@ agents:
       - context7
       - serena
 
+  dev_environment_verifier:
+    description: "Verifies dev environment setup succeeded and marks container as verified"
+    model: "claude-opus-4-20250514"
+    timeout: 300
+    retries: 2
+    makes_code_changes: false  # Only verifies and updates state
+    filesystem_write_allowed: false  # Only updates dev container state
+    requires_dev_container: false
+    requires_docker: false  # Needs to inspect Docker images built by setup agent
+    capabilities:
+      - environment_verification
+      - docker_image_validation
+      - build_output_analysis
+      - test_result_validation
+    tools_enabled:
+      - file_operations
+      - git_integration
+      - docker_operations
+    mcp_servers:
+      - context7
+      - serena
+
   idea_researcher:
     description: "Market research and idea validation"
     model: "claude-opus-4-20250514"
     timeout: 300
     retries: 2
-    makes_code_changes: true  # Creates research documents
+    makes_code_changes: false  # Posts research to GitHub discussions, doesn't create files
+    filesystem_write_allowed: false  # Must post to GitHub, not create local files
     requires_dev_container: false  # Documentation work doesn't need project dependencies
-    requires_docker: true  # MUST run in Docker for security isolation
+    requires_docker: true  # Must run in Docker for security isolation
     capabilities:
       - research
       - market_analysis
@@ -53,8 +76,8 @@ agents:
     retries: 3
     makes_code_changes: false  # Posts to GitHub discussions, doesn't create files
     requires_dev_container: false  # Documentation work doesn't need project dependencies
-    requires_docker: true  # MUST run in Docker for security isolation
-    filesystem_write_allowed: false  # CRITICAL: Must post to GitHub, not create local files
+    filesystem_write_allowed: false  # Must post to GitHub, not create local files
+    requires_docker: true  # Must run in Docker for security isolation
     capabilities:
       - requirements_analysis
       - user_story_creation
@@ -73,9 +96,10 @@ agents:
     model: "claude-sonnet-4-5-20250929"
     timeout: 300
     retries: 2
-    makes_code_changes: true  # Creates planning documents
+    makes_code_changes: false  # Creates planning documents
+    filesystem_write_allowed: false  # Must post to GitHub, not create local files
     requires_dev_container: false  # Documentation work doesn't need project dependencies
-    requires_docker: true  # MUST run in Docker for security isolation
+    requires_docker: true  # Must run in Docker for security isolation
     capabilities:
       - product_strategy
       - feature_prioritization
@@ -91,13 +115,13 @@ agents:
 
   requirements_reviewer:
     description: "Requirements validation and quality assurance"
-    model: "claude-sonnet-4-5-20250929"
+    model: "claude-opus-4-20250514"
     timeout: 300
     retries: 2
     makes_code_changes: false  # Review only, no changes
-    requires_dev_container: false
-    requires_docker: true  # MUST run in Docker for security isolation
     filesystem_write_allowed: false  # Posts reviews to GitHub, doesn't create files
+    requires_dev_container: false
+    requires_docker: true  # Must run in Docker for security isolation
     capabilities:
       - requirements_validation
       - quality_assessment
@@ -115,9 +139,10 @@ agents:
     model: "claude-sonnet-4-5-20250929"
     timeout: 600
     retries: 3
-    makes_code_changes: true  # Creates architecture documents and diagrams
+    makes_code_changes: false  # Creates architecture documents and diagrams
+    filesystem_write_allowed: false  # Posts reviews to GitHub, doesn't create files
     requires_dev_container: false  # Design work doesn't need project dependencies yet
-    requires_docker: true  # MUST run in Docker for security isolation
+    requires_docker: true  # Must run in Docker for security isolation
     capabilities:
       - system_architecture
       - technical_design
@@ -133,13 +158,13 @@ agents:
 
   design_reviewer:
     description: "Architecture validation and technical review"
-    model: "claude-sonnet-4-5-20250929"
+    model: "claude-opus-4-20250514"
     timeout: 300
     retries: 2
     makes_code_changes: false  # Review only, no changes
-    requires_dev_container: false
-    requires_docker: true  # MUST run in Docker for security isolation
     filesystem_write_allowed: false  # Posts reviews to GitHub, doesn't create files
+    requires_dev_container: false
+    requires_docker: true  # Must run in Docker for security isolation
     capabilities:
       - architecture_validation
       - security_review
@@ -157,9 +182,10 @@ agents:
     model: "claude-sonnet-4-5-20250929"
     timeout: 300
     retries: 2
-    makes_code_changes: true  # Creates test plan documents
+    makes_code_changes: false  # Creates test plan documents
+    filesystem_write_allowed: false  # Posts reviews to GitHub, doesn't create files
     requires_dev_container: false  # Planning doesn't need dependencies yet
-    requires_docker: true  # MUST run in Docker for security isolation
+    requires_docker: true  # Must run in Docker for security isolation
     capabilities:
       - test_strategy
       - test_planning
@@ -174,12 +200,13 @@ agents:
 
   test_reviewer:
     description: "Test plan validation and review"
-    model: "claude-sonnet-4-5-20250929"
+    model: "claude-opus-4-20250514"
     timeout: 300
     retries: 2
     makes_code_changes: false  # Review only, no changes
+    filesystem_write_allowed: false  # Posts reviews to GitHub, doesn't create files
     requires_dev_container: false
-    requires_docker: true  # MUST run in Docker for security isolation
+    requires_docker: true  # Must run in Docker for security isolation
     capabilities:
       - test_validation
       - coverage_review
@@ -197,9 +224,9 @@ agents:
     timeout: 300
     retries: 2
     makes_code_changes: false  # Creates GitHub issues, not files
-    requires_dev_container: false
-    requires_docker: true  # MUST run in Docker for security isolation
     filesystem_write_allowed: false  # Creates GitHub issues via API only
+    requires_dev_container: false
+    requires_docker: true  # Must run in Docker for security isolation
     capabilities:
       - work_decomposition
       - task_estimation
@@ -235,13 +262,13 @@ agents:
 
   code_reviewer:
     description: "Code quality review and validation"
-    model: "claude-sonnet-4-5-20250929"
+    model: "claude-opus-4-20250514"
     timeout: 300
     retries: 2
     makes_code_changes: false  # Review only, no changes
-    requires_dev_container: false  # Can review code without running it
-    requires_docker: true  # MUST run in Docker for security isolation
     filesystem_write_allowed: false  # Posts reviews to GitHub, doesn't create files
+    requires_dev_container: false  # Can review code without running it
+    requires_docker: true  # Must run in Docker for security isolation
     capabilities:
       - code_review
       - quality_assessment
@@ -260,8 +287,8 @@ agents:
     timeout: 600
     retries: 3
     makes_code_changes: true  # Writes test code
-    requires_dev_container: true  # NEEDS project dependencies to run tests
-    requires_docker: true  # MUST run in Docker for security isolation
+    requires_dev_container: true  # Needs project dependencies to run tests
+    requires_docker: true  # Must run in Docker for security isolation
     capabilities:
       - qa_testing
       - integration_testing
@@ -275,13 +302,13 @@ agents:
 
   qa_reviewer:
     description: "QA work validation and test execution review"
-    model: "claude-sonnet-4-5-20250929"
+    model: "claude-opus-4-20250514"
     timeout: 300
     retries: 2
     makes_code_changes: false  # Review only, no changes
-    requires_dev_container: false  # Can review test results without running them
-    requires_docker: true  # MUST run in Docker for security isolation
     filesystem_write_allowed: false  # Posts reviews to GitHub, doesn't create files
+    requires_dev_container: false  # Can review test results without running them
+    requires_docker: true  # Must run in Docker for security isolation
     capabilities:
       - qa_validation
       - test_execution_review
@@ -301,7 +328,7 @@ agents:
     retries: 2
     makes_code_changes: true  # Creates documentation files
     requires_dev_container: false  # Documentation doesn't need dependencies
-    requires_docker: true  # MUST run in Docker for security isolation
+    requires_docker: true  # Must run in Docker for security isolation
     capabilities:
       - technical_writing
       - documentation_creation
@@ -317,8 +344,9 @@ agents:
     timeout: 300
     retries: 2
     makes_code_changes: false  # Review only, no changes
+    filesystem_write_allowed: false  # Posts reviews to GitHub, doesn't create files
     requires_dev_container: false
-    requires_docker: true  # MUST run in Docker for security isolation
+    requires_docker: true  # Must run in Docker for security isolation
     capabilities:
       - editorial_review
       - content_optimization
