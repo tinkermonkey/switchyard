@@ -50,7 +50,7 @@ class HybridWorkspaceContext(WorkspaceContext):
         """
         # Check if we have indicators of implementation work
         column = self.task_context.get('column', '').lower()
-        agent_type = self.task_context.get('agent_type', '').lower()
+        agent_name = self.task_context.get('agent_name', '').lower()
 
         # Implementation-focused columns/agents use issues workspace
         implementation_columns = ['development', 'code review', 'testing', 'qa']
@@ -62,7 +62,7 @@ class HybridWorkspaceContext(WorkspaceContext):
         if any(col in column for col in implementation_columns):
             return 'issues'
 
-        if any(agent in agent_type for agent in implementation_agents):
+        if any(agent in agent_name for agent in implementation_agents):
             return 'issues'
 
         # Early-stage work uses discussions

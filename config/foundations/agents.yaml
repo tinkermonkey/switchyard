@@ -245,6 +245,7 @@ agents:
     timeout: 900
     retries: 3
     makes_code_changes: true  # Writes actual code
+    filesystem_write_allowed: true  # CRITICAL: Must write to /workspace for implementation
     requires_dev_container: true  # NEEDS project dependencies to run/test code
     requires_docker: true  # MUST run in Docker for security isolation
     capabilities:
@@ -287,6 +288,7 @@ agents:
     timeout: 600
     retries: 3
     makes_code_changes: true  # Writes test code
+    filesystem_write_allowed: true  # CRITICAL: Must write test files to /workspace
     requires_dev_container: true  # Needs project dependencies to run tests
     requires_docker: true  # Must run in Docker for security isolation
     capabilities:

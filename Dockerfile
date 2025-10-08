@@ -55,7 +55,9 @@ RUN mkdir -p projects
 
 # Set up Git (will be configured via environment and mounted config)
 RUN git config --global user.name "Orchestrator Bot" && \
-    git config --global user.email "orchestrator@example.com"
+    git config --global user.email "orchestrator@example.com" && \
+    git config --global --add safe.directory /workspace && \
+    git config --global --add safe.directory '/workspace/*'
 
 # Ensure Python path includes the app directory
 ENV PYTHONPATH=/app

@@ -1,7 +1,7 @@
 import { createFileRoute } from '@tanstack/react-router'
-import { Link } from '@tanstack/react-router'
-import { Activity, GitBranch, RefreshCw } from 'lucide-react'
+import { RefreshCw } from 'lucide-react'
 import Header from '../components/Header'
+import NavigationTabs from '../components/NavigationTabs'
 import { useState, useEffect, useCallback, useRef } from 'react'
 import {
   ReactFlow,
@@ -485,24 +485,11 @@ function PipelineView() {
     <div className="min-h-screen p-5 bg-gh-canvas text-gh-fg">
       <Header />
 
-      <div className="flex gap-3 my-3">
-        <Link
-          to="/"
-          className="px-4 py-2 bg-gh-canvas-subtle border border-gh-border rounded-md hover:bg-gh-border-muted transition-colors text-sm"
-        >
-          <Activity className="inline w-4 h-4 mr-2" />
-          Dashboard
-        </Link>
-        <Link
-          to="/pipeline"
-          className="px-4 py-2 bg-gh-accent-emphasis border border-gh-accent-primary rounded-md text-sm text-white"
-        >
-          <GitBranch className="inline w-4 h-4 mr-2" />
-          Pipeline View
-        </Link>
+      <div className="flex items-center justify-between my-3">
+        <NavigationTabs />
         <button
           onClick={fetchPipeline}
-          className="px-4 py-2 bg-gh-canvas-subtle border border-gh-border rounded-md hover:bg-gh-border-muted transition-colors text-sm ml-auto"
+          className="px-4 py-2 bg-gh-canvas-subtle border border-gh-border rounded-md hover:bg-gh-border-muted transition-colors text-sm"
         >
           <RefreshCw className="inline w-4 h-4 mr-2" />
           Refresh

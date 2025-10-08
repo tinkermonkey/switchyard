@@ -334,11 +334,10 @@ export default function Header() {
           {/* Right side: Stats cards */}
           <div className="flex gap-4 flex-wrap justify-end flex-1 mr-12">
             {/* Only show these blocks if connected */}
-            {connected && (() => {
-
-              {/* Claude Usage with Progress Bars */ }
-              {
-                systemHealth?.orchestrator?.checks?.claude_usage?.available && (() => {
+            {connected && (
+              <>
+                {/* Claude Usage with Progress Bars */}
+                {systemHealth?.orchestrator?.checks?.claude_usage?.available && (() => {
                   const usage = systemHealth.orchestrator.checks.claude_usage
                   const formatTokens = (tokens) => {
                     if (!tokens) return '0'
@@ -391,10 +390,8 @@ export default function Header() {
                       )}
                     </div>
                   )
-                })()
-              }
-              {
-                statCards.map((card, idx) => (
+                })()}
+                {statCards.map((card, idx) => (
                   <div key={idx} className="bg-gh-canvas p-3 rounded-md border border-gh-border min-w-[140px]">
                     <h3 className="text-gh-fg-muted text-xs uppercase mb-1">
                       {card.title}
@@ -403,9 +400,9 @@ export default function Header() {
                       {card.value}
                     </div>
                   </div>
-                ))
-              }
-            })()}
+                ))}
+              </>
+            )}
           </div>
         </div>
       </div>

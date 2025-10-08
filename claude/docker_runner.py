@@ -175,6 +175,8 @@ class DockerAgentRunner:
         workspace_mount_mode = 'rw' if filesystem_write_allowed else 'ro'
         if not filesystem_write_allowed:
             logger.warning(f"Agent {agent} has filesystem_write_allowed=false, mounting workspace as READ-ONLY")
+        else:
+            logger.info(f"Agent {agent} has filesystem_write_allowed=true, mounting workspace as READ-WRITE")
 
         # Get host home directory for SSH/git mounts
         host_home = os.environ.get("HOST_HOME", os.environ.get("HOME", "/root"))

@@ -95,13 +95,16 @@ class SeniorSoftwareEngineerAgent(MakerAgent):
         previous_stage_prompt = ""
         if previous_stage:
             previous_stage_prompt = f"""
-## Previous Stage Output
+## Previous Work and Feedback
 
-The following analysis was completed in a previous stage:
+The following is the complete history of agent outputs and feedback for this issue.
+This includes outputs from ALL previous stages (design, testing, QA, etc.) and any
+user feedback. If this issue was returned from testing or QA, pay special attention
+to their feedback and address all issues they identified.
 
 {previous_stage}
 
-Build upon this analysis in your implementation.
+IMPORTANT: Review all feedback carefully and address every issue raised.
 """
 
         quality_standards = self.get_quality_standards()
@@ -131,12 +134,14 @@ Implement the following requirement for project {project}:
 
 **CRITICAL INSTRUCTIONS**:
 - You are running in a Docker container with the project mounted at `/workspace/`
+- You HAVE WRITE ACCESS to `/workspace/` - write all code changes there
+- DO NOT write to `/tmp` or any other directory - use `/workspace/` only
 - Read existing code first to understand patterns and structure
-- Create both implementation AND test files
+- Create both implementation AND test files in `/workspace/`
 - Verify your code by reading it back after writing
 - Your changes will be automatically committed to a feature branch upon completion
 
-**Working Directory**: `/workspace/` (the project root)
+**Working Directory**: `/workspace/` (the project root with READ-WRITE access)
 
 **Expected Deliverables**:
 1. Implementation files (Python, JS, etc.)

@@ -245,25 +245,15 @@ class ProjectMonitor:
 
     def _get_issue_context(self, repository: str, issue_number: int, org: str,
                            current_column: str, workflow_template) -> str:
-        """Get previous stage context from issue comments"""
+        """
+        Get previous stage context from issue comments.
+
+        Now gathers ALL agent outputs and user feedback from the entire thread,
+        not just the immediately previous column. This ensures that when an issue
+        moves backwards in the workflow (e.g., from Testing back to Development),
+        the agent receives all relevant context including QA feedback.
+        """
         try:
-            # Find previous column in workflow
-            column_names = [col.name for col in workflow_template.columns]
-            if current_column not in column_names:
-                return ""
-
-            current_index = column_names.index(current_column)
-            if current_index == 0:
-                return ""  # First column, no previous stage
-
-            previous_column = workflow_template.columns[current_index - 1]
-            previous_agent = previous_column.agent
-
-            if not previous_agent or previous_agent == 'null':
-                return ""  # No agent in previous stage
-
-            repository = repository  # Already have this parameter
-
             # Fetch all comments
             result = subprocess.run(
                 ['gh', 'issue', 'view', str(issue_number), '--repo', f"{org}/{repository}", '--json', 'comments'],
@@ -271,50 +261,75 @@ class ProjectMonitor:
             )
             data = json.loads(result.stdout)
 
-            # Find the last comment from the previous agent
-            previous_agent_comment = None
-            previous_agent_timestamp = None
-
-            for comment in reversed(data.get('comments', [])):
-                if f"_Processed by the {previous_agent} agent_" in comment.get('body', ''):
-                    previous_agent_comment = comment
-                    previous_agent_timestamp = comment.get('createdAt')
-                    break
-
-            if not previous_agent_comment:
-                return ""  # Previous agent hasn't processed yet
-
-            # Collect user comments after the agent's comment
             from dateutil import parser as date_parser
             from datetime import timezone
 
-            agent_time = date_parser.parse(previous_agent_timestamp)
-            # Make timezone-aware if naive
-            if agent_time.tzinfo is None:
-                agent_time = agent_time.replace(tzinfo=timezone.utc)
+            # Collect ALL agent comments with their timestamps
+            agent_comments = []
+            for comment in data.get('comments', []):
+                body = comment.get('body', '')
+                # Match agent signature pattern
+                if '_Processed by the ' in body and ' agent_' in body:
+                    # Extract agent name from signature
+                    import re
+                    match = re.search(r'_Processed by the (.+?) agent_', body)
+                    if match:
+                        agent_name = match.group(1)
+                        timestamp = comment.get('createdAt')
+                        parsed_time = date_parser.parse(timestamp)
+                        if parsed_time.tzinfo is None:
+                            parsed_time = parsed_time.replace(tzinfo=timezone.utc)
 
+                        agent_comments.append({
+                            'agent': agent_name,
+                            'body': body,
+                            'timestamp': parsed_time,
+                            'raw_timestamp': timestamp
+                        })
+
+            if not agent_comments:
+                return ""  # No agent comments yet
+
+            # Sort agent comments chronologically
+            agent_comments.sort(key=lambda x: x['timestamp'])
+
+            # Collect user comments (non-bot comments)
             user_comments = []
             for comment in data.get('comments', []):
-                comment_time = date_parser.parse(comment.get('createdAt'))
-                # Make timezone-aware if naive
-                if comment_time.tzinfo is None:
-                    comment_time = comment_time.replace(tzinfo=timezone.utc)
+                if not comment.get('author', {}).get('isBot', False):
+                    timestamp = comment.get('createdAt')
+                    parsed_time = date_parser.parse(timestamp)
+                    if parsed_time.tzinfo is None:
+                        parsed_time = parsed_time.replace(tzinfo=timezone.utc)
 
-                # Get comments after agent's comment that are from users (not bot)
-                if comment_time > agent_time and not comment.get('author', {}).get('isBot', False):
-                    user_comments.append(comment)
+                    user_comments.append({
+                        'author': comment.get('author', {}).get('login', 'unknown'),
+                        'body': comment.get('body', ''),
+                        'timestamp': parsed_time
+                    })
 
-            # Format context
+            # Build chronological context with all agent outputs and user feedback
             context_parts = []
-            context_parts.append(f"## Output from {previous_agent.replace('_', ' ').title()}")
-            context_parts.append(previous_agent_comment.get('body', ''))
+            context_parts.append("## Previous Work and Feedback")
+            context_parts.append("\nThe following is a complete history of agent outputs and user feedback for this issue:\n")
 
-            if user_comments:
-                context_parts.append("\n## User Feedback Since Then")
-                for comment in user_comments:
-                    author = comment.get('author', {}).get('login', 'unknown')
-                    body = comment.get('body', '')
-                    context_parts.append(f"**@{author}**: {body}")
+            # Merge agent comments and user comments in chronological order
+            all_items = []
+            for ac in agent_comments:
+                all_items.append(('agent', ac))
+            for uc in user_comments:
+                all_items.append(('user', uc))
+
+            all_items.sort(key=lambda x: x[1]['timestamp'])
+
+            # Format chronologically
+            for item_type, item in all_items:
+                if item_type == 'agent':
+                    context_parts.append(f"\n### Output from {item['agent'].replace('_', ' ').title()}")
+                    context_parts.append(item['body'])
+                else:
+                    context_parts.append(f"\n**User Feedback (@{item['author']})**:")
+                    context_parts.append(item['body'])
 
             return "\n\n".join(context_parts)
 
@@ -1610,7 +1625,8 @@ _Review cycle initiated by Claude Code Orchestrator_
                     project_name,
                     board_name,
                     change['issue_number'],
-                    change['repository']
+                    change['repository'],
+                    change.get('new_status')  # Pass the new status for safety check
                 )
 
                 self.trigger_agent_for_status(
@@ -1629,7 +1645,8 @@ _Review cycle initiated by Claude Code Orchestrator_
                     project_name,
                     board_name,
                     change['issue_number'],
-                    change['repository']
+                    change['repository'],
+                    change.get('status')  # Pass the status for safety check
                 )
 
                 self.trigger_agent_for_status(
@@ -1641,7 +1658,7 @@ _Review cycle initiated by Claude Code Orchestrator_
                 )
 
     def _check_and_create_discussion(self, project_name: str, board_name: str,
-                                     issue_number: int, repository: str):
+                                     issue_number: int, repository: str, status: Optional[str] = None):
         """Check if issue needs a discussion and create it if configured"""
         try:
             from config.state_manager import state_manager
@@ -1672,6 +1689,12 @@ _Review cycle initiated by Claude Code Orchestrator_
             # Check if auto-creation is enabled (default to True for discussion workspaces)
             auto_create = getattr(pipeline_config, 'auto_create_from_issues', True)
             if not auto_create:
+                return
+
+            # SAFETY LATCH: Only create discussions for items in Backlog column of Planning & Design board
+            # This prevents erroneous discussion creation when sub-issues are linked to parent issues
+            if status and status.lower() != 'backlog':
+                logger.debug(f"Skipping discussion creation for issue #{issue_number} - not in Backlog column (current: {status})")
                 return
 
             logger.info(f"Creating discussion for issue #{issue_number} (workspace: {workspace})")

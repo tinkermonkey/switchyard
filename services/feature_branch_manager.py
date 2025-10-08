@@ -275,10 +275,21 @@ class FeatureBranchManager:
         await git_workflow_manager.pull_branch(project_dir)
 
         # Create and checkout new branch
-        await git_workflow_manager.create_branch(project_dir, branch_name)
-        await git_workflow_manager.checkout_branch(project_dir, branch_name)
+        success = await git_workflow_manager.create_branch(project_dir, branch_name)
 
-        logger.info(f"Created branch {branch_name} from main")
+        if not success:
+            # Branch might already exist (race condition with parallel sub-issue)
+            # Try to checkout existing branch instead
+            logger.warning(f"Failed to create branch {branch_name}, attempting checkout of existing branch")
+            checkout_success = await git_workflow_manager.checkout_branch(project_dir, branch_name)
+
+            if not checkout_success:
+                raise Exception(f"Failed to create or checkout branch {branch_name}")
+
+            logger.info(f"Checked out existing branch {branch_name} (race condition resolved)")
+        else:
+            await git_workflow_manager.checkout_branch(project_dir, branch_name)
+            logger.info(f"Created branch {branch_name} from main")
 
     async def git_checkout(self, project_dir: str, branch_name: str):
         """Checkout a branch"""

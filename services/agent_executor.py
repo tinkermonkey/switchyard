@@ -93,6 +93,10 @@ class AgentExecutor:
                     if repo_owner and repo_name:
                         gh_integration = GitHubIntegration(repo_owner=repo_owner, repo_name=repo_name)
 
+                        # Add agent_name to task_context for hybrid workspace routing
+                        # This allows hybrid workspaces to determine if git operations are needed
+                        task_context['agent_name'] = agent_name
+
                         # Create workspace context based on type
                         workspace_type = task_context.get('workspace_type', 'issues')
                         workspace_context = WorkspaceContextFactory.create(
