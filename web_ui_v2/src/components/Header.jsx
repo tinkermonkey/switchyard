@@ -333,71 +333,79 @@ export default function Header() {
 
           {/* Right side: Stats cards */}
           <div className="flex gap-4 flex-wrap justify-end flex-1 mr-12">
-            {/* Claude Usage with Progress Bars */}
-            {systemHealth?.orchestrator?.checks?.claude_usage?.available && (() => {
-              const usage = systemHealth.orchestrator.checks.claude_usage
-              const formatTokens = (tokens) => {
-                if (!tokens) return '0'
-                const millions = tokens / 1000000
-                return millions >= 1000 ? `${(millions / 1000).toFixed(1)}B` : `${millions.toFixed(0)}M`
-              }
+            {/* Only show these blocks if connected */}
+            {connected && (() => {
 
-              const getQuotaColor = (percent) => {
-                if (percent >= 90) return 'bg-gh-danger'
-                if (percent >= 75) return 'bg-yellow-500'
-                return 'bg-gh-success'
-              }
+              {/* Claude Usage with Progress Bars */ }
+              {
+                systemHealth?.orchestrator?.checks?.claude_usage?.available && (() => {
+                  const usage = systemHealth.orchestrator.checks.claude_usage
+                  const formatTokens = (tokens) => {
+                    if (!tokens) return '0'
+                    const millions = tokens / 1000000
+                    return millions >= 1000 ? `${(millions / 1000).toFixed(1)}B` : `${millions.toFixed(0)}M`
+                  }
 
-              const weeklyPercent = usage.weekly_usage_percent || 0
-              const sessionPercent = usage.session_usage_percent || 0
+                  const getQuotaColor = (percent) => {
+                    if (percent >= 90) return 'bg-gh-danger'
+                    if (percent >= 75) return 'bg-yellow-500'
+                    return 'bg-gh-success'
+                  }
 
-              return (
-                <div className="bg-gh-canvas p-3 rounded-md border border-gh-border min-w-[140px]">
-                  {usage.weekly_quota && (
-                    <div>
-                      <div className="flex justify-between items-center text-xs mb-0.5">
-                        <span className="text-gh-fg-muted">Weekly</span>
-                        <span className="font-semibold text-gh-fg-default">
-                          {formatTokens(usage.weekly_usage)}/{formatTokens(usage.weekly_quota)}
-                        </span>
-                      </div>
-                      <div className="w-full bg-gh-border-muted rounded-full h-1.5">
-                        <div
-                          className={`h-1.5 rounded-full transition-all ${getQuotaColor(weeklyPercent)}`}
-                          style={{ width: `${Math.min(weeklyPercent, 100)}%` }}
-                        />
-                      </div>
+                  const weeklyPercent = usage.weekly_usage_percent || 0
+                  const sessionPercent = usage.session_usage_percent || 0
+
+                  return (
+                    <div className="bg-gh-canvas p-3 rounded-md border border-gh-border min-w-[140px]">
+                      {usage.weekly_quota && (
+                        <div>
+                          <div className="flex justify-between items-center text-xs mb-0.5">
+                            <span className="text-gh-fg-muted">Weekly</span>
+                            <span className="font-semibold text-gh-fg-default">
+                              {formatTokens(usage.weekly_usage)}/{formatTokens(usage.weekly_quota)}
+                            </span>
+                          </div>
+                          <div className="w-full bg-gh-border-muted rounded-full h-1.5">
+                            <div
+                              className={`h-1.5 rounded-full transition-all ${getQuotaColor(weeklyPercent)}`}
+                              style={{ width: `${Math.min(weeklyPercent, 100)}%` }}
+                            />
+                          </div>
+                        </div>
+                      )}
+                      {usage.session_quota && (
+                        <div>
+                          <div className="flex justify-between items-center text-xs mb-0.5">
+                            <span className="text-gh-fg-muted">Session ({usage.session_remaining_minutes || 0}m)</span>
+                            <span className="font-semibold text-gh-fg-default">
+                              {formatTokens(usage.session_usage)}/{formatTokens(usage.session_quota)}
+                            </span>
+                          </div>
+                          <div className="w-full bg-gh-border-muted rounded-full h-1.5">
+                            <div
+                              className={`h-1.5 rounded-full transition-all ${getQuotaColor(sessionPercent)}`}
+                              style={{ width: `${Math.min(sessionPercent, 100)}%` }}
+                            />
+                          </div>
+                        </div>
+                      )}
                     </div>
-                  )}
-                  {usage.session_quota && (
-                    <div>
-                      <div className="flex justify-between items-center text-xs mb-0.5">
-                        <span className="text-gh-fg-muted">Session ({usage.session_remaining_minutes || 0}m)</span>
-                        <span className="font-semibold text-gh-fg-default">
-                          {formatTokens(usage.session_usage)}/{formatTokens(usage.session_quota)}
-                        </span>
-                      </div>
-                      <div className="w-full bg-gh-border-muted rounded-full h-1.5">
-                        <div
-                          className={`h-1.5 rounded-full transition-all ${getQuotaColor(sessionPercent)}`}
-                          style={{ width: `${Math.min(sessionPercent, 100)}%` }}
-                        />
-                      </div>
+                  )
+                })()
+              }
+              {
+                statCards.map((card, idx) => (
+                  <div key={idx} className="bg-gh-canvas p-3 rounded-md border border-gh-border min-w-[140px]">
+                    <h3 className="text-gh-fg-muted text-xs uppercase mb-1">
+                      {card.title}
+                    </h3>
+                    <div className="text-xl font-semibold text-gh-accent-primary">
+                      {card.value}
                     </div>
-                  )}
-                </div>
-              )
+                  </div>
+                ))
+              }
             })()}
-            {statCards.map((card, idx) => (
-              <div key={idx} className="bg-gh-canvas p-3 rounded-md border border-gh-border min-w-[140px]">
-                <h3 className="text-gh-fg-muted text-xs uppercase mb-1">
-                  {card.title}
-                </h3>
-                <div className="text-xl font-semibold text-gh-accent-primary">
-                  {card.value}
-                </div>
-              </div>
-            ))}
           </div>
         </div>
       </div>
