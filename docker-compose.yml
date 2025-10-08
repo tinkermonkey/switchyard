@@ -14,11 +14,9 @@ services:
       context: .
       args:
         DOCKER_GID: "${DOCKER_GID:-984}"  # Pass host docker GID to Dockerfile
-    user: "1000:1000"  # Run as UID/GID 1000
+    user: "0:0"  # Run as root in container (maps to host UID via user namespace in rootless Docker)
     group_add:
       - "${DOCKER_GID:-984}"  # Add host docker group at runtime
-    userns_mode: "host"  # Disable user namespace remapping so socket UIDs match
-    privileged: true  # Required for Docker socket access when userns is globally enabled
     volumes:
       # Mount the orchestrator code (this is clauditoreum/)
       - ./:/app

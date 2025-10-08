@@ -19,5 +19,7 @@ fi
 # SSH key is mounted read-only from host, permissions already correct
 # No need to chmod as it's read-only and already has proper permissions on host
 
+# Git safe.directory is configured in Dockerfile at build time (in /etc/gitconfig)
+
 # Execute the main command
 exec "$@"

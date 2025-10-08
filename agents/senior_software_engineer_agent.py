@@ -54,7 +54,7 @@ class SeniorSoftwareEngineerAgent(MakerAgent):
         return """
 ## Implementation Guidelines
 
-**CRITICAL**: You are implementing actual code, NOT writing analysis documents.
+**CRITICAL**: You are implementing actual code, NOT writing analysis documents. If the environment doesn't work or something doesn't makes sense, stop and ask for help.
 
 ### Your Task:
 1. **READ existing code** to understand the codebase structure

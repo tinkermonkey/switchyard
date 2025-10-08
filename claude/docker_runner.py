@@ -40,6 +40,135 @@ class DockerAgentRunner:
 
         return sanitized
 
+    @staticmethod
+    def _verify_write_access(directory_path: str) -> Dict[str, Any]:
+        """
+        Verify that we have write access to a directory by attempting to create and delete a test file.
+
+        Args:
+            directory_path: Path to directory to test (on host filesystem)
+
+        Returns:
+            Dict with 'success' (bool), 'message' (str), and 'error' (str) if failed
+        """
+        import tempfile
+        import time
+
+        try:
+            # Create a unique test filename
+            test_filename = f".write-test-{int(time.time())}.tmp"
+            test_path = os.path.join(directory_path, test_filename)
+
+            # Try to write the file
+            with open(test_path, 'w') as f:
+                f.write("write test")
+
+            # Try to read it back
+            with open(test_path, 'r') as f:
+                content = f.read()
+                if content != "write test":
+                    return {
+                        'success': False,
+                        'error': f"Write verification failed: content mismatch (wrote 'write test', read '{content}')"
+                    }
+
+            # Try to delete it
+            os.remove(test_path)
+
+            return {
+                'success': True,
+                'message': f"Can read, write, and delete files in {directory_path}"
+            }
+
+        except PermissionError as e:
+            return {
+                'success': False,
+                'error': f"Permission denied: {e}"
+            }
+        except Exception as e:
+            return {
+                'success': False,
+                'error': f"Unexpected error: {e}"
+            }
+
+    async def _verify_container_write_access(
+        self,
+        docker_cmd: list,
+        agent: str,
+        project: str
+    ) -> bool:
+        """
+        Spawn a test container with the same configuration and verify it can write to /workspace.
+
+        This is a critical safety check that runs before launching the expensive Claude agent.
+        It catches permission issues immediately instead of wasting time and API calls.
+
+        Args:
+            docker_cmd: The docker run command being prepared (should be ['docker', 'run', '--rm', '--name', name, ...])
+            agent: Agent name
+            project: Project name
+
+        Returns:
+            True if container can write, False otherwise
+        """
+        import subprocess
+        import time
+
+        # Create a unique test container name
+        test_container_name = f"write-test-{agent}-{int(time.time())}"
+
+        # docker_cmd ends with the image name - remove it and everything after
+        # docker_cmd structure: ['docker', 'run', '--rm', '--name', 'name', ..., 'image']
+        test_cmd = docker_cmd[:-1]  # Remove the image name
+
+        # Replace the container name if it exists
+        if '--name' in test_cmd:
+            name_index = test_cmd.index('--name')
+            test_cmd[name_index + 1] = test_container_name
+        else:
+            # Add --name after --rm if it doesn't exist
+            for i, arg in enumerate(test_cmd):
+                if arg == '--rm':
+                    test_cmd.insert(i + 1, '--name')
+                    test_cmd.insert(i + 2, test_container_name)
+                    break
+
+        # Add the image and simple test command
+        test_cmd.extend([
+            'clauditoreum-orchestrator:latest',  # Use simple base image for quick test
+            'sh', '-c',
+            'echo "test" > /workspace/.write-verify && rm /workspace/.write-verify && echo "SUCCESS"'
+        ])
+
+        logger.info(f"   Running container write test with container: {test_container_name}")
+
+        try:
+            result = subprocess.run(
+                test_cmd,
+                capture_output=True,
+                text=True,
+                timeout=10  # Quick test, should be fast
+            )
+
+            if result.returncode == 0 and 'SUCCESS' in result.stdout:
+                logger.info(f"   ✓ Container write test PASSED")
+                return True
+            else:
+                logger.error(f"   ✗ Container write test FAILED")
+                logger.error(f"   Return code: {result.returncode}")
+                logger.error(f"   Stdout: {result.stdout}")
+                logger.error(f"   Stderr: {result.stderr}")
+                return False
+
+        except subprocess.TimeoutExpired:
+            logger.error(f"   ✗ Container write test TIMED OUT")
+            # Try to clean up
+            subprocess.run(['docker', 'rm', '-f', test_container_name], capture_output=True)
+            return False
+        except Exception as e:
+            logger.error(f"   ✗ Container write test ERROR: {e}")
+            return False
+
     async def run_agent_in_container(
         self,
         prompt: str,
@@ -178,6 +307,18 @@ class DockerAgentRunner:
         else:
             logger.info(f"Agent {agent} has filesystem_write_allowed=true, mounting workspace as READ-WRITE")
 
+            # Verify write access if agent expects it
+            # Use container path (project_dir) not host path for verification
+            if filesystem_write_allowed:
+                logger.info(f"Verifying write access to {project_dir}")
+                test_result = self._verify_write_access(str(project_dir))
+                if not test_result['success']:
+                    logger.error(f"FILESYSTEM WRITE TEST FAILED: {test_result['error']}")
+                    logger.error(f"Agent {agent} expects write access but cannot write to workspace!")
+                    raise Exception(f"Filesystem write verification failed: {test_result['error']}")
+                else:
+                    logger.info(f"✓ Filesystem write verification passed: {test_result['message']}")
+
         # Get host home directory for SSH/git mounts
         host_home = os.environ.get("HOST_HOME", os.environ.get("HOME", "/root"))
 
@@ -190,9 +331,12 @@ class DockerAgentRunner:
             logger.info("Adding -i flag for stdin support")
 
         # Add volume mounts, working directory, and environment variables
+        mount_spec = f'{host_project_path}:/workspace:{workspace_mount_mode}'
+        logger.info(f"DOCKER MOUNT: {mount_spec}")
+
         cmd.extend([
             # Mount project directory (read-only or read-write based on config)
-            '-v', f'{host_project_path}:/workspace:{workspace_mount_mode}',
+            '-v', mount_spec,
 
             # Mount SSH keys for git operations (read-only)
             '-v', f'{host_home}/.ssh:/root/.ssh:ro',
@@ -229,6 +373,11 @@ class DockerAgentRunner:
                 '-v', '/var/run/docker.sock:/var/run/docker.sock',
                 '--user', 'root'  # Required for Docker socket access on macOS
             ])
+        elif filesystem_write_allowed:
+            # For agents that need write access, run as root so they can write to workspace
+            # In rootless Docker, container UID 0 maps to host user UID via user namespace
+            logger.info(f"Agent {agent} needs write access, running as root (maps to host user via userns)")
+            cmd.extend(['--user', 'root'])
 
         # Add CONTEXT7_API_KEY if present
         if 'CONTEXT7_API_KEY' in os.environ:
@@ -291,8 +440,26 @@ class DockerAgentRunner:
         claude_model = context.get('claude_model', 'claude-sonnet-4-5-20250929')
         logger.info(f"Using Claude model in Docker: {claude_model}")
 
-        # Build the Claude command to run inside container
+        # Get agent info for safety check
         agent = context.get('agent', 'unknown')
+        from config.manager import config_manager
+        agent_config = config_manager.get_project_agent_config(context.get('project', 'unknown'), agent)
+        filesystem_write_allowed = getattr(agent_config, 'filesystem_write_allowed', True)
+
+        # SAFETY CHECK: Verify container can actually write to workspace before launching expensive agent
+        if filesystem_write_allowed:
+            logger.info("Pre-launch safety check: Verifying container write access...")
+            write_test_passed = await self._verify_container_write_access(
+                docker_cmd=docker_cmd,
+                agent=agent,
+                project=context.get('project', 'unknown')
+            )
+            if not write_test_passed:
+                logger.error("FATAL: Container cannot write to workspace - aborting agent launch")
+                raise Exception("Container write access verification failed - agent would not be able to write files")
+            logger.info("✓ Pre-launch verification passed: Container has write access")
+
+        # Build the Claude command to run inside container
 
         # For large prompts, write to a temp file and mount it into container
         import tempfile
@@ -321,12 +488,13 @@ class DockerAgentRunner:
 
         # Choose permission mode based on whether running as root
         # bypassPermissions is blocked when running as root, so use acceptEdits instead
-        if agent == 'dev_environment_setup':
-            # dev_environment_setup runs as root (needs Docker socket), use acceptEdits
+        if agent == 'dev_environment_setup' or filesystem_write_allowed:
+            # Agents running as root (for write access) must use acceptEdits
+            # bypassPermissions is blocked by Claude Code when running as root for security
             claude_cmd.extend(['--permission-mode', 'acceptEdits'])
             logger.info("Using --permission-mode acceptEdits (running as root)")
         else:
-            # Other agents run as non-root, can use bypassPermissions
+            # Readonly agents can use bypassPermissions
             claude_cmd.extend(['--permission-mode', 'bypassPermissions'])
             logger.info("Using --permission-mode bypassPermissions")
 
@@ -347,7 +515,16 @@ class DockerAgentRunner:
         full_cmd = docker_cmd + claude_cmd
 
         logger.info(f"Executing: docker run ... claude ...")
-        logger.info(f"Full command (sanitized): {' '.join(full_cmd[:10])} ... {' '.join(full_cmd[-5:])}")
+        # Log the complete docker command (sanitize tokens)
+        sanitized_cmd = []
+        for i, part in enumerate(full_cmd):
+            if i > 0 and full_cmd[i-1] in ['-e'] and any(x in part for x in ['TOKEN', 'KEY']):
+                # Sanitize tokens
+                key_name = part.split('=')[0]
+                sanitized_cmd.append(f"{key_name}=***")
+            else:
+                sanitized_cmd.append(part)
+        logger.info(f"Full Docker command: {' '.join(sanitized_cmd)}")
 
         obs = context.get('observability')
         agent = context.get('agent', 'unknown')

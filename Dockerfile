@@ -54,10 +54,10 @@ RUN mkdir -p orchestrator_data/state/checkpoints orchestrator_data/handoffs orch
 RUN mkdir -p projects
 
 # Set up Git (will be configured via environment and mounted config)
-RUN git config --global user.name "Orchestrator Bot" && \
-    git config --global user.email "orchestrator@example.com" && \
-    git config --global --add safe.directory /workspace && \
-    git config --global --add safe.directory '/workspace/*'
+# Use --system to set git config for all users (goes to /etc/gitconfig)
+RUN git config --system user.name "Orchestrator Bot" && \
+    git config --system user.email "orchestrator@example.com" && \
+    git config --system --add safe.directory '*'
 
 # Ensure Python path includes the app directory
 ENV PYTHONPATH=/app
