@@ -233,7 +233,7 @@ class GitHubStateManager:
             repo=project_config.github['repo'],
             boards={},
             labels_created=[],
-            last_sync=datetime.utcnow().isoformat(),
+            last_sync=datetime.utcnow().isoformat() + 'Z',
             sync_hash=current_hash,
             issue_discussion_links={},
             discussion_issue_links={}
@@ -269,7 +269,7 @@ class GitHubStateManager:
             status_field_id=status_field_id
         )
 
-        state.last_sync = datetime.utcnow().isoformat()
+        state.last_sync = datetime.utcnow().isoformat() + 'Z'
         self.save_project_state(state)
 
     def mark_labels_created(self, project_name: str, labels: List[str]):
@@ -282,7 +282,7 @@ class GitHubStateManager:
             if label not in state.labels_created:
                 state.labels_created.append(label)
 
-        state.last_sync = datetime.utcnow().isoformat()
+        state.last_sync = datetime.utcnow().isoformat() + 'Z'
         self.save_project_state(state)
 
     def refresh_board_field_ids(self, project_name: str, board_name: str) -> bool:
@@ -350,7 +350,7 @@ class GitHubStateManager:
             state = self.create_initial_state(project_name)
 
         state.sync_hash = current_hash
-        state.last_sync = datetime.utcnow().isoformat()
+        state.last_sync = datetime.utcnow().isoformat() + 'Z'
         self.save_project_state(state)
 
     def get_board_by_name(self, project_name: str, board_name: str) -> Optional[GitHubBoard]:

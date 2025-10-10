@@ -375,7 +375,7 @@ class HumanFeedbackLoopExecutor:
                 logger.debug(f"Cannot check issue #{state.issue_number} for feedback - GitHub App not configured")
                 return None
 
-            result = github_app.graphql_request(query, {
+            result = await github_app.graphql_request(query, {
                 'org': org,
                 'repo': state.repository,
                 'number': state.issue_number
@@ -476,7 +476,7 @@ class HumanFeedbackLoopExecutor:
             }
             """
 
-            result = github_app.graphql_request(query, {'discussionId': state.discussion_id})
+            result = await github_app.graphql_request(query, {'discussionId': state.discussion_id})
 
             logger.debug(f"GraphQL result: {result is not None}")
 
@@ -595,7 +595,7 @@ class HumanFeedbackLoopExecutor:
             }
             """
 
-            result = github_app.graphql_request(query, {'discussionId': state.discussion_id})
+            result = await github_app.graphql_request(query, {'discussionId': state.discussion_id})
 
             if not result or 'node' not in result or not result['node']:
                 logger.warning(f"Could not load discussion {state.discussion_id}")

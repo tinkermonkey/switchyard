@@ -414,7 +414,7 @@ Be direct and technical. Focus on preventing the specific error pattern."""
 
             doc = {
                 "pattern_name": pattern['pattern_name'],
-                "analysis_date": datetime.utcnow().isoformat(),
+                "analysis_date": datetime.utcnow().isoformat() + 'Z',
                 "occurrence_count": pattern['occurrence_count'],
                 "affected_sessions": pattern['occurrence_count'],  # Approximation
                 "affected_projects": pattern.get('affected_projects', []),
@@ -443,7 +443,7 @@ Be direct and technical. Focus on preventing the specific error pattern."""
                 "status": "pending",
 
                 # Metadata
-                "created_at": datetime.utcnow().isoformat(),
+                "created_at": datetime.utcnow().isoformat() + 'Z',
                 "llm_model": analysis.get('llm_model'),
                 "llm_tokens_used": analysis.get('llm_tokens_used'),
                 "llm_cost_usd": analysis.get('llm_cost_usd')

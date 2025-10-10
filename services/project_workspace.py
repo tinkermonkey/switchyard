@@ -195,16 +195,24 @@ class ProjectWorkspaceManager:
 
     def ensure_branch(self, project_name: str, branch_name: str, create_if_missing: bool = True) -> bool:
         """
-        Ensure project is on specified branch
+        DEPRECATED: Use GitWorkflowManager.checkout_branch() instead.
+        
+        This method is deprecated because it can create branches without proper tracking.
+        Use services.git_workflow_manager.checkout_branch() for checkout operations,
+        or services.feature_branch_manager.ensure_and_prepare_branch() for branch creation.
 
         Args:
             project_name: Name of the project
             branch_name: Branch to switch to
-            create_if_missing: Create branch if it doesn't exist
+            create_if_missing: Create branch if it doesn't exist (DANGEROUS - use FeatureBranchManager instead)
 
         Returns:
             True if successful, False otherwise
         """
+        logger.warning(
+            f"DEPRECATED: ensure_branch() called for {project_name}/{branch_name}. "
+            "Use GitWorkflowManager.checkout_branch() or FeatureBranchManager instead."
+        )
         project_dir = self.get_project_dir(project_name)
 
         if not project_dir.exists():
@@ -279,24 +287,6 @@ class ProjectWorkspaceManager:
 
         except Exception as e:
             logger.error(f"Failed to get current branch: {e}")
-
-        return None
-
-    def create_feature_branch(self, project_name: str, issue_number: int) -> Optional[str]:
-        """
-        Create a feature branch for an issue
-
-        Args:
-            project_name: Name of the project
-            issue_number: GitHub issue number
-
-        Returns:
-            Branch name if successful, None otherwise
-        """
-        branch_name = f"feature/issue-{issue_number}"
-
-        if self.ensure_branch(project_name, branch_name, create_if_missing=True):
-            return branch_name
 
         return None
 

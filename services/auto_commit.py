@@ -53,16 +53,11 @@ class AutoCommitService:
             # Ensure we're on a feature branch (not main/master)
             current_branch = self._get_current_branch(project_dir)
             if current_branch in ['main', 'master']:
-                logger.warning(f"Cannot auto-commit to {current_branch} branch, creating feature branch")
-                if issue_number:
-                    branch_name = f"feature/issue-{issue_number}"
-                else:
-                    branch_name = f"feature/{agent}-{task_id[:8]}"
-
-                success = self._create_branch(project_dir, branch_name)
-                if not success:
-                    logger.error(f"Failed to create feature branch {branch_name}")
-                    return False
+                logger.error(f"WORKFLOW BUG: Agent executed on {current_branch} branch without proper branch preparation!")
+                logger.error(f"Project: {project}, Agent: {agent}, Issue: {issue_number}")
+                logger.error(f"FeatureBranchManager should have created a branch BEFORE agent execution")
+                logger.error(f"Auto-commit REFUSED to create emergency branch - this would bypass parent/sub-issue logic")
+                return False
 
             # Stage all changes
             self._stage_changes(project_dir)
@@ -132,28 +127,6 @@ class AutoCommitService:
             logger.error(f"Failed to get current branch: {e}")
 
         return None
-
-    def _create_branch(self, project_dir: Path, branch_name: str) -> bool:
-        """Create and checkout a new branch"""
-        try:
-            result = subprocess.run(
-                ['git', 'checkout', '-b', branch_name],
-                cwd=project_dir,
-                capture_output=True,
-                text=True,
-                timeout=30
-            )
-
-            if result.returncode == 0:
-                logger.info(f"Created and checked out branch: {branch_name}")
-                return True
-            else:
-                logger.error(f"Failed to create branch: {result.stderr}")
-                return False
-
-        except Exception as e:
-            logger.error(f"Failed to create branch {branch_name}: {e}")
-            return False
 
     def _stage_changes(self, project_dir: Path) -> bool:
         """Stage all changes"""

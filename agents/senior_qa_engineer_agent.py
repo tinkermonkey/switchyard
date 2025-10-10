@@ -78,6 +78,8 @@ After writing your tests, execute the full test suite, including:
 - Integration tests (written by you)
 - End-to-end tests (written by you)
 
+**IMPORTANT**: Do not create test runner scripts, use the native test framework commands (e.g., `pytest`, `unittest`, etc.).
+
 Ensure that all tests pass successfully.
 If any fail, think about whether the test needs to be fixed or if the code has a bug that needs to be fixed.
 

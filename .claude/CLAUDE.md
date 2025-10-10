@@ -1,255 +1,560 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to coding agents when working with this codebase.
 
-## Repository Architecture
+**IMPORTANT**: Do not create markdown files or any documentation during your tasks unless creating documentation is explicitly part of the task requirements.
 
-This repository is a Claude Code Agent Orchestrator designed to facilitate automated code development and testing.
+## Project Overview
 
-## Workspace Isolation and File System Safety
+This is the Claude Code Agent Orchestrator - an autonomous AI development system that manages GitHub-integrated software development workflows. The orchestrator coordinates specialized AI agents through GitHub Projects v2 Kanban boards, executing complete SDLC pipelines from requirements analysis to deployment.
 
-**CRITICAL**: The orchestrator MUST be isolated to its own workspace directory tree to prevent accidental modification of user's personal repositories.
+## Core Architecture
 
-### Workspace Structure
+### Technology Stack
+- **Language**: Python 3.11+
+- **Framework**: Async/await with asyncio
+- **Queue**: Redis (with in-memory fallback)
+- **Search/Analytics**: Elasticsearch 9.0
+- **GitHub**: GraphQL API, REST API, GitHub CLI
+- **Claude**: Anthropic Claude API (Sonnet 4.5, Opus 4)
+- **Docker**: Container orchestration for agent isolation
 
-The orchestrator operates within a dedicated workspace directory that contains:
-- `clauditoreum/` - The orchestrator codebase itself (this repository)
-- `<project-name>/` - Managed project checkouts (e.g., `context-studio/`)
+### Key Components
 
-Example directory structure on the host machine:
+**Pipeline System** (`pipeline/`)
+- Sequential pipeline orchestration with checkpoints
+- Circuit breaker pattern for fault tolerance
+- State persistence and recovery
+
+**Agent System** (`agents/`)
+- Specialized agents for different SDLC stages
+- Base classes: `MakerAgent` (creates output), `PipelineStage` (reviews/validates)
+- Three execution modes: Initial, Revision, Question (conversational)
+- Docker-in-Docker execution with workspace mounting
+
+**Configuration System** (`config/`)
+- Three-layer architecture: Foundations, Projects, State
+- `foundations/`: Agent definitions, pipeline templates, workflow templates
+- `projects/`: Project-specific configurations
+- `state/`: Runtime GitHub state (auto-managed)
+
+**Services** (`services/`)
+- `GitHubProjectManager`: Automatic project board reconciliation
+- `ProjectMonitor`: Polls GitHub boards for changes
+- `GitWorkflowManager`: Automated git operations and PR management
+- `FeatureBranchManager`: Branch lifecycle management
+- `DevContainerStateManager`: Docker image verification
+- `ProjectWorkspaceManager`: Workspace initialization
+
+**Task Queue** (`task_queue/`)
+- Redis-backed priority queue
+- Task lifecycle management
+- Priority levels: LOW, MEDIUM, HIGH, CRITICAL
+
+**State Management** (`state_management/`)
+- Checkpointing for pipeline recovery
+- Git state tracking
+- Conversation history for multi-turn interactions
+
+### Workspace Isolation
+
+**Host File System**:
 ```
-~/workspace/orchestrator/          # Orchestrator workspace root
-├── clauditoreum/                  # This codebase
-│   ├── config/
-│   ├── agents/
-│   ├── pipeline/
-│   └── ...
-└── context-studio/                # Managed project checkout
-    ├── src/
-    ├── tests/
-    └── ...
+./                                # Orchestrator isolated workspace
+│   ├── clauditoreum/             # This codebase
+│   └── <project-name>/           # Managed project checkouts (e.g., context-studio/)
 ```
 
-### File System Boundaries
-
-**The orchestrator MUST NEVER access files outside its workspace directory.**
-
-User's personal repositories exist as siblings to the orchestrator workspace:
+**Inside Orchestrator Container**:
+The orchestrator always runs in Docker. The container can only see the orchestrator workspace:
 ```
-~/workspace/                       # User's workspace (OFF LIMITS to orchestrator)
-├── orchestrator/                  # Orchestrator's isolated workspace (SAFE)
-│   ├── clauditoreum/
-│   └── context-studio/           # Orchestrator-managed copy
-├── context-studio/                # User's personal copy (OFF LIMITS)
-├── other-project/                 # User's personal copy (OFF LIMITS)
-└── ...
+/app/                             # Orchestrator code (clauditoreum/)
+/workspace/                       # Orchestrator workspace root
+├── clauditoreum/                 # Same as /app (this codebase)
+└── <project-name>/               # Managed checkouts ONLY
 ```
 
-### Container Volume Mounts
-
-In Docker, the isolation is enforced by mounting only the orchestrator workspace:
+**Container Volume Mounts** (from docker-compose.yml):
 ```yaml
 volumes:
-  - ./:/app                        # Mount clauditoreum/ as /app
-  - ..:/workspace                  # Mount orchestrator/ as /workspace
+  - ./:/app                        # Host: clauditoreum/ → Container: /app
+  - ..:/workspace                  # Host: orchestrator/ → Container: /workspace
+  - ~/.ssh/id_ed25519:/home/orchestrator/.ssh/id_ed25519:ro
+  - ~/.gitconfig:/home/orchestrator/.gitconfig:ro
+  - ~/.orchestrator:/home/orchestrator/.orchestrator  # GitHub App private keys
+  - /var/run/docker.sock:/var/run/docker.sock  # Docker-in-Docker for agent containers
 ```
 
-Inside the container:
-- `/workspace/` = Host's `~/workspace/orchestrator/`
-- `/app/` = Host's `~/workspace/orchestrator/clauditoreum/`
-- `/workspace/context-studio/` = Host's `~/workspace/orchestrator/context-studio/`
+**Critical Isolation Rules**:
+- The orchestrator container can ONLY access `/workspace/` which maps to a location on the host defined in the docker-compose.yml
+- Projects are cloned into `/workspace/<project>/` (inside the orchestrator workspace)
+- All agent operations happen within the isolated orchestrator workspace
 
-The orchestrator **cannot** see `/workspace/orchestrator/` from the host level - it only sees its own isolated workspace.
-
-### Project Checkout and Management
-
-When a project is configured in `config/projects/`, the orchestrator:
-1. Checks if project directory exists in workspace (e.g., `/workspace/context-studio/`)
-2. If not found, clones the repository to the workspace directory
-3. Manages git operations (branches, commits, pushes) within this checkout
-4. Launches agents in Docker containers with this project directory mounted
-
-This ensures:
-- User's personal repositories remain untouched
-- All agent work happens in isolated, managed checkouts
-- File system operations are contained within the orchestrator workspace
-
-## Best Practices
-
-- Don't use emojis in comments, code, or documentation.
-- Never use absolute paths that could escape the workspace boundary
-- Always use workspace-relative paths for project operations
-
-## File structure
-
-```
-├── pipeline/                         # Pipeline definition
-│   ├── base.py
-│   ├── orchestrator.py
-│   └── factory.py                    # Pipeline factory with new config system
-├── state_management/                 # Legacy state management
-│   ├── manager.py
-│   └── git_state.py
-├── handoff/                          # Handoff management
-│   ├── protocol.py
-│   └── quality_gate.py
-├── agents/                           # Sub-agent implementations
-│   ├── business_analyst.py
-│   ├── product_manager.py
-│   ├── software_engineer.py
-│   └── ...
-├── services/                         # Service layer
-│   ├── github_project_manager.py    # GitHub reconciliation manager
-│   └── project_monitor.py           # GitHub project monitoring
-├── config/                           # Configuration system
-│   ├── foundations/                  # Foundational configurations
-│   │   ├── agents.yaml              # Agent definitions and capabilities
-│   │   ├── pipelines.yaml           # Pipeline templates
-│   │   └── workflows.yaml           # Kanban workflow templates
-│   ├── projects/                     # Project-specific configurations
-│   │   └── context-studio.yaml      # Example project configuration
-│   ├── manager.py                    # Configuration loading and management
-│   ├── state_manager.py             # GitHub state management
-│   └── git_workflow.yaml            # Git automation settings
-├── state/                            # Runtime state (not version controlled)
-│   ├── projects/                     # Project-specific state
-│   │   └── context-studio/
-│   │       └── github_state.yaml    # GitHub project IDs, sync status
-│   └── orchestrator/                 # Global orchestrator state
-├── .claude/
-│   └── CLAUDE.md                     # This file, the Orchestrator's own Claude instructions
-└── requirements.txt                  # Python requirements
-```
-
-## Claude Code SDK architecture for autonomous agents
-
-The Claude Code SDK employs a **single-threaded master loop architecture** that fundamentally shapes how agents operate for hours-long autonomous sessions. At its core, the SDK uses the nO (Master Loop Engine) for orchestration, combined with the h2A real-time steering queue for interruptions and guidance. This architecture supports automatic context compaction, session resumption, and memory persistence - essential capabilities for long-running development tasks.
-
-The SDK's production-ready features include automatic prompt caching, fine-grained permission controls, and native IDE integration. **Sub-agents operate in isolated 200K token context windows**, preventing context pollution while enabling parallel processing. This isolation pattern is crucial for managing complex, multi-hour development sessions where different aspects of the codebase require focused attention.
-
-Memory persistence follows a hierarchical file structure: `~/.claude/CLAUDE.md` for global memory, `./CLAUDE.md` for project-shared knowledge, and `./.claude/agents/` for specialized sub-agents. This system automatically discovers and loads relevant context as agents navigate project directories, maintaining continuity across sessions while preventing information overload.
-
-## Sub-agent patterns and context management
-
-Sub-agents represent a paradigm shift in managing complex development tasks. Each sub-agent operates as a specialized assistant with an **isolated context window**, enabling sophisticated task decomposition without context pollution. The implementation leverages markdown configuration files that define the agent's model, tools, and specific expertise.
-
-Context window optimization employs multiple strategies. **Automatic context summarization** triggers when approaching token limits, preserving essential information while discarding verbose details. The recursive memory loading system gathers context from the project hierarchy on-demand, loading CLAUDE.md files only when accessing specific directories. This intelligent loading prevents context bloat while ensuring agents have necessary information.
-
-For production deployments, the SDK supports centralized memory management through MDM or Group Policy, enabling team-shared knowledge in version-controlled memory files while maintaining individual developer preferences in local memory. The checkpoint pattern preserves state before major operations, enabling robust recovery from interruptions or failures.
-
-## GitHub integration and Kanban automation
-
-GitHub CLI integration forms the backbone of automated workflow management. Agents execute commands like `gh issue create`, `gh pr merge`, and `gh project item-create` programmatically, enabling full lifecycle automation from issue creation through deployment. The integration supports both GraphQL queries for complex project management and REST APIs for standard operations.
-
-**Webhook listeners monitor Kanban board changes** in real-time, triggering agent workflows when cards move between columns. The implementation uses Node.js with signature verification for security, processing events like card movements to automatically initiate appropriate agent actions. For the two-board system, label-based status tracking provides additional granularity, with status labels (`incoming`, `scheduled`, `in-progress`) and project labels (`pre-sdlc`, `sdlc`) controlling workflow progression.
-
-Docker containerization ensures consistent development environments across agent sessions. Each agent container includes git, GitHub CLI, and necessary development tools, with volume mounts providing access to the codebase and SSH keys for authentication. This isolation prevents environmental conflicts while maintaining security boundaries.
-
-## Agent prompt engineering best practices
-
-Effective prompt engineering balances conciseness with clarity. **Token reduction strategies** include selective elimination of redundant words, strategic use of abbreviations, and keyword prioritization. The LLMLingua approach achieves up to 20x compression using small language models to identify unimportant tokens, dramatically reducing costs while maintaining effectiveness.
-
-Essential prompt elements that must always be retained include role definition, core objectives, output format specifications, critical constraints, and success criteria. Nice-to-have elements like verbose examples or philosophical explanations should be compressed or removed. The STAR framework (Situation, Task, Action, Result) provides structure for technical tasks while maintaining brevity.
-
-**Reviewer agents implement the maker-checker loop pattern**, where maker agents create initial outputs and checker agents validate quality. This multi-layer review architecture progresses through syntax validation, logic review, context validation, and security assessment before final human review. Each layer catches different issue categories, ensuring comprehensive quality assurance.
-
-## Configuration Management Architecture
-
-The orchestrator uses a three-layer configuration architecture that separates foundational capabilities, project-specific choices, and runtime state.
+## Configuration Management
 
 ### Foundational Layer (`config/foundations/`)
 
-**Agent Definitions (`agents.yaml`)**: Defines what agents exist and their capabilities including models, timeouts, tools, and MCP server connections. This is the authoritative source for all available agents in the system.
+**agents.yaml**: Defines all 17 agents with capabilities, timeouts, Docker requirements
+- `requires_dev_container: true` - Needs project dependencies
+- `requires_docker: true` - Must run in Docker
+- `makes_code_changes: true` - Modifies codebase
+- `filesystem_write_allowed: true` - Can write to /workspace
 
-**Pipeline Templates (`pipelines.yaml`)**: Defines reusable pipeline stage sequences with quality gates, timeouts, and maker-checker patterns. Templates can be instantiated by projects with customizations.
+**pipelines.yaml**: Pipeline templates (planning_design, environment_support, sdlc_execution)
+- Maker-checker workflow pattern
+- Stage dependencies and inputs
+- Review requirements and escalation rules
 
-**Workflow Templates (`workflows.yaml`)**: Defines kanban board structures and automation rules including column definitions, agent assignments, and trigger conditions.
+**workflows.yaml**: Kanban board templates with column definitions
 
-### Project Layer (`config/projects/`)
+### Project Layer (`config/projects/<project>.yaml`)
 
-Project-specific configurations that reference foundational templates and apply customizations. Each project defines which pipelines to enable, GitHub repository settings, and agent customizations.
+```yaml
+project:
+  name: "project-name"
+  github:
+    org: "your-org"
+    repo: "your-repo"
+    repo_url: "git@github.com:your-org/your-repo.git"
+  tech_stacks:
+    backend: "python, fastapi"
+    frontend: "react, typescript"
+  pipelines:
+    enabled:
+      - template: "planning_design"
+        workflow: "planning_workflow"
+      - template: "sdlc_execution"
+        workflow: "dev_workflow"
+```
 
-### State Layer (`state/projects/`)
+### State Layer (`state/projects/<project>/`)
 
-Runtime GitHub state including project IDs, board IDs, column IDs, and sync status. This layer is managed automatically by the orchestrator and enables configuration reconciliation.
+Auto-managed runtime state (DO NOT edit manually):
+- `github_state.yaml` - Board IDs, column IDs, sync status
+- `dev_container_state.yaml` - Docker image verification status
 
-### Configuration Reconciliation
+## Agent Execution Modes
 
-The orchestrator implements a reconciliation loop that ensures GitHub project boards match the desired configuration. On startup and when configuration changes, the system:
+All maker agents support three modes:
 
-1. Compares current GitHub state with desired configuration
-2. Creates missing project boards and columns
-3. Updates existing boards to match configuration
-4. Creates repository labels for pipeline routing
-5. Marks state as synchronized
+1. **Initial Mode**: First-time creation from requirements
+2. **Revision Mode**: Update based on reviewer feedback
+3. **Question Mode**: Conversational Q&A about previous output
 
-This eliminates the need for manual setup scripts and makes the orchestrator the authoritative source for project structure.
+Mode detection is automatic based on task context:
+- `trigger: 'feedback_loop'` + `conversation_mode: 'threaded'` → Question mode
+- `trigger: 'review_cycle_revision'` or `revision` in context → Revision mode
+- Otherwise → Initial mode
 
-## Sequential pipeline architecture
+## Docker-in-Docker Agent Execution
 
-The sequential orchestration pattern ensures agents process outputs from previous agents in a predefined order, with each stage building through progressive refinement. This deterministic flow control with defined handoff points enables quality-focused processing while maintaining clear dependencies between stages.
+Agents run in isolated Docker containers with project dependencies:
 
-**State management employs distributed patterns** with coordinated checkpointing across all agents. The StateManager class persists agent state to durable storage with versioning, creating checkpoints at major phase completions. Recovery mechanisms support both backward recovery to stable checkpoints and forward recovery through error correction, minimizing lost work during failures.
+**Container Creation** (`claude/docker_runner.py`):
+```python
+# Build project-specific agent image (Dockerfile.agent in project)
+docker build -f /workspace/<project>/Dockerfile.agent -t <project>-agent
 
-The two-board Kanban architecture separates pre-SDLC activities (requirements, design, planning) from SDLC proper (development, testing, deployment). Pre-SDLC columns progress from Backlog through Requirements Analysis and Design to Ready for Development. SDLC columns flow from Development through Code Review, Testing, and Deployment to Done. Each transition triggers specific agent handoffs with context preservation.
+# Run agent container with mounts
+docker run \
+  -v /workspace/<project>:/workspace \
+  -v /home/orchestrator/.ssh:/home/orchestrator/.ssh:ro \
+  <project>-agent \
+  claude --project /workspace <task>
+```
 
-## Mono-repo organization with CLAUDE.md
+**Environment Requirements**:
+- `dev_environment_setup` agent creates `Dockerfile.agent` for each project
+- `dev_environment_verifier` agent validates the Docker image
+- Images must include: project dependencies, git, Claude CLI, GitHub CLI
 
-The hierarchical configuration structure places CLAUDE.md files strategically throughout the mono-repo. The root-level file contains global agent configuration and project overview. Technology-specific configurations reside in `ux/CLAUDE.md` for frontend agents and `backend/CLAUDE.md` for backend specialists. This structure enables tech-stack agnostic agents to read appropriate configurations based on working directory.
+## Common Commands
 
-Each CLAUDE.md file follows a consistent pattern: architecture overview, workflow commands, agent guidelines, handoff protocols, error recovery procedures, and state management configuration. **Checkpoint frequency defaults to every major phase completion**, with backward recovery to the last stable state on failure. The configuration includes specific tool commands, formatting requirements, and validation criteria relevant to each component.
+### Running the Orchestrator
 
-## Role-specific agent implementations
+```bash
+# Local development (requires Python 3.11+, Redis)
+python main.py
 
-### Business Analyst Agent
-Focuses on requirements gathering and user story creation, operating with CBAP certification-level expertise. Uses INVEST principles for user stories and Given-When-Then format for acceptance criteria. Outputs include Business Requirements Documents, user stories, and process flow diagrams.
+# Docker Compose (recommended)
+docker-compose up -d
 
-### Product Manager Agent  
-Employs RICE framework for feature prioritization, balancing Reach, Impact, Confidence, and Effort. Creates product roadmaps, conducts market analysis, and aligns stakeholders around OKRs. Outputs prioritization matrices and stakeholder communication summaries.
+# View logs
+docker-compose logs -f orchestrator
 
-### Requirements Reviewer Agent
-Validates requirements against the 5Cs: Clear, Concise, Complete, Consistent, and Correct. Identifies ambiguities, gaps, and conflicts while ensuring testability. Produces review reports with severity-categorized issues and specific improvement recommendations.
+# Check health
+curl http://localhost:5001/health
+```
 
-### Software Architect Agent
-Designs systems considering scalability, maintainability, performance, and security. Creates Architecture Decision Records (ADRs) with trade-off analyses. Generates C4 model diagrams, API specifications, and performance plans.
+### Testing
 
-### Architecture Reviewer Agent
-Validates designs against patterns, security standards, and scalability requirements. Performs vulnerability assessments and performance analysis. Outputs include compliance checklists and prioritized improvement recommendations.
+```bash
+# Run unit tests with pytest
+pytest tests/unit/
 
-### Senior Software Engineer Agent
-Implements clean code following SOLID principles, DRY, KISS, and YAGNI. Maintains >80% test coverage with comprehensive error handling. Produces well-structured source code with documentation and performance benchmarks.
+# Run integration tests
+pytest tests/integration/
 
-### Code Reviewer Agent
-Categorizes issues as Must Fix, Should Fix, Consider, or Nitpick. Integrates static analysis tools and security scanners. Provides line-specific feedback with severity levels and fix suggestions.
+# Run all tests
+pytest
 
-### Senior QA Engineer Agent
-Develops comprehensive test strategies across unit, integration, system, and acceptance levels. Designs test cases using equivalence partitioning and boundary analysis. Creates automated test suites with performance baselines.
+# Run with coverage
+pytest --cov=. --cov-report=html
 
-### Technical Writer Agent
-Generates API documentation from OpenAPI specifications, creates user guides and tutorials, and maintains knowledge bases. Follows documentation standards for clarity, accuracy, and completeness.
+# Run specific test file
+pytest tests/unit/test_parser.py -v
 
-## Handoff mechanisms between agents
+# Run with verbose output
+pytest -v
 
-The context transfer protocol structures handoffs with clear specifications. Each handoff includes the originating agent, target agent, task context with completed work and decisions made, deliverables with quality metrics, and next steps with required actions and constraints. This JSON-based protocol ensures no information is lost during transitions.
+# Stop on first failure
+pytest -x
 
-**Quality gates enforce standards** before progression, with each agent validating input from the previous stage. The QualityGate class evaluates outputs against thresholds, requesting revisions when quality falls below acceptable levels. This approach prioritizes quality over speed, ensuring compound improvements over time.
+# Alternative: Use the test script
+./scripts/run_tests.sh --unit
+./scripts/run_tests.sh --integration
+./scripts/run_tests.sh --all --coverage
 
-## Long-running session management
+# Alternative: Use Make commands (wrapper around scripts)
+make test              # Run unit tests
+make test-integration  # Run integration tests
+make test-all          # Run all tests
+make test-coverage     # Run with coverage
+make clean-test        # Clean test artifacts
+```
 
-Session persistence leverages the Claude Code SDK's built-in capabilities for conversation history preservation and tool usage logging. The `claude --resume session-abc123` command continues specific conversations, while `claude --continue` resumes the most recent session. Headless mode (`claude -p "task" --output-format stream-json`) enables full automation.
+### Project Management
 
-**Memory management strategies** include automatic context summarization when approaching limits, recursive loading based on directory access, and intelligent tool usage tracking. The system preserves context during tool calls while implementing cost-aware optimization, balancing cheaper models for routine tasks with premium models for complex reasoning.
+```bash
+# Project workspaces are initialized automatically on startup
 
-Error recovery employs multiple layers: model-level reasoning for logical errors, tool-level retries with exponential backoff, system-level handling for resource exhaustion, and application-level custom strategies. State preservation during recovery ensures minimal work loss, with detailed logging enabling debugging and continuous improvement.
+# Cleanup orphaned feature branches (use Make or direct Python)
+make cleanup-branches
+# or
+PYTHONPATH=. python scripts/cleanup_orphaned_branches.py
 
-## Docker containerization for development isolation
+# Cleanup specific project
+make cleanup-project PROJECT=context-studio
+# or
+PYTHONPATH=. python scripts/cleanup_orphaned_branches.py --project context-studio
 
-The Docker-based workflow encapsulates each agent's environment, mounting the workspace, Docker socket, git configuration, and SSH keys as volumes. The container includes all necessary tools: git, GitHub CLI, development frameworks, and the Claude Code SDK itself.
+# Docker images for verified projects are checked automatically on startup
+```
 
-Docker Compose orchestrates multiple services, including the main Claude agent container and webhook listeners for GitHub integration. Environment variables manage authentication tokens and configuration, while working directories ensure agents operate in the correct context. This containerization enables consistent, reproducible agent behavior across different host systems.
+### GitHub Operations
 
-## Making agents tech-stack agnostic
+```bash
+# GitHub CLI must be authenticated
+gh auth status
 
-Configuration-driven architecture enables agents to adapt to different technology stacks dynamically. The project configuration schema specifies language, framework, architecture pattern, testing framework, and deployment target. Agents load appropriate tools based on this configuration: Python projects load Pylint and pytest, while Java projects load Checkstyle and JUnit.
+# View project boards
+gh project list --owner <org>
 
-The Agent Protocol specification provides standardized communication across frameworks. POST endpoints create tasks and execute steps, while GET endpoints list and monitor progress. This protocol ensures agents remain portable across different technology stacks while maintaining consistent interfaces.
+# View issues in project
+gh issue list --repo <org>/<repo>
+
+# Create issue
+gh issue create --title "..." --body "..." --label "pipeline:dev"
+```
+
+### Docker Operations
+
+```bash
+# View running containers
+docker ps
+
+# Build project agent image
+docker build -f /workspace/<project>/Dockerfile.agent -t <project>-agent /workspace/<project>
+
+# Test agent container
+docker run -v /workspace/<project>:/workspace <project>-agent /bin/bash
+
+# Clean Docker artifacts
+docker system prune -a
+```
+
+## Development Workflow
+
+### Adding a New Agent
+
+1. Create agent class in `agents/<agent_name>_agent.py`:
+```python
+from agents.base_maker_agent import MakerAgent
+
+class CustomAgent(MakerAgent):
+    @property
+    def agent_display_name(self) -> str:
+        return "Custom Agent"
+    
+    @property
+    def agent_role_description(self) -> str:
+        return "Brief role description"
+    
+    @property
+    def output_sections(self) -> List[str]:
+        return ["section1", "section2"]
+```
+
+2. Register in `agents/__init__.py`:
+```python
+from .custom_agent import CustomAgent
+
+AGENT_REGISTRY = {
+    "custom_agent": CustomAgent,
+}
+```
+
+3. Add to `config/foundations/agents.yaml`:
+```yaml
+agents:
+  custom_agent:
+    description: "Agent description"
+    model: "claude-sonnet-4-5-20250929"
+    timeout: 300
+    retries: 2
+    makes_code_changes: false
+    requires_dev_container: false
+    requires_docker: true
+```
+
+### Adding a New Pipeline
+
+1. Add template to `config/foundations/pipelines.yaml`:
+```yaml
+pipeline_templates:
+  custom_pipeline:
+    name: "Custom Pipeline"
+    stages:
+      - stage: "stage_name"
+        default_agent: "agent_name"
+        review_required: true
+```
+
+2. Enable in project config `config/projects/<project>.yaml`:
+```yaml
+pipelines:
+  enabled:
+    - template: "custom_pipeline"
+      name: "custom"
+```
+
+### Modifying Agent Behavior
+
+Agents use Claude instructions via `claude/claude_integration.py`:
+- Instructions are in `agents/<agent>/.claude/instructions.md`
+- Context includes: issue details, previous outputs, review feedback
+- Output posted to GitHub as discussion comment or issue comment
+
+## GitHub Integration
+
+### Project Board Automation
+
+The orchestrator automatically manages GitHub Projects v2 boards:
+
+1. **Reconciliation Loop** (on startup):
+   - Compares config vs GitHub state
+   - Creates/updates project boards and columns
+   - Creates repository labels for pipeline routing
+
+2. **Monitoring Loop** (continuous):
+   - Polls GitHub boards every 30 seconds
+   - Detects card movements between columns
+   - Enqueues tasks for appropriate agents
+
+3. **Label-Based Routing**:
+   - `pipeline:dev` → SDLC execution pipeline
+   - `pipeline:epic` → Planning & design pipeline
+
+### GitHub App vs PAT Authentication
+
+**Personal Access Token** (simple):
+- Requires `repo` and `project` scopes
+- Comments appear as your user account
+
+**GitHub App** (recommended):
+- Comments appear as bot with `[bot]` badge
+- Better rate limits (5000 req/hour)
+- Requires private key at `~/.orchestrator/<app-name>.pem`
+- Set `GITHUB_APP_ID`, `GITHUB_APP_INSTALLATION_ID`, `GITHUB_APP_PRIVATE_KEY_PATH`
+
+## Monitoring and Observability
+
+### Observability Server
+
+The observability server runs on port 5001 and provides REST APIs for the web UI:
+
+```bash
+# Main endpoints
+curl http://localhost:5001/health              # System health status
+curl http://localhost:5001/agents/active       # Currently running agents
+curl http://localhost:5001/history             # Agent execution history
+curl http://localhost:5001/claude-logs-history # Claude logs
+curl http://localhost:5001/current-pipeline    # Current pipeline state
+curl http://localhost:5001/pipeline-run-events # Pipeline run events
+curl http://localhost:5001/active-pipeline-runs # Active pipeline runs
+
+# Review filter management
+curl http://localhost:5001/api/review-filters              # GET filters
+curl http://localhost:5001/api/review-filters -X POST      # Create filter
+curl http://localhost:5001/api/review-filters/<id> -X PUT  # Update filter
+curl http://localhost:5001/api/review-filters/<id> -X DELETE # Delete filter
+
+# Circuit breaker monitoring
+curl http://localhost:5001/api/circuit-breakers  # Circuit breaker states
+
+# Project management
+curl http://localhost:5001/api/projects  # Project list and status
+```
+
+**Agent Operations**:
+```bash
+# Kill a running agent container
+curl -X POST http://localhost:5001/agents/kill/<container_name>
+```
+
+### Health Check Response
+
+```json
+{
+  "healthy": true,
+  "checks": {
+    "redis": {"healthy": true, "message": "Connected"},
+    "github": {"healthy": true, "message": "Authenticated"},
+    "docker": {"healthy": true, "message": "Socket accessible"}
+  },
+  "timestamp": "2025-10-10T12:00:00Z"
+}
+```
+
+### Logs
+
+- **Structured JSON logging** to stdout (container logs)
+- **File logging** to `orchestrator_data/logs/`
+- **Pattern detection** via Elasticsearch (if enabled)
+- **Web UI** at http://localhost:3000
+
+### Metrics
+
+Prometheus metrics are exposed on port 8000 (configurable via `METRICS_PORT`):
+```bash
+# View Prometheus metrics
+curl http://localhost:8000/metrics
+```
+
+**Available Metrics**:
+- `tasks_total{agent, status}` - Total tasks processed (success/failure)
+- `task_duration_seconds{agent}` - Task execution duration histogram
+- `active_tasks{agent}` - Currently active tasks gauge
+- `pipeline_health` - Overall pipeline health score (0-100)
+
+Quality metrics are also logged to `orchestrator_data/metrics/quality_metrics_<date>.jsonl`
+
+## Troubleshooting
+
+### GitHub Authentication Fails
+
+```bash
+# Check authentication
+gh auth status
+
+# Refresh token
+gh auth refresh
+
+# Verify scopes (must include 'project')
+gh auth status --show-token
+```
+
+### Docker Image Build Fails
+
+```bash
+# View dev_environment_setup logs
+docker-compose logs orchestrator | grep dev_environment_setup
+
+# Manually build to debug
+docker build -f /workspace/<project>/Dockerfile.agent -t <project>-agent /workspace/<project>
+
+# Check dev container state
+cat state/projects/<project>/dev_container_state.yaml
+```
+
+### Agent Task Fails
+
+```bash
+# View agent logs in GitHub issue comments
+# Check orchestrator logs
+docker-compose logs -f orchestrator
+
+# View task queue
+# Redis CLI
+redis-cli
+> LRANGE orchestrator:tasks:queue 0 -1
+```
+
+### Redis Connection Issues
+
+```bash
+# Check Redis is running
+docker-compose ps redis
+
+# Test connection
+redis-cli -h localhost -p 6379 ping
+
+# Orchestrator falls back to in-memory queue if Redis unavailable
+```
+
+## Security Considerations
+
+- API keys stored in `.env` (NEVER commit)
+- SSH keys mounted read-only into containers
+- Docker socket access controlled via group membership
+- GitHub App private keys at `~/.orchestrator/` (mounted into container)
+- Agent containers run as non-root user (UID 1000)
+- Docker is run in rootfull mode because rootless docker-in-docker is not yet stable
+
+## File Structure Reference
+
+```
+clauditoreum/
+├── agents/                      # 17 specialized AI agents
+│   ├── base_maker_agent.py     # Base class for maker agents
+│   ├── business_analyst_agent.py
+│   ├── senior_software_engineer_agent.py
+│   └── ...
+├── config/                      # Configuration system
+│   ├── foundations/            # Agent, pipeline, workflow definitions
+│   ├── projects/               # Project-specific configs
+│   └── state_manager.py        # GitHub state management
+├── pipeline/                    # Pipeline orchestration
+│   ├── base.py                 # PipelineStage base class
+│   └── orchestrator.py         # Sequential pipeline executor
+├── services/                    # Service layer
+│   ├── github_project_manager.py  # Board reconciliation
+│   ├── project_monitor.py      # Board polling
+│   ├── git_workflow_manager.py # Git automation
+│   └── ...
+├── state_management/           # Checkpointing and recovery
+├── task_queue/                 # Redis task queue
+├── claude/                     # Claude integration
+│   ├── claude_integration.py  # Claude API wrapper
+│   ├── docker_runner.py       # Docker-in-Docker execution
+│   └── session_manager.py     # Conversation state
+├── monitoring/                 # Logging and metrics
+├── tests/                      # Unit and integration tests
+├── main.py                     # Orchestrator entry point
+├── Dockerfile                  # Orchestrator container
+├── docker-compose.yml          # Service orchestration
+└── Makefile                    # Common commands
+```
+
+## Best Practices
+
+- **Don't Document**: Don't create markdown files or any documentation during your tasks unless creating documentation is explicitly part of the task requirements.
+- **Workspace Isolation**: The orchestrator runs in Docker - all operations are within `/workspace/` container boundary
+- **Path Usage**: Use workspace-relative paths, never absolute paths that could escape boundaries
+- **File Operations**: All file operations must be within `/workspace/` (the isolated orchestrator workspace)
+- **Testing**: Use pytest directly or the provided test scripts/Makefile wrappers
+- **Agent Output**: Agents should post outputs to GitHub, not create local files (except code agents)
+- **Health Checks**: Monitor the `/health` endpoint after changes
+- **Git Operations**: All git operations happen in isolated managed checkouts under `/workspace/<project>/`
+- **Timeouts**: Keep agent timeouts reasonable (most: 300s, builds: 1800s)
+- **Quality Assurance**: Follow maker-checker pattern for quality assurance

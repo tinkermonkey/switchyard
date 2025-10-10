@@ -50,7 +50,7 @@ class GitWorkflowManager:
         branch_info = BranchInfo(
             branch_name=branch_name,
             issue_number=issue_number,
-            created_at=datetime.utcnow().isoformat()
+            created_at=datetime.utcnow().isoformat() + 'Z'
         )
 
         self.branch_cache[project][issue_number] = branch_info
@@ -86,6 +86,23 @@ class GitWorkflowManager:
             Dict with pr_number, pr_url, created (bool)
         """
         branch_info = self.get_branch_info(project, issue_number)
+        
+        # If no branch found, check if this is a sub-issue with a parent
+        if not branch_info:
+            try:
+                from services.feature_branch_manager import feature_branch_manager
+                # Check if there's a feature branch for a parent issue
+                all_feature_branches = feature_branch_manager.get_all_feature_branches(project)
+                for feature_branch in all_feature_branches:
+                    if any(si.number == issue_number for si in feature_branch.sub_issues):
+                        logger.info(f"Issue #{issue_number} is sub-issue of #{feature_branch.parent_issue}, using parent's branch")
+                        # Track this sub-issue against the parent's branch for future PR operations
+                        self.track_branch(project, issue_number, feature_branch.branch_name)
+                        branch_info = self.get_branch_info(project, issue_number)
+                        break
+            except Exception as e:
+                logger.warning(f"Could not check for parent issue branch: {e}")
+        
         if not branch_info:
             logger.error(f"No branch tracked for issue #{issue_number}")
             return {'success': False, 'error': 'No branch tracked'}

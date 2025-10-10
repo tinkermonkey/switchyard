@@ -393,7 +393,7 @@ class PatternDetector:
                 "resolved": False,
 
                 # Detection metadata
-                "detected_at": datetime.utcnow().isoformat(),
+                "detected_at": datetime.utcnow().isoformat() + 'Z',
                 "detection_rule": rule.detection,
                 "elasticsearch_query": query
             }

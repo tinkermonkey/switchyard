@@ -34,7 +34,7 @@ Alert Banner (when circuits open)
 - Transforms into user-friendly format
 - Returns summary counts (open, half_open, healthy)
 
-**3. Header Component** (`web_ui_v2/src/components/Header.jsx`)
+**3. Header Component** (`web_ui/src/components/Header.jsx`)
 - Polls circuit breaker API every 5 seconds
 - Displays prominent alert banner when circuits open
 - Shows "All Systems Operational" badge when healthy

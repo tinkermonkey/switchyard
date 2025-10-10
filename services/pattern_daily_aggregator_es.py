@@ -507,7 +507,7 @@ class PatternDailyAggregator:
                 "unique_sessions": insight_data.get('unique_sessions', 0),
                 "unique_agents": insight_data.get('unique_agents', 0),
                 "unique_projects": insight_data.get('unique_projects', 0),
-                "created_at": datetime.utcnow().isoformat()
+                "created_at": datetime.utcnow().isoformat() + 'Z'
             }
 
             # Store in Elasticsearch (use date + type as document ID for idempotency)

@@ -1,0 +1,211 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+  line-height: 1.5;
+  font-weight: 400;
+
+  /* Light mode colors */
+  --gh-canvas: #ffffff;
+  --gh-canvas-subtle: #f6f8fa;
+  --gh-border: #d0d7de;
+  --gh-border-muted: #eaeef2;
+  --gh-fg: #1f2328;
+  --gh-fg-muted: #656d76;
+  --gh-fg-subtle: #8c959f;
+  --gh-accent-primary: #0969da;
+  --gh-accent-emphasis: #0550ae;
+  --gh-success: #1a7f37;
+  --gh-danger: #d1242f;
+  --gh-warning: #9a6700;
+  --gh-warning-subtle: #fff8c5;
+}
+
+.dark {
+  /* Dark mode colors */
+  --gh-canvas: #0d1117;
+  --gh-canvas-subtle: #161b22;
+  --gh-border: #30363d;
+  --gh-border-muted: #21262d;
+  --gh-fg: #c9d1d9;
+  --gh-fg-muted: #8b949e;
+  --gh-fg-subtle: #6e7681;
+  --gh-accent-primary: #58a6ff;
+  --gh-accent-emphasis: #1f6feb;
+  --gh-success: #238636;
+  --gh-danger: #da3633;
+  --gh-warning: #9e6a03;
+  --gh-warning-subtle: rgba(187, 128, 9, 0.15);
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+}
+
+/* Custom scrollbar styles matching the original UI */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: #0d1117;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #30363d;
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #484f58;
+}
+
+/* Dark theme scrollbar for light mode */
+.light ::-webkit-scrollbar-track {
+  background: #f6f8fa;
+}
+
+.light ::-webkit-scrollbar-thumb {
+  background: #d0d7de;
+}
+
+.light ::-webkit-scrollbar-thumb:hover {
+  background: #a8b1bb;
+}
+
+/* Pulse animation for loading states */
+@keyframes pulse {
+  0%, 100% { opacity: 0.8; }
+  50% { opacity: 0.4; }
+}
+
+.animate-pulse-custom {
+  animation: pulse 1.5s ease-in-out infinite;
+}
+
+/* Candy stripe animation for active agents */
+@keyframes stripes {
+  0% { background-position: 0 0; }
+  100% { background-position: 1rem 0; }
+}
+
+/* Markdown prose styles for prompt rendering */
+.prose {
+  color: var(--gh-fg);
+  max-width: none;
+}
+
+.prose h1, .prose h2, .prose h3, .prose h4, .prose h5, .prose h6 {
+  color: var(--gh-accent-primary);
+  font-weight: 600;
+  margin-top: 1.5em;
+  margin-bottom: 0.5em;
+  line-height: 1.25;
+}
+
+.prose h1 { font-size: 2em; border-bottom: 1px solid var(--gh-border); padding-bottom: 0.3em; }
+.prose h2 { font-size: 1.5em; border-bottom: 1px solid var(--gh-border); padding-bottom: 0.3em; }
+.prose h3 { font-size: 1.25em; }
+.prose h4 { font-size: 1em; }
+.prose h5 { font-size: 0.875em; }
+.prose h6 { font-size: 0.85em; color: var(--gh-fg-muted); }
+
+.prose p {
+  margin-top: 0.75em;
+  margin-bottom: 0.75em;
+}
+
+.prose a {
+  color: var(--gh-accent-primary);
+  text-decoration: none;
+}
+
+.prose a:hover {
+  text-decoration: underline;
+}
+
+.prose strong {
+  color: var(--gh-fg);
+  font-weight: 600;
+}
+
+.prose em {
+  font-style: italic;
+}
+
+.prose code {
+  background: var(--gh-canvas-subtle);
+  padding: 0.2em 0.4em;
+  border-radius: 6px;
+  font-size: 85%;
+  font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+  color: var(--gh-fg);
+}
+
+.prose pre {
+  background: var(--gh-canvas-subtle);
+  border: 1px solid var(--gh-border);
+  border-radius: 6px;
+  padding: 1em;
+  overflow-x: auto;
+  margin: 1em 0;
+}
+
+.prose pre code {
+  background: transparent;
+  padding: 0;
+  border-radius: 0;
+  font-size: 100%;
+}
+
+.prose ul, .prose ol {
+  margin-top: 0.75em;
+  margin-bottom: 0.75em;
+  padding-left: 2em;
+}
+
+.prose li {
+  margin-top: 0.25em;
+  margin-bottom: 0.25em;
+}
+
+.prose blockquote {
+  border-left: 4px solid var(--gh-border);
+  padding-left: 1em;
+  color: var(--gh-fg-muted);
+  font-style: italic;
+  margin: 1em 0;
+}
+
+.prose table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 1em 0;
+}
+
+.prose th, .prose td {
+  border: 1px solid var(--gh-border);
+  padding: 0.5em 1em;
+  text-align: left;
+}
+
+.prose th {
+  background: var(--gh-canvas-subtle);
+  font-weight: 600;
+}
+
+.prose hr {
+  border: none;
+  border-top: 1px solid var(--gh-border);
+  margin: 1.5em 0;
+}
+
+.prose img {
+  max-width: 100%;
+  height: auto;
+}

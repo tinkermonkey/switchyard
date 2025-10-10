@@ -41,6 +41,16 @@ class ProjectMonitor:
         self.workspace_router = WorkspaceRouter()
         self.discussions = GitHubDiscussions()
 
+        # Initialize decision observability
+        from monitoring.observability import get_observability_manager
+        from monitoring.decision_events import DecisionEventEmitter
+        self.obs = get_observability_manager()
+        self.decision_events = DecisionEventEmitter(self.obs)
+
+        # Initialize pipeline run manager
+        from services.pipeline_run import get_pipeline_run_manager
+        self.pipeline_run_manager = get_pipeline_run_manager()
+
         # Get polling interval from first project's orchestrator config (for now)
         projects = self.config_manager.list_projects()
         if projects:
@@ -177,6 +187,19 @@ class ProjectMonitor:
                     'new_status': current_item.status,
                     'repository': current_item.repository
                 })
+                
+                # EMIT DECISION EVENT: Status change detected
+                # Extract board name from project_name key (format: project_board)
+                board_name = project_name.split('_', 1)[1] if '_' in project_name else 'unknown'
+                self.decision_events.emit_status_progression(
+                    issue_number=issue_number,
+                    project=project_name.split('_', 1)[0] if '_' in project_name else project_name,
+                    board=board_name,
+                    from_status=last_item.status,
+                    to_status=current_item.status,
+                    trigger='manual',  # Status changes from GitHub are manual
+                    success=True  # Already successfully moved in GitHub
+                )
 
         # Update last state
         self.last_state[project_name] = current_by_issue
@@ -571,6 +594,45 @@ class ProjectMonitor:
                     break
 
             if agent and agent != 'null':
+                # Determine workspace type and get discussion ID FIRST, before using them
+                from config.state_manager import state_manager
+                workspace_type = pipeline_config.workspace
+                discussion_id = None
+
+                if workspace_type in ['discussions', 'hybrid']:
+                    discussion_id = state_manager.get_discussion_for_issue(project_name, issue_number)
+
+                # Get or create pipeline run early so we can tag all events
+                # Fetch issue details for pipeline run
+                issue_data_early = self.get_issue_details(repository, issue_number, project_config.github['org'])
+                pipeline_run = self.pipeline_run_manager.get_or_create_pipeline_run(
+                    issue_number=issue_number,
+                    issue_title=issue_data_early.get('title', f'Issue #{issue_number}'),
+                    issue_url=issue_data_early.get('url', ''),
+                    project=project_name,
+                    board=board_name
+                )
+                logger.debug(f"Using pipeline run {pipeline_run.id} for issue #{issue_number}")
+
+                # EMIT DECISION EVENT: Agent routing decision
+                # Collect alternative agents from workflow
+                alternative_agents = [
+                    col.agent for col in workflow_template.columns
+                    if col.agent and col.agent != 'null' and col.agent != agent
+                ]
+                
+                self.decision_events.emit_agent_routing_decision(
+                    issue_number=issue_number,
+                    project=project_name,
+                    board=board_name,
+                    current_status=status,
+                    selected_agent=agent,
+                    reason=f"Status '{status}' maps to agent '{agent}' in workflow '{pipeline_config.workflow}'",
+                    alternatives=alternative_agents,
+                    workspace_type=workspace_type,
+                    pipeline_run_id=pipeline_run.id
+                )
+                
                 # Check if there's already a pending task for this issue and agent
                 existing_tasks = self.task_queue.get_pending_tasks()
                 for existing_task in existing_tasks:
@@ -581,14 +643,6 @@ class ProjectMonitor:
                         existing_task.agent == agent):
                         logger.info(f"Task already exists for {agent} on issue #{issue_number} - skipping duplicate")
                         return None
-
-                # Determine workspace type and get discussion ID FIRST, before checking if processed
-                from config.state_manager import state_manager
-                workspace_type = pipeline_config.workspace
-                discussion_id = None
-
-                if workspace_type in ['discussions', 'hybrid']:
-                    discussion_id = state_manager.get_discussion_for_issue(project_name, issue_number)
 
                 # Check if agent should execute work using execution state tracker
                 # This check must happen BEFORE column type routing to prevent duplicate runs
@@ -889,8 +943,8 @@ class ProjectMonitor:
 
             if agent and agent != 'null':
 
-                # Fetch full issue details from GitHub
-                issue_data = self.get_issue_details(repository, issue_number, project_config.github['org'])
+                # Fetch full issue details from GitHub (use issue_data_early from above)
+                issue_data = issue_data_early
 
                 # Get the stage config from pipeline template for this column
                 pipeline_template = self.config_manager.get_pipeline_template(pipeline_config.template)
@@ -915,6 +969,9 @@ class ProjectMonitor:
                     current_stage_config=current_stage_config
                 )
 
+                # Pipeline run already created above, just use it
+                logger.info(f"Creating task with pipeline run {pipeline_run.id} for issue #{issue_number}")
+
                 # Create task for the agent
                 task_context = {
                     'project': project_name,
@@ -927,6 +984,7 @@ class ProjectMonitor:
                     'column': status,
                     'trigger': 'project_monitor',
                     'workspace_type': workspace_type,
+                    'pipeline_run_id': pipeline_run.id,  # Include pipeline run ID
                     'timestamp': datetime.now().isoformat()
                 }
 
@@ -944,6 +1002,17 @@ class ProjectMonitor:
                 )
 
                 self.task_queue.enqueue(task)
+                
+                # EMIT DECISION EVENT: Task queued
+                self.decision_events.emit_task_queued(
+                    agent=agent,
+                    project=project_name,
+                    issue_number=issue_number,
+                    board=board_name,
+                    priority='MEDIUM',
+                    reason=f"Agent '{agent}' assigned to issue #{issue_number} in status '{status}'",
+                    pipeline_run_id=pipeline_run.id
+                )
 
                 # Record execution start in work execution state
                 from services.work_execution_state import work_execution_tracker
@@ -958,7 +1027,18 @@ class ProjectMonitor:
                 logger.info(f"Created task for {agent} - Issue #{issue_number} moved to {status} on {board_name}")
                 return agent
             else:
+                # No agent for this column - end pipeline run if one exists
                 logger.info(f"No agent assigned to column '{status}' in {board_name}")
+                
+                # End active pipeline run (issue has reached end of pipeline)
+                ended = self.pipeline_run_manager.end_pipeline_run(
+                    project=project_name,
+                    issue_number=issue_number,
+                    reason=f"Issue moved to column '{status}' with no agent"
+                )
+                if ended:
+                    logger.info(f"Ended pipeline run for issue #{issue_number} (no agent in column '{status}')")
+                
                 return None
 
         except Exception as e:
@@ -1210,7 +1290,8 @@ _Review cycle initiated by Claude Code Orchestrator_
                             org=project_config.github['org'],
                             workflow_columns=workflow_template.columns,
                             workspace_type=workspace_type,
-                            discussion_id=discussion_id
+                            discussion_id=discussion_id,
+                            pipeline_run_id=pipeline_run.id
                         )
                     )
 

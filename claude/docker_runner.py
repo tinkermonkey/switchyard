@@ -134,10 +134,11 @@ class DockerAgentRunner:
                     break
 
         # Add the image and simple test command
+        # Test writes to /workspace (the project directory), NOT to /home/orchestrator/.ssh (which is read-only)
         test_cmd.extend([
             'clauditoreum-orchestrator:latest',  # Use simple base image for quick test
             'sh', '-c',
-            'echo "test" > /workspace/.write-verify && rm /workspace/.write-verify && echo "SUCCESS"'
+            'echo "test" > /workspace/.write-verify && cat /workspace/.write-verify && rm /workspace/.write-verify && echo "SUCCESS"'
         ])
 
         logger.info(f"   Running container write test with container: {test_container_name}")
@@ -229,8 +230,9 @@ class DockerAgentRunner:
             return result_text
 
         finally:
-            # Clean up container
+            # Clean up container and tracking
             self._cleanup_container(container_name)
+            self._unregister_active_container(container_name)
 
     def _prepare_mcp_config(self, mcp_servers: list, project_dir: Path) -> Dict:
         """Prepare MCP configuration for the container"""
@@ -286,7 +288,7 @@ class DockerAgentRunner:
         host_workspace = os.environ.get('HOST_WORKSPACE_PATH', '/workspace')
         container_path_str = str(project_dir.absolute())
         if container_path_str.startswith('/workspace/'):
-            # /workspace/context-studio -> $HOST_WORKSPACE_PATH/context-studio
+            # /workspace/project-name -> $HOST_WORKSPACE_PATH/project-name
             project_name = container_path_str.replace('/workspace/', '')
             host_project_path = f'{host_workspace}/{project_name}'
         else:
@@ -339,10 +341,10 @@ class DockerAgentRunner:
             '-v', mount_spec,
 
             # Mount SSH keys for git operations (read-only)
-            '-v', f'{host_home}/.ssh:/root/.ssh:ro',
+            '-v', f'{host_home}/.ssh:/home/orchestrator/.ssh:ro',
 
             # Mount git config (read-only)
-            '-v', f'{host_home}/.gitconfig:/root/.gitconfig:ro',
+            '-v', f'{host_home}/.gitconfig:/home/orchestrator/.gitconfig:ro',
 
             # Working directory inside container
             '-w', '/workspace',
@@ -366,18 +368,16 @@ class DockerAgentRunner:
 
         # Special handling for dev_environment_setup agent: mount Docker socket for image building
         if agent == 'dev_environment_setup':
-            logger.info("Mounting Docker socket for dev_environment_setup agent (running as root)")
-            # On macOS Docker Desktop, socket permissions require root access
-            # This is acceptable for dev_environment_setup as it's a build/setup task
+            logger.info("Mounting Docker socket for dev_environment_setup agent")
+            # The orchestrator user is already part of the docker group (see Dockerfile)
+            # This allows Docker socket access without requiring root
             cmd.extend([
                 '-v', '/var/run/docker.sock:/var/run/docker.sock',
-                '--user', 'root'  # Required for Docker socket access on macOS
             ])
-        elif filesystem_write_allowed:
-            # For agents that need write access, run as root so they can write to workspace
-            # In rootless Docker, container UID 0 maps to host user UID via user namespace
-            logger.info(f"Agent {agent} needs write access, running as root (maps to host user via userns)")
-            cmd.extend(['--user', 'root'])
+
+        # Note: With rootful Docker, no user namespace remapping by default
+        # Container UID 1000 = host UID 1000 directly, giving proper file access
+        # and allowing Claude Code to run with bypass permissions (not as root)
 
         # Add CONTEXT7_API_KEY if present
         if 'CONTEXT7_API_KEY' in os.environ:
@@ -486,17 +486,10 @@ class DockerAgentRunner:
             '--model', claude_model,
         ]
 
-        # Choose permission mode based on whether running as root
-        # bypassPermissions is blocked when running as root, so use acceptEdits instead
-        if agent == 'dev_environment_setup' or filesystem_write_allowed:
-            # Agents running as root (for write access) must use acceptEdits
-            # bypassPermissions is blocked by Claude Code when running as root for security
-            claude_cmd.extend(['--permission-mode', 'acceptEdits'])
-            logger.info("Using --permission-mode acceptEdits (running as root)")
-        else:
-            # Readonly agents can use bypassPermissions
-            claude_cmd.extend(['--permission-mode', 'bypassPermissions'])
-            logger.info("Using --permission-mode bypassPermissions")
+        # Use bypassPermissions for all agents in containerized environment
+        # The container provides isolation, so we can safely bypass permission checks
+        claude_cmd.extend(['--permission-mode', 'bypassPermissions'])
+        logger.info("Using --permission-mode bypassPermissions (safe in isolated container)")
 
         # Add --resume flag if continuing an existing session
         if existing_session_id:
@@ -530,6 +523,9 @@ class DockerAgentRunner:
         agent = context.get('agent', 'unknown')
         task_id = context.get('task_id', 'unknown')
         project = context.get('project', 'unknown')
+
+        # Track active container in Redis for kill switch
+        self._register_active_container(container_name, agent, project, task_id, context)
 
         # Emit events
         if obs:
@@ -692,6 +688,43 @@ class DockerAgentRunner:
                     logger.debug(f"Cleaned up temp prompt file: {prompt_file.name}")
                 except Exception as e:
                     logger.warning(f"Failed to clean up temp file: {e}")
+
+    def _register_active_container(self, container_name: str, agent: str, project: str, task_id: str, context: Dict[str, Any]):
+        """Register an active container in Redis for tracking and kill switch"""
+        try:
+            import redis
+            from datetime import datetime
+
+            redis_client = redis.Redis(host='redis', port=6379, decode_responses=True)
+
+            # Store container info
+            container_info = {
+                'container_name': container_name,
+                'agent': agent,
+                'project': project,
+                'task_id': task_id,
+                'started_at': datetime.now().isoformat(),
+                'issue_number': str(context.get('issue_number', 'unknown'))
+            }
+
+            # Store in Redis with 2 hour expiry (safety cleanup)
+            redis_client.hset(f'agent:container:{container_name}', mapping=container_info)
+            redis_client.expire(f'agent:container:{container_name}', 7200)
+
+            logger.info(f"Registered active container: {container_name} (agent={agent}, project={project})")
+
+        except Exception as e:
+            logger.warning(f"Failed to register container in Redis: {e}")
+
+    def _unregister_active_container(self, container_name: str):
+        """Remove container from active tracking"""
+        try:
+            import redis
+            redis_client = redis.Redis(host='redis', port=6379, decode_responses=True)
+            redis_client.delete(f'agent:container:{container_name}')
+            logger.info(f"Unregistered container: {container_name}")
+        except Exception as e:
+            logger.warning(f"Failed to unregister container from Redis: {e}")
 
     def _cleanup_container(self, container_name: str):
         """Clean up the container if it's still running"""

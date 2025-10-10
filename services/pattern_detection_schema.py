@@ -102,6 +102,9 @@ AGENT_LOGS_MAPPING = {
             "pipeline_type": {
                 "type": "keyword"
             },
+            "pipeline_run_id": {
+                "type": "keyword"  # Link to pipeline run
+            },
 
             # Full event data for reference
             "raw_event": {
@@ -181,6 +184,7 @@ AGENT_EVENTS_MAPPING = {
             "discussion_id": {"type": "keyword"},
             "board": {"type": "keyword"},
             "pipeline_type": {"type": "keyword"},
+            "pipeline_run_id": {"type": "keyword"},  # Link to pipeline run
             "raw_event": {"type": "object", "enabled": True}  # Enable indexing for lifecycle events
         }
     },
@@ -208,7 +212,8 @@ CLAUDE_STREAMS_MAPPING = {
             "tool_params_text": {"type": "text", "analyzer": "standard"},
             "success": {"type": "boolean"},
             "error_message": {"type": "text", "fields": {"keyword": {"type": "keyword", "ignore_above": 512}}},
-            "raw_event": {"type": "object", "enabled": True}  # Enable full event indexing
+            "raw_event": {"type": "object", "enabled": True},  # Enable full event indexing
+            "pipeline_run_id": {"type": "keyword"}  # Link to pipeline run
         }
     },
     "settings": {
@@ -216,6 +221,31 @@ CLAUDE_STREAMS_MAPPING = {
             "number_of_shards": 1,
             "number_of_replicas": 0,
             "refresh_interval": "10s"  # Can be slower for streaming logs
+        }
+    }
+}
+
+# Mapping for pipeline runs
+PIPELINE_RUNS_MAPPING = {
+    "mappings": {
+        "properties": {
+            "id": {"type": "keyword"},
+            "issue_number": {"type": "integer"},
+            "issue_title": {"type": "text", "fields": {"keyword": {"type": "keyword", "ignore_above": 512}}},
+            "issue_url": {"type": "keyword"},
+            "project": {"type": "keyword"},
+            "board": {"type": "keyword"},
+            "started_at": {"type": "date"},
+            "ended_at": {"type": "date"},
+            "status": {"type": "keyword"},  # active, completed
+            "duration_ms": {"type": "long"}  # Calculated field
+        }
+    },
+    "settings": {
+        "index": {
+            "number_of_shards": 1,
+            "number_of_replicas": 0,
+            "refresh_interval": "5s"
         }
     }
 }
@@ -275,7 +305,7 @@ def enrich_event(event_data: dict) -> dict:
     from datetime import datetime
 
     enriched = {
-        "timestamp": event_data.get("timestamp") or datetime.utcnow().isoformat(),
+        "timestamp": event_data.get("timestamp") or datetime.utcnow().isoformat() + 'Z',
         "raw_event": event_data
     }
 

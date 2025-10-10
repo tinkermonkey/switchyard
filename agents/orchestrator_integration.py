@@ -142,6 +142,12 @@ async def process_task_integrated(task, state_manager, logger):
     from services.project_workspace import workspace_manager
     from services.agent_executor import get_agent_executor
     from config.manager import config_manager
+    from monitoring.observability import get_observability_manager
+    from monitoring.decision_events import DecisionEventEmitter
+    
+    # Initialize decision observability
+    obs = get_observability_manager()
+    decision_events = DecisionEventEmitter(obs)
 
     task_context = task.context
     board_name = task_context.get('board', '')
@@ -168,9 +174,41 @@ async def process_task_integrated(task, state_manager, logger):
     validation_result = await validate_task_can_run(task, logger)
     if not validation_result['can_run']:
         logger.log_warning(f"Task {task.id} blocked: {validation_result['reason']}")
+        
+        # EMIT DECISION EVENT: Error encountered
+        decision_events.emit_error_decision(
+            error_type='TaskValidationError',
+            error_message=validation_result['reason'],
+            context={
+                'task_id': task.id,
+                'agent': task.agent,
+                'issue_number': issue_number,
+                'board': board_name
+            },
+            recovery_action='queue_dev_environment_setup' if validation_result.get('needs_dev_setup') else 'block_task',
+            success=validation_result.get('needs_dev_setup', False),
+            project=task.project
+        )
+        
         # Queue dev_environment_setup task if needed
         if validation_result.get('needs_dev_setup'):
             await queue_dev_environment_setup(task.project, logger)
+            
+            # EMIT DECISION EVENT: Recovery successful
+            decision_events.emit_error_decision(
+                error_type='TaskValidationError',
+                error_message=validation_result['reason'],
+                context={
+                    'task_id': task.id,
+                    'agent': task.agent,
+                    'issue_number': issue_number,
+                    'board': board_name
+                },
+                recovery_action='queue_dev_environment_setup',
+                success=True,
+                project=task.project
+            )
+        
         raise Exception(f"Task blocked: {validation_result['reason']}")
 
     # Execute agent using centralized executor
@@ -244,6 +282,22 @@ async def process_task_integrated(task, state_manager, logger):
             logger.error(f"Error during auto-advancement: {e}")
             import traceback
             logger.error(traceback.format_exc())
+            
+            # EMIT DECISION EVENT: Error during auto-advancement
+            decision_events.emit_error_decision(
+                error_type='AutoAdvancementError',
+                error_message=str(e),
+                context={
+                    'task_id': task.id,
+                    'agent': task.agent,
+                    'issue_number': issue_number,
+                    'board': board_name,
+                    'current_column': current_column_name
+                },
+                recovery_action='log_and_continue',
+                success=False,
+                project=task.project
+            )
 
     return result
 

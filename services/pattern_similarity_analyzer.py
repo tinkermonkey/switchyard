@@ -303,7 +303,7 @@ class PatternSimilarityAnalyzer:
                 "consolidation_priority": priority,
 
                 # Metadata
-                "computed_at": datetime.utcnow().isoformat()
+                "computed_at": datetime.utcnow().isoformat() + 'Z'
             }
 
             # Use pattern names as doc ID for idempotency

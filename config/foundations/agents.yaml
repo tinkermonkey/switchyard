@@ -358,6 +358,25 @@ agents:
       - file_operations
       - git_integration
 
+  test_agent:
+    description: "Test agent for integration testing and CI/CD verification"
+    model: "claude-sonnet-4-5-20250929"
+    timeout: 300  # 5 minutes
+    retries: 2
+    makes_code_changes: true  # Can modify files for testing
+    requires_dev_container: false  # Runs in basic orchestrator container
+    requires_docker: true  # Can run in Docker for isolation
+    filesystem_write_allowed: true  # Can write files for testing
+    capabilities:
+      - test_execution
+      - verification
+      - validation
+      - integration_testing
+    tools_enabled:
+      - file_operations
+      - git_integration
+    mcp_servers: []  # No MCP servers needed for basic testing
+
 # Default agent configuration applied to all agents
 default_config:
   working_directory: "/workspace/{project_name}"

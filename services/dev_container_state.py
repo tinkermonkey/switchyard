@@ -10,6 +10,7 @@ Tracks the state of project development container images:
 
 import yaml
 import logging
+import subprocess
 from pathlib import Path
 from typing import Dict, Optional
 from enum import Enum
@@ -153,6 +154,86 @@ class DevContainerStateManager:
     def is_blocked(self, project_name: str) -> bool:
         """Check if a project's dev container setup is blocked"""
         return self.get_status(project_name) == DevContainerStatus.BLOCKED
+
+    def verify_image_exists(self, project_name: str) -> bool:
+        """
+        Verify that the Docker image for a project actually exists locally
+
+        Args:
+            project_name: Name of the project
+
+        Returns:
+            True if image exists locally, False otherwise
+        """
+        image_name = self.get_image_name(project_name)
+
+        if not image_name:
+            logger.debug(f"No image name recorded for {project_name}")
+            return False
+
+        try:
+            # Use docker image inspect to check if image exists
+            result = subprocess.run(
+                ['docker', 'image', 'inspect', image_name],
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+
+            exists = result.returncode == 0
+
+            if exists:
+                logger.debug(f"Docker image {image_name} exists locally")
+            else:
+                logger.warning(f"Docker image {image_name} does not exist locally (state may be stale)")
+
+            return exists
+
+        except subprocess.TimeoutExpired:
+            logger.error(f"Timeout checking if Docker image {image_name} exists")
+            return False
+        except Exception as e:
+            logger.error(f"Error checking if Docker image {image_name} exists: {e}")
+            return False
+
+    def verify_and_update_status(self, project_name: str) -> bool:
+        """
+        Verify that a project's Docker image exists and update status if it doesn't
+
+        This is useful after Docker context switches or system restarts where the
+        state file may say "verified" but the image no longer exists.
+
+        Args:
+            project_name: Name of the project
+
+        Returns:
+            True if image exists (or status is not verified), False if image is missing
+        """
+        status = self.get_status(project_name)
+
+        # Only verify if status is VERIFIED
+        if status != DevContainerStatus.VERIFIED:
+            return True  # No verification needed for other states
+
+        # Check if image actually exists
+        if self.verify_image_exists(project_name):
+            return True  # Image exists, all good
+
+        # Image doesn't exist - reset status to UNVERIFIED
+        image_name = self.get_image_name(project_name)
+        logger.warning(
+            f"Project {project_name} marked as verified but image {image_name} not found. "
+            f"Resetting status to unverified."
+        )
+
+        self.set_status(
+            project_name,
+            DevContainerStatus.UNVERIFIED,
+            image_name=image_name,
+            error_message="Image missing after Docker context switch or system restart"
+        )
+
+        return False
 
     def get_all_statuses(self) -> Dict[str, DevContainerStatus]:
         """

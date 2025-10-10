@@ -39,18 +39,18 @@ Added 7 REST API endpoints for review filter management:
 
 ### Frontend Components
 
-**web_ui_v2/src/components/ReviewLearning.jsx**
+**web_ui/src/components/ReviewLearning.jsx**
 - Main page component with filter list, create/edit functionality
 - Includes sub-components:
   - `FilterCard` - Display filter with toggle, edit, delete actions
   - `FilterForm` - Modal form for creating/editing filters
 
-**web_ui_v2/src/routes/review-learning.jsx**
+**web_ui/src/routes/review-learning.jsx**
 - TanStack Router route definition
 
 **Updated Components:**
-- web_ui_v2/src/components/Dashboard.jsx - Added "Review Learning" navigation link
-- web_ui_v2/src/components/ReviewLearning.jsx - Consistent navigation across all pages
+- web_ui/src/components/Dashboard.jsx - Added "Review Learning" navigation link
+- web_ui/src/components/ReviewLearning.jsx - Consistent navigation across all pages
 
 ## Features
 
@@ -172,9 +172,9 @@ Filters created via UI are **immediately active** and will be:
 - ✅ services/observability_server.py:349-670 - Added 7 API endpoints
 
 ### Frontend
-- ✅ web_ui_v2/src/components/ReviewLearning.jsx - New main component (440 lines)
-- ✅ web_ui_v2/src/routes/review-learning.jsx - New route
-- ✅ web_ui_v2/src/components/Dashboard.jsx:2,38-49 - Added navigation link
+- ✅ web_ui/src/components/ReviewLearning.jsx - New main component (440 lines)
+- ✅ web_ui/src/routes/review-learning.jsx - New route
+- ✅ web_ui/src/components/Dashboard.jsx:2,38-49 - Added navigation link
 
 ### Documentation
 - ✅ docs/REVIEW_LEARNING_UI_IMPLEMENTATION.md - This file

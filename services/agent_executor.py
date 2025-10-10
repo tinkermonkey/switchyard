@@ -74,12 +74,9 @@ class AgentExecutor:
         # Create agent instance
         agent_stage = self.factory.create_agent(agent_name, project_name)
 
-        # Emit agent initialized event
-        agent_config = agent_stage.agent_config or {}
-        self.obs.emit_agent_initialized(agent_name, task_id, project_name, agent_config)
-
         # Prepare workspace using abstraction layer
         workspace_context = None
+        branch_name = None
         if 'issue_number' in task_context:
             try:
                 from services.workspace import WorkspaceContextFactory
@@ -110,6 +107,9 @@ class AgentExecutor:
                         # Prepare workspace (git branch OR discussion context)
                         prep_result = await workspace_context.prepare_execution()
                         task_context.update(prep_result)
+                        
+                        # Extract branch name if available
+                        branch_name = prep_result.get('branch_name')
 
                         logger.info(
                             f"Prepared {workspace_type} workspace: {prep_result.get('branch_name', prep_result.get('discussion_id'))}"
@@ -118,6 +118,29 @@ class AgentExecutor:
             except Exception as e:
                 logger.warning(f"Failed to prepare workspace: {e}")
                 # Continue execution even if workspace preparation fails
+        
+        # Generate container name if agent will use Docker
+        # This matches the naming logic in docker_runner.py:206-207
+        container_name = None
+        if execution_context.get('use_docker', True):
+            from claude.docker_runner import DockerAgentRunner
+            raw_container_name = f"claude-agent-{project_name}-{task_id}"
+            container_name = DockerAgentRunner._sanitize_container_name(raw_container_name)
+            logger.info(f"Generated container name for UI tracking: {container_name}")
+
+        # Emit agent initialized event (after workspace prep to include branch_name and container_name)
+        agent_config = agent_stage.agent_config or {}
+        self.obs.emit_agent_initialized(agent_name, task_id, project_name, agent_config, branch_name, container_name)
+
+        # Mark dev container as in_progress when setup agent starts
+        if agent_name == 'dev_environment_setup':
+            from services.dev_container_state import dev_container_state, DevContainerStatus
+            dev_container_state.set_status(
+                project_name,
+                DevContainerStatus.IN_PROGRESS,
+                image_name=f"{project_name}-agent:latest"
+            )
+            logger.info(f"Marked {project_name} dev container as IN_PROGRESS")
 
         # Execute agent
         start_time = time.time()
@@ -126,6 +149,10 @@ class AgentExecutor:
 
             duration_ms = (time.time() - start_time) * 1000
             self.obs.emit_agent_completed(agent_name, task_id, project_name, duration_ms, True)
+
+            # If dev_environment_setup completed successfully, queue verifier
+            if agent_name == 'dev_environment_setup':
+                await self._queue_environment_verifier(project_name, task_context)
 
             # Post agent output to GitHub (centralized posting)
             await self._post_agent_output_to_github(agent_name, task_context, result)
@@ -365,6 +392,56 @@ class AgentExecutor:
 
         logger.warning(f"Could not find markdown output for {agent_name} in keys: {list(result.keys())}")
         return None
+
+    async def _queue_environment_verifier(
+        self,
+        project_name: str,
+        task_context: Dict[str, Any]
+    ):
+        """
+        Queue a dev_environment_verifier task after setup completes.
+
+        Args:
+            project_name: Name of the project
+            task_context: Context from the setup task
+        """
+        try:
+            from task_queue.task_manager import Task, TaskPriority, TaskQueue
+            from datetime import datetime
+
+            logger.info(f"Queuing dev_environment_verifier task for {project_name}")
+
+            task_queue = TaskQueue(use_redis=True)
+
+            # Create verifier task with reference to setup output
+            task = Task(
+                id=f"auto_dev_env_verify_{project_name}_{int(datetime.now().timestamp())}",
+                agent="dev_environment_verifier",
+                project=project_name,
+                priority=TaskPriority.HIGH,
+                context={
+                    'issue': task_context.get('issue', {
+                        'title': f'Verify development environment for {project_name}',
+                        'body': 'Auto-triggered: Verify Docker image after setup completion',
+                        'number': 0
+                    }),
+                    'issue_number': task_context.get('issue_number', 0),
+                    'board': task_context.get('board', 'system'),
+                    'repository': project_name,
+                    'automated_setup': True,
+                    'auto_triggered': True,
+                    'use_docker': False,  # Verifier also runs locally
+                    'previous_stage_output': 'Setup agent completed successfully'
+                },
+                created_at=datetime.now().isoformat()
+            )
+
+            task_queue.enqueue(task)
+            logger.info(f"Queued dev_environment_verifier task: {task.id}")
+
+        except Exception as e:
+            logger.error(f"Failed to queue dev_environment_verifier for {project_name}: {e}")
+            # Don't fail the setup agent if verifier queueing fails
 
 
 # Global singleton instance

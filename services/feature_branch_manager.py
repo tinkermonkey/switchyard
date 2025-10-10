@@ -216,43 +216,42 @@ class FeatureBranchManager:
 
     async def get_parent_issue(self, github_integration, issue_number: int) -> Optional[int]:
         """
-        Get parent issue number using GitHub GraphQL API
+        Get parent issue number by parsing issue body for parent references
 
-        Returns parent issue number if this issue is tracked by a parent, None otherwise
+        Looks for patterns:
+        - "Part of #123"
+        - "Parent Issue: #123"
+        - "## Parent Issue" followed by #123
+
+        Returns parent issue number if found, None otherwise
         """
-        query = """
-        query($owner: String!, $repo: String!, $issueNumber: Int!) {
-          repository(owner: $owner, name: $repo) {
-            issue(number: $issueNumber) {
-              trackedInIssues(first: 1) {
-                nodes {
-                  number
-                }
-              }
-            }
-          }
-        }
-        """
+        import re
 
         try:
-            result = await github_integration.graphql_query(
-                query,
-                variables={
-                    "owner": github_integration.repo_owner,
-                    "repo": github_integration.repo_name,
-                    "issueNumber": issue_number
-                }
-            )
+            issue = await github_integration.get_issue(issue_number)
+            body = issue.get("body", "")
 
-            tracked_in = result.get("data", {}).get("repository", {}).get("issue", {}).get("trackedInIssues", {})
-            nodes = tracked_in.get("nodes", [])
+            if not body:
+                logger.info(f"Issue #{issue_number} has no body - no parent detected")
+                return None
 
-            if nodes:
-                parent_number = nodes[0]["number"]
-                logger.info(f"Issue #{issue_number} is tracked by parent #{parent_number}")
-                return parent_number
+            # Parse for parent references (most specific to least specific)
+            patterns = [
+                r'Parent Issue[:\s]+#(\d+)',  # "Parent Issue: #123" or "Parent Issue #123"
+                r'Part of #(\d+)',            # "Part of #123"
+                r'##\s*Parent Issue[^\d]*#(\d+)',  # "## Parent Issue\nPart of #123"
+                r'Sub-issue of #(\d+)',       # "Sub-issue of #123"
+                r'Child of #(\d+)',           # "Child of #123"
+            ]
 
-            logger.info(f"Issue #{issue_number} has no parent - standalone issue")
+            for pattern in patterns:
+                match = re.search(pattern, body, re.IGNORECASE)
+                if match:
+                    parent_num = int(match.group(1))
+                    logger.info(f"Issue #{issue_number} is sub-issue of parent #{parent_num} (matched pattern: {pattern})")
+                    return parent_num
+
+            logger.info(f"Issue #{issue_number} has no parent reference in body")
             return None
 
         except Exception as e:
@@ -261,9 +260,19 @@ class FeatureBranchManager:
 
     def create_feature_branch_name(self, parent_issue: int, title: str = "") -> str:
         """Create feature branch name from parent issue"""
+        # Validate issue number
+        if parent_issue <= 0:
+            raise ValueError(f"Invalid issue number: {parent_issue}. Issue numbers must be positive integers.")
+
         sanitized_title = title.lower().replace(" ", "-")[:30] if title else "feature"
         # Remove special characters
         sanitized_title = "".join(c for c in sanitized_title if c.isalnum() or c == "-")
+        # Remove trailing/leading dashes
+        sanitized_title = sanitized_title.strip("-")
+        # Collapse multiple dashes
+        while "--" in sanitized_title:
+            sanitized_title = sanitized_title.replace("--", "-")
+
         return f"feature/issue-{parent_issue}-{sanitized_title}"
 
     async def create_branch_from_main(self, project_dir: str, branch_name: str):
@@ -323,6 +332,166 @@ class FeatureBranchManager:
         """Check if branch exists"""
         from services.git_workflow_manager import git_workflow_manager
         return await git_workflow_manager.branch_exists(project_dir, branch_name)
+
+    async def get_current_branch(self, project_dir: str) -> str:
+        """
+        Get the currently checked out branch name.
+
+        This is useful for agents that don't need to create new branches
+        and just want to work on whatever branch is currently active.
+
+        Returns:
+            Current branch name (e.g., 'main', 'feature/issue-88-...')
+        """
+        from services.git_workflow_manager import git_workflow_manager
+        return await git_workflow_manager.get_current_branch(project_dir)
+
+    async def get_all_feature_branches_for_project(self, project_dir: str) -> List[str]:
+        """Get all feature branches from git (local and remote)"""
+        from services.git_workflow_manager import git_workflow_manager
+        import subprocess
+
+        try:
+            result = subprocess.run(
+                ["git", "branch", "-a"],
+                cwd=project_dir,
+                capture_output=True,
+                text=True,
+                check=True
+            )
+
+            branches = []
+            for line in result.stdout.splitlines():
+                line = line.strip()
+                # Remove the * for current branch
+                if line.startswith("*"):
+                    line = line[1:].strip()
+                # Extract branch name from remotes/origin/branch-name
+                if "remotes/origin/" in line:
+                    line = line.split("remotes/origin/")[1]
+                # Only include feature branches
+                if line.startswith("feature/"):
+                    branches.append(line)
+
+            return list(set(branches))  # Remove duplicates
+        except Exception as e:
+            logger.error(f"Failed to get branches: {e}")
+            return []
+
+    async def find_conflicting_branches(
+        self,
+        project_dir: str,
+        issue_number: int
+    ) -> List[str]:
+        """Find existing branches for this issue that might conflict"""
+        all_branches = await self.get_all_feature_branches_for_project(project_dir)
+
+        # Look for branches that reference this issue number
+        conflicting = []
+        for branch in all_branches:
+            # Match patterns like feature/issue-125 or feature/issue-125-something
+            if f"issue-{issue_number}" in branch or f"issue-{issue_number}-" in branch:
+                conflicting.append(branch)
+
+        return conflicting
+
+    async def find_related_branches(
+        self,
+        project: str,
+        project_dir: str,
+        issue_number: int,
+        issue_title: str,
+        parent_issue: Optional[int] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Find existing branches that might be related to this issue
+
+        Returns list of dicts with:
+        - branch_name: str
+        - match_type: str (exact_issue, parent_branch, feature_state, semantic_similarity)
+        - confidence: float (0.0 to 1.0)
+        - reason: str
+        """
+        import re
+        from difflib import SequenceMatcher
+
+        all_branches = await self.get_all_feature_branches_for_project(project_dir)
+        matches = []
+
+        # 1. Exact issue number match
+        for branch in all_branches:
+            if f"issue-{issue_number}" in branch or f"issue-{issue_number}-" in branch:
+                matches.append({
+                    "branch_name": branch,
+                    "match_type": "exact_issue",
+                    "confidence": 1.0,
+                    "reason": f"Branch contains issue #{issue_number}"
+                })
+
+        # 2. Parent issue branch match
+        if parent_issue:
+            for branch in all_branches:
+                if f"issue-{parent_issue}" in branch or f"issue-{parent_issue}-" in branch:
+                    matches.append({
+                        "branch_name": branch,
+                        "match_type": "parent_branch",
+                        "confidence": 0.95,
+                        "reason": f"Branch for parent issue #{parent_issue}"
+                    })
+
+        # 3. Check feature branch state tracking
+        feature_branches = self.get_all_feature_branches(project)
+        for fb in feature_branches:
+            # Check if this issue is already tracked in a feature branch
+            if any(si.number == issue_number for si in fb.sub_issues):
+                matches.append({
+                    "branch_name": fb.branch_name,
+                    "match_type": "feature_state",
+                    "confidence": 0.98,
+                    "reason": f"Issue already tracked in feature branch state"
+                })
+            # Check if parent matches
+            elif parent_issue and fb.parent_issue == parent_issue:
+                matches.append({
+                    "branch_name": fb.branch_name,
+                    "match_type": "feature_state",
+                    "confidence": 0.95,
+                    "reason": f"Feature branch for parent issue #{parent_issue}"
+                })
+
+        # 4. Semantic similarity with branch names
+        if issue_title and not matches:  # Only if no strong matches found
+            issue_keywords = set(re.findall(r'\w+', issue_title.lower()))
+            # Remove common words
+            stop_words = {'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by'}
+            issue_keywords = issue_keywords - stop_words
+
+            for branch in all_branches:
+                # Extract meaningful parts from branch name
+                branch_parts = branch.replace('feature/', '').replace('-', ' ')
+                branch_keywords = set(re.findall(r'\w+', branch_parts.lower())) - stop_words
+
+                # Calculate keyword overlap
+                overlap = len(issue_keywords & branch_keywords)
+                if overlap >= 2:  # At least 2 keywords in common
+                    similarity = overlap / len(issue_keywords | branch_keywords)
+                    if similarity >= 0.3:  # 30% similarity threshold
+                        matches.append({
+                            "branch_name": branch,
+                            "match_type": "semantic_similarity",
+                            "confidence": min(0.7, similarity),  # Cap at 0.7 for semantic matches
+                            "reason": f"Similar keywords: {', '.join(issue_keywords & branch_keywords)}"
+                        })
+
+        # Remove duplicates, keeping highest confidence
+        unique_matches = {}
+        for match in matches:
+            branch = match["branch_name"]
+            if branch not in unique_matches or match["confidence"] > unique_matches[branch]["confidence"]:
+                unique_matches[branch] = match
+
+        # Sort by confidence (highest first)
+        return sorted(unique_matches.values(), key=lambda x: x["confidence"], reverse=True)
 
     async def git_add_all(self, project_dir: str):
         """Stage all changes"""
@@ -426,22 +595,149 @@ git push --force-with-lease
         """
         project_dir = os.path.join(self.workspace_root, project)
 
+        # Step 0: Validate issue exists and is valid
+        if issue_number <= 0:
+            raise ValueError(f"Invalid issue number: {issue_number}. Issue numbers must be positive integers.")
+
+        try:
+            issue_data = await github_integration.get_issue(issue_number)
+            if not issue_data:
+                raise ValueError(f"Issue #{issue_number} does not exist or cannot be accessed")
+
+            # Use the actual issue title if not provided
+            if not issue_title:
+                issue_title = issue_data.get("title", "")
+
+            logger.info(f"Processing issue #{issue_number}: {issue_title}")
+        except Exception as e:
+            logger.error(f"Failed to validate issue #{issue_number}: {e}")
+            raise ValueError(f"Issue #{issue_number} does not exist or cannot be accessed: {e}")
+
         # Step 1: Determine parent issue
         parent_issue = await self.get_parent_issue(github_integration, issue_number)
 
+        # Step 2: Find related branches (prioritizes reuse over creation)
+        related_branches = await self.find_related_branches(
+            project=project,
+            project_dir=project_dir,
+            issue_number=issue_number,
+            issue_title=issue_title,
+            parent_issue=parent_issue
+        )
+
+        # Step 3: Use existing branch if high confidence match found
+        if related_branches:
+            best_match = related_branches[0]
+            if best_match["confidence"] >= 0.8:  # High confidence threshold
+                logger.info(
+                    f"Found related branch for issue #{issue_number}: {best_match['branch_name']} "
+                    f"(confidence: {best_match['confidence']:.2f}, reason: {best_match['reason']})"
+                )
+                branch_name = best_match["branch_name"]
+
+                # Get or create feature branch state
+                if parent_issue:
+                    feature_branch = self.get_feature_branch_state(project, parent_issue)
+                    if not feature_branch:
+                        # Create feature branch state for existing branch
+                        feature_branch = self.create_feature_branch_state(
+                            project=project,
+                            parent_issue=parent_issue,
+                            branch_name=branch_name,
+                            sub_issues=[issue_number]
+                        )
+                    else:
+                        # Add this sub-issue to tracking
+                        self.add_sub_issue_to_branch(project, feature_branch, issue_number)
+
+                # Checkout and continue with existing flow
+                await self.git_checkout(project_dir, branch_name)
+
+                # Pull latest (Step 4 in original flow)
+                try:
+                    await self.git_pull_rebase(project_dir)
+                    if parent_issue and feature_branch:
+                        feature_branch.last_pull_at = datetime.now().isoformat()
+                        self.save_feature_branch_state(project, feature_branch)
+                    logger.info(f"Pulled latest changes for {branch_name}")
+                except MergeConflictError as e:
+                    logger.error(f"Merge conflict in {branch_name}: {e.files}")
+                    await self.escalate_merge_conflict(
+                        github_integration,
+                        issue_number,
+                        branch_name,
+                        e.files
+                    )
+                    raise
+
+                # Check staleness
+                if parent_issue and feature_branch:
+                    commits_behind = await self.get_commits_behind_main(project_dir, branch_name)
+                    feature_branch.commits_behind_main = commits_behind
+                    if commits_behind > 50:
+                        await self.escalate_stale_branch(
+                            github_integration,
+                            parent_issue,
+                            branch_name,
+                            commits_behind
+                        )
+                    elif commits_behind > 20:
+                        logger.warning(f"Branch {branch_name} is {commits_behind} commits behind main")
+
+                    # Mark sub-issue as in progress
+                    self.mark_sub_issue_in_progress(project, feature_branch, issue_number)
+
+                return branch_name
+
+            elif best_match["confidence"] >= 0.5:  # Medium confidence - post comment for human review
+                branch_options = "\n".join([
+                    f"- `{m['branch_name']}` (confidence: {m['confidence']:.0%}, {m['reason']})"
+                    for m in related_branches[:3]
+                ])
+
+                await github_integration.post_comment(
+                    issue_number,
+                    f"""## Branch Selection Required
+
+Found potentially related branches, but confidence is not high enough for automatic selection.
+
+**Candidate branches:**
+{branch_options}
+
+**Options:**
+1. To use an existing branch, update this issue body to include: `Part of #<parent-issue-number>`
+2. To create a new branch, close and reopen this issue to retry
+3. The orchestrator will create a new standalone branch if no action is taken
+
+Waiting for human decision...
+"""
+                )
+                logger.warning(
+                    f"Medium confidence branch match for issue #{issue_number}. "
+                    f"Posted comment for human review. Creating new branch as fallback."
+                )
+                # Fall through to create new branch
+
+        # Step 4: No high-confidence match - handle parent/standalone logic
         if not parent_issue:
             # Standalone issue - create individual branch
-            logger.info(f"Issue #{issue_number} has no parent - creating standalone branch")
+            logger.info(f"Issue #{issue_number} has no parent and no related branches - creating standalone branch")
+
             branch_name = self.create_feature_branch_name(issue_number, issue_title)
 
             if not await self.branch_exists(project_dir, branch_name):
                 await self.create_branch_from_main(project_dir, branch_name)
             else:
                 await self.git_checkout(project_dir, branch_name)
+            
+            # Track branch in git workflow manager for PR management
+            from services.git_workflow_manager import git_workflow_manager
+            git_workflow_manager.track_branch(project, issue_number, branch_name)
+            logger.info(f"Tracked branch {branch_name} for issue #{issue_number} in GitWorkflowManager")
 
             return branch_name
 
-        # Step 2: Get or create feature branch for parent
+        # Step 5: Parent issue detected - get or create feature branch
         feature_branch = self.get_feature_branch_state(project, parent_issue)
 
         if not feature_branch:
@@ -457,10 +753,21 @@ git push --force-with-lease
                 branch_name=branch_name,
                 sub_issues=[issue_number]
             )
-            logger.info(f"Created feature branch {branch_name} for parent #{parent_issue}")
+            
+            # Track branch in git workflow manager for PR management
+            # Note: Track against the PARENT issue since that's what the PR will be for
+            from services.git_workflow_manager import git_workflow_manager
+            git_workflow_manager.track_branch(project, parent_issue, branch_name)
+            logger.info(f"Created feature branch {branch_name} for parent #{parent_issue} and tracked in GitWorkflowManager")
         else:
             # Add this sub-issue to tracking if not already
             self.add_sub_issue_to_branch(project, feature_branch, issue_number)
+            
+            # Ensure branch is tracked in git workflow manager (in case it wasn't tracked before)
+            from services.git_workflow_manager import git_workflow_manager
+            if not git_workflow_manager.get_branch_info(project, parent_issue):
+                git_workflow_manager.track_branch(project, parent_issue, feature_branch.branch_name)
+                logger.info(f"Ensured branch {feature_branch.branch_name} is tracked for parent #{parent_issue} in GitWorkflowManager")
 
         # Step 3: Checkout branch
         await self.git_checkout(project_dir, feature_branch.branch_name)
@@ -721,6 +1028,71 @@ The PR is now ready for review and can be merged when approved.
             except Exception as e:
                 logger.error(f"Error cleaning up branch for parent #{feature_branch.parent_issue}: {e}")
                 continue
+
+    async def detect_and_clean_invalid_branches(
+        self,
+        project: str,
+        project_dir: str,
+        github_integration
+    ) -> Dict[str, List[str]]:
+        """
+        Detect and optionally clean invalid branches (issues that don't exist, etc.)
+
+        Returns dict with 'cleaned' and 'errors' lists
+        """
+        import re
+
+        all_branches = await self.get_all_feature_branches_for_project(project_dir)
+        cleaned = []
+        errors = []
+
+        for branch in all_branches:
+            # Extract issue number from branch name
+            match = re.search(r'issue-(\d+)', branch)
+            if not match:
+                continue
+
+            issue_num = int(match.group(1))
+
+            # Skip if issue number is invalid
+            if issue_num <= 0:
+                logger.warning(f"Branch {branch} has invalid issue number: {issue_num}")
+                try:
+                    # Try to delete both local and remote
+                    from services.git_workflow_manager import git_workflow_manager
+                    await git_workflow_manager.checkout_branch(project_dir, "main")
+
+                    # Delete local branch
+                    import subprocess
+                    subprocess.run(
+                        ["git", "branch", "-D", branch],
+                        cwd=project_dir,
+                        capture_output=True,
+                        check=False
+                    )
+
+                    # Delete remote branch
+                    try:
+                        await github_integration.delete_branch(branch)
+                    except Exception:
+                        pass  # Remote might not exist
+
+                    cleaned.append(branch)
+                    logger.info(f"Cleaned invalid branch: {branch}")
+                except Exception as e:
+                    errors.append(f"{branch}: {e}")
+                    logger.error(f"Failed to clean branch {branch}: {e}")
+                continue
+
+            # Check if issue exists
+            try:
+                issue = await github_integration.get_issue(issue_num)
+                if not issue:
+                    logger.warning(f"Branch {branch} references non-existent issue #{issue_num}")
+            except Exception as e:
+                logger.error(f"Cannot verify issue #{issue_num} for branch {branch}: {e}")
+
+        return {"cleaned": cleaned, "errors": errors}
 
 
 # Global instance

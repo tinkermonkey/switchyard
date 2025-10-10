@@ -25,6 +25,12 @@ class PipelineProgression:
 
     def __init__(self, task_queue: TaskQueue):
         self.task_queue = task_queue
+        
+        # Initialize decision observability
+        from monitoring.observability import get_observability_manager
+        from monitoring.decision_events import DecisionEventEmitter
+        self.obs = get_observability_manager()
+        self.decision_events = DecisionEventEmitter(self.obs)
 
     def get_next_column(self, project_name: str, board_name: str, current_column: str) -> Optional[str]:
         """Get the next column in the workflow"""
@@ -201,11 +207,46 @@ class PipelineProgression:
             if not next_column:
                 logger.info(f"No next stage for issue #{issue_number} - pipeline complete")
                 return False
+            
+            # EMIT DECISION EVENT: Status progression started
+            self.decision_events.emit_status_progression(
+                issue_number=issue_number,
+                project=project_name,
+                board=board_name,
+                from_status=current_column,
+                to_status=next_column,
+                trigger='pipeline_progression',
+                success=None  # Not yet executed
+            )
 
             # Move issue to next column
             if not self.move_issue_to_column(project_name, board_name, issue_number, next_column):
                 logger.error(f"Failed to move issue #{issue_number} to '{next_column}'")
+                
+                # EMIT DECISION EVENT: Status progression failed
+                self.decision_events.emit_status_progression(
+                    issue_number=issue_number,
+                    project=project_name,
+                    board=board_name,
+                    from_status=current_column,
+                    to_status=next_column,
+                    trigger='pipeline_progression',
+                    success=False,
+                    error="Failed to move issue to next column"
+                )
+                
                 return False
+            
+            # EMIT DECISION EVENT: Status progression completed
+            self.decision_events.emit_status_progression(
+                issue_number=issue_number,
+                project=project_name,
+                board=board_name,
+                from_status=current_column,
+                to_status=next_column,
+                trigger='pipeline_progression',
+                success=True
+            )
 
             # Get the agent for the next column
             project_config = config_manager.get_project_config(project_name)

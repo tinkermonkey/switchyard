@@ -49,6 +49,85 @@ def handle_disconnect():
     if sid in connected_clients:
         connected_clients.remove(sid)
 
+@app.route('/agents/active')
+def get_active_agents():
+    """Get list of currently running agent containers"""
+    try:
+        # Get active agent containers from Redis
+        redis_client = redis.Redis(host='redis', port=6379, decode_responses=True)
+
+        # Find all keys matching agent container pattern
+        agent_keys = redis_client.keys('agent:container:*')
+
+        active_agents = []
+        for key in agent_keys:
+            container_info = redis_client.hgetall(key)
+            if container_info:
+                active_agents.append({
+                    'container_name': container_info.get('container_name'),
+                    'container_id': container_info.get('container_id'),
+                    'agent': container_info.get('agent'),
+                    'project': container_info.get('project'),
+                    'task_id': container_info.get('task_id'),
+                    'started_at': container_info.get('started_at'),
+                    'issue_number': container_info.get('issue_number')
+                })
+
+        return jsonify({'active_agents': active_agents}), 200
+
+    except Exception as e:
+        logger.error(f"Failed to get active agents: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/agents/kill/<container_name>', methods=['POST'])
+def kill_agent(container_name):
+    """Emergency kill switch - immediately stop an agent container"""
+    try:
+        logger.warning(f"KILL SWITCH ACTIVATED for container: {container_name}")
+
+        # Stop the container immediately
+        result = subprocess.run(
+            ['docker', 'rm', '-f', container_name],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+
+        if result.returncode == 0:
+            logger.info(f"Successfully killed container: {container_name}")
+
+            # Remove from Redis tracking
+            redis_client = redis.Redis(host='redis', port=6379, decode_responses=True)
+            redis_client.delete(f'agent:container:{container_name}')
+
+            return jsonify({
+                'success': True,
+                'message': f'Container {container_name} stopped',
+                'container_name': container_name
+            }), 200
+        else:
+            logger.error(f"Failed to kill container {container_name}: {result.stderr}")
+            return jsonify({
+                'success': False,
+                'error': result.stderr,
+                'container_name': container_name
+            }), 500
+
+    except subprocess.TimeoutExpired:
+        logger.error(f"Timeout killing container: {container_name}")
+        return jsonify({
+            'success': False,
+            'error': 'Timeout - container may be unresponsive',
+            'container_name': container_name
+        }), 500
+    except Exception as e:
+        logger.error(f"Error killing container {container_name}: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e),
+            'container_name': container_name
+        }), 500
+
 @app.route('/health')
 def health():
     """Health check endpoint - returns orchestrator health status"""
@@ -452,6 +531,165 @@ def get_current_pipeline():
             'success': False,
             'error': str(e),
             'pipeline': None
+        }), 500
+
+@app.route('/pipeline-run-events')
+def get_pipeline_run_events():
+    """
+    Get all events for a specific pipeline run in chronological order
+    Combines decision events, agent lifecycle events, and execution logs
+    """
+    try:
+        pipeline_run_id = request.args.get('pipeline_run_id')
+        
+        if not pipeline_run_id:
+            return jsonify({
+                'success': False,
+                'error': 'pipeline_run_id parameter is required'
+            }), 400
+        
+        # Get pipeline run details first
+        from services.pipeline_run import get_pipeline_run_manager
+        pipeline_run_manager = get_pipeline_run_manager()
+        pipeline_run = pipeline_run_manager.get_pipeline_run_by_id(pipeline_run_id)
+        
+        if not pipeline_run:
+            return jsonify({
+                'success': False,
+                'error': f'Pipeline run {pipeline_run_id} not found'
+            }), 404
+        
+        # Query all event types from Elasticsearch
+        all_events = []
+        
+        # 1. Get decision events
+        try:
+            decision_events_query = {
+                "query": {
+                    "term": {
+                        "pipeline_run_id.keyword": pipeline_run_id
+                    }
+                },
+                "sort": [{"timestamp": "asc"}],
+                "size": 1000
+            }
+            
+            decision_result = es_client.search(
+                index="decision-events-*",
+                body=decision_events_query
+            )
+            
+            for hit in decision_result['hits']['hits']:
+                event_data = hit['_source']
+                event_data['event_category'] = 'decision'
+                event_data['event_index'] = hit['_index']
+                all_events.append(event_data)
+        except Exception as e:
+            logger.warning(f"Error fetching decision events: {e}")
+        
+        # 2. Get agent lifecycle events (agent_initialized, agent_completed, etc.)
+        try:
+            agent_events_query = {
+                "query": {
+                    "term": {
+                        "data.pipeline_run_id.keyword": pipeline_run_id
+                    }
+                },
+                "sort": [{"timestamp": "asc"}],
+                "size": 1000
+            }
+            
+            agent_result = es_client.search(
+                index="agent-events-*",
+                body=agent_events_query
+            )
+            
+            for hit in agent_result['hits']['hits']:
+                event_data = hit['_source']
+                event_data['event_category'] = 'agent_lifecycle'
+                event_data['event_index'] = hit['_index']
+                all_events.append(event_data)
+        except Exception as e:
+            logger.warning(f"Error fetching agent events: {e}")
+        
+        # 3. Get Claude stream logs for detailed execution
+        try:
+            claude_logs_query = {
+                "query": {
+                    "term": {
+                        "pipeline_run_id.keyword": pipeline_run_id
+                    }
+                },
+                "sort": [{"timestamp": "asc"}],
+                "size": 10000  # May be many logs
+            }
+            
+            claude_result = es_client.search(
+                index="claude-streams-*",
+                body=claude_logs_query
+            )
+            
+            for hit in claude_result['hits']['hits']:
+                event_data = hit['_source']
+                event_data['event_category'] = 'claude_log'
+                event_data['event_index'] = hit['_index']
+                all_events.append(event_data)
+        except Exception as e:
+            logger.warning(f"Error fetching Claude logs: {e}")
+        
+        # Sort all events by timestamp
+        all_events.sort(key=lambda x: x.get('timestamp', ''))
+        
+        return jsonify({
+            'success': True,
+            'pipeline_run': pipeline_run.to_dict(),
+            'events': all_events,
+            'event_count': len(all_events)
+        })
+        
+    except Exception as e:
+        logger.error(f"Error fetching pipeline run events: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+@app.route('/active-pipeline-runs')
+def get_active_pipeline_runs():
+    """Get all currently active pipeline runs"""
+    try:
+        # Query Elasticsearch for active pipeline runs
+        query = {
+            "query": {
+                "term": {
+                    "status": "active"
+                }
+            },
+            "sort": [{"started_at": "desc"}],
+            "size": 100
+        }
+        
+        result = es_client.search(
+            index="pipeline-runs",
+            body=query
+        )
+        
+        runs = []
+        for hit in result['hits']['hits']:
+            runs.append(hit['_source'])
+        
+        return jsonify({
+            'success': True,
+            'runs': runs,
+            'count': len(runs)
+        })
+        
+    except Exception as e:
+        logger.error(f"Error fetching active pipeline runs: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e),
+            'runs': []
         }), 500
 
 # =======================================================================================
@@ -928,6 +1166,44 @@ def collect_git_branch_data(project_name, workspace_path):
                 # Get file changes for this branch
                 file_changes = []
 
+                # For the current branch, check working directory changes first
+                if is_current:
+                    # Get unstaged changes
+                    status_result = subprocess.run(
+                        ['git', '-C', str(workspace_path), 'status', '--porcelain'],
+                        capture_output=True,
+                        text=True,
+                        timeout=5
+                    )
+
+                    if status_result.returncode == 0:
+                        for status_line in status_result.stdout.strip().split('\n'):
+                            if not status_line.strip():
+                                continue
+                            # Format: "XY filename" where X is staged, Y is unstaged
+                            # Positions 0-1 are status, position 2 is space, filename starts at 3
+                            if len(status_line) < 4:
+                                continue
+                            status_chars = status_line[:2]
+                            file_name = status_line[3:]
+
+                            change_type = 'modified'
+                            if 'A' in status_chars:
+                                change_type = 'added'
+                            elif 'D' in status_chars:
+                                change_type = 'deleted'
+                            elif '?' in status_chars:
+                                change_type = 'untracked'
+
+                            file_changes.append({
+                                'file': file_name,
+                                'insertions': 0,
+                                'deletions': 0,
+                                'change_type': change_type,
+                                'staged': status_chars[0] != ' ' and status_chars[0] != '?',
+                                'unstaged': status_chars[1] != ' '
+                            })
+
                 # Compare to remote tracking branch or main/master
                 compare_target = tracking_branch if tracking_branch else 'origin/main'
 
@@ -1199,9 +1475,31 @@ def redis_subscriber_thread():
 
                     # Route to appropriate websocket event based on channel
                     if message['channel'] == 'orchestrator:agent_events':
-                        # Regular agent events
-                        socketio.emit('agent_event', event_data)
-                        logger.debug(f"Broadcasted agent event: {event_data.get('event_type')}")
+                        # Check if this is a decision event
+                        event_type = event_data.get('event_type', '')
+                        decision_event_types = [
+                            'agent_routing_decision',
+                            'workspace_routing_decision',
+                            'status_progression_decision',
+                            'review_cycle_started',
+                            'review_iteration_started',
+                            'reviewer_selected',
+                            'maker_selected',
+                            'review_escalated',
+                            'review_cycle_completed',
+                            'error_handling_decision',
+                            'feedback_detected',
+                            'task_queued'
+                        ]
+                        
+                        if event_type in decision_event_types:
+                            # Decision event - route to decision_event handler
+                            socketio.emit('decision_event', event_data)
+                            logger.debug(f"Broadcasted decision event: {event_type}")
+                        else:
+                            # Regular agent events
+                            socketio.emit('agent_event', event_data)
+                            logger.debug(f"Broadcasted agent event: {event_type}")
                     elif message['channel'] == 'orchestrator:claude_stream':
                         # Claude stream events
                         socketio.emit('claude_stream_event', event_data)

@@ -353,7 +353,7 @@ _🤖 This discussion was automatically created by the Pattern Detection System.
             "last_occurrence": last_occurrence,
             "affected_projects": affected_projects,
             "affected_agents": affected_agents,
-            "created_at": datetime.utcnow().isoformat(),
+            "created_at": datetime.utcnow().isoformat() + 'Z',
             "approval_count": 0,
             "rejection_count": 0
         }
@@ -417,7 +417,7 @@ _🤖 This discussion was automatically created by the Pattern Detection System.
                     "doc": {
                         "approval_count": approval_status['approve_count'],
                         "rejection_count": approval_status['reject_count'],
-                        "last_checked_at": datetime.utcnow().isoformat()
+                        "last_checked_at": datetime.utcnow().isoformat() + 'Z'
                     }
                 },
                 refresh=True
@@ -625,7 +625,7 @@ _🤖 This issue was automatically created from an approved pattern detection di
                 "last_occurrence": discussion_source.get('last_occurrence'),
                 "affected_projects": discussion_source.get('affected_projects'),
                 "affected_agents": discussion_source.get('affected_agents'),
-                "created_at": datetime.utcnow().isoformat()
+                "created_at": datetime.utcnow().isoformat() + 'Z'
             }
 
             self.es.index(
@@ -641,7 +641,7 @@ _🤖 This issue was automatically created from an approved pattern detection di
                 body={
                     "doc": {
                         "resolution": "accepted",
-                        "closed_at": datetime.utcnow().isoformat()
+                        "closed_at": datetime.utcnow().isoformat() + 'Z'
                     }
                 },
                 refresh=True

@@ -10,6 +10,7 @@ from typing import Dict, Any, Optional
 from datetime import datetime
 from enum import Enum
 from dataclasses import dataclass, asdict
+from elasticsearch import Elasticsearch
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +41,52 @@ class EventType(Enum):
     PERFORMANCE_METRIC = "performance_metric"
     TOKEN_USAGE = "token_usage"
 
+    # ========== ORCHESTRATOR DECISION EVENTS ==========
+    
+    # Feedback Monitoring
+    FEEDBACK_DETECTED = "feedback_detected"
+    FEEDBACK_LISTENING_STARTED = "feedback_listening_started"
+    FEEDBACK_LISTENING_STOPPED = "feedback_listening_stopped"
+    FEEDBACK_IGNORED = "feedback_ignored"
+    
+    # Agent Routing & Selection
+    AGENT_ROUTING_DECISION = "agent_routing_decision"
+    AGENT_SELECTED = "agent_selected"
+    WORKSPACE_ROUTING_DECISION = "workspace_routing_decision"
+    
+    # Status & Pipeline Progression
+    STATUS_PROGRESSION_STARTED = "status_progression_started"
+    STATUS_PROGRESSION_COMPLETED = "status_progression_completed"
+    STATUS_PROGRESSION_FAILED = "status_progression_failed"
+    PIPELINE_STAGE_TRANSITION = "pipeline_stage_transition"
+    
+    # Review Cycle Management
+    REVIEW_CYCLE_STARTED = "review_cycle_started"
+    REVIEW_CYCLE_ITERATION = "review_cycle_iteration"
+    REVIEW_CYCLE_MAKER_SELECTED = "review_cycle_maker_selected"
+    REVIEW_CYCLE_REVIEWER_SELECTED = "review_cycle_reviewer_selected"
+    REVIEW_CYCLE_ESCALATED = "review_cycle_escalated"
+    REVIEW_CYCLE_COMPLETED = "review_cycle_completed"
+    
+    # Conversational Loop Routing
+    CONVERSATIONAL_LOOP_STARTED = "conversational_loop_started"
+    CONVERSATIONAL_QUESTION_ROUTED = "conversational_question_routed"
+    CONVERSATIONAL_LOOP_PAUSED = "conversational_loop_paused"
+    CONVERSATIONAL_LOOP_RESUMED = "conversational_loop_resumed"
+    
+    # Error Handling & Circuit Breakers
+    ERROR_ENCOUNTERED = "error_encountered"
+    ERROR_RECOVERED = "error_recovered"
+    CIRCUIT_BREAKER_OPENED = "circuit_breaker_opened"
+    CIRCUIT_BREAKER_CLOSED = "circuit_breaker_closed"
+    RETRY_ATTEMPTED = "retry_attempted"
+    
+    # Task Queue Management
+    TASK_QUEUED = "task_queued"
+    TASK_DEQUEUED = "task_dequeued"
+    TASK_PRIORITY_CHANGED = "task_priority_changed"
+    TASK_CANCELLED = "task_cancelled"
+
 @dataclass
 class ObservabilityEvent:
     """Structured event for agent observability"""
@@ -62,9 +109,10 @@ class ObservabilityEvent:
 class ObservabilityManager:
     """Manages event emission for agent observability"""
 
-    def __init__(self, redis_client: redis.Redis = None, enabled: bool = True):
+    def __init__(self, redis_client: redis.Redis = None, elasticsearch_client: Elasticsearch = None, enabled: bool = True):
         """Initialize observability manager"""
         self.enabled = enabled
+        self.es = elasticsearch_client
 
         if not enabled:
             logger.info("Observability disabled")
@@ -87,6 +135,15 @@ class ObservabilityManager:
             except Exception as e:
                 logger.error(f"Failed to connect to Redis for observability: {e}")
                 self.enabled = False
+        
+        # Connect to Elasticsearch if not provided
+        if not self.es:
+            try:
+                self.es = Elasticsearch(['http://elasticsearch:9200'])
+                logger.info("Observability manager connected to Elasticsearch")
+            except Exception as e:
+                logger.warning(f"Failed to connect to Elasticsearch for observability: {e}")
+                self.es = None
 
         # Channel for all agent events (pub/sub)
         self.channel = "orchestrator:agent_events"
@@ -95,16 +152,63 @@ class ObservabilityManager:
         self.stream_key = "orchestrator:event_stream"
         self.stream_maxlen = 1000  # Keep last 1000 events
         self.stream_ttl = 7200  # 2 hours in seconds
+    
+    def _is_decision_event(self, event_type: EventType) -> bool:
+        """Check if an event type is a decision event that should be indexed in Elasticsearch"""
+        decision_events = {
+            # Feedback Monitoring
+            EventType.FEEDBACK_DETECTED,
+            EventType.FEEDBACK_LISTENING_STARTED,
+            EventType.FEEDBACK_LISTENING_STOPPED,
+            EventType.FEEDBACK_IGNORED,
+            # Agent Routing & Selection
+            EventType.AGENT_ROUTING_DECISION,
+            EventType.AGENT_SELECTED,
+            EventType.WORKSPACE_ROUTING_DECISION,
+            # Status & Pipeline Progression
+            EventType.STATUS_PROGRESSION_STARTED,
+            EventType.STATUS_PROGRESSION_COMPLETED,
+            EventType.STATUS_PROGRESSION_FAILED,
+            EventType.PIPELINE_STAGE_TRANSITION,
+            # Review Cycle Management
+            EventType.REVIEW_CYCLE_STARTED,
+            EventType.REVIEW_CYCLE_ITERATION,
+            EventType.REVIEW_CYCLE_MAKER_SELECTED,
+            EventType.REVIEW_CYCLE_REVIEWER_SELECTED,
+            EventType.REVIEW_CYCLE_ESCALATED,
+            EventType.REVIEW_CYCLE_COMPLETED,
+            # Conversational Loop Routing
+            EventType.CONVERSATIONAL_LOOP_STARTED,
+            EventType.CONVERSATIONAL_QUESTION_ROUTED,
+            EventType.CONVERSATIONAL_LOOP_PAUSED,
+            EventType.CONVERSATIONAL_LOOP_RESUMED,
+            # Error Handling & Circuit Breakers
+            EventType.ERROR_ENCOUNTERED,
+            EventType.ERROR_RECOVERED,
+            EventType.CIRCUIT_BREAKER_OPENED,
+            EventType.CIRCUIT_BREAKER_CLOSED,
+            EventType.RETRY_ATTEMPTED,
+            # Task Queue Management
+            EventType.TASK_QUEUED,
+            EventType.TASK_DEQUEUED,
+            EventType.TASK_PRIORITY_CHANGED,
+            EventType.TASK_CANCELLED,
+        }
+        return event_type in decision_events
 
     def emit(self, event_type: EventType, agent: str, task_id: str,
-             project: str, data: Dict[str, Any]):
+             project: str, data: Dict[str, Any], pipeline_run_id: Optional[str] = None):
         """Emit an observability event"""
         if not self.enabled:
             return
 
         try:
+            # Add pipeline_run_id to data if provided
+            if pipeline_run_id:
+                data['pipeline_run_id'] = pipeline_run_id
+            
             event = ObservabilityEvent(
-                timestamp=datetime.utcnow().isoformat(),
+                timestamp=datetime.utcnow().isoformat() + 'Z',
                 event_type=event_type.value,
                 agent=agent,
                 task_id=task_id,
@@ -127,6 +231,32 @@ class ObservabilityManager:
 
             # Set TTL on the stream key (refreshes on each write)
             self.redis.expire(self.stream_key, self.stream_ttl)
+            
+            # Index decision events in Elasticsearch
+            if self.es and self._is_decision_event(event_type):
+                try:
+                    # Create index name based on current date
+                    index_name = f"decision-events-{datetime.utcnow().strftime('%Y-%m-%d')}"
+                    
+                    # Prepare document for Elasticsearch
+                    doc = {
+                        'timestamp': event.timestamp,
+                        'event_type': event.event_type,
+                        'event_category': 'decision',  # Category for filtering
+                        'agent': agent,
+                        'task_id': task_id,
+                        'project': project,
+                        'pipeline_run_id': pipeline_run_id,
+                        **data  # Flatten data into document
+                    }
+                    
+                    # Index the document
+                    self.es.index(index=index_name, document=doc)
+                    logger.info(f"Indexed decision event {event_type.value} to {index_name}")
+                except Exception as e:
+                    logger.error(f"Failed to index decision event to Elasticsearch: {e}")
+            elif self._is_decision_event(event_type):
+                logger.warning(f"Decision event {event_type.value} not indexed - ES client is None")
 
             logger.debug(f"Emitted {event_type.value} event for {agent}/{task_id}")
 
@@ -134,24 +264,31 @@ class ObservabilityManager:
             logger.error(f"Failed to emit observability event: {e}")
 
     def emit_task_received(self, agent: str, task_id: str, project: str,
-                          context: Dict[str, Any]):
+                          context: Dict[str, Any], pipeline_run_id: Optional[str] = None):
         """Emit task received event"""
         self.emit(EventType.TASK_RECEIVED, agent, task_id, project, {
             'context_keys': list(context.keys()),
             'issue_number': context.get('issue_number'),
             'board': context.get('board'),
             'trigger': context.get('trigger')
-        })
+        }, pipeline_run_id=pipeline_run_id)
 
     def emit_agent_initialized(self, agent: str, task_id: str, project: str,
-                              config: Dict[str, Any]):
+                              config: Dict[str, Any], branch_name: Optional[str] = None,
+                              container_name: Optional[str] = None):
         """Emit agent initialized event"""
-        self.emit(EventType.AGENT_INITIALIZED, agent, task_id, project, {
+        data = {
             'model': config.get('model'),
             'timeout': config.get('timeout'),
             'tools_enabled': config.get('tools_enabled'),
             'mcp_servers': config.get('mcp_servers')
-        })
+        }
+        if branch_name:
+            data['branch_name'] = branch_name
+        if container_name:
+            data['container_name'] = container_name
+
+        self.emit(EventType.AGENT_INITIALIZED, agent, task_id, project, data)
 
     def emit_prompt_constructed(self, agent: str, task_id: str, project: str,
                                prompt: str, estimated_tokens: Optional[int] = None):
@@ -172,7 +309,7 @@ class ObservabilityManager:
         self.emit(EventType.CLAUDE_API_CALL_STARTED, agent, task_id, project, {
             'model': model,
             'input_tokens': input_tokens,
-            'start_time': datetime.utcnow().isoformat()
+            'start_time': datetime.utcnow().isoformat() + 'Z'
         })
 
     def emit_claude_call_completed(self, agent: str, task_id: str, project: str,
@@ -203,7 +340,7 @@ class ObservabilityManager:
 
         data = {
             'tool_name': tool_name,
-            'timestamp': datetime.utcnow().isoformat()
+            'timestamp': datetime.utcnow().isoformat() + 'Z'
         }
 
         if not started:

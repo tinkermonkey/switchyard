@@ -36,23 +36,6 @@ RUN curl -fsSL https://download.docker.com/linux/debian/gpg | \
     apt-get install -y docker-ce-cli && \
     rm -rf /var/lib/apt/lists/*
 
-# Install Python dependencies
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
-# Copy application code
-COPY . .
-
-# Copy and set permissions for entrypoint script
-COPY docker-entrypoint.sh /usr/local/bin/
-RUN chmod +x /usr/local/bin/docker-entrypoint.sh
-
-# Create orchestrator data directories (new structure)
-RUN mkdir -p orchestrator_data/state/checkpoints orchestrator_data/handoffs orchestrator_data/logs orchestrator_data/metrics
-
-# Create projects directory for mounted repositories
-RUN mkdir -p projects
-
 # Set up Git (will be configured via environment and mounted config)
 # Use --system to set git config for all users (goes to /etc/gitconfig)
 RUN git config --system user.name "Orchestrator Bot" && \
@@ -66,17 +49,31 @@ ENV PYTHONPATH=/app
 # This enables docker socket access for dev_environment_setup agent
 # On macOS, DOCKER_GID=0 (root group), so we add user to root group
 # On Linux, DOCKER_GID is typically 984-999, so we create a docker group
-# Also add to nogroup (65534) as a workaround for userns issues
 RUN if [ "${DOCKER_GID}" = "0" ]; then \
-        useradd -m -u 1000 -G root,nogroup orchestrator; \
+        useradd -m -u 1000 -G root orchestrator; \
     else \
         groupadd -g ${DOCKER_GID} docker || true && \
-        useradd -m -u 1000 -G docker,nogroup orchestrator; \
+        useradd -m -u 1000 -G docker orchestrator; \
     fi && \
-    chown -R orchestrator:orchestrator /app orchestrator_data projects && \
     mkdir -p /home/orchestrator/.ssh && \
     chown orchestrator:orchestrator /home/orchestrator/.ssh && \
     chmod 700 /home/orchestrator/.ssh
+
+# Install Python dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application code
+COPY . .
+
+# Copy and set permissions for entrypoint script
+COPY docker-entrypoint.sh /usr/local/bin/
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+
+# Create orchestrator data directories (new structure) and set ownership
+RUN mkdir -p orchestrator_data/state/checkpoints orchestrator_data/handoffs orchestrator_data/logs orchestrator_data/metrics && \
+    mkdir -p projects && \
+    chown -R orchestrator:orchestrator /app orchestrator_data projects
 
 # Switch to non-root user
 USER orchestrator

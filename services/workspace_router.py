@@ -18,6 +18,12 @@ class WorkspaceRouter:
 
     def __init__(self):
         self.discussions = GitHubDiscussions()
+        
+        # Initialize decision observability
+        from monitoring.observability import get_observability_manager
+        from monitoring.decision_events import DecisionEventEmitter
+        self.obs = get_observability_manager()
+        self.decision_events = DecisionEventEmitter(self.obs)
 
     def determine_workspace(self, project: str, board: str, stage: str) -> Tuple[str, Optional[str]]:
         """
@@ -51,6 +57,16 @@ class WorkspaceRouter:
             workspace = pipeline_config.workspace
 
             if workspace == "issues":
+                # EMIT DECISION EVENT: Workspace routing decision
+                self.decision_events.emit_workspace_routing(
+                    issue_number=0,  # Issue number not available at this level
+                    project=project,
+                    board=board,
+                    stage=stage,
+                    selected_workspace="issues",
+                    category_id=None,
+                    reason=f"Pipeline '{board}' configured for 'issues' workspace"
+                )
                 return ("issues", None)
 
             elif workspace == "discussions":
@@ -60,6 +76,18 @@ class WorkspaceRouter:
                     project_config.github['repo'],
                     pipeline_config.discussion_category
                 )
+                
+                # EMIT DECISION EVENT: Workspace routing decision
+                self.decision_events.emit_workspace_routing(
+                    issue_number=0,  # Issue number not available at this level
+                    project=project,
+                    board=board,
+                    stage=stage,
+                    selected_workspace="discussions",
+                    category_id=category_id,
+                    reason=f"Pipeline '{board}' configured for 'discussions' workspace"
+                )
+                
                 return ("discussions", category_id)
 
             elif workspace == "hybrid":
@@ -70,9 +98,32 @@ class WorkspaceRouter:
                         project_config.github['repo'],
                         pipeline_config.discussion_category
                     )
+                    
+                    # EMIT DECISION EVENT: Workspace routing decision
+                    self.decision_events.emit_workspace_routing(
+                        issue_number=0,  # Issue number not available at this level
+                        project=project,
+                        board=board,
+                        stage=stage,
+                        selected_workspace="discussions",
+                        category_id=category_id,
+                        reason=f"Hybrid pipeline: stage '{stage}' is in discussion_stages list"
+                    )
+                    
                     return ("discussions", category_id)
                 else:
                     # Default to issues for implementation stages
+                    # EMIT DECISION EVENT: Workspace routing decision
+                    self.decision_events.emit_workspace_routing(
+                        issue_number=0,  # Issue number not available at this level
+                        project=project,
+                        board=board,
+                        stage=stage,
+                        selected_workspace="issues",
+                        category_id=None,
+                        reason=f"Hybrid pipeline: stage '{stage}' not in discussion_stages, using issues workspace"
+                    )
+                    
                     return ("issues", None)
 
             else:

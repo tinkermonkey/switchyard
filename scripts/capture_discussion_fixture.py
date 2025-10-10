@@ -137,7 +137,7 @@ if __name__ == '__main__':
     import argparse
 
     parser = argparse.ArgumentParser(description='Capture GitHub Discussion as test fixture')
-    parser.add_argument('--org', default='austinsand', help='GitHub organization')
+    parser.add_argument('--org', default='tinkermonkey', help='GitHub organization')
     parser.add_argument('--repo', default='context-studio', help='Repository name')
     parser.add_argument('--discussion', type=int, required=True, help='Discussion number')
     parser.add_argument('--output', default=None, help='Output file (default: tests/fixtures/discussion_N.json)')

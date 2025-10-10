@@ -236,6 +236,32 @@ PATTERN_SIMILARITY_MAPPING = {
     }
 }
 
+# Pipeline runs - tracks issue journey through workflow
+PIPELINE_RUNS_MAPPING = {
+    "mappings": {
+        "properties": {
+            "id": {"type": "keyword"},
+            "issue_number": {"type": "integer"},
+            "issue_title": {
+                "type": "text",
+                "fields": {"keyword": {"type": "keyword", "ignore_above": 512}}
+            },
+            "issue_url": {"type": "keyword"},
+            "project": {"type": "keyword"},
+            "board": {"type": "keyword"},
+            "started_at": {"type": "date"},
+            "ended_at": {"type": "date"},
+            "status": {"type": "keyword"},  # active, completed
+            "duration_ms": {"type": "long"}  # Calculated field for completed runs
+        }
+    },
+    "settings": {
+        "number_of_shards": 1,
+        "number_of_replicas": 1,
+        "refresh_interval": "5s"
+    }
+}
+
 
 def create_all_indices(es_client):
     """
@@ -250,7 +276,8 @@ def create_all_indices(es_client):
         "pattern-llm-analysis": PATTERN_LLM_ANALYSIS_MAPPING,
         "pattern-insights": PATTERN_INSIGHTS_MAPPING,
         "pattern-claude-md-changes": CLAUDE_MD_CHANGES_MAPPING,
-        "pattern-similarity": PATTERN_SIMILARITY_MAPPING
+        "pattern-similarity": PATTERN_SIMILARITY_MAPPING,
+        "pipeline-runs": PIPELINE_RUNS_MAPPING
     }
 
     for index_name, mapping in indices.items():

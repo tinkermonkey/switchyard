@@ -29,7 +29,8 @@ class ReviewCycleState:
         project_name: str,
         board_name: str,
         workspace_type: str = 'issues',
-        discussion_id: Optional[str] = None
+        discussion_id: Optional[str] = None,
+        pipeline_run_id: Optional[str] = None
     ):
         self.issue_number = issue_number
         self.repository = repository
@@ -40,6 +41,7 @@ class ReviewCycleState:
         self.board_name = board_name
         self.workspace_type = workspace_type
         self.discussion_id = discussion_id
+        self.pipeline_run_id = pipeline_run_id
         self.current_iteration = 0
         self.maker_outputs = []
         self.review_outputs = []
@@ -65,6 +67,7 @@ class ReviewCycleState:
             'board_name': self.board_name,
             'workspace_type': self.workspace_type,
             'discussion_id': self.discussion_id,
+            'pipeline_run_id': self.pipeline_run_id,
             'current_iteration': self.current_iteration,
             'maker_outputs': self.maker_outputs,
             'review_outputs': self.review_outputs,
@@ -90,7 +93,8 @@ class ReviewCycleState:
             project_name=data['project_name'],
             board_name=data['board_name'],
             workspace_type=data.get('workspace_type', 'issues'),
-            discussion_id=data.get('discussion_id')
+            discussion_id=data.get('discussion_id'),
+            pipeline_run_id=data.get('pipeline_run_id')
         )
         state.current_iteration = data.get('current_iteration', 0)
         state.maker_outputs = data.get('maker_outputs', [])
@@ -115,6 +119,12 @@ class ReviewCycleExecutor:
         self.active_cycles = {}  # Track active review cycles by issue number
         self.state_dir = None  # Will be set per project
         self.outcome_correlator = get_review_outcome_correlator()
+        
+        # Initialize decision observability
+        from monitoring.observability import get_observability_manager
+        from monitoring.decision_events import DecisionEventEmitter
+        self.obs = get_observability_manager()
+        self.decision_events = DecisionEventEmitter(self.obs)
 
     async def _analyze_review_cycle_outcomes(self, cycle_state: ReviewCycleState):
         """
@@ -355,7 +365,8 @@ class ReviewCycleExecutor:
         org: str,
         workflow_columns: list = None,
         workspace_type: str = 'issues',
-        discussion_id: Optional[str] = None
+        discussion_id: Optional[str] = None,
+        pipeline_run_id: Optional[str] = None
     ) -> Tuple[str, bool]:
         """
         Start a review cycle for an issue
@@ -383,9 +394,90 @@ class ReviewCycleExecutor:
                 existing_cycle.reviewer_agent == column.agent):
                 logger.info(
                     f"Review cycle already active for issue #{issue_number}, "
-                    f"using existing cycle (status: {existing_cycle.status})"
+                    f"using existing cycle (status: {existing_cycle.status}, "
+                    f"iteration: {existing_cycle.current_iteration}/{existing_cycle.max_iterations})"
                 )
+                
+                # Check if the cycle is already beyond max iterations (corrupted state)
+                if existing_cycle.current_iteration >= existing_cycle.max_iterations:
+                    logger.warning(
+                        f"Review cycle for issue #{issue_number} is already at or beyond max iterations "
+                        f"({existing_cycle.current_iteration}/{existing_cycle.max_iterations}). "
+                        f"This indicates a corrupted state. Cleaning up and escalating."
+                    )
+                    
+                    # Remove corrupted cycle
+                    self._remove_cycle_state(existing_cycle)
+                    del self.active_cycles[issue_number]
+                    
+                    # Post escalation message
+                    escalation_message = (
+                        f"⚠️ **Review Cycle Exceeded Max Iterations**\n\n"
+                        f"The review cycle has already reached or exceeded the maximum iterations "
+                        f"({existing_cycle.current_iteration}/{existing_cycle.max_iterations}). "
+                        f"Manual review is required.\n\n"
+                        f"**Maker Agent:** {existing_cycle.maker_agent}\n"
+                        f"**Reviewer Agent:** {existing_cycle.reviewer_agent}\n\n"
+                        f"Please review the work and provide feedback to continue."
+                    )
+                    
+                    if workspace_type == 'discussions' and discussion_id:
+                        from services.github_discussions import GitHubDiscussions
+                        discussions = GitHubDiscussions()
+                        discussions.add_discussion_comment(discussion_id, escalation_message)
+                    else:
+                        await self.github.post_issue_comment(
+                            issue_number,
+                            escalation_message,
+                            repository
+                        )
+                    
+                    # Return current column, cycle not complete
+                    return column.name, False
+                
+                # Reuse existing cycle - do NOT append maker output or reset state
                 cycle_state = existing_cycle
+                
+                # Store workflow columns for next column lookup
+                self.workflow_columns = workflow_columns
+                
+                # Continue directly to executing the review loop
+                # The existing state already has the maker outputs and iteration tracking
+                try:
+                    # Execute the review loop
+                    final_status, next_column = await self._execute_review_loop(
+                        cycle_state,
+                        column,
+                        issue_data,
+                        org
+                    )
+
+                    # Clean up
+                    del self.active_cycles[issue_number]
+
+                    return next_column, True
+
+                except Exception as e:
+                    logger.error(f"Review cycle failed for issue #{issue_number}: {e}")
+                    # Clean up on error
+                    if issue_number in self.active_cycles:
+                        del self.active_cycles[issue_number]
+
+                    # Post error comment (workspace-aware)
+                    error_message = f"⚠️ **Review Cycle Error**\n\nThe automated review cycle encountered an error:\n```\n{str(e)}\n```\n\nPlease review manually."
+
+                    if workspace_type == 'discussions' and discussion_id:
+                        from services.github_discussions import GitHubDiscussions
+                        discussions = GitHubDiscussions()
+                        discussions.add_discussion_comment(discussion_id, error_message)
+                    else:
+                        await self.github.post_issue_comment(
+                            issue_number,
+                            error_message,
+                            repository
+                        )
+
+                    raise
             else:
                 # Different review column - remove old cycle and create new one
                 logger.info(
@@ -394,6 +486,7 @@ class ReviewCycleExecutor:
                     f"now: {column.agent}/{column.maker_agent})"
                 )
                 self._remove_cycle_state(existing_cycle)
+                del self.active_cycles[issue_number]
                 # Create new review cycle state
                 cycle_state = ReviewCycleState(
                     issue_number=issue_number,
@@ -404,7 +497,8 @@ class ReviewCycleExecutor:
                     project_name=project_name,
                     board_name=board_name,
                     workspace_type=workspace_type,
-                    discussion_id=discussion_id
+                    discussion_id=discussion_id,
+                    pipeline_run_id=pipeline_run_id
                 )
         else:
             # Create new review cycle state
@@ -417,10 +511,11 @@ class ReviewCycleExecutor:
                 project_name=project_name,
                 board_name=board_name,
                 workspace_type=workspace_type,
-                discussion_id=discussion_id
+                discussion_id=discussion_id,
+                pipeline_run_id=pipeline_run_id
             )
 
-        # Store initial maker output
+        # Store initial maker output (only for NEW cycles)
         cycle_state.maker_outputs.append({
             'iteration': 0,
             'output': previous_stage_output,
@@ -434,6 +529,24 @@ class ReviewCycleExecutor:
         # Save initial state to disk
         cycle_state.status = 'maker_working'
         self._save_cycle_state(cycle_state)
+        
+        # EMIT DECISION EVENT: Review cycle started
+        self.decision_events.emit_review_cycle_decision(
+            issue_number=issue_number,
+            project=project_name,
+            board=board_name,
+            cycle_iteration=0,
+            decision_type='start',
+            maker_agent=column.maker_agent,
+            reviewer_agent=column.agent,
+            reason=f"Starting review cycle with maker '{column.maker_agent}' and reviewer '{column.agent}' (max iterations: {column.max_iterations})",
+            additional_data={
+                'max_iterations': column.max_iterations,
+                'workspace_type': workspace_type,
+                'discussion_id': discussion_id
+            },
+            pipeline_run_id=cycle_state.pipeline_run_id
+        )
 
         try:
             # Execute the review loop
@@ -527,14 +640,40 @@ class ReviewCycleExecutor:
                     from services.project_workspace import workspace_manager
 
                     project_dir = workspace_manager.get_project_dir(cycle_state.project_name)
-                    await git_workflow_manager.update_pr_status(
-                        project=cycle_state.project_name,
-                        issue_number=cycle_state.issue_number,
-                        project_dir=project_dir,
-                        status='approved',
-                        org=org,
-                        repo=cycle_state.repository
+                    
+                    # Ensure branch is tracked before updating PR
+                    branch_info = git_workflow_manager.get_branch_info(
+                        cycle_state.project_name,
+                        cycle_state.issue_number
                     )
+                    
+                    if not branch_info:
+                        # Branch not tracked yet - get current branch and track it
+                        try:
+                            current_branch = await git_workflow_manager.get_current_branch(project_dir)
+                            if current_branch and current_branch != 'main':
+                                git_workflow_manager.track_branch(
+                                    cycle_state.project_name,
+                                    cycle_state.issue_number,
+                                    current_branch
+                                )
+                                logger.info(f"Tracked existing branch {current_branch} for issue #{cycle_state.issue_number}")
+                            else:
+                                logger.warning(f"Cannot update PR status - no feature branch found for issue #{cycle_state.issue_number}")
+                                # Don't fail the review cycle just because PR update failed
+                        except Exception as e:
+                            logger.warning(f"Could not track branch for PR update: {e}")
+                    
+                    if branch_info or git_workflow_manager.get_branch_info(cycle_state.project_name, cycle_state.issue_number):
+                        # Only try to update PR if we have a tracked branch
+                        await git_workflow_manager.update_pr_status(
+                            project=cycle_state.project_name,
+                            issue_number=cycle_state.issue_number,
+                            project_dir=project_dir,
+                            status='approved',
+                            org=org,
+                            repo=cycle_state.repository
+                        )
 
             elif review_result.status == ReviewStatus.CHANGES_REQUESTED:
                 logger.info(f"Changes requested, executing maker for revision")
@@ -569,10 +708,10 @@ class ReviewCycleExecutor:
                     )
 
                     if branch_info:
-                        workspace_manager.ensure_branch(
-                            cycle_state.project_name,
-                            branch_info.branch_name
-                        )
+                        # Checkout existing branch
+                        from services.git_workflow_manager import git_workflow_manager
+                        project_dir = workspace_manager.get_project_dir(cycle_state.project_name)
+                        await git_workflow_manager.checkout_branch(str(project_dir), branch_info.branch_name)
                         logger.info(f"Switched to branch {branch_info.branch_name} for maker revision")
 
                 # Execute maker agent
@@ -1251,6 +1390,23 @@ class ReviewCycleExecutor:
                 f"Review cycle iteration {iteration}/{cycle_state.max_iterations} "
                 f"for issue #{cycle_state.issue_number}"
             )
+            
+            # EMIT DECISION EVENT: Review cycle iteration
+            self.decision_events.emit_review_cycle_decision(
+                issue_number=cycle_state.issue_number,
+                project=cycle_state.project_name,
+                board=cycle_state.board_name,
+                cycle_iteration=iteration,
+                decision_type='iteration',
+                maker_agent=cycle_state.maker_agent,
+                reviewer_agent=cycle_state.reviewer_agent,
+                reason=f"Starting iteration {iteration} of {cycle_state.max_iterations}",
+                additional_data={
+                    'max_iterations': cycle_state.max_iterations,
+                    'workspace_type': cycle_state.workspace_type
+                },
+                pipeline_run_id=cycle_state.pipeline_run_id
+            )
 
             # Fetch fresh discussion context before each iteration
             # This ensures we get ALL comments including user feedback since the last agent output
@@ -1270,6 +1426,19 @@ class ReviewCycleExecutor:
                 issue_data,
                 iteration,
                 full_discussion_context=fresh_context
+            )
+            
+            # EMIT DECISION EVENT: Reviewer selected
+            self.decision_events.emit_review_cycle_decision(
+                issue_number=cycle_state.issue_number,
+                project=cycle_state.project_name,
+                board=cycle_state.board_name,
+                cycle_iteration=iteration,
+                decision_type='reviewer_selected',
+                maker_agent=cycle_state.maker_agent,
+                reviewer_agent=cycle_state.reviewer_agent,
+                reason=f"Executing reviewer agent '{cycle_state.reviewer_agent}' for iteration {iteration}",
+                pipeline_run_id=cycle_state.pipeline_run_id
             )
 
             # Execute reviewer agent
@@ -1321,6 +1490,24 @@ class ReviewCycleExecutor:
             if review_result_parsed.status == ReviewStatus.APPROVED:
                 # Success! Move to next column
                 logger.info(f"Review approved for issue #{cycle_state.issue_number}")
+                
+                # EMIT DECISION EVENT: Review cycle completed
+                self.decision_events.emit_review_cycle_decision(
+                    issue_number=cycle_state.issue_number,
+                    project=cycle_state.project_name,
+                    board=cycle_state.board_name,
+                    cycle_iteration=iteration,
+                    decision_type='complete',
+                    maker_agent=cycle_state.maker_agent,
+                    reviewer_agent=cycle_state.reviewer_agent,
+                    reason=f"Review cycle completed successfully: approved after {iteration} iteration(s)",
+                    additional_data={
+                        'total_iterations': iteration,
+                        'status': 'approved'
+                    },
+                    pipeline_run_id=cycle_state.pipeline_run_id
+                )
+                
                 await self._post_cycle_summary(
                     cycle_state,
                     "APPROVED",
@@ -1434,6 +1621,19 @@ class ReviewCycleExecutor:
 
             # Step 4: Re-invoke maker agent with feedback
             logger.info(f"Re-invoking {cycle_state.maker_agent} with reviewer feedback")
+            
+            # EMIT DECISION EVENT: Maker selected
+            self.decision_events.emit_review_cycle_decision(
+                issue_number=cycle_state.issue_number,
+                project=cycle_state.project_name,
+                board=cycle_state.board_name,
+                cycle_iteration=iteration,
+                decision_type='maker_selected',
+                maker_agent=cycle_state.maker_agent,
+                reviewer_agent=cycle_state.reviewer_agent,
+                reason=f"Executing maker agent '{cycle_state.maker_agent}' to address review feedback in iteration {iteration}",
+                pipeline_run_id=cycle_state.pipeline_run_id
+            )
 
             # Fetch fresh context again (now includes reviewer's comment)
             if cycle_state.workspace_type == 'discussions' and cycle_state.discussion_id:
@@ -1466,25 +1666,54 @@ class ReviewCycleExecutor:
 
                 if branch_info:
                     # Switch to existing branch
+                    from services.git_workflow_manager import git_workflow_manager
                     project_dir = workspace_manager.get_project_dir(cycle_state.project_name)
-                    workspace_manager.ensure_branch(
-                        cycle_state.project_name,
-                        branch_info.branch_name
-                    )
+                    await git_workflow_manager.checkout_branch(str(project_dir), branch_info.branch_name)
                     logger.info(f"Switched to branch {branch_info.branch_name} for maker revision")
                 else:
-                    # Create branch if it doesn't exist (shouldn't happen, but handle it)
-                    branch_name = workspace_manager.create_feature_branch(
-                        cycle_state.project_name,
-                        cycle_state.issue_number
-                    )
-                    if branch_name:
-                        git_workflow_manager.track_branch(
-                            cycle_state.project_name,
-                            cycle_state.issue_number,
-                            branch_name
+                    # Create branch if it doesn't exist - use FeatureBranchManager to respect parent/sub-issue relationships
+                    from services.feature_branch_manager import feature_branch_manager
+                    from services.integrations.github_integration import github_integration
+                    
+                    try:
+                        project_dir = workspace_manager.get_project_dir(cycle_state.project_name)
+                        # Use FeatureBranchManager which handles parent/sub-issue detection
+                        branch_name = await feature_branch_manager.ensure_and_prepare_branch(
+                            project=cycle_state.project_name,
+                            project_dir=str(project_dir),
+                            issue_number=cycle_state.issue_number,
+                            issue_title=cycle_state.issue_title or f"Issue {cycle_state.issue_number}",
+                            github_integration=github_integration
                         )
-                        logger.info(f"Created branch {branch_name} for maker revision")
+                        
+                        # Track the branch for git workflow (this will be done by feature_branch_manager too, but ensure it)
+                        if not git_workflow_manager.get_branch_info(cycle_state.project_name, cycle_state.issue_number):
+                            # Check if this is a sub-issue
+                            all_feature_branches = feature_branch_manager.get_all_feature_branches(cycle_state.project_name)
+                            for feature_branch in all_feature_branches:
+                                if any(si.number == cycle_state.issue_number for si in feature_branch.sub_issues):
+                                    # Track against parent for PR creation
+                                    git_workflow_manager.track_branch(
+                                        cycle_state.project_name,
+                                        feature_branch.parent_issue,  # Track with parent issue number
+                                        branch_name
+                                    )
+                                    logger.info(f"Tracked sub-issue #{cycle_state.issue_number} branch {branch_name} under parent #{feature_branch.parent_issue}")
+                                    break
+                            else:
+                                # Standalone issue
+                                git_workflow_manager.track_branch(
+                                    cycle_state.project_name,
+                                    cycle_state.issue_number,
+                                    branch_name
+                                )
+                                logger.info(f"Tracked standalone issue #{cycle_state.issue_number} branch {branch_name}")
+                        
+                        logger.info(f"Prepared branch {branch_name} for maker revision using FeatureBranchManager")
+                    except Exception as e:
+                        logger.error(f"Failed to prepare branch for issue #{cycle_state.issue_number}: {e}")
+                        # Continue without branch - agent will work on current branch
+                        logger.warning(f"Continuing on current branch for issue #{cycle_state.issue_number}")
 
             # Execute maker agent directly
             await self._execute_agent_directly(
@@ -1943,6 +2172,27 @@ _Automated review cycle by Claude Code Orchestrator_
         """Escalate when blocking issues are found (workspace-aware)"""
         from services.github_integration import GitHubIntegration
         import subprocess
+        
+        # EMIT DECISION EVENT: Review cycle escalated
+        blocking_issues = [
+            f.message for f in review_result.findings if f.severity == 'blocking'
+        ]
+        self.decision_events.emit_review_cycle_decision(
+            issue_number=cycle_state.issue_number,
+            project=cycle_state.project_name,
+            board=cycle_state.board_name,
+            cycle_iteration=cycle_state.current_iteration,
+            decision_type='escalate',
+            maker_agent=cycle_state.maker_agent,
+            reviewer_agent=cycle_state.reviewer_agent,
+            reason=f"Escalating due to {review_result.blocking_count} blocking issue(s) found by reviewer",
+            additional_data={
+                'escalation_reason': 'blocking_issues',
+                'blocking_count': review_result.blocking_count,
+                'blocking_issues': blocking_issues[:5]  # First 5 for brevity
+            },
+            pipeline_run_id=cycle_state.pipeline_run_id
+        )
 
         # Add label (only for issues)
         if cycle_state.workspace_type == 'issues':
@@ -2007,6 +2257,24 @@ _Escalated by Claude Code Orchestrator - Monitoring for your response..._
     async def _escalate_max_iterations(self, cycle_state: ReviewCycleState, review_result):
         """Escalate when max iterations reached without approval (workspace-aware)"""
         import subprocess
+        
+        # EMIT DECISION EVENT: Review cycle escalated
+        self.decision_events.emit_review_cycle_decision(
+            issue_number=cycle_state.issue_number,
+            project=cycle_state.project_name,
+            board=cycle_state.board_name,
+            cycle_iteration=cycle_state.current_iteration,
+            decision_type='escalate',
+            maker_agent=cycle_state.maker_agent,
+            reviewer_agent=cycle_state.reviewer_agent,
+            reason=f"Escalating: max iterations ({cycle_state.max_iterations}) reached without approval",
+            additional_data={
+                'escalation_reason': 'max_iterations',
+                'remaining_issues': len(review_result.findings),
+                'quality_score': review_result.score
+            },
+            pipeline_run_id=cycle_state.pipeline_run_id
+        )
 
         # Add label (only for issues)
         if cycle_state.workspace_type == 'issues':

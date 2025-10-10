@@ -133,7 +133,7 @@ class DiscordChannel(WebhookChannel):
                     {"name": "Project", "value": occurrence.get('project', 'N/A'), "inline": True},
                     {"name": "Error", "value": f"```{occurrence.get('error_message', 'N/A')[:200]}```", "inline": False}
                 ],
-                "timestamp": datetime.utcnow().isoformat()
+                "timestamp": datetime.utcnow().isoformat() + 'Z'
             }]
         }
 

@@ -19,7 +19,10 @@ class HealthMonitor:
             'claude': self.check_claude,
             'disk': self.check_disk_space,
             'memory': self.check_memory,
-            'claude_usage': self.check_claude_usage
+            # Disabled: claude_usage requires Claude Code session data which doesn't exist
+            # in the orchestrator container. The orchestrator launches agents in separate
+            # containers and doesn't maintain its own Claude session history.
+            # 'claude_usage': self.check_claude_usage
         }
         
     async def check_health(self) -> Dict[str, Any]:
@@ -57,7 +60,7 @@ class HealthMonitor:
             redis_client = redis.Redis(host='redis', port=6379, decode_responses=True)
             redis_client.setex(
                 'orchestrator:health',
-                300,  # 5 minute TTL
+                600,  # 10 minute TTL (health check max backoff is 5 minutes)
                 json.dumps(health_result)
             )
         except Exception as e:
@@ -78,6 +81,7 @@ class HealthMonitor:
 
         # Check GitHub App authentication status for detailed reporting
         from services.github_app import github_app
+        import subprocess
 
         github_app_status = {
             'enabled': github_app.enabled
@@ -96,7 +100,8 @@ class HealthMonitor:
         # Check PAT authentication via gh CLI
         auth_result = subprocess.run(
             ['gh', 'auth', 'status'],
-            capture_output=True, text=True
+            capture_output=True, text=True,
+            timeout=5
         )
 
         pat_status = {
@@ -117,7 +122,8 @@ class HealthMonitor:
         # Check if we can access user info
         user_result = subprocess.run(
             ['gh', 'api', 'user'],
-            capture_output=True, text=True
+            capture_output=True, text=True,
+            timeout=5
         )
 
         if user_result.returncode != 0:
@@ -159,7 +165,8 @@ class HealthMonitor:
         # Check repository access
         repo_result = subprocess.run(
             ['gh', 'api', f'repos/{org}/{repo}'],
-            capture_output=True, text=True
+            capture_output=True, text=True,
+            timeout=5
         )
 
         if repo_result.returncode != 0:
@@ -177,7 +184,8 @@ class HealthMonitor:
         # This is the orchestrator's primary function
         projects_result = subprocess.run(
             ['gh', 'project', 'list', '--owner', org, '--format', 'json'],
-            capture_output=True, text=True
+            capture_output=True, text=True,
+            timeout=5
         )
 
         if projects_result.returncode != 0:
@@ -247,7 +255,8 @@ class HealthMonitor:
         """Check Claude Code CLI accessibility"""
         result = subprocess.run(
             ['claude', '--version'],
-            capture_output=True
+            capture_output=True,
+            timeout=5
         )
         return {'healthy': result.returncode == 0}
 

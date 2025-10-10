@@ -17,6 +17,7 @@ from services.github_project_manager import GitHubProjectManager
 from services.project_monitor import ProjectMonitor
 from services.project_workspace import workspace_manager
 from services.scheduled_tasks import get_scheduled_tasks_service
+from services.dev_container_state import dev_container_state
 from agents.orchestrator_integration import process_task_integrated
 
 async def main():
@@ -59,6 +60,16 @@ async def main():
     logger.info("Initializing project workspaces")
     projects_needing_setup = workspace_manager.initialize_all_projects()
     logger.info("Project workspaces initialized")
+
+    # Verify Docker images for all projects marked as verified
+    # This handles cases where Docker context changed or images were lost
+    logger.info("Verifying Docker images for verified projects")
+    for project_name in projects_needing_setup.keys():
+        image_verified = dev_container_state.verify_and_update_status(project_name)
+        if not image_verified:
+            # Image was marked verified but doesn't exist - mark for setup
+            logger.info(f"Project {project_name} needs dev environment setup (Docker image missing)")
+            projects_needing_setup[project_name] = True
 
     # Queue dev_environment_setup tasks for projects that need it
     from task_queue.task_manager import Task, TaskPriority
@@ -136,6 +147,8 @@ async def main():
     max_consecutive_failures = 10  # Exit only after 10 consecutive failures (transient issues should recover)
     health_check_backoff = 10  # Start with 10 second backoff
     max_backoff = 300  # Max 5 minutes between health checks
+    # NOTE: health_monitor.py writes to Redis with 10-minute TTL to ensure key doesn't expire
+    # even when health checks are running at max_backoff (300s) with execution delays
     last_health_check = 0
 
     while True:
