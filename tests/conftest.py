@@ -6,6 +6,7 @@ This file provides common fixtures and configuration for all tests.
 
 import pytest
 import asyncio
+import os
 from pathlib import Path
 from typing import Dict, Any
 
@@ -19,7 +20,7 @@ from tests.utils.builders import ReviewCycleStateBuilder, DiscussionBuilder, Tas
 # ============================================================================
 
 def pytest_configure(config):
-    """Register custom markers"""
+    """Register custom markers and load environment"""
     config.addinivalue_line(
         "markers", "unit: Unit tests (fast, isolated)"
     )
@@ -32,6 +33,22 @@ def pytest_configure(config):
     config.addinivalue_line(
         "markers", "slow: Slow tests (skip in fast test runs)"
     )
+
+    # Load environment variables from .env file for integration tests
+    # This ensures API keys and other config are available
+    from config.environment import Environment
+    try:
+        env = Environment()
+        # Export environment variables if they're configured
+        if env.claude_code_oauth_token:
+            os.environ['CLAUDE_CODE_OAUTH_TOKEN'] = env.claude_code_oauth_token.get_secret_value()
+        if env.anthropic_api_key:
+            os.environ['ANTHROPIC_API_KEY'] = env.anthropic_api_key.get_secret_value()
+        if env.github_token:
+            os.environ['GITHUB_TOKEN'] = env.github_token.get_secret_value()
+    except Exception as e:
+        # Don't fail tests if .env is missing - some tests don't need it
+        pass
 
 
 @pytest.fixture(scope="session")
@@ -213,9 +230,9 @@ All requirements have been addressed. The business analysis is comprehensive and
 
 ## Assessment
 
-✅ All acceptance criteria defined
-✅ User stories follow INVEST principles
-✅ Requirements are clear and testable
+All acceptance criteria defined
+User stories follow INVEST principles
+Requirements are clear and testable
 
 _Processed by the requirements_reviewer agent_"""
 

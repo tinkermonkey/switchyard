@@ -44,25 +44,48 @@ def mock_github_integration():
     """Create a mock GitHub integration"""
     mock_gh = AsyncMock()
 
-    # Mock graphql_query for parent issue detection
-    mock_gh.graphql_query = AsyncMock(return_value={
-        "data": {
-            "repository": {
-                "issue": {
-                    "trackedInIssues": {
-                        "nodes": [{"number": 50}]
-                    }
-                }
+    # Mock get_issue - returns different issues based on number
+    async def mock_get_issue(issue_number):
+        issues = {
+            50: {
+                "number": 50,
+                "title": "User Authentication Feature",
+                "state": "open",
+                "body": "Parent issue for authentication"
+            },
+            51: {
+                "number": 51,
+                "title": "Login form UI",
+                "state": "open",
+                "body": "Part of #50"  # References parent
+            },
+            52: {
+                "number": 52,
+                "title": "Password validation",
+                "state": "open",
+                "body": "Part of #50"  # References parent
+            },
+            53: {
+                "number": 53,
+                "title": "Session management",
+                "state": "open",
+                "body": "Part of #50"  # References parent
+            },
+            100: {
+                "number": 100,
+                "title": "Standalone feature",
+                "state": "open",
+                "body": "No parent"
             }
         }
-    })
+        return issues.get(issue_number, {
+            "number": issue_number,
+            "title": f"Issue {issue_number}",
+            "state": "open",
+            "body": ""
+        })
 
-    # Mock get_issue
-    mock_gh.get_issue = AsyncMock(return_value={
-        "number": 50,
-        "title": "User Authentication Feature",
-        "state": "open"
-    })
+    mock_gh.get_issue = mock_get_issue
 
     # Mock post_comment
     mock_gh.post_comment = AsyncMock(return_value={"success": True})
@@ -300,18 +323,7 @@ class TestFeatureBranchLifecycle:
         temp_workspace
     ):
         """Test preparing branch for standalone issue (no parent)"""
-        # Mock no parent issue
-        mock_github_integration.graphql_query = AsyncMock(return_value={
-            "data": {
-                "repository": {
-                    "issue": {
-                        "trackedInIssues": {
-                            "nodes": []
-                        }
-                    }
-                }
-            }
-        })
+        # Issue 100 already configured in mock_github_integration with no parent reference
 
         # Create project directory
         project_dir = Path(temp_workspace) / "test-project"
@@ -445,9 +457,9 @@ class TestConflictHandling:
             sub_issues=[51]
         )
 
-        # Mock conflict on pull
-        mock_git_workflow.pull_rebase.side_effect = Exception("Merge conflict detected")
-        mock_git_workflow.get_conflicting_files.return_value = ["auth.py", "config.js"]
+        # Mock conflict on pull - needs to contain "conflict" keyword for MergeConflictError detection
+        mock_git_workflow.pull_rebase = AsyncMock(side_effect=Exception("CONFLICT: Merge conflict in auth.py"))
+        mock_git_workflow.get_conflicting_files = AsyncMock(return_value=["auth.py", "config.js"])
 
         # Create project directory
         project_dir = Path(temp_workspace) / "test-project"
@@ -488,8 +500,8 @@ class TestStaleBranchDetection:
             sub_issues=[51]
         )
 
-        # Mock 25 commits behind (warning threshold)
-        mock_git_workflow.get_commits_behind.return_value = 25
+        # Mock 25 commits behind (warning threshold - between 20 and 50)
+        mock_git_workflow.get_commits_behind = AsyncMock(return_value=25)
 
         # Create project directory
         project_dir = Path(temp_workspace) / "test-project"
@@ -524,8 +536,8 @@ class TestStaleBranchDetection:
             sub_issues=[51]
         )
 
-        # Mock 60 commits behind (escalation threshold)
-        mock_git_workflow.get_commits_behind.return_value = 60
+        # Mock 60 commits behind (escalation threshold > 50)
+        mock_git_workflow.get_commits_behind = AsyncMock(return_value=60)
 
         # Create project directory
         project_dir = Path(temp_workspace) / "test-project"

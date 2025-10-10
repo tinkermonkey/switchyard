@@ -30,22 +30,29 @@ class TestFeatureBranchPreparation:
             'repository': 'test-org/test-repo'
         }
 
-        # Mock dependencies
-        with patch('services.agent_executor.feature_branch_manager') as mock_fbm, \
-             patch('services.agent_executor.config_manager') as mock_config, \
+        # Mock dependencies using the workspace abstraction layer
+        with patch('services.workspace.WorkspaceContextFactory') as mock_factory, \
+             patch('config.manager.config_manager') as mock_config, \
              patch.object(agent_executor.factory, 'create_agent') as mock_create_agent, \
              patch.object(agent_executor.obs, 'emit_task_received'), \
              patch.object(agent_executor.obs, 'emit_agent_initialized'), \
-             patch.object(agent_executor.obs, 'emit_agent_completed'):
+             patch.object(agent_executor.obs, 'emit_agent_completed'), \
+             patch.object(agent_executor, '_post_agent_output_to_github', new_callable=AsyncMock):
 
             # Setup mocks
             mock_project_config = MagicMock()
-            mock_project_config.repository = "test-org/test-repo"
+            mock_project_config.github = {'org': 'test-org', 'repo': 'test-repo'}
             mock_config.get_project_config.return_value = mock_project_config
 
-            mock_fbm.prepare_feature_branch = AsyncMock(
-                return_value="feature/issue-50-user-auth"
+            # Mock workspace context
+            mock_workspace = MagicMock()
+            mock_workspace.prepare_execution = AsyncMock(
+                return_value={'branch_name': 'feature/issue-51-login-form-ui', 'work_dir': '/workspace/test-project'}
             )
+            mock_workspace.finalize_execution = AsyncMock(
+                return_value={'success': True}
+            )
+            mock_factory.create.return_value = mock_workspace
 
             # Mock agent
             mock_agent = MagicMock()
@@ -60,15 +67,12 @@ class TestFeatureBranchPreparation:
                 task_context=task_context
             )
 
-            # Verify prepare_feature_branch was called
-            mock_fbm.prepare_feature_branch.assert_called_once()
-            call_kwargs = mock_fbm.prepare_feature_branch.call_args[1]
-            assert call_kwargs['project'] == 'test-project'
-            assert call_kwargs['issue_number'] == 51
-            assert call_kwargs['issue_title'] == 'Login form UI'
+            # Verify workspace was created and preparation was called
+            mock_factory.create.assert_called_once()
+            mock_workspace.prepare_execution.assert_called_once()
 
             # Verify branch name added to context
-            assert task_context['branch_name'] == "feature/issue-50-user-auth"
+            assert task_context['branch_name'] == "feature/issue-51-login-form-ui"
 
     @pytest.mark.asyncio
     async def test_skip_branch_prep_no_issue_number(self, agent_executor):
@@ -77,14 +81,12 @@ class TestFeatureBranchPreparation:
             'task_type': 'adhoc'
         }
 
-        with patch('services.agent_executor.feature_branch_manager') as mock_fbm, \
-             patch('services.agent_executor.config_manager') as mock_config, \
+        with patch('services.workspace.WorkspaceContextFactory') as mock_factory, \
+             patch('config.manager.config_manager') as mock_config, \
              patch.object(agent_executor.factory, 'create_agent') as mock_create_agent, \
              patch.object(agent_executor.obs, 'emit_task_received'), \
              patch.object(agent_executor.obs, 'emit_agent_initialized'), \
              patch.object(agent_executor.obs, 'emit_agent_completed'):
-
-            mock_fbm.prepare_feature_branch = AsyncMock()
 
             # Mock agent
             mock_agent = MagicMock()
@@ -99,8 +101,8 @@ class TestFeatureBranchPreparation:
                 task_context=task_context
             )
 
-            # Verify prepare_feature_branch was NOT called
-            mock_fbm.prepare_feature_branch.assert_not_called()
+            # Verify workspace context was NOT created (no issue_number)
+            mock_factory.create.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_branch_prep_failure_continues_execution(self, agent_executor):
@@ -110,8 +112,8 @@ class TestFeatureBranchPreparation:
             'issue_title': 'Login form UI'
         }
 
-        with patch('services.agent_executor.feature_branch_manager') as mock_fbm, \
-             patch('services.agent_executor.config_manager') as mock_config, \
+        with patch('services.workspace.WorkspaceContextFactory') as mock_factory, \
+             patch('config.manager.config_manager') as mock_config, \
              patch.object(agent_executor.factory, 'create_agent') as mock_create_agent, \
              patch.object(agent_executor.obs, 'emit_task_received'), \
              patch.object(agent_executor.obs, 'emit_agent_initialized'), \
@@ -119,13 +121,11 @@ class TestFeatureBranchPreparation:
 
             # Setup mocks
             mock_project_config = MagicMock()
-            mock_project_config.repository = "test-org/test-repo"
+            mock_project_config.github = {'org': 'test-org', 'repo': 'test-repo'}
             mock_config.get_project_config.return_value = mock_project_config
 
-            # Branch prep fails
-            mock_fbm.prepare_feature_branch = AsyncMock(
-                side_effect=Exception("GitHub API error")
-            )
+            # Workspace creation fails
+            mock_factory.create.side_effect = Exception("GitHub API error")
 
             # Mock agent
             mock_agent = MagicMock()
@@ -156,8 +156,8 @@ class TestFeatureBranchFinalization:
             'issue_title': 'Login form UI'
         }
 
-        with patch('services.agent_executor.feature_branch_manager') as mock_fbm, \
-             patch('services.agent_executor.config_manager') as mock_config, \
+        with patch('services.workspace.WorkspaceContextFactory') as mock_factory, \
+             patch('config.manager.config_manager') as mock_config, \
              patch.object(agent_executor.factory, 'create_agent') as mock_create_agent, \
              patch.object(agent_executor, '_post_agent_output_to_github') as mock_post, \
              patch.object(agent_executor.obs, 'emit_task_received'), \
@@ -166,19 +166,22 @@ class TestFeatureBranchFinalization:
 
             # Setup mocks
             mock_project_config = MagicMock()
-            mock_project_config.repository = "test-org/test-repo"
+            mock_project_config.github = {'org': 'test-org', 'repo': 'test-repo'}
             mock_config.get_project_config.return_value = mock_project_config
 
-            mock_fbm.prepare_feature_branch = AsyncMock(
-                return_value="feature/issue-50-user-auth"
+            # Mock workspace context
+            mock_workspace = MagicMock()
+            mock_workspace.prepare_execution = AsyncMock(
+                return_value={'branch_name': 'feature/issue-51-login-form-ui', 'work_dir': '/workspace/test-project'}
             )
-            mock_fbm.finalize_feature_branch_work = AsyncMock(
+            mock_workspace.finalize_execution = AsyncMock(
                 return_value={
                     'success': True,
-                    'pr_url': 'https://github.com/org/repo/pull/123',
+                    'pr_url': 'https://github.com/test-org/test-repo/pull/123',
                     'all_complete': False
                 }
             )
+            mock_factory.create.return_value = mock_workspace
 
             # Mock agent
             mock_agent = MagicMock()
@@ -196,10 +199,9 @@ class TestFeatureBranchFinalization:
             )
 
             # Verify finalize was called
-            mock_fbm.finalize_feature_branch_work.assert_called_once()
-            call_kwargs = mock_fbm.finalize_feature_branch_work.call_args[1]
-            assert call_kwargs['project'] == 'test-project'
-            assert call_kwargs['issue_number'] == 51
+            mock_workspace.finalize_execution.assert_called_once()
+            call_kwargs = mock_workspace.finalize_execution.call_args[1]
+            assert 'commit_message' in call_kwargs
             assert 'senior_software_engineer' in call_kwargs['commit_message']
 
     @pytest.mark.asyncio
@@ -209,17 +211,21 @@ class TestFeatureBranchFinalization:
             'issue_number': 51
         }
 
-        with patch('services.agent_executor.feature_branch_manager') as mock_fbm, \
-             patch('services.agent_executor.config_manager') as mock_config, \
+        with patch('services.workspace.WorkspaceContextFactory') as mock_factory, \
+             patch('config.manager.config_manager') as mock_config, \
              patch.object(agent_executor.factory, 'create_agent') as mock_create_agent, \
              patch.object(agent_executor, '_post_agent_output_to_github') as mock_post, \
              patch.object(agent_executor.obs, 'emit_task_received'), \
              patch.object(agent_executor.obs, 'emit_agent_initialized'), \
              patch.object(agent_executor.obs, 'emit_agent_completed'):
 
-            # Setup mocks - no branch preparation
-            mock_fbm.prepare_feature_branch = AsyncMock(side_effect=Exception("No parent"))
-            mock_fbm.finalize_feature_branch_work = AsyncMock()
+            # Setup mocks
+            mock_project_config = MagicMock()
+            mock_project_config.github = {'org': 'test-org', 'repo': 'test-repo'}
+            mock_config.get_project_config.return_value = mock_project_config
+
+            # Workspace preparation fails - no workspace context created
+            mock_factory.create.side_effect = Exception("No parent")
 
             # Mock agent
             mock_agent = MagicMock()
@@ -236,8 +242,8 @@ class TestFeatureBranchFinalization:
                 task_context=task_context
             )
 
-            # Verify finalize was NOT called (no branch_name)
-            mock_fbm.finalize_feature_branch_work.assert_not_called()
+            # Agent should still execute successfully
+            mock_agent.execute.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_finalize_failure_does_not_fail_execution(self, agent_executor):
@@ -247,8 +253,8 @@ class TestFeatureBranchFinalization:
             'issue_title': 'Login form UI'
         }
 
-        with patch('services.agent_executor.feature_branch_manager') as mock_fbm, \
-             patch('services.agent_executor.config_manager') as mock_config, \
+        with patch('services.workspace.WorkspaceContextFactory') as mock_factory, \
+             patch('config.manager.config_manager') as mock_config, \
              patch.object(agent_executor.factory, 'create_agent') as mock_create_agent, \
              patch.object(agent_executor, '_post_agent_output_to_github') as mock_post, \
              patch.object(agent_executor.obs, 'emit_task_received'), \
@@ -257,16 +263,18 @@ class TestFeatureBranchFinalization:
 
             # Setup mocks
             mock_project_config = MagicMock()
-            mock_project_config.repository = "test-org/test-repo"
+            mock_project_config.github = {'org': 'test-org', 'repo': 'test-repo'}
             mock_config.get_project_config.return_value = mock_project_config
 
-            mock_fbm.prepare_feature_branch = AsyncMock(
-                return_value="feature/issue-50-user-auth"
+            # Mock workspace context - finalization fails
+            mock_workspace = MagicMock()
+            mock_workspace.prepare_execution = AsyncMock(
+                return_value={'branch_name': 'feature/issue-51-login-form-ui', 'work_dir': '/workspace/test-project'}
             )
-            # Finalization fails
-            mock_fbm.finalize_feature_branch_work = AsyncMock(
+            mock_workspace.finalize_execution = AsyncMock(
                 side_effect=Exception("Git push failed")
             )
+            mock_factory.create.return_value = mock_workspace
 
             # Mock agent
             mock_agent = MagicMock()
@@ -298,8 +306,8 @@ class TestCommitMessages:
             'issue_title': 'Login form UI'
         }
 
-        with patch('services.agent_executor.feature_branch_manager') as mock_fbm, \
-             patch('services.agent_executor.config_manager') as mock_config, \
+        with patch('services.workspace.WorkspaceContextFactory') as mock_factory, \
+             patch('config.manager.config_manager') as mock_config, \
              patch.object(agent_executor.factory, 'create_agent') as mock_create_agent, \
              patch.object(agent_executor, '_post_agent_output_to_github') as mock_post, \
              patch.object(agent_executor.obs, 'emit_task_received'), \
@@ -308,11 +316,16 @@ class TestCommitMessages:
 
             # Setup mocks
             mock_project_config = MagicMock()
-            mock_project_config.repository = "test-org/test-repo"
+            mock_project_config.github = {'org': 'test-org', 'repo': 'test-repo'}
             mock_config.get_project_config.return_value = mock_project_config
 
-            mock_fbm.prepare_feature_branch = AsyncMock(return_value="feature/issue-50-auth")
-            mock_fbm.finalize_feature_branch_work = AsyncMock(return_value={'success': True})
+            # Mock workspace context
+            mock_workspace = MagicMock()
+            mock_workspace.prepare_execution = AsyncMock(
+                return_value={'branch_name': 'feature/issue-51-login-form-ui', 'work_dir': '/workspace/test-project'}
+            )
+            mock_workspace.finalize_execution = AsyncMock(return_value={'success': True})
+            mock_factory.create.return_value = mock_workspace
 
             # Mock agent
             mock_agent = MagicMock()
@@ -330,7 +343,7 @@ class TestCommitMessages:
             )
 
             # Verify commit message
-            call_kwargs = mock_fbm.finalize_feature_branch_work.call_args[1]
+            call_kwargs = mock_workspace.finalize_execution.call_args[1]
             commit_msg = call_kwargs['commit_message']
 
             assert 'issue #51' in commit_msg

@@ -7,15 +7,18 @@ without including previous iterations or unrelated comments.
 """
 
 import json
+import logging
 import pytest
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 # Load fixture
 @pytest.fixture
 def discussion_95_data():
     """Load discussion 95 snapshot"""
-    fixture_path = Path(__file__).parent / 'fixtures' / 'discussion_95.json'
+    fixture_path = Path(__file__).parent.parent / 'fixtures' / 'discussion_95.json'
     with open(fixture_path) as f:
         return json.load(f)
 
@@ -90,9 +93,9 @@ class TestContextExtraction:
 
         # At this point in the timeline, the last BA comment might have 0 or 1 replies
         # depending on which BA comment is "last" (comment 15 is the final one)
-        print(f"\nLast BA comment had {context['reply_count']} replies")
-        print(f"Agent comment length: {context['agent_body_length']} chars")
-        print(f"Total context: {context['total_chars']} chars")
+        logger.info(f"\nLast BA comment had {context['reply_count']} replies")
+        logger.info(f"Agent comment length: {context['agent_body_length']} chars")
+        logger.info(f"Total context: {context['total_chars']} chars")
 
         # Key assertion: context should be reasonably sized (not 200KB+)
         # A single BA comment + replies should be < 50KB
@@ -111,7 +114,7 @@ class TestContextExtraction:
         ba_signature = '_Processed by the business_analyst agent_'
         ba_comments = [c for c in all_comments if ba_signature in c.get('body', '')]
 
-        print(f"\nTotal BA comments in discussion: {len(ba_comments)}")
+        logger.info(f"\nTotal BA comments in discussion: {len(ba_comments)}")
 
         # Extract context
         context = extract_context_manually(discussion_95_data, 'business_analyst')
@@ -139,12 +142,12 @@ class TestContextExtraction:
             for c in all_comments
         )
 
-        print(f"\nTotal replies in discussion: {total_replies}")
+        logger.info(f"\nTotal replies in discussion: {total_replies}")
 
         # Extract context for BA
         context = extract_context_manually(discussion_95_data, 'business_analyst')
 
-        print(f"Replies in extracted context: {context['reply_count']}")
+        logger.info(f"Replies in extracted context: {context['reply_count']}")
 
         # Should not include ALL replies, only those threaded to the last BA comment
         assert context['reply_count'] <= total_replies, \
@@ -157,17 +160,17 @@ class TestContextExtraction:
 
     def test_context_for_idea_researcher_with_conversational_replies(self, discussion_95_data):
         """
-        Scenario: idea_researcher comment has 6 conversational replies
-        Expected: All 6 replies should be included (it's a conversational thread)
+        Scenario: idea_researcher comment has 6 total replies (3 human, 3 bot)
+        Expected: Only the 3 human replies should be included (bot replies filtered out)
         """
         context = extract_context_manually(discussion_95_data, 'idea_researcher')
 
-        # idea_researcher's comment (comment 0) has 6 replies
+        # idea_researcher's comment (comment 0) has 6 total replies, 3 human
         assert context['agent_comment'] is not None
-        assert context['reply_count'] == 6, \
-            f"Expected 6 replies for idea_researcher, got {context['reply_count']}"
+        assert context['reply_count'] == 3, \
+            f"Expected 3 human replies for idea_researcher, got {context['reply_count']}"
 
-        print(f"\nIdea researcher context: {context['total_chars']} chars with {context['reply_count']} replies")
+        logger.info(f"\nIdea researcher context: {context['total_chars']} chars with {context['reply_count']} replies")
 
     def test_actual_project_monitor_context_extraction(self, discussion_95_data):
         """
@@ -181,7 +184,7 @@ class TestContextExtraction:
         sys.path.insert(0, str(Path(__file__).parent.parent))
 
         from services.project_monitor import ProjectMonitor
-        from task_management.queue import TaskQueue
+        from task_queue.task_manager import TaskQueue
         from config.manager import ConfigManager
 
         # Create minimal instances
@@ -257,7 +260,7 @@ class TestCriticalScenarios:
         assert context['reply_count'] == 0
 
         # Total context should be just comment 15 (~22KB)
-        print(f"\nFinal RR context: {context['total_chars']:,} chars ({context['total_chars']/1024:.1f} KB)")
+        logger.info(f"\nFinal RR context: {context['total_chars']:,} chars ({context['total_chars']/1024:.1f} KB)")
         assert context['total_chars'] < 30000, \
             f"Final RR context too large: {context['total_chars']} chars"
 
@@ -288,10 +291,10 @@ class TestCriticalScenarios:
         human_reply_len = len(human_reply['body'])
         expected_context = ba_body_len + human_reply_len
 
-        print(f"\nBA revision context:")
-        print(f"  BA comment 6: {ba_body_len:,} chars")
-        print(f"  Human reply: {human_reply_len:,} chars")
-        print(f"  Total: {expected_context:,} chars ({expected_context/1024:.1f} KB)")
+        logger.info(f"\nBA revision context:")
+        logger.info(f"  BA comment 6: {ba_body_len:,} chars")
+        logger.info(f"  Human reply: {human_reply_len:,} chars")
+        logger.info(f"  Total: {expected_context:,} chars ({expected_context/1024:.1f} KB)")
 
         # Should be reasonable size
         assert expected_context < 50000, \
@@ -327,10 +330,10 @@ class TestCriticalScenarios:
 
         expected_size = len(ba_body) + sum(len(r['body']) for r in human_replies)
 
-        print(f"\nRR reviewing BA with feedback:")
-        print(f"  BA comment: {len(ba_body):,} chars")
-        print(f"  Human replies: {len(human_replies)}")
-        print(f"  Total: {expected_size:,} chars ({expected_size/1024:.1f} KB)")
+        logger.info(f"\nRR reviewing BA with feedback:")
+        logger.info(f"  BA comment: {len(ba_body):,} chars")
+        logger.info(f"  Human replies: {len(human_replies)}")
+        logger.info(f"  Total: {expected_size:,} chars ({expected_size/1024:.1f} KB)")
 
         # Should include the human feedback
         assert len(human_replies) > 0
@@ -354,10 +357,10 @@ class TestCriticalScenarios:
             if context['agent_comment'] is not None:
                 max_sizes[agent_type] = context['total_chars']
 
-                print(f"\n{agent_type}:")
-                print(f"  Comment size: {context['agent_body_length']:,} chars")
-                print(f"  Replies: {context['reply_count']}")
-                print(f"  Total: {context['total_chars']:,} chars ({context['total_chars']/1024:.1f} KB)")
+                logger.info(f"\n{agent_type}:")
+                logger.info(f"  Comment size: {context['agent_body_length']:,} chars")
+                logger.info(f"  Replies: {context['reply_count']}")
+                logger.info(f"  Total: {context['total_chars']:,} chars ({context['total_chars']/1024:.1f} KB)")
 
                 # No single agent context should exceed 100KB (very generous limit)
                 assert context['total_chars'] < 100000, \
@@ -365,7 +368,7 @@ class TestCriticalScenarios:
 
         # The largest context should be idea_researcher with 6 conversational replies
         # All others should be much smaller
-        print(f"\nMax context sizes: {max_sizes}")
+        logger.info(f"\nMax context sizes: {max_sizes}")
 
     def test_multiple_review_cycles_dont_accumulate_context(self, discussion_95_data):
         """
@@ -383,7 +386,7 @@ class TestCriticalScenarios:
             if '_Processed by the business_analyst agent_' in c.get('body', '')
         ]
 
-        print(f"\nFound {len(ba_comments)} BA iterations")
+        logger.info(f"\nFound {len(ba_comments)} BA iterations")
 
         # The key test: when we extract context for "business_analyst",
         # we should ONLY get the LAST one, not all iterations accumulated
@@ -400,7 +403,7 @@ class TestCriticalScenarios:
         assert context['agent_comment']['body'] == last_ba_comment['body'], \
             f"Context should be from comment {last_ba_index} (last BA), but got different content"
 
-        print(f"✅ Correctly extracted only last BA comment (index {last_ba_index}), not all {len(ba_comments)} iterations")
+        logger.info(f"Correctly extracted only last BA comment (index {last_ba_index}), not all {len(ba_comments)} iterations")
 
 
 if __name__ == '__main__':

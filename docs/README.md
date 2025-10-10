@@ -25,10 +25,8 @@ pytest -v -s
 
 ```
 tests/
-├── unit/                      # Fast, isolated unit tests
-│   ├── test_review_cycle_state.py
-│   ├── test_context_extraction.py
-│   └── test_review_parser.py
+│   ├── unit/
+│   │   ├── test_context_extraction.py
 ├── integration/               # Service integration tests
 │   ├── test_github_integration.py
 │   ├── test_review_cycle_flow.py

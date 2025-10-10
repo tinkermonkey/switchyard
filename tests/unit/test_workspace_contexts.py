@@ -33,7 +33,7 @@ class TestIssuesWorkspaceContext:
             'workspace_type': 'issues'  # KEY: issues workspace
         }
 
-        with patch('services.agent_executor.feature_branch_manager') as mock_fbm, \
+        with patch('services.feature_branch_manager.feature_branch_manager') as mock_fbm, \
              patch('services.agent_executor.config_manager') as mock_config, \
              patch.object(agent_executor.factory, 'create_agent') as mock_create_agent, \
              patch.object(agent_executor.obs, 'emit_task_received'), \
@@ -48,6 +48,7 @@ class TestIssuesWorkspaceContext:
             mock_project_config = MagicMock()
             mock_project_config.github = {'org': 'test-org', 'repo': 'test-repo'}
             mock_config.get_project_config.return_value = mock_project_config
+            mock_config.get_project_agent_config.return_value = {}
 
             mock_agent = MagicMock()
             mock_agent.execute = AsyncMock(return_value={'status': 'success'})
@@ -72,7 +73,7 @@ class TestIssuesWorkspaceContext:
         """Issues workspace should finalize git operations (commit/push/PR)"""
         from services.agent_executor import AgentExecutor
 
-        with patch('services.agent_executor.feature_branch_manager') as mock_fbm, \
+        with patch('services.feature_branch_manager.feature_branch_manager') as mock_fbm, \
              patch('services.agent_executor.GitHubIntegration') as mock_gh, \
              patch('services.agent_executor.config_manager') as mock_config:
 
@@ -87,6 +88,7 @@ class TestIssuesWorkspaceContext:
             mock_project_config = MagicMock()
             mock_project_config.github = {'org': 'test-org', 'repo': 'test-repo'}
             mock_config.get_project_config.return_value = mock_project_config
+            mock_config.get_project_agent_config.return_value = {}
 
             executor = AgentExecutor()
 
@@ -108,7 +110,7 @@ class TestIssuesWorkspaceContext:
                     agent_name='test_agent',
                     project_name='test-project',
                     task_context=task_context,
-                    task_id='test-123'
+                    task_id_prefix='test-123'
                 )
 
                 # Verify finalization was called
@@ -123,7 +125,7 @@ class TestIssuesWorkspaceContext:
         """Issues workspace should use actual git repository directory"""
         from services.agent_executor import AgentExecutor
 
-        with patch('services.agent_executor.workspace_manager') as mock_workspace:
+        with patch('services.project_workspace.workspace_manager') as mock_workspace:
             mock_workspace.get_project_dir.return_value = Path('/workspace/test-project')
 
             executor = AgentExecutor()
@@ -134,20 +136,23 @@ class TestIssuesWorkspaceContext:
             }
 
             with patch.object(executor, 'factory') as mock_factory, \
-                 patch.object(executor, '_build_execution_context') as mock_build, \
                  patch.object(executor, '_post_agent_output_to_github') as mock_post, \
-                 patch('services.agent_executor.feature_branch_manager'):
+                 patch('services.feature_branch_manager.feature_branch_manager'), \
+                 patch('services.agent_executor.config_manager') as mock_config:
+
+                mock_config.get_project_config.return_value = MagicMock(github={'org': 'test', 'repo': 'test'})
+                mock_config.get_project_agent_config.return_value = {}
 
                 mock_agent = MagicMock()
                 mock_agent.execute = AsyncMock(return_value={'status': 'success'})
+                mock_agent.agent_config = {}
                 mock_factory.create_agent.return_value = mock_agent
-                mock_build.return_value = {}
 
                 await executor.execute_agent(
                     agent_name='test_agent',
                     project_name='test-project',
                     task_context=task_context,
-                    task_id='test-123'
+                    task_id_prefix='test-123'
                 )
 
                 # Verify workspace manager was called for project directory
@@ -162,8 +167,8 @@ class TestDiscussionsWorkspaceContext:
         """Discussions workspace should NOT prepare git feature branch"""
         from services.agent_executor import AgentExecutor
 
-        with patch('services.agent_executor.feature_branch_manager') as mock_fbm, \
-             patch('services.agent_executor.config_manager') as mock_config:
+        with patch('services.feature_branch_manager.feature_branch_manager') as mock_fbm, \
+             patch('config.manager.config_manager') as mock_config:
 
             mock_fbm.prepare_feature_branch = AsyncMock()
 
@@ -192,7 +197,7 @@ class TestDiscussionsWorkspaceContext:
                     agent_name='business_analyst',
                     project_name='test-project',
                     task_context=task_context,
-                    task_id='test-88'
+                    task_id_prefix='test-88'
                 )
 
                 # Verify feature branch preparation was NOT called
@@ -203,8 +208,8 @@ class TestDiscussionsWorkspaceContext:
         """Discussions workspace should NOT finalize git operations"""
         from services.agent_executor import AgentExecutor
 
-        with patch('services.agent_executor.feature_branch_manager') as mock_fbm, \
-             patch('services.agent_executor.config_manager') as mock_config:
+        with patch('services.feature_branch_manager.feature_branch_manager') as mock_fbm, \
+             patch('config.manager.config_manager') as mock_config:
 
             mock_fbm.finalize_feature_branch_work = AsyncMock()
 
@@ -233,7 +238,7 @@ class TestDiscussionsWorkspaceContext:
                     agent_name='business_analyst',
                     project_name='test-project',
                     task_context=task_context,
-                    task_id='test-88'
+                    task_id_prefix='test-88'
                 )
 
                 # Verify finalization was NOT called (the bug we're fixing!)
@@ -254,12 +259,11 @@ class TestDiscussionsWorkspaceContext:
 
         result = {
             'status': 'success',
-            'output': 'Test output'
+            'markdown_analysis': 'Test markdown output for discussion posting'
         }
 
-        with patch('services.agent_executor.GitHubIntegration') as mock_gh_class:
-            mock_gh = MagicMock()
-            mock_gh_class.return_value = mock_gh
+        # Patch the executor's github instance directly
+        with patch.object(executor, 'github') as mock_gh:
             mock_gh.post_agent_output = AsyncMock(
                 return_value={'success': True}
             )
@@ -272,9 +276,22 @@ class TestDiscussionsWorkspaceContext:
 
             # Verify output was posted
             mock_gh.post_agent_output.assert_called_once()
-            call_args = mock_gh.post_agent_output.call_args[1]
-            assert call_args['issue_number'] == 88
-            assert 'discussion_id' in call_args['context']
+            call_args_positional = mock_gh.post_agent_output.call_args[0]
+            call_args_keyword = mock_gh.post_agent_output.call_args[1]
+            
+            # Check that the method was called with task_context and formatted output
+            assert len(call_args_positional) == 2
+            
+            # First argument should be task_context
+            task_context_arg = call_args_positional[0]
+            assert task_context_arg['issue_number'] == 88
+            assert task_context_arg['discussion_id'] == 'D_kwDOPH6wk84AiUip'
+            assert task_context_arg['workspace_type'] == 'discussions'
+            
+            # Second argument should be the formatted markdown output
+            output_arg = call_args_positional[1]
+            assert 'Test markdown output for discussion posting' in output_arg
+            assert 'business_analyst agent' in output_arg
 
 
 class TestWorkspaceContextBehaviorEquivalence:
@@ -302,8 +319,8 @@ class TestWorkspaceContextBehaviorEquivalence:
             with patch.object(executor, 'factory') as mock_factory, \
                  patch.object(executor, '_build_execution_context') as mock_build, \
                  patch.object(executor, '_post_agent_output_to_github') as mock_post, \
-                 patch('services.agent_executor.feature_branch_manager'), \
-                 patch('services.agent_executor.config_manager'):
+                 patch('services.feature_branch_manager.feature_branch_manager'), \
+                 patch('config.manager.config_manager'):
 
                 mock_agent = MagicMock()
                 mock_agent.execute = AsyncMock(return_value={'status': 'success'})
@@ -315,7 +332,7 @@ class TestWorkspaceContextBehaviorEquivalence:
                     agent_name='test_agent',
                     project_name='test-project',
                     task_context=task_context,
-                    task_id=f'test-{workspace_type}'
+                    task_id_prefix=f'test-{workspace_type}'
                 )
 
                 assert result['status'] == 'success'
@@ -328,7 +345,7 @@ class TestWorkspaceContextBehaviorEquivalence:
         git_operation_count = {}
 
         for workspace_type in ['issues', 'discussions']:
-            with patch('services.agent_executor.feature_branch_manager') as mock_fbm, \
+            with patch('services.feature_branch_manager.feature_branch_manager') as mock_fbm, \
                  patch('services.agent_executor.config_manager') as mock_config:
 
                 mock_fbm.prepare_feature_branch = AsyncMock(
@@ -341,6 +358,7 @@ class TestWorkspaceContextBehaviorEquivalence:
                 mock_project_config = MagicMock()
                 mock_project_config.github = {'org': 'test-org', 'repo': 'test-repo'}
                 mock_config.get_project_config.return_value = mock_project_config
+                mock_config.get_project_agent_config.return_value = {}
 
                 executor = AgentExecutor()
 
@@ -353,19 +371,18 @@ class TestWorkspaceContextBehaviorEquivalence:
                     task_context['discussion_id'] = 'D_test'
 
                 with patch.object(executor, 'factory') as mock_factory, \
-                     patch.object(executor, '_build_execution_context') as mock_build, \
                      patch.object(executor, '_post_agent_output_to_github') as mock_post:
 
                     mock_agent = MagicMock()
                     mock_agent.execute = AsyncMock(return_value={'status': 'success'})
+                    mock_agent.agent_config = {}
                     mock_factory.create_agent.return_value = mock_agent
-                    mock_build.return_value = {}
 
                     await executor.execute_agent(
                         agent_name='test_agent',
                         project_name='test-project',
                         task_context=task_context,
-                        task_id=f'test-{workspace_type}'
+                        task_id_prefix=f'test-{workspace_type}'
                     )
 
                     prepare_called = mock_fbm.prepare_feature_branch.call_count
@@ -398,7 +415,7 @@ class TestFeatureBranchManagerHandlesStandalone:
              patch.object(fbm, 'git_add_all', new_callable=AsyncMock), \
              patch.object(fbm, 'git_commit', new_callable=AsyncMock), \
              patch.object(fbm, 'git_push', new_callable=AsyncMock), \
-             patch('services.feature_branch_manager.git_workflow_manager') as mock_gwm:
+             patch('services.git_workflow_manager.git_workflow_manager') as mock_gwm:
 
             mock_gwm.get_current_branch = AsyncMock(return_value='feature/issue-88-standalone')
 

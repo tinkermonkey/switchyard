@@ -6,6 +6,7 @@ Provides event streaming for web UI observation of agent execution
 import json
 import redis
 import logging
+import uuid
 from typing import Dict, Any, Optional
 from datetime import datetime
 from enum import Enum
@@ -91,6 +92,7 @@ class EventType(Enum):
 class ObservabilityEvent:
     """Structured event for agent observability"""
     timestamp: str
+    event_id: str
     event_type: str
     agent: str
     task_id: str
@@ -206,9 +208,10 @@ class ObservabilityManager:
             # Add pipeline_run_id to data if provided
             if pipeline_run_id:
                 data['pipeline_run_id'] = pipeline_run_id
-            
+
             event = ObservabilityEvent(
                 timestamp=datetime.utcnow().isoformat() + 'Z',
+                event_id=str(uuid.uuid4()),
                 event_type=event_type.value,
                 agent=agent,
                 task_id=task_id,

@@ -3,11 +3,14 @@ import pytest
 from datetime import datetime
 from agents.business_analyst_agent import BusinessAnalystAgent
 
+import logging
+
+logger = logging.getLogger(__name__)
 @pytest.mark.asyncio
 async def test_business_analyst_direct():
     """Test Business Analyst agent directly"""
 
-    print("🧪 Testing Business Analyst Agent Directly...")
+    logger.info(" Testing Business Analyst Agent Directly...")
 
     agent = BusinessAnalystAgent()
 
@@ -27,17 +30,17 @@ async def test_business_analyst_direct():
 
     try:
         result = await agent.execute(test_context)
-        print("✅ Business Analyst executed successfully")
-        print(f"📄 Result keys: {list(result.keys())}")
+        logger.info(" Business Analyst executed successfully")
+        logger.info(f"📄 Result keys: {list(result.keys())}")
 
         # Validate result structure
         assert 'requirements_analysis' in result
         assert 'quality_metrics' in result
 
-        print("✅ Result structure validated")
+        logger.info(" Result structure validated")
         return True
     except Exception as e:
-        print(f"❌ Business Analyst test failed: {e}")
+        logger.info(f" Business Analyst test failed: {e}")
         return False
 
 if __name__ == "__main__":

@@ -124,7 +124,7 @@ class TestReviewCycleContextExtraction:
         not alternating based on iteration number.
         """
         # Mock GitHub API to return our test discussion
-        async def mock_graphql_request(query, variables):
+        def mock_graphql_request(query, variables):
             return discussion_with_3_iterations
 
         from services.github_app import github_app
@@ -180,7 +180,7 @@ class TestReviewCycleContextExtraction:
             }
         }
 
-        async def mock_graphql_request(query, variables):
+        def mock_graphql_request(query, variables):
             return discussion
 
         from services.github_app import github_app
@@ -241,7 +241,7 @@ class TestReviewCycleContextExtraction:
             }
         }
 
-        async def mock_graphql_request(query, variables):
+        def mock_graphql_request(query, variables):
             return discussion
 
         from services.github_app import github_app
@@ -294,7 +294,7 @@ class TestReviewCycleContextExtraction:
             }
         }
 
-        async def mock_graphql_request(query, variables):
+        def mock_graphql_request(query, variables):
             return discussion
 
         from services.github_app import github_app
@@ -346,7 +346,7 @@ class TestContextSizeLimits:
         """
         Test: Context should be ONE comment, not accumulated discussion
         """
-        async def mock_graphql_request(query, variables):
+        def mock_graphql_request(query, variables):
             return discussion_with_3_iterations
 
         from services.github_app import github_app

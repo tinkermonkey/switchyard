@@ -134,7 +134,7 @@ INFO - Using Docker image: clauditoreum-orchestrator:latest for agent business_a
 Run the test suite:
 
 ```bash
-python tests/test_readonly_filesystem.py
+python tests/integration/test_readonly_filesystem.py
 ```
 
 **Test 1:** Business analyst cannot create files

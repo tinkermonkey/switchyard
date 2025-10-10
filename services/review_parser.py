@@ -91,9 +91,30 @@ class ReviewParser:
         ]
     }
 
+    # Content-based inference patterns for when no explicit status is found
+    CONTENT_INFERENCE_PATTERNS = {
+        ReviewStatus.APPROVED: [
+            r'(?i)\bno\s+(?:blocking\s+)?issues?\s+(?:found|identified)\b',
+            r'(?i)\ball\s+checks?\s+(?:have\s+)?passed\b',
+            r'(?i)\bready\s+to\s+proceed\b',
+            r'(?i)\b(?:looks?|appears?)\s+good\b'
+        ],
+        ReviewStatus.BLOCKED: [
+            r'(?i)\bcannot\s+proceed\b',
+            r'(?i)\bmust\s+(?:be\s+)?(?:addressed|fixed|resolved)\b',
+            r'(?i)(?<!non[-\s])\bblocking\s+issues?\s+(?:remain|exist|identified)\b',  # Negative lookbehind for "non-"
+            r'(?i)(?<!non[-\s])\bcritical\s+issues?\s+(?:remain|exist|identified)\b'  # Negative lookbehind for "non-"
+        ],
+        ReviewStatus.CHANGES_REQUESTED: [
+            r'(?i)\bnon[-\s]?blocking\s+issues?\b',
+            r'(?i)\bplease\s+(?:address|fix|consider)\b',
+            r'(?i)\bsuggestions?\s+for\s+improvement\b'
+        ]
+    }
+
     # Severity indicators
     SEVERITY_MARKERS = {
-        'blocking': r'(?i)\b(?:blocking|critical|must\s+fix|blocker)\b',
+        'blocking': r'(?i)(?<!non[-\s])\b(?:blocking|critical|must\s+fix|blocker)\b',  # Negative lookbehind for "non-"
         'high': r'(?i)\b(?:high|major|important|should\s+fix)\b',
         'medium': r'(?i)\b(?:medium|moderate|consider)\b',
         'low': r'(?i)\b(?:low|minor|nice\s+to\s+have|nitpick)\b'
@@ -152,11 +173,9 @@ class ReviewParser:
         """
         Extract review status from text
 
-        CRITICAL: ONLY matches explicit "Status: VALUE" declarations.
-        No fuzzy keyword matching to prevent false positives.
-
-        If no explicit status declaration is found, returns UNKNOWN,
-        which triggers inference from findings count in parse_review().
+        First tries explicit "Status: VALUE" declarations.
+        If none found, uses content-based inference patterns.
+        If still none found, returns UNKNOWN for findings-based inference.
         """
         # Remove inline markdown formatting (bold, italic) to match patterns
         # e.g., "**Status**: **BLOCKED**" becomes "Status: BLOCKED"
@@ -164,14 +183,21 @@ class ReviewParser:
         text_clean = re.sub(r'\*([^*]+)\*', r'\1', text_clean)      # Remove *italic*
         text_clean = re.sub(r'_([^_]+)_', r'\1', text_clean)        # Remove _italic_
 
-        # Check for explicit status declarations ONLY
+        # Check for explicit status declarations FIRST
         for status in [ReviewStatus.APPROVED, ReviewStatus.BLOCKED, ReviewStatus.CHANGES_REQUESTED]:
             pattern = self.STATUS_PATTERNS[status][0]  # Only one pattern per status now
             if re.search(pattern, text_clean):
                 logger.info(f"Matched explicit status declaration: {status.value} (pattern: {pattern})")
                 return status
 
-        logger.info("No explicit status declaration found, will infer from findings")
+        # If no explicit status found, try content-based inference
+        for status in [ReviewStatus.APPROVED, ReviewStatus.BLOCKED, ReviewStatus.CHANGES_REQUESTED]:
+            for pattern in self.CONTENT_INFERENCE_PATTERNS[status]:
+                if re.search(pattern, text_clean):
+                    logger.info(f"Inferred status from content: {status.value} (pattern: {pattern})")
+                    return status
+
+        logger.info("No explicit status declaration or content inference found, will infer from findings")
         return ReviewStatus.UNKNOWN
 
     def _extract_findings(self, text: str) -> List[ReviewFinding]:
@@ -193,8 +219,13 @@ class ReviewParser:
             text
         ))
 
-        # Pattern 3: Emoji-based structured sections (e.g., "🚫 One blocking issue:")
-        has_emoji_structure = bool(re.search(r'(?m)^\s*(?:🚫|⚠️|⚡)\s+.*?:\s*$.*?^\s*[•\-\*]\s+', text, re.DOTALL))
+        # Pattern 3: Emoji-based or text-based structured sections
+        # e.g., "🚫 One blocking issue:", "One blocking issue:", "High priority:"
+        has_emoji_structure = bool(re.search(
+            r'(?m)^\s*(?:(?:🚫|⚠️|⚡)\s+)?(?:One|Multiple|Some)?\s*(?:blocking|high\s+priority|medium\s+priority|low\s+priority).*?:\s*$.*?^\s*[•\-\*]\s+',
+            text,
+            re.IGNORECASE | re.DOTALL
+        ))
 
         if has_severity_sections or has_generic_sections or has_emoji_structure:
             # Parse as structured findings (handles severity sections natively)
@@ -226,10 +257,15 @@ class ReviewParser:
             line = line.strip()
 
             # Check if this is a section header:
-            # Case 1: Emoji-based header (e.g., "🚫 One blocking issue:" or "### 🚫 Blocking Issues")
-            emoji_header_match = re.match(r'^(?:#{1,6}\s*)?(?:🚫|⚠️|⚡|✅)\s+(.*)', line)
-            if emoji_header_match:
-                section_title = emoji_header_match.group(1).strip().rstrip(':')
+            # Case 1: Emoji-based or text-based header (e.g., "🚫 One blocking issue:", "One blocking issue:", "High priority:")
+            # Must end with colon and contain severity keywords
+            emoji_or_text_header_match = re.match(
+                r'^(?:#{1,6}\s*)?(?:(?:🚫|⚠️|⚡|✅)\s+)?((?:One|Multiple|Some)?\s*(?:blocking|high\s+priority|medium\s+priority|low\s+priority).*?):\s*$',
+                line,
+                re.IGNORECASE
+            )
+            if emoji_or_text_header_match:
+                section_title = emoji_or_text_header_match.group(1).strip()
                 current_section_severity = self._extract_severity(section_title)
                 continue
 

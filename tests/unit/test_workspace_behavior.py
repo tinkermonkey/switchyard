@@ -30,7 +30,7 @@ class TestWorkspaceGitOperations:
         }
 
         with patch('services.feature_branch_manager.feature_branch_manager') as mock_fbm, \
-             patch('config.manager.config_manager') as mock_config, \
+             patch('services.agent_executor.config_manager') as mock_config, \
              patch.object(agent_executor.factory, 'create_agent') as mock_create, \
              patch.object(agent_executor.obs, 'emit_task_received'), \
              patch.object(agent_executor.obs, 'emit_agent_initialized'), \
@@ -42,6 +42,7 @@ class TestWorkspaceGitOperations:
             mock_config.get_project_config.return_value = MagicMock(
                 github={'org': 'test', 'repo': 'test'}
             )
+            mock_config.get_project_agent_config.return_value = {}
 
             mock_agent = MagicMock()
             mock_agent.execute = AsyncMock(return_value={'status': 'success'})
@@ -67,13 +68,18 @@ class TestWorkspaceGitOperations:
         }
 
         with patch('services.feature_branch_manager.feature_branch_manager') as mock_fbm, \
-             patch('config.manager.config_manager') as mock_config, \
+             patch('services.agent_executor.config_manager') as mock_config, \
              patch.object(agent_executor.factory, 'create_agent') as mock_create, \
              patch.object(agent_executor.obs, 'emit_task_received'), \
              patch.object(agent_executor.obs, 'emit_agent_initialized'), \
              patch.object(agent_executor.obs, 'emit_agent_completed'):
 
             mock_fbm.prepare_feature_branch = AsyncMock()
+            
+            mock_config.get_project_config.return_value = MagicMock(
+                github={'org': 'test', 'repo': 'test'}
+            )
+            mock_config.get_project_agent_config.return_value = {}
 
             mock_agent = MagicMock()
             mock_agent.execute = AsyncMock(return_value={'status': 'success'})
@@ -98,7 +104,7 @@ class TestWorkspaceGitOperations:
         }
 
         with patch('services.feature_branch_manager.feature_branch_manager') as mock_fbm, \
-             patch('config.manager.config_manager') as mock_config, \
+             patch('services.agent_executor.config_manager') as mock_config, \
              patch.object(agent_executor.factory, 'create_agent') as mock_create, \
              patch.object(agent_executor.obs, 'emit_task_received'), \
              patch.object(agent_executor.obs, 'emit_agent_initialized'), \
@@ -110,6 +116,7 @@ class TestWorkspaceGitOperations:
             mock_config.get_project_config.return_value = MagicMock(
                 github={'org': 'test', 'repo': 'test'}
             )
+            mock_config.get_project_agent_config.return_value = {}
 
             mock_agent = MagicMock()
             mock_agent.execute = AsyncMock(return_value={'status': 'success'})
@@ -135,13 +142,18 @@ class TestWorkspaceGitOperations:
         }
 
         with patch('services.feature_branch_manager.feature_branch_manager') as mock_fbm, \
-             patch('config.manager.config_manager') as mock_config, \
+             patch('services.agent_executor.config_manager') as mock_config, \
              patch.object(agent_executor.factory, 'create_agent') as mock_create, \
              patch.object(agent_executor.obs, 'emit_task_received'), \
              patch.object(agent_executor.obs, 'emit_agent_initialized'), \
              patch.object(agent_executor.obs, 'emit_agent_completed'):
 
             mock_fbm.finalize_feature_branch_work = AsyncMock()
+            
+            mock_config.get_project_config.return_value = MagicMock(
+                github={'org': 'test', 'repo': 'test'}
+            )
+            mock_config.get_project_agent_config.return_value = {}
 
             mock_agent = MagicMock()
             mock_agent.execute = AsyncMock(return_value={'status': 'success'})
@@ -172,7 +184,7 @@ class TestFeatureBranchManagerStandalone:
              patch.object(fbm, 'git_add_all', new_callable=AsyncMock), \
              patch.object(fbm, 'git_commit', new_callable=AsyncMock), \
              patch.object(fbm, 'git_push', new_callable=AsyncMock), \
-             patch('services.feature_branch_manager.git_workflow_manager') as mock_gwm:
+             patch('services.git_workflow_manager.git_workflow_manager') as mock_gwm:
 
             mock_gwm.get_current_branch = AsyncMock(return_value='feature/issue-88-test')
             mock_gh = MagicMock()

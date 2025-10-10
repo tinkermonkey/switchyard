@@ -556,6 +556,16 @@ class ProjectMonitor:
             logger.error(traceback.format_exc())
             return ""
 
+    def _check_agent_processed_issue_sync(self, issue_number: int, agent: str, repository: str) -> bool:
+        """Synchronous wrapper for checking if agent has processed issue"""
+        try:
+            from services.github_integration import GitHubIntegration
+            github = GitHubIntegration()
+            return asyncio.run(github.has_agent_processed_issue(issue_number, agent, repository))
+        except Exception as e:
+            logger.warning(f"Could not check for prior agent work: {e}")
+            return False
+
     def trigger_agent_for_status(self, project_name: str, board_name: str, issue_number: int, status: str, repository: str) -> Optional[str]:
         """Determine which agent should handle this status and create a task or review cycle"""
         try:
@@ -650,7 +660,7 @@ class ProjectMonitor:
                 try:
                     # Create a new event loop for this thread if needed
                     try:
-                        loop = asyncio.get_event_loop()
+                        loop = asyncio.get_running_loop()
                     except RuntimeError:
                         loop = asyncio.new_event_loop()
                         asyncio.set_event_loop(loop)
@@ -830,13 +840,7 @@ class ProjectMonitor:
                         elif column and column.type == 'conversational':
                             # Check if there's existing work to resume
                             # Only resume if there's evidence of prior agent activity
-                            from services.github_integration import GitHubIntegration
-                            github = GitHubIntegration()
-
-                            # Check for existing agent comments on the issue
-                            has_prior_work = loop.run_until_complete(
-                                github.has_agent_processed_issue(issue_number, agent, repository)
-                            )
+                            has_prior_work = self._check_agent_processed_issue_sync(issue_number, agent, repository)
 
                             if has_prior_work:
                                 # Resume existing conversational feedback loop

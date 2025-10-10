@@ -8,6 +8,9 @@ from task_queue.task_manager import TaskQueue, Task, TaskPriority
 from state_management.manager import StateManager
 from monitoring.logging import OrchestratorLogger
 
+import logging
+
+logger = logging.getLogger(__name__)
 class PerformanceTestSuite:
     def __init__(self):
         self.task_queue = TaskQueue()
@@ -31,7 +34,7 @@ class PerformanceTestSuite:
 
     async def test_task_throughput(self, num_tasks=50):
         """Test task processing throughput"""
-        print(f"⚡ Testing Task Throughput ({num_tasks} tasks)...")
+        logger.info(f"⚡ Testing Task Throughput ({num_tasks} tasks)...")
 
         # Create multiple test tasks
         tasks = []
@@ -62,7 +65,7 @@ class PerformanceTestSuite:
         enqueue_time = time.time() - start_time
         enqueue_rate = num_tasks / enqueue_time
 
-        print(f"✅ Enqueued {num_tasks} tasks in {enqueue_time:.2f}s ({enqueue_rate:.1f} tasks/sec)")
+        logger.info(f" Enqueued {num_tasks} tasks in {enqueue_time:.2f}s ({enqueue_rate:.1f} tasks/sec)")
 
         # Measure dequeue performance
         dequeue_start = time.time()
@@ -75,7 +78,7 @@ class PerformanceTestSuite:
         dequeue_time = time.time() - dequeue_start
         dequeue_rate = len(dequeued_tasks) / dequeue_time if dequeue_time > 0 else 0
 
-        print(f"✅ Dequeued {len(dequeued_tasks)} tasks in {dequeue_time:.2f}s ({dequeue_rate:.1f} tasks/sec)")
+        logger.info(f" Dequeued {len(dequeued_tasks)} tasks in {dequeue_time:.2f}s ({dequeue_rate:.1f} tasks/sec)")
 
         return {
             "tasks_enqueued": num_tasks,
@@ -88,7 +91,7 @@ class PerformanceTestSuite:
 
     async def test_concurrent_processing(self, num_concurrent=5):
         """Test concurrent task processing capabilities"""
-        print(f"🔄 Testing Concurrent Processing ({num_concurrent} concurrent tasks)...")
+        logger.info(f" Testing Concurrent Processing ({num_concurrent} concurrent tasks)...")
 
         async def simulate_agent_work(task_id: int, duration: float = 0.5):
             """Simulate agent processing work"""
@@ -128,11 +131,11 @@ class PerformanceTestSuite:
 
         avg_task_duration = sum(r["duration"] for r in successful_results) / len(successful_results) if successful_results else 0
 
-        print(f"✅ Concurrent processing completed:")
-        print(f"   - Total duration: {total_duration:.2f}s")
-        print(f"   - Successful tasks: {len(successful_results)}/{num_concurrent}")
-        print(f"   - Failed tasks: {len(failed_results)}")
-        print(f"   - Average task duration: {avg_task_duration:.2f}s")
+        logger.info(f" Concurrent processing completed:")
+        logger.info(f"   - Total duration: {total_duration:.2f}s")
+        logger.info(f"   - Successful tasks: {len(successful_results)}/{num_concurrent}")
+        logger.info(f"   - Failed tasks: {len(failed_results)}")
+        logger.info(f"   - Average task duration: {avg_task_duration:.2f}s")
 
         return {
             "total_duration": total_duration,
@@ -144,7 +147,7 @@ class PerformanceTestSuite:
 
     async def test_memory_usage_under_load(self, num_tasks=1000):
         """Test memory usage patterns under heavy load"""
-        print(f"💾 Testing Memory Usage Under Load ({num_tasks} tasks)...")
+        logger.info(f" Testing Memory Usage Under Load ({num_tasks} tasks)...")
 
         # Record initial memory
         initial_memory = self.get_memory_usage()
@@ -181,7 +184,7 @@ class PerformanceTestSuite:
             if i % 100 == 0 and i > 0:
                 current_memory = self.get_memory_usage()
                 memory_snapshots.append((f"after_{i}_tasks", current_memory))
-                print(f"  After {i} tasks: {current_memory:.1f} MB ({current_memory-initial_memory:+.1f} MB)")
+                logger.info(f"  After {i} tasks: {current_memory:.1f} MB ({current_memory-initial_memory:+.1f} MB)")
 
         # Final memory check before cleanup
         before_gc_memory = self.get_memory_usage()
@@ -204,12 +207,12 @@ class PerformanceTestSuite:
         final_memory = self.get_memory_usage()
         memory_snapshots.append(("final", final_memory))
 
-        print(f"✅ Memory usage analysis:")
-        print(f"   - Initial: {initial_memory:.1f} MB")
-        print(f"   - Peak: {before_gc_memory:.1f} MB ({before_gc_memory-initial_memory:+.1f} MB)")
-        print(f"   - After GC: {after_gc_memory:.1f} MB ({after_gc_memory-initial_memory:+.1f} MB)")
-        print(f"   - Final: {final_memory:.1f} MB ({final_memory-initial_memory:+.1f} MB)")
-        print(f"   - Dequeued: {dequeued_count} tasks")
+        logger.info(f" Memory usage analysis:")
+        logger.info(f"   - Initial: {initial_memory:.1f} MB")
+        logger.info(f"   - Peak: {before_gc_memory:.1f} MB ({before_gc_memory-initial_memory:+.1f} MB)")
+        logger.info(f"   - After GC: {after_gc_memory:.1f} MB ({after_gc_memory-initial_memory:+.1f} MB)")
+        logger.info(f"   - Final: {final_memory:.1f} MB ({final_memory-initial_memory:+.1f} MB)")
+        logger.info(f"   - Dequeued: {dequeued_count} tasks")
 
         return {
             "initial_memory_mb": initial_memory,
@@ -225,7 +228,7 @@ class PerformanceTestSuite:
 
     async def test_checkpoint_performance(self, num_checkpoints=100):
         """Test checkpoint creation and retrieval performance"""
-        print(f"💾 Testing Checkpoint Performance ({num_checkpoints} checkpoints)...")
+        logger.info(f" Testing Checkpoint Performance ({num_checkpoints} checkpoints)...")
 
         # Test checkpoint creation performance
         creation_times = []
@@ -255,10 +258,10 @@ class PerformanceTestSuite:
         max_creation_time = max(creation_times)
         min_creation_time = min(creation_times)
 
-        print(f"✅ Checkpoint creation performance:")
-        print(f"   - Average: {avg_creation_time*1000:.2f} ms")
-        print(f"   - Min: {min_creation_time*1000:.2f} ms")
-        print(f"   - Max: {max_creation_time*1000:.2f} ms")
+        logger.info(f" Checkpoint creation performance:")
+        logger.info(f"   - Average: {avg_creation_time*1000:.2f} ms")
+        logger.info(f"   - Min: {min_creation_time*1000:.2f} ms")
+        logger.info(f"   - Max: {max_creation_time*1000:.2f} ms")
 
         # Test retrieval performance
         retrieval_times = []
@@ -272,9 +275,9 @@ class PerformanceTestSuite:
 
         avg_retrieval_time = sum(retrieval_times) / len(retrieval_times)
 
-        print(f"✅ Checkpoint retrieval performance:")
-        print(f"   - Average: {avg_retrieval_time*1000:.2f} ms")
-        print(f"   - Tested: {len(retrieval_times)} retrievals")
+        logger.info(f" Checkpoint retrieval performance:")
+        logger.info(f"   - Average: {avg_retrieval_time*1000:.2f} ms")
+        logger.info(f"   - Tested: {len(retrieval_times)} retrievals")
 
         return {
             "checkpoints_created": num_checkpoints,
@@ -287,7 +290,7 @@ class PerformanceTestSuite:
 
     async def test_system_resource_usage(self, duration=30):
         """Test system resource usage over time"""
-        print(f"📊 Testing System Resource Usage (monitoring for {duration}s)...")
+        logger.info(f" Testing System Resource Usage (monitoring for {duration}s)...")
 
         resource_samples = []
         sample_interval = 2  # seconds
@@ -330,9 +333,9 @@ class PerformanceTestSuite:
             resource_samples.append(stats)
 
             if i == 0:
-                print(f"   Initial: Memory {stats['memory_mb']:.1f}MB, CPU {stats['cpu_percent']:.1f}%")
+                logger.info(f"   Initial: Memory {stats['memory_mb']:.1f}MB, CPU {stats['cpu_percent']:.1f}%")
             elif i == samples_count - 1:
-                print(f"   Final: Memory {stats['memory_mb']:.1f}MB, CPU {stats['cpu_percent']:.1f}%")
+                logger.info(f"   Final: Memory {stats['memory_mb']:.1f}MB, CPU {stats['cpu_percent']:.1f}%")
 
             await asyncio.sleep(sample_interval)
 
@@ -351,11 +354,11 @@ class PerformanceTestSuite:
         avg_cpu = sum(cpu_values) / len(cpu_values)
         peak_cpu = max(cpu_values)
 
-        print(f"✅ Resource usage analysis:")
-        print(f"   - Average memory: {avg_memory:.1f} MB")
-        print(f"   - Peak memory: {peak_memory:.1f} MB")
-        print(f"   - Average CPU: {avg_cpu:.1f}%")
-        print(f"   - Peak CPU: {peak_cpu:.1f}%")
+        logger.info(f" Resource usage analysis:")
+        logger.info(f"   - Average memory: {avg_memory:.1f} MB")
+        logger.info(f"   - Peak memory: {peak_memory:.1f} MB")
+        logger.info(f"   - Average CPU: {avg_cpu:.1f}%")
+        logger.info(f"   - Peak CPU: {peak_cpu:.1f}%")
 
         return {
             "duration": duration,
@@ -369,11 +372,11 @@ class PerformanceTestSuite:
 
     async def run_all_tests(self):
         """Run complete performance test suite"""
-        print("⚡ Running Performance Test Suite...\n")
+        logger.info("⚡ Running Performance Test Suite...\n")
 
         # Record baseline
         self.baseline_memory = self.get_memory_usage()
-        print(f"📊 Baseline memory usage: {self.baseline_memory:.1f} MB\n")
+        logger.info(f" Baseline memory usage: {self.baseline_memory:.1f} MB\n")
 
         tests = [
             ("Task Throughput (50 tasks)", lambda: self.test_task_throughput(50)),
@@ -386,38 +389,38 @@ class PerformanceTestSuite:
         results = {}
         for test_name, test_func in tests:
             try:
-                print(f"🧪 Running {test_name}...")
+                logger.info(f" Running {test_name}...")
                 start_time = time.time()
                 result = await test_func()
                 duration = time.time() - start_time
 
                 result['test_duration'] = duration
                 results[test_name] = result
-                print(f"✅ {test_name} completed in {duration:.2f}s\n")
+                logger.info(f" {test_name} completed in {duration:.2f}s\n")
 
                 # Small delay between tests
                 await asyncio.sleep(1)
 
             except Exception as e:
                 results[test_name] = {"error": str(e)}
-                print(f"❌ {test_name} FAILED: {e}\n")
+                logger.info(f" {test_name} FAILED: {e}\n")
 
         # Final memory check
         final_memory = self.get_memory_usage()
         memory_delta = final_memory - self.baseline_memory
 
-        print("📊 Performance Test Summary:")
+        logger.info(" Performance Test Summary:")
         for test, result in results.items():
             if "error" in result:
-                print(f"  ❌ {test}: {result['error']}")
+                logger.info(f"   {test}: {result['error']}")
             else:
-                print(f"  ✅ {test}: Completed ({result.get('test_duration', 0):.2f}s)")
+                logger.info(f"   {test}: Completed ({result.get('test_duration', 0):.2f}s)")
 
-        print(f"\n💾 Memory Impact: {self.baseline_memory:.1f} MB → {final_memory:.1f} MB ({memory_delta:+.1f} MB)")
+        logger.info(f"\n Memory Impact: {self.baseline_memory:.1f} MB → {final_memory:.1f} MB ({memory_delta:+.1f} MB)")
 
         return results
 
 if __name__ == "__main__":
     suite = PerformanceTestSuite()
     results = asyncio.run(suite.run_all_tests())
-    print(f"\n📈 Performance test results: {len(results)} tests completed")
+    logger.info(f"\n📈 Performance test results: {len(results)} tests completed")

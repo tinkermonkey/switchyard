@@ -9,6 +9,9 @@ from datetime import datetime
 from state_management.manager import StateManager
 from task_queue.task_manager import TaskQueue, Task, TaskPriority
 
+import logging
+
+logger = logging.getLogger(__name__)
 class CheckpointRecoveryTestSuite:
     def __init__(self):
         self.test_results = {}
@@ -17,7 +20,7 @@ class CheckpointRecoveryTestSuite:
 
     async def test_graceful_shutdown_recovery(self):
         """Test recovery after graceful shutdown"""
-        print("🔄 Testing Graceful Shutdown Recovery...")
+        logger.info(" Testing Graceful Shutdown Recovery...")
 
         # Create a long-running task checkpoint
         pipeline_id = "shutdown_recovery_001"
@@ -45,7 +48,7 @@ class CheckpointRecoveryTestSuite:
             context=test_context
         )
 
-        print("✅ Initial checkpoint created")
+        logger.info(" Initial checkpoint created")
 
         # Simulate some work progress
         test_context["work_completed"]["requirements_phase"] = "completed"
@@ -58,12 +61,12 @@ class CheckpointRecoveryTestSuite:
             context=test_context
         )
 
-        print("✅ Progress checkpoint created")
+        logger.info(" Progress checkpoint created")
 
         # Verify checkpoints exist
         checkpoints = list(Path("orchestrator_data/state/checkpoints").glob(f"{pipeline_id}_stage_*.json"))
         assert len(checkpoints) >= 1, "No checkpoints found"
-        print(f"✅ Found {len(checkpoints)} checkpoint files")
+        logger.info(f" Found {len(checkpoints)} checkpoint files")
 
         # Test recovery
         latest_checkpoint = await self.state_manager.get_latest_checkpoint(pipeline_id)
@@ -71,12 +74,12 @@ class CheckpointRecoveryTestSuite:
         assert latest_checkpoint["stage_index"] == 2, "Incorrect stage index in checkpoint"
         assert latest_checkpoint["context"]["work_completed"]["requirements_phase"] == "completed"
 
-        print("✅ Checkpoint recovery working correctly")
+        logger.info(" Checkpoint recovery working correctly")
         return True
 
     async def test_crash_recovery(self):
         """Test recovery after unexpected crash"""
-        print("⚡ Testing Crash Recovery...")
+        logger.info("⚡ Testing Crash Recovery...")
 
         pipeline_id = "crash_recovery_001"
 
@@ -111,7 +114,7 @@ class CheckpointRecoveryTestSuite:
             }
         )
 
-        print("✅ Crash state simulation created")
+        logger.info(" Crash state simulation created")
 
         # Test recovery mechanisms
         recovered_checkpoint = await self.state_manager.get_latest_checkpoint(pipeline_id)
@@ -122,12 +125,12 @@ class CheckpointRecoveryTestSuite:
         assert recovered_agent_state is not None
         assert recovered_agent_state["work_progress"] == 0.6
 
-        print("✅ Crash recovery data successfully retrieved")
+        logger.info(" Crash recovery data successfully retrieved")
         return True
 
     async def test_partial_state_corruption(self):
         """Test recovery from partial state file corruption"""
-        print("🔧 Testing Partial State Corruption Recovery...")
+        logger.info(" Testing Partial State Corruption Recovery...")
 
         pipeline_id = "corruption_test_001"
 
@@ -166,29 +169,29 @@ class CheckpointRecoveryTestSuite:
         with open(checkpoints[0], 'w') as f:
             f.write('{"corrupted": "partial"}')  # Invalid structure for our checkpoint format
 
-        print(f"✅ Corrupted checkpoint file: {checkpoints[0].name}")
+        logger.info(f" Corrupted checkpoint file: {checkpoints[0].name}")
 
         # Test recovery mechanisms
         try:
             # Should still be able to get the latest valid checkpoint
             recovered_checkpoint = await self.state_manager.get_latest_checkpoint(pipeline_id)
             if recovered_checkpoint and recovered_checkpoint["stage_index"] == 1:
-                print("✅ Recovered from latest valid checkpoint despite corruption")
+                logger.info(" Recovered from latest valid checkpoint despite corruption")
                 return True
             elif recovered_checkpoint:
-                print("⚠️ Recovered checkpoint but from unexpected stage")
+                logger.info(" Recovered checkpoint but from unexpected stage")
                 return True
             else:
                 # If no recovery, test graceful handling
-                print("✅ Gracefully handled corrupted checkpoint (no crash)")
+                logger.info(" Gracefully handled corrupted checkpoint (no crash)")
                 return True
         except Exception as e:
-            print(f"❌ Failed to handle corruption gracefully: {e}")
+            logger.info(f" Failed to handle corruption gracefully: {e}")
             return False
 
     async def test_concurrent_checkpoint_access(self):
         """Test checkpoint system under concurrent access"""
-        print("⚡ Testing Concurrent Checkpoint Access...")
+        logger.info("⚡ Testing Concurrent Checkpoint Access...")
 
         pipeline_id = "concurrent_test_001"
 
@@ -222,17 +225,17 @@ class CheckpointRecoveryTestSuite:
 
         # Verify all workers completed successfully
         successful_workers = [r for r in results if "completed" in r]
-        print(f"✅ {len(successful_workers)}/5 workers completed successfully")
+        logger.info(f" {len(successful_workers)}/5 workers completed successfully")
 
         # Verify checkpoints were created
         all_checkpoints = list(Path("orchestrator_data/state/checkpoints").glob(f"{pipeline_id}_worker_*"))
-        print(f"✅ Created {len(all_checkpoints)} checkpoint files from concurrent access")
+        logger.info(f" Created {len(all_checkpoints)} checkpoint files from concurrent access")
 
         return len(successful_workers) >= 4  # Allow for some failures
 
     async def test_checkpoint_size_limits(self):
         """Test checkpoint system with large data"""
-        print("📊 Testing Checkpoint Size Limits...")
+        logger.info(" Testing Checkpoint Size Limits...")
 
         pipeline_id = "size_test_001"
 
@@ -258,7 +261,7 @@ class CheckpointRecoveryTestSuite:
                 context=large_context
             )
 
-            print("✅ Large checkpoint created successfully")
+            logger.info(" Large checkpoint created successfully")
 
             # Test retrieving large checkpoint
             recovered = await self.state_manager.get_latest_checkpoint(pipeline_id)
@@ -266,16 +269,16 @@ class CheckpointRecoveryTestSuite:
             assert len(recovered["context"]["large_data"]["requirements"]) == 1000
             assert len(recovered["context"]["large_data"]["analysis_data"]) == 10000
 
-            print("✅ Large checkpoint retrieved successfully")
+            logger.info(" Large checkpoint retrieved successfully")
             return True
 
         except Exception as e:
-            print(f"⚠️ Large checkpoint test failed: {e}")
+            logger.info(f" Large checkpoint test failed: {e}")
             return False
 
     async def test_checkpoint_cleanup(self):
         """Test checkpoint cleanup and management"""
-        print("🧹 Testing Checkpoint Cleanup...")
+        logger.info("🧹 Testing Checkpoint Cleanup...")
 
         pipeline_id = "cleanup_test_001"
 
@@ -295,19 +298,19 @@ class CheckpointRecoveryTestSuite:
 
         # Verify checkpoints exist
         checkpoints_before = list(Path("orchestrator_data/state/checkpoints").glob(f"{pipeline_id}_stage_*.json"))
-        print(f"✅ Created {len(checkpoints_before)} checkpoints for cleanup test")
+        logger.info(f" Created {len(checkpoints_before)} checkpoints for cleanup test")
 
         # Test that we can still get the latest checkpoint
         latest = await self.state_manager.get_latest_checkpoint(pipeline_id)
         assert latest is not None
         assert latest["stage_index"] == 4
 
-        print("✅ Checkpoint cleanup test completed")
+        logger.info(" Checkpoint cleanup test completed")
         return True
 
     async def cleanup_test_environment(self):
         """Clean up test environment"""
-        print("🧹 Cleaning up test environment...")
+        logger.info("🧹 Cleaning up test environment...")
 
         # Clean up test checkpoint files
         test_patterns = [
@@ -339,11 +342,11 @@ class CheckpointRecoveryTestSuite:
             except:
                 pass
 
-        print(f"✅ Cleaned up {cleanup_count} test files")
+        logger.info(f" Cleaned up {cleanup_count} test files")
 
     async def run_all_tests(self):
         """Run complete checkpoint recovery test suite"""
-        print("🔧 Running Checkpoint Recovery Validation...\n")
+        logger.info(" Running Checkpoint Recovery Validation...\n")
 
         tests = [
             ("Graceful Shutdown Recovery", self.test_graceful_shutdown_recovery),
@@ -357,27 +360,27 @@ class CheckpointRecoveryTestSuite:
         results = {}
         for test_name, test_func in tests:
             try:
-                print(f"🧪 Running {test_name}...")
+                logger.info(f" Running {test_name}...")
                 result = await test_func()
                 results[test_name] = "PASSED" if result else "FAILED"
-                print(f"✅ {test_name} PASSED\n")
+                logger.info(f" {test_name} PASSED\n")
             except Exception as e:
                 results[test_name] = f"FAILED: {e}"
-                print(f"❌ {test_name} FAILED: {e}\n")
+                logger.info(f" {test_name} FAILED: {e}\n")
 
         # Cleanup
         await self.cleanup_test_environment()
 
-        print("📊 Checkpoint Recovery Test Results:")
+        logger.info(" Checkpoint Recovery Test Results:")
         for test, result in results.items():
-            status = "✅" if "PASSED" in result else "❌"
-            print(f"  {status} {test}: {result}")
+            status = "" if "PASSED" in result else ""
+            logger.info(f"  {status} {test}: {result}")
 
         all_passed = all("PASSED" in result for result in results.values())
         if all_passed:
-            print("\n✅ All checkpoint recovery tests passed!")
+            logger.info("\n All checkpoint recovery tests passed!")
         else:
-            print("\n⚠️ Some checkpoint recovery tests failed!")
+            logger.info("\n Some checkpoint recovery tests failed!")
 
         return all_passed
 

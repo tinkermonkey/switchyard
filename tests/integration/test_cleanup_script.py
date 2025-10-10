@@ -136,6 +136,15 @@ class TestCleanupAllProjects:
             mock_config2 = MagicMock()
             mock_config2.repository = "org2/repo2"
 
+            # Setup get_project_config to return appropriate config for each project
+            def get_project_config_side_effect(project_name):
+                if project_name == 'project1':
+                    return mock_config1
+                elif project_name == 'project2':
+                    return mock_config2
+                return None
+
+            mock_config.get_project_config.side_effect = get_project_config_side_effect
             mock_config.get_all_project_configs.return_value = {
                 'project1': mock_config1,
                 'project2': mock_config2
@@ -179,6 +188,17 @@ class TestCleanupAllProjects:
             mock_config3 = MagicMock()
             mock_config3.repository = "org3/repo3"
 
+            # Setup get_project_config to return appropriate config for each project
+            def get_project_config_side_effect(project_name):
+                if project_name == 'project1':
+                    return mock_config1
+                elif project_name == 'project2':
+                    return mock_config2
+                elif project_name == 'project3':
+                    return mock_config3
+                return None
+
+            mock_config.get_project_config.side_effect = get_project_config_side_effect
             mock_config.get_all_project_configs.return_value = {
                 'project1': mock_config1,
                 'project2': mock_config2,

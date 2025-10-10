@@ -224,12 +224,12 @@ class TestFindingExtraction:
         review = """
         ## Review Results
 
-        🚫 **Critical Issue**: Missing security requirements
+        **Critical Issue**: Missing security requirements
 
         The requirements document lacks authentication and authorization
         specifications, which is a blocking issue.
 
-        ⚠️ **High Priority**: Unclear acceptance criteria for story 5
+        **High Priority**: Unclear acceptance criteria for story 5
         """
 
         result = parser.parse_review(review)
@@ -245,7 +245,7 @@ class TestFindingExtraction:
         ## Issues Found
 
         - **Security**: Missing authentication requirements
-          💡 Add section 3.1 for authentication flows
+          Suggestion: Add section 3.1 for authentication flows
         - **Clarity**: User story 3 needs detail
           Suggestion: Include specific user actions
         """
@@ -503,18 +503,18 @@ class TestEdgeCases:
     def test_unicode_emoji_markers(self, parser):
         """Test: Handle unicode emoji markers"""
         review = """
-        ✅ Approved
+        Approved
 
-        🚫 One blocking issue:
+        One blocking issue:
         - Missing security requirements
 
-        ⚠️ High priority:
+        High priority:
         - Add more detail
         """
 
         result = parser.parse_review(review)
 
-        # Should extract findings despite emojis
+        # Should extract findings
         assert len(result.findings) >= 2
 
     def test_multiple_findings_same_severity(self, parser):
@@ -577,13 +577,13 @@ Successfully addressing all blocking issues from iteration 2.
 
 ## Assessment
 
-### Completeness ✅
+### Completeness
 All critical requirements now specified:
 - Authentication flows (new section 3.1)
 - Error handling scenarios (new section 4.2)
 - Data validation rules (expanded section 2.3)
 
-### Clarity ✅
+### Clarity
 User stories now follow INVEST principles with clear acceptance criteria.
 
 ### Quality Score
@@ -610,10 +610,10 @@ Status: APPROVED
 
 ## Issues Found
 
-### 🚫 Blocking Issues
+### Blocking Issues
 
 - **Security**: Missing authentication and authorization requirements
-  💡 Add section 3.1 detailing authentication flows and role-based access control
+  Suggestion: Add section 3.1 detailing authentication flows and role-based access control
 
 - **Critical Gap**: No error handling scenarios specified
   Suggestion: Add section 4.2 covering error conditions and user feedback
@@ -621,10 +621,10 @@ Status: APPROVED
 - **Data Validation**: Insufficient validation rules for user inputs
   Recommended: Expand section 2.3 with specific validation criteria
 
-### ⚠️ High Priority
+### High Priority
 
 - **User Story 3**: Lacks specific acceptance criteria
-  💡 Use Given-When-Then format for clarity
+  Suggestion: Use Given-When-Then format for clarity
 
 ## Summary
 

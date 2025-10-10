@@ -19,7 +19,8 @@ def scheduled_tasks_service():
 class TestSchedulerLifecycle:
     """Test scheduler start/stop lifecycle"""
 
-    def test_start_scheduler(self, scheduled_tasks_service):
+    @pytest.mark.asyncio
+    async def test_start_scheduler(self, scheduled_tasks_service):
         """Test starting the scheduler"""
         scheduled_tasks_service.start()
 
@@ -36,7 +37,8 @@ class TestSchedulerLifecycle:
         # Cleanup
         scheduled_tasks_service.stop()
 
-    def test_stop_scheduler(self, scheduled_tasks_service):
+    @pytest.mark.asyncio
+    async def test_stop_scheduler(self, scheduled_tasks_service):
         """Test stopping the scheduler"""
         scheduled_tasks_service.start()
         assert scheduled_tasks_service.running is True
@@ -44,7 +46,8 @@ class TestSchedulerLifecycle:
         scheduled_tasks_service.stop()
         assert scheduled_tasks_service.running is False
 
-    def test_start_already_running(self, scheduled_tasks_service, caplog):
+    @pytest.mark.asyncio
+    async def test_start_already_running(self, scheduled_tasks_service, caplog):
         """Test starting scheduler when already running"""
         scheduled_tasks_service.start()
         scheduled_tasks_service.start()  # Second start
@@ -64,7 +67,8 @@ class TestSchedulerLifecycle:
 class TestScheduledJobConfiguration:
     """Test scheduled job configurations"""
 
-    def test_cleanup_job_schedule(self, scheduled_tasks_service):
+    @pytest.mark.asyncio
+    async def test_cleanup_job_schedule(self, scheduled_tasks_service):
         """Test cleanup job is scheduled for 2 AM daily"""
         scheduled_tasks_service.start()
 
@@ -75,13 +79,23 @@ class TestScheduledJobConfiguration:
 
         # Verify trigger (CronTrigger)
         trigger = cleanup_job.trigger
-        assert trigger.fields[2].expressions[0].step == 2  # Hour = 2
-        assert trigger.fields[3].expressions[0].step == 0  # Minute = 0
+        # Field 5 is hour, field 6 is minute
+        hour_field = trigger.fields[5]
+        minute_field = trigger.fields[6]
+        
+        # Check that hour is set to 2
+        assert len(hour_field.expressions) == 1
+        assert hour_field.expressions[0].first == 2
+        
+        # Check that minute is set to 0
+        assert len(minute_field.expressions) == 1
+        assert minute_field.expressions[0].first == 0
 
         # Cleanup
         scheduled_tasks_service.stop()
 
-    def test_stale_check_job_schedule(self, scheduled_tasks_service):
+    @pytest.mark.asyncio
+    async def test_stale_check_job_schedule(self, scheduled_tasks_service):
         """Test stale check job is scheduled for 9 AM daily"""
         scheduled_tasks_service.start()
 
@@ -92,8 +106,17 @@ class TestScheduledJobConfiguration:
 
         # Verify trigger
         trigger = stale_job.trigger
-        assert trigger.fields[2].expressions[0].step == 9  # Hour = 9
-        assert trigger.fields[3].expressions[0].step == 0  # Minute = 0
+        # Field 5 is hour, field 6 is minute
+        hour_field = trigger.fields[5]
+        minute_field = trigger.fields[6]
+        
+        # Check that hour is set to 9
+        assert len(hour_field.expressions) == 1
+        assert hour_field.expressions[0].first == 9
+        
+        # Check that minute is set to 0
+        assert len(minute_field.expressions) == 1
+        assert minute_field.expressions[0].first == 0
 
         # Cleanup
         scheduled_tasks_service.stop()
@@ -105,7 +128,7 @@ class TestCleanupTask:
     @pytest.mark.asyncio
     async def test_cleanup_orphaned_branches_no_projects(self, scheduled_tasks_service):
         """Test cleanup when no projects configured"""
-        with patch('services.scheduled_tasks.config_manager') as mock_config:
+        with patch('config.manager.config_manager') as mock_config:
             mock_config.get_all_project_configs.return_value = {}
 
             # Should not raise error
@@ -118,9 +141,9 @@ class TestCleanupTask:
         mock_project_config = MagicMock()
         mock_project_config.repository = "test-org/test-repo"
 
-        with patch('services.scheduled_tasks.config_manager') as mock_config, \
-             patch('services.scheduled_tasks.feature_branch_manager') as mock_fbm, \
-             patch('services.scheduled_tasks.GitHubIntegration') as mock_gh_class:
+        with patch('config.manager.config_manager') as mock_config, \
+             patch('services.feature_branch_manager.feature_branch_manager') as mock_fbm, \
+             patch('services.github_integration.GitHubIntegration') as mock_gh_class:
 
             # Setup mocks
             mock_config.get_all_project_configs.return_value = {
@@ -151,9 +174,9 @@ class TestCleanupTask:
         mock_config2 = MagicMock()
         mock_config2.repository = "org2/repo2"
 
-        with patch('services.scheduled_tasks.config_manager') as mock_config, \
-             patch('services.scheduled_tasks.feature_branch_manager') as mock_fbm, \
-             patch('services.scheduled_tasks.GitHubIntegration') as mock_gh_class:
+        with patch('config.manager.config_manager') as mock_config, \
+             patch('services.feature_branch_manager.feature_branch_manager') as mock_fbm, \
+             patch('services.github_integration.GitHubIntegration') as mock_gh_class:
 
             mock_config.get_all_project_configs.return_value = {
                 'project1': mock_config1,
@@ -177,9 +200,9 @@ class TestCleanupTask:
         mock_config2 = MagicMock()
         mock_config2.repository = "org2/repo2"
 
-        with patch('services.scheduled_tasks.config_manager') as mock_config, \
-             patch('services.scheduled_tasks.feature_branch_manager') as mock_fbm, \
-             patch('services.scheduled_tasks.GitHubIntegration') as mock_gh_class:
+        with patch('config.manager.config_manager') as mock_config, \
+             patch('services.feature_branch_manager.feature_branch_manager') as mock_fbm, \
+             patch('services.github_integration.GitHubIntegration') as mock_gh_class:
 
             mock_config.get_all_project_configs.return_value = {
                 'project1': mock_config1,
@@ -204,7 +227,7 @@ class TestStaleCheckTask:
     @pytest.mark.asyncio
     async def test_check_stale_branches_no_projects(self, scheduled_tasks_service):
         """Test stale check when no projects configured"""
-        with patch('services.scheduled_tasks.config_manager') as mock_config:
+        with patch('config.manager.config_manager') as mock_config:
             mock_config.get_all_project_configs.return_value = {}
 
             # Should not raise error
@@ -226,9 +249,9 @@ class TestStaleCheckTask:
             sub_issues=[SubIssueState(number=51, status="in_progress")]
         )
 
-        with patch('services.scheduled_tasks.config_manager') as mock_config, \
-             patch('services.scheduled_tasks.feature_branch_manager') as mock_fbm, \
-             patch('services.scheduled_tasks.GitHubIntegration') as mock_gh_class:
+        with patch('config.manager.config_manager') as mock_config, \
+             patch('services.feature_branch_manager.feature_branch_manager') as mock_fbm, \
+             patch('services.github_integration.GitHubIntegration') as mock_gh_class:
 
             mock_config.get_all_project_configs.return_value = {
                 'test-project': mock_project_config
@@ -260,9 +283,9 @@ class TestStaleCheckTask:
             sub_issues=[SubIssueState(number=51, status="in_progress")]
         )
 
-        with patch('services.scheduled_tasks.config_manager') as mock_config, \
-             patch('services.scheduled_tasks.feature_branch_manager') as mock_fbm, \
-             patch('services.scheduled_tasks.GitHubIntegration') as mock_gh_class:
+        with patch('config.manager.config_manager') as mock_config, \
+             patch('services.feature_branch_manager.feature_branch_manager') as mock_fbm, \
+             patch('services.github_integration.GitHubIntegration') as mock_gh_class:
 
             mock_config.get_all_project_configs.return_value = {
                 'test-project': mock_project_config
@@ -283,26 +306,33 @@ class TestStaleCheckTask:
 class TestManualTriggers:
     """Test manual task triggers"""
 
-    def test_run_cleanup_now(self, scheduled_tasks_service):
+    @pytest.mark.asyncio
+    async def test_run_cleanup_now(self, scheduled_tasks_service):
         """Test manual cleanup trigger"""
-        with patch.object(scheduled_tasks_service, '_cleanup_orphaned_branches') as mock_cleanup:
+        with patch.object(scheduled_tasks_service, '_cleanup_orphaned_branches') as mock_cleanup, \
+             patch('asyncio.create_task') as mock_create_task:
+            
             mock_cleanup = AsyncMock()
 
             # Manually trigger
             scheduled_tasks_service.run_cleanup_now()
 
-            # Task should be created (asyncio.create_task)
-            # We can't easily verify task creation without running event loop
+            # Verify task creation was called
+            mock_create_task.assert_called_once()
 
-    def test_run_stale_check_now(self, scheduled_tasks_service):
+    @pytest.mark.asyncio
+    async def test_run_stale_check_now(self, scheduled_tasks_service):
         """Test manual stale check trigger"""
-        with patch.object(scheduled_tasks_service, '_check_stale_branches') as mock_check:
+        with patch.object(scheduled_tasks_service, '_check_stale_branches') as mock_check, \
+             patch('asyncio.create_task') as mock_create_task:
+            
             mock_check = AsyncMock()
 
             # Manually trigger
             scheduled_tasks_service.run_stale_check_now()
 
-            # Task should be created
+            # Verify task creation was called
+            mock_create_task.assert_called_once()
 
 
 class TestGlobalInstance:

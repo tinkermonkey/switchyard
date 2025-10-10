@@ -6,15 +6,18 @@ by mocking the GraphQL call to use fixture data.
 """
 
 import json
+import logging
 import pytest
 from pathlib import Path
 from unittest.mock import patch, MagicMock
+
+logger = logging.getLogger(__name__)
 
 
 @pytest.fixture
 def discussion_95_data():
     """Load discussion 95 snapshot"""
-    fixture_path = Path(__file__).parent / 'fixtures' / 'discussion_95.json'
+    fixture_path = Path(__file__).parent.parent / 'fixtures' / 'discussion_95.json'
     with open(fixture_path) as f:
         return json.load(f)
 
@@ -50,10 +53,10 @@ def test_actual_context_extraction_business_analyst(discussion_95_data):
 
     context_size = len(ba_body) + sum(len(r['body']) for r in human_replies)
 
-    print(f"\n=== Expected Context (Last BA Comment + Replies) ===")
-    print(f"BA comment size: {len(ba_body):,} chars ({len(ba_body)/1024:.1f} KB)")
-    print(f"Human replies: {len(human_replies)}")
-    print(f"Total expected context: {context_size:,} chars ({context_size/1024:.1f} KB)")
+    logger.info(f"\n=== Expected Context (Last BA Comment + Replies) ===")
+    logger.info(f"BA comment size: {len(ba_body):,} chars ({len(ba_body)/1024:.1f} KB)")
+    logger.info(f"Human replies: {len(human_replies)}")
+    logger.info(f"Total expected context: {context_size:,} chars ({context_size/1024:.1f} KB)")
 
     # This is the expected size for a single comment + replies
     assert context_size < 50000, \
@@ -66,13 +69,13 @@ def test_actual_context_extraction_business_analyst(discussion_95_data):
         for reply in comment.get('replies', {}).get('nodes', []):
             total_discussion += len(reply['body'])
 
-    print(f"\n=== Total Discussion Size (ALL comments - BAD) ===")
-    print(f"Total discussion: {total_discussion:,} chars ({total_discussion/1024:.1f} KB)")
-    print(f"Ratio: {context_size/total_discussion*100:.1f}% of total")
-    print(f"")
-    print(f"❌ If we pass entire discussion: {total_discussion/1024:.1f} KB")
-    print(f"✅ If we pass only last comment: {context_size/1024:.1f} KB")
-    print(f"📉 Savings: {(total_discussion-context_size)/1024:.1f} KB ({(1-context_size/total_discussion)*100:.0f}% reduction)")
+    logger.info(f"\n=== Total Discussion Size (ALL comments - BAD) ===")
+    logger.info(f"Total discussion: {total_discussion:,} chars ({total_discussion/1024:.1f} KB)")
+    logger.info(f"Ratio: {context_size/total_discussion*100:.1f}% of total")
+    logger.info(f"")
+    logger.info(f"If we pass entire discussion: {total_discussion/1024:.1f} KB")
+    logger.info(f"If we pass only last comment: {context_size/1024:.1f} KB")
+    logger.info(f"Savings: {(total_discussion-context_size)/1024:.1f} KB ({(1-context_size/total_discussion)*100:.0f}% reduction)")
 
     # The context should be a small fraction of the total discussion
     assert context_size < total_discussion * 0.2, \

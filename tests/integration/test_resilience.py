@@ -2,6 +2,9 @@ import asyncio
 from datetime import datetime
 from task_queue.task_manager import Task, TaskPriority
 
+import logging
+
+logger = logging.getLogger(__name__)
 async def test_circuit_breaker():
     """Test circuit breaker functionality with simulated failures"""
 
@@ -35,10 +38,10 @@ async def test_circuit_breaker():
             await process_task_integrated(failing_task, state_manager, logger)
         except Exception as e:
             failures += 1
-            print(f"Attempt {i+1} failed: {e}")
+            logger.info(f"Attempt {i+1} failed: {e}")
 
     assert failures > 0, "Expected some failures for circuit breaker testing"
-    print(f"✅ Circuit breaker test: {failures}/5 attempts failed as expected")
+    logger.info(f" Circuit breaker test: {failures}/5 attempts failed as expected")
 
 if __name__ == "__main__":
     asyncio.run(test_circuit_breaker())

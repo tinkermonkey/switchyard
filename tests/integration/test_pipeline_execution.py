@@ -7,15 +7,19 @@ from state_management.manager import StateManager
 from monitoring.logging import OrchestratorLogger
 from agents.orchestrator_integration import process_task_integrated
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 @pytest.mark.asyncio
 async def test_pipeline_execution():
     """Test complete pipeline execution with Business Analyst"""
 
-    print("🧪 Testing Pipeline Execution...")
-
     # Setup
     state_manager = StateManager()
     logger = OrchestratorLogger("test")
+
+    logger.info(" Testing Pipeline Execution...")
 
     # Create test task
     test_task = Task(
@@ -36,18 +40,18 @@ async def test_pipeline_execution():
     # Execute
     try:
         result = await process_task_integrated(test_task, state_manager, logger)
-        print("✅ Pipeline integration test passed")
-        print(f"📄 Result keys: {list(result.keys())}")
+        logger.info(" Pipeline integration test passed")
+        logger.info(f"📄 Result keys: {list(result.keys())}")
 
         # Validate result structure
         assert 'pipeline_id' in result
         assert 'task_id' in result
         assert result['task_id'] == test_task.id
 
-        print("✅ Result structure validated")
+        logger.info(" Result structure validated")
         return True
     except Exception as e:
-        print(f"❌ Integration test failed: {e}")
+        logger.info(f" Integration test failed: {e}")
         return False
 
 if __name__ == "__main__":

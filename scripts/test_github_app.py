@@ -1,154 +1,131 @@
 #!/usr/bin/env python3
 """
-Test script for GitHub App authentication
+Test script for GitHub App authentication and Discussions API
 
-This script verifies that the GitHub App is properly configured and can authenticate.
+Run this to verify:
+1. GitHub App can authenticate
+2. Installation token can be generated
+3. Discussions API is accessible
 """
 
-import os
 import sys
-from pathlib import Path
+import os
 
 # Add parent directory to path
-sys.path.insert(0, str(Path(__file__).parent.parent))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-from services.github_app_auth import get_github_app_auth
-import logging
+from services.github_app import github_app
+from services.github_discussions import GitHubDiscussions
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-
-logger = logging.getLogger(__name__)
 
 def test_github_app_auth():
     """Test GitHub App authentication"""
+    print("=" * 60)
+    print("Testing GitHub App Authentication")
+    print("=" * 60)
 
-    print("\n" + "="*60)
-    print("GitHub App Authentication Test")
-    print("="*60 + "\n")
-
-    # Get auth instance
-    auth = get_github_app_auth()
-
-    # Check configuration
-    print("1. Configuration Check:")
-    print("-" * 40)
-
-    if not auth.is_configured():
-        print("   Status: NOT CONFIGURED")
-        print("\n   GitHub App authentication is not configured.")
-        print("   The orchestrator will fall back to using GITHUB_TOKEN (PAT).")
-        print("\n   To configure GitHub App:")
-        print("   1. Follow the guide at documentation/github_app_setup.md")
-        print("   2. Set these environment variables:")
-        print("      - GITHUB_APP_ID")
-        print("      - GITHUB_APP_INSTALLATION_ID")
-        print("      - GITHUB_APP_PRIVATE_KEY_PATH or GITHUB_APP_PRIVATE_KEY")
+    if not github_app.enabled:
+        print("❌ GitHub App is not enabled")
+        print("   Check that GITHUB_APP_ID, GITHUB_APP_INSTALLATION_ID,")
+        print("   and GITHUB_APP_PRIVATE_KEY_PATH are set correctly")
         return False
 
-    print(f"   Status: CONFIGURED")
-    print(f"   App ID: {auth.app_id}")
-    print(f"   Installation ID: {auth.installation_id}")
-    print(f"   Private Key: {'Loaded from file' if auth.private_key_path else 'Loaded from env'}")
+    print("✓ GitHub App initialized")
+    print(f"  App ID: {github_app.app_id}")
+    print(f"  Installation ID: {github_app.installation_id}")
 
-    # Test JWT generation
-    print("\n2. JWT Generation Test:")
-    print("-" * 40)
+    # Try to get installation token
+    print("\nGenerating installation token...")
+    token = github_app.get_installation_token()
 
-    try:
-        jwt_token = auth.generate_jwt()
-        print(f"   Status: SUCCESS")
-        print(f"   JWT Token: {jwt_token[:50]}...")
-    except Exception as e:
-        print(f"   Status: FAILED")
-        print(f"   Error: {e}")
+    if token:
+        print("✓ Installation token generated successfully")
+        print(f"  Token: {token[:20]}...{token[-10:]}")
+        print(f"  Expires: {github_app._token_expires_at}")
+        return True
+    else:
+        print("❌ Failed to generate installation token")
         return False
 
-    # Test installation token
-    print("\n3. Installation Token Test:")
-    print("-" * 40)
 
-    try:
-        token = auth.get_installation_token()
+def test_discussions_api(owner: str, repo: str):
+    """Test Discussions API access"""
+    print("\n" + "=" * 60)
+    print(f"Testing Discussions API for {owner}/{repo}")
+    print("=" * 60)
 
-        if token:
-            print(f"   Status: SUCCESS")
-            print(f"   Token: {token[:20]}...")
-            print(f"   Expires at: {auth.token_expires_at}")
-        else:
-            print(f"   Status: FAILED")
-            print(f"   Could not get installation token")
-            return False
+    discussions = GitHubDiscussions()
 
-    except Exception as e:
-        print(f"   Status: FAILED")
-        print(f"   Error: {e}")
+    # Test 1: Get discussion categories
+    print("\n1. Getting discussion categories...")
+    categories = discussions.get_discussion_categories(owner, repo)
+
+    if categories:
+        print(f"✓ Found {len(categories)} categories:")
+        for cat in categories:
+            emoji = cat.get('emoji', '📋')
+            name = cat['name']
+            print(f"  {emoji} {name} (ID: {cat['id'][:20]}...)")
+    else:
+        print("❌ Failed to get categories")
         return False
 
-    # Test app info retrieval
-    print("\n4. GitHub App Info Test:")
-    print("-" * 40)
+    # Test 2: List recent discussions
+    print("\n2. Listing recent discussions...")
+    recent_discussions = discussions.list_discussions(owner, repo, first=5)
 
-    try:
-        app_info = auth.get_app_info()
+    if recent_discussions:
+        print(f"✓ Found {len(recent_discussions)} recent discussions:")
+        for disc in recent_discussions[:3]:
+            print(f"  #{disc['number']}: {disc['title']}")
+            print(f"    Category: {disc['category']['name']}")
+            print(f"    Updated: {disc['updatedAt']}")
+    else:
+        print("⚠️  No discussions found (or repo doesn't have discussions enabled)")
 
-        if app_info:
-            print(f"   Status: SUCCESS")
-            print(f"   App Name: {app_info.get('name')}")
-            print(f"   App Owner: {app_info.get('owner', {}).get('login')}")
-            print(f"   Description: {app_info.get('description', 'N/A')}")
-        else:
-            print(f"   Status: FAILED")
-            print(f"   Could not retrieve app info")
-            return False
+    # Test 3: Search for mentions
+    print("\n3. Searching for @orchestrator-bot mentions...")
+    mentioned = discussions.search_discussions_for_mentions(owner, repo)
 
-    except Exception as e:
-        print(f"   Status: FAILED")
-        print(f"   Error: {e}")
-        return False
-
-    # Test installation info retrieval
-    print("\n5. Installation Info Test:")
-    print("-" * 40)
-
-    try:
-        install_info = auth.get_installation_info()
-
-        if install_info:
-            print(f"   Status: SUCCESS")
-            print(f"   Account: {install_info.get('account', {}).get('login')}")
-            print(f"   Target Type: {install_info.get('target_type')}")
-            print(f"   Repository Selection: {install_info.get('repository_selection')}")
-        else:
-            print(f"   Status: FAILED")
-            print(f"   Could not retrieve installation info")
-            return False
-
-    except Exception as e:
-        print(f"   Status: FAILED")
-        print(f"   Error: {e}")
-        return False
-
-    print("\n" + "="*60)
-    print("All tests passed! GitHub App is properly configured.")
-    print("="*60 + "\n")
-
-    print("Next steps:")
-    print("1. Rebuild containers: docker-compose up -d --build")
-    print("2. Comments from orchestrator will now appear as 'orchestrator-bot[bot]'")
-    print("3. The 'isBot' flag will be properly set to true")
+    if mentioned:
+        print(f"✓ Found {len(mentioned)} discussion(s) with @orchestrator-bot mentions:")
+        for disc in mentioned[:3]:
+            print(f"  #{disc['number']}: {disc['title']}")
+    else:
+        print("⚠️  No mentions found")
 
     return True
 
+
+def main():
+    """Run all tests"""
+    print("\n🔧 GitHub App & Discussions API Test Suite\n")
+
+    # Test authentication
+    auth_success = test_github_app_auth()
+
+    if not auth_success:
+        print("\n❌ Authentication failed - cannot continue with API tests")
+        sys.exit(1)
+
+    # Get repo from environment or use default
+    owner = os.environ.get('GITHUB_ORG', 'tinkermonkey')
+    repo = os.environ.get('GITHUB_REPO', 'context-studio')
+
+    # Test Discussions API
+    api_success = test_discussions_api(owner, repo)
+
+    print("\n" + "=" * 60)
+    if auth_success and api_success:
+        print("✅ All tests passed!")
+        print("\nYou can now:")
+        print("  - Create discussions programmatically")
+        print("  - Post comments as orchestrator-bot[bot]")
+        print("  - Monitor discussions for @mentions")
+    else:
+        print("⚠️  Some tests had issues")
+    print("=" * 60)
+
+
 if __name__ == "__main__":
-    try:
-        success = test_github_app_auth()
-        sys.exit(0 if success else 1)
-    except KeyboardInterrupt:
-        print("\n\nTest interrupted by user")
-        sys.exit(1)
-    except Exception as e:
-        logger.error(f"Unexpected error: {e}", exc_info=True)
-        sys.exit(1)
+    main()

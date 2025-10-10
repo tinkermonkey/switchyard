@@ -149,13 +149,13 @@ class TestEscalationCommentFormat:
         blocking_count = 3
 
         # Simulate escalation comment format
-        comment = f"""## 🚫 Review Blocked - Human Review Required
+        comment = f"""## Review Blocked - Human Review Required
 
 The automated review identified **{blocking_count} blocking issue(s)** that require human attention.
 """
 
         assert '3 blocking issue(s)' in comment
-        assert '🚫' in comment
+        assert 'Review Blocked' in comment
         assert 'Human Review Required' in comment
 
     def test_blocked_escalation_comment_lists_issues(self):
@@ -183,13 +183,13 @@ The automated review identified **{blocking_count} blocking issue(s)** that requ
         """Test: Max iterations escalation comment shows iteration count"""
         max_iterations = 3
 
-        comment = f"""## ⚠️ Max Review Iterations Reached
+        comment = f"""## Max Review Iterations Reached
 
 The automated review cycle has reached the maximum iterations ({max_iterations}) without approval.
 """
 
         assert f'maximum iterations ({max_iterations})' in comment
-        assert '⚠️' in comment
+        assert 'Max Review Iterations' in comment
 
     def test_escalation_comment_includes_instructions(self):
         """Test: Escalation comment includes next steps for human"""
@@ -268,7 +268,7 @@ class TestEscalationDetectionFromDiscussion:
 
     def test_detect_escalation_from_comment(self):
         """Test: Detect escalation from 'Review Blocked' comment"""
-        comment_body = """## 🚫 Review Blocked - Human Review Required
+        comment_body = """## Review Blocked - Human Review Required
 
 The automated review identified **3 blocking issue(s)** that require human attention.
 """
@@ -279,7 +279,7 @@ The automated review identified **3 blocking issue(s)** that require human atten
 
     def test_detect_max_iterations_escalation(self):
         """Test: Detect escalation from 'Max Review Iterations' comment"""
-        comment_body = """## ⚠️ Max Review Iterations Reached
+        comment_body = """## Max Review Iterations Reached
 
 The automated review cycle has reached the maximum iterations (3) without approval.
 """
@@ -298,7 +298,7 @@ The automated review cycle has reached the maximum iterations (3) without approv
             },
             {
                 'author': 'orchestrator-bot',
-                'body': '## 🚫 Review Blocked - Human Review Required',
+                'body': '## Review Blocked - Human Review Required',
                 'created_at': datetime(2025, 10, 3, 10, 5, 0, tzinfo=timezone.utc)
             },
             {
@@ -354,7 +354,7 @@ The automated review cycle has reached the maximum iterations (3) without approv
             },
             {
                 'author': 'orchestrator-bot',
-                'body': '## 🚫 Review Blocked - Human Review Required',
+                'body': '## Review Blocked - Human Review Required',
                 'created_at': datetime(2025, 10, 3, 10, 5, 0, tzinfo=timezone.utc)
             },
             {
@@ -428,7 +428,7 @@ class TestMultipleEscalations:
         timeline = [
             {
                 'author': 'orchestrator-bot',
-                'body': '## 🚫 Review Blocked - First escalation',
+                'body': '## Review Blocked - First escalation',
                 'created_at': datetime(2025, 10, 3, 10, 0, 0, tzinfo=timezone.utc)
             },
             {
@@ -438,7 +438,7 @@ class TestMultipleEscalations:
             },
             {
                 'author': 'orchestrator-bot',
-                'body': '## 🚫 Review Blocked - Second escalation',
+                'body': '## Review Blocked - Second escalation',
                 'created_at': datetime(2025, 10, 3, 10, 10, 0, tzinfo=timezone.utc)
             },
             {
