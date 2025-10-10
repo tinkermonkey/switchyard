@@ -244,6 +244,41 @@ AGG_AGENT_PERFORMANCE = {
 }
 
 
+# ILM Policy for review outcomes (monthly rotation, 12-month retention)
+REVIEW_OUTCOMES_ILM_POLICY = {
+    "policy": {
+        "phases": {
+            "hot": {
+                "min_age": "0ms",
+                "actions": {
+                    "rollover": {
+                        "max_age": "30d",
+                        "max_size": "5gb"
+                    },
+                    "set_priority": {
+                        "priority": 100
+                    }
+                }
+            },
+            "warm": {
+                "min_age": "30d",
+                "actions": {
+                    "set_priority": {
+                        "priority": 50
+                    }
+                }
+            },
+            "delete": {
+                "min_age": "365d",  # Keep review outcomes for 1 year
+                "actions": {
+                    "delete": {}
+                }
+            }
+        }
+    }
+}
+
+
 def setup_review_learning_indices(es_client):
     """
     Setup all Elasticsearch indices for review learning system.
@@ -251,6 +286,12 @@ def setup_review_learning_indices(es_client):
     Args:
         es_client: Elasticsearch client instance
     """
+    # Create ILM policy for review outcomes (12-month retention)
+    es_client.ilm.put_lifecycle(
+        name="review-outcomes-lifecycle",
+        body=REVIEW_OUTCOMES_ILM_POLICY
+    )
+    
     # Create index template for review outcomes (monthly rotation)
     es_client.indices.put_index_template(
         name="review-outcomes-template",

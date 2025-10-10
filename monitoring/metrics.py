@@ -44,18 +44,62 @@ class MetricsCollector:
             logger.info("MetricsCollector initialized (JSON logging only)")
     
     def _create_index_templates(self):
-        """Create index templates for metrics indices"""
+        """Create index templates for metrics indices with ILM policies"""
         try:
-            # Task metrics template
+            # First, create the ILM policy for metrics (90-day retention)
+            ilm_policy = {
+                "policy": {
+                    "phases": {
+                        "hot": {
+                            "min_age": "0ms",
+                            "actions": {
+                                "rollover": {
+                                    "max_age": "1d",
+                                    "max_size": "5gb"
+                                },
+                                "set_priority": {
+                                    "priority": 100
+                                }
+                            }
+                        },
+                        "warm": {
+                            "min_age": "7d",
+                            "actions": {
+                                "set_priority": {
+                                    "priority": 50
+                                }
+                            }
+                        },
+                        "delete": {
+                            "min_age": "90d",
+                            "actions": {
+                                "delete": {}
+                            }
+                        }
+                    }
+                }
+            }
+            
+            # Create or update ILM policy
+            self.es.ilm.put_lifecycle(
+                name="orchestrator-metrics-policy",
+                body=ilm_policy
+            )
+            logger.info("Created ILM policy: orchestrator-metrics-policy (90-day retention)")
+            
+            # Task metrics template with ILM policy
             task_template = {
                 "index_patterns": ["orchestrator-task-metrics-*"],
                 "template": {
                     "settings": {
                         "number_of_shards": 1,
-                        "number_of_replicas": 0
+                        "number_of_replicas": 0,
+                        "index.lifecycle.name": "orchestrator-metrics-policy",
+                        "index.lifecycle.rollover_alias": "orchestrator-task-metrics"
                     },
                     "mappings": {
                         "properties": {
+                            "@timestamp": {"type": "date"},
                             "timestamp": {"type": "date"},
                             "agent": {"type": "keyword"},
                             "duration": {"type": "float"},
@@ -65,16 +109,19 @@ class MetricsCollector:
                 }
             }
             
-            # Quality metrics template
+            # Quality metrics template with ILM policy
             quality_template = {
                 "index_patterns": ["orchestrator-quality-metrics-*"],
                 "template": {
                     "settings": {
                         "number_of_shards": 1,
-                        "number_of_replicas": 0
+                        "number_of_replicas": 0,
+                        "index.lifecycle.name": "orchestrator-metrics-policy",
+                        "index.lifecycle.rollover_alias": "orchestrator-quality-metrics"
                     },
                     "mappings": {
                         "properties": {
+                            "@timestamp": {"type": "date"},
                             "timestamp": {"type": "date"},
                             "agent": {"type": "keyword"},
                             "metric_name": {"type": "keyword"},
@@ -89,15 +136,16 @@ class MetricsCollector:
                 name="orchestrator-task-metrics",
                 body=task_template
             )
+            logger.info("Created index template: orchestrator-task-metrics (with ILM policy)")
             
             self.es.indices.put_index_template(
                 name="orchestrator-quality-metrics",
                 body=quality_template
             )
+            logger.info("Created index template: orchestrator-quality-metrics (with ILM policy)")
             
-            logger.info("Created Elasticsearch index templates for metrics")
         except Exception as e:
-            logger.warning(f"Failed to create index templates: {e}")
+            logger.warning(f"Failed to create index templates or ILM policy: {e}")
         
     def record_task_start(self, agent: str):
         """Record task start (no-op, kept for compatibility)"""

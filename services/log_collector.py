@@ -109,6 +109,13 @@ class LogCollector:
         logger.info("Setting up Elasticsearch indices...")
 
         try:
+            # Create ILM policy for agent logs (90-day retention)
+            self.es.ilm.put_lifecycle(
+                name="agent-logs-ilm-policy",
+                body=AGENT_LOGS_ILM_POLICY
+            )
+            logger.info("Created ILM policy: agent-logs-ilm-policy (90-day retention)")
+            
             # Create index templates for both new indices
             self.es.indices.put_index_template(
                 name="agent-events-template",
@@ -122,12 +129,12 @@ class LogCollector:
             )
             logger.info("Created index template: claude-streams-template")
 
-            # Keep old template for migration period
+            # Keep old template for migration period (with ILM policy)
             self.es.indices.put_index_template(
                 name="agent-logs-template",
                 body=AGENT_LOGS_TEMPLATE
             )
-            logger.info("Created index template: agent-logs-template (legacy)")
+            logger.info("Created index template: agent-logs-template (legacy, with ILM policy)")
 
             # Create today's indices for both types
             today_events = get_index_name(event_category='agent_lifecycle')

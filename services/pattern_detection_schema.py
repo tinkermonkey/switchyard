@@ -117,7 +117,10 @@ AGENT_LOGS_MAPPING = {
         "index": {
             "number_of_shards": 1,
             "number_of_replicas": 0,  # Single node, no replicas needed
-            "refresh_interval": "5s"
+            "refresh_interval": "5s",
+            "lifecycle": {
+                "name": "agent-logs-ilm-policy"
+            }
         }
     }
 }
@@ -192,7 +195,10 @@ AGENT_EVENTS_MAPPING = {
         "index": {
             "number_of_shards": 1,
             "number_of_replicas": 0,
-            "refresh_interval": "5s"
+            "refresh_interval": "5s",
+            "lifecycle": {
+                "name": "agent-logs-ilm-policy"
+            }
         }
     }
 }
@@ -220,7 +226,10 @@ CLAUDE_STREAMS_MAPPING = {
         "index": {
             "number_of_shards": 1,
             "number_of_replicas": 0,
-            "refresh_interval": "10s"  # Can be slower for streaming logs
+            "refresh_interval": "10s",  # Can be slower for streaming logs
+            "lifecycle": {
+                "name": "agent-logs-ilm-policy"
+            }
         }
     }
 }
@@ -245,7 +254,10 @@ PIPELINE_RUNS_MAPPING = {
         "index": {
             "number_of_shards": 1,
             "number_of_replicas": 0,
-            "refresh_interval": "5s"
+            "refresh_interval": "5s",
+            "lifecycle": {
+                "name": "agent-logs-ilm-policy"
+            }
         }
     }
 }
