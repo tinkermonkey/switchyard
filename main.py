@@ -42,7 +42,7 @@ async def main():
 
     root_logger.info("=== Orchestrator starting up ===")
 
-    metrics = MetricsCollector(port=env_config.metrics_port)
+    metrics = MetricsCollector()
 
     # Initialize state management
     state_manager = StateManager(Path("orchestrator_data/state"))

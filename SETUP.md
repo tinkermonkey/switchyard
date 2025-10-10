@@ -350,11 +350,11 @@ LOG_LEVEL=DEBUG python main.py
 
 ### Health Checks
 ```bash
-# Check task queue
-curl http://localhost:9090/metrics
+# Check metrics are being recorded
+cat orchestrator_data/metrics/task_metrics_$(date +%Y-%m-%d).jsonl
 
-# Check individual agents
-curl http://localhost:8080/health
+# Check web UI
+curl http://localhost:3000
 ```
 
 ### Common Issues
@@ -434,7 +434,7 @@ ANTHROPIC_API_KEY=your_key
 
 ### Monitoring Setup
 
-- **Metrics**: Prometheus endpoint on port 9090
+- **Metrics**: JSON logs in `orchestrator_data/metrics/`
 - **Logs**: Structured JSON logging to stdout
 - **Health Checks**: HTTP endpoint at `/health`
 - **Alerts**: Configure based on task failure rates

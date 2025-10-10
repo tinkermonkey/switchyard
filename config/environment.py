@@ -54,7 +54,6 @@ class Environment(BaseSettings):
     orchestrator_root: Path = Path.cwd()
 
     # Monitoring
-    metrics_port: int = 8000
     log_level: str = "INFO"
 
     # Docker/Host Configuration (used by docker-compose for file permissions)

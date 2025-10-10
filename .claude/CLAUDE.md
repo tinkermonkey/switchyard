@@ -435,19 +435,34 @@ curl -X POST http://localhost:5001/agents/kill/<container_name>
 
 ### Metrics
 
-Prometheus metrics are exposed on port 8000 (configurable via `METRICS_PORT`):
+Task execution and quality metrics are written to **Elasticsearch indices** with JSON file backup:
+
+**Elasticsearch Indices:**
+- `orchestrator-task-metrics-YYYY.MM.DD` - Task execution (agent, duration, success)
+- `orchestrator-quality-metrics-YYYY.MM.DD` - Quality scores (agent, metric_name, score)
+
+**Query Examples:**
 ```bash
-# View Prometheus metrics
-curl http://localhost:8000/metrics
+# Recent task metrics
+curl -s "http://localhost:9200/orchestrator-task-metrics-*/_search?size=10&sort=@timestamp:desc" | jq '.hits.hits[]._source'
+
+# Success rate by agent
+curl -s "http://localhost:9200/orchestrator-task-metrics-*/_search" -H 'Content-Type: application/json' -d '{
+  "size": 0,
+  "aggs": {
+    "by_agent": {
+      "terms": {"field": "agent"},
+      "aggs": {"success_rate": {"avg": {"field": "success"}}}
+    }
+  }
+}' | jq '.aggregations.by_agent.buckets'
 ```
 
-**Available Metrics**:
-- `tasks_total{agent, status}` - Total tasks processed (success/failure)
-- `task_duration_seconds{agent}` - Task execution duration histogram
-- `active_tasks{agent}` - Currently active tasks gauge
-- `pipeline_health` - Overall pipeline health score (0-100)
-
-Quality metrics are also logged to `orchestrator_data/metrics/quality_metrics_<date>.jsonl`
+**JSON Backup Files:**
+```bash
+cat orchestrator_data/metrics/task_metrics_<date>.jsonl
+cat orchestrator_data/metrics/quality_metrics_<date>.jsonl
+```
 
 ## Troubleshooting
 
