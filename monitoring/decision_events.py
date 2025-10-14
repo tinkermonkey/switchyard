@@ -957,6 +957,227 @@ class DecisionEventEmitter:
             }
         )
 
+    def emit_branch_reused(
+        self,
+        project: str,
+        issue_number: int,
+        branch_name: str,
+        confidence: float,
+        match_reason: str,
+        parent_issue: Optional[int] = None
+    ):
+        """
+        Emit event when existing branch is reused
+        
+        Args:
+            project: Project name
+            issue_number: Issue number
+            branch_name: Branch being reused
+            confidence: Match confidence (0.0 to 1.0)
+            match_reason: Why this branch was selected
+            parent_issue: Parent issue number if this is a sub-issue
+        """
+        task_id = f"branch_management_{project}_{issue_number}"
+        
+        self.obs.emit(
+            EventType.BRANCH_REUSED,
+            agent="orchestrator",
+            task_id=task_id,
+            project=project,
+            data={
+                'decision_category': 'branch_management',
+                'issue_number': issue_number,
+                'parent_issue': parent_issue,
+                'inputs': {
+                    'existing_branch': branch_name,
+                    'confidence': confidence
+                },
+                'decision': {
+                    'action': 'reuse_existing_branch',
+                    'branch_name': branch_name
+                },
+                'reason': match_reason,
+                'reasoning_data': {
+                    'confidence_score': confidence,
+                    'match_type': match_reason
+                }
+            }
+        )
+    
+    def emit_branch_created(
+        self,
+        project: str,
+        issue_number: int,
+        branch_name: str,
+        reason: str,
+        parent_issue: Optional[int] = None,
+        is_standalone: bool = True
+    ):
+        """
+        Emit event when new branch is created
+        
+        Args:
+            project: Project name
+            issue_number: Issue number
+            branch_name: New branch name
+            reason: Why new branch was created
+            parent_issue: Parent issue number if feature branch
+            is_standalone: Whether this is a standalone branch
+        """
+        task_id = f"branch_management_{project}_{issue_number}"
+        
+        branch_type = "standalone" if is_standalone else "feature"
+        
+        self.obs.emit(
+            EventType.BRANCH_CREATED,
+            agent="orchestrator",
+            task_id=task_id,
+            project=project,
+            data={
+                'decision_category': 'branch_management',
+                'issue_number': issue_number,
+                'parent_issue': parent_issue,
+                'inputs': {
+                    'is_standalone': is_standalone,
+                    'has_parent': parent_issue is not None
+                },
+                'decision': {
+                    'action': 'create_new_branch',
+                    'branch_name': branch_name,
+                    'branch_type': branch_type
+                },
+                'reason': reason
+            }
+        )
+    
+    def emit_branch_selection_escalated(
+        self,
+        project: str,
+        issue_number: int,
+        confidence: float,
+        candidate_branches: List[Dict[str, Any]],
+        reason: str
+    ):
+        """
+        Emit event when branch selection is escalated to human
+        
+        Args:
+            project: Project name
+            issue_number: Issue number
+            confidence: Best match confidence
+            candidate_branches: List of candidate branches with confidence
+            reason: Why escalation was needed
+        """
+        task_id = f"branch_management_{project}_{issue_number}"
+        
+        self.obs.emit(
+            EventType.BRANCH_SELECTION_ESCALATED,
+            agent="orchestrator",
+            task_id=task_id,
+            project=project,
+            data={
+                'decision_category': 'branch_management',
+                'issue_number': issue_number,
+                'inputs': {
+                    'best_confidence': confidence,
+                    'candidate_count': len(candidate_branches),
+                    'candidates': candidate_branches[:3]  # Top 3
+                },
+                'decision': {
+                    'action': 'escalate_to_human',
+                    'waiting_for': 'human_decision'
+                },
+                'reason': reason
+            }
+        )
+    
+    def emit_branch_conflict_detected(
+        self,
+        project: str,
+        issue_number: int,
+        branch_name: str,
+        conflicting_files: List[str],
+        parent_issue: Optional[int] = None
+    ):
+        """
+        Emit event when merge conflict is detected
+        
+        Args:
+            project: Project name
+            issue_number: Issue number
+            branch_name: Branch with conflict
+            conflicting_files: List of files with conflicts
+            parent_issue: Parent issue number if applicable
+        """
+        task_id = f"branch_management_{project}_{issue_number}"
+        
+        self.obs.emit(
+            EventType.BRANCH_CONFLICT_DETECTED,
+            agent="orchestrator",
+            task_id=task_id,
+            project=project,
+            data={
+                'decision_category': 'branch_management',
+                'issue_number': issue_number,
+                'parent_issue': parent_issue,
+                'branch_name': branch_name,
+                'inputs': {
+                    'conflicting_files': conflicting_files,
+                    'conflict_count': len(conflicting_files)
+                },
+                'decision': {
+                    'action': 'escalate_merge_conflict',
+                    'requires_human_resolution': True
+                },
+                'reason': f"Merge conflict detected in {len(conflicting_files)} file(s) during git pull --rebase"
+            }
+        )
+    
+    def emit_branch_stale_detected(
+        self,
+        project: str,
+        issue_number: int,
+        branch_name: str,
+        commits_behind: int,
+        action_taken: str,
+        parent_issue: Optional[int] = None
+    ):
+        """
+        Emit event when stale branch is detected
+        
+        Args:
+            project: Project name
+            issue_number: Issue number
+            branch_name: Stale branch name
+            commits_behind: Number of commits behind main
+            action_taken: Action taken (warn, escalate, continue)
+            parent_issue: Parent issue number if applicable
+        """
+        task_id = f"branch_management_{project}_{issue_number}"
+        
+        severity = "critical" if commits_behind > 50 else "warning" if commits_behind > 20 else "info"
+        
+        self.obs.emit(
+            EventType.BRANCH_STALE_DETECTED,
+            agent="orchestrator",
+            task_id=task_id,
+            project=project,
+            data={
+                'decision_category': 'branch_management',
+                'issue_number': issue_number,
+                'parent_issue': parent_issue,
+                'branch_name': branch_name,
+                'inputs': {
+                    'commits_behind_main': commits_behind,
+                    'severity': severity
+                },
+                'decision': {
+                    'action': action_taken
+                },
+                'reason': f"Branch is {commits_behind} commits behind main ({severity} threshold)"
+            }
+        )
+
 
 # Singleton getter for convenience
 _decision_event_emitter: Optional[DecisionEventEmitter] = None

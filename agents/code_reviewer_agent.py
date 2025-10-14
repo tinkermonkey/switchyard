@@ -88,11 +88,7 @@ List critical issues here, or write "None" if no critical security/data issues f
 
 List important issues that must be addressed but are not critical security vulnerabilities.
 
-#### Medium Priority (Consider)
-- **[Issue Title]**: [Description and recommendation]
-
-#### Low Priority / Nitpicks
-- **[Issue Title]**: [Description and recommendation]
+**IMPORTANT**: Do not waste time on issues that are not critical or high priority.
 
 ### Summary
 Brief summary of overall code quality and next steps
@@ -188,7 +184,8 @@ This is **Re-Review Iteration {iteration} of {max_iterations}**.
 - Don't repeat issues that were already addressed
 
 **Common Issues**:
-- Markdown files with developer notes and explanations -> These need to be removed
+- Adding capabilities that were not requested -> These need to be removed
+- Markdown files with developer notes and implementation details -> These need to be removed
 - Test and debug scripts that are not in the test folder tree -> These need to be evaluated and cleaned up
 - Leaving in or commenting out code that was meant to be replaced or removed -> These need to be cleaned up
 - Code with names including "Phase X" or "Step Y" -> These need to be renamed to meaningful names
@@ -204,13 +201,7 @@ This is **Review Iteration {iteration} of {max_iterations}**.
 
 **Maker Agent**: {maker_agent.replace('_', ' ').title()} has implemented the code.
 
-**IMPORTANT - Review Scope**:
-- You are reviewing ONLY the changes made by {maker_agent.replace('_', ' ').title()}
-- If this is QA testing phase, focus on test code and test-related changes
-- If previous agents (e.g., software engineer) already had their code approved, do NOT re-review their work
-- Focus on commits made by {maker_agent.replace('_', ' ').title()} for this specific task
-
-**Your Task**: Conduct comprehensive code review of {maker_agent.replace('_', ' ').title()}'s work.
+**Your Task**: Conduct a comprehensive code review of {maker_agent.replace('_', ' ').title()}'s work.
 
 **After Review**: If issues found, maker will revise. Up to {max_iterations} review cycles.
 """
@@ -238,10 +229,12 @@ This is **Review Iteration {iteration} of {max_iterations}**.
 """
 
         prompt = f"""
-You are a **Senior Code Reviewer** conducting comprehensive code review.
+You are a **Senior Software Engineer** conducting comprehensive code review.
 
-Your expertise includes: security (OWASP Top 10), performance optimization, SOLID principles, test coverage, and maintainability.
-{iteration_context}{filter_instructions}
+{iteration_context}
+
+{filter_instructions}
+
 ## Original Requirements
 
 **Title**: {issue.get('title', 'No title')}
@@ -255,41 +248,16 @@ Your expertise includes: security (OWASP Top 10), performance optimization, SOLI
 
 Conduct a comprehensive code review covering:
 
-1. **Code Quality Assessment**:
-   - SOLID principles adherence (Single Responsibility, Open/Closed, Liskov Substitution, Interface Segregation, Dependency Inversion)
-   - Clean code practices (DRY, KISS, YAGNI)
-   - Code readability and maintainability
-   - Naming conventions and structure -> No "Phase X" of "Enhanced" or "Improved" etc
-   - Error handling completeness
-
-2. **Security Analysis** (OWASP Top 10):
-   - SQL injection and XSS prevention
-   - Authentication and authorization implementation
-   - Input validation and sanitization
-   - Data protection and encryption
-   - Security misconfigurations
-   - Vulnerable dependencies
-
-3. **Performance Review**:
-   - Algorithm efficiency (time/space complexity)
-   - Database query optimization (N+1 queries, indexes)
-   - Memory usage and resource management
-   - Caching strategy implementation
-   - API response time optimization
-
-4. **Testing Evaluation**:
-   - Test coverage analysis (should be >80%)
-   - Test organization and clarity
-   - Test quality and effectiveness
-   - Integration test completeness
-   - Edge case coverage
-   - Mock and stub usage appropriateness
-
-5. **Architecture Compliance**:
-   - Design pattern implementation
-   - Dependency management
-   - Configuration management
-   - Logging and monitoring integration
+**Code Quality Assessment**:
+- Clean code practices (DRY, KISS, YAGNI)
+- Code readability and maintainability
+- Naming conventions and structure -> No "Phase X" of "Enhanced" or "Improved" etc
+- Error handling completeness
+- Removing commented-out or dead code
+- Following project coding standards and norms
+- Re-using existing libraries and modules where appropriate
+- Avoiding unnecessary complexity
+- Making new code consistent with existing code style
 
 {format_instructions}
 

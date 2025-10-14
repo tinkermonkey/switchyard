@@ -738,6 +738,76 @@ class DockerAgentRunner:
         except Exception as e:
             logger.warning(f"Failed to cleanup container {container_name}: {e}")
 
+    @staticmethod
+    def cleanup_orphaned_redis_keys():
+        """
+        Clean up Redis tracking keys for containers that no longer exist.
+
+        This is called on orchestrator startup to handle cases where:
+        - Orchestrator was restarted while agents were running
+        - Containers finished after orchestrator restart
+        - Redis keys were never cleaned up because finally blocks didn't execute
+        """
+        try:
+            import redis
+            redis_client = redis.Redis(host='redis', port=6379, decode_responses=True)
+
+            # Get all agent container tracking keys
+            agent_keys = redis_client.keys('agent:container:*')
+
+            if not agent_keys:
+                logger.info("No agent container tracking keys found in Redis")
+                return
+
+            logger.info(f"Checking {len(agent_keys)} agent container tracking keys for orphans")
+
+            cleaned_count = 0
+            for key in agent_keys:
+                try:
+                    # Get container name from Redis
+                    container_info = redis_client.hgetall(key)
+                    container_name = container_info.get('container_name')
+
+                    if not container_name:
+                        # Invalid tracking key, remove it
+                        redis_client.delete(key)
+                        cleaned_count += 1
+                        logger.info(f"Removed invalid tracking key: {key}")
+                        continue
+
+                    # Check if container exists
+                    result = subprocess.run(
+                        ['docker', 'ps', '-a', '--filter', f'name={container_name}', '--format', '{{.Names}}'],
+                        capture_output=True,
+                        text=True,
+                        timeout=5
+                    )
+
+                    if result.returncode == 0:
+                        # Parse output to see if container exists
+                        existing_containers = [line.strip() for line in result.stdout.strip().split('\n') if line.strip()]
+
+                        if container_name not in existing_containers:
+                            # Container doesn't exist, remove tracking key
+                            redis_client.delete(key)
+                            cleaned_count += 1
+                            logger.info(f"Cleaned up orphaned tracking key for non-existent container: {container_name}")
+                        else:
+                            logger.debug(f"Container {container_name} still exists, keeping tracking key")
+
+                except subprocess.TimeoutExpired:
+                    logger.warning(f"Timeout checking container existence for {key}")
+                except Exception as e:
+                    logger.warning(f"Error checking container {key}: {e}")
+
+            if cleaned_count > 0:
+                logger.info(f"Cleaned up {cleaned_count} orphaned container tracking keys")
+            else:
+                logger.info("No orphaned container tracking keys found")
+
+        except Exception as e:
+            logger.error(f"Error during orphaned Redis key cleanup: {e}")
+
 
 # Global instance
 docker_runner = DockerAgentRunner()

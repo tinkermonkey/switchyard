@@ -17,6 +17,7 @@ from elasticsearch import Elasticsearch, helpers
 from services.pattern_detection_schema import (
     AGENT_LOGS_MAPPING,
     AGENT_LOGS_TEMPLATE,
+    AGENT_LOGS_ILM_POLICY,
     AGENT_EVENTS_TEMPLATE,
     CLAUDE_STREAMS_TEMPLATE,
     get_index_name,
@@ -109,12 +110,12 @@ class LogCollector:
         logger.info("Setting up Elasticsearch indices...")
 
         try:
-            # Create ILM policy for agent logs (90-day retention)
+            # Create ILM policy for agent logs (7-day retention)
             self.es.ilm.put_lifecycle(
                 name="agent-logs-ilm-policy",
                 body=AGENT_LOGS_ILM_POLICY
             )
-            logger.info("Created ILM policy: agent-logs-ilm-policy (90-day retention)")
+            logger.info("Created ILM policy: agent-logs-ilm-policy (7-day retention)")
             
             # Create index templates for both new indices
             self.es.indices.put_index_template(

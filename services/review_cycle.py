@@ -1847,6 +1847,7 @@ class ReviewCycleExecutor:
             'trigger': 'review_cycle',
             'workspace_type': cycle_state.workspace_type,
             'discussion_id': cycle_state.discussion_id,
+            'pipeline_run_id': cycle_state.pipeline_run_id,  # Include pipeline run ID for event tracking
             'review_cycle': {
                 'iteration': iteration,
                 'max_iterations': cycle_state.max_iterations,
@@ -1886,6 +1887,7 @@ class ReviewCycleExecutor:
             'trigger': 'review_cycle_revision',  # Specific trigger for review cycle revisions
             'workspace_type': cycle_state.workspace_type,
             'discussion_id': cycle_state.discussion_id,
+            'pipeline_run_id': cycle_state.pipeline_run_id,  # Include pipeline run ID for event tracking
             'review_cycle': {
                 'iteration': iteration,
                 'max_iterations': cycle_state.max_iterations,

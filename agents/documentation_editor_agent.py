@@ -1,11 +1,11 @@
 from typing import Dict, Any, List
-from agents.base_maker_agent import MakerAgent
+from agents.base_analysis_agent import AnalysisAgent
 import logging
 
 logger = logging.getLogger(__name__)
 
 
-class DocumentationEditorAgent(MakerAgent):
+class DocumentationEditorAgent(AnalysisAgent):
     """
     Documentation Editor agent for refining and improving documentation.
 

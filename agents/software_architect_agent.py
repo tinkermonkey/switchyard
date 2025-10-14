@@ -1,11 +1,11 @@
 from typing import Dict, Any, List
-from agents.base_maker_agent import MakerAgent
+from agents.base_analysis_agent import AnalysisAgent
 import logging
 
 logger = logging.getLogger(__name__)
 
 
-class SoftwareArchitectAgent(MakerAgent):
+class SoftwareArchitectAgent(AnalysisAgent):
     """
     Software Architect agent for system architecture design.
 
@@ -33,11 +33,8 @@ class SoftwareArchitectAgent(MakerAgent):
         return [
             "System Architecture",
             "Scalability Design",
-            "Performance Architecture",
-            "Security Architecture",
-            "Maintainability Design",
-            "Technology Decisions",
-            "Architecture Decision Records (ADRs)",
+            "Established Patterns",
+            "Component Reuse",
             "Implementation Plan"
         ]
 
@@ -47,9 +44,12 @@ class SoftwareArchitectAgent(MakerAgent):
 
     def get_quality_standards(self) -> str:
         return """
-- Architecture patterns are appropriate for the problem domain
+- Architecture patterns are appropriate for the problem domain and the application
 - Scalability considerations are clearly defined
 - Security best practices are incorporated
 - Technology choices are justified with ADRs
 - Design supports maintainability and testability
+- No unnecessary complexity is introduced
+- No over-engineering is present
+- No new design patterns that are not important to the project
 """

@@ -201,14 +201,19 @@ Business Analyst's Output:
 {previous_stage}
 {feedback_prompt}
 
-IMPORTANT: Output your review as text directly in your response. DO NOT create any files. This review will be posted to GitHub as a comment.
+**IMPORTANT - OUTPUT FORMAT**:
+- Output your review as text directly in your response
+- DO NOT create any files - this review will be posted to GitHub as a comment
+- **START IMMEDIATELY** with "### Status" - no preambles or introductory text
+- **NO CONVERSATIONAL DIALOG**: Do NOT include planning statements like "I'll review...", "Let me check...", "Now let me...", etc.
+- **NO TOOL USAGE COMMENTARY**: Do not narrate what tools you're using or what you're searching for
+- Your response should begin directly with the review format shown below
 
 Provide a comprehensive review focusing on:
-1. **Completeness**: Are all functional and non-functional requirements captured?
-2. **Clarity**: Are requirements clear and unambiguous?
-3. **Testability**: Can each requirement be verified/tested?
-4. **Consistency**: Do requirements align and avoid contradictions?
-5. **User Stories**: Do they follow INVEST principles with proper acceptance criteria?
+1. **Simplicity**: Do the requirements avoid unnecessary complexity?
+2. **Clarity**: Are the requirements clearly and unambiguously stated?
+3. **Completeness**: Are all aspects of the issue addressed?
+4. **Context awareness**: Do the requirements consider the broader project context? Do they align with project goals and constraints? Do they reuse existing components where possible?
 
 Use the web search tool and any MCP servers if needed to validate requirements as well as your feedback.
 

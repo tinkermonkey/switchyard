@@ -25,15 +25,12 @@ class SeniorSoftwareEngineerAgent(MakerAgent):
 
     @property
     def agent_role_description(self) -> str:
-        return "I implement clean, well thought out code following SOLID principles, DRY, KISS, and YAGNI, with comprehensive test coverage (>80%), proper error handling, and maintainable architecture."
+        return "I implement clean, well thought out code with proper error handling and maintainable architecture."
 
     @property
     def output_sections(self) -> List[str]:
         return [
-            "Core Implementation",
-            "Code Quality",
-            "Testing Implementation",
-            "Performance Considerations"
+            "Implementation"
         ]
 
     # ==================================================================================
@@ -42,48 +39,14 @@ class SeniorSoftwareEngineerAgent(MakerAgent):
 
     def get_quality_standards(self) -> str:
         return """
-- Code follows SOLID principles (Single Responsibility, Open/Closed, Liskov Substitution, Interface Segregation, Dependency Inversion)
-- Test coverage >80% with unit, integration, and edge case tests
 - Proper error handling and logging
 - Clear variable/function naming
-- Performance optimized for the use case
 """
 
     def get_initial_guidelines(self) -> str:
         """Override to provide code implementation guidelines"""
         return """
-## Implementation Guidelines
-
-**CRITICAL**: You are implementing actual code, NOT writing analysis documents. If the environment doesn't work or something doesn't makes sense, stop and ask for help.
-
-### Your Task:
-1. **READ existing code** to understand the codebase structure
-2. **WRITE new code files** or **EDIT existing files** to implement the requirements
-3. **CREATE test files** with comprehensive test coverage
-4. **UPDATE configuration** files as needed
-5. **DELETE dead code** and unnecessary files
-
-### Tools Available:
-- `Read` - Read existing files to understand patterns
-- `Write` - Create new files for implementation
-- `Edit` - Modify existing files
-- `Bash` - Run tests, check syntax, verify installation
-- `Git` - Commit changes to a feature branch, investigate code history
-- `Serena MCP` - Use for learning about the code base
-- `Puppeteer MCP` - Test web UI changes if applicable
-
-### File Creation Requirements:
-- Place files in the correct directory structure
-- Follow existing naming conventions
-- Include docstrings and comments
-
-### Success Criteria:
-- New/modified files exist in the repository
-- Code is syntactically correct
-- Tests are included and pass
-- Implementation matches requirements
-
-**OUTPUT FORMAT**: After implementing, provide a brief summary of what you did (2-3 sentences) and list the files you created/modified.
+Implement the code changes to meet the requirements specified.
 """
 
     def _build_initial_prompt(self, task_context: Dict[str, Any]) -> str:
@@ -91,6 +54,11 @@ class SeniorSoftwareEngineerAgent(MakerAgent):
         issue = task_context.get('issue', {})
         project = task_context.get('project', 'unknown')
         previous_stage = task_context.get('previous_stage_output', '')
+        direct_prompt = task_context.get('direct_prompt', '')
+
+        # Drop out if direct prompt provided
+        if direct_prompt:
+            return direct_prompt
 
         previous_stage_prompt = ""
         if previous_stage:
@@ -104,15 +72,7 @@ to their feedback and address all issues they identified.
 
 {previous_stage}
 
-IMPORTANT: Review all feedback carefully and address every issue raised.
-"""
-
-        quality_standards = self.get_quality_standards()
-        quality_section = f"""
-## Quality Standards
-
-Your implementation must meet these standards:
-{quality_standards}
+IMPORTANT: Review all feedback carefully and address every issue that is not already addressed.
 """
 
         prompt = f"""
@@ -120,34 +80,12 @@ You are a {self.agent_display_name}.
 
 {self.agent_role_description}
 
-## Task: Code Implementation
+**Issue Title**: {issue.get('title', 'No title')}
 
-Implement the following requirement for project {project}:
+**Description**:
+{issue.get('body', 'No description')}
 
-**Title**: {issue.get('title', 'No title')}
-**Description**: {issue.get('body', 'No description')}
-**Labels**: {issue.get('labels', [])}
 {previous_stage_prompt}
-{quality_section}
-
-{self.get_initial_guidelines()}
-
-**CRITICAL INSTRUCTIONS**:
-- You are running in a Docker container with the project mounted at `/workspace/`
-- You HAVE WRITE ACCESS to `/workspace/` - write all code changes there
-- DO NOT write to `/tmp` or any other directory - use `/workspace/` only
-- Read existing code first to understand patterns and structure
-- Create both implementation AND test files in `/workspace/`
-- Verify your code by reading it back after writing
-- Your changes will be automatically committed to a feature branch upon completion
-
-**Working Directory**: `/workspace/` (the project root with READ-WRITE access)
-
-**Expected Deliverables**:
-1. Implementation files (Python, JS, etc.)
-2. Test files with >80% coverage
-3. Updated configuration if needed
-4. Brief markdown summary listing files created/modified
 
 """
         return prompt

@@ -30,6 +30,15 @@ es_client = Elasticsearch(['http://elasticsearch:9200'])
 # Track connected clients
 connected_clients = set()
 
+# Track Redis subscriber health
+subscriber_health = {
+    'is_running': False,
+    'last_message_time': None,
+    'messages_processed': 0,
+    'last_error': None,
+    'started_at': None
+}
+
 # Git branch data cache
 git_branch_cache = {}
 git_branch_cache_lock = threading.Lock()
@@ -77,6 +86,38 @@ def get_active_agents():
 
     except Exception as e:
         logger.error(f"Failed to get active agents: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/debug/test-pubsub', methods=['POST'])
+def test_pubsub():
+    """Test endpoint to publish a test message to Redis pub/sub"""
+    try:
+        redis_client = redis.Redis(host='redis', port=6379, decode_responses=True)
+        
+        test_event = {
+            'timestamp': datetime.utcnow().isoformat() + 'Z',
+            'event_id': 'test-' + str(time.time()),
+            'event_type': 'agent_completed',
+            'agent': 'test_agent',
+            'task_id': 'test_task',
+            'project': 'test_project',
+            'data': {'test': True, 'duration_ms': 1000}
+        }
+        
+        # Publish to agent events channel
+        result = redis_client.publish('orchestrator:agent_events', json.dumps(test_event))
+        
+        logger.info(f"Published test event to Redis pub/sub, {result} subscribers received it")
+        
+        return jsonify({
+            'success': True,
+            'message': f'Test event published to {result} subscribers',
+            'event': test_event,
+            'subscriber_health': subscriber_health
+        }), 200
+        
+    except Exception as e:
+        logger.error(f"Failed to publish test event: {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/agents/kill/<container_name>', methods=['POST'])
@@ -143,10 +184,14 @@ def health():
             return jsonify({
                 'status': 'starting',
                 'message': 'Orchestrator is starting, no health check completed yet',
-                'connected_clients': len(connected_clients)
+                'connected_clients': len(connected_clients),
+                'subscriber_health': subscriber_health
             }), 503
 
         health_data = json.loads(health_json)
+        
+        # Add subscriber health to response
+        health_data['subscriber_health'] = subscriber_health
 
         # Return the full health check data
         # Determine status: healthy, degraded, or unhealthy
@@ -592,7 +637,7 @@ def get_pipeline_run_events():
             agent_events_query = {
                 "query": {
                     "term": {
-                        "data.pipeline_run_id.keyword": pipeline_run_id
+                        "pipeline_run_id": pipeline_run_id
                     }
                 },
                 "sort": [{"timestamp": "asc"}],
@@ -686,6 +731,67 @@ def get_active_pipeline_runs():
         
     except Exception as e:
         logger.error(f"Error fetching active pipeline runs: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e),
+            'runs': []
+        }), 500
+
+@app.route('/completed-pipeline-runs')
+def get_completed_pipeline_runs():
+    """Get completed pipeline runs with pagination"""
+    try:
+        # Get pagination parameters
+        limit = int(request.args.get('limit', 10))
+        offset = int(request.args.get('offset', 0))
+        
+        # Cap limit to prevent excessive queries
+        limit = min(limit, 100)
+        
+        # Query Elasticsearch for completed pipeline runs
+        query = {
+            "query": {
+                "term": {
+                    "status": "completed"
+                }
+            },
+            "sort": [{"ended_at": "desc"}],
+            "from": offset,
+            "size": limit
+        }
+        
+        result = es_client.search(
+            index="pipeline-runs",
+            body=query
+        )
+        
+        runs = []
+        for hit in result['hits']['hits']:
+            run_data = hit['_source']
+            
+            # Calculate duration if both timestamps exist
+            if run_data.get('started_at') and run_data.get('ended_at'):
+                try:
+                    from datetime import datetime
+                    start = datetime.fromisoformat(run_data['started_at'].replace('Z', '+00:00'))
+                    end = datetime.fromisoformat(run_data['ended_at'].replace('Z', '+00:00'))
+                    duration = (end - start).total_seconds()
+                    run_data['duration'] = duration
+                except Exception as e:
+                    logger.warning(f"Error calculating duration: {e}")
+            
+            runs.append(run_data)
+        
+        return jsonify({
+            'success': True,
+            'runs': runs,
+            'count': len(runs),
+            'offset': offset,
+            'limit': limit
+        })
+        
+    except Exception as e:
+        logger.error(f"Error fetching completed pipeline runs: {e}")
         return jsonify({
             'success': False,
             'error': str(e),
@@ -950,9 +1056,7 @@ def get_available_agents():
         'success': True,
         'agents': [
             'requirements_reviewer',
-            'design_reviewer',
             'code_reviewer',
-            'test_reviewer',
             'qa_reviewer'
         ]
     })
@@ -1453,6 +1557,11 @@ def get_projects():
 
 def redis_subscriber_thread():
     """Background thread that listens to Redis pub/sub and broadcasts to WebSocket clients"""
+    global subscriber_health
+    
+    subscriber_health['is_running'] = True
+    subscriber_health['started_at'] = datetime.utcnow().isoformat() + 'Z'
+    
     try:
         # Connect to Redis
         redis_client = redis.Redis(
@@ -1467,11 +1576,22 @@ def redis_subscriber_thread():
 
         logger.info("Redis subscriber started, listening for agent events and Claude streams...")
 
+        # Add heartbeat counter for health monitoring
+        message_count = 0
+        
         for message in pubsub.listen():
             if message['type'] == 'message':
+                message_count += 1
+                subscriber_health['messages_processed'] = message_count
+                subscriber_health['last_message_time'] = datetime.utcnow().isoformat() + 'Z'
+                
                 try:
                     # Parse event
                     event_data = json.loads(message['data'])
+                    
+                    # Log every 10th message for health monitoring
+                    if message_count % 10 == 0:
+                        logger.debug(f"Redis subscriber health check: processed {message_count} messages")
 
                     # Route to appropriate websocket event based on channel
                     if message['channel'] == 'orchestrator:agent_events':
@@ -1497,19 +1617,37 @@ def redis_subscriber_thread():
                             socketio.emit('decision_event', event_data)
                             logger.debug(f"Broadcasted decision event: {event_type}")
                         else:
-                            # Regular agent events
+                            # Regular agent events (including lifecycle events)
                             socketio.emit('agent_event', event_data)
-                            logger.debug(f"Broadcasted agent event: {event_type}")
+                            
+                            # Log agent lifecycle events at INFO level for visibility
+                            if event_type in ['agent_initialized', 'agent_started', 'agent_completed', 'agent_failed']:
+                                logger.info(f"Broadcasted agent lifecycle event: {event_type} (agent={event_data.get('agent')}, task_id={event_data.get('task_id')})")
+                            else:
+                                logger.debug(f"Broadcasted agent event: {event_type}")
                     elif message['channel'] == 'orchestrator:claude_stream':
                         # Claude stream events
                         socketio.emit('claude_stream_event', event_data)
                         logger.debug(f"Broadcasted Claude stream event from {event_data.get('agent')}")
 
                 except Exception as e:
-                    logger.error(f"Error processing Redis message: {e}")
+                    error_msg = f"Error processing Redis message: {e}"
+                    logger.error(error_msg, exc_info=True)
+                    subscriber_health['last_error'] = error_msg
+            elif message['type'] == 'subscribe':
+                logger.info(f"Subscribed to Redis channel: {message['channel']}")
 
     except Exception as e:
-        logger.error(f"Redis subscriber error: {e}")
+        error_msg = f"Redis subscriber thread crashed: {e}"
+        logger.error(error_msg, exc_info=True)
+        subscriber_health['is_running'] = False
+        subscriber_health['last_error'] = error_msg
+        
+        # Try to restart the subscriber after a delay
+        import time
+        time.sleep(5)
+        logger.warning("Attempting to restart Redis subscriber thread...")
+        redis_subscriber_thread()
 
 def start_observability_server(host='0.0.0.0', port=5001):
     """Start the observability WebSocket server"""

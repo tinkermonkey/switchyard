@@ -652,16 +652,12 @@ class AgentCommentFormatter:
         agent_info = {
             'idea_researcher': ('🔬', 'Idea Research'),
             'business_analyst': ('📊', 'Business Analysis'),
-            'product_manager': ('🎯', 'Product Planning'),
             'requirements_reviewer': ('✅', 'Requirements Review'),
             'software_architect': ('🏗️', 'Architecture Design'),
-            'design_reviewer': ('👁️', 'Design Review'),
             'senior_software_engineer': ('💻', 'Implementation'),
             'code_reviewer': ('🔍', 'Code Review'),
             'senior_qa_engineer': ('🧪', 'QA Testing'),
             'qa_reviewer': ('✅', 'QA Review'),
-            'test_planner': ('📋', 'Test Planning'),
-            'test_reviewer': ('✔️', 'Test Review'),
             'technical_writer': ('📝', 'Documentation'),
             'documentation_editor': ('✏️', 'Documentation Review')
         }

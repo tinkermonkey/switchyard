@@ -13,7 +13,7 @@ Key responsibilities:
 """
 
 from typing import Dict, Any, List, Optional
-from agents.base_maker_agent import MakerAgent
+from agents.base_analysis_agent import AnalysisAgent
 from config.manager import ConfigManager
 from config.state_manager import GitHubStateManager
 import logging
@@ -23,7 +23,7 @@ import re
 logger = logging.getLogger(__name__)
 
 
-class WorkBreakdownAgent(MakerAgent):
+class WorkBreakdownAgent(AnalysisAgent):
     """
     Work Breakdown Agent for decomposing epics into phase-based sub-issues.
 
@@ -67,8 +67,8 @@ class WorkBreakdownAgent(MakerAgent):
 ## Important Guidelines
 
 - Break work into logical phases based on the architecture design
-- Each sub-issue should be a cohesive unit of work for a developer or QA engineer
-- Include specific requirements, design guidance, and acceptance criteria in each sub-issue
+- Each sub-issue should be a cohesive unit of work for a developer
+- Include all specific requirements, design guidance, and acceptance criteria in each sub-issue
 - Order sub-issues by dependencies (earlier phases first)
 - Keep phase titles concise: "Phase 1: Infrastructure setup"
 - Do NOT include effort estimates or timeline predictions
@@ -80,8 +80,7 @@ class WorkBreakdownAgent(MakerAgent):
 - Each sub-issue has clear, testable acceptance criteria
 - Dependencies between sub-issues are explicitly stated
 - Requirements trace back to the original business requirements
-- Design guidance references specific sections of the architecture
-- Test criteria come from the test plan
+- Design guidance captures relevant sections of the architecture with full architectural context
 """
 
     # ==================================================================================
@@ -282,8 +281,8 @@ Each sub-issue will be created as a sub-task of issue #{parent_issue_number} and
 
 Make sure to:
 1. Extract phases from the software architect's design (or create logical phases if not explicit)
-2. Pull specific requirements from the business analyst's work
-3. Pull test criteria from the test planner's output
+2. Break work into smaller chunks if phases are too large
+3. Pull specific requirements from the business analyst's work and specific design guidance from the software architect
 4. Order phases by dependencies (foundational work first)
 5. Keep titles concise and descriptive
 """
@@ -490,22 +489,41 @@ Make sure to:
         created_issues = []
         for idx, sub_issue in enumerate(sub_issues, start=1):
             try:
-                # Create issue using GitHub CLI
+                # Create issue using GitHub CLI (returns URL directly)
                 result = subprocess.run(
                     ['gh', 'issue', 'create',
                      '-R', repo,
                      '--title', sub_issue['title'],
-                     '--body', sub_issue['body'],
-                     '--json', 'number,url,id'],
+                     '--body', sub_issue['body']],
                     capture_output=True,
                     text=True,
                     check=True
                 )
 
-                issue_data = json_lib.loads(result.stdout)
-                issue_number = str(issue_data['number'])
-                issue_url = issue_data['url']
+                # gh issue create returns the issue URL
+                issue_url = result.stdout.strip()
+                
+                # Extract issue number from URL (e.g., https://github.com/org/repo/issues/123)
+                import re as regex
+                url_match = regex.search(r'/issues/(\d+)$', issue_url)
+                if not url_match:
+                    raise Exception(f"Could not extract issue number from URL: {issue_url}")
+                
+                issue_number = url_match.group(1)
+                
+                # Get full issue details including node ID using gh issue view
+                view_result = subprocess.run(
+                    ['gh', 'issue', 'view', issue_number,
+                     '-R', repo,
+                     '--json', 'id,number,url'],
+                    capture_output=True,
+                    text=True,
+                    check=True
+                )
+                
+                issue_data = json_lib.loads(view_result.stdout)
                 issue_id = issue_data['id']
+                issue_number = str(issue_data['number'])
 
                 # Add issue to SDLC board's Backlog column
                 subprocess.run(

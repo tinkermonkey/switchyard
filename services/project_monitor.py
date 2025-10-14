@@ -7,6 +7,7 @@ import logging
 from datetime import datetime
 from typing import Dict, Any, List, Optional
 from dataclasses import dataclass
+from monitoring.timestamp_utils import utc_isoformat
 from task_queue.task_manager import TaskQueue, Task, TaskPriority
 from config.manager import ConfigManager
 
@@ -188,18 +189,39 @@ class ProjectMonitor:
                     'repository': current_item.repository
                 })
                 
-                # EMIT DECISION EVENT: Status change detected
-                # Extract board name from project_name key (format: project_board)
+                # EMIT DECISION EVENT: Status change detected (if not already emitted)
+                # Check if this was a recent programmatic change to avoid duplicate events
+                from services.work_execution_state import work_execution_tracker
+                
+                # Extract project/board names from project_name key (format: project_board)
+                actual_project = project_name.split('_', 1)[0] if '_' in project_name else project_name
                 board_name = project_name.split('_', 1)[1] if '_' in project_name else 'unknown'
-                self.decision_events.emit_status_progression(
+                
+                # Check if this status change was recently made programmatically
+                # (in which case the event was already emitted by pipeline_progression)
+                was_programmatic = work_execution_tracker.was_recent_programmatic_change(
+                    project_name=actual_project,
                     issue_number=issue_number,
-                    project=project_name.split('_', 1)[0] if '_' in project_name else project_name,
-                    board=board_name,
-                    from_status=last_item.status,
                     to_status=current_item.status,
-                    trigger='manual',  # Status changes from GitHub are manual
-                    success=True  # Already successfully moved in GitHub
+                    time_window_seconds=60
                 )
+                
+                if not was_programmatic:
+                    # Only emit if this appears to be a manual status change
+                    self.decision_events.emit_status_progression(
+                        issue_number=issue_number,
+                        project=actual_project,
+                        board=board_name,
+                        from_status=last_item.status,
+                        to_status=current_item.status,
+                        trigger='manual',  # Status changes from GitHub polling are manual
+                        success=True  # Already successfully moved in GitHub
+                    )
+                else:
+                    logger.debug(
+                        f"Skipping duplicate status_progression event for #{issue_number} "
+                        f"({last_item.status} → {current_item.status}) - already emitted programmatically"
+                    )
 
         # Update last state
         self.last_state[project_name] = current_by_issue
@@ -223,7 +245,8 @@ class ProjectMonitor:
                                    workspace_type: str = 'issues',
                                    discussion_id: Optional[str] = None,
                                    pipeline_config=None,
-                                   current_stage_config=None) -> str:
+                                   current_stage_config=None,
+                                   project_name: Optional[str] = None) -> str:
         """
         Fetch comments from the previous workflow stage agent and user comments since then.
         Works with both issues and discussions workspaces.
@@ -235,12 +258,64 @@ class ProjectMonitor:
         """
         # Check if this stage has specific input requirements
         if current_stage_config and hasattr(current_stage_config, 'inputs_from') and current_stage_config.inputs_from:
+            # Try to find associated discussion even if we're in issues workspace
+            actual_discussion_id = discussion_id
+            
+            if not actual_discussion_id and workspace_type == 'issues' and project_name:
+                # We're in issues workspace but need discussion context
+                # Look up the discussion associated with this issue's parent
+                try:
+                    # For sub-issues, we need to find the parent issue's discussion
+                    from config.state_manager import GitHubStateManager
+                    state_manager = GitHubStateManager()
+                    github_state = state_manager.load_project_state(project_name)
+                    
+                    if github_state and github_state.issue_discussion_links:
+                        # Try to get discussion for this issue
+                        actual_discussion_id = github_state.issue_discussion_links.get(issue_number)
+                        
+                        if not actual_discussion_id:
+                            # This might be a sub-issue, look for parent issue's discussion
+                            # Get parent issue number from GitHub (sub-issues have trackedIn field)
+                            try:
+                                import subprocess
+                                result = subprocess.run(
+                                    ['gh', 'issue', 'view', str(issue_number),
+                                     '--repo', f"{org}/{repository}",
+                                     '--json', 'body'],
+                                    capture_output=True, text=True, check=True
+                                )
+                                issue_data = json.loads(result.stdout)
+                                body = issue_data.get('body', '')
+                                
+                                # Look for "Part of #NNN" pattern in issue body
+                                import re
+                                parent_match = re.search(r'Part of #(\d+)', body)
+                                if parent_match:
+                                    parent_issue_number = int(parent_match.group(1))
+                                    actual_discussion_id = github_state.issue_discussion_links.get(parent_issue_number)
+                                    if actual_discussion_id:
+                                        logger.info(f"Found parent issue #{parent_issue_number} discussion for sub-issue #{issue_number}")
+                                    else:
+                                        logger.debug(f"Parent issue #{parent_issue_number} found but has no discussion")
+                                else:
+                                    logger.debug(f"No 'Part of #NNN' pattern found in issue #{issue_number} body")
+                            except Exception as e:
+                                logger.debug(f"Could not look up parent issue for #{issue_number}: {e}")
+                    
+                    if actual_discussion_id:
+                        logger.info(f"Found associated discussion {actual_discussion_id} for issue #{issue_number}")
+                except Exception as e:
+                    logger.warning(f"Error looking up discussion for issue #{issue_number}: {e}")
+            
             # Use discussion-based approach for gathering specific agent outputs
-            if (workspace_type == 'discussions' or workspace_type == 'hybrid') and discussion_id:
+            if actual_discussion_id:
                 logger.info(f"Gathering inputs from specific agents: {current_stage_config.inputs_from}")
-                return self._get_agent_outputs_from_discussion(discussion_id, current_stage_config.inputs_from)
+                return self._get_agent_outputs_from_discussion(actual_discussion_id, current_stage_config.inputs_from)
             else:
-                logger.warning(f"inputs_from specified but not in discussion workspace, falling back to previous stage")
+                logger.warning(f"inputs_from specified but no discussion found for issue #{issue_number}, cannot fetch design context")
+                # Fall back to issue context
+                return self._get_issue_context(repository, issue_number, org, current_column, workflow_template)
 
         # For hybrid pipelines, determine if previous stage was in discussions or issues
         should_use_discussion = False
@@ -488,20 +563,26 @@ class ProjectMonitor:
 
     def _get_agent_outputs_from_discussion(self, discussion_id: str, agent_names: List[str]) -> str:
         """
-        Get outputs from specific agents in a discussion.
+        Get outputs from specific agents with full threaded context.
         Used when a stage has inputs_from specified.
+        
+        For each agent:
+        1. Find their final output (could be top-level OR a threaded reply)
+        2. Collect all threaded conversation (human feedback + agent replies)
+        3. Return complete context for each input agent
 
         Args:
             discussion_id: The discussion ID
             agent_names: List of agent names to get outputs from
 
         Returns:
-            Formatted context string with all specified agent outputs
+            Formatted context string with all specified agent outputs and their threaded conversations
         """
         try:
             from services.github_app import github_app
             from dateutil import parser as date_parser
 
+            # GraphQL query WITH replies to capture threaded conversations
             query = """
             query($discussionId: ID!) {
               node(id: $discussionId) {
@@ -515,6 +596,16 @@ class ProjectMonitor:
                         login
                       }
                       createdAt
+                      replies(first: 50) {
+                        nodes {
+                          id
+                          body
+                          author {
+                            login
+                          }
+                          createdAt
+                        }
+                      }
                     }
                   }
                 }
@@ -535,20 +626,65 @@ class ProjectMonitor:
             for agent_name in agent_names:
                 agent_signature = f"_Processed by the {agent_name} agent_"
 
-                # Find the last comment from this agent
-                agent_comment = None
-                for comment in reversed(all_comments):
+                # Find agent's FINAL output (could be in top-level OR threaded reply)
+                final_output = None
+                parent_comment_id = None
+                final_timestamp = None
+
+                # Check threaded replies first (most recent refinements)
+                for comment in all_comments:
+                    for reply in comment.get('replies', {}).get('nodes', []):
+                        if agent_signature in reply.get('body', ''):
+                            reply_time = date_parser.parse(reply.get('createdAt'))
+                            if final_timestamp is None or reply_time > final_timestamp:
+                                final_output = reply
+                                parent_comment_id = comment['id']
+                                final_timestamp = reply_time
+
+                # Check top-level comments (initial outputs)
+                for comment in all_comments:
                     if agent_signature in comment.get('body', ''):
-                        agent_comment = comment
-                        break
+                        comment_time = date_parser.parse(comment.get('createdAt'))
+                        if final_timestamp is None or comment_time > final_timestamp:
+                            final_output = comment
+                            parent_comment_id = comment['id']
+                            final_timestamp = comment_time
 
-                if agent_comment:
-                    context_parts.append(f"## Output from {agent_name.replace('_', ' ').title()}")
-                    context_parts.append(agent_comment.get('body', ''))
-                else:
+                if not final_output:
                     logger.warning(f"No output found from agent '{agent_name}' in discussion {discussion_id}")
+                    continue
 
-            return "\n\n".join(context_parts) if context_parts else ""
+                # Build complete context for this agent
+                agent_context = []
+                agent_context.append(f"## Output from {agent_name.replace('_', ' ').title()}")
+
+                # If we have a parent comment, get the full thread history
+                if parent_comment_id:
+                    thread_history = self.get_full_thread_history(all_comments, parent_comment_id)
+
+                    if thread_history:
+                        # Format thread chronologically
+                        for msg in thread_history:
+                            author = msg['author']
+                            body = msg['body']
+                            role = msg['role']
+
+                            if role == 'agent':
+                                agent_context.append(f"\n**{agent_name}** (agent):")
+                                agent_context.append(body)
+                            else:
+                                agent_context.append(f"\n**@{author}** (human feedback):")
+                                agent_context.append(body)
+                    else:
+                        # Fallback: just the final output
+                        agent_context.append(final_output.get('body', ''))
+                else:
+                    # Just the final output (no thread)
+                    agent_context.append(final_output.get('body', ''))
+
+                context_parts.append('\n'.join(agent_context))
+
+            return "\n\n---\n\n".join(context_parts) if context_parts else ""
 
         except Exception as e:
             logger.error(f"Error fetching agent outputs from discussion: {e}")
@@ -559,6 +695,7 @@ class ProjectMonitor:
     def _check_agent_processed_issue_sync(self, issue_number: int, agent: str, repository: str) -> bool:
         """Synchronous wrapper for checking if agent has processed issue"""
         try:
+            import asyncio
             from services.github_integration import GitHubIntegration
             github = GitHubIntegration()
             return asyncio.run(github.has_agent_processed_issue(issue_number, agent, repository))
@@ -879,6 +1016,14 @@ class ProjectMonitor:
                                                 state.claude_session_id = persisted_session.session_id
                                                 logger.info(f"Restored Claude Code session for #{issue_number}: {state.claude_session_id}")
 
+                                            # Load previous outputs from issue to rebuild conversation history
+                                            loop_new.run_until_complete(
+                                                human_feedback_loop_executor._load_previous_outputs_from_issue(
+                                                    state,
+                                                    project_config.github['org']
+                                                )
+                                            )
+
                                             # Register and start monitoring
                                             human_feedback_loop_executor.active_loops[issue_number] = state
                                             human_feedback_loop_executor.workflow_columns = workflow_template.columns
@@ -963,6 +1108,15 @@ class ProjectMonitor:
                                 current_stage_config = stage
                                 break
 
+                # Check if this is a repair_cycle stage and handle it specially
+                if current_stage_config and getattr(current_stage_config, 'stage_type', None) == 'repair_cycle':
+                    logger.info(f"Detected repair_cycle stage for issue #{issue_number} in {status}")
+                    return self._start_repair_cycle_for_issue(
+                        project_name, board_name, issue_number, status,
+                        repository, project_config, pipeline_config,
+                        workflow_template, column, current_stage_config
+                    )
+
                 # Fetch context from previous workflow stage (workspace-aware)
                 previous_stage_context = self.get_previous_stage_context(
                     repository, issue_number, project_config.github['org'],
@@ -970,7 +1124,8 @@ class ProjectMonitor:
                     workspace_type=workspace_type,
                     discussion_id=discussion_id,
                     pipeline_config=pipeline_config,
-                    current_stage_config=current_stage_config
+                    current_stage_config=current_stage_config,
+                    project_name=project_name
                 )
 
                 # Pipeline run already created above, just use it
@@ -989,7 +1144,7 @@ class ProjectMonitor:
                     'trigger': 'project_monitor',
                     'workspace_type': workspace_type,
                     'pipeline_run_id': pipeline_run.id,  # Include pipeline run ID
-                    'timestamp': datetime.now().isoformat()
+                    'timestamp': utc_isoformat()
                 }
 
                 # Add discussion_id if working in discussions
@@ -1002,7 +1157,7 @@ class ProjectMonitor:
                     project=project_name,
                     priority=TaskPriority.MEDIUM,
                     context=task_context,
-                    created_at=datetime.now().isoformat()
+                    created_at=utc_isoformat()
                 )
 
                 self.task_queue.enqueue(task)
@@ -1097,7 +1252,8 @@ class ProjectMonitor:
                 workspace_type=workspace_type,
                 discussion_id=discussion_id,
                 pipeline_config=pipeline_config,
-                current_stage_config=current_stage_config
+                current_stage_config=current_stage_config,
+                project_name=project_name
             )
 
             # Start conversational loop in background thread
@@ -1204,12 +1360,23 @@ class ProjectMonitor:
                 workspace_type=workspace_type,
                 discussion_id=discussion_id,
                 pipeline_config=pipeline_config,
-                current_stage_config=current_stage_config
+                current_stage_config=current_stage_config,
+                project_name=project_name
             )
 
             if not previous_stage_context:
                 logger.warning(f"No previous stage output found for issue #{issue_number} - cannot start review cycle")
                 return None
+
+            # Get or create pipeline run before starting the thread
+            pipeline_run = self.pipeline_run_manager.get_or_create_pipeline_run(
+                issue_number=issue_number,
+                issue_title=issue_data.get('title', f'Issue #{issue_number}'),
+                issue_url=issue_data.get('url', ''),
+                project=project_name,
+                board=board_name
+            )
+            logger.debug(f"Using pipeline run {pipeline_run.id} for review cycle on issue #{issue_number}")
 
             logger.info(
                 f"Starting review cycle for issue #{issue_number} in background thread "
@@ -1331,7 +1498,8 @@ _Review cycle initiated by Claude Code Orchestrator_
                                         project_name=project_name,
                                         board_name=board_name,
                                         issue_number=issue_number,
-                                        target_column=next_column
+                                        target_column=next_column,
+                                        trigger='review_cycle_completion'
                                     )
                                     logger.info(f"Successfully moved issue #{issue_number} to {next_column}")
                         except Exception as move_error:
@@ -1355,6 +1523,257 @@ _Review cycle initiated by Claude Code Orchestrator_
 
         except Exception as e:
             logger.error(f"Error starting review cycle: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return None
+
+    def _start_repair_cycle_for_issue(
+        self,
+        project_name: str,
+        board_name: str,
+        issue_number: int,
+        status: str,
+        repository: str,
+        project_config,
+        pipeline_config,
+        workflow_template,
+        column,
+        stage_config
+    ) -> Optional[str]:
+        """Start an automated repair cycle (test-fix-validate) for an issue"""
+        try:
+            import asyncio
+            import threading
+            from pipeline.repair_cycle import RepairCycleStage, RepairTestRunConfig, RepairTestType
+
+            # Get issue details
+            issue_data = self.get_issue_details(repository, issue_number, project_config.github['org'])
+
+            # Get workspace info
+            workspace_type = pipeline_config.workspace
+            from config.state_manager import state_manager
+            discussion_id = None
+
+            if workspace_type in ['discussions', 'hybrid']:
+                discussion_id = state_manager.get_discussion_for_issue(project_name, issue_number)
+
+            # Get previous stage context
+            previous_stage_context = self.get_previous_stage_context(
+                repository, issue_number, project_config.github['org'],
+                status, workflow_template,
+                workspace_type=workspace_type,
+                discussion_id=discussion_id,
+                pipeline_config=pipeline_config,
+                current_stage_config=stage_config,
+                project_name=project_name
+            )
+
+            # Load test configurations from project config
+            testing_config = project_config.testing or {}
+            test_configs = []
+            
+            for test_type_config in testing_config.get('types', []):
+                test_type = RepairTestType(test_type_config['type'])
+                test_configs.append(RepairTestRunConfig(
+                    test_type=test_type,
+                    timeout=test_type_config.get('timeout', 600),
+                    max_iterations=test_type_config.get('max_iterations', 5),
+                    review_warnings=test_type_config.get('review_warnings', True),
+                    max_file_iterations=test_type_config.get('max_file_iterations', 3)
+                ))
+
+            if not test_configs:
+                logger.warning(f"No test configurations found for project {project_name}")
+                return None
+
+            # Get global settings from stage config
+            max_total_agent_calls = stage_config.max_total_agent_calls or 100
+            checkpoint_interval = stage_config.checkpoint_interval or 5
+
+            # Get or create pipeline run
+            pipeline_run = self.pipeline_run_manager.get_or_create_pipeline_run(
+                issue_number=issue_number,
+                issue_title=issue_data.get('title', f'Issue #{issue_number}'),
+                issue_url=issue_data.get('url', ''),
+                project=project_name,
+                board=board_name
+            )
+            logger.debug(f"Using pipeline run {pipeline_run.id} for repair cycle on issue #{issue_number}")
+
+            logger.info(
+                f"Starting repair cycle for issue #{issue_number} in background thread "
+                f"(agent: {stage_config.default_agent}, test types: {[tc.test_type.value for tc in test_configs]})"
+            )
+
+            def run_cycle_in_thread():
+                """Run the repair cycle in a background thread"""
+                try:
+                    # Create new event loop for this thread
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+
+                    # Post initial comment (workspace-aware)
+                    from services.github_integration import GitHubIntegration
+                    github = GitHubIntegration()
+
+                    start_context = {
+                        'issue_number': issue_number,
+                        'repository': repository,
+                        'workspace_type': workspace_type,
+                        'discussion_id': discussion_id
+                    }
+
+                    loop.run_until_complete(
+                        github.post_agent_output(
+                            start_context,
+                            f"""## 🔧 Starting Repair Cycle (Testing)
+
+**Agent**: {stage_config.default_agent.replace('_', ' ').title()}
+**Test Types**: {', '.join([tc.test_type.value for tc in test_configs])}
+**Max Iterations**: {max_total_agent_calls}
+
+The automated test-fix-validate cycle is now starting. Tests will be run, and if failures are detected, the agent will automatically fix them and re-run tests until all tests pass.
+
+---
+_Repair cycle initiated by Claude Code Orchestrator_
+"""
+                        )
+                    )
+
+                    # Create RepairCycleStage
+                    stage = RepairCycleStage(
+                        name=status,
+                        test_configs=test_configs,
+                        agent_name=stage_config.default_agent,
+                        max_total_agent_calls=max_total_agent_calls,
+                        checkpoint_interval=checkpoint_interval
+                    )
+
+                    # Build context for stage execution
+                    from services.project_workspace import workspace_manager
+                    from monitoring.observability import get_observability_manager
+                    
+                    project_dir = workspace_manager.get_project_dir(project_name)
+                    obs = get_observability_manager()
+
+                    stage_context = {
+                        'project': project_name,
+                        'board': board_name,
+                        'pipeline': pipeline_config.name,
+                        'repository': repository,
+                        'issue_number': issue_number,
+                        'issue': issue_data,
+                        'previous_stage_output': previous_stage_context,
+                        'column': status,
+                        'workspace_type': workspace_type,
+                        'discussion_id': discussion_id,
+                        'pipeline_run_id': pipeline_run.id,
+                        'project_dir': project_dir,
+                        'use_docker': True,  # Repair cycle should use Docker
+                        'observability': obs,  # REQUIRED: Observability manager for event tracking
+                        'task_id': f"repair_cycle_{issue_number}_{pipeline_run.id}"  # For observability tracking
+                    }
+
+                    # Execute repair cycle
+                    result = loop.run_until_complete(stage.execute(stage_context))
+
+                    overall_success = result.get('overall_success', False)
+                    test_results = result.get('test_results', [])
+
+                    logger.info(
+                        f"Repair cycle completed for issue #{issue_number}, "
+                        f"success={overall_success}, total_agent_calls={result.get('total_agent_calls', 0)}"
+                    )
+
+                    # Post summary comment
+                    summary_lines = [
+                        f"## ✅ Repair Cycle Complete" if overall_success else "## ❌ Repair Cycle Failed",
+                        "",
+                        f"**Total Agent Calls**: {result.get('total_agent_calls', 0)}",
+                        f"**Duration**: {result.get('duration_seconds', 0):.1f}s",
+                        ""
+                    ]
+
+                    for test_result in test_results:
+                        test_type = test_result.get('test_type', 'unknown')
+                        passed = test_result.get('passed', False)
+                        iterations = test_result.get('iterations', 0)
+                        summary_lines.append(
+                            f"- **{test_type}**: {'✅ PASSED' if passed else '❌ FAILED'} "
+                            f"({iterations} iterations)"
+                        )
+
+                    summary_lines.append("")
+                    summary_lines.append("---")
+                    summary_lines.append("_Repair cycle executed by Claude Code Orchestrator_")
+
+                    loop.run_until_complete(
+                        github.post_agent_output(
+                            start_context,
+                            "\n".join(summary_lines)
+                        )
+                    )
+
+                    # If successful, auto-advance to next column
+                    if overall_success:
+                        # Find next column in workflow
+                        current_index = next(
+                            (i for i, col in enumerate(workflow_template.columns) if col.name == status),
+                            None
+                        )
+                        
+                        if current_index is not None and current_index + 1 < len(workflow_template.columns):
+                            next_column = workflow_template.columns[current_index + 1]
+                            
+                            logger.info(f"Auto-advancing issue #{issue_number} from {status} to {next_column.name}")
+                            
+                            from services.pipeline_progression import PipelineProgression
+                            progression_service = PipelineProgression(self.task_queue)
+                            progression_service.move_issue_to_column(
+                                project_name=project_name,
+                                board_name=board_name,
+                                issue_number=issue_number,
+                                target_column=next_column.name,
+                                trigger='repair_cycle_completion'
+                            )
+                            logger.info(f"Successfully moved issue #{issue_number} to {next_column.name}")
+
+                    # Record execution completion in work execution state
+                    from services.work_execution_state import work_execution_tracker
+                    work_execution_tracker.record_execution_outcome(
+                        issue_number=issue_number,
+                        column=status,
+                        agent=stage_config.default_agent,
+                        outcome='success' if overall_success else 'failure',
+                        project_name=project_name
+                    )
+
+                    loop.close()
+                except Exception as e:
+                    logger.error(f"Error in repair cycle thread: {e}")
+                    import traceback
+                    logger.error(traceback.format_exc())
+
+            # Start in background thread (non-blocking)
+            thread = threading.Thread(target=run_cycle_in_thread, daemon=True)
+            thread.start()
+
+            logger.info(f"Repair cycle thread started for issue #{issue_number}")
+
+            # Record execution start in work execution state
+            from services.work_execution_state import work_execution_tracker
+            work_execution_tracker.record_execution_start(
+                issue_number=issue_number,
+                column=status,
+                agent=stage_config.default_agent,
+                trigger_source='manual',
+                project_name=project_name
+            )
+
+            return stage_config.default_agent
+
+        except Exception as e:
+            logger.error(f"Error starting repair cycle: {e}")
             import traceback
             logger.error(traceback.format_exc())
             return None
@@ -1662,7 +2081,7 @@ _Review cycle initiated by Claude Code Orchestrator_
                     'formatted_text': feedback_text
                 },
                 'previous_output': previous_output,  # Include agent's previous work
-                'timestamp': datetime.now().isoformat()
+                'timestamp': utc_isoformat()
             }
 
             task = Task(
@@ -1671,7 +2090,7 @@ _Review cycle initiated by Claude Code Orchestrator_
                 project=project_name,
                 priority=TaskPriority.HIGH,  # Feedback gets high priority
                 context=task_context,
-                created_at=datetime.now().isoformat()
+                created_at=utc_isoformat()
             )
 
             self.task_queue.enqueue(task)
@@ -1694,15 +2113,31 @@ _Review cycle initiated by Claude Code Orchestrator_
                 logger.info(f"   Status: {change['old_status']} → {change['new_status']}")
                 logger.info(f"   Board: {board_name}")
 
-                # Record status change in work execution state
+                # Record status change in work execution state (only if not programmatic)
                 from services.work_execution_state import work_execution_tracker
-                work_execution_tracker.record_status_change(
+                
+                # Check if this was a recent programmatic change to avoid duplicate recording
+                was_programmatic = work_execution_tracker.was_recent_programmatic_change(
+                    project_name=project_name,
                     issue_number=change['issue_number'],
-                    from_status=change['old_status'],
                     to_status=change['new_status'],
-                    trigger='manual',  # Status changes from GitHub are manual
-                    project_name=project_name
+                    time_window_seconds=60
                 )
+                
+                if not was_programmatic:
+                    # Only record if this appears to be a manual status change
+                    work_execution_tracker.record_status_change(
+                        issue_number=change['issue_number'],
+                        from_status=change['old_status'],
+                        to_status=change['new_status'],
+                        trigger='manual',  # Status changes from GitHub polling are manual
+                        project_name=project_name
+                    )
+                else:
+                    logger.debug(
+                        f"Skipping duplicate status_change recording for #{change['issue_number']} "
+                        f"({change['old_status']} → {change['new_status']}) - already recorded programmatically"
+                    )
 
                 # Check if this issue needs a discussion created BEFORE triggering agent
                 # (Important for discussions workspaces)
@@ -2721,7 +3156,7 @@ Moving to implementation phase.
                     'formatted_text': feedback_text
                 },
                 'previous_output': previous_output,
-                'timestamp': datetime.now().isoformat()
+                'timestamp': utc_isoformat()
             }
 
             from task_queue.task_manager import Task, TaskPriority
@@ -2731,7 +3166,7 @@ Moving to implementation phase.
                 project=project_name,
                 priority=TaskPriority.HIGH,
                 context=task_context,
-                created_at=datetime.now().isoformat()
+                created_at=utc_isoformat()
             )
 
             self.task_queue.enqueue(task)

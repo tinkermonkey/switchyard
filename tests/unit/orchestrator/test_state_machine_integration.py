@@ -84,9 +84,30 @@ class TestSimpleAgentExecution:
             progression.github_client = mock_github
             progression.get_issue_details = lambda repo, num, org: mock_github.get_issue(num)
             
-            # Mock move_issue_to_column to actually update the mock GitHub state
-            def mock_move_issue(project_name, board_name, issue_number, target_column):
+            # Mock move_issue_to_column to actually update the mock GitHub state and emit events
+            def mock_move_issue(project_name, board_name, issue_number, target_column, trigger='unknown'):
+                # Emit status progression event (start)
+                mock_observability[1].emit_status_progression(
+                    issue_number=issue_number,
+                    project=project_name,
+                    board=board_name,
+                    from_status='Requirements',
+                    to_status=target_column,
+                    trigger=trigger,
+                    success=None
+                )
+                # Update status
                 mock_github.update_issue_status(issue_number, target_column)
+                # Emit status progression event (success)
+                mock_observability[1].emit_status_progression(
+                    issue_number=issue_number,
+                    project=project_name,
+                    board=board_name,
+                    from_status='Requirements',
+                    to_status=target_column,
+                    trigger=trigger,
+                    success=True
+                )
                 return True
             progression.move_issue_to_column = mock_move_issue
             
@@ -183,7 +204,7 @@ class TestMakerReviewerCycle:
             assert result is not None
             assert result[1] == True  # cycle_complete
             
-            # Step 2: Promote to next stage
+            # Step 4: Progress after review
             from services.pipeline_progression import PipelineProgression
             progression = PipelineProgression(task_queue=mock_task_queue)
             progression.decision_events = mock_observability[1]
@@ -191,7 +212,7 @@ class TestMakerReviewerCycle:
             progression.get_issue_details = lambda repo, num, org: mock_github.get_issue(num)
             
             # Mock move_issue_to_column to actually update the mock GitHub state
-            def mock_move_issue(project_name, board_name, issue_number, target_column):
+            def mock_move_issue(project_name, board_name, issue_number, target_column, trigger='unknown'):
                 mock_github.update_issue_status(issue_number, target_column)
                 return True
             progression.move_issue_to_column = mock_move_issue
@@ -342,7 +363,7 @@ class TestMultiStagePipeline:
             progression.get_issue_details = lambda repo, num, org: mock_github.get_issue(num)
             
             # Mock move_issue_to_column to actually update the mock GitHub state
-            def mock_move_issue(project_name, board_name, issue_number, target_column):
+            def mock_move_issue(project_name, board_name, issue_number, target_column, trigger='unknown'):
                 mock_github.update_issue_status(issue_number, target_column)
                 return True
             progression.move_issue_to_column = mock_move_issue
@@ -591,7 +612,7 @@ class TestComplexScenarios:
             progression.get_issue_details = lambda repo, num, org: mock_github.get_issue(num)
             
             # Mock move_issue_to_column to actually update the mock GitHub state
-            def mock_move_issue(project_name, board_name, issue_number, target_column):
+            def mock_move_issue(project_name, board_name, issue_number, target_column, trigger='unknown'):
                 mock_github.update_issue_status(issue_number, target_column)
                 return True
             progression.move_issue_to_column = mock_move_issue

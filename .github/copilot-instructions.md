@@ -173,9 +173,6 @@ docker run \
 ### Running the Orchestrator
 
 ```bash
-# Local development (requires Python 3.11+, Redis)
-python main.py
-
 # Docker Compose (recommended)
 docker-compose up -d
 
@@ -190,160 +187,11 @@ curl http://localhost:5001/health
 
 ```bash
 # Run unit tests with pytest
-pytest tests/unit/
+source .venv/bin/activate && pytest tests/unit/
 
 # Run integration tests
-pytest tests/integration/
-
-# Run all tests
-pytest
-
-# Run with coverage
-pytest --cov=. --cov-report=html
-
-# Run specific test file
-pytest tests/unit/test_parser.py -v
-
-# Run with verbose output
-pytest -v
-
-# Stop on first failure
-pytest -x
-
-# Alternative: Use the test script
-./scripts/run_tests.sh --unit
-./scripts/run_tests.sh --integration
-./scripts/run_tests.sh --all --coverage
-
-# Alternative: Use Make commands (wrapper around scripts)
-make test              # Run unit tests
-make test-integration  # Run integration tests
-make test-all          # Run all tests
-make test-coverage     # Run with coverage
-make clean-test        # Clean test artifacts
+source .venv/bin/activate && pytest tests/integration/
 ```
-
-### Project Management
-
-```bash
-# Project workspaces are initialized automatically on startup
-
-# Cleanup orphaned feature branches (use Make or direct Python)
-make cleanup-branches
-# or
-PYTHONPATH=. python scripts/cleanup_orphaned_branches.py
-
-# Cleanup specific project
-make cleanup-project PROJECT=context-studio
-# or
-PYTHONPATH=. python scripts/cleanup_orphaned_branches.py --project context-studio
-
-# Docker images for verified projects are checked automatically on startup
-```
-
-### GitHub Operations
-
-```bash
-# GitHub CLI must be authenticated
-gh auth status
-
-# View project boards
-gh project list --owner <org>
-
-# View issues in project
-gh issue list --repo <org>/<repo>
-
-# Create issue
-gh issue create --title "..." --body "..." --label "pipeline:dev"
-```
-
-### Docker Operations
-
-```bash
-# View running containers
-docker ps
-
-# Build project agent image
-docker build -f /workspace/<project>/Dockerfile.agent -t <project>-agent /workspace/<project>
-
-# Test agent container
-docker run -v /workspace/<project>:/workspace <project>-agent /bin/bash
-
-# Clean Docker artifacts
-docker system prune -a
-```
-
-## Development Workflow
-
-### Adding a New Agent
-
-1. Create agent class in `agents/<agent_name>_agent.py`:
-```python
-from agents.base_maker_agent import MakerAgent
-
-class CustomAgent(MakerAgent):
-    @property
-    def agent_display_name(self) -> str:
-        return "Custom Agent"
-    
-    @property
-    def agent_role_description(self) -> str:
-        return "Brief role description"
-    
-    @property
-    def output_sections(self) -> List[str]:
-        return ["section1", "section2"]
-```
-
-2. Register in `agents/__init__.py`:
-```python
-from .custom_agent import CustomAgent
-
-AGENT_REGISTRY = {
-    "custom_agent": CustomAgent,
-}
-```
-
-3. Add to `config/foundations/agents.yaml`:
-```yaml
-agents:
-  custom_agent:
-    description: "Agent description"
-    model: "claude-sonnet-4-5-20250929"
-    timeout: 300
-    retries: 2
-    makes_code_changes: false
-    requires_dev_container: false
-    requires_docker: true
-```
-
-### Adding a New Pipeline
-
-1. Add template to `config/foundations/pipelines.yaml`:
-```yaml
-pipeline_templates:
-  custom_pipeline:
-    name: "Custom Pipeline"
-    stages:
-      - stage: "stage_name"
-        default_agent: "agent_name"
-        review_required: true
-```
-
-2. Enable in project config `config/projects/<project>.yaml`:
-```yaml
-pipelines:
-  enabled:
-    - template: "custom_pipeline"
-      name: "custom"
-```
-
-### Modifying Agent Behavior
-
-Agents use Claude instructions via `claude/claude_integration.py`:
-- Instructions are in `agents/<agent>/.claude/instructions.md`
-- Context includes: issue details, previous outputs, review feedback
-- Output posted to GitHub as discussion comment or issue comment
 
 ## GitHub Integration
 
@@ -412,20 +260,6 @@ curl http://localhost:5001/api/projects  # Project list and status
 curl -X POST http://localhost:5001/agents/kill/<container_name>
 ```
 
-### Health Check Response
-
-```json
-{
-  "healthy": true,
-  "checks": {
-    "redis": {"healthy": true, "message": "Connected"},
-    "github": {"healthy": true, "message": "Authenticated"},
-    "docker": {"healthy": true, "message": "Socket accessible"}
-  },
-  "timestamp": "2025-10-10T12:00:00Z"
-}
-```
-
 ### Logs
 
 - **Structured JSON logging** to stdout (container logs)
@@ -441,81 +275,12 @@ Task execution and quality metrics are written to **Elasticsearch indices** with
 - `orchestrator-task-metrics-YYYY.MM.DD` - Task execution (agent, duration, success)
 - `orchestrator-quality-metrics-YYYY.MM.DD` - Quality scores (agent, metric_name, score)
 
-**Query Examples:**
-```bash
-# Recent task metrics
-curl -s "http://localhost:9200/orchestrator-task-metrics-*/_search?size=10&sort=@timestamp:desc" | jq '.hits.hits[]._source'
-
-# Success rate by agent
-curl -s "http://localhost:9200/orchestrator-task-metrics-*/_search" -H 'Content-Type: application/json' -d '{
-  "size": 0,
-  "aggs": {
-    "by_agent": {
-      "terms": {"field": "agent"},
-      "aggs": {"success_rate": {"avg": {"field": "success"}}}
-    }
-  }
-}' | jq '.aggregations.by_agent.buckets'
-```
-
-**JSON Backup Files:**
-```bash
-cat orchestrator_data/metrics/task_metrics_<date>.jsonl
-cat orchestrator_data/metrics/quality_metrics_<date>.jsonl
-```
-
-## Troubleshooting
-
-### GitHub Authentication Fails
-
-```bash
-# Check authentication
-gh auth status
-
-# Refresh token
-gh auth refresh
-
-# Verify scopes (must include 'project')
-gh auth status --show-token
-```
-
-### Docker Image Build Fails
-
-```bash
-# View dev_environment_setup logs
-docker-compose logs orchestrator | grep dev_environment_setup
-
-# Manually build to debug
-docker build -f /workspace/<project>/Dockerfile.agent -t <project>-agent /workspace/<project>
-
-# Check dev container state
-cat state/projects/<project>/dev_container_state.yaml
-```
-
-### Agent Task Fails
-
-```bash
-# View agent logs in GitHub issue comments
-# Check orchestrator logs
-docker-compose logs -f orchestrator
-
-# View task queue
-# Redis CLI
-redis-cli
-> LRANGE orchestrator:tasks:queue 0 -1
-```
-
-### Redis Connection Issues
-
-```bash
-# Check Redis is running
-docker-compose ps redis
-
-# Test connection
-redis-cli -h localhost -p 6379 ping
-
-# Orchestrator falls back to in-memory queue if Redis unavailable
-```
+**Timestamp Standardization:**
+- **All timestamps use UTC with 'Z' suffix** (ISO8601 format)
+- **Never use `datetime.now()`** for Elasticsearch writes
+- **Always use `monitoring.timestamp_utils.utc_now()` or `utc_isoformat()`**
+- Format: `2025-10-10T12:34:56.789012Z` (always UTC, always 'Z' suffix)
+- This ensures correct time-range queries and proper ILM policy execution
 
 ## Security Considerations
 
@@ -560,15 +325,3 @@ clauditoreum/
 ├── docker-compose.yml          # Service orchestration
 └── Makefile                    # Common commands
 ```
-
-## Best Practices
-
-- **Workspace Isolation**: The orchestrator runs in Docker - all operations are within `/workspace/` container boundary
-- **Path Usage**: Use workspace-relative paths, never absolute paths that could escape boundaries
-- **File Operations**: All file operations must be within `/workspace/` (the isolated orchestrator workspace)
-- **Testing**: Use pytest directly or the provided test scripts/Makefile wrappers
-- **Agent Output**: Agents should post outputs to GitHub, not create local files (except code agents)
-- **Health Checks**: Monitor the `/health` endpoint after changes
-- **Git Operations**: All git operations happen in isolated managed checkouts under `/workspace/<project>/`
-- **Timeouts**: Keep agent timeouts reasonable (most: 300s, builds: 1800s)
-- **Quality Assurance**: Follow maker-checker pattern for quality assurance

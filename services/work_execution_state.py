@@ -341,6 +341,163 @@ class WorkExecutionStateTracker:
         state = self.load_state(project_name, issue_number)
         return state['execution_history']
 
+    def was_recent_programmatic_change(
+        self,
+        project_name: str,
+        issue_number: int,
+        to_status: str,
+        time_window_seconds: int = 60
+    ) -> bool:
+        """
+        Check if a status change to the given status was recently made programmatically.
+        
+        This helps avoid duplicate event emission when the project monitor detects
+        a status change that was already emitted by the pipeline progression service.
+        
+        Args:
+            project_name: Project name
+            issue_number: Issue number
+            to_status: Target status to check
+            time_window_seconds: Time window in seconds to consider "recent" (default: 60)
+        
+        Returns:
+            True if a programmatic status change to this status was made within the time window
+        """
+        state = self.load_state(project_name, issue_number)
+        
+        # Check status_changes for recent programmatic changes
+        for status_change in reversed(state.get('status_changes', [])):
+            if status_change['to_status'] != to_status:
+                continue
+            
+            # Check if trigger indicates programmatic change
+            trigger = status_change.get('trigger', '')
+            if trigger in ['agent_auto_advance', 'pipeline_progression', 'review_cycle', 
+                          'agent_completion', 'auto']:
+                # Check if it's recent
+                try:
+                    change_time = datetime.fromisoformat(status_change['timestamp'])
+                    now = datetime.now(timezone.utc)
+                    time_diff = (now - change_time).total_seconds()
+                    
+                    if time_diff <= time_window_seconds:
+                        logger.debug(
+                            f"Found recent programmatic status change for {project_name}/#{issue_number} "
+                            f"to {to_status} (trigger: {trigger}, {time_diff:.1f}s ago)"
+                        )
+                        return True
+                except Exception as e:
+                    logger.warning(f"Error parsing timestamp for status change: {e}")
+                    continue
+        
+        return False
+
+    def cleanup_stuck_in_progress_states(self):
+        """
+        Clean up execution states that are stuck as 'in_progress'.
+
+        This handles cases where:
+        - Orchestrator was restarted while agents were running
+        - Agents completed but record_execution_outcome() was never called
+        - Execution states remain permanently stuck as 'in_progress'
+
+        Strategy:
+        - Find all state files with in_progress executions
+        - Check if corresponding agent container still exists
+        - If container is gone, mark execution as 'failure' with reason 'orchestrator_restart'
+        """
+        import subprocess
+
+        if not self.state_dir.exists():
+            logger.info("No execution state directory found, skipping cleanup")
+            return
+
+        state_files = list(self.state_dir.glob("*.yaml"))
+
+        if not state_files:
+            logger.info("No execution state files found, skipping cleanup")
+            return
+
+        logger.info(f"Checking {len(state_files)} execution state files for stuck in_progress states")
+
+        cleaned_count = 0
+        for state_file in state_files:
+            try:
+                # Load state
+                with open(state_file, 'r') as f:
+                    state = yaml.safe_load(f)
+
+                if not state or 'execution_history' not in state:
+                    continue
+
+                project_name = state.get('project_name')
+                issue_number = state.get('issue_number')
+
+                # Find in_progress executions
+                modified = False
+                for execution in state['execution_history']:
+                    if execution.get('outcome') == 'in_progress':
+                        agent = execution.get('agent')
+                        column = execution.get('column')
+                        timestamp = execution.get('timestamp')
+
+                        logger.info(
+                            f"Found stuck in_progress execution: {project_name}/#{issue_number} "
+                            f"{agent} in {column} from {timestamp}"
+                        )
+
+                        # Check if agent container still exists
+                        # Container names follow pattern: claude-agent-{project}-{task_id}
+                        # We can't determine exact container name, so we check if ANY agent container
+                        # for this project/agent is running
+                        container_pattern = f"claude-agent-{project_name}-*{agent}*"
+
+                        result = subprocess.run(
+                            ['docker', 'ps', '-a', '--filter', f'name={project_name}',
+                             '--filter', f'name={agent}', '--format', '{{.Names}}'],
+                            capture_output=True,
+                            text=True,
+                            timeout=5
+                        )
+
+                        has_running_container = bool(result.stdout.strip())
+
+                        if not has_running_container:
+                            # No container found, mark as failed due to orchestrator restart
+                            execution['outcome'] = 'failure'
+                            execution['error'] = (
+                                'Agent execution interrupted by orchestrator restart. '
+                                'Container no longer exists. This execution did not complete normally.'
+                            )
+                            modified = True
+                            cleaned_count += 1
+
+                            logger.info(
+                                f"Marked stuck execution as failed: {project_name}/#{issue_number} "
+                                f"{agent} in {column} (no container found)"
+                            )
+                        else:
+                            logger.info(
+                                f"Agent container still running for {project_name}/#{issue_number}, "
+                                f"keeping in_progress state"
+                            )
+
+                # Save if modified
+                if modified:
+                    state['last_updated'] = datetime.now(timezone.utc).isoformat()
+                    with open(state_file, 'w') as f:
+                        yaml.dump(state, f, default_flow_style=False, sort_keys=False)
+
+                    logger.info(f"Updated state file: {state_file}")
+
+            except Exception as e:
+                logger.error(f"Error processing state file {state_file}: {e}")
+
+        if cleaned_count > 0:
+            logger.info(f"Cleaned up {cleaned_count} stuck in_progress execution states")
+        else:
+            logger.info("No stuck in_progress execution states found")
+
 
 # Global instance
 work_execution_tracker = WorkExecutionStateTracker()

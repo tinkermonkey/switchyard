@@ -57,6 +57,12 @@ class FeatureBranchManager:
         self.state_dir = Path(workspace_root) / "clauditoreum" / "state" / "projects"
         # Don't create directories until actually needed (lazy creation)
         self._state_dir_initialized = False
+        
+        # Initialize decision observability
+        from monitoring.observability import get_observability_manager
+        from monitoring.decision_events import DecisionEventEmitter
+        self.obs = get_observability_manager()
+        self.decision_events = DecisionEventEmitter(self.obs)
 
     def _ensure_state_dir(self):
         """Ensure state directory exists (lazy initialization)"""
@@ -634,6 +640,16 @@ git push --force-with-lease
                     f"(confidence: {best_match['confidence']:.2f}, reason: {best_match['reason']})"
                 )
                 branch_name = best_match["branch_name"]
+                
+                # EMIT DECISION EVENT: Branch reused
+                self.decision_events.emit_branch_reused(
+                    project=project,
+                    issue_number=issue_number,
+                    branch_name=branch_name,
+                    confidence=best_match["confidence"],
+                    match_reason=best_match["reason"],
+                    parent_issue=parent_issue
+                )
 
                 # Get or create feature branch state
                 if parent_issue:
@@ -662,6 +678,16 @@ git push --force-with-lease
                     logger.info(f"Pulled latest changes for {branch_name}")
                 except MergeConflictError as e:
                     logger.error(f"Merge conflict in {branch_name}: {e.files}")
+                    
+                    # EMIT DECISION EVENT: Merge conflict detected
+                    self.decision_events.emit_branch_conflict_detected(
+                        project=project,
+                        issue_number=issue_number,
+                        branch_name=branch_name,
+                        conflicting_files=e.files,
+                        parent_issue=parent_issue
+                    )
+                    
                     await self.escalate_merge_conflict(
                         github_integration,
                         issue_number,
@@ -675,6 +701,16 @@ git push --force-with-lease
                     commits_behind = await self.get_commits_behind_main(project_dir, branch_name)
                     feature_branch.commits_behind_main = commits_behind
                     if commits_behind > 50:
+                        # EMIT DECISION EVENT: Critical staleness
+                        self.decision_events.emit_branch_stale_detected(
+                            project=project,
+                            issue_number=issue_number,
+                            branch_name=branch_name,
+                            commits_behind=commits_behind,
+                            action_taken="escalate_stale_branch",
+                            parent_issue=parent_issue
+                        )
+                        
                         await self.escalate_stale_branch(
                             github_integration,
                             parent_issue,
@@ -682,6 +718,16 @@ git push --force-with-lease
                             commits_behind
                         )
                     elif commits_behind > 20:
+                        # EMIT DECISION EVENT: Warning staleness
+                        self.decision_events.emit_branch_stale_detected(
+                            project=project,
+                            issue_number=issue_number,
+                            branch_name=branch_name,
+                            commits_behind=commits_behind,
+                            action_taken="warn_stale_branch",
+                            parent_issue=parent_issue
+                        )
+                        
                         logger.warning(f"Branch {branch_name} is {commits_behind} commits behind main")
 
                     # Mark sub-issue as in progress
@@ -694,6 +740,15 @@ git push --force-with-lease
                     f"- `{m['branch_name']}` (confidence: {m['confidence']:.0%}, {m['reason']})"
                     for m in related_branches[:3]
                 ])
+                
+                # EMIT DECISION EVENT: Branch selection escalated
+                self.decision_events.emit_branch_selection_escalated(
+                    project=project,
+                    issue_number=issue_number,
+                    confidence=best_match["confidence"],
+                    candidate_branches=related_branches[:3],
+                    reason=f"Medium confidence match ({best_match['confidence']:.0%}), escalating to human"
+                )
 
                 await github_integration.post_comment(
                     issue_number,
@@ -726,6 +781,16 @@ Waiting for human decision...
             branch_name = self.create_feature_branch_name(issue_number, issue_title)
 
             if not await self.branch_exists(project_dir, branch_name):
+                # EMIT DECISION EVENT: New standalone branch created
+                self.decision_events.emit_branch_created(
+                    project=project,
+                    issue_number=issue_number,
+                    branch_name=branch_name,
+                    reason="No parent issue and no related branches found - creating new standalone branch",
+                    parent_issue=None,
+                    is_standalone=True
+                )
+                
                 await self.create_branch_from_main(project_dir, branch_name)
             else:
                 await self.git_checkout(project_dir, branch_name)
@@ -744,6 +809,16 @@ Waiting for human decision...
             # First sub-issue - create feature branch
             parent_details = await github_integration.get_issue(parent_issue)
             branch_name = self.create_feature_branch_name(parent_issue, parent_details.get("title", ""))
+
+            # EMIT DECISION EVENT: New feature branch created
+            self.decision_events.emit_branch_created(
+                project=project,
+                issue_number=issue_number,
+                branch_name=branch_name,
+                reason=f"First sub-issue of parent #{parent_issue} - creating shared feature branch",
+                parent_issue=parent_issue,
+                is_standalone=False
+            )
 
             await self.create_branch_from_main(project_dir, branch_name)
 
@@ -783,6 +858,16 @@ Waiting for human decision...
         except MergeConflictError as e:
             # Don't auto-resolve - escalate to human
             logger.error(f"Merge conflict in {feature_branch.branch_name}: {e.files}")
+            
+            # EMIT DECISION EVENT: Merge conflict detected
+            self.decision_events.emit_branch_conflict_detected(
+                project=project,
+                issue_number=issue_number,
+                branch_name=feature_branch.branch_name,
+                conflicting_files=e.files,
+                parent_issue=parent_issue
+            )
+            
             await self.escalate_merge_conflict(
                 github_integration,
                 issue_number,
@@ -796,6 +881,16 @@ Waiting for human decision...
         feature_branch.commits_behind_main = commits_behind
 
         if commits_behind > 50:
+            # EMIT DECISION EVENT: Critical staleness detected
+            self.decision_events.emit_branch_stale_detected(
+                project=project,
+                issue_number=issue_number,
+                branch_name=feature_branch.branch_name,
+                commits_behind=commits_behind,
+                action_taken="escalate_stale_branch",
+                parent_issue=parent_issue
+            )
+            
             await self.escalate_stale_branch(
                 github_integration,
                 parent_issue,
@@ -803,6 +898,16 @@ Waiting for human decision...
                 commits_behind
             )
         elif commits_behind > 20:
+            # EMIT DECISION EVENT: Warning staleness detected
+            self.decision_events.emit_branch_stale_detected(
+                project=project,
+                issue_number=issue_number,
+                branch_name=feature_branch.branch_name,
+                commits_behind=commits_behind,
+                action_taken="warn_stale_branch",
+                parent_issue=parent_issue
+            )
+            
             logger.warning(
                 f"Branch {feature_branch.branch_name} is {commits_behind} commits behind main"
             )

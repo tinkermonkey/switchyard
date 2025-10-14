@@ -9,6 +9,7 @@ For automated maker-checker review workflows, see review_cycle.py instead.
 
 import asyncio
 import logging
+import re
 from typing import Dict, Any, Optional, Tuple
 from datetime import datetime
 from config.manager import WorkflowColumn
@@ -17,6 +18,18 @@ from services.github_integration import GitHubIntegration
 from services.conversational_session_state import conversational_session_state
 
 logger = logging.getLogger(__name__)
+
+# Regex pattern to match bot usernames (GitHub Apps, Actions, etc.)
+# - orchestrator-bot (with or without [bot] suffix) - our bot
+# - github-actions[bot] - GitHub Actions (requires [bot] suffix)
+# - app/orchestrator-bot - alternative GitHub App format
+BOT_USERNAME_PATTERN = re.compile(
+    r'^orchestrator-bot(\[bot\])?$|^github-actions\[bot\]$|^app/orchestrator-bot$'
+)
+
+def is_bot_user(username: str) -> bool:
+    """Check if a username belongs to a bot account"""
+    return BOT_USERNAME_PATTERN.match(username) is not None
 
 
 class HumanFeedbackState:
@@ -76,6 +89,22 @@ class HumanFeedbackLoopExecutor:
         logger.info(
             f"Starting human feedback loop for issue #{issue_number} "
             f"with agent {column.agent}"
+        )
+
+        # Emit decision event for loop start
+        from monitoring.decision_events import DecisionEventEmitter
+        from monitoring.observability import get_observability_manager
+        
+        obs = get_observability_manager()
+        decision_events = DecisionEventEmitter(obs)
+        
+        decision_events.emit_conversational_loop_started(
+            issue_number=issue_number,
+            project=project_name,
+            board=board_name,
+            agent=column.agent,
+            workspace_type=workspace_type,
+            discussion_id=discussion_id
         )
 
         # Create state
@@ -138,6 +167,20 @@ class HumanFeedbackLoopExecutor:
             f"Monitoring discussion {state.discussion_id} for human feedback "
             f"(will poll indefinitely until card moves to different column)"
         )
+        
+        # Safety check: Verify we have valid state
+        if not state.agent_outputs:
+            logger.warning(
+                f"⚠️  SAFETY WARNING: No previous agent outputs loaded for issue #{state.issue_number}. "
+                f"This means we cannot determine what feedback is 'new' vs 'old'. "
+                f"The monitoring loop will treat ALL historical human comments as new feedback. "
+                f"This likely indicates a bug in state loading or bot username filtering."
+            )
+        else:
+            logger.info(
+                f"✅ State validated: {len(state.agent_outputs)} previous outputs loaded. "
+                f"Will only respond to feedback after {state.agent_outputs[-1]['timestamp']}"
+            )
 
         while True:
             await asyncio.sleep(poll_interval)
@@ -158,6 +201,34 @@ class HumanFeedbackLoopExecutor:
             if human_feedback:
                 logger.info(f"Human feedback detected from {human_feedback['author']}")
                 state.current_iteration += 1
+
+                # Emit decision event for feedback detection
+                from monitoring.decision_events import DecisionEventEmitter
+                from monitoring.observability import get_observability_manager
+                
+                obs = get_observability_manager()
+                decision_events = DecisionEventEmitter(obs)
+                
+                # Determine the mode that will be used based on context that will be built
+                # Question mode: threaded conversation with parent comment context
+                # Revision mode: feedback without thread history (top-level or no parent)
+                has_parent_comment = 'parent_comment' in human_feedback and human_feedback['parent_comment'] is not None
+                predicted_mode = 'question' if has_parent_comment else 'revision'
+                
+                # Build action description with mode info
+                action_description = f"route_to_agent_{state.agent}_in_{predicted_mode}_mode"
+                
+                decision_events.emit_feedback_detected(
+                    issue_number=state.issue_number,
+                    project=state.project_name,
+                    board=state.board_name,
+                    feedback_source='discussion_reply' if state.workspace_type == 'discussions' else 'issue_comment',
+                    feedback_content=human_feedback.get('body', ''),
+                    target_agent=state.agent,
+                    action_taken=action_description,
+                    workspace_type=state.workspace_type,
+                    discussion_id=state.discussion_id
+                )
 
                 # Execute agent with human feedback (pass full dict with author)
                 await self._execute_agent(
@@ -291,6 +362,17 @@ class HumanFeedbackLoopExecutor:
             context['claude_session_id'] = state.claude_session_id
             logger.info(f"Resuming Claude Code session: {state.claude_session_id}")
 
+        # Determine what execution mode the agent will use based on context
+        # This matches the logic in base_maker_agent._determine_execution_mode()
+        if human_feedback and context.get('conversation_mode') == 'threaded' and len(context.get('thread_history', [])) > 0:
+            execution_mode = 'question'
+        elif human_feedback or context.get('trigger') == 'feedback_loop':
+            execution_mode = 'revision'
+        else:
+            execution_mode = 'initial'
+        
+        logger.info(f"Agent will execute in {execution_mode.upper()} mode (iteration {state.current_iteration}, is_initial={is_initial})")
+
         # Execute agent via centralized executor (ensures observability)
         logger.info(f"Executing {state.agent} (iteration {state.current_iteration})")
 
@@ -375,7 +457,7 @@ class HumanFeedbackLoopExecutor:
                 logger.debug(f"Cannot check issue #{state.issue_number} for feedback - GitHub App not configured")
                 return None
 
-            result = await github_app.graphql_request(query, {
+            result = github_app.graphql_request(query, {
                 'org': org,
                 'repo': state.repository,
                 'number': state.issue_number
@@ -410,7 +492,7 @@ class HumanFeedbackLoopExecutor:
                     if created_at.tzinfo:
                         created_at = created_at.replace(tzinfo=None)
 
-                    if author != 'orchestrator-bot' and created_at > last_agent_time:
+                    if not is_bot_user(author) and created_at > last_agent_time:
                         logger.info(f"Found human feedback in issue comment from {author}")
                         return {
                             'author': author,
@@ -476,7 +558,7 @@ class HumanFeedbackLoopExecutor:
             }
             """
 
-            result = await github_app.graphql_request(query, {'discussionId': state.discussion_id})
+            result = github_app.graphql_request(query, {'discussionId': state.discussion_id})
 
             logger.debug(f"GraphQL result: {result is not None}")
 
@@ -520,7 +602,7 @@ class HumanFeedbackLoopExecutor:
                     if created_at.tzinfo:
                         created_at = created_at.replace(tzinfo=None)
 
-                    if author != 'orchestrator-bot' and created_at > last_agent_time:
+                    if not is_bot_user(author) and created_at > last_agent_time:
                         logger.info(f"Found human feedback in top-level comment from {author}")
                         return {
                             'author': author,
@@ -545,7 +627,7 @@ class HumanFeedbackLoopExecutor:
                     logger.debug(f"Reply from {author} at {created_at} (last_agent: {last_agent_time})")
 
                     # Check if human comment after last agent output
-                    if author != 'orchestrator-bot' and created_at > last_agent_time:
+                    if not is_bot_user(author) and created_at > last_agent_time:
                         logger.info(f"Found human feedback in reply from {author} to comment {comment.get('id')}")
                         # Return the parent comment info so we can build correct thread context
                         return {
@@ -565,6 +647,81 @@ class HumanFeedbackLoopExecutor:
         except Exception as e:
             logger.error(f"Error checking for human feedback: {e}")
             return None
+
+    async def _load_previous_outputs_from_issue(self, state: HumanFeedbackState, org: str):
+        """Load previous agent outputs from issue comments to rebuild conversation history"""
+        from services.github_app import github_app
+        from dateutil import parser as date_parser
+
+        try:
+            # Use GraphQL to get issue comments
+            query = """
+            query($org: String!, $repo: String!, $number: Int!) {
+              repository(owner: $org, name: $repo) {
+                issue(number: $number) {
+                  comments(last: 50) {
+                    nodes {
+                      author { login }
+                      body
+                      createdAt
+                    }
+                  }
+                }
+              }
+            }
+            """
+
+            # Check if GitHub App is configured before attempting GraphQL
+            if not github_app.enabled:
+                logger.warning(f"Cannot load previous outputs for issue #{state.issue_number} - GitHub App not configured")
+                return
+
+            result = github_app.graphql_request(query, {
+                'org': org,
+                'repo': state.repository,
+                'number': state.issue_number
+            })
+
+            if not result or 'repository' not in result or not result['repository']:
+                logger.warning(f"Could not load issue #{state.issue_number}")
+                return
+
+            comments = result['repository']['issue']['comments']['nodes']
+
+            # Collect all bot comments in chronological order
+            bot_comments = []
+
+            for comment in comments:
+                if is_bot_user(comment.get('author', {}).get('login', '')):
+                    bot_comments.append({
+                        'body': comment.get('body', ''),
+                        'timestamp': comment.get('createdAt')
+                    })
+
+            # Sort by timestamp and add to state
+            bot_comments.sort(key=lambda x: x['timestamp'])
+
+            for i, comment in enumerate(bot_comments):
+                state.agent_outputs.append({
+                    'iteration': i,
+                    'output': comment['body'],
+                    'is_initial': i == 0,
+                    'has_feedback': i > 0,
+                    'timestamp': comment['timestamp']
+                })
+
+            state.current_iteration = len(bot_comments)
+            logger.info(f"Loaded {len(bot_comments)} previous agent outputs from issue #{state.issue_number}")
+            
+            if len(bot_comments) > 0:
+                logger.info(f"Most recent agent output timestamp: {bot_comments[-1]['timestamp']}")
+            else:
+                logger.warning(f"No previous agent outputs found for issue #{state.issue_number} - all comments will appear as 'new feedback'")
+
+        except Exception as e:
+            logger.error(f"Failed to load previous outputs from issue: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
 
     async def _load_previous_outputs_from_discussion(self, state: HumanFeedbackState, org: str):
         """Load previous agent outputs from discussion to rebuild conversation history"""
@@ -595,7 +752,7 @@ class HumanFeedbackLoopExecutor:
             }
             """
 
-            result = await github_app.graphql_request(query, {'discussionId': state.discussion_id})
+            result = github_app.graphql_request(query, {'discussionId': state.discussion_id})
 
             if not result or 'node' not in result or not result['node']:
                 logger.warning(f"Could not load discussion {state.discussion_id}")
@@ -608,7 +765,7 @@ class HumanFeedbackLoopExecutor:
 
             for comment in comments:
                 # Check top-level comment
-                if comment.get('author', {}).get('login') == 'orchestrator-bot':
+                if is_bot_user(comment.get('author', {}).get('login', '')):
                     bot_comments.append({
                         'body': comment.get('body', ''),
                         'timestamp': comment.get('createdAt')
@@ -616,7 +773,7 @@ class HumanFeedbackLoopExecutor:
 
                 # Check replies
                 for reply in comment.get('replies', {}).get('nodes', []):
-                    if reply.get('author', {}).get('login') == 'orchestrator-bot':
+                    if is_bot_user(reply.get('author', {}).get('login', '')):
                         bot_comments.append({
                             'body': reply.get('body', ''),
                             'timestamp': reply.get('createdAt')
@@ -636,6 +793,11 @@ class HumanFeedbackLoopExecutor:
 
             state.current_iteration = len(bot_comments)
             logger.info(f"Loaded {len(bot_comments)} previous agent outputs from discussion")
+            
+            if len(bot_comments) > 0:
+                logger.info(f"Most recent agent output timestamp: {bot_comments[-1]['timestamp']}")
+            else:
+                logger.warning(f"No previous agent outputs found for issue #{state.issue_number} - all comments will appear as 'new feedback'")
 
         except Exception as e:
             logger.error(f"Failed to load previous outputs from discussion: {e}")

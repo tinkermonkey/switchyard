@@ -435,6 +435,278 @@ class PipelineRunManager:
                 
         except Exception as e:
             logger.error(f"Error cleaning up pipeline run mappings: {e}")
+    
+    def cleanup_stale_active_runs_on_startup(self):
+        """
+        Clean up stale 'active' pipeline runs on orchestrator startup.
+        
+        On startup, we need to:
+        1. Query Elasticsearch for all 'active' pipeline runs
+        2. Check if each issue is actually in a column with an agent
+        3. End runs for issues in Done/Backlog or columns without agents
+        4. Keep runs active only if they're in columns with agents assigned
+        
+        This fixes the issue where runs remain 'active' after:
+        - Orchestrator restarts
+        - Issues manually moved to Done
+        - Issues moved to Backlog
+        """
+        if not self.es:
+            logger.warning("Elasticsearch not available, skipping stale pipeline run cleanup")
+            return
+        
+        try:
+            from config.manager import config_manager
+            import subprocess
+            import json
+            
+            # Get all active pipeline runs from Elasticsearch
+            query = {
+                "query": {
+                    "term": {"status": "active"}
+                },
+                "size": 1000  # Get all active runs
+            }
+            
+            result = self.es.search(index=self.es_index, body=query)
+            
+            if result['hits']['total']['value'] == 0:
+                logger.info("No active pipeline runs to clean up")
+                return
+            
+            logger.info(f"Found {result['hits']['total']['value']} active pipeline runs, checking if they should be ended")
+            
+            ended_count = 0
+            kept_active_count = 0
+            
+            for hit in result['hits']['hits']:
+                run = hit['_source']
+                pipeline_run_id = run['id']
+                project = run['project']
+                issue_number = run['issue_number']
+                board = run['board']
+                
+                try:
+                    # Get project config
+                    project_config = config_manager.get_project_config(project)
+                    if not project_config:
+                        logger.warning(f"No config for project {project}, ending run {pipeline_run_id}")
+                        self._end_run_in_elasticsearch(run, "Project config not found")
+                        ended_count += 1
+                        continue
+                    
+                    # Find pipeline config for this board
+                    pipeline_config = next(
+                        (p for p in project_config.pipelines if p.board_name == board),
+                        None
+                    )
+                    
+                    if not pipeline_config:
+                        logger.warning(f"No pipeline config for board {board}, ending run {pipeline_run_id}")
+                        self._end_run_in_elasticsearch(run, "Pipeline config not found")
+                        ended_count += 1
+                        continue
+                    
+                    # Get workflow template
+                    workflow_template = config_manager.get_workflow_template(pipeline_config.workflow)
+                    
+                    # Get current column for this issue from GitHub Projects v2
+                    # We need to query the project board to see what column the issue is in
+                    current_column = self._get_issue_column_from_github(
+                        project_config, pipeline_config, issue_number
+                    )
+                    
+                    if not current_column:
+                        logger.warning(
+                            f"Could not determine column for issue #{issue_number}, "
+                            f"ending run {pipeline_run_id} (issue may have been removed from board)"
+                        )
+                        self._end_run_in_elasticsearch(run, "Issue not found on board")
+                        ended_count += 1
+                        continue
+                    
+                    # Check if this column has an agent assigned
+                    column_config = next(
+                        (c for c in workflow_template.columns if c.name == current_column),
+                        None
+                    )
+                    
+                    if not column_config:
+                        logger.warning(
+                            f"Column {current_column} not in workflow, "
+                            f"ending run {pipeline_run_id}"
+                        )
+                        self._end_run_in_elasticsearch(run, f"Column '{current_column}' not in workflow")
+                        ended_count += 1
+                        continue
+                    
+                    # Check if column has an agent
+                    has_agent = column_config.agent and column_config.agent != 'null'
+                    
+                    if not has_agent:
+                        logger.info(
+                            f"Issue #{issue_number} in column '{current_column}' with no agent, "
+                            f"ending run {pipeline_run_id}"
+                        )
+                        self._end_run_in_elasticsearch(run, f"Issue in column '{current_column}' with no agent")
+                        ended_count += 1
+                    else:
+                        logger.debug(
+                            f"Issue #{issue_number} in column '{current_column}' with agent {column_config.agent}, "
+                            f"keeping run {pipeline_run_id} active"
+                        )
+                        kept_active_count += 1
+                    
+                except Exception as e:
+                    logger.error(
+                        f"Error checking pipeline run {pipeline_run_id} for "
+                        f"{project} issue #{issue_number}: {e}"
+                    )
+                    # Keep active on error to be safe
+                    kept_active_count += 1
+            
+            logger.info(
+                f"Pipeline run cleanup complete: ended {ended_count} stale runs, "
+                f"kept {kept_active_count} runs active"
+            )
+            
+        except Exception as e:
+            logger.error(f"Error during stale pipeline run cleanup: {e}")
+    
+    def _get_issue_column_from_github(self, project_config, pipeline_config, issue_number: int) -> Optional[str]:
+        """
+        Query GitHub Projects v2 to get the current column for an issue
+        
+        Args:
+            project_config: Project configuration
+            pipeline_config: Pipeline configuration
+            issue_number: Issue number to look up
+            
+        Returns:
+            Column name if found, None otherwise
+        """
+        try:
+            import subprocess
+            import json
+            
+            # Extract project number from board name (e.g., "Development Pipeline" -> number from GitHub)
+            # We need to query the organization's projects to find the right one
+            org = project_config.github.get('org')
+            repo = project_config.github.get('repo')
+            board_name = pipeline_config.board_name
+            
+            # Get project number from state manager
+            from config.state_manager import state_manager
+            github_state = state_manager.load_project_state(project_config.name)
+            
+            if not github_state or not github_state.boards:
+                logger.warning(f"No GitHub state for project {project_config.name}")
+                return None
+            
+            # github_state.boards is a dict, not a list
+            board_state = github_state.boards.get(board_name)
+            if not board_state or not board_state.project_number:
+                logger.warning(f"No project number for board {board_name}")
+                return None
+            
+            project_number = board_state.project_number
+            
+            # Query GitHub Projects v2 API for this specific issue
+            query = f'''{{
+                user(login: "{org}") {{
+                    projectV2(number: {project_number}) {{
+                        items(first: 100) {{
+                            nodes {{
+                                content {{
+                                    ... on Issue {{
+                                        number
+                                    }}
+                                }}
+                                fieldValues(first: 10) {{
+                                    nodes {{
+                                        ... on ProjectV2ItemFieldSingleSelectValue {{
+                                            name
+                                            field {{
+                                                ... on ProjectV2SingleSelectField {{
+                                                    name
+                                                }}
+                                            }}
+                                        }}
+                                    }}
+                                }}
+                            }}
+                        }}
+                    }}
+                }}
+            }}'''
+            
+            result = subprocess.run(
+                ['gh', 'api', 'graphql', '-f', f'query={query}'],
+                capture_output=True, text=True, check=True, timeout=30
+            )
+            
+            data = json.loads(result.stdout)
+            project_data = data['data']['user']['projectV2']
+            
+            # Find the item matching our issue number
+            for node in project_data['items']['nodes']:
+                content = node.get('content')
+                if content and content.get('number') == issue_number:
+                    # Found the issue, extract status field
+                    for field_value in node['fieldValues']['nodes']:
+                        if field_value and field_value.get('field', {}).get('name') == 'Status':
+                            column_name = field_value.get('name')
+                            logger.debug(f"Found issue #{issue_number} in column '{column_name}'")
+                            return column_name
+            
+            logger.debug(f"Issue #{issue_number} not found on board {board_name}")
+            return None
+            
+        except subprocess.CalledProcessError as e:
+            logger.error(f"GraphQL query failed: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"Error querying issue column: {e}")
+            return None
+    
+    def _end_run_in_elasticsearch(self, run_data: Dict[str, Any], reason: str):
+        """
+        End a pipeline run directly in Elasticsearch (cleanup helper)
+        
+        Args:
+            run_data: Pipeline run data from Elasticsearch
+            reason: Reason for ending (for logging)
+        """
+        try:
+            pipeline_run_id = run_data['id']
+            run_data['ended_at'] = datetime.utcnow().isoformat() + 'Z'
+            run_data['status'] = 'completed'
+            
+            self.es.index(
+                index=self.es_index,
+                id=pipeline_run_id,
+                document=run_data
+            )
+            
+            # Also clean up Redis if it exists
+            redis_key = self._get_redis_key(pipeline_run_id)
+            if self.redis.exists(redis_key):
+                self.redis.setex(
+                    redis_key,
+                    3600,  # Keep for 1 hour after completion
+                    json.dumps(run_data)
+                )
+            
+            # Remove from issue mapping
+            project = run_data['project']
+            issue_number = run_data['issue_number']
+            issue_key = self._get_issue_key(project, issue_number)
+            self.redis.hdel(self.redis_issue_mapping, issue_key)
+            
+            logger.info(f"Ended stale pipeline run {pipeline_run_id}: {reason}")
+            
+        except Exception as e:
+            logger.error(f"Error ending pipeline run {run_data.get('id')}: {e}")
 
 
 # Global pipeline run manager instance

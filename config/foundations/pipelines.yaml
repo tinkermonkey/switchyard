@@ -36,30 +36,13 @@ pipeline_templates:
         default_agent: "software_architect"
         timeout: 600
         retries: 3
-        review_required: true
-        reviewer_agent: "design_reviewer"
-        reviewer_timeout: 300
-        reviewer_retries: 2
-        escalation:
-          blocking_threshold: 1
-
-      - stage: "test_planning"
-        name: "Test Strategy & Planning"
-        required_capabilities: ["test_strategy", "test_planning"]
-        default_agent: "test_planner"
-        inputs_from: ["business_analyst", "software_architect"]
-        timeout: 300
-        retries: 2
-        review_required: true
-        reviewer_agent: "test_reviewer"
-        reviewer_timeout: 300
-        reviewer_retries: 2
+        review_required: false
 
       - stage: "work_breakdown"
         name: "Work Breakdown & Issue Creation"
         required_capabilities: ["work_decomposition", "issue_creation"]
         default_agent: "work_breakdown_agent"
-        inputs_from: ["business_analyst", "software_architect", "test_planner"]
+        inputs_from: ["business_analyst", "software_architect"]
         timeout: 300
         retries: 2
         review_required: false
@@ -68,7 +51,7 @@ pipeline_templates:
         name: "Epic Documentation"
         required_capabilities: ["technical_writing", "documentation_creation"]
         default_agent: "technical_writer"
-        inputs_from: ["business_analyst", "software_architect", "test_planner"]
+        inputs_from: ["business_analyst", "software_architect"]
         timeout: 300
         retries: 2
         review_required: true
@@ -109,6 +92,7 @@ pipeline_templates:
         name: "Software Development"
         required_capabilities: ["software_development", "code_implementation"]
         default_agent: "senior_software_engineer"
+        inputs_from: ["software_architect"]  # Pull full design from planning workflow (requirements already in issue body)
         timeout: 1800
         retries: 5
         review_required: true
@@ -119,18 +103,17 @@ pipeline_templates:
           blocking_threshold: 1
           github_pr_required: true
 
-      - stage: "qa_testing"
-        name: "Quality Assurance & Testing"
-        required_capabilities: ["qa_testing", "integration_testing"]
-        default_agent: "senior_qa_engineer"
-        timeout: 600
-        retries: 5
-        review_required: true
-        reviewer_agent: "qa_reviewer"
-        reviewer_timeout: 300
-        reviewer_retries: 5
-        escalation:
-          blocking_threshold: 1
+      - stage: "testing"
+        name: "Automated Testing & Validation"
+        stage_type: "repair_cycle"  # NEW: Signals this is a repair cycle stage
+        required_capabilities: ["test_execution", "software_development"]
+        default_agent: "senior_software_engineer"
+        timeout: 3600  # Longer timeout for iterative cycles
+        retries: 1  # Retries handled internally by cycle
+        review_required: false  # No review for deterministic testing
+        # Test configurations will be loaded from project config
+        max_total_agent_calls: 100  # Circuit breaker for cost control
+        checkpoint_interval: 5  # Checkpoint every N iterations
 
       - stage: "staging"
         name: "Staging Review"

@@ -4,6 +4,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 import logging
+from monitoring.timestamp_utils import utc_now, utc_isoformat
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +47,7 @@ class MetricsCollector:
     def _create_index_templates(self):
         """Create index templates for metrics indices with ILM policies"""
         try:
-            # First, create the ILM policy for metrics (90-day retention)
+            # First, create the ILM policy for metrics (7-day retention)
             ilm_policy = {
                 "policy": {
                     "phases": {
@@ -63,7 +64,7 @@ class MetricsCollector:
                             }
                         },
                         "warm": {
-                            "min_age": "7d",
+                            "min_age": "3d",
                             "actions": {
                                 "set_priority": {
                                     "priority": 50
@@ -71,7 +72,7 @@ class MetricsCollector:
                             }
                         },
                         "delete": {
-                            "min_age": "90d",
+                            "min_age": "7d",
                             "actions": {
                                 "delete": {}
                             }
@@ -85,7 +86,7 @@ class MetricsCollector:
                 name="orchestrator-metrics-policy",
                 body=ilm_policy
             )
-            logger.info("Created ILM policy: orchestrator-metrics-policy (90-day retention)")
+            logger.info("Created ILM policy: orchestrator-metrics-policy (7-day retention)")
             
             # Task metrics template with ILM policy
             task_template = {
@@ -144,8 +145,68 @@ class MetricsCollector:
             )
             logger.info("Created index template: orchestrator-quality-metrics (with ILM policy)")
             
+            # Create initial write indices with aliases if they don't exist
+            self._create_initial_indices()
+            
         except Exception as e:
             logger.warning(f"Failed to create index templates or ILM policy: {e}")
+    
+    def _create_initial_indices(self):
+        """Create initial write indices with aliases for ILM rollover"""
+        try:
+            # Use numeric suffixes for ILM rollover compatibility
+            # ILM requires index names to end with a number (e.g., -000001)
+            task_index = "orchestrator-task-metrics-000001"
+            task_alias = "orchestrator-task-metrics"
+            
+            if not self.es.indices.exists(index=task_index):
+                self.es.indices.create(
+                    index=task_index,
+                    body={
+                        "aliases": {
+                            task_alias: {
+                                "is_write_index": True
+                            }
+                        }
+                    }
+                )
+                logger.info(f"Created initial write index: {task_index} with alias {task_alias}")
+            elif not self.es.indices.exists_alias(name=task_alias):
+                # Index exists but alias doesn't - add the alias
+                self.es.indices.put_alias(
+                    index=task_index,
+                    name=task_alias,
+                    body={"is_write_index": True}
+                )
+                logger.info(f"Added write alias {task_alias} to existing index {task_index}")
+            
+            # Create quality metrics initial index with alias
+            quality_index = "orchestrator-quality-metrics-000001"
+            quality_alias = "orchestrator-quality-metrics"
+            
+            if not self.es.indices.exists(index=quality_index):
+                self.es.indices.create(
+                    index=quality_index,
+                    body={
+                        "aliases": {
+                            quality_alias: {
+                                "is_write_index": True
+                            }
+                        }
+                    }
+                )
+                logger.info(f"Created initial write index: {quality_index} with alias {quality_alias}")
+            elif not self.es.indices.exists_alias(name=quality_alias):
+                # Index exists but alias doesn't - add the alias
+                self.es.indices.put_alias(
+                    index=quality_index,
+                    name=quality_alias,
+                    body={"is_write_index": True}
+                )
+                logger.info(f"Added write alias {quality_alias} to existing index {quality_index}")
+                
+        except Exception as e:
+            logger.warning(f"Failed to create initial indices with aliases: {e}")
         
     def record_task_start(self, agent: str):
         """Record task start (no-op, kept for compatibility)"""
@@ -153,9 +214,10 @@ class MetricsCollector:
         
     def record_task_complete(self, agent: str, duration: float, success: bool):
         """Record task completion to Elasticsearch and JSON log"""
-        now = datetime.now()
+        now = utc_now()
+        timestamp_str = utc_isoformat()
         metrics_data = {
-            "timestamp": now.isoformat(),
+            "timestamp": timestamp_str,
             "agent": agent,
             "duration": duration,
             "success": success
@@ -164,11 +226,11 @@ class MetricsCollector:
         # Write to Elasticsearch if enabled
         if self.es_enabled:
             try:
-                index_name = f"orchestrator-task-metrics-{now.strftime('%Y.%m.%d')}"
+                # Write to the alias, not the dated index - ILM will handle rollover
                 self.es.index(
-                    index=index_name,
+                    index="orchestrator-task-metrics",
                     document={
-                        "@timestamp": now.isoformat(),
+                        "@timestamp": timestamp_str,
                         "agent": agent,
                         "duration": duration,
                         "success": success
@@ -188,9 +250,10 @@ class MetricsCollector:
 
     def record_quality_metric(self, agent: str, metric_name: str, score: float):
         """Record quality metrics to Elasticsearch and JSON log"""
-        now = datetime.now()
+        now = utc_now()
+        timestamp_str = utc_isoformat()
         metrics_data = {
-            "timestamp": now.isoformat(),
+            "timestamp": timestamp_str,
             "agent": agent,
             "metric_name": metric_name,
             "score": score
@@ -199,11 +262,11 @@ class MetricsCollector:
         # Write to Elasticsearch if enabled
         if self.es_enabled:
             try:
-                index_name = f"orchestrator-quality-metrics-{now.strftime('%Y.%m.%d')}"
+                # Write to the alias, not the dated index - ILM will handle rollover
                 self.es.index(
-                    index=index_name,
+                    index="orchestrator-quality-metrics",
                     document={
-                        "@timestamp": now.isoformat(),
+                        "@timestamp": timestamp_str,
                         "agent": agent,
                         "metric_name": metric_name,
                         "score": score

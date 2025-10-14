@@ -12,6 +12,7 @@ from datetime import datetime
 from enum import Enum
 from dataclasses import dataclass, asdict
 from elasticsearch import Elasticsearch
+from monitoring.timestamp_utils import utc_now, utc_isoformat
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +88,14 @@ class EventType(Enum):
     TASK_DEQUEUED = "task_dequeued"
     TASK_PRIORITY_CHANGED = "task_priority_changed"
     TASK_CANCELLED = "task_cancelled"
+    
+    # Branch Management
+    BRANCH_SELECTED = "branch_selected"
+    BRANCH_CREATED = "branch_created"
+    BRANCH_REUSED = "branch_reused"
+    BRANCH_CONFLICT_DETECTED = "branch_conflict_detected"
+    BRANCH_STALE_DETECTED = "branch_stale_detected"
+    BRANCH_SELECTION_ESCALATED = "branch_selection_escalated"
 
 @dataclass
 class ObservabilityEvent:
@@ -195,8 +204,25 @@ class ObservabilityManager:
             EventType.TASK_DEQUEUED,
             EventType.TASK_PRIORITY_CHANGED,
             EventType.TASK_CANCELLED,
+            # Branch Management
+            EventType.BRANCH_SELECTED,
+            EventType.BRANCH_CREATED,
+            EventType.BRANCH_REUSED,
+            EventType.BRANCH_CONFLICT_DETECTED,
+            EventType.BRANCH_STALE_DETECTED,
+            EventType.BRANCH_SELECTION_ESCALATED,
         }
         return event_type in decision_events
+
+    def _is_agent_lifecycle_event(self, event_type: EventType) -> bool:
+        """Check if an event type is an agent lifecycle event that should be indexed in Elasticsearch"""
+        lifecycle_events = {
+            EventType.AGENT_INITIALIZED,
+            EventType.AGENT_STARTED,
+            EventType.AGENT_COMPLETED,
+            EventType.AGENT_FAILED
+        }
+        return event_type in lifecycle_events
 
     def emit(self, event_type: EventType, agent: str, task_id: str,
              project: str, data: Dict[str, Any], pipeline_run_id: Optional[str] = None):
@@ -210,7 +236,7 @@ class ObservabilityManager:
                 data['pipeline_run_id'] = pipeline_run_id
 
             event = ObservabilityEvent(
-                timestamp=datetime.utcnow().isoformat() + 'Z',
+                timestamp=utc_isoformat(),
                 event_id=str(uuid.uuid4()),
                 event_type=event_type.value,
                 agent=agent,
@@ -239,7 +265,7 @@ class ObservabilityManager:
             if self.es and self._is_decision_event(event_type):
                 try:
                     # Create index name based on current date
-                    index_name = f"decision-events-{datetime.utcnow().strftime('%Y-%m-%d')}"
+                    index_name = f"decision-events-{utc_now().strftime('%Y-%m-%d')}"
                     
                     # Prepare document for Elasticsearch
                     doc = {
@@ -260,6 +286,32 @@ class ObservabilityManager:
                     logger.error(f"Failed to index decision event to Elasticsearch: {e}")
             elif self._is_decision_event(event_type):
                 logger.warning(f"Decision event {event_type.value} not indexed - ES client is None")
+            
+            # Index agent lifecycle events in Elasticsearch
+            if self.es and self._is_agent_lifecycle_event(event_type):
+                try:
+                    # Create index name based on current date
+                    index_name = f"agent-events-{utc_now().strftime('%Y-%m-%d')}"
+                    
+                    # Prepare document for Elasticsearch
+                    doc = {
+                        'timestamp': event.timestamp,
+                        'event_type': event.event_type,
+                        'event_category': 'agent_lifecycle',  # Category for filtering
+                        'agent': agent,
+                        'task_id': task_id,
+                        'project': project,
+                        'pipeline_run_id': pipeline_run_id,
+                        **data  # Flatten data into document
+                    }
+                    
+                    # Index the document
+                    self.es.index(index=index_name, document=doc)
+                    logger.info(f"Indexed agent lifecycle event {event_type.value} to {index_name}")
+                except Exception as e:
+                    logger.error(f"Failed to index agent lifecycle event to Elasticsearch: {e}")
+            elif self._is_agent_lifecycle_event(event_type):
+                logger.warning(f"Agent lifecycle event {event_type.value} not indexed - ES client is None")
 
             logger.debug(f"Emitted {event_type.value} event for {agent}/{task_id}")
 
@@ -278,7 +330,8 @@ class ObservabilityManager:
 
     def emit_agent_initialized(self, agent: str, task_id: str, project: str,
                               config: Dict[str, Any], branch_name: Optional[str] = None,
-                              container_name: Optional[str] = None):
+                              container_name: Optional[str] = None,
+                              pipeline_run_id: Optional[str] = None):
         """Emit agent initialized event"""
         data = {
             'model': config.get('model'),
@@ -291,7 +344,7 @@ class ObservabilityManager:
         if container_name:
             data['container_name'] = container_name
 
-        self.emit(EventType.AGENT_INITIALIZED, agent, task_id, project, data)
+        self.emit(EventType.AGENT_INITIALIZED, agent, task_id, project, data, pipeline_run_id)
 
     def emit_prompt_constructed(self, agent: str, task_id: str, project: str,
                                prompt: str, estimated_tokens: Optional[int] = None):
@@ -363,15 +416,138 @@ class ObservabilityManager:
 
     def emit_agent_completed(self, agent: str, task_id: str, project: str,
                             duration_ms: float, success: bool,
-                            error: Optional[str] = None):
+                            error: Optional[str] = None,
+                            pipeline_run_id: Optional[str] = None,
+                            output: Optional[str] = None):
         """Emit agent completion event"""
         event_type = EventType.AGENT_COMPLETED if success else EventType.AGENT_FAILED
 
-        self.emit(event_type, agent, task_id, project, {
+        data = {
             'duration_ms': duration_ms,
             'success': success,
             'error': error
-        })
+        }
+        
+        # Include output if provided (truncate if too long)
+        if output:
+            # Store full output (for display in UI)
+            data['output'] = output
+            # Also store a preview for events list
+            data['output_preview'] = output[:1000] + "..." if len(output) > 1000 else output
+        
+        self.emit(event_type, agent, task_id, project, data, pipeline_run_id)
+    
+    def cleanup_stale_agent_events_on_startup(self):
+        """
+        Clean up stale agent_initialized events from Redis stream on startup.
+        
+        This fixes the issue where agents that crashed or were interrupted
+        without emitting completion events remain in the event stream as 'active'.
+        
+        Strategy:
+        1. Read all events from Redis stream
+        2. Track agents that have initialized but not completed
+        3. For agents without completion that are older than threshold, emit synthetic completion events
+        4. This allows the UI to correctly show no active agents after restart
+        """
+        if not self.enabled or not self.redis:
+            return
+        
+        try:
+            from datetime import datetime, timedelta
+            
+            # Threshold for considering an agent stale (2 hours)
+            STALE_THRESHOLD_HOURS = 2
+            stale_threshold = datetime.utcnow() - timedelta(hours=STALE_THRESHOLD_HOURS)
+            
+            # Read all events from the stream
+            try:
+                stream_data = self.redis.xrange(self.stream_key, '-', '+')
+            except Exception as e:
+                logger.warning(f"Could not read Redis stream for cleanup: {e}")
+                return
+            
+            if not stream_data:
+                logger.debug("No events in Redis stream to clean up")
+                return
+            
+            # Track agent states
+            agent_states = {}
+            
+            for stream_id, event_data in stream_data:
+                try:
+                    event_json = event_data.get('event')
+                    if not event_json:
+                        continue
+                    
+                    event = json.loads(event_json)
+                    event_type = event.get('event_type')
+                    agent = event.get('agent')
+                    task_id = event.get('task_id')
+                    timestamp_str = event.get('timestamp')
+                    
+                    if not agent or not event_type:
+                        continue
+                    
+                    # Parse timestamp
+                    try:
+                        if timestamp_str.endswith('Z'):
+                            event_time = datetime.fromisoformat(timestamp_str[:-1])
+                        else:
+                            event_time = datetime.fromisoformat(timestamp_str)
+                    except:
+                        continue
+                    
+                    # Track agent state
+                    if event_type == 'agent_initialized':
+                        agent_states[task_id] = {
+                            'agent': agent,
+                            'task_id': task_id,
+                            'project': event.get('project'),
+                            'initialized_at': event_time,
+                            'completed': False
+                        }
+                    elif event_type in ['agent_completed', 'agent_failed']:
+                        if task_id in agent_states:
+                            agent_states[task_id]['completed'] = True
+                
+                except Exception as e:
+                    logger.debug(f"Error processing event for cleanup: {e}")
+                    continue
+            
+            # Find stale agents (initialized but not completed, older than threshold)
+            stale_count = 0
+            for task_id, state in agent_states.items():
+                if not state['completed'] and state['initialized_at'] < stale_threshold:
+                    agent = state['agent']
+                    project = state['project']
+                    
+                    logger.info(
+                        f"Found stale agent event: {agent} (task: {task_id}, "
+                        f"initialized: {state['initialized_at']}) - emitting synthetic completion"
+                    )
+                    
+                    # Emit synthetic agent_failed event to mark it as complete
+                    # This will be added to the stream and picked up by the UI
+                    self.emit_agent_completed(
+                        agent=agent,
+                        task_id=task_id,
+                        project=project,
+                        duration_ms=0,
+                        success=False,
+                        error="Agent interrupted (orchestrator restarted)",
+                        output=None
+                    )
+                    
+                    stale_count += 1
+            
+            if stale_count > 0:
+                logger.info(f"Cleaned up {stale_count} stale agent events")
+            else:
+                logger.debug("No stale agent events found")
+                
+        except Exception as e:
+            logger.error(f"Error during stale agent event cleanup: {e}")
 
 # Global observability manager instance
 _observability_manager: Optional[ObservabilityManager] = None

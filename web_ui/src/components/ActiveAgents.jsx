@@ -157,7 +157,7 @@ const ActiveAgents = ({
               onClick={() => handleKillClick(agent)}
               disabled={isKillingAgent(agent.container_name)}
               className={`
-                w-full px-2 py-1.5 rounded text-xs font-medium flex items-center justify-center gap-1.5
+                px-1 py-1 rounded text-xs font-SM flex items-center justify-center gap-1.5
                 ${isKillingAgent(agent.container_name)
                   ? 'bg-gray-300 text-gray-500 cursor-not-allowed'
                   : 'bg-red-600 text-white hover:bg-red-700 active:bg-red-800'

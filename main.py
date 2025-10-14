@@ -4,6 +4,7 @@ import time
 from pathlib import Path
 
 from flask.cli import F
+from monitoring.timestamp_utils import utc_now, utc_isoformat
 from config.environment import Environment
 from config.manager import config_manager
 from config.state_manager import state_manager as github_state_manager
@@ -61,6 +62,32 @@ async def main():
     projects_needing_setup = workspace_manager.initialize_all_projects()
     logger.info("Project workspaces initialized")
 
+    # Clean up orphaned Redis keys from agent containers that completed after orchestrator restart
+    logger.info("Cleaning up orphaned agent container tracking keys")
+    from claude.docker_runner import DockerAgentRunner
+    DockerAgentRunner.cleanup_orphaned_redis_keys()
+    logger.info("Orphaned Redis key cleanup complete")
+
+    # Clean up stuck in_progress execution states from interrupted agent runs
+    logger.info("Cleaning up stuck in_progress execution states")
+    from services.work_execution_state import work_execution_tracker
+    work_execution_tracker.cleanup_stuck_in_progress_states()
+    logger.info("Execution state cleanup complete")
+    
+    # Clean up stale active pipeline runs
+    logger.info("Cleaning up stale active pipeline runs")
+    from services.pipeline_run import get_pipeline_run_manager
+    pipeline_run_manager = get_pipeline_run_manager()
+    pipeline_run_manager.cleanup_stale_active_runs_on_startup()
+    logger.info("Pipeline run cleanup complete")
+    
+    # Clean up stale agent events from Redis stream
+    logger.info("Cleaning up stale agent events from Redis stream")
+    from monitoring.observability import get_observability_manager
+    observability = get_observability_manager()
+    observability.cleanup_stale_agent_events_on_startup()
+    logger.info("Stale agent event cleanup complete")
+
     # Verify Docker images for all projects marked as verified
     # This handles cases where Docker context changed or images were lost
     logger.info("Verifying Docker images for verified projects")
@@ -73,14 +100,13 @@ async def main():
 
     # Queue dev_environment_setup tasks for projects that need it
     from task_queue.task_manager import Task, TaskPriority
-    from datetime import datetime
 
     for project_name, needs_setup in projects_needing_setup.items():
         if needs_setup:
             logger.info(f"Queuing dev_environment_setup task for {project_name}")
 
             task = Task(
-                id=f"dev_env_setup_{project_name}_{int(datetime.now().timestamp())}",
+                id=f"dev_env_setup_{project_name}_{int(utc_now().timestamp())}",
                 agent="dev_environment_setup",
                 project=project_name,
                 priority=TaskPriority.HIGH,  # High priority for initial setup
@@ -96,7 +122,7 @@ async def main():
                     'automated_setup': True,  # Flag to indicate this is automated setup
                     'use_docker': False  # Run locally in orchestrator environment to access Docker for building project images
                 },
-                created_at=datetime.now().isoformat()
+                created_at=utc_isoformat()
             )
 
             task_queue.enqueue(task)

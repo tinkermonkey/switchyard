@@ -52,12 +52,12 @@ workflow_templates:
       - name: "Requirements Review"
         type: "review"
         stage_mapping: "requirements_review"
-        agent: "product_manager"
+        agent: "requirements_reviewer"
         maker_agent: "business_analyst"
         max_iterations: 3
         auto_advance_on_approval: true
         escalate_on_blocked: true
-        description: "Strategic validation of requirements"
+        description: "Requirements validation and quality assurance"
         automation_rules:
           - trigger: "item_moved_to_column"
             action: "assign_label"
@@ -83,60 +83,6 @@ workflow_templates:
             action: "start_conversational_loop"
             parameters:
               stage: "design"
-
-      - name: "Design Review"
-        type: "review"
-        stage_mapping: "design_review"
-        agent: "design_reviewer"
-        maker_agent: "software_architect"
-        max_iterations: 3
-        auto_advance_on_approval: true
-        escalate_on_blocked: true
-        description: "Architecture validation and review"
-        automation_rules:
-          - trigger: "item_moved_to_column"
-            action: "assign_label"
-            parameters:
-              labels: ["stage:design-review"]
-          - trigger: "item_moved_to_column"
-            action: "start_review_cycle"
-            parameters:
-              stage: "design"
-
-      - name: "Test Planning"
-        type: "conversational"
-        stage_mapping: "test_planning"
-        agent: "test_planner"
-        feedback_timeout_seconds: 3600
-        description: "Test strategy and planning"
-        automation_rules:
-          - trigger: "item_moved_to_column"
-            action: "assign_label"
-            parameters:
-              labels: ["stage:test-planning"]
-          - trigger: "item_moved_to_column"
-            action: "start_conversational_loop"
-            parameters:
-              stage: "test_planning"
-
-      - name: "Test Plan Review"
-        type: "review"
-        stage_mapping: "test_planning_review"
-        agent: "test_reviewer"
-        maker_agent: "test_planner"
-        max_iterations: 3
-        auto_advance_on_approval: true
-        escalate_on_blocked: true
-        description: "Test plan validation"
-        automation_rules:
-          - trigger: "item_moved_to_column"
-            action: "assign_label"
-            parameters:
-              labels: ["stage:test-plan-review"]
-          - trigger: "item_moved_to_column"
-            action: "start_review_cycle"
-            parameters:
-              stage: "test_planning"
 
       - name: "Work Breakdown"
         type: "conversational"
@@ -261,50 +207,29 @@ workflow_templates:
               stage: "implementation"
 
       - name: "Testing"
-        stage_mapping: "qa_testing"
-        agent: "senior_qa_engineer"
+        stage_mapping: "testing"
+        agent: "senior_software_engineer"
         auto_advance_on_approval: true
-        description: "QA test creation"
+        description: "Automated test-fix-validate repair cycle"
         automation_rules:
           - trigger: "item_moved_to_column"
             action: "assign_label"
             parameters:
-              labels: ["stage:qa-testing"]
-
-      - name: "QA Review"
-        type: "review"
-        stage_mapping: "qa_testing_review"
-        agent: "qa_reviewer"
-        maker_agent: "senior_qa_engineer"
-        max_iterations: 3
-        auto_advance_on_approval: true
-        escalate_on_blocked: true
-        description: "QA test review"
-        automation_rules:
+              labels: ["stage:testing"]
           - trigger: "item_moved_to_column"
-            action: "assign_label"
+            action: "start_pipeline_stage"
             parameters:
-              labels: ["stage:qa-review"]
-          - trigger: "item_moved_to_column"
-            action: "start_review_cycle"
-            parameters:
-              stage: "qa_testing"
+              stage: "testing"
 
       - name: "Staged"
-        type: "conversational"
-        stage_mapping: "staging"
-        agent: "senior_software_engineer"
-        feedback_timeout_seconds: 7200
-        description: "Staged for production - human review and feedback"
+        stage_mapping: null
+        agent: null
+        description: "Staged for production - manual human review and approval"
         automation_rules:
           - trigger: "item_moved_to_column"
             action: "assign_label"
             parameters:
               labels: ["status:staged"]
-          - trigger: "item_moved_to_column"
-            action: "start_conversational_loop"
-            parameters:
-              stage: "staging"
 
       - name: "Done"
         stage_mapping: null
@@ -411,15 +336,6 @@ stage_labels:
   - name: "stage:design"
     color: "cfd3d7"
     description: "Design stage"
-  - name: "stage:design-review"
-    color: "cfd3d7"
-    description: "Design review stage"
-  - name: "stage:test-planning"
-    color: "cfd3d7"
-    description: "Test planning stage"
-  - name: "stage:test-plan-review"
-    color: "cfd3d7"
-    description: "Test plan review stage"
   - name: "stage:work-breakdown"
     color: "cfd3d7"
     description: "Work breakdown stage"
@@ -429,9 +345,9 @@ stage_labels:
   - name: "stage:code-review"
     color: "cfd3d7"
     description: "Code review stage"
-  - name: "stage:qa-testing"
+  - name: "stage:testing"
     color: "cfd3d7"
-    description: "QA testing stage"
+    description: "Automated testing stage (repair cycle)"
   - name: "stage:staging"
     color: "cfd3d7"
     description: "Staging stage"

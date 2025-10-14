@@ -212,9 +212,7 @@ class AutoCommitService:
             'senior_software_engineer': 'Implement feature',
             'senior_qa_engineer': 'Add tests',
             'technical_writer': 'Add documentation',
-            'idea_researcher': 'Add research findings',
-            'product_manager': 'Add product planning',
-            'test_planner': 'Add test plan'
+            'idea_researcher': 'Add research findings'
         }
 
         action = agent_actions.get(agent, f'Update from {agent}')

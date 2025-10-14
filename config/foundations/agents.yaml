@@ -24,7 +24,6 @@ agents:
       - web_search
     mcp_servers:
       - context7
-      - serena
 
   dev_environment_verifier:
     description: "Verifies dev environment setup succeeded and marks container as verified"
@@ -46,7 +45,6 @@ agents:
       - docker_operations
     mcp_servers:
       - context7
-      - serena
 
   idea_researcher:
     description: "Market research and idea validation"
@@ -67,7 +65,6 @@ agents:
       - web_search
     mcp_servers:
       - context7
-      - serena
 
   business_analyst:
     description: "Requirements analysis and user story development"
@@ -89,29 +86,6 @@ agents:
       - web_search
     mcp_servers:
       - context7
-      - serena
-
-  product_manager:
-    description: "Strategic product planning and prioritization"
-    model: "claude-sonnet-4-5-20250929"
-    timeout: 300
-    retries: 2
-    makes_code_changes: false  # Creates planning documents
-    filesystem_write_allowed: false  # Must post to GitHub, not create local files
-    requires_dev_container: false  # Documentation work doesn't need project dependencies
-    requires_docker: true  # Must run in Docker for security isolation
-    capabilities:
-      - product_strategy
-      - feature_prioritization
-      - stakeholder_management
-      - market_positioning
-    tools_enabled:
-      - file_operations
-      - git_integration
-      - web_search
-    mcp_servers:
-      - context7
-      - serena
 
   requirements_reviewer:
     description: "Requirements validation and quality assurance"
@@ -132,7 +106,6 @@ agents:
       - git_integration
     mcp_servers:
       - context7
-      - serena
 
   software_architect:
     description: "System architecture and technical design"
@@ -154,69 +127,6 @@ agents:
       - web_search
     mcp_servers:
       - context7
-      - serena
-
-  design_reviewer:
-    description: "Architecture validation and technical review"
-    model: "claude-opus-4-20250514"
-    timeout: 300
-    retries: 2
-    makes_code_changes: false  # Review only, no changes
-    filesystem_write_allowed: false  # Posts reviews to GitHub, doesn't create files
-    requires_dev_container: false
-    requires_docker: true  # Must run in Docker for security isolation
-    capabilities:
-      - architecture_validation
-      - security_review
-      - scalability_assessment
-      - compliance_validation
-    tools_enabled:
-      - file_operations
-      - git_integration
-    mcp_servers:
-      - context7
-      - serena
-
-  test_planner:
-    description: "Test strategy and planning"
-    model: "claude-sonnet-4-5-20250929"
-    timeout: 300
-    retries: 2
-    makes_code_changes: false  # Creates test plan documents
-    filesystem_write_allowed: false  # Posts reviews to GitHub, doesn't create files
-    requires_dev_container: false  # Planning doesn't need dependencies yet
-    requires_docker: true  # Must run in Docker for security isolation
-    capabilities:
-      - test_strategy
-      - test_planning
-      - coverage_analysis
-      - automation_planning
-    tools_enabled:
-      - file_operations
-      - git_integration
-    mcp_servers:
-      - context7
-      - serena
-
-  test_reviewer:
-    description: "Test plan validation and review"
-    model: "claude-opus-4-20250514"
-    timeout: 300
-    retries: 2
-    makes_code_changes: false  # Review only, no changes
-    filesystem_write_allowed: false  # Posts reviews to GitHub, doesn't create files
-    requires_dev_container: false
-    requires_docker: true  # Must run in Docker for security isolation
-    capabilities:
-      - test_validation
-      - coverage_review
-      - quality_assessment
-    tools_enabled:
-      - file_operations
-      - git_integration
-    mcp_servers:
-      - context7
-      - serena
 
   work_breakdown_agent:
     description: "Break approved designs into phase-based sub-issues for implementation"
@@ -237,7 +147,6 @@ agents:
       - git_integration
     mcp_servers:
       - context7
-      - serena
 
   senior_software_engineer:
     description: "Software development and implementation"
@@ -259,7 +168,6 @@ agents:
       - web_search
     mcp_servers:
       - context7
-      - serena
 
   code_reviewer:
     description: "Code quality review and validation"
@@ -280,48 +188,6 @@ agents:
       - git_integration
     mcp_servers:
       - context7
-      - serena
-
-  senior_qa_engineer:
-    description: "Quality assurance and end-to-end testing"
-    model: "claude-sonnet-4-5-20250929"
-    timeout: 600
-    retries: 3
-    makes_code_changes: true  # Writes test code
-    filesystem_write_allowed: true  # CRITICAL: Must write test files to /workspace
-    requires_dev_container: true  # Needs project dependencies to run tests
-    requires_docker: true  # Must run in Docker for security isolation
-    capabilities:
-      - qa_testing
-      - integration_testing
-      - performance_testing
-      - production_readiness
-    tools_enabled:
-      - file_operations
-      - git_integration
-    mcp_servers:
-      - serena
-
-  qa_reviewer:
-    description: "QA work validation and test execution review"
-    model: "claude-opus-4-20250514"
-    timeout: 300
-    retries: 2
-    makes_code_changes: false  # Review only, no changes
-    filesystem_write_allowed: false  # Posts reviews to GitHub, doesn't create files
-    requires_dev_container: false  # Can review test results without running them
-    requires_docker: true  # Must run in Docker for security isolation
-    capabilities:
-      - qa_validation
-      - test_execution_review
-      - coverage_analysis
-      - production_readiness_review
-    tools_enabled:
-      - file_operations
-      - git_integration
-    mcp_servers:
-      - context7
-      - serena
 
   technical_writer:
     description: "Technical documentation creation"

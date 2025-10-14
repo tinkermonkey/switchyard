@@ -1,11 +1,11 @@
 from typing import Dict, Any, List
-from agents.base_maker_agent import MakerAgent
+from agents.base_analysis_agent import AnalysisAgent
 import logging
 
 logger = logging.getLogger(__name__)
 
 
-class BusinessAnalystAgent(MakerAgent):
+class BusinessAnalystAgent(AnalysisAgent):
     """
     Business Analyst agent for requirements analysis and user story creation.
 
@@ -25,7 +25,7 @@ class BusinessAnalystAgent(MakerAgent):
 
     @property
     def agent_role_description(self) -> str:
-        return """I analyze business requirements using CBAP best practices, create user stories with INVEST principles, and ensure requirements are clear, complete, and testable."""
+        return """I analyze business requirements, create user stories, and ensure requirements are clear, complete, and testable."""
 
     @property
     def output_sections(self) -> List[str]:
@@ -43,12 +43,23 @@ class BusinessAnalystAgent(MakerAgent):
         return """
 ## Important Guidelines
 
+**Content Guidelines**:
 - Do NOT include effort estimates, timeline estimates, or implementation suggestions
 - Do NOT include quality assessments or quality scores
 - Avoid hypothetical or generic requirements; focus on specifics from the issue
 - Avoid hyperbolic language and made-up metrics; be concise and factual
 - Focus purely on WHAT needs to be built, not HOW or WHEN
 - User stories should capture requirements only, not implementation details
+
+**Formatting Requirements**:
+- Your response should start IMMEDIATELY with "## Executive Summary"
+- Do NOT include any conversational preambles (e.g., "Ok, I'll analyze...", "Let me build...")
+- Do NOT create a "Summary for GitHub Comment" section - your entire output is the comment
+- The complete structure should be exactly:
+  1. ## Executive Summary
+  2. ## Functional Requirements
+  3. ## User Stories
+  (Nothing before, nothing after)
 """
 
     def get_quality_standards(self) -> str:

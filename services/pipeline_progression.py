@@ -77,8 +77,20 @@ class PipelineProgression:
             return None
 
     def move_issue_to_column(self, project_name: str, board_name: str, issue_number: int,
-                            target_column: str) -> bool:
-        """Move an issue to a specific column in GitHub Projects v2"""
+                            target_column: str, trigger: str = 'manual') -> bool:
+        """
+        Move an issue to a specific column in GitHub Projects v2
+        
+        Args:
+            project_name: Project name
+            board_name: Board/pipeline name
+            issue_number: Issue number to move
+            target_column: Target column name
+            trigger: What triggered the move ('manual', 'auto', 'review_cycle', 'agent_completion')
+        
+        Returns:
+            True if successful, False otherwise
+        """
         try:
             project_config = config_manager.get_project_config(project_name)
             project_state = state_manager.load_project_state(project_name)
@@ -91,6 +103,60 @@ class PipelineProgression:
             if not board_state:
                 logger.error(f"No board state found for {board_name}")
                 return False
+            
+            # Determine current status (for decision event)
+            current_status = None
+            try:
+                # Try to get current status from GitHub
+                github_org = project_config.github['org']
+                github_repo = project_config.github['repo']
+                
+                query = f'''{{
+                    repository(owner: "{github_org}", name: "{github_repo}") {{
+                        issue(number: {issue_number}) {{
+                            projectItems(first: 10) {{
+                                nodes {{
+                                    id
+                                    project {{
+                                        number
+                                    }}
+                                    fieldValueByName(name: "Status") {{
+                                        ... on ProjectV2ItemFieldSingleSelectValue {{
+                                            name
+                                        }}
+                                    }}
+                                }}
+                            }}
+                        }}
+                    }}
+                }}'''
+                
+                result = subprocess.run(
+                    ['gh', 'api', 'graphql', '-f', f'query={query}'],
+                    capture_output=True, text=True, check=True
+                )
+                data = json.loads(result.stdout)
+                project_items = data['data']['repository']['issue']['projectItems']['nodes']
+                
+                for item in project_items:
+                    if item['project']['number'] == board_state.project_number:
+                        field_value = item.get('fieldValueByName')
+                        if field_value:
+                            current_status = field_value.get('name')
+                        break
+            except Exception as e:
+                logger.debug(f"Could not determine current status: {e}")
+            
+            # EMIT DECISION EVENT: Status progression started
+            self.decision_events.emit_status_progression(
+                issue_number=issue_number,
+                project=project_name,
+                board=board_name,
+                from_status=current_status or 'unknown',
+                to_status=target_column,
+                trigger=trigger,
+                success=None  # Not yet executed
+            )
 
             # Get the field ID for Status from board state
             status_field_id = board_state.status_field_id
@@ -175,15 +241,25 @@ class PipelineProgression:
                 capture_output=True, text=True, check=True
             )
 
-            # Record status change with 'auto' trigger (from pipeline progression)
+            # Record status change with trigger (from pipeline progression)
             from services.work_execution_state import work_execution_tracker
-            # Note: We don't have the old status here, but the tracker will handle it
             work_execution_tracker.record_status_change(
                 issue_number=issue_number,
-                from_status=None,  # Could track this if needed
+                from_status=current_status,
                 to_status=target_column,
-                trigger='auto',  # Automatic progression
+                trigger=trigger,
                 project_name=project_name
+            )
+            
+            # EMIT DECISION EVENT: Status progression completed
+            self.decision_events.emit_status_progression(
+                issue_number=issue_number,
+                project=project_name,
+                board=board_name,
+                from_status=current_status or 'unknown',
+                to_status=target_column,
+                trigger=trigger,
+                success=True
             )
 
             logger.info(f"Moved issue #{issue_number} to column '{target_column}' in {board_name}")
@@ -191,6 +267,19 @@ class PipelineProgression:
 
         except Exception as e:
             logger.error(f"Error moving issue to column: {e}")
+            
+            # EMIT DECISION EVENT: Status progression failed
+            self.decision_events.emit_status_progression(
+                issue_number=issue_number,
+                project=project_name,
+                board=board_name,
+                from_status=current_status or 'unknown',
+                to_status=target_column,
+                trigger=trigger,
+                success=False,
+                error=str(e)
+            )
+            
             return False
 
     def progress_to_next_stage(self, project_name: str, board_name: str, issue_number: int,
@@ -207,46 +296,19 @@ class PipelineProgression:
             if not next_column:
                 logger.info(f"No next stage for issue #{issue_number} - pipeline complete")
                 return False
-            
-            # EMIT DECISION EVENT: Status progression started
-            self.decision_events.emit_status_progression(
-                issue_number=issue_number,
-                project=project_name,
-                board=board_name,
-                from_status=current_column,
-                to_status=next_column,
-                trigger='pipeline_progression',
-                success=None  # Not yet executed
-            )
 
-            # Move issue to next column
-            if not self.move_issue_to_column(project_name, board_name, issue_number, next_column):
-                logger.error(f"Failed to move issue #{issue_number} to '{next_column}'")
-                
-                # EMIT DECISION EVENT: Status progression failed
-                self.decision_events.emit_status_progression(
-                    issue_number=issue_number,
-                    project=project_name,
-                    board=board_name,
-                    from_status=current_column,
-                    to_status=next_column,
-                    trigger='pipeline_progression',
-                    success=False,
-                    error="Failed to move issue to next column"
-                )
-                
-                return False
-            
-            # EMIT DECISION EVENT: Status progression completed
-            self.decision_events.emit_status_progression(
-                issue_number=issue_number,
-                project=project_name,
-                board=board_name,
-                from_status=current_column,
-                to_status=next_column,
-                trigger='pipeline_progression',
-                success=True
+            # Move issue to next column (decision events emitted inside move_issue_to_column)
+            moved = self.move_issue_to_column(
+                project_name, 
+                board_name, 
+                issue_number, 
+                next_column,
+                trigger='pipeline_progression'
             )
+            
+            if not moved:
+                logger.error(f"Failed to move issue #{issue_number} to '{next_column}'")
+                return False
 
             # Get the agent for the next column
             project_config = config_manager.get_project_config(project_name)

@@ -35,7 +35,7 @@ class OrchestratorLogger:
             extra={
                 'agent': agent,
                 'task_id': task_id,
-                'context': context,
+                #'context': context,
                 'timestamp': datetime.now().isoformat()
             }
         )
@@ -47,7 +47,7 @@ class OrchestratorLogger:
                 'agent': agent,
                 'task_id': task_id,
                 'duration_seconds': duration,
-                'result': result,
+                #'result': result,
                 'timestamp': datetime.now().isoformat()
             }
         )

@@ -14,6 +14,7 @@ import json
 from typing import Dict, Any, Optional
 from datetime import datetime, timezone
 from pathlib import Path
+from monitoring.timestamp_utils import utc_now, utc_isoformat
 from monitoring.observability import get_observability_manager
 from pipeline.factory import PipelineFactory
 from config.manager import config_manager
@@ -52,7 +53,7 @@ class AgentExecutor:
             Agent execution result
         """
         # Generate unique task ID
-        task_id = f"{task_id_prefix}_{agent_name}_{int(datetime.now().timestamp())}"
+        task_id = f"{task_id_prefix}_{agent_name}_{int(utc_now().timestamp())}"
 
         logger.info(f"Executing agent {agent_name} for project {project_name} (task_id: {task_id})")
 
@@ -128,9 +129,14 @@ class AgentExecutor:
             container_name = DockerAgentRunner._sanitize_container_name(raw_container_name)
             logger.info(f"Generated container name for UI tracking: {container_name}")
 
+        # Extract pipeline_run_id from task_context for event tracking
+        pipeline_run_id = task_context.get('pipeline_run_id')
+
         # Emit agent initialized event (after workspace prep to include branch_name and container_name)
         agent_config = agent_stage.agent_config or {}
-        self.obs.emit_agent_initialized(agent_name, task_id, project_name, agent_config, branch_name, container_name)
+        self.obs.emit_agent_initialized(
+            agent_name, task_id, project_name, agent_config, branch_name, container_name, pipeline_run_id
+        )
 
         # Mark dev container as in_progress when setup agent starts
         if agent_name == 'dev_environment_setup':
@@ -147,8 +153,21 @@ class AgentExecutor:
         try:
             result = await agent_stage.execute(execution_context)
 
+            # Extract output from result for event emission
+            output_text = None
+            if isinstance(result, dict):
+                # Try to get markdown output or raw analysis result
+                output_text = result.get('markdown_analysis') or result.get('raw_analysis_result')
+                
+                # If not found at top level, try nested in context
+                if not output_text and 'context' in result:
+                    ctx = result['context']
+                    output_text = ctx.get('markdown_analysis') or ctx.get('raw_analysis_result')
+
             duration_ms = (time.time() - start_time) * 1000
-            self.obs.emit_agent_completed(agent_name, task_id, project_name, duration_ms, True)
+            self.obs.emit_agent_completed(
+                agent_name, task_id, project_name, duration_ms, True, None, pipeline_run_id, output_text
+            )
 
             # If dev_environment_setup completed successfully, queue verifier
             if agent_name == 'dev_environment_setup':
@@ -192,7 +211,9 @@ class AgentExecutor:
 
         except Exception as e:
             duration_ms = (time.time() - start_time) * 1000
-            self.obs.emit_agent_completed(agent_name, task_id, project_name, duration_ms, False, str(e))
+            self.obs.emit_agent_completed(
+                agent_name, task_id, project_name, duration_ms, False, str(e), pipeline_run_id, None
+            )
 
             # Record failed execution outcome
             if 'issue_number' in task_context and 'column' in task_context:
@@ -263,7 +284,7 @@ class AgentExecutor:
 
         # Build context with ALL required fields for agents
         context = {
-            'pipeline_id': f"pipeline_{task_id}_{datetime.now().timestamp()}",
+            'pipeline_id': f"pipeline_{task_id}_{utc_now().timestamp()}",
             'task_id': task_id,
             'agent': agent_name,
             'project': project_name,
@@ -346,7 +367,7 @@ class AgentExecutor:
                 feedback_manager.set_last_agent_comment_time(
                     issue_number,
                     agent_name,
-                    datetime.now(timezone.utc).isoformat()
+                    utc_isoformat()
                 )
             else:
                 logger.error(f"Failed to post {agent_name} output to GitHub: {post_result.get('error')}")
@@ -415,7 +436,7 @@ class AgentExecutor:
 
             # Create verifier task with reference to setup output
             task = Task(
-                id=f"auto_dev_env_verify_{project_name}_{int(datetime.now().timestamp())}",
+                id=f"auto_dev_env_verify_{project_name}_{int(utc_now().timestamp())}",
                 agent="dev_environment_verifier",
                 project=project_name,
                 priority=TaskPriority.HIGH,
@@ -433,7 +454,7 @@ class AgentExecutor:
                     'use_docker': False,  # Verifier also runs locally
                     'previous_stage_output': 'Setup agent completed successfully'
                 },
-                created_at=datetime.now().isoformat()
+                created_at=utc_isoformat()
             )
 
             task_queue.enqueue(task)

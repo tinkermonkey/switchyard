@@ -170,6 +170,7 @@ function ClaudeCallCompletedEvent({ event, timestamp }) {
 }
 
 function AgentCompletedEvent({ event, timestamp }) {
+  const [showModal, setShowModal] = useState(false)
   const isSuccess = event.event_type === 'agent_completed'
   const durationMs = event.data?.duration_ms
   const duration = durationMs
@@ -177,21 +178,43 @@ function AgentCompletedEvent({ event, timestamp }) {
       ? `${(durationMs / 1000).toFixed(1)}s`
       : `${(durationMs / 60000).toFixed(1)} min`
     : 'N/A'
+  const hasOutput = event.data?.output && event.data.output.length > 0
 
   return (
-    <EventCard
-      icon={isSuccess ? <CheckCircle /> : <XCircle />}
-      title={isSuccess ? 'Agent Completed' : 'Agent Failed'}
-      badge={event.agent}
-      badgeColor={isSuccess ? 'success' : 'error'}
-      timestamp={timestamp}
-    >
-      <EventDetail label="Duration" value={duration} />
-      <EventDetail label="Status" value={isSuccess ? '✓ Success' : '✗ Failed'} />
-      {!isSuccess && event.data?.error && (
-        <EventDetail label="Error" value={event.data.error} />
+    <>
+      <EventCard
+        icon={isSuccess ? <CheckCircle /> : <XCircle />}
+        title={isSuccess ? 'Agent Completed' : 'Agent Failed'}
+        badge={event.agent}
+        badgeColor={isSuccess ? 'success' : 'error'}
+        timestamp={timestamp}
+      >
+        <EventDetail label="Duration" value={duration} />
+        <EventDetail label="Status" value={isSuccess ? '✓ Success' : '✗ Failed'} />
+        {!isSuccess && event.data?.error && (
+          <EventDetail label="Error" value={event.data.error} />
+        )}
+        {hasOutput && (
+          <button
+            onClick={() => setShowModal(true)}
+            className="text-gh-accent-primary text-sm hover:underline flex items-center gap-1 mt-2"
+          >
+            <ExternalLink className="w-4 h-4" />
+            View output
+          </button>
+        )}
+      </EventCard>
+
+      {showModal && (
+        <Modal title="Agent Output" onClose={() => setShowModal(false)}>
+          <div className="prose prose-invert max-w-none">
+            <ReactMarkdown remarkPlugins={[remarkGfm]}>
+              {event.data.output}
+            </ReactMarkdown>
+          </div>
+        </Modal>
       )}
-    </EventCard>
+    </>
   )
 }
 

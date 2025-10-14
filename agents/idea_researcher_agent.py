@@ -1,11 +1,11 @@
 from typing import Dict, Any, List
-from agents.base_maker_agent import MakerAgent
+from agents.base_analysis_agent import AnalysisAgent
 import logging
 
 logger = logging.getLogger(__name__)
 
 
-class IdeaResearcherAgent(MakerAgent):
+class IdeaResearcherAgent(AnalysisAgent):
     """
     Idea Researcher agent for technical research and concept analysis.
 

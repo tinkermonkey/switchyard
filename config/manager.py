@@ -52,6 +52,9 @@ class PipelineStage:
     reviewer_retries: Optional[int] = None
     escalation: Optional[Dict[str, Any]] = None
     inputs_from: Optional[List[str]] = None  # List of agent names to gather outputs from
+    stage_type: Optional[str] = None  # NEW: "repair_cycle" or None for standard stages
+    max_total_agent_calls: Optional[int] = None  # NEW: For repair cycles
+    checkpoint_interval: Optional[int] = None  # NEW: For repair cycles
 
 
 @dataclass
@@ -119,8 +122,9 @@ class ProjectConfig:
     tech_stacks: Dict[str, str]
     pipelines: List[ProjectPipeline]
     pipeline_routing: Dict[str, Any]
-    agent_customizations: Dict[str, Dict[str, Any]]
-    orchestrator: Dict[str, Any]
+    testing: Optional[Dict[str, Any]] = None  # NEW: Testing configuration
+    agent_customizations: Dict[str, Dict[str, Any]] = None
+    orchestrator: Dict[str, Any] = None
 
 
 class ConfigurationError(Exception):
@@ -247,7 +251,10 @@ class ConfigManager:
                     reviewer_timeout=stage_data.get('reviewer_timeout'),
                     reviewer_retries=stage_data.get('reviewer_retries'),
                     escalation=stage_data.get('escalation'),
-                    inputs_from=stage_data.get('inputs_from')
+                    inputs_from=stage_data.get('inputs_from'),
+                    stage_type=stage_data.get('stage_type'),  # NEW
+                    max_total_agent_calls=stage_data.get('max_total_agent_calls'),  # NEW
+                    checkpoint_interval=stage_data.get('checkpoint_interval')  # NEW
                 ))
 
             templates[name] = PipelineTemplate(
@@ -348,6 +355,7 @@ class ConfigManager:
             tech_stacks=project_data['tech_stacks'],
             pipelines=pipelines,
             pipeline_routing=project_data['pipeline_routing'],
+            testing=project_data.get('testing'),  # NEW
             agent_customizations=project_data.get('agent_customizations', {}),
             orchestrator=data.get('orchestrator', {})
         )

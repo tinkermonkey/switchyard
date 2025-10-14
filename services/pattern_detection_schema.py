@@ -134,24 +134,21 @@ AGENT_LOGS_TEMPLATE = {
 }
 
 
-# Lifecycle policy for index rotation (daily indices, 90-day retention)
+# Lifecycle policy for index rotation (daily indices, 7-day retention)
+# Note: No rollover action since we use date-based index names
 AGENT_LOGS_ILM_POLICY = {
     "policy": {
         "phases": {
             "hot": {
                 "min_age": "0ms",
                 "actions": {
-                    "rollover": {
-                        "max_age": "1d",
-                        "max_size": "5gb"
-                    },
                     "set_priority": {
                         "priority": 100
                     }
                 }
             },
             "warm": {
-                "min_age": "7d",
+                "min_age": "3d",
                 "actions": {
                     "set_priority": {
                         "priority": 50
@@ -159,7 +156,7 @@ AGENT_LOGS_ILM_POLICY = {
                 }
             },
             "delete": {
-                "min_age": "90d",
+                "min_age": "7d",
                 "actions": {
                     "delete": {}
                 }
@@ -314,10 +311,10 @@ def enrich_event(event_data: dict) -> dict:
     Returns:
         Enriched event ready for Elasticsearch indexing
     """
-    from datetime import datetime
+    from monitoring.timestamp_utils import utc_isoformat
 
     enriched = {
-        "timestamp": event_data.get("timestamp") or datetime.utcnow().isoformat() + 'Z',
+        "timestamp": event_data.get("timestamp") or utc_isoformat(),
         "raw_event": event_data
     }
 
@@ -391,16 +388,23 @@ def enrich_claude_log(log_data: dict) -> dict:
     Returns:
         Enriched log ready for Elasticsearch
     """
-    from datetime import datetime
+    from monitoring.timestamp_utils import timestamp_to_utc_isoformat, utc_now
     import copy
 
     # Convert timestamp to ISO format for raw_event to avoid parsing issues
     raw_event = copy.deepcopy(log_data)
     if "timestamp" in raw_event and isinstance(raw_event["timestamp"], (int, float)):
-        raw_event["timestamp"] = datetime.fromtimestamp(raw_event["timestamp"]).isoformat()
+        raw_event["timestamp"] = timestamp_to_utc_isoformat(raw_event["timestamp"])
+
+    # Get timestamp, defaulting to current UTC time if not present
+    timestamp = log_data.get("timestamp")
+    if isinstance(timestamp, (int, float)):
+        timestamp_str = timestamp_to_utc_isoformat(timestamp)
+    else:
+        timestamp_str = timestamp_to_utc_isoformat(utc_now().timestamp())
 
     enriched = {
-        "timestamp": datetime.fromtimestamp(log_data.get("timestamp", datetime.now().timestamp())).isoformat(),
+        "timestamp": timestamp_str,
         "agent_name": log_data.get("agent"),
         "project": log_data.get("project"),
         "task_id": log_data.get("task_id"),

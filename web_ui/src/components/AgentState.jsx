@@ -7,12 +7,14 @@ import { CheckCircle2, Circle, PlayCircle, ChevronDown, ChevronUp } from 'lucide
 export default function AgentState() {
   const { logs, events } = useSocket()
   const [isMessageExpanded, setIsMessageExpanded] = useState(false)
+  const [isPromptExpanded, setIsPromptExpanded] = useState(false)
 
   const agentState = useMemo(() => {
     let lastTodoWrite = null
     let lastTextMessage = null
     let lastToolCall = null
     let currentAgent = null
+    let inputPrompt = null
 
     // Start from most recent logs (end of array since they're appended)
     for (let i = logs.length - 1; i >= 0; i--) {
@@ -57,6 +59,21 @@ export default function AgentState() {
       }
 
       if (lastTodoWrite && lastTextMessage && lastToolCall && currentAgent) break
+    }
+
+    // Find the input prompt from the most recent prompt_constructed event for this agent
+    if (currentAgent) {
+      for (let i = 0; i < events.length; i++) {
+        const event = events[i]
+        if (event.agent === currentAgent && event.event_type === 'prompt_constructed') {
+          inputPrompt = {
+            text: event.data?.prompt || '',
+            timestamp: event.timestamp,
+            agent: event.agent
+          }
+          break
+        }
+      }
     }
 
     // Check for agent status in the events array (not logs)
@@ -112,7 +129,8 @@ export default function AgentState() {
       currentAgent,
       isExecuting,
       agentCompleted,
-      agentFailed
+      agentFailed,
+      inputPrompt
     }
   }, [logs, events])
 
@@ -149,7 +167,7 @@ export default function AgentState() {
     return { total: todos.length, completed, inProgress, pending }
   }
 
-  const { lastTodoWrite, lastTextMessage, lastToolCall, currentAgent, isExecuting, agentCompleted, agentFailed } = agentState
+  const { lastTodoWrite, lastTextMessage, lastToolCall, currentAgent, isExecuting, agentCompleted, agentFailed, inputPrompt } = agentState
 
   const formatAgentName = (agentName) => {
     if (!agentName) return 'Unknown Agent'
@@ -209,6 +227,44 @@ export default function AgentState() {
         <div className="p-4 flex gap-4">
           {/* Left column - 70% width */}
           <div className="flex-[7] space-y-4">
+            {inputPrompt && (
+              <div className="bg-gh-canvas rounded-md border border-gh-border p-3">
+                <div className="flex items-center justify-between mb-2">
+                  <div className="flex items-center gap-2">
+                    <h3 className="text-sm font-semibold text-gh-fg">Input Prompt</h3>
+                    <span className="text-xs text-gh-fg-muted">
+                      {formatTimestamp(inputPrompt.timestamp)}
+                    </span>
+                  </div>
+                  <button
+                    onClick={() => setIsPromptExpanded(!isPromptExpanded)}
+                    className="text-gh-accent-primary hover:bg-gh-border-muted rounded p-1 transition-colors"
+                    title={isPromptExpanded ? 'Collapse' : 'Expand'}
+                  >
+                    {isPromptExpanded ? (
+                      <ChevronUp className="w-4 h-4" />
+                    ) : (
+                      <ChevronDown className="w-4 h-4" />
+                    )}
+                  </button>
+                </div>
+                <div className="relative">
+                  <div
+                    className={`prose prose-sm prose-invert font-mono text-xs max-w-none transition-all ${
+                      isPromptExpanded ? '' : 'max-h-[200px] overflow-y-auto'
+                    }`}
+                  >
+                    <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                      {inputPrompt.text}
+                    </ReactMarkdown>
+                  </div>
+                  {!isPromptExpanded && inputPrompt.text.length > 500 && (
+                    <div className="absolute bottom-0 left-0 right-0 h-12 bg-gradient-to-t from-gh-canvas via-gh-canvas/80 to-transparent pointer-events-none" />
+                  )}
+                </div>
+              </div>
+            )}
+
             {lastTextMessage && (
               <div className="bg-gh-canvas rounded-md border border-gh-border p-3">
                 <div className="flex items-center justify-between mb-2">

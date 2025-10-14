@@ -138,7 +138,7 @@ class TestPipelineProgression:
             assert result is True
             # Verify move was attempted with correct arguments (next is Requirements Review)
             mock_move.assert_called_once_with(
-                'test-project', 'dev', 500, 'Requirements Review'
+                'test-project', 'dev', 500, 'Requirements Review', trigger='pipeline_progression'
             )
     
     def test_promote_issue_emits_decision_event(
@@ -163,8 +163,31 @@ class TestPipelineProgression:
             progression = PipelineProgression(task_queue=mock_task_queue)
             progression.decision_events = mock_observability[1]
             
-            # Mock move_issue_to_column
-            with patch.object(progression, 'move_issue_to_column', return_value=True):
+            # Mock move_issue_to_column to emit event and return True
+            def mock_move_with_event(*args, **kwargs):
+                # Emit the start event
+                mock_observability[1].emit_status_progression(
+                    issue_number=501,
+                    project='test-project',
+                    board='dev',
+                    from_status='Design',
+                    to_status='Design Review',
+                    trigger=kwargs.get('trigger', 'unknown'),
+                    success=None
+                )
+                # Emit the success event
+                mock_observability[1].emit_status_progression(
+                    issue_number=501,
+                    project='test-project',
+                    board='dev',
+                    from_status='Design',
+                    to_status='Design Review',
+                    trigger=kwargs.get('trigger', 'unknown'),
+                    success=True
+                )
+                return True
+            
+            with patch.object(progression, 'move_issue_to_column', side_effect=mock_move_with_event):
                 progression.progress_to_next_stage(
                     'test-project', 'dev', 501, 'Design', 'test-repo',
                     {'number': 501, 'title': 'Test'}
@@ -351,8 +374,26 @@ class TestFullPipelineTraversal:
             progression = PipelineProgression(task_queue=mock_task_queue)
             progression.decision_events = mock_observability[1]
             
+            # Mock move_issue_to_column to emit events
+            def mock_move_with_event(project, board, issue_num, target_col, trigger='unknown'):
+                # Determine current status from previous calls
+                call_count = mock_observability[1].emit_status_progression.call_count
+                from_statuses = ['Requirements', 'Requirements Review', 'Design']
+                from_status = from_statuses[call_count] if call_count < len(from_statuses) else 'unknown'
+                
+                mock_observability[1].emit_status_progression(
+                    issue_number=issue_num,
+                    project=project,
+                    board=board,
+                    from_status=from_status,
+                    to_status=target_col,
+                    trigger=trigger,
+                    success=True
+                )
+                return True
+            
             # Progress through multiple stages
-            with patch.object(progression, 'move_issue_to_column', return_value=True):
+            with patch.object(progression, 'move_issue_to_column', side_effect=mock_move_with_event):
                 progression.progress_to_next_stage(
                     'test-project', 'dev', 701, 'Requirements', 'test-repo',
                     {'number': 701, 'title': 'Test'}
