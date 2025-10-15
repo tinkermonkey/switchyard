@@ -13,7 +13,6 @@ export function deriveActiveAgentsFromEvents(events) {
   }
 
   const agentStates = new Map()
-  const STALE_AGENT_THRESHOLD_MS = 2 * 60 * 60 * 1000 // 2 hours
 
   // Process events from oldest to newest to build up state correctly
   for (let i = events.length - 1; i >= 0; i--) {
@@ -46,24 +45,9 @@ export function deriveActiveAgentsFromEvents(events) {
     }
   }
 
-  // Filter to only show running agents, excluding stale ones
-  const now = new Date()
+  // Filter to only show running agents
   const runningAgents = Array.from(agentStates.values()).filter((agent) => {
-    if (agent.status !== 'running') {
-      return false
-    }
-    
-    // Check if agent is stale (running for more than threshold)
-    const runtimeMs = getRuntimeMs(agent.started_at)
-    if (runtimeMs > STALE_AGENT_THRESHOLD_MS) {
-      console.warn(
-        `[deriveActiveAgentsFromEvents] Filtering out stale agent ${agent.agent} ` +
-        `(running for ${Math.floor(runtimeMs / 60000)} minutes, threshold is ${STALE_AGENT_THRESHOLD_MS / 60000} minutes)`
-      )
-      return false
-    }
-    
-    return true
+    return agent.status === 'running'
   })
   
   // Debug logging (can be removed later)

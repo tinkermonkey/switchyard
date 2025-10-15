@@ -10,7 +10,8 @@
 
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as ReviewLearningRouteImport } from './routes/review-learning'
-import { Route as PipelineRouteImport } from './routes/pipeline'
+import { Route as ProjectsRouteImport } from './routes/projects'
+import { Route as PipelineRunRouteImport } from './routes/pipeline-run'
 import { Route as IndexRouteImport } from './routes/index'
 
 const ReviewLearningRoute = ReviewLearningRouteImport.update({
@@ -18,9 +19,14 @@ const ReviewLearningRoute = ReviewLearningRouteImport.update({
   path: '/review-learning',
   getParentRoute: () => rootRouteImport,
 } as any)
-const PipelineRoute = PipelineRouteImport.update({
-  id: '/pipeline',
-  path: '/pipeline',
+const ProjectsRoute = ProjectsRouteImport.update({
+  id: '/projects',
+  path: '/projects',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const PipelineRunRoute = PipelineRunRouteImport.update({
+  id: '/pipeline-run',
+  path: '/pipeline-run',
   getParentRoute: () => rootRouteImport,
 } as any)
 const IndexRoute = IndexRouteImport.update({
@@ -31,31 +37,35 @@ const IndexRoute = IndexRouteImport.update({
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
-  '/pipeline': typeof PipelineRoute
+  '/pipeline-run': typeof PipelineRunRoute
+  '/projects': typeof ProjectsRoute
   '/review-learning': typeof ReviewLearningRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
-  '/pipeline': typeof PipelineRoute
+  '/pipeline-run': typeof PipelineRunRoute
+  '/projects': typeof ProjectsRoute
   '/review-learning': typeof ReviewLearningRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
-  '/pipeline': typeof PipelineRoute
+  '/pipeline-run': typeof PipelineRunRoute
+  '/projects': typeof ProjectsRoute
   '/review-learning': typeof ReviewLearningRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
-  fullPaths: '/' | '/pipeline' | '/review-learning'
+  fullPaths: '/' | '/pipeline-run' | '/projects' | '/review-learning'
   fileRoutesByTo: FileRoutesByTo
-  to: '/' | '/pipeline' | '/review-learning'
-  id: '__root__' | '/' | '/pipeline' | '/review-learning'
+  to: '/' | '/pipeline-run' | '/projects' | '/review-learning'
+  id: '__root__' | '/' | '/pipeline-run' | '/projects' | '/review-learning'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
-  PipelineRoute: typeof PipelineRoute
+  PipelineRunRoute: typeof PipelineRunRoute
+  ProjectsRoute: typeof ProjectsRoute
   ReviewLearningRoute: typeof ReviewLearningRoute
 }
 
@@ -68,11 +78,18 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof ReviewLearningRouteImport
       parentRoute: typeof rootRouteImport
     }
-    '/pipeline': {
-      id: '/pipeline'
-      path: '/pipeline'
-      fullPath: '/pipeline'
-      preLoaderRoute: typeof PipelineRouteImport
+    '/projects': {
+      id: '/projects'
+      path: '/projects'
+      fullPath: '/projects'
+      preLoaderRoute: typeof ProjectsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/pipeline-run': {
+      id: '/pipeline-run'
+      path: '/pipeline-run'
+      fullPath: '/pipeline-run'
+      preLoaderRoute: typeof PipelineRunRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/': {
@@ -87,7 +104,8 @@ declare module '@tanstack/react-router' {
 
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
-  PipelineRoute: PipelineRoute,
+  PipelineRunRoute: PipelineRunRoute,
+  ProjectsRoute: ProjectsRoute,
   ReviewLearningRoute: ReviewLearningRoute,
 }
 export const routeTree = rootRouteImport

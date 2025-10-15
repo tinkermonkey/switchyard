@@ -2,6 +2,7 @@ import { createFileRoute } from '@tanstack/react-router'
 import { RefreshCw, Activity, CheckCircle, XCircle, AlertCircle, MessageSquare, GitBranch, PlayCircle } from 'lucide-react'
 import Header from '../components/Header'
 import NavigationTabs from '../components/NavigationTabs'
+import CycleBoundingNode from '../components/CycleBoundingNode'
 import { useState, useEffect, useCallback, useMemo } from 'react'
 import {
   ReactFlow,
@@ -14,9 +15,14 @@ import {
   Position,
 } from '@xyflow/react'
 import '@xyflow/react/dist/style.css'
-import dagre from '@dagrejs/dagre'
 import { useSocket } from '../contexts/SocketContext'
 import { formatDuration } from '../utils/stateHelpers'
+import {
+  identifyCycles,
+  applyCycleLayout,
+  toggleCycleCollapsed,
+  updateEdgesForCycles,
+} from '../utils/cycleLayout'
 
 /**
  * Custom node component for pipeline run events with candy-stripe animation
@@ -192,6 +198,7 @@ const PipelineEventNode = ({ data }) => {
 
 const nodeTypes = {
   pipelineEvent: PipelineEventNode,
+  cycleBounding: CycleBoundingNode,
 }
 
 function PipelineRunView() {
@@ -199,6 +206,7 @@ function PipelineRunView() {
   const [completedPipelineRuns, setCompletedPipelineRuns] = useState([])
   const [selectedPipelineRun, setSelectedPipelineRun] = useState(null)
   const [pipelineRunEvents, setPipelineRunEvents] = useState([])
+  const [workflowConfig, setWorkflowConfig] = useState(null) // NEW: Workflow configuration
   const [loading, setLoading] = useState(true)
   const [loadingCompleted, setLoadingCompleted] = useState(false)
   const [loadingEvents, setLoadingEvents] = useState(false)
@@ -211,6 +219,7 @@ function PipelineRunView() {
   const [chartHeight, setChartHeight] = useState(600)
   const [legendOpen, setLegendOpen] = useState(true)
   const [reactFlowInstance, setReactFlowInstance] = useState(null)
+  const [cycles, setCycles] = useState(new Map()) // Track cycle collapse state
   const completedLimit = 10
   const { events: socketEvents } = useSocket()
   
@@ -275,6 +284,27 @@ function PipelineRunView() {
     fetchCompletedPipelineRuns(newOffset, true)
   }, [completedOffset, completedLimit, fetchCompletedPipelineRuns])
   
+  // Fetch workflow configuration for selected pipeline run
+  const fetchWorkflowConfig = useCallback(async (project, board) => {
+    if (!project || !board) return
+    
+    try {
+      const response = await fetch(`/api/workflow-config/${project}/${board}`)
+      const data = await response.json()
+      
+      if (data.success) {
+        console.log(`📋 [Pipeline Run] Loaded workflow config for ${project}/${board}:`, data.workflow)
+        setWorkflowConfig(data.workflow)
+      } else {
+        console.error(`Failed to load workflow config: ${data.error}`)
+        setWorkflowConfig(null)
+      }
+    } catch (error) {
+      console.error('Error fetching workflow configuration:', error)
+      setWorkflowConfig(null)
+    }
+  }, [])
+  
   // Fetch events for selected pipeline run
   const fetchPipelineRunEvents = useCallback(async (pipelineRunId) => {
     if (!pipelineRunId) return
@@ -292,6 +322,12 @@ function PipelineRunView() {
     } finally {
       setLoadingEvents(false)
     }
+  }, [])
+  
+  // Handle cycle collapse/expand toggle
+  const handleToggleCycle = useCallback((cycleId) => {
+    setCycles(prevCycles => toggleCycleCollapsed(prevCycles, cycleId))
+    // State update will trigger useEffect to rebuild flowchart
   }, [])
   
   // Build flowchart from events
@@ -320,7 +356,7 @@ function PipelineRunView() {
     const createdNode = {
       id: 'created',
       type: 'pipelineEvent',
-      position: { x: 0, y: 0 }, // Will be positioned by Dagre
+      position: { x: 0, y: 0 }, // Will be positioned by layout
       data: {
         label: 'Pipeline Started',
         type: 'pipeline_created',
@@ -330,11 +366,10 @@ function PipelineRunView() {
     }
     newNodes.push(createdNode)
     
-    // Track review cycles: map of agent -> [execution instances]
-    const reviewCycles = new Map()
+    // Track agent executions: map of agent -> [execution instances]
     const agentExecutions = new Map()
     
-    // First pass: identify all agent executions and group review cycles
+    // First pass: identify all agent executions
     pipelineRunEvents.forEach(event => {
       if (event.event_category === 'agent_lifecycle') {
         const agent = event.agent
@@ -366,9 +401,18 @@ function PipelineRunView() {
     })
     
     // Identify review cycles (agents with multiple executions)
-    agentExecutions.forEach((executions, agent) => {
-      if (executions.length > 1) {
-        reviewCycles.set(agent, executions)
+    const detectedCycles = identifyCycles(pipelineRunEvents, agentExecutions, workflowConfig)
+    
+    // Merge with existing cycle state (preserve collapse state)
+    // NOTE: Don't call setCycles here to avoid updating state during render
+    const updatedCycles = new Map(detectedCycles)
+    cycles.forEach((existingCycle, agent) => {
+      if (updatedCycles.has(agent)) {
+        const newCycle = updatedCycles.get(agent)
+        updatedCycles.set(agent, {
+          ...newCycle,
+          isCollapsed: existingCycle.isCollapsed, // Preserve collapse state
+        })
       }
     })
     
@@ -415,12 +459,13 @@ function PipelineRunView() {
         newNodes.push({
           id: nodeId,
           type: 'pipelineEvent',
-          position: { x: 0, y: 0 }, // Will be positioned by Dagre
+          position: { x: 0, y: 0 }, // Will be positioned by layout
           data: {
             label: decisionType.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase()),
             type: 'decision_event',
             metadata: metadataParts.join(' • '),
             decision_category: event.decision_category,
+            timestamp: event.timestamp, // ADDED: Include timestamp for cycle detection
           },
           draggable: false,
         })
@@ -436,8 +481,8 @@ function PipelineRunView() {
         const executionIndex = executions.findIndex(e => e.taskId === taskId)
         
         // Check if this is part of a review cycle
-        if (reviewCycles.has(agent)) {
-          const cycleExecutions = reviewCycles.get(agent)
+        if (updatedCycles.has(agent)) {
+          const cycleExecutions = updatedCycles.get(agent).executions
           const cycleIndex = cycleExecutions.findIndex(e => e.taskId === taskId)
           
           const nodeId = `agent-${agent}-${cycleIndex}`
@@ -448,7 +493,7 @@ function PipelineRunView() {
           newNodes.push({
             id: nodeId,
             type: 'pipelineEvent',
-            position: { x: 0, y: 0 }, // Will be positioned by Dagre
+            position: { x: 0, y: 0 }, // Will be positioned by layout
             data: {
               label: agent.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase()),
               type: 'agent_execution',
@@ -487,7 +532,7 @@ function PipelineRunView() {
           newNodes.push({
             id: nodeId,
             type: 'pipelineEvent',
-            position: { x: 0, y: 0 }, // Will be positioned by Dagre
+            position: { x: 0, y: 0 }, // Will be positioned by layout
             data: {
               label: agent.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase()),
               type: 'agent_execution',
@@ -526,7 +571,7 @@ function PipelineRunView() {
       const completedNode = {
         id: 'completed',
         type: 'pipelineEvent',
-        position: { x: 0, y: 0 }, // Will be positioned by Dagre
+        position: { x: 0, y: 0 }, // Will be positioned by layout
         data: {
           label: 'Pipeline Completed',
           type: 'pipeline_completed',
@@ -554,74 +599,53 @@ function PipelineRunView() {
       }
     }
     
-    // Apply Dagre layout
-    const dagreGraph = new dagre.graphlib.Graph()
-    dagreGraph.setDefaultEdgeLabel(() => ({}))
-    dagreGraph.setGraph({ 
-      rankdir: 'TB', // Top to Bottom
-      nodesep: 80, // Horizontal spacing between nodes
-      ranksep: 100, // Vertical spacing between ranks
-    })
-    
-    // Estimated node dimensions (will vary based on content)
-    const nodeWidth = 250
-    const nodeHeight = 80
-    
-    // Add nodes to Dagre graph with estimated dimensions
-    newNodes.forEach((node) => {
-      dagreGraph.setNode(node.id, { 
-        width: nodeWidth, 
-        height: nodeHeight 
-      })
-    })
-    
-    // Add edges to Dagre graph
-    newEdges.forEach((edge) => {
-      dagreGraph.setEdge(edge.source, edge.target)
-    })
-    
-    // Calculate layout
-    dagre.layout(dagreGraph)
-    
-    // Find the bounds of the layout to center everything
-    let minX = Infinity
-    let maxX = -Infinity
-    newNodes.forEach((node) => {
-      const nodeWithPosition = dagreGraph.node(node.id)
-      minX = Math.min(minX, nodeWithPosition.x - nodeWidth / 2)
-      maxX = Math.max(maxX, nodeWithPosition.x + nodeWidth / 2)
-    })
-    
-    // Calculate center offset to center the entire graph horizontally
-    const graphWidth = maxX - minX
-    const centerOffset = -minX + (800 - graphWidth) / 2 // Center in an 800px viewport
-    
-    // Apply calculated positions to nodes (centering them)
-    const layoutedNodes = newNodes.map((node) => {
-      const nodeWithPosition = dagreGraph.node(node.id)
-      return {
-        ...node,
-        position: {
-          x: nodeWithPosition.x - nodeWidth / 2 + centerOffset,
-          y: nodeWithPosition.y - nodeHeight / 2,
-        },
+    // Apply custom cycle layout
+    const { nodes: layoutedNodes, cycleNodes } = applyCycleLayout(
+      newNodes,
+      newEdges,
+      updatedCycles,
+      {
+        nodeWidth: 250,
+        nodeHeight: 80,
+        horizontalSpacing: 150,
+        cycleGap: 100,
+        cyclePadding: 40,
+        viewportHeight: 600,
       }
+    )
+    
+    // Update edges for collapsed cycles
+    const updatedEdges = updateEdgesForCycles(newEdges, updatedCycles, agentExecutions)
+    
+    // Add toggle callback to cycle nodes
+    const finalNodes = layoutedNodes.map(node => {
+      if (node.type === 'cycleBounding') {
+        return {
+          ...node,
+          data: {
+            ...node.data,
+            onToggleCollapse: handleToggleCycle,
+          },
+        }
+      }
+      return node
     })
     
-    // Calculate chart height based on the max Y position
-    const maxY = Math.max(...layoutedNodes.map(n => n.position.y + nodeHeight))
-    setChartHeight(Math.max(600, maxY + 100)) // Add padding at bottom
+    // Calculate chart dimensions based on layout
+    const maxX = Math.max(...finalNodes.map(n => n.position.x + (n.style?.width || 250)))
+    const maxY = Math.max(...finalNodes.map(n => n.position.y + (n.style?.height || 80)))
+    setChartHeight(Math.max(600, maxY + 100))
     
-    setNodes(layoutedNodes)
-    setEdges(newEdges)
+    setNodes(finalNodes)
+    setEdges(updatedEdges)
     
     // Fit view after layout is complete
     if (reactFlowInstance) {
       setTimeout(() => {
-        reactFlowInstance.fitView({ padding: 0.05, duration: 300 })
+        reactFlowInstance.fitView({ padding: 0.1, duration: 300 })
       }, 50)
     }
-  }, [pipelineRunEvents, selectedPipelineRun, socketEvents, setNodes, setEdges, reactFlowInstance])
+  }, [pipelineRunEvents, selectedPipelineRun, socketEvents, cycles, workflowConfig, setNodes, setEdges, reactFlowInstance, handleToggleCycle])
   
   // Initial load
   useEffect(() => {
@@ -640,8 +664,77 @@ function PipelineRunView() {
   useEffect(() => {
     if (selectedPipelineRun) {
       fetchPipelineRunEvents(selectedPipelineRun.id)
+      // Also fetch workflow configuration
+      fetchWorkflowConfig(selectedPipelineRun.project, selectedPipelineRun.board)
     }
-  }, [selectedPipelineRun, fetchPipelineRunEvents])
+  }, [selectedPipelineRun, fetchPipelineRunEvents, fetchWorkflowConfig])
+  
+  // Detect and update cycles when events or workflow config changes
+  useEffect(() => {
+    if (!pipelineRunEvents.length) return
+    
+    console.log('🔄 [Pipeline Run] Detecting cycles with workflow config:', workflowConfig ? 'loaded' : 'not loaded')
+    
+    // Build agent executions map
+    const agentExecutions = new Map()
+    pipelineRunEvents.forEach(event => {
+      if (event.event_category === 'agent_lifecycle' && event.event_type === 'agent_initialized') {
+        const agent = event.agent
+        if (!agentExecutions.has(agent)) {
+          agentExecutions.set(agent, [])
+        }
+        agentExecutions.get(agent).push({
+          taskId: event.task_id,
+          status: 'running',
+        })
+      }
+    })
+    
+    // Debug: Log detailed information about what we're passing to cycle detection
+    console.group('📊 [Pipeline Run] Cycle Detection Input Data')
+    console.log('Total events:', pipelineRunEvents.length)
+    console.log('Agent execution map:')
+    agentExecutions.forEach((executions, agent) => {
+      console.log(`  - ${agent}: ${executions.length} execution(s)`, executions.map(e => e.taskId))
+    })
+    console.log('Workflow config:', workflowConfig)
+    
+    // Store data for debugging (accessible via window.debugPipelineData in console)
+    window.debugPipelineData = {
+      selectedPipelineRun,
+      pipelineRunEvents,
+      agentExecutions: Array.from(agentExecutions.entries()).map(([agent, execs]) => ({
+        agent,
+        executions: execs
+      })),
+      workflowConfig
+    }
+    console.log('💾 Debug data stored in window.debugPipelineData')
+    console.groupEnd()
+    
+    // Detect cycles - pass workflow config for configuration-based detection
+    const detectedCycles = identifyCycles(pipelineRunEvents, agentExecutions, workflowConfig)
+    
+    console.log(`🔄 [Pipeline Run] Detected ${detectedCycles.size} cycles`)
+    detectedCycles.forEach((cycle, cycleId) => {
+      console.log(`  - ${cycleId}:`, {
+        type: cycle.type,
+        agentExecutions: cycle.agentExecutions?.length || 0,
+        agents: [...new Set(cycle.agentExecutions?.map(e => e.agent) || [])]
+      })
+    })
+    
+    // Merge with existing collapse state
+    setCycles(prevCycles => {
+      const updated = new Map(detectedCycles)
+      prevCycles.forEach((existingCycle, agent) => {
+        if (updated.has(agent)) {
+          updated.get(agent).isCollapsed = existingCycle.isCollapsed
+        }
+      })
+      return updated
+    })
+  }, [pipelineRunEvents, workflowConfig, selectedPipelineRun])
   
   // Rebuild flowchart when events or socket events change
   useEffect(() => {
@@ -832,15 +925,49 @@ function PipelineRunView() {
           <div className="flex-1">
             {selectedPipelineRun ? (
               <>
-                <div className="mb-4">
-                  <h2 className="text-xl font-semibold">{selectedPipelineRun.issue_title}</h2>
-                  <p className="text-sm text-gh-fg-muted mt-1">
-                    {selectedPipelineRun.project} • Issue #{selectedPipelineRun.issue_number} • Board: {selectedPipelineRun.board}
-                  </p>
-                  <p className="text-sm text-gh-fg-muted">
-                    Started: {new Date(selectedPipelineRun.started_at).toLocaleString()}
-                    {selectedPipelineRun.ended_at && ` • Ended: ${new Date(selectedPipelineRun.ended_at).toLocaleString()}`}
-                  </p>
+                <div className="mb-4 flex items-start justify-between">
+                  <div>
+                    <h2 className="text-xl font-semibold">{selectedPipelineRun.issue_title}</h2>
+                    <p className="text-sm text-gh-fg-muted mt-1">
+                      {selectedPipelineRun.project} • Issue #{selectedPipelineRun.issue_number} • Board: {selectedPipelineRun.board}
+                    </p>
+                    <p className="text-sm text-gh-fg-muted">
+                      Started: {new Date(selectedPipelineRun.started_at).toLocaleString()}
+                      {selectedPipelineRun.ended_at && ` • Ended: ${new Date(selectedPipelineRun.ended_at).toLocaleString()}`}
+                    </p>
+                  </div>
+                  
+                  {/* Debug: Download Data Button */}
+                  <button
+                    onClick={() => {
+                      const debugData = {
+                        pipelineRun: selectedPipelineRun,
+                        events: pipelineRunEvents,
+                        workflowConfig: workflowConfig,
+                        cycles: Array.from(cycles.entries()).map(([id, data]) => ({
+                          id,
+                          ...data,
+                          agentExecutions: data.agentExecutions?.map(e => ({
+                            agent: e.agent,
+                            taskId: e.execution?.taskId || e.taskId
+                          }))
+                        })),
+                        timestamp: new Date().toISOString()
+                      }
+                      const blob = new Blob([JSON.stringify(debugData, null, 2)], { type: 'application/json' })
+                      const url = URL.createObjectURL(blob)
+                      const a = document.createElement('a')
+                      a.href = url
+                      a.download = `pipeline-run-${selectedPipelineRun.id.substring(0, 8)}-debug.json`
+                      a.click()
+                      URL.revokeObjectURL(url)
+                      console.log('📥 Downloaded debug data')
+                    }}
+                    className="px-3 py-1 text-xs bg-gh-canvas-subtle border border-gh-border rounded hover:bg-gh-border-muted transition-colors whitespace-nowrap"
+                    title="Download debug data as JSON"
+                  >
+                    📥 Download Debug Data
+                  </button>
                 </div>
                 
                 {loadingEvents ? (
@@ -865,7 +992,7 @@ function PipelineRunView() {
                       minZoom={0.5}
                       maxZoom={1.5}
                       zoomOnScroll={false}
-                      panOnScroll={false}
+                      panOnScroll={true}
                     >
                       <Background />
                       <Controls />

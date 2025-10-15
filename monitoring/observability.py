@@ -70,6 +70,23 @@ class EventType(Enum):
     REVIEW_CYCLE_ESCALATED = "review_cycle_escalated"
     REVIEW_CYCLE_COMPLETED = "review_cycle_completed"
     
+    # Repair Cycle Management (Test-Fix Cycles)
+    REPAIR_CYCLE_STARTED = "repair_cycle_started"
+    REPAIR_CYCLE_ITERATION = "repair_cycle_iteration"
+    REPAIR_CYCLE_TEST_CYCLE_STARTED = "repair_cycle_test_cycle_started"
+    REPAIR_CYCLE_TEST_CYCLE_COMPLETED = "repair_cycle_test_cycle_completed"
+    REPAIR_CYCLE_TEST_EXECUTION_STARTED = "repair_cycle_test_execution_started"
+    REPAIR_CYCLE_TEST_EXECUTION_COMPLETED = "repair_cycle_test_execution_completed"
+    REPAIR_CYCLE_FIX_CYCLE_STARTED = "repair_cycle_fix_cycle_started"
+    REPAIR_CYCLE_FIX_CYCLE_COMPLETED = "repair_cycle_fix_cycle_completed"
+    REPAIR_CYCLE_FILE_FIX_STARTED = "repair_cycle_file_fix_started"
+    REPAIR_CYCLE_FILE_FIX_COMPLETED = "repair_cycle_file_fix_completed"
+    REPAIR_CYCLE_FILE_FIX_FAILED = "repair_cycle_file_fix_failed"
+    REPAIR_CYCLE_WARNING_REVIEW_STARTED = "repair_cycle_warning_review_started"
+    REPAIR_CYCLE_WARNING_REVIEW_COMPLETED = "repair_cycle_warning_review_completed"
+    REPAIR_CYCLE_WARNING_REVIEW_FAILED = "repair_cycle_warning_review_failed"
+    REPAIR_CYCLE_COMPLETED = "repair_cycle_completed"
+    
     # Conversational Loop Routing
     CONVERSATIONAL_LOOP_STARTED = "conversational_loop_started"
     CONVERSATIONAL_QUESTION_ROUTED = "conversational_question_routed"
@@ -188,6 +205,22 @@ class ObservabilityManager:
             EventType.REVIEW_CYCLE_REVIEWER_SELECTED,
             EventType.REVIEW_CYCLE_ESCALATED,
             EventType.REVIEW_CYCLE_COMPLETED,
+            # Repair Cycle Management
+            EventType.REPAIR_CYCLE_STARTED,
+            EventType.REPAIR_CYCLE_ITERATION,
+            EventType.REPAIR_CYCLE_TEST_CYCLE_STARTED,
+            EventType.REPAIR_CYCLE_TEST_CYCLE_COMPLETED,
+            EventType.REPAIR_CYCLE_TEST_EXECUTION_STARTED,
+            EventType.REPAIR_CYCLE_TEST_EXECUTION_COMPLETED,
+            EventType.REPAIR_CYCLE_FIX_CYCLE_STARTED,
+            EventType.REPAIR_CYCLE_FIX_CYCLE_COMPLETED,
+            EventType.REPAIR_CYCLE_FILE_FIX_STARTED,
+            EventType.REPAIR_CYCLE_FILE_FIX_COMPLETED,
+            EventType.REPAIR_CYCLE_FILE_FIX_FAILED,
+            EventType.REPAIR_CYCLE_WARNING_REVIEW_STARTED,
+            EventType.REPAIR_CYCLE_WARNING_REVIEW_COMPLETED,
+            EventType.REPAIR_CYCLE_WARNING_REVIEW_FAILED,
+            EventType.REPAIR_CYCLE_COMPLETED,
             # Conversational Loop Routing
             EventType.CONVERSATIONAL_LOOP_STARTED,
             EventType.CONVERSATIONAL_QUESTION_ROUTED,

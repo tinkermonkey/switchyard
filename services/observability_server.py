@@ -1555,6 +1555,85 @@ def get_projects():
             'projects': []
         }), 500
 
+@app.route('/api/workflow-config/<project>/<board>', methods=['GET'])
+def get_workflow_config(project, board):
+    """
+    Get the workflow configuration for a specific project and board.
+    
+    Returns the workflow template including columns with their types (maker/review)
+    and maker-reviewer relationships.
+    
+    Args:
+        project: Project name
+        board: Board name
+        
+    Returns:
+        JSON with workflow configuration including:
+        - columns: List of workflow columns with type, agent, maker_agent info
+        - name: Workflow template name
+    """
+    try:
+        from config.manager import config_manager
+        
+        # Get project config
+        project_config = config_manager.get_project_config(project)
+        if not project_config:
+            return jsonify({
+                'success': False,
+                'error': f'Project {project} not found'
+            }), 404
+        
+        # Find pipeline config for this board
+        pipeline_config = next(
+            (p for p in project_config.pipelines if p.board_name == board),
+            None
+        )
+        
+        if not pipeline_config:
+            return jsonify({
+                'success': False,
+                'error': f'No pipeline configured for board {board}'
+            }), 404
+        
+        # Get workflow template
+        workflow_template = config_manager.get_workflow_template(pipeline_config.workflow)
+        
+        if not workflow_template:
+            return jsonify({
+                'success': False,
+                'error': f'Workflow template {pipeline_config.workflow} not found'
+            }), 404
+        
+        # Build response with column information
+        columns = []
+        for col in workflow_template.columns:
+            columns.append({
+                'name': col.name,
+                'type': col.type,  # 'maker' or 'review'
+                'agent': col.agent,
+                'maker_agent': col.maker_agent,  # For review columns: which agent is being reviewed
+                'max_iterations': col.max_iterations,
+                'auto_advance_on_approval': col.auto_advance_on_approval,
+                'escalate_on_blocked': col.escalate_on_blocked
+            })
+        
+        return jsonify({
+            'success': True,
+            'workflow': {
+                'name': workflow_template.name,
+                'columns': columns
+            }
+        }), 200
+        
+    except Exception as e:
+        logger.error(f"Error fetching workflow config for {project}/{board}: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
 def redis_subscriber_thread():
     """Background thread that listens to Redis pub/sub and broadcasts to WebSocket clients"""
     global subscriber_health

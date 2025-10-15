@@ -8,13 +8,17 @@ export default function AgentState() {
   const { logs, events } = useSocket()
   const [isMessageExpanded, setIsMessageExpanded] = useState(false)
   const [isPromptExpanded, setIsPromptExpanded] = useState(false)
+  const [isPreviousResultExpanded, setIsPreviousResultExpanded] = useState(false)
 
   const agentState = useMemo(() => {
     let lastTodoWrite = null
     let lastTextMessage = null
     let lastToolCall = null
+    let previousToolCall = null
+    let previousToolResult = null
     let currentAgent = null
     let inputPrompt = null
+    let agentInitTimestamp = null
 
     // Start from most recent logs (end of array since they're appended)
     for (let i = logs.length - 1; i >= 0; i--) {
@@ -26,52 +30,176 @@ export default function AgentState() {
         currentAgent = log.agent
       }
 
-      // Only collect data from the current agent to avoid mixing state
-      if (log.agent === currentAgent && event?.type === 'assistant' && event?.message?.content) {
-        const contents = Array.isArray(event.message.content)
-          ? event.message.content
-          : [event.message.content]
+      if (lastTodoWrite && lastTextMessage && lastToolCall && currentAgent) break
+    }
 
-        for (const item of contents) {
-          if (item.type === 'text' && !lastTextMessage && item.text?.trim()) {
-            lastTextMessage = {
-              text: item.text,
-              timestamp: log.timestamp,
-              agent: log.agent
+    // Find the most recent agent_initialized event to get the start timestamp for this agent run
+    if (currentAgent) {
+      for (let i = 0; i < events.length; i++) {
+        const event = events[i]
+        if (event.agent === currentAgent && event.event_type === 'agent_initialized') {
+          // Events use ISO 8601 string timestamps, convert to Unix epoch (seconds)
+          try {
+            if (typeof event.timestamp === 'string') {
+              agentInitTimestamp = new Date(event.timestamp).getTime() / 1000
+            } else {
+              agentInitTimestamp = event.timestamp
             }
-          } else if (item.type === 'tool_use') {
-            if (item.name === 'TodoWrite' && !lastTodoWrite) {
-              lastTodoWrite = {
-                todos: item.input?.todos || [],
+          } catch (e) {
+            console.error('[AgentState] Error parsing init event timestamp:', e, event.timestamp)
+          }
+          break
+        }
+      }
+      
+      if (!agentInitTimestamp) {
+        console.warn('[AgentState] No agent_initialized event found for agent', currentAgent)
+      }
+    }
+
+    // Now collect data from logs
+    // If we have an init timestamp, only accept data after it
+    // If we don't have one yet, accept all data from current agent (fall back to original behavior)
+    if (currentAgent) {     
+      let logsChecked = 0
+      let logsFromAgent = 0
+      let logsAfterInit = 0
+      
+      for (let i = logs.length - 1; i >= 0; i--) {
+        const log = logs[i]
+        const event = log.event
+        logsChecked++
+
+        // Check if this log is from the current agent and after initialization (if we have an init timestamp)
+        const isCurrentAgent = log.agent === currentAgent
+        if (isCurrentAgent) logsFromAgent++
+        
+        const isAfterInit = agentInitTimestamp === null || log.timestamp >= agentInitTimestamp
+        if (isCurrentAgent && isAfterInit) logsAfterInit++
+        
+        if (isCurrentAgent && isAfterInit && event?.type === 'assistant' && event?.message?.content) {
+          const contents = Array.isArray(event.message.content)
+            ? event.message.content
+            : [event.message.content]
+
+          for (const item of contents) {
+            if (item.type === 'text' && !lastTextMessage && item.text?.trim()) {
+              lastTextMessage = {
+                text: item.text,
                 timestamp: log.timestamp,
                 agent: log.agent
               }
-            } else if (item.name !== 'TodoWrite' && !lastToolCall) {
-              lastToolCall = {
-                name: item.name,
-                input: item.input,
-                timestamp: log.timestamp,
-                agent: log.agent
+              try {
+                const ts = log.timestamp > 10000000000 ? log.timestamp : log.timestamp * 1000
+              } catch (e) {
+                console.error('[AgentState] Error logging text message:', e)
+              }
+            } else if (item.type === 'tool_use') {
+              if (item.name === 'TodoWrite' && !lastTodoWrite) {
+                lastTodoWrite = {
+                  todos: item.input?.todos || [],
+                  timestamp: log.timestamp,
+                  agent: log.agent
+                }
+                try {
+                  const ts = log.timestamp > 10000000000 ? log.timestamp : log.timestamp * 1000
+                } catch (e) {
+                  console.error('[AgentState] Error logging TodoWrite:', e)
+                }
+              } else if (item.name !== 'TodoWrite') {
+                // Collect tool calls (lastToolCall is most recent, previousToolCall is second most recent)
+                if (!lastToolCall) {
+                  lastToolCall = {
+                    name: item.name,
+                    input: item.input,
+                    timestamp: log.timestamp,
+                    agent: log.agent
+                  }
+                  try {
+                    const ts = log.timestamp > 10000000000 ? log.timestamp : log.timestamp * 1000
+                  } catch (e) {
+                    console.error('[AgentState] Error logging tool call:', e)
+                  }
+                } else if (!previousToolCall) {
+                  previousToolCall = {
+                    name: item.name,
+                    input: item.input,
+                    timestamp: log.timestamp,
+                    agent: log.agent
+                  }
+                  try {
+                    const ts = log.timestamp > 10000000000 ? log.timestamp : log.timestamp * 1000
+                  } catch (e) {
+                    console.error('[AgentState] Error logging previous tool call:', e)
+                  }
+                }
               }
             }
           }
         }
-      }
 
-      if (lastTodoWrite && lastTextMessage && lastToolCall && currentAgent) break
+        if (lastTodoWrite && lastTextMessage && lastToolCall && previousToolCall) break
+      }
+      
+      // Now find the tool result for the previous tool call
+      // Tool results have event.type === 'user' and contain tool_result
+      if (previousToolCall && currentAgent) {
+        for (let i = logs.length - 1; i >= 0; i--) {
+          const log = logs[i]
+          const event = log.event
+          
+          const isCurrentAgent = log.agent === currentAgent
+          const isAfterInit = agentInitTimestamp === null || log.timestamp >= agentInitTimestamp
+          const isBeforeOrAtLastToolCall = log.timestamp <= lastToolCall.timestamp
+          const isAfterOrAtPreviousToolCall = log.timestamp >= previousToolCall.timestamp
+          
+          if (isCurrentAgent && isAfterInit && isBeforeOrAtLastToolCall && isAfterOrAtPreviousToolCall && event?.type === 'user' && event?.message?.content) {
+            const contents = Array.isArray(event.message.content)
+              ? event.message.content
+              : [event.message.content]
+
+            for (const item of contents) {
+              if (item.type === 'tool_result') {
+                // Check if this result matches the previous tool call by timestamp proximity
+                // Tool results should come shortly after their corresponding tool call
+                const timeDiff = Math.abs(log.timestamp - previousToolCall.timestamp)
+                if (timeDiff < 60) { // Within 60 seconds
+                  previousToolResult = {
+                    content: item.content,
+                    timestamp: log.timestamp,
+                    agent: log.agent
+                  }
+                  break
+                }
+              }
+            }
+            if (previousToolResult) break
+          }
+        }
+      }
     }
 
     // Find the input prompt from the most recent prompt_constructed event for this agent
+    // Only use it if it's after the agent initialization (or if we don't have an init timestamp)
     if (currentAgent) {
       for (let i = 0; i < events.length; i++) {
         const event = events[i]
         if (event.agent === currentAgent && event.event_type === 'prompt_constructed') {
-          inputPrompt = {
-            text: event.data?.prompt || '',
-            timestamp: event.timestamp,
-            agent: event.agent
+          // Convert event timestamp (ISO string) to Unix epoch for comparison
+          let eventTimestamp = event.timestamp
+          if (typeof eventTimestamp === 'string') {
+            eventTimestamp = new Date(eventTimestamp).getTime() / 1000
           }
-          break
+          
+          const isAfterInit = agentInitTimestamp === null || eventTimestamp >= agentInitTimestamp
+          if (isAfterInit) {
+            inputPrompt = {
+              text: event.data?.prompt || '',
+              timestamp: eventTimestamp,  // Store as Unix epoch
+              agent: event.agent
+            }
+            break
+          }
         }
       }
     }
@@ -126,6 +254,8 @@ export default function AgentState() {
       lastTodoWrite,
       lastTextMessage,
       lastToolCall,
+      previousToolCall,
+      previousToolResult,
       currentAgent,
       isExecuting,
       agentCompleted,
@@ -167,7 +297,7 @@ export default function AgentState() {
     return { total: todos.length, completed, inProgress, pending }
   }
 
-  const { lastTodoWrite, lastTextMessage, lastToolCall, currentAgent, isExecuting, agentCompleted, agentFailed, inputPrompt } = agentState
+  const { lastTodoWrite, lastTextMessage, lastToolCall, previousToolCall, previousToolResult, currentAgent, isExecuting, agentCompleted, agentFailed, inputPrompt } = agentState
 
   const formatAgentName = (agentName) => {
     if (!agentName) return 'Unknown Agent'
@@ -176,8 +306,19 @@ export default function AgentState() {
 
   const formatTimestamp = (timestamp) => {
     if (!timestamp) return ''
-    const date = new Date(timestamp * 1000)  // Convert seconds to milliseconds
-    return date.toLocaleTimeString('en-US', { timeZone: 'UTC', hour12: false }) + ' UTC'
+    try {
+      // Check if timestamp is already in milliseconds or seconds
+      const ts = timestamp > 10000000000 ? timestamp : timestamp * 1000
+      const date = new Date(ts)
+      if (isNaN(date.getTime())) {
+        console.error('[AgentState] Invalid timestamp:', timestamp)
+        return 'Invalid date'
+      }
+      return date.toLocaleTimeString('en-US', { timeZone: 'UTC', hour12: false }) + ' UTC'
+    } catch (e) {
+      console.error('[AgentState] Error formatting timestamp:', timestamp, e)
+      return 'Error'
+    }
   }
 
   const todoStats = getTodoStats(lastTodoWrite?.todos)
@@ -318,6 +459,67 @@ export default function AgentState() {
                   <span className="text-sm text-gh-fg font-mono">
                     {formatToolCall(lastToolCall)}
                   </span>
+                </div>
+              </div>
+            )}
+
+            {previousToolCall && (
+              <div className="bg-gh-canvas rounded-md border border-gh-border p-3">
+                <div className="flex items-center gap-2 mb-2">
+                  <h3 className="text-sm font-semibold text-gh-fg">Previous Tool Call</h3>
+                  <span className="text-xs text-gh-fg-muted">
+                    {formatTimestamp(previousToolCall.timestamp)}
+                  </span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <span className="px-2 py-1 bg-gh-warning rounded text-xs font-semibold text-white">
+                    {previousToolCall.name}
+                  </span>
+                  <span className="text-sm text-gh-fg font-mono">
+                    {formatToolCall(previousToolCall)}
+                  </span>
+                </div>
+              </div>
+            )}
+
+            {previousToolResult && (
+              <div className="bg-gh-canvas rounded-md border border-gh-border p-3">
+                <div className="flex items-center justify-between mb-2">
+                  <div className="flex items-center gap-2">
+                    <h3 className="text-sm font-semibold text-gh-fg">Previous Tool Result</h3>
+                    <span className="text-xs text-gh-fg-muted">
+                      {formatTimestamp(previousToolResult.timestamp)}
+                    </span>
+                  </div>
+                  <button
+                    onClick={() => setIsPreviousResultExpanded(!isPreviousResultExpanded)}
+                    className="text-gh-accent-primary hover:bg-gh-border-muted rounded p-1 transition-colors"
+                    title={isPreviousResultExpanded ? 'Collapse' : 'Expand'}
+                  >
+                    {isPreviousResultExpanded ? (
+                      <ChevronUp className="w-4 h-4" />
+                    ) : (
+                      <ChevronDown className="w-4 h-4" />
+                    )}
+                  </button>
+                </div>
+                <div className="relative">
+                  <div
+                    className={`prose prose-sm prose-invert font-mono text-xs max-w-none transition-all ${
+                      isPreviousResultExpanded ? '' : 'max-h-[200px] overflow-y-auto'
+                    }`}
+                  >
+                    {typeof previousToolResult.content === 'string' ? (
+                      <pre className="whitespace-pre-wrap">{previousToolResult.content}</pre>
+                    ) : (
+                      <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                        {JSON.stringify(previousToolResult.content, null, 2)}
+                      </ReactMarkdown>
+                    )}
+                  </div>
+                  {!isPreviousResultExpanded && JSON.stringify(previousToolResult.content).length > 500 && (
+                    <div className="absolute bottom-0 left-0 right-0 h-12 bg-gradient-to-t from-gh-canvas via-gh-canvas/80 to-transparent pointer-events-none" />
+                  )}
                 </div>
               </div>
             )}

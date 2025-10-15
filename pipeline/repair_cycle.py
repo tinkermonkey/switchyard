@@ -223,11 +223,15 @@ class RepairCycleStage(PipelineStage):
         error_message = None
 
         try:
-            for test_config in self.test_configs:
-                logger.info(f"Starting {test_config.test_type.value} test cycle")
+            # Track which test type in sequence (1st, 2nd, 3rd)
+            for test_type_index, test_config in enumerate(self.test_configs, start=1):
+                logger.info(
+                    f"Starting {test_config.test_type.value} test cycle "
+                    f"(test type {test_type_index}/{len(self.test_configs)})"
+                )
 
                 cycle_start = utc_now()
-                cycle_result = await self._run_test_cycle(test_config, context)
+                cycle_result = await self._run_test_cycle(test_config, context, test_type_index)
                 cycle_end = utc_now()
 
                 cycle_result.duration_seconds = (cycle_end - cycle_start).total_seconds()
@@ -285,9 +289,16 @@ class RepairCycleStage(PipelineStage):
 
             raise
 
-    async def _run_test_cycle(self, config: RepairTestRunConfig, context: Dict[str, Any]) -> CycleResult:
+    async def _run_test_cycle(
+        self, config: RepairTestRunConfig, context: Dict[str, Any], test_type_index: int
+    ) -> CycleResult:
         """
         Run a complete test-fix cycle for one test type.
+
+        Args:
+            config: Test configuration for this test type
+            context: Pipeline context
+            test_type_index: Which test type in sequence (1=first, 2=second, etc.)
 
         Workflow:
             1. Run tests
@@ -298,21 +309,101 @@ class RepairCycleStage(PipelineStage):
         Returns:
             CycleResult with success status and metrics
         """
-        iteration = 0
+        # Emit test cycle started event
+        obs = context.get("observability")
+        project = context.get("project", "unknown")
+        task_id = context.get("task_id", f"repair_cycle_{self.name}")
+        pipeline_run_id = context.get("pipeline_run_id")
+        
+        if obs:
+            obs.emit(
+                obs.EventType.REPAIR_CYCLE_TEST_CYCLE_STARTED,
+                "repair_cycle",
+                task_id,
+                project,
+                {
+                    "test_type": config.test_type.value,
+                    "test_type_index": test_type_index,  # Which test type in sequence
+                    "total_test_types": len(self.test_configs),  # Total test types to run
+                    "max_iterations": config.max_iterations,
+                    "review_warnings": config.review_warnings,
+                    "timeout": config.timeout,
+                },
+                pipeline_run_id=pipeline_run_id,
+            )
+        
+        # Test cycle iteration counter (resets for each test type)
+        test_cycle_iteration = 0
         files_fixed = 0
         warnings_reviewed = 0
 
-        while iteration < config.max_iterations:
-            iteration += 1
-            logger.info(f"Test cycle iteration {iteration}/{config.max_iterations} " f"for {config.test_type.value}")
+        while test_cycle_iteration < config.max_iterations:
+            test_cycle_iteration += 1
+            logger.info(
+                f"Test cycle iteration {test_cycle_iteration}/{config.max_iterations} "
+                f"for {config.test_type.value} (test type {test_type_index}/{len(self.test_configs)})"
+            )
+
+            # Emit iteration started event
+            if obs:
+                obs.emit(
+                    obs.EventType.REPAIR_CYCLE_ITERATION,
+                    "repair_cycle",
+                    task_id,
+                    project,
+                    {
+                        "test_type": config.test_type.value,
+                        "test_type_index": test_type_index,  # Which test type in sequence
+                        "test_cycle_iteration": test_cycle_iteration,  # Iteration within this test type
+                        "max_test_cycle_iterations": config.max_iterations,
+                        "files_fixed_so_far": files_fixed,
+                        "warnings_reviewed_so_far": warnings_reviewed,
+                    },
+                    pipeline_run_id=pipeline_run_id,
+                )
 
             # Check circuit breaker
             if self._agent_call_count >= self.max_total_agent_calls:
                 logger.error(f"Circuit breaker triggered: max agent calls " f"({self.max_total_agent_calls}) reached")
+                
+                # Emit test cycle completed event with failure
+                if obs:
+                    obs.emit(
+                        obs.EventType.REPAIR_CYCLE_TEST_CYCLE_COMPLETED,
+                        "repair_cycle",
+                        task_id,
+                        project,
+                        {
+                            "test_type": config.test_type.value,
+                            "test_type_index": test_type_index,
+                            "passed": False,
+                            "test_cycle_iterations": test_cycle_iteration,
+                            "error": "Circuit breaker: max agent calls reached",
+                        },
+                        pipeline_run_id=pipeline_run_id,
+                    )
+                
+                # Emit cycle completed event with failure
+                if obs:
+                    obs.emit(
+                        obs.EventType.REPAIR_CYCLE_COMPLETED,
+                        "repair_cycle",
+                        task_id,
+                        project,
+                        {
+                            "test_type": config.test_type.value,
+                            "test_type_index": test_type_index,
+                            "passed": False,
+                            "test_cycle_iterations": test_cycle_iteration,
+                            "error": "Circuit breaker: max agent calls reached",
+                        },
+                        pipeline_run_id=pipeline_run_id,
+                    )
+                
                 return CycleResult(
                     test_type=config.test_type,
                     passed=False,
-                    iterations=iteration,
+                    iterations=test_cycle_iteration,
                     final_result=None,
                     error="Circuit breaker: max agent calls reached",
                     files_fixed=files_fixed,
@@ -320,7 +411,7 @@ class RepairCycleStage(PipelineStage):
                 )
 
             # Step 1: Run tests (containerized agent)
-            test_result = await self._run_tests(config, context, iteration)
+            test_result = await self._run_tests(config, context, test_cycle_iteration, test_type_index)
 
             # Check for infrastructure failures (indicated by __infrastructure__ file)
             infrastructure_failures = [f for f in test_result.failures if f.file == "__infrastructure__"]
@@ -328,10 +419,45 @@ class RepairCycleStage(PipelineStage):
                 logger.error(
                     f"Infrastructure failure detected in test execution: " f"{infrastructure_failures[0].message}"
                 )
+                
+                # Emit test cycle completed event with infrastructure failure
+                if obs:
+                    obs.emit(
+                        obs.EventType.REPAIR_CYCLE_TEST_CYCLE_COMPLETED,
+                        "repair_cycle",
+                        task_id,
+                        project,
+                        {
+                            "test_type": config.test_type.value,
+                            "test_type_index": test_type_index,
+                            "passed": False,
+                            "test_cycle_iterations": test_cycle_iteration,
+                            "error": f"Infrastructure failure: {infrastructure_failures[0].message}",
+                        },
+                        pipeline_run_id=pipeline_run_id,
+                    )
+                
+                # Emit cycle completed event with infrastructure failure
+                if obs:
+                    obs.emit(
+                        obs.EventType.REPAIR_CYCLE_COMPLETED,
+                        "repair_cycle",
+                        task_id,
+                        project,
+                        {
+                            "test_type": config.test_type.value,
+                            "test_type_index": test_type_index,
+                            "passed": False,
+                            "test_cycle_iterations": test_cycle_iteration,
+                            "error": f"Infrastructure failure: {infrastructure_failures[0].message}",
+                        },
+                        pipeline_run_id=pipeline_run_id,
+                    )
+                
                 return CycleResult(
                     test_type=config.test_type,
                     passed=False,
-                    iterations=iteration,
+                    iterations=test_cycle_iteration,
                     final_result=test_result,
                     error=f"Infrastructure failure: {infrastructure_failures[0].message}",
                     files_fixed=files_fixed,
@@ -340,7 +466,7 @@ class RepairCycleStage(PipelineStage):
 
             # Step 2: Check for failures
             if not test_result.has_failures():
-                logger.info(f"No test failures in iteration {iteration}")
+                logger.info(f"No test failures in test cycle iteration {test_cycle_iteration}")
 
                 # Step 3: Handle warnings if configured
                 if config.review_warnings and test_result.has_warnings():
@@ -350,7 +476,7 @@ class RepairCycleStage(PipelineStage):
 
                     # Re-run tests after fixing warnings
                     logger.info("Re-running tests after warning fixes")
-                    test_result = await self._run_tests(config, context, iteration)
+                    test_result = await self._run_tests(config, context, test_cycle_iteration, test_type_index)
 
                     # If warning fixes broke tests, continue loop
                     if test_result.has_failures():
@@ -358,10 +484,52 @@ class RepairCycleStage(PipelineStage):
                         continue
 
                 # Success!
+                logger.info(f"Test cycle completed successfully after {test_cycle_iteration} iterations")
+                
+                # Emit test cycle completed event with success
+                if obs:
+                    obs.emit(
+                        obs.EventType.REPAIR_CYCLE_TEST_CYCLE_COMPLETED,
+                        "repair_cycle",
+                        task_id,
+                        project,
+                        {
+                            "test_type": config.test_type.value,
+                            "passed": True,
+                            "test_cycle_iterations": test_cycle_iteration,
+                            "files_fixed": files_fixed,
+                            "warnings_reviewed": warnings_reviewed,
+                            "final_passed": test_result.passed,
+                            "final_failed": test_result.failed,
+                            "final_warnings": test_result.warnings,
+                        },
+                        pipeline_run_id=pipeline_run_id,
+                    )
+                
+                # Emit cycle completed event with success
+                if obs:
+                    obs.emit(
+                        obs.EventType.REPAIR_CYCLE_COMPLETED,
+                        "repair_cycle",
+                        task_id,
+                        project,
+                        {
+                            "test_type": config.test_type.value,
+                            "passed": True,
+                            "test_cycle_iterations": test_cycle_iteration,
+                            "files_fixed": files_fixed,
+                            "warnings_reviewed": warnings_reviewed,
+                            "final_passed": test_result.passed,
+                            "final_failed": test_result.failed,
+                            "final_warnings": test_result.warnings,
+                        },
+                        pipeline_run_id=pipeline_run_id,
+                    )
+                
                 return CycleResult(
                     test_type=config.test_type,
                     passed=True,
-                    iterations=iteration,
+                    iterations=test_cycle_iteration,
                     final_result=test_result,
                     files_fixed=files_fixed,
                     warnings_reviewed=warnings_reviewed,
@@ -371,30 +539,103 @@ class RepairCycleStage(PipelineStage):
             grouped_failures = test_result.group_failures_by_file()
             logger.info(f"Found failures in {len(grouped_failures)} files: " f"{list(grouped_failures.keys())}")
 
+            # Emit fix cycle started event
+            if obs:
+                obs.emit(
+                    obs.EventType.REPAIR_CYCLE_FIX_CYCLE_STARTED,
+                    "repair_cycle",
+                    task_id,
+                    project,
+                    {
+                        "test_type": config.test_type.value,
+                        "test_type_index": test_type_index,  # Which test type in sequence
+                        "test_cycle_iteration": test_cycle_iteration,  # Which iteration of this test type
+                        "file_count": len(grouped_failures),
+                        "total_failures": len(test_result.failures),
+                    },
+                    pipeline_run_id=pipeline_run_id,
+                )
+
             # Step 5: Fix each file (containerized agent)
             fixed_count = await self._fix_failures_by_file(grouped_failures, config, context)
             files_fixed += fixed_count
 
+            # Emit fix cycle completed event
+            if obs:
+                obs.emit(
+                    obs.EventType.REPAIR_CYCLE_FIX_CYCLE_COMPLETED,
+                    "repair_cycle",
+                    task_id,
+                    project,
+                    {
+                        "test_type": config.test_type.value,
+                        "test_type_index": test_type_index,  # Which test type in sequence
+                        "test_cycle_iteration": test_cycle_iteration,  # Which iteration of this test type
+                        "files_fixed": fixed_count,
+                        "total_files_fixed": files_fixed,
+                    },
+                    pipeline_run_id=pipeline_run_id,
+                )
+
             # Checkpoint if needed
-            if iteration % self.checkpoint_interval == 0:
-                await self._checkpoint(config.test_type, iteration, context)
+            if test_cycle_iteration % self.checkpoint_interval == 0:
+                await self._checkpoint(config.test_type, test_cycle_iteration, context)
 
         # Max iterations reached
         logger.error(f"Max iterations ({config.max_iterations}) reached for " f"{config.test_type.value} tests")
-        final_result = await self._run_tests(config, context, iteration)
+        final_result = await self._run_tests(config, context, test_cycle_iteration, test_type_index)
+
+        # Emit test cycle completed event with failure
+        if obs:
+            obs.emit(
+                obs.EventType.REPAIR_CYCLE_TEST_CYCLE_COMPLETED,
+                "repair_cycle",
+                task_id,
+                project,
+                {
+                    "test_type": config.test_type.value,
+                    "passed": False,
+                    "test_cycle_iterations": test_cycle_iteration,
+                    "error": "Max iterations reached",
+                    "files_fixed": files_fixed,
+                    "warnings_reviewed": warnings_reviewed,
+                    "final_passed": final_result.passed if final_result else 0,
+                    "final_failed": final_result.failed if final_result else 0,
+                },
+                pipeline_run_id=pipeline_run_id,
+            )
+
+        # Emit cycle completed event with failure
+        if obs:
+            obs.emit(
+                obs.EventType.REPAIR_CYCLE_COMPLETED,
+                "repair_cycle",
+                task_id,
+                project,
+                {
+                    "test_type": config.test_type.value,
+                    "passed": False,
+                    "test_cycle_iterations": test_cycle_iteration,
+                    "error": "Max iterations reached",
+                    "files_fixed": files_fixed,
+                    "warnings_reviewed": warnings_reviewed,
+                    "final_passed": final_result.passed if final_result else 0,
+                    "final_failed": final_result.failed if final_result else 0,
+                },
+                pipeline_run_id=pipeline_run_id,
+            )
 
         return CycleResult(
             test_type=config.test_type,
             passed=False,
-            iterations=iteration,
+            iterations=test_cycle_iteration,
             final_result=final_result,
             error="Max iterations reached",
             files_fixed=files_fixed,
             warnings_reviewed=warnings_reviewed,
         )
 
-    async def _run_tests(
-        self, config: RepairTestRunConfig, context: Dict[str, Any], iteration: int
+    async def _run_tests(self, config: RepairTestRunConfig, context: Dict[str, Any], test_cycle_iteration: int, test_type_index: int
     ) -> RepairTestResult:
         """
         Run tests and return structured results.
@@ -410,7 +651,30 @@ class RepairCycleStage(PipelineStage):
         Returns:
             RepairTestResult with parsed test output
         """
-        logger.info(f"Running {config.test_type.value} tests (iteration {iteration})")
+        logger.info(f"Running {config.test_type.value} tests (test cycle iteration {test_cycle_iteration}/{config.max_iterations}, test type {test_type_index})")
+
+        # Get observability manager
+        obs = context.get("observability")
+        project = context.get("project", "unknown")
+        task_id = context.get("task_id", f"repair_cycle_{self.name}")
+        pipeline_run_id = context.get("pipeline_run_id")
+
+        # Emit test execution started event
+        if obs:
+            obs.emit(
+                obs.EventType.REPAIR_CYCLE_TEST_EXECUTION_STARTED,
+                "repair_cycle_test",
+                f"{task_id}_test_iter{test_cycle_iteration}",
+                project,
+                {
+                    "test_type": config.test_type.value,
+                    "test_type_index": test_type_index,  # Which test type in sequence
+                    "test_cycle_iteration": test_cycle_iteration,  # Which iteration of this test type
+                    "max_test_cycle_iterations": config.max_iterations,
+                    "timeout": config.timeout,
+                },
+                pipeline_run_id=pipeline_run_id,
+            )
 
         # Get AgentExecutor
         from services.agent_executor import get_agent_executor
@@ -425,8 +689,10 @@ class RepairCycleStage(PipelineStage):
         task_context = {
             **context,
             "pipeline_run_id": pipeline_run_id,  # Ensure pipeline_run_id flows through
-            "task_description": f"Run {config.test_type.value} tests (iteration {iteration})",
+            "task_description": f"Run {config.test_type.value} tests (test cycle iteration {test_cycle_iteration})",
             "timeout": config.timeout,
+            # Clear review_cycle context to avoid iteration count confusion from previous review cycles
+            "review_cycle": None,
             # Provide the custom instructions as a 'direct_prompt' so the agent can use it
             "direct_prompt": f"""Run all {config.test_type.value} tests for this project.
 
@@ -462,7 +728,7 @@ DO NOT include any explanation, markdown formatting, or other text - ONLY the JS
                     agent_name=self.agent_name,
                     project_name=project,
                     task_context=task_context,
-                    task_id_prefix=f"repair_test_{config.test_type.value}_iter{iteration}_attempt{attempt}",
+                    task_id_prefix=f"repair_test_{config.test_type.value}_type{test_type_index}_iter{test_cycle_iteration}_attempt{attempt}",
                 )
 
                 # Extract result text from agent output
@@ -518,9 +784,9 @@ DO NOT include any explanation, markdown formatting, or other text - ONLY the JS
                     warnings_count = len(warning_list)
                     logger.info(f"Warning count not provided as int, using list length: {warnings_count}")
 
-                return RepairTestResult(
+                test_result = RepairTestResult(
                     test_type=config.test_type,
-                    iteration=iteration,
+                    iteration=test_cycle_iteration,
                     passed=result_json.get("passed", 0),
                     failed=result_json.get("failed", 0),
                     warnings=warnings_count,
@@ -529,6 +795,28 @@ DO NOT include any explanation, markdown formatting, or other text - ONLY the JS
                     raw_output=result_text,
                     timestamp=utc_isoformat(),
                 )
+                
+                # Emit test execution completed event
+                if obs:
+                    obs.emit(
+                        obs.EventType.REPAIR_CYCLE_TEST_EXECUTION_COMPLETED,
+                        "repair_cycle_test",
+                        f"{task_id}_test_iter{test_cycle_iteration}",
+                        project,
+                        {
+                            "test_type": config.test_type.value,
+                            "test_type_index": test_type_index,  # Which test type in sequence
+                            "test_cycle_iteration": test_cycle_iteration,  # Which iteration of this test type
+                            "max_test_cycle_iterations": config.max_iterations,
+                            "passed": test_result.passed,
+                            "failed": test_result.failed,
+                            "warnings": test_result.warnings,
+                            "has_failures": test_result.has_failures(),
+                        },
+                        pipeline_run_id=pipeline_run_id,
+                    )
+                
+                return test_result
 
             except ValueError as e:
                 # JSON parsing failure - this is an infrastructure issue, not a test failure
@@ -551,7 +839,7 @@ DO NOT include any explanation, markdown formatting, or other text - ONLY the JS
                     # Return a special result indicating infrastructure failure
                     return RepairTestResult(
                         test_type=config.test_type,
-                        iteration=iteration,
+                        iteration=test_cycle_iteration,
                         passed=0,
                         failed=0,  # 0 instead of 999 to indicate infrastructure failure
                         warnings=0,
@@ -578,7 +866,7 @@ DO NOT include any explanation, markdown formatting, or other text - ONLY the JS
                     # Max retries reached - return infrastructure failure
                     return RepairTestResult(
                         test_type=config.test_type,
-                        iteration=iteration,
+                        iteration=test_cycle_iteration,
                         passed=0,
                         failed=0,
                         warnings=0,
@@ -597,7 +885,7 @@ DO NOT include any explanation, markdown formatting, or other text - ONLY the JS
         # Should never reach here, but just in case
         return RepairTestResult(
             test_type=config.test_type,
-            iteration=iteration,
+            iteration=test_cycle_iteration,
             passed=0,
             failed=0,
             warnings=0,
@@ -629,17 +917,34 @@ DO NOT include any explanation, markdown formatting, or other text - ONLY the JS
         """
         files_fixed = 0
 
+        # Get observability manager
+        obs = context.get("observability")
+        project = context.get("project", "unknown")
+        task_id = context.get("task_id", f"repair_cycle_{self.name}")
+        pipeline_run_id = context.get("pipeline_run_id")
+
         # Get AgentExecutor
         from services.agent_executor import get_agent_executor
 
         agent_executor = get_agent_executor()
 
-        # Get project info
-        project = context.get("project", "unknown")
-        pipeline_run_id = context.get("pipeline_run_id")
-
         for test_file, failures in grouped_failures.items():
             logger.info(f"Fixing {len(failures)} failures in {test_file}")
+
+            # Emit file fix started event
+            if obs:
+                obs.emit(
+                    obs.EventType.REPAIR_CYCLE_FILE_FIX_STARTED,
+                    "repair_cycle_fix",
+                    f"{task_id}_fix_{test_file.replace('/', '_').replace('.', '_')}",
+                    project,
+                    {
+                        "test_file": test_file,
+                        "failure_count": len(failures),
+                        "test_type": config.test_type.value,
+                    },
+                    pipeline_run_id=pipeline_run_id,
+                )
 
             # Build failure list for prompt
             failure_messages = [f"- {f.test}: {f.message}" for f in failures]
@@ -651,6 +956,8 @@ DO NOT include any explanation, markdown formatting, or other text - ONLY the JS
                 "pipeline_run_id": pipeline_run_id,  # Ensure pipeline_run_id flows through
                 "task_description": f"Fix failures in {test_file}",
                 "timeout": config.timeout,
+                # Clear review_cycle context to avoid iteration count confusion from previous review cycles
+                "review_cycle": None,
                 # Provide the fix instructions as a 'direct_prompt' so the agent can use it
                 "direct_prompt": f"""Fix these test failures in {test_file}:
 
@@ -672,9 +979,41 @@ DO NOT include any explanation, markdown formatting, or other text - ONLY the JS
 
                 logger.info(f"Fixed failures in {test_file}")
                 files_fixed += 1
+                
+                # Emit file fix completed event
+                if obs:
+                    obs.emit(
+                        obs.EventType.REPAIR_CYCLE_FILE_FIX_COMPLETED,
+                        "repair_cycle_fix",
+                        f"{task_id}_fix_{test_file.replace('/', '_').replace('.', '_')}",
+                        project,
+                        {
+                            "test_file": test_file,
+                            "failure_count": len(failures),
+                            "test_type": config.test_type.value,
+                            "success": True,
+                        },
+                        pipeline_run_id=pipeline_run_id,
+                    )
 
             except Exception as e:
                 logger.error(f"Failed to fix failures in {test_file}: {e}", exc_info=True)
+                
+                # Emit file fix failed event
+                if obs:
+                    obs.emit(
+                        obs.EventType.REPAIR_CYCLE_FILE_FIX_FAILED,
+                        "repair_cycle_fix",
+                        f"{task_id}_fix_{test_file.replace('/', '_').replace('.', '_')}",
+                        project,
+                        {
+                            "test_file": test_file,
+                            "failure_count": len(failures),
+                            "test_type": config.test_type.value,
+                            "error": str(e),
+                        },
+                        pipeline_run_id=pipeline_run_id,
+                    )
 
         return files_fixed
 
@@ -695,17 +1034,34 @@ DO NOT include any explanation, markdown formatting, or other text - ONLY the JS
         grouped_warnings = test_result.group_warnings_by_file()
         warnings_reviewed = 0
 
+        # Get observability manager
+        obs = context.get("observability")
+        project = context.get("project", "unknown")
+        task_id = context.get("task_id", f"repair_cycle_{self.name}")
+        pipeline_run_id = context.get("pipeline_run_id")
+
         # Get AgentExecutor
         from services.agent_executor import get_agent_executor
 
         agent_executor = get_agent_executor()
 
-        # Get project info
-        project = context.get("project", "unknown")
-        pipeline_run_id = context.get("pipeline_run_id")
-
         for source_file, warnings in grouped_warnings.items():
             logger.info(f"Reviewing {len(warnings)} warnings in {source_file}")
+
+            # Emit warning review started event
+            if obs:
+                obs.emit(
+                    obs.EventType.REPAIR_CYCLE_WARNING_REVIEW_STARTED,
+                    "repair_cycle_warnings",
+                    f"{task_id}_warn_{source_file.replace('/', '_').replace('.', '_')}",
+                    project,
+                    {
+                        "source_file": source_file,
+                        "warning_count": len(warnings),
+                        "test_type": config.test_type.value,
+                    },
+                    pipeline_run_id=pipeline_run_id,
+                )
 
             # Build warning list for prompt
             warning_messages = [f"- {w.message}" for w in warnings]
@@ -717,6 +1073,8 @@ DO NOT include any explanation, markdown formatting, or other text - ONLY the JS
                 "pipeline_run_id": pipeline_run_id,  # Ensure pipeline_run_id flows through
                 "task_description": f"Review warnings in {source_file}",
                 "timeout": config.timeout,
+                # Clear review_cycle context to avoid iteration count confusion from previous review cycles
+                "review_cycle": None,
                 # Provide the review instructions as a 'direct_prompt' so the agent can use it
                 "direct_prompt": f"""Review these warnings from a run of {source_file}:
 
@@ -742,9 +1100,41 @@ For each warning:
 
                 logger.info(f"Reviewed warnings in {source_file}")
                 warnings_reviewed += 1
+                
+                # Emit warning review completed event
+                if obs:
+                    obs.emit(
+                        obs.EventType.REPAIR_CYCLE_WARNING_REVIEW_COMPLETED,
+                        "repair_cycle_warnings",
+                        f"{task_id}_warn_{source_file.replace('/', '_').replace('.', '_')}",
+                        project,
+                        {
+                            "source_file": source_file,
+                            "warning_count": len(warnings),
+                            "test_type": config.test_type.value,
+                            "success": True,
+                        },
+                        pipeline_run_id=pipeline_run_id,
+                    )
 
             except Exception as e:
                 logger.error(f"Failed to review warnings in {source_file}: {e}", exc_info=True)
+                
+                # Emit warning review failed event
+                if obs:
+                    obs.emit(
+                        obs.EventType.REPAIR_CYCLE_WARNING_REVIEW_FAILED,
+                        "repair_cycle_warnings",
+                        f"{task_id}_warn_{source_file.replace('/', '_').replace('.', '_')}",
+                        project,
+                        {
+                            "source_file": source_file,
+                            "warning_count": len(warnings),
+                            "test_type": config.test_type.value,
+                            "error": str(e),
+                        },
+                        pipeline_run_id=pipeline_run_id,
+                    )
 
         return warnings_reviewed
 
@@ -818,16 +1208,16 @@ For each warning:
             f"Response preview: {response[:500]}..."
         )
 
-    async def _checkpoint(self, test_type: RepairTestType, iteration: int, context: Dict[str, Any]):
+    async def _checkpoint(self, test_type: RepairTestType, test_cycle_iteration: int, context: Dict[str, Any]):
         """Save checkpoint for recovery"""
-        logger.info(f"Checkpointing {test_type.value} test cycle at iteration {iteration}")
+        logger.info(f"Checkpointing {test_type.value} test cycle at iteration {test_cycle_iteration}")
 
         # Implementation would integrate with state_management/checkpointing.py
         # For now, just log
         checkpoint_data = {
             "stage": self.name,
             "test_type": test_type.value,
-            "iteration": iteration,
+            "test_cycle_iteration": test_cycle_iteration,
             "agent_call_count": self._agent_call_count,
             "timestamp": utc_isoformat(),
         }
