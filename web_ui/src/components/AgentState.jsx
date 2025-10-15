@@ -4,6 +4,37 @@ import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { CheckCircle2, Circle, PlayCircle, ChevronDown, ChevronUp } from 'lucide-react'
 
+// Unified timestamp normalization function
+// Accepts: Unix epoch (seconds), Unix epoch (milliseconds), or ISO 8601 string
+// Returns: Unix epoch in seconds, or null if invalid
+const normalizeTimestamp = (timestamp) => {
+  if (!timestamp) return null
+  
+  try {
+    // Handle ISO 8601 string (e.g., "2025-10-15T05:35:19.907108Z")
+    if (typeof timestamp === 'string') {
+      const date = new Date(timestamp)
+      if (isNaN(date.getTime())) {
+        console.error('[AgentState] Invalid ISO timestamp string:', timestamp)
+        return null
+      }
+      return date.getTime() / 1000 // Convert to Unix epoch seconds
+    }
+    
+    // Handle numeric timestamps
+    if (typeof timestamp === 'number') {
+      // If timestamp is in milliseconds (> 10 billion), convert to seconds
+      return timestamp > 10000000000 ? timestamp / 1000 : timestamp
+    }
+    
+    console.error('[AgentState] Unknown timestamp format:', timestamp, typeof timestamp)
+    return null
+  } catch (e) {
+    console.error('[AgentState] Error normalizing timestamp:', timestamp, e)
+    return null
+  }
+}
+
 export default function AgentState() {
   const { logs, events } = useSocket()
   const [isMessageExpanded, setIsMessageExpanded] = useState(false)
@@ -38,15 +69,9 @@ export default function AgentState() {
       for (let i = 0; i < events.length; i++) {
         const event = events[i]
         if (event.agent === currentAgent && event.event_type === 'agent_initialized') {
-          // Events use ISO 8601 string timestamps, convert to Unix epoch (seconds)
-          try {
-            if (typeof event.timestamp === 'string') {
-              agentInitTimestamp = new Date(event.timestamp).getTime() / 1000
-            } else {
-              agentInitTimestamp = event.timestamp
-            }
-          } catch (e) {
-            console.error('[AgentState] Error parsing init event timestamp:', e, event.timestamp)
+          agentInitTimestamp = normalizeTimestamp(event.timestamp)
+          if (!agentInitTimestamp) {
+            console.error('[AgentState] Failed to normalize agent_initialized timestamp:', event.timestamp)
           }
           break
         }
@@ -74,7 +99,8 @@ export default function AgentState() {
         const isCurrentAgent = log.agent === currentAgent
         if (isCurrentAgent) logsFromAgent++
         
-        const isAfterInit = agentInitTimestamp === null || log.timestamp >= agentInitTimestamp
+        const normalizedLogTimestamp = normalizeTimestamp(log.timestamp)
+        const isAfterInit = agentInitTimestamp === null || (normalizedLogTimestamp && normalizedLogTimestamp >= agentInitTimestamp)
         if (isCurrentAgent && isAfterInit) logsAfterInit++
         
         if (isCurrentAgent && isAfterInit && event?.type === 'assistant' && event?.message?.content) {
@@ -86,25 +112,15 @@ export default function AgentState() {
             if (item.type === 'text' && !lastTextMessage && item.text?.trim()) {
               lastTextMessage = {
                 text: item.text,
-                timestamp: log.timestamp,
+                timestamp: normalizedLogTimestamp, // Use normalized timestamp
                 agent: log.agent
-              }
-              try {
-                const ts = log.timestamp > 10000000000 ? log.timestamp : log.timestamp * 1000
-              } catch (e) {
-                console.error('[AgentState] Error logging text message:', e)
               }
             } else if (item.type === 'tool_use') {
               if (item.name === 'TodoWrite' && !lastTodoWrite) {
                 lastTodoWrite = {
                   todos: item.input?.todos || [],
-                  timestamp: log.timestamp,
+                  timestamp: normalizedLogTimestamp, // Use normalized timestamp
                   agent: log.agent
-                }
-                try {
-                  const ts = log.timestamp > 10000000000 ? log.timestamp : log.timestamp * 1000
-                } catch (e) {
-                  console.error('[AgentState] Error logging TodoWrite:', e)
                 }
               } else if (item.name !== 'TodoWrite') {
                 // Collect tool calls (lastToolCall is most recent, previousToolCall is second most recent)
@@ -112,25 +128,15 @@ export default function AgentState() {
                   lastToolCall = {
                     name: item.name,
                     input: item.input,
-                    timestamp: log.timestamp,
+                    timestamp: normalizedLogTimestamp, // Use normalized timestamp
                     agent: log.agent
-                  }
-                  try {
-                    const ts = log.timestamp > 10000000000 ? log.timestamp : log.timestamp * 1000
-                  } catch (e) {
-                    console.error('[AgentState] Error logging tool call:', e)
                   }
                 } else if (!previousToolCall) {
                   previousToolCall = {
                     name: item.name,
                     input: item.input,
-                    timestamp: log.timestamp,
+                    timestamp: normalizedLogTimestamp, // Use normalized timestamp
                     agent: log.agent
-                  }
-                  try {
-                    const ts = log.timestamp > 10000000000 ? log.timestamp : log.timestamp * 1000
-                  } catch (e) {
-                    console.error('[AgentState] Error logging previous tool call:', e)
                   }
                 }
               }
@@ -148,10 +154,11 @@ export default function AgentState() {
           const log = logs[i]
           const event = log.event
           
+          const normalizedLogTimestamp = normalizeTimestamp(log.timestamp)
           const isCurrentAgent = log.agent === currentAgent
-          const isAfterInit = agentInitTimestamp === null || log.timestamp >= agentInitTimestamp
-          const isBeforeOrAtLastToolCall = log.timestamp <= lastToolCall.timestamp
-          const isAfterOrAtPreviousToolCall = log.timestamp >= previousToolCall.timestamp
+          const isAfterInit = agentInitTimestamp === null || (normalizedLogTimestamp && normalizedLogTimestamp >= agentInitTimestamp)
+          const isBeforeOrAtLastToolCall = normalizedLogTimestamp && lastToolCall.timestamp && normalizedLogTimestamp <= lastToolCall.timestamp
+          const isAfterOrAtPreviousToolCall = normalizedLogTimestamp && previousToolCall.timestamp && normalizedLogTimestamp >= previousToolCall.timestamp
           
           if (isCurrentAgent && isAfterInit && isBeforeOrAtLastToolCall && isAfterOrAtPreviousToolCall && event?.type === 'user' && event?.message?.content) {
             const contents = Array.isArray(event.message.content)
@@ -162,11 +169,11 @@ export default function AgentState() {
               if (item.type === 'tool_result') {
                 // Check if this result matches the previous tool call by timestamp proximity
                 // Tool results should come shortly after their corresponding tool call
-                const timeDiff = Math.abs(log.timestamp - previousToolCall.timestamp)
+                const timeDiff = Math.abs(normalizedLogTimestamp - previousToolCall.timestamp)
                 if (timeDiff < 60) { // Within 60 seconds
                   previousToolResult = {
                     content: item.content,
-                    timestamp: log.timestamp,
+                    timestamp: normalizedLogTimestamp, // Use normalized timestamp
                     agent: log.agent
                   }
                   break
@@ -185,17 +192,13 @@ export default function AgentState() {
       for (let i = 0; i < events.length; i++) {
         const event = events[i]
         if (event.agent === currentAgent && event.event_type === 'prompt_constructed') {
-          // Convert event timestamp (ISO string) to Unix epoch for comparison
-          let eventTimestamp = event.timestamp
-          if (typeof eventTimestamp === 'string') {
-            eventTimestamp = new Date(eventTimestamp).getTime() / 1000
-          }
+          const eventTimestamp = normalizeTimestamp(event.timestamp)
           
-          const isAfterInit = agentInitTimestamp === null || eventTimestamp >= agentInitTimestamp
-          if (isAfterInit) {
+          const isAfterInit = agentInitTimestamp === null || (eventTimestamp && eventTimestamp >= agentInitTimestamp)
+          if (isAfterInit && eventTimestamp) {
             inputPrompt = {
               text: event.data?.prompt || '',
-              timestamp: eventTimestamp,  // Store as Unix epoch
+              timestamp: eventTimestamp,  // Store as normalized Unix epoch
               agent: event.agent
             }
             break
@@ -306,14 +309,17 @@ export default function AgentState() {
 
   const formatTimestamp = (timestamp) => {
     if (!timestamp) return ''
+    
     try {
-      // Check if timestamp is already in milliseconds or seconds
-      const ts = timestamp > 10000000000 ? timestamp : timestamp * 1000
-      const date = new Date(ts)
+      // Timestamps should already be normalized to Unix epoch seconds
+      // Convert to milliseconds for Date constructor
+      const date = new Date(timestamp * 1000)
+      
       if (isNaN(date.getTime())) {
-        console.error('[AgentState] Invalid timestamp:', timestamp)
+        console.error('[AgentState] Invalid timestamp after normalization:', timestamp)
         return 'Invalid date'
       }
+      
       return date.toLocaleTimeString('en-US', { timeZone: 'UTC', hour12: false }) + ' UTC'
     } catch (e) {
       console.error('[AgentState] Error formatting timestamp:', timestamp, e)
@@ -391,9 +397,10 @@ export default function AgentState() {
                 </div>
                 <div className="relative">
                   <div
-                    className={`prose prose-sm prose-invert font-mono text-xs max-w-none transition-all ${
+                    className={`prose prose-sm prose-invert font-mono text-xs max-w-none transition-all break-words ${
                       isPromptExpanded ? '' : 'max-h-[200px] overflow-y-auto'
                     }`}
+                    style={{ overflowWrap: 'break-word' }}
                   >
                     <ReactMarkdown remarkPlugins={[remarkGfm]}>
                       {inputPrompt.text}
@@ -429,9 +436,10 @@ export default function AgentState() {
                 </div>
                 <div className="relative">
                   <div
-                    className={`prose prose-sm prose-invert font-mono text-xs max-w-none transition-all ${
+                    className={`prose prose-sm prose-invert font-mono text-xs max-w-none transition-all break-words ${
                       isMessageExpanded ? '' : 'max-h-[200px] overflow-y-auto'
                     }`}
+                    style={{ overflowWrap: 'break-word' }}
                   >
                     <ReactMarkdown remarkPlugins={[remarkGfm]}>
                       {lastTextMessage.text}
@@ -505,12 +513,13 @@ export default function AgentState() {
                 </div>
                 <div className="relative">
                   <div
-                    className={`prose prose-sm prose-invert font-mono text-xs max-w-none transition-all ${
+                    className={`prose prose-sm prose-invert font-mono text-xs max-w-none transition-all break-words ${
                       isPreviousResultExpanded ? '' : 'max-h-[200px] overflow-y-auto'
                     }`}
+                    style={{ overflowWrap: 'break-word' }}
                   >
                     {typeof previousToolResult.content === 'string' ? (
-                      <pre className="whitespace-pre-wrap">{previousToolResult.content}</pre>
+                      <pre className="whitespace-pre-wrap break-words" style={{ overflowWrap: 'break-word' }}>{previousToolResult.content}</pre>
                     ) : (
                       <ReactMarkdown remarkPlugins={[remarkGfm]}>
                         {JSON.stringify(previousToolResult.content, null, 2)}

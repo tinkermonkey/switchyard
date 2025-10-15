@@ -46,6 +46,7 @@ from datetime import datetime
 
 from pipeline.base import PipelineStage
 from monitoring.timestamp_utils import utc_now, utc_isoformat, to_utc_isoformat
+from monitoring.observability import EventType
 
 
 logger = logging.getLogger(__name__)
@@ -317,7 +318,7 @@ class RepairCycleStage(PipelineStage):
         
         if obs:
             obs.emit(
-                obs.EventType.REPAIR_CYCLE_TEST_CYCLE_STARTED,
+                EventType.REPAIR_CYCLE_TEST_CYCLE_STARTED,
                 "repair_cycle",
                 task_id,
                 project,
@@ -347,7 +348,7 @@ class RepairCycleStage(PipelineStage):
             # Emit iteration started event
             if obs:
                 obs.emit(
-                    obs.EventType.REPAIR_CYCLE_ITERATION,
+                    EventType.REPAIR_CYCLE_ITERATION,
                     "repair_cycle",
                     task_id,
                     project,
@@ -369,7 +370,7 @@ class RepairCycleStage(PipelineStage):
                 # Emit test cycle completed event with failure
                 if obs:
                     obs.emit(
-                        obs.EventType.REPAIR_CYCLE_TEST_CYCLE_COMPLETED,
+                        EventType.REPAIR_CYCLE_TEST_CYCLE_COMPLETED,
                         "repair_cycle",
                         task_id,
                         project,
@@ -386,7 +387,7 @@ class RepairCycleStage(PipelineStage):
                 # Emit cycle completed event with failure
                 if obs:
                     obs.emit(
-                        obs.EventType.REPAIR_CYCLE_COMPLETED,
+                        EventType.REPAIR_CYCLE_COMPLETED,
                         "repair_cycle",
                         task_id,
                         project,
@@ -423,7 +424,7 @@ class RepairCycleStage(PipelineStage):
                 # Emit test cycle completed event with infrastructure failure
                 if obs:
                     obs.emit(
-                        obs.EventType.REPAIR_CYCLE_TEST_CYCLE_COMPLETED,
+                        EventType.REPAIR_CYCLE_TEST_CYCLE_COMPLETED,
                         "repair_cycle",
                         task_id,
                         project,
@@ -440,7 +441,7 @@ class RepairCycleStage(PipelineStage):
                 # Emit cycle completed event with infrastructure failure
                 if obs:
                     obs.emit(
-                        obs.EventType.REPAIR_CYCLE_COMPLETED,
+                        EventType.REPAIR_CYCLE_COMPLETED,
                         "repair_cycle",
                         task_id,
                         project,
@@ -489,7 +490,7 @@ class RepairCycleStage(PipelineStage):
                 # Emit test cycle completed event with success
                 if obs:
                     obs.emit(
-                        obs.EventType.REPAIR_CYCLE_TEST_CYCLE_COMPLETED,
+                        EventType.REPAIR_CYCLE_TEST_CYCLE_COMPLETED,
                         "repair_cycle",
                         task_id,
                         project,
@@ -509,7 +510,7 @@ class RepairCycleStage(PipelineStage):
                 # Emit cycle completed event with success
                 if obs:
                     obs.emit(
-                        obs.EventType.REPAIR_CYCLE_COMPLETED,
+                        EventType.REPAIR_CYCLE_COMPLETED,
                         "repair_cycle",
                         task_id,
                         project,
@@ -542,7 +543,7 @@ class RepairCycleStage(PipelineStage):
             # Emit fix cycle started event
             if obs:
                 obs.emit(
-                    obs.EventType.REPAIR_CYCLE_FIX_CYCLE_STARTED,
+                    EventType.REPAIR_CYCLE_FIX_CYCLE_STARTED,
                     "repair_cycle",
                     task_id,
                     project,
@@ -563,7 +564,7 @@ class RepairCycleStage(PipelineStage):
             # Emit fix cycle completed event
             if obs:
                 obs.emit(
-                    obs.EventType.REPAIR_CYCLE_FIX_CYCLE_COMPLETED,
+                    EventType.REPAIR_CYCLE_FIX_CYCLE_COMPLETED,
                     "repair_cycle",
                     task_id,
                     project,
@@ -588,7 +589,7 @@ class RepairCycleStage(PipelineStage):
         # Emit test cycle completed event with failure
         if obs:
             obs.emit(
-                obs.EventType.REPAIR_CYCLE_TEST_CYCLE_COMPLETED,
+                EventType.REPAIR_CYCLE_TEST_CYCLE_COMPLETED,
                 "repair_cycle",
                 task_id,
                 project,
@@ -608,7 +609,7 @@ class RepairCycleStage(PipelineStage):
         # Emit cycle completed event with failure
         if obs:
             obs.emit(
-                obs.EventType.REPAIR_CYCLE_COMPLETED,
+                EventType.REPAIR_CYCLE_COMPLETED,
                 "repair_cycle",
                 task_id,
                 project,
@@ -662,7 +663,7 @@ class RepairCycleStage(PipelineStage):
         # Emit test execution started event
         if obs:
             obs.emit(
-                obs.EventType.REPAIR_CYCLE_TEST_EXECUTION_STARTED,
+                EventType.REPAIR_CYCLE_TEST_EXECUTION_STARTED,
                 "repair_cycle_test",
                 f"{task_id}_test_iter{test_cycle_iteration}",
                 project,
@@ -799,7 +800,7 @@ DO NOT include any explanation, markdown formatting, or other text - ONLY the JS
                 # Emit test execution completed event
                 if obs:
                     obs.emit(
-                        obs.EventType.REPAIR_CYCLE_TEST_EXECUTION_COMPLETED,
+                        EventType.REPAIR_CYCLE_TEST_EXECUTION_COMPLETED,
                         "repair_cycle_test",
                         f"{task_id}_test_iter{test_cycle_iteration}",
                         project,
@@ -934,7 +935,7 @@ DO NOT include any explanation, markdown formatting, or other text - ONLY the JS
             # Emit file fix started event
             if obs:
                 obs.emit(
-                    obs.EventType.REPAIR_CYCLE_FILE_FIX_STARTED,
+                    EventType.REPAIR_CYCLE_FILE_FIX_STARTED,
                     "repair_cycle_fix",
                     f"{task_id}_fix_{test_file.replace('/', '_').replace('.', '_')}",
                     project,
@@ -983,7 +984,7 @@ DO NOT include any explanation, markdown formatting, or other text - ONLY the JS
                 # Emit file fix completed event
                 if obs:
                     obs.emit(
-                        obs.EventType.REPAIR_CYCLE_FILE_FIX_COMPLETED,
+                        EventType.REPAIR_CYCLE_FILE_FIX_COMPLETED,
                         "repair_cycle_fix",
                         f"{task_id}_fix_{test_file.replace('/', '_').replace('.', '_')}",
                         project,
@@ -1002,7 +1003,7 @@ DO NOT include any explanation, markdown formatting, or other text - ONLY the JS
                 # Emit file fix failed event
                 if obs:
                     obs.emit(
-                        obs.EventType.REPAIR_CYCLE_FILE_FIX_FAILED,
+                        EventType.REPAIR_CYCLE_FILE_FIX_FAILED,
                         "repair_cycle_fix",
                         f"{task_id}_fix_{test_file.replace('/', '_').replace('.', '_')}",
                         project,
@@ -1051,7 +1052,7 @@ DO NOT include any explanation, markdown formatting, or other text - ONLY the JS
             # Emit warning review started event
             if obs:
                 obs.emit(
-                    obs.EventType.REPAIR_CYCLE_WARNING_REVIEW_STARTED,
+                    EventType.REPAIR_CYCLE_WARNING_REVIEW_STARTED,
                     "repair_cycle_warnings",
                     f"{task_id}_warn_{source_file.replace('/', '_').replace('.', '_')}",
                     project,
@@ -1104,7 +1105,7 @@ For each warning:
                 # Emit warning review completed event
                 if obs:
                     obs.emit(
-                        obs.EventType.REPAIR_CYCLE_WARNING_REVIEW_COMPLETED,
+                        EventType.REPAIR_CYCLE_WARNING_REVIEW_COMPLETED,
                         "repair_cycle_warnings",
                         f"{task_id}_warn_{source_file.replace('/', '_').replace('.', '_')}",
                         project,
@@ -1123,7 +1124,7 @@ For each warning:
                 # Emit warning review failed event
                 if obs:
                     obs.emit(
-                        obs.EventType.REPAIR_CYCLE_WARNING_REVIEW_FAILED,
+                        EventType.REPAIR_CYCLE_WARNING_REVIEW_FAILED,
                         "repair_cycle_warnings",
                         f"{task_id}_warn_{source_file.replace('/', '_').replace('.', '_')}",
                         project,

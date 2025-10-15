@@ -872,11 +872,13 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
   // When using parent-child relationships, React Flow automatically handles
   // hiding children when parent is collapsed, so we don't need to filter
   
+  // CRITICAL: Define these BEFORE the debug block so they're always available
+  const parentNodes = [...cycleNodes, ...layoutedNodes.filter(n => !n.parentId)]
+  const childNodes = layoutedNodes.filter(n => n.parentId)
+  
   // Debug: Log final node structure
   if (DEBUG_CYCLE_LAYOUT) {
     console.group('🏗️ Final Node Structure:')
-    const parentNodes = [...cycleNodes, ...layoutedNodes.filter(n => !n.parentId)]
-    const childNodes = layoutedNodes.filter(n => n.parentId)
     console.log('  Parent nodes:', parentNodes.map(n => ({ id: n.id, type: n.type, pos: n.position })))
     console.log('  Child nodes:', childNodes.map(n => ({ 
       id: n.id, 
