@@ -63,7 +63,7 @@ class HumanFeedbackLoopExecutor:
 
     def __init__(self):
         self.review_parser = ReviewParser()
-        self.github = GitHubIntegration()
+        # Don't initialize GitHubIntegration here - create it per-loop with proper repo context
         self.active_loops = {}  # Track active loops by issue number
 
     async def start_loop(

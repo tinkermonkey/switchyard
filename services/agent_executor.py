@@ -31,7 +31,7 @@ class AgentExecutor:
     def __init__(self):
         self.obs = get_observability_manager()
         self.factory = PipelineFactory(config_manager)
-        self.github = GitHubIntegration()
+        # Don't initialize GitHubIntegration here - create it per-execution with proper repo context
 
     async def execute_agent(
         self,
@@ -331,6 +331,28 @@ class AgentExecutor:
 
         issue_number = task_context['issue_number']
         workspace_type = task_context.get('workspace_type', 'issues')
+        repository = task_context.get('repository')
+        
+        # Get repo owner/org from project config
+        project_name = task_context.get('project')
+        if not project_name:
+            logger.warning(f"No project name in task context, skipping GitHub post for {agent_name}")
+            return
+            
+        try:
+            project_config = config_manager.get_project_config(project_name)
+            repo_owner = project_config.github.get('org') if project_config and hasattr(project_config, 'github') else None
+            
+            if not repository:
+                repository = project_config.github.get('repo') if project_config and hasattr(project_config, 'github') else None
+                
+            if not repo_owner or not repository:
+                logger.warning(f"Cannot determine repo owner/name for project {project_name}, skipping GitHub post")
+                return
+                
+        except Exception as e:
+            logger.warning(f"Error getting project config for {project_name}: {e}")
+            return
 
         # Extract markdown output from result (different agents use different keys)
         markdown_output = self._extract_markdown_output(agent_name, result)
@@ -348,11 +370,14 @@ class AgentExecutor:
         )
 
         try:
+            # Create GitHubIntegration with proper repo context
+            github = GitHubIntegration(repo_owner=repo_owner, repo_name=repository)
+            
             # Get reply_to_id for threaded conversations
             reply_to_id = task_context.get('reply_to_comment_id')
 
             # Post to GitHub (workspace-aware: issues or discussions)
-            post_result = await self.github.post_agent_output(
+            post_result = await github.post_agent_output(
                 task_context,
                 comment,
                 reply_to_id=reply_to_id

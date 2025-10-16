@@ -794,12 +794,12 @@ class ProjectMonitor:
             logger.error(traceback.format_exc())
             return ""
 
-    def _check_agent_processed_issue_sync(self, issue_number: int, agent: str, repository: str) -> bool:
+    def _check_agent_processed_issue_sync(self, issue_number: int, agent: str, repository: str, org: str) -> bool:
         """Synchronous wrapper for checking if agent has processed issue"""
         try:
             import asyncio
             from services.github_integration import GitHubIntegration
-            github = GitHubIntegration()
+            github = GitHubIntegration(repo_owner=org, repo_name=repository)
             return asyncio.run(github.has_agent_processed_issue(issue_number, agent, repository))
         except Exception as e:
             logger.warning(f"Could not check for prior agent work: {e}")
@@ -933,7 +933,7 @@ class ProjectMonitor:
                     already_processed = False
                     if workspace_type in ['discussions', 'hybrid'] and discussion_id:
                         from services.github_integration import GitHubIntegration
-                        github = GitHubIntegration()
+                        github = GitHubIntegration(repo_owner=project_config.github['org'], repo_name=repository)
 
                         # For discussions, also check discussion comments (fallback)
                         already_processed = loop.run_until_complete(
@@ -1079,7 +1079,7 @@ class ProjectMonitor:
                         elif column and column.type == 'conversational':
                             # Check if there's existing work to resume
                             # Only resume if there's evidence of prior agent activity
-                            has_prior_work = self._check_agent_processed_issue_sync(issue_number, agent, repository)
+                            has_prior_work = self._check_agent_processed_issue_sync(issue_number, agent, repository, project_config.github['org'])
 
                             if has_prior_work:
                                 # Resume existing conversational feedback loop
@@ -1517,7 +1517,7 @@ class ProjectMonitor:
 
                     # Post initial comment (workspace-aware)
                     from services.github_integration import GitHubIntegration
-                    github = GitHubIntegration()
+                    github = GitHubIntegration(repo_owner=project_config.github['org'], repo_name=repository)
 
                     start_context = {
                         'issue_number': issue_number,
@@ -1739,7 +1739,7 @@ _Review cycle initiated by Claude Code Orchestrator_
 
                     # Post initial comment (workspace-aware)
                     from services.github_integration import GitHubIntegration
-                    github = GitHubIntegration()
+                    github = GitHubIntegration(repo_owner=project_config.github['org'], repo_name=repository)
 
                     start_context = {
                         'issue_number': issue_number,
@@ -2036,7 +2036,7 @@ _Repair cycle initiated by Claude Code Orchestrator_
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
 
-            github = GitHubIntegration()
+            github = GitHubIntegration(repo_owner=project_config.github['org'], repo_name=repository)
 
             # Get all comments to find which agent the user is responding to
             all_feedback_comments = loop.run_until_complete(

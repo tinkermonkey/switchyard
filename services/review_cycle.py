@@ -115,7 +115,7 @@ class ReviewCycleExecutor:
 
     def __init__(self):
         self.review_parser = ReviewParser()
-        self.github = GitHubIntegration()
+        # Don't initialize GitHubIntegration here - create it per-call with proper repo context
         self.active_cycles = {}  # Track active review cycles by issue number
         self.state_dir = None  # Will be set per project
         self.outcome_correlator = get_review_outcome_correlator()
@@ -125,6 +125,18 @@ class ReviewCycleExecutor:
         from monitoring.decision_events import DecisionEventEmitter
         self.obs = get_observability_manager()
         self.decision_events = DecisionEventEmitter(self.obs)
+
+    def _get_github_integration(self, cycle_state: ReviewCycleState) -> GitHubIntegration:
+        """Get properly initialized GitHubIntegration for this cycle"""
+        from config.manager import config_manager
+        
+        project_config = config_manager.get_project_config(cycle_state.project_name)
+        repo_owner = project_config.github.get('org') if project_config and hasattr(project_config, 'github') else None
+        
+        if not repo_owner:
+            raise ValueError(f"Cannot determine repo owner for project {cycle_state.project_name}")
+            
+        return GitHubIntegration(repo_owner=repo_owner, repo_name=cycle_state.repository)
 
     async def _analyze_review_cycle_outcomes(self, cycle_state: ReviewCycleState):
         """
