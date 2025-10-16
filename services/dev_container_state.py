@@ -11,6 +11,7 @@ Tracks the state of project development container images:
 import yaml
 import logging
 import subprocess
+import os
 from pathlib import Path
 from typing import Dict, Optional
 from enum import Enum
@@ -33,7 +34,11 @@ class DevContainerStateManager:
     def __init__(self, state_dir: Path = None):
         """Initialize dev container state manager"""
         if state_dir is None:
-            state_dir = Path("state/dev_containers")
+            # CRITICAL: Use absolute path to orchestrator's state directory
+            # This prevents state from being created inside project directories when
+            # agents execute with project working directory
+            orchestrator_root = os.environ.get('ORCHESTRATOR_ROOT', '/app')
+            state_dir = Path(orchestrator_root) / "state" / "dev_containers"
 
         self.state_dir = state_dir
         self.state_dir.mkdir(parents=True, exist_ok=True)

@@ -60,8 +60,11 @@ services:
       - CONTEXT7_MCP_URL=https://mcp.context7.com/mcp
       - CONTEXT7_API_KEY=${CONTEXT7_API_KEY}
       # Host paths for Docker-in-Docker mounting
-      - HOST_WORKSPACE_PATH=${HOME}/workspace/orchestrator
-      - HOST_HOME=${HOME}
+      # These are intentionally NOT set - the code has correct defaults:
+      # - HOST_WORKSPACE_PATH defaults to '/workspace' (the mounted parent dir)
+      # - HOST_HOME defaults to $HOME inside the container
+      # Setting them from the host's $HOME can cause issues with Snap Docker
+      # where $HOME points to /home/user/snap/docker/XXX instead of /home/user
 
     depends_on:
       - redis

@@ -261,7 +261,7 @@ workflow_templates:
         type: "conversational"
         stage_mapping: "environment_setup"
         agent: "dev_environment_setup"
-        auto_advance_on_approval: false
+        auto_advance_on_approval: true
         feedback_timeout_seconds: 7200
         description: "Environment setup in progress - conversational mode enabled"
         automation_rules:

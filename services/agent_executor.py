@@ -398,6 +398,8 @@ class AgentExecutor:
             'markdown_documentation',
             'markdown_output',
             'raw_analysis_result',
+            'output',  # Used by dev_environment_verifier
+            'verification_result',  # Used by dev_environment_verifier
         ]
 
         for key in output_keys:

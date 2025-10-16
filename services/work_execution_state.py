@@ -44,7 +44,12 @@ class WorkExecutionStateTracker:
     def __init__(self, state_dir: Path = None):
         """Initialize work execution state tracker"""
         if state_dir is None:
-            state_dir = Path("state/execution_history")
+            # CRITICAL: Use absolute path to orchestrator's state directory
+            # This prevents state from being created inside project directories when
+            # agents execute with project working directory
+            import os
+            orchestrator_root = os.environ.get('ORCHESTRATOR_ROOT', '/app')
+            state_dir = Path(orchestrator_root) / "state" / "execution_history"
 
         self.state_dir = state_dir
         self.state_dir.mkdir(parents=True, exist_ok=True)

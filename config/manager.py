@@ -125,6 +125,7 @@ class ProjectConfig:
     testing: Optional[Dict[str, Any]] = None  # NEW: Testing configuration
     agent_customizations: Dict[str, Dict[str, Any]] = None
     orchestrator: Dict[str, Any] = None
+    hidden: bool = False  # Hide from UI and monitoring
 
 
 class ConfigurationError(Exception):
@@ -357,7 +358,8 @@ class ConfigManager:
             pipeline_routing=project_data['pipeline_routing'],
             testing=project_data.get('testing'),  # NEW
             agent_customizations=project_data.get('agent_customizations', {}),
-            orchestrator=data.get('orchestrator', {})
+            orchestrator=data.get('orchestrator', {}),
+            hidden=project_data.get('hidden', False)  # Hide from UI and monitoring
         )
 
     def get_agents(self) -> Dict[str, AgentConfig]:
@@ -495,6 +497,23 @@ class ConfigManager:
             projects.append(file_path.stem)
 
         return sorted(projects)
+
+    def list_visible_projects(self) -> List[str]:
+        """List all visible (non-hidden) project configurations"""
+        all_projects = self.list_projects()
+        visible_projects = []
+        
+        for project_name in all_projects:
+            try:
+                project_config = self.get_project_config(project_name)
+                if not project_config.hidden:
+                    visible_projects.append(project_name)
+            except Exception as e:
+                logger.warning(f"Error checking visibility for project {project_name}: {e}")
+                # Include projects with errors in the list by default
+                visible_projects.append(project_name)
+        
+        return visible_projects
 
     def reload_config(self):
         """Clear cached configurations and reload from disk"""

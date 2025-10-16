@@ -220,11 +220,14 @@ class FeatureBranchManager:
             for si in feature_branch.sub_issues
         )
 
-    async def get_parent_issue(self, github_integration, issue_number: int) -> Optional[int]:
+    async def get_parent_issue(self, github_integration, issue_number: int, project: Optional[str] = None) -> Optional[int]:
         """
-        Get parent issue number by parsing issue body for parent references
+        Get parent issue number from GitHub's parent_issue_url field or issue body
 
-        Looks for patterns:
+        First attempts to extract parent from the `parent_issue_url` field in the REST API response.
+        Falls back to parsing issue body for parent references if not found.
+
+        Looks for patterns in body:
         - "Part of #123"
         - "Parent Issue: #123"
         - "## Parent Issue" followed by #123
@@ -232,7 +235,31 @@ class FeatureBranchManager:
         Returns parent issue number if found, None otherwise
         """
         import re
+        import subprocess
 
+        # Step 1: Try to get parent from GitHub's parent_issue_url field (REST API)
+        try:
+            # Use gh API to query the issue with parent_issue_url field
+            result = subprocess.run(
+                ['gh', 'api', f'repos/{github_integration.github_org}/{github_integration.repo_name}/issues/{issue_number}',
+                 '--jq', '.parent_issue_url'],
+                capture_output=True, text=True, check=True, timeout=10
+            )
+            
+            parent_issue_url = result.stdout.strip()
+            
+            # Extract issue number from URL like "https://api.github.com/repos/owner/repo/issues/146"
+            if parent_issue_url and parent_issue_url != "null":
+                url_match = re.search(r'/issues/(\d+)$', parent_issue_url)
+                if url_match:
+                    parent_num = int(url_match.group(1))
+                    logger.info(f"Issue #{issue_number} is sub-issue of parent #{parent_num} (from parent_issue_url)")
+                    return parent_num
+        except Exception as e:
+            logger.debug(f"Failed to query parent_issue_url from GitHub REST API: {e}")
+            # Fall through to body parsing
+
+        # Step 2: Fall back to parsing issue body
         try:
             issue = await github_integration.get_issue(issue_number)
             body = issue.get("body", "")
@@ -246,6 +273,7 @@ class FeatureBranchManager:
                 r'Parent Issue[:\s]+#(\d+)',  # "Parent Issue: #123" or "Parent Issue #123"
                 r'Part of #(\d+)',            # "Part of #123"
                 r'##\s*Parent Issue[^\d]*#(\d+)',  # "## Parent Issue\nPart of #123"
+                r'##\s*Parent Issue[^\d]*Closes\s+#(\d+)',  # "## Parent Issue\nCloses #123"
                 r'Sub-issue of #(\d+)',       # "Sub-issue of #123"
                 r'Child of #(\d+)',           # "Child of #123"
             ]
@@ -620,7 +648,7 @@ git push --force-with-lease
             raise ValueError(f"Issue #{issue_number} does not exist or cannot be accessed: {e}")
 
         # Step 1: Determine parent issue
-        parent_issue = await self.get_parent_issue(github_integration, issue_number)
+        parent_issue = await self.get_parent_issue(github_integration, issue_number, project=project)
 
         # Step 2: Find related branches (prioritizes reuse over creation)
         related_branches = await self.find_related_branches(

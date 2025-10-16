@@ -41,6 +41,18 @@ fi
 # SSH key is mounted read-only from host, permissions already correct
 # Git safe.directory is configured in Dockerfile at build time (in /etc/gitconfig)
 
+# Authenticate GitHub CLI if GITHUB_TOKEN is set
+if [ -n "$GITHUB_TOKEN" ]; then
+    # Ensure .config directory exists for gh to save config
+    mkdir -p /home/orchestrator/.config
+    chmod 700 /home/orchestrator/.config 2>/dev/null || true
+    
+    # Authenticate gh CLI with token
+    echo "$GITHUB_TOKEN" | gh auth login --with-token 2>/dev/null || {
+        echo "Warning: gh auth login failed, but GITHUB_TOKEN is available for API calls"
+    }
+fi
+
 # Execute the main command
 exec "$@"
 

@@ -15,6 +15,72 @@ class DockerAgentRunner:
     def __init__(self, network_name: str = "clauditoreum_orchestrator-net"):
         # Docker Compose prefixes network names with project directory name
         self.network_name = network_name
+        self._host_workspace_path = None  # Cache for host workspace path detection
+
+    @staticmethod
+    def _detect_host_workspace_path() -> str:
+        """
+        Auto-detect the actual host filesystem path that is mounted to /workspace.
+        
+        This reads /proc/self/mountinfo to find the real host path, avoiding issues
+        with Snap Docker where $HOME environment variable points to snap-specific paths
+        like /home/user/snap/docker/XXX instead of /home/user.
+        
+        Returns:
+            The host filesystem path mounted to /workspace, or '/workspace' as fallback
+        """
+        try:
+            with open('/proc/self/mountinfo', 'r') as f:
+                for line in f:
+                    parts = line.split()
+                    # Format: mount_id parent_id major:minor root mount_point ...
+                    if len(parts) >= 5:
+                        mount_point = parts[4]  # The mount point in container namespace
+                        if mount_point == '/workspace':
+                            # The 'root' field contains the host path
+                            host_path = parts[3]
+                            logger.info(f"Auto-detected host workspace path: {host_path}")
+                            return host_path
+        except Exception as e:
+            logger.warning(f"Failed to auto-detect host workspace path: {e}")
+        
+        # Fallback to environment variable or default
+        fallback = os.environ.get('HOST_WORKSPACE_PATH', '/workspace')
+        logger.info(f"Using fallback host workspace path: {fallback}")
+        return fallback
+
+    @staticmethod
+    def _detect_host_home_path() -> str:
+        """
+        Auto-detect the actual host home directory path.
+        
+        This reads /proc/self/mountinfo to find the host's home directory from SSH key mounts,
+        avoiding issues with Snap Docker where $HOME points to snap-specific paths.
+        
+        Returns:
+            The host home directory path, or $HOME as fallback
+        """
+        try:
+            with open('/proc/self/mountinfo', 'r') as f:
+                for line in f:
+                    parts = line.split()
+                    if len(parts) >= 5:
+                        mount_point = parts[4]
+                        # Look for .ssh mount which should be from host home
+                        if '.ssh' in mount_point:
+                            host_path = parts[3]  # e.g., /home/username/.ssh/id_ed25519
+                            # Extract home directory (remove /.ssh/... part)
+                            if '/.ssh/' in host_path:
+                                host_home = host_path.split('/.ssh/')[0]
+                                logger.info(f"Auto-detected host home path: {host_home}")
+                                return host_home
+        except Exception as e:
+            logger.warning(f"Failed to auto-detect host home path: {e}")
+        
+        # Fallback to environment variable or container's HOME
+        fallback = os.environ.get("HOST_HOME", os.environ.get("HOME", "/root"))
+        logger.info(f"Using fallback host home path: {fallback}")
+        return fallback
 
     @staticmethod
     def _sanitize_container_name(name: str) -> str:
@@ -206,8 +272,8 @@ class DockerAgentRunner:
         raw_container_name = f"claude-agent-{project}-{task_id}"
         container_name = self._sanitize_container_name(raw_container_name)
 
-        # Determine if we'll need stdin (for large prompts)
-        use_stdin = len(prompt) > 50000
+        # Always use stdin for passing prompts (avoids command-line length limits and escaping issues)
+        use_stdin = True
 
         docker_cmd = self._build_docker_command(
             container_name=container_name,
@@ -285,7 +351,11 @@ class DockerAgentRunner:
 
         # Convert container project path to host path for Docker-in-Docker
         # In docker-compose.yml: - ..:/workspace means /workspace maps to host's ~/workspace/orchestrator
-        host_workspace = os.environ.get('HOST_WORKSPACE_PATH', '/workspace')
+        
+        # Auto-detect the actual host path by reading /proc/self/mountinfo
+        # This avoids issues with Snap Docker where $HOME points to snap-specific paths
+        host_workspace = self._detect_host_workspace_path()
+        
         container_path_str = str(project_dir.absolute())
         if container_path_str.startswith('/workspace/'):
             # /workspace/project-name -> $HOST_WORKSPACE_PATH/project-name
@@ -321,8 +391,8 @@ class DockerAgentRunner:
                 else:
                     logger.info(f"✓ Filesystem write verification passed: {test_result['message']}")
 
-        # Get host home directory for SSH/git mounts
-        host_home = os.environ.get("HOST_HOME", os.environ.get("HOME", "/root"))
+        # Get host home directory for SSH/git mounts (auto-detect to avoid Snap Docker issues)
+        host_home = self._detect_host_home_path()
 
         # Base docker command - build list dynamically to conditionally add -i flag
         cmd = ['docker', 'run', '--rm', '--name', container_name, '--network', self.network_name]
@@ -360,6 +430,7 @@ class DockerAgentRunner:
         if oauth_token:
             cmd.extend(['-e', f'CLAUDE_CODE_OAUTH_TOKEN={oauth_token}'])
             logger.info("Using CLAUDE_CODE_OAUTH_TOKEN (subscription billing)")
+            logger.info(f"DEBUG: OAuth token length: {len(oauth_token)}, starts with: {oauth_token[:10]}...")
         elif anthropic_key:
             cmd.extend(['-e', f'ANTHROPIC_API_KEY={anthropic_key}'])
             logger.info("Using ANTHROPIC_API_KEY (API billing)")
@@ -460,20 +531,7 @@ class DockerAgentRunner:
             logger.info("✓ Pre-launch verification passed: Container has write access")
 
         # Build the Claude command to run inside container
-
-        # For large prompts, write to a temp file and mount it into container
-        import tempfile
-        import os
-
-        prompt_file = None
-        use_file_mount = len(prompt) > 50000  # Use file mount for prompts > 50KB
-
-        if use_file_mount:
-            # Create a temporary file for the prompt
-            prompt_file = tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt', dir='/tmp')
-            prompt_file.write(prompt)
-            prompt_file.close()
-            logger.info(f"Prompt is large ({len(prompt)} chars), using mounted file: {prompt_file.name}")
+        # We always use stdin to pass the prompt (no temp files or command-line args)
 
         # Check for existing session to resume
         existing_session_id = context.get('claude_session_id')
@@ -496,13 +554,8 @@ class DockerAgentRunner:
             claude_cmd.extend(['--resume', existing_session_id])
             logger.info(f"Resuming Claude Code session: {existing_session_id}")
 
-        if use_file_mount:
-            # Large prompt - will be sent via stdin
-            # Use '-' to tell claude to read from stdin
-            claude_cmd.append('-')
-        else:
-            # Small prompt - pass directly
-            claude_cmd.append(prompt)
+        # Always pass prompt via stdin (use '-' to tell claude to read from stdin)
+        claude_cmd.append('-')
 
         # Combine docker command with claude command
         full_cmd = docker_cmd + claude_cmd
@@ -533,34 +586,18 @@ class DockerAgentRunner:
             api_start_time = time.time()
             obs.emit_claude_call_started(agent, task_id, project, claude_model)
 
-        prompt_input = None
         try:
-            # Prepare stdin if using prompt file
-            if use_file_mount and prompt_file:
-                with open(prompt_file.name, 'r') as f:
-                    prompt_input = f.read()
-                logger.info(f"DOCKER DEBUG - Prompt file size: {len(prompt_input)} chars")
-                logger.info(f"DOCKER DEBUG - Prompt starts with: {prompt_input[:200]}")
+            # Always use stdin to pass the prompt
+            logger.info(f"Passing prompt via stdin ({len(prompt)} chars)")
 
-            # Run the container
-            if use_file_mount and prompt_input:
-                # For stdin input, use communicate() to avoid broken pipe
-                process = subprocess.Popen(
-                    full_cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    stdin=subprocess.PIPE,
-                    text=True
-                )
-                # Note: We'll handle stdin in the streaming loop below
-            else:
-                process = subprocess.Popen(
-                    full_cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    stdin=subprocess.DEVNULL
-                )
+            # Run the container with stdin enabled
+            process = subprocess.Popen(
+                full_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                stdin=subprocess.PIPE,
+                text=True
+            )
 
             # Collect output
             result_parts = []
@@ -580,27 +617,25 @@ class DockerAgentRunner:
 
             def write_stdin():
                 """Write prompt to stdin in a separate thread"""
-                if use_file_mount and prompt_input and process.stdin:
-                    try:
-                        logger.info(f"STDIN DEBUG - Writing {len(prompt_input)} chars to stdin")
-                        process.stdin.write(prompt_input)
-                        process.stdin.flush()
-                        logger.info("STDIN DEBUG - Stdin write completed, closing stdin")
-                        process.stdin.close()
-                        logger.info("STDIN DEBUG - Stdin closed successfully")
-                    except BrokenPipeError:
-                        logger.warning("STDIN DEBUG - Broken pipe while writing to stdin (process may have exited early)")
-                    except Exception as e:
-                        logger.error(f"STDIN DEBUG - Error writing to stdin: {e}")
+                try:
+                    logger.debug(f"Writing {len(prompt)} chars to stdin")
+                    process.stdin.write(prompt)
+                    process.stdin.flush()
+                    logger.debug("Stdin write completed, closing stdin")
+                    process.stdin.close()
+                    logger.debug("Stdin closed successfully")
+                except BrokenPipeError:
+                    logger.warning("Broken pipe while writing to stdin (process may have exited early)")
+                except Exception as e:
+                    logger.error(f"Error writing to stdin: {e}")
 
             # Start stderr reader thread
             stderr_thread = threading.Thread(target=read_stderr, daemon=True)
             stderr_thread.start()
 
-            # Start stdin writer thread if needed
-            if use_file_mount and prompt_input:
-                stdin_thread = threading.Thread(target=write_stdin, daemon=True)
-                stdin_thread.start()
+            # Start stdin writer thread
+            stdin_thread = threading.Thread(target=write_stdin, daemon=True)
+            stdin_thread.start()
 
             # Stream stdout
             for line in iter(process.stdout.readline, ''):
@@ -680,14 +715,6 @@ class DockerAgentRunner:
         except Exception as e:
             logger.error(f"Agent execution error: {e}")
             raise
-        finally:
-            # Clean up temp prompt file
-            if prompt_file and os.path.exists(prompt_file.name):
-                try:
-                    os.unlink(prompt_file.name)
-                    logger.debug(f"Cleaned up temp prompt file: {prompt_file.name}")
-                except Exception as e:
-                    logger.warning(f"Failed to clean up temp file: {e}")
 
     def _register_active_container(self, container_name: str, agent: str, project: str, task_id: str, context: Dict[str, Any]):
         """Register an active container in Redis for tracking and kill switch"""

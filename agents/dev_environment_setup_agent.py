@@ -43,26 +43,19 @@ class DevEnvironmentSetupAgent(MakerAgent):
 
     def get_initial_guidelines(self) -> str:
         return """
-## Environment Fixing Requirements
-
-**CRITICAL**: You MUST actually fix the files, not just write documentation about what should be fixed.
-
 ### Your Task:
 
-1. **Analyze the Problem**:
-   - Read the issue description carefully
+1. **Analyze the Codebase and any problem descriptions**:
+   - Identify the different types of files involved in the environment setup
+   - Look for sub-directories with their own Dockerfiles or dependency files and consider them too
    - Identify which files need modification (Dockerfile, requirements.txt, docker-compose.yml, etc.)
-   - Understand the root cause
 
 2. **Find and Read Files**:
    - Use Glob/Grep to locate Dockerfile, requirements files, build scripts
    - Read the current configuration to understand the setup
 
-3. **Make Actual Changes**:
-   - **EDIT the Dockerfile** to fix the issue
-   - **EDIT dependency files** (requirements.txt, package.json, etc.) if needed
-   - **EDIT build scripts** or configuration files if needed
-   - Use the Edit or Write tools to modify files
+3. **Create or Fix Dockerfile.agent**:
+   Follow the Dockerfile.agent Architecture Pattern below (see detailed section).
 
 4. **Build the Docker Image**:
    Use the project name from your task context to build the image:
@@ -76,7 +69,21 @@ class DevEnvironmentSetupAgent(MakerAgent):
 
 5. **Test the Docker Image**:
    - If there's a validation script provided in the issue, run it in the container
-   - Run basic smoke tests to ensure the environment works:
+   - **MANDATORY**: Test all three critical CLI tools:
+   ```bash
+   # Test Claude CLI (REQUIRED)
+   docker run --rm {PROJECT_NAME}-agent:latest which claude
+   docker run --rm {PROJECT_NAME}-agent:latest claude --version
+   
+   # Test Git CLI (REQUIRED)
+   docker run --rm {PROJECT_NAME}-agent:latest which git
+   docker run --rm {PROJECT_NAME}-agent:latest git --version
+   
+   # Test GitHub CLI (REQUIRED)
+   docker run --rm {PROJECT_NAME}-agent:latest which gh
+   docker run --rm {PROJECT_NAME}-agent:latest gh --version
+   ```
+   - Run project-specific smoke tests:
    ```bash
    docker run --rm {PROJECT_NAME}-agent:latest python3 --version
    docker run --rm {PROJECT_NAME}-agent:latest python3 -c "import {MODULE_NAME}"
@@ -86,6 +93,7 @@ class DevEnvironmentSetupAgent(MakerAgent):
    docker run --rm -v /workspace/{PROJECT_NAME}:/workspace/{PROJECT_NAME} {PROJECT_NAME}-agent:latest python3 /workspace/{PROJECT_NAME}/validation_script.py
    ```
    - Document test results (pass/fail with full output)
+   - **If claude, git, or gh are missing, the image is NOT valid and must be fixed**
 
 6. **Document What You Did**:
    - List files you modified
@@ -117,7 +125,167 @@ bash command="docker run --rm -v /workspace/{PROJECT_NAME}:/workspace/{PROJECT_N
 ```
 
 **Notes**:
-- Replace `{PROJECT_NAME}` with the actual project from your task context
+- The project path is `/workspace/{PROJECT_NAME}/`
+- Image tag follows pattern: `{PROJECT_NAME}-agent:latest`
+- Validation scripts are usually in the project root or mentioned in the issue
+
+**CRITICAL**: Steps 4 and 5 (BUILD and TEST) are MANDATORY for environment changes. Without them, you haven't verified the fix works.
+
+### Dockerfile.agent Architecture Pattern (MANDATORY):
+
+**CRITICAL DESIGN PRINCIPLE**: The Dockerfile.agent builds the ENVIRONMENT (installed tools and dependencies), NOT the project source code. Source code is mounted at runtime by the orchestrator.
+
+**Why This Matters**:
+- Source code comes from a runtime mount: `-v /host/project:/workspace`
+- Any source code copied during build is WASTED and gets overridden by the mount
+- Copying large directories (node_modules, .git) and then chown'ing them wastes 90+ seconds
+
+**Correct Dockerfile.agent Structure**:
+
+```dockerfile
+# ============================================================================
+# Stage 1: Base Environment Setup
+# ============================================================================
+FROM clauditoreum-orchestrator:latest
+
+# The base image already includes:
+# - Claude CLI (REQUIRED - must be present)
+# - Git CLI (REQUIRED - must be present)  
+# - GitHub CLI (REQUIRED - must be present)
+# - Python 3.11
+# - Essential build tools
+# - procps package (provides 'ps' command needed by Claude CLI)
+
+USER root
+
+# ============================================================================
+# Stage 2: Install Project-Specific Runtimes
+# ============================================================================
+# Install language runtimes and tools needed by the project
+# Examples:
+# - Node.js (if building a JS/TS project)
+# - Java (if building a Java project)
+# - Additional Python packages (if needed beyond base image)
+# - Database clients (if needed for testing)
+
+# Example for Node.js project:
+# RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \\
+#     apt-get install -y nodejs && \\
+#     apt-get clean && \\
+#     rm -rf /var/lib/apt/lists/*
+
+# Example for enabling package managers:
+# RUN corepack enable && \\
+#     corepack prepare pnpm@latest --activate
+
+# ============================================================================
+# Stage 3: Pre-install Dependencies (OPTIONAL but RECOMMENDED)
+# ============================================================================
+# Pre-installing dependencies speeds up agent startup time because the agent
+# doesn't have to install them every time it runs.
+
+# WORKDIR should match where the orchestrator will mount the project
+WORKDIR /workspace/{PROJECT_NAME}
+
+# OPTION A: Pre-install dependencies (Recommended for fast startup)
+# Copy ONLY the dependency manifests needed for installation
+# DO NOT copy source code - it comes from the runtime mount
+
+# For Node.js/pnpm projects:
+# COPY package.json pnpm-workspace.yaml pnpm-lock.yaml* ./
+# COPY apps/*/package.json ./apps/*/
+# COPY packages/*/package.json ./packages/*/
+# RUN --mount=type=cache,target=/root/.local/share/pnpm/store \\
+#     pnpm install --frozen-lockfile
+
+# For Python projects:
+# COPY requirements.txt ./
+# RUN pip install --no-cache-dir -r requirements.txt
+
+# ============================================================================
+# Stage 4: Ownership and Permissions
+# ============================================================================
+# Change ownership ONLY of what was installed, NOT source code
+# Source code ownership is handled by the mount
+
+# For pre-installed node_modules:
+# RUN chown -R orchestrator:orchestrator /workspace/{PROJECT_NAME}/node_modules
+
+# For pre-installed Python packages (already in /usr/local, no chown needed):
+# (No action required - packages installed as root in system paths)
+
+# ============================================================================
+# Stage 5: Switch to Runtime User
+# ============================================================================
+USER orchestrator
+
+# ============================================================================
+# Stage 6: Verification (MANDATORY)
+# ============================================================================
+# Verify all critical CLIs are present (from base image)
+RUN claude --version && \\
+    git --version && \\
+    gh --version
+
+# Verify project-specific tools (if installed):
+# RUN node --version && pnpm --version
+# RUN python3 --version && pip --version
+
+# ============================================================================
+# Default command
+# ============================================================================
+CMD ["/bin/bash"]
+```
+
+**KEY RULES FOR Dockerfile.agent**:
+
+1. **NEVER** copy the entire project with `COPY . .` - This is wasteful
+2. **NEVER** chown source code - It comes from a mount at runtime
+3. **DO** copy dependency manifests (package.json, requirements.txt) if pre-installing deps
+4. **DO** pre-install dependencies to speed up agent startup
+5. **DO** verify claude, git, and gh CLIs are present
+6. **DO** use cache mounts for package managers when possible
+7. **DO** clean up package manager caches to keep image size small
+
+**Anti-Patterns to AVOID**:
+
+❌ `COPY . .` - Copies source code (wasteful, gets overridden)
+❌ `RUN chown -R orchestrator:orchestrator /workspace/{PROJECT_NAME}` - Wastes 90+ seconds
+❌ Not using .dockerignore - Sends huge build context to Docker daemon
+❌ Not verifying Claude CLI is present - Agent will fail at runtime
+❌ Installing dependencies without cache mounts - Slow and wasteful
+
+**Optimization: Create .dockerignore**:
+
+Even though we're not copying source code, Docker still sends the build context.
+Create a .dockerignore file to exclude unnecessary files:
+
+```
+# Exclude node_modules - they get installed during build
+node_modules/
+
+# Exclude git directory
+.git/
+.github/
+
+# Exclude build artifacts
+dist/
+build/
+.turbo/
+.next/
+.wrangler/
+
+# Exclude logs
+*.log
+
+# Exclude IDE files
+.vscode/
+.idea/
+```
+
+This reduces build context from 770MB to <10MB and speeds up builds dramatically.
+
+**Notes**:
 - The project path is `/workspace/{PROJECT_NAME}/`
 - Image tag follows pattern: `{PROJECT_NAME}-agent:latest`
 - Validation scripts are usually in the project root or mentioned in the issue
@@ -126,23 +294,16 @@ bash command="docker run --rm -v /workspace/{PROJECT_NAME}:/workspace/{PROJECT_N
 
 ### Common Environment Issues:
 
-- **Architecture mismatches**: Add `--platform=linux/arm64` to FROM statements
+- **Architecture mismatches**: Make sure to properly sense the architecture and adapt the FROM statements, don't hard code the platform
 - **Wrong package versions**: Update requirements.txt or package.json
 - **Missing dependencies**: Add RUN commands to Dockerfile
 - **Build failures**: Fix syntax errors, missing files, wrong paths
 - **Permission issues**: Adjust file permissions, USER directives
+- **Slow builds (90+ second chown)**: Dockerfile is copying source code with `COPY . .` - Remove it!
+- **Large build context (500MB+)**: Missing .dockerignore file - Create one!
+- **Missing CLI tools**: Verify Claude, Git, and GitHub CLIs are present with RUN verification step
+- **Missing procps package**: Claude CLI needs `ps` command - Base image has it, but verify in tests
 
 **IMPORTANT**: The auto-commit will only work if you actually modify files. If no files are changed, your work isn't complete.
 """
 
-    def get_quality_standards(self) -> str:
-        return """
-- Actual files are modified (not just documentation created)
-- Docker image is built successfully (REQUIRED - not optional)
-- Docker image is tested with validation scripts (REQUIRED if script provided)
-- Build output shows no errors
-- Test results show all validations passing
-- Changes directly address the reported issue
-- Changes are minimal and focused
-- No unrelated modifications
-"""

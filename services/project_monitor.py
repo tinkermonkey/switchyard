@@ -62,43 +62,14 @@ class ProjectMonitor:
 
     def get_project_items(self, project_owner: str, project_number: int) -> List[ProjectItem]:
         """Query GitHub Projects v2 API to get current project items (excludes closed issues)"""
-        query = f'''{{
-            user(login: "{project_owner}") {{
-                projectV2(number: {project_number}) {{
-                    id
-                    title
-                    items(first: 100) {{
-                        nodes {{
-                            id
-                            content {{
-                                ... on Issue {{
-                                    id
-                                    number
-                                    title
-                                    state
-                                    repository {{
-                                        name
-                                    }}
-                                    updatedAt
-                                }}
-                            }}
-                            fieldValues(first: 10) {{
-                                nodes {{
-                                    ... on ProjectV2ItemFieldSingleSelectValue {{
-                                        name
-                                        field {{
-                                            ... on ProjectV2SingleSelectField {{
-                                                name
-                                            }}
-                                        }}
-                                    }}
-                                }}
-                            }}
-                        }}
-                    }}
-                }}
-            }}
-        }}'''
+        from services.github_owner_utils import build_projects_v2_query, get_owner_type
+        
+        # Build the correct query based on owner type
+        query = build_projects_v2_query(project_owner, project_number)
+        
+        if query is None:
+            logger.error(f"Cannot query project items - unable to determine owner type for '{project_owner}'")
+            return []
 
         try:
             result = subprocess.run(
@@ -107,7 +78,13 @@ class ProjectMonitor:
             )
 
             data = json.loads(result.stdout)
-            project_data = data['data']['user']['projectV2']
+            
+            # Get project data from the correct path based on owner type
+            owner_type = get_owner_type(project_owner)
+            if owner_type == 'user':
+                project_data = data['data']['user']['projectV2']
+            else:  # organization
+                project_data = data['data']['organization']['projectV2']
 
             items = []
             for node in project_data['items']['nodes']:
@@ -313,8 +290,63 @@ class ProjectMonitor:
                 logger.info(f"Gathering inputs from specific agents: {current_stage_config.inputs_from}")
                 return self._get_agent_outputs_from_discussion(actual_discussion_id, current_stage_config.inputs_from)
             else:
-                logger.warning(f"inputs_from specified but no discussion found for issue #{issue_number}, cannot fetch design context")
-                # Fall back to issue context
+                logger.warning(f"inputs_from specified but no discussion found for issue #{issue_number}")
+                
+                # Fallback 1: Check the current issue for agent outputs
+                logger.info(f"Checking current issue #{issue_number} for outputs from: {current_stage_config.inputs_from}")
+                issue_outputs = self._get_agent_outputs_from_issue(repository, issue_number, org, current_stage_config.inputs_from)
+                
+                if issue_outputs:
+                    logger.info(f"Found agent outputs in current issue #{issue_number}")
+                    return issue_outputs
+                
+                # Fallback 2: Check parent issue if one exists
+                logger.info(f"No outputs found in issue #{issue_number}, checking for parent issue")
+                try:
+                    import asyncio
+                    from services.github_integration import GitHubIntegration
+                    from services.feature_branch_manager import feature_branch_manager
+                    
+                    # Get GitHub integration with proper repo context
+                    github_integration = GitHubIntegration(repo_owner=org, repo_name=repository)
+                    
+                    # Create event loop if needed
+                    try:
+                        loop = asyncio.get_running_loop()
+                    except RuntimeError:
+                        loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(loop)
+                    
+                    # Get parent issue number
+                    parent_issue_number = loop.run_until_complete(
+                        feature_branch_manager.get_parent_issue(
+                            github_integration,
+                            issue_number,
+                            project=project_name
+                        )
+                    )
+                    
+                    if parent_issue_number:
+                        logger.info(f"Found parent issue #{parent_issue_number}, checking for agent outputs")
+                        parent_outputs = self._get_agent_outputs_from_issue(
+                            repository, parent_issue_number, org, current_stage_config.inputs_from
+                        )
+                        
+                        if parent_outputs:
+                            logger.info(f"Found agent outputs in parent issue #{parent_issue_number}")
+                            return parent_outputs
+                        else:
+                            logger.info(f"No outputs found in parent issue #{parent_issue_number}")
+                    else:
+                        logger.info(f"No parent issue found for issue #{issue_number}")
+                        
+                except Exception as e:
+                    logger.warning(f"Error checking parent issue: {e}")
+                    import traceback
+                    logger.warning(traceback.format_exc())
+                
+                # Fallback 3: Use general issue context
+                logger.warning(f"No agent outputs found in issue or parent, falling back to general issue context")
                 return self._get_issue_context(repository, issue_number, org, current_column, workflow_template)
 
         # For hybrid pipelines, determine if previous stage was in discussions or issues
@@ -688,6 +720,76 @@ class ProjectMonitor:
 
         except Exception as e:
             logger.error(f"Error fetching agent outputs from discussion: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return ""
+
+    def _get_agent_outputs_from_issue(self, repository: str, issue_number: int, org: str, agent_names: List[str]) -> str:
+        """
+        Get outputs from specific agents from an issue.
+        Similar to _get_agent_outputs_from_discussion but for issues.
+        
+        For each agent:
+        1. Find their most recent output in the issue comments
+        2. Return the complete comment body
+
+        Args:
+            repository: Repository name
+            issue_number: Issue number
+            org: Organization name
+            agent_names: List of agent names to get outputs from
+
+        Returns:
+            Formatted context string with all specified agent outputs
+        """
+        try:
+            import subprocess
+            import json
+            from dateutil import parser as date_parser
+
+            # Fetch all comments from the issue
+            result = subprocess.run(
+                ['gh', 'issue', 'view', str(issue_number), '--repo', f"{org}/{repository}", '--json', 'comments'],
+                capture_output=True, text=True, check=True
+            )
+            data = json.loads(result.stdout)
+            all_comments = data.get('comments', [])
+
+            # Find outputs from each requested agent
+            context_parts = []
+
+            for agent_name in agent_names:
+                agent_signature = f"_Processed by the {agent_name} agent_"
+
+                # Find agent's most recent output
+                final_output = None
+                final_timestamp = None
+
+                for comment in all_comments:
+                    if agent_signature in comment.get('body', ''):
+                        comment_time = date_parser.parse(comment.get('createdAt'))
+                        if final_timestamp is None or comment_time > final_timestamp:
+                            final_output = comment
+                            final_timestamp = comment_time
+
+                if not final_output:
+                    logger.warning(f"No output found from agent '{agent_name}' in issue #{issue_number}")
+                    continue
+
+                # Build context for this agent
+                agent_context = []
+                agent_context.append(f"## Output from {agent_name.replace('_', ' ').title()}")
+                agent_context.append(final_output.get('body', ''))
+
+                context_parts.append('\n'.join(agent_context))
+
+            return "\n\n---\n\n".join(context_parts) if context_parts else ""
+
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Error fetching issue comments: {e}")
+            return ""
+        except Exception as e:
+            logger.error(f"Error fetching agent outputs from issue: {e}")
             import traceback
             logger.error(traceback.format_exc())
             return ""
@@ -1292,6 +1394,29 @@ class ProjectMonitor:
                         f"success={success}, next_column={next_column}"
                     )
 
+                    # Move card to next column if auto_advance is enabled and we have a next column
+                    if success and next_column:
+                        auto_advance = getattr(column, 'auto_advance_on_approval', False)
+                        if auto_advance:
+                            logger.info(f"Auto-advancing issue #{issue_number} to {next_column}")
+                            try:
+                                from services.pipeline_progression import PipelineProgression
+                                progression_service = PipelineProgression(self.task_queue)
+                                progression_service.move_issue_to_column(
+                                    project_name=project_name,
+                                    board_name=board_name,
+                                    issue_number=issue_number,
+                                    target_column=next_column,
+                                    trigger='conversational_loop_completion'
+                                )
+                                logger.info(f"Successfully moved issue #{issue_number} to {next_column}")
+                            except Exception as move_error:
+                                logger.error(f"Failed to move issue to next column: {move_error}")
+                                import traceback
+                                logger.error(traceback.format_exc())
+                        else:
+                            logger.info(f"Auto-advance disabled for column {column.name}, not moving card")
+
                     loop.close()
                 except Exception as e:
                     logger.error(f"Error in conversational loop thread: {e}")
@@ -1791,7 +1916,7 @@ _Repair cycle initiated by Claude Code Orchestrator_
         logger.info("Checking for active review cycles to resume...")
         from services.review_cycle import review_cycle_executor
 
-        for project_name in self.config_manager.list_projects():
+        for project_name in self.config_manager.list_visible_projects():
             project_config = self.config_manager.get_project_config(project_name)
             org = project_config.github['org']
 
@@ -1802,8 +1927,8 @@ _Repair cycle initiated by Claude Code Orchestrator_
 
         while True:
             try:
-                # Get all configured projects
-                for project_name in self.config_manager.list_projects():
+                # Get all configured visible projects (exclude hidden/test projects)
+                for project_name in self.config_manager.list_visible_projects():
                     project_config = self.config_manager.get_project_config(project_name)
 
                     # Get project state to find actual GitHub project numbers

@@ -106,6 +106,15 @@ class GitHubProjectManager:
 
                 if discovered_board:
                     logger.info(f"Found existing board: {pipeline_config.board_name} (#{discovered_board['number']})")
+                    
+                    # Link discovered board to repository to make it repository-scoped
+                    await self._link_board_to_repository(
+                        discovered_board['number'],
+                        project_config.github['org'],
+                        project_config.github['repo'],
+                        pipeline_config.board_name
+                    )
+                    
                     # Update state with discovered board
                     workflow_template = self.config_manager.get_workflow_template(pipeline_config.workflow)
                     columns = await self._configure_board_columns(
@@ -136,6 +145,15 @@ class GitHubProjectManager:
                         return False
             else:
                 logger.info(f"Board exists in GitHub: {pipeline_config.board_name}, updating columns")
+                
+                # Link existing board to repository if not already linked
+                await self._link_board_to_repository(
+                    existing_board.project_number,
+                    project_config.github['org'],
+                    project_config.github['repo'],
+                    pipeline_config.board_name
+                )
+                
                 # Update existing board columns
                 workflow_template = self.config_manager.get_workflow_template(pipeline_config.workflow)
                 project_number = existing_board.project_number
@@ -170,7 +188,8 @@ class GitHubProjectManager:
             # Get workflow template
             workflow_template = self.config_manager.get_workflow_template(pipeline_config.workflow)
 
-            # Create the GitHub project (note: --body flag not supported in all gh versions)
+            # Create the GitHub project at the organization level first
+            # Then link it to the repository to make it repository-scoped
             cmd = [
                 'gh', 'project', 'create',
                 '--owner', project_config.github['org'],
@@ -186,6 +205,19 @@ class GitHubProjectManager:
             node_id = project_data.get('node_id')
 
             logger.info(f"Created project board: {pipeline_config.board_name} (#{project_number})")
+
+            # Link the project to the repository to make it repository-scoped
+            link_cmd = [
+                'gh', 'project', 'link', str(project_number),
+                '--owner', project_config.github['org'],
+                '--repo', project_config.github['repo']
+            ]
+            try:
+                subprocess.run(link_cmd, capture_output=True, text=True, check=True)
+                logger.info(f"Linked project #{project_number} to repository {project_config.github['repo']}")
+            except subprocess.CalledProcessError as link_error:
+                logger.warning(f"Failed to link project to repository: {link_error.stderr}")
+                logger.warning("Project created but not linked to repository - will be org-level instead of repo-level")
 
             # Configure columns
             columns = await self._configure_board_columns(project_number, workflow_template, project_config.github['org'])
@@ -431,6 +463,41 @@ class GitHubProjectManager:
             logger.error(f"Failed to reconcile labels for {project_name}: {e}")
             return False
 
+    async def _link_board_to_repository(self, project_number: int, org: str, repo: str, board_name: str) -> bool:
+        """Link a project board to a repository to make it repository-scoped
+        
+        Args:
+            project_number: The project number to link
+            org: GitHub organization
+            repo: Repository name
+            board_name: Name of the board for logging
+            
+        Returns:
+            True if linking succeeded or board was already linked, False on error
+        """
+        try:
+            link_cmd = [
+                'gh', 'project', 'link', str(project_number),
+                '--owner', org,
+                '--repo', repo
+            ]
+            result = subprocess.run(link_cmd, capture_output=True, text=True, check=False)
+            
+            if result.returncode == 0:
+                logger.info(f"Linked project '{board_name}' (#{project_number}) to repository {org}/{repo}")
+                return True
+            elif "already linked" in result.stderr.lower() or "already associated" in result.stderr.lower():
+                logger.debug(f"Project '{board_name}' (#{project_number}) already linked to repository {org}/{repo}")
+                return True
+            else:
+                logger.warning(f"Failed to link project '{board_name}' to repository: {result.stderr.strip()}")
+                logger.warning(f"Project remains at organization level instead of repository level")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error linking board to repository: {e}")
+            return False
+
     def get_project_state(self, project_name: str):
         """Get the current GitHub state for a project"""
         return self.state_manager.load_project_state(project_name)
@@ -538,14 +605,49 @@ class GitHubProjectManager:
             True if the board exists, False otherwise
         """
         try:
-            cmd = ['gh', 'project', 'view', str(project_number), '--owner', org, '--format', 'json']
-            result = subprocess.run(cmd, capture_output=True, text=True, check=False)
-
+            from services.github_owner_utils import get_owner_type
+            
+            owner_type = get_owner_type(org)
+            if owner_type is None:
+                logger.error(f"Cannot verify board - unable to determine owner type for '{org}'")
+                return False
+            
+            # Build GraphQL query to check if project exists
+            if owner_type == 'user':
+                query = f'''{{
+                    user(login: "{org}") {{
+                        projectV2(number: {project_number}) {{
+                            id
+                            number
+                        }}
+                    }}
+                }}'''
+            else:  # organization
+                query = f'''{{
+                    organization(login: "{org}") {{
+                        projectV2(number: {project_number}) {{
+                            id
+                            number
+                        }}
+                    }}
+                }}'''
+            
+            result = subprocess.run(
+                ['gh', 'api', 'graphql', '-f', f'query={query}'],
+                capture_output=True,
+                text=True,
+                check=False
+            )
+            
             if result.returncode == 0:
-                return True
+                data = json.loads(result.stdout)
+                owner_key = 'user' if owner_type == 'user' else 'organization'
+                project_data = data.get('data', {}).get(owner_key, {}).get('projectV2')
+                return project_data is not None
             else:
                 logger.debug(f"Board #{project_number} not found: {result.stderr}")
                 return False
+                
         except Exception as e:
             logger.error(f"Error verifying board existence: {e}")
             return False
@@ -561,13 +663,16 @@ class GitHubProjectManager:
             Dictionary with board info (number, id, node_id) if found, None otherwise
         """
         try:
-            # List all projects in the organization
-            cmd = ['gh', 'project', 'list', '--owner', org, '--format', 'json']
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-            projects_data = json.loads(result.stdout)
+            from services.github_owner_utils import get_projects_list_for_owner
+            
+            # List all projects for the owner (user or organization)
+            projects = get_projects_list_for_owner(org)
+            
+            if projects is None:
+                logger.error(f"Failed to list projects for owner: {org}")
+                return None
 
             # Search for a project with matching title
-            projects = projects_data.get('projects', [])
             for project in projects:
                 if project.get('title') == title:
                     logger.info(f"Discovered existing board: {title} (#{project.get('number')})")
@@ -581,12 +686,6 @@ class GitHubProjectManager:
             logger.debug(f"No existing board found with title: {title}")
             return None
 
-        except subprocess.CalledProcessError as e:
-            logger.error(f"Failed to list projects: {e.stderr if e.stderr else str(e)}")
-            return None
-        except json.JSONDecodeError as e:
-            logger.error(f"Failed to parse project list response: {e}")
-            return None
         except Exception as e:
             logger.error(f"Error discovering board by name: {e}")
             return None

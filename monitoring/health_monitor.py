@@ -10,6 +10,11 @@ class HealthMonitor:
 
     # Class-level variable to store last health check result (accessible by observability server)
     last_health_check = None
+    
+    # Cache GitHub authentication check (username lookup doesn't change frequently)
+    _github_auth_cache = None
+    _github_auth_cache_time = None
+    _github_auth_cache_ttl = 1800  # 30 minutes
 
     def __init__(self, orchestrator=None):
         self.orchestrator = orchestrator
@@ -75,6 +80,21 @@ class HealthMonitor:
         """Check GitHub connectivity and project management permissions"""
         import json
         from services.github_capabilities import github_capabilities, GitHubCapability
+        import time
+
+        # Check cache first
+        cache_valid = (
+            HealthMonitor._github_auth_cache is not None and
+            HealthMonitor._github_auth_cache_time is not None and
+            time.time() - HealthMonitor._github_auth_cache_time < HealthMonitor._github_auth_cache_ttl
+        )
+        
+        if cache_valid:
+            # Return cached result
+            cached_result = HealthMonitor._github_auth_cache.copy()
+            cached_result['cached'] = True
+            cached_result['cache_age_seconds'] = int(time.time() - HealthMonitor._github_auth_cache_time)
+            return cached_result
 
         # Check all capabilities
         capability_status = github_capabilities.check_capabilities()
@@ -98,8 +118,10 @@ class HealthMonitor:
             github_app_status['reason'] = 'Not configured (missing app_id, installation_id, or private_key)'
 
         # Check PAT authentication via gh CLI
+        # Note: gh auth status returns error if token is set via GITHUB_TOKEN env var
+        # instead of gh auth login, so we test actual API functionality instead
         auth_result = subprocess.run(
-            ['gh', 'auth', 'status'],
+            ['gh', 'api', 'user', '--jq', '.login'],
             capture_output=True, text=True,
             timeout=5
         )
@@ -182,16 +204,14 @@ class HealthMonitor:
 
         # Test GitHub Projects v2 permissions
         # This is the orchestrator's primary function
-        projects_result = subprocess.run(
-            ['gh', 'project', 'list', '--owner', org, '--format', 'json'],
-            capture_output=True, text=True,
-            timeout=5
-        )
-
-        if projects_result.returncode != 0:
+        from services.github_owner_utils import get_projects_list_for_owner
+        
+        projects_list = get_projects_list_for_owner(org)
+        
+        if projects_list is None:
             return {
                 'healthy': False,
-                'error': f'GitHub Projects access failed: {projects_result.stderr}',
+                'error': f'GitHub Projects access failed: unable to list projects for {org}',
                 'auth_methods': {
                     'pat': {'authenticated': True, 'repo_access': True, 'projects_access': False},
                     'github_app': github_app_status
@@ -201,20 +221,10 @@ class HealthMonitor:
                 'critical': 'GitHub Projects v2 access is required for orchestrator to function'
             }
 
-        # Test if we can actually list projects (empty list is OK)
-        try:
-            json.loads(projects_result.stdout)
-        except json.JSONDecodeError as e:
-            return {
-                'healthy': False,
-                'error': f'Invalid response from GitHub Projects API: {e}',
-                'projects_access': 'invalid_response'
-            }
-
         # Determine if we have degraded functionality
         degraded = not github_capabilities.has_capability(GitHubCapability.GITHUB_APP_AUTH)
 
-        return {
+        result = {
             'healthy': True,  # Core functionality works with PAT
             'degraded': degraded,  # Some features unavailable
             'auth_methods': {
@@ -228,6 +238,12 @@ class HealthMonitor:
             'tested_org': org,
             'tested_repo': f'{org}/{repo}'
         }
+        
+        # Cache successful result
+        HealthMonitor._github_auth_cache = result.copy()
+        HealthMonitor._github_auth_cache_time = time.time()
+        
+        return result
     
     async def check_disk_space(self) -> Dict[str, Any]:
         """Check available disk space"""

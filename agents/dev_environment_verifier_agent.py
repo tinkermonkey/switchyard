@@ -107,22 +107,44 @@ docker images {project_name}-agent:latest
 
 # Inspect image details
 docker inspect {project_name}-agent:latest
-
-# Run basic smoke tests
-docker run --rm {project_name}-agent:latest python3 --version
-docker run --rm {project_name}-agent:latest which git
-docker run --rm {project_name}-agent:latest which gh
 ```
 
-### Step 3: Validate Build Success
+### Step 3: Verify Critical CLI Tools
+
+**REQUIRED**: All agent images MUST have these CLI tools working:
+
+```bash
+# 1. Claude CLI - CRITICAL for agent execution
+docker run --rm {project_name}-agent:latest which claude
+docker run --rm {project_name}-agent:latest claude --version
+
+# 2. Git CLI - CRITICAL for version control operations
+docker run --rm {project_name}-agent:latest which git
+docker run --rm {project_name}-agent:latest git --version
+
+# 3. GitHub CLI - CRITICAL for GitHub API operations
+docker run --rm {project_name}-agent:latest which gh
+docker run --rm {project_name}-agent:latest gh --version
+
+# 4. Basic runtime (Python, Node, etc. - depends on project)
+docker run --rm {project_name}-agent:latest python3 --version 2>/dev/null || echo "Python not required"
+docker run --rm {project_name}-agent:latest node --version 2>/dev/null || echo "Node not required"
+```
+
+**All three CLI tools (claude, git, gh) MUST be present and working.** If any are missing, mark as BLOCKED.
+
+### Step 4: Validate Build Success
 
 Confirm:
 - Docker build completed without errors
 - Image was created recently
-- Basic commands work in the container
+- **Claude CLI is present and working** (CRITICAL)
+- **Git CLI is present and working** (CRITICAL)
+- **GitHub CLI is present and working** (CRITICAL)
+- Project-specific runtimes work (Python, Node, etc.)
 - If validation script was mentioned, it was executed and passed
 
-### Step 4: Update Dev Container State
+### Step 5: Update Dev Container State
 
 **CRITICAL**: You MUST update the dev container state based on your findings.
 
@@ -165,19 +187,22 @@ print(f"✗ Marked {{project_name}} dev container as BLOCKED: {{error_message}}"
 **APPROVED (Mark as VERIFIED)**:
 - Docker image exists and was created recently
 - Build output shows success (no errors)
-- Smoke tests pass (python, git, gh commands work)
+- **Claude CLI is present and working** (`claude --version` succeeds)
+- **Git CLI is present and working** (`git --version` succeeds)
+- **GitHub CLI is present and working** (`gh --version` succeeds)
+- Project-specific runtimes work (if applicable)
 - Validation tests passed (if provided in issue)
 - State was marked as VERIFIED using Python code above
 
 **CHANGES NEEDED**:
-- Image exists but has warnings to address
+- Image exists but CLI tools have warnings to address
 - Build succeeded but tests weren't run when they should have been
 - Minor issues that should be fixed
 
 **BLOCKED (Mark as BLOCKED)**:
 - Docker image doesn't exist
 - Build failed with errors
-- Smoke tests fail
+- **Any of the three critical CLI tools (claude, git, gh) are missing or broken**
 - Critical validation tests failed
 - Cannot start container
 
@@ -201,7 +226,11 @@ IMPORTANT: Output your verification review as text directly in your response. DO
 [Summary of build output - success/failure, any errors]
 
 #### Test Results
-[Results of smoke tests and validation tests]
+[Results of CLI tool tests - claude, git, gh, and any project-specific tests]
+- Claude CLI: [working/missing]
+- Git CLI: [working/missing]
+- GitHub CLI: [working/missing]
+- Project runtime: [details]
 
 #### Issues Found
 [List any issues discovered, or "None" if all passed]
@@ -258,6 +287,7 @@ REMEMBER: You MUST execute Python code to update the dev container state. Withou
 
         return {
             'status': 'success',
-            'output': review_text,
-            'verification_result': review_text
+            'markdown_review': review_text,  # Primary key for review agents
+            'output': review_text,  # Fallback key
+            'verification_result': review_text  # Descriptive key
         }

@@ -1465,8 +1465,8 @@ def get_projects():
                 }
             })
 
-        # Get all configured projects from config manager
-        project_configs = config_manager.list_projects()
+        # Get all configured projects from config manager (excluding hidden projects)
+        project_configs = config_manager.list_visible_projects()
 
         for project_name in project_configs:
             try:

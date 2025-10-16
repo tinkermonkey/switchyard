@@ -238,6 +238,26 @@ class RepairCycleStage(PipelineStage):
                 cycle_result.duration_seconds = (cycle_end - cycle_start).total_seconds()
                 results.append(cycle_result)
 
+                # Emit test cycle completed event (always emit, regardless of outcome)
+                if obs:
+                    obs.emit(
+                        EventType.REPAIR_CYCLE_TEST_CYCLE_COMPLETED,
+                        "repair_cycle",
+                        task_id,
+                        project,
+                        {
+                            "test_type": test_config.test_type.value,
+                            "test_type_index": test_type_index,
+                            "passed": cycle_result.passed,
+                            "test_cycle_iterations": cycle_result.iterations,
+                            "files_fixed": cycle_result.files_fixed,
+                            "warnings_reviewed": cycle_result.warnings_reviewed,
+                            "error": cycle_result.error,
+                            "duration_seconds": cycle_result.duration_seconds,
+                        },
+                        pipeline_run_id=pipeline_run_id,
+                    )
+
                 # Emit observability metrics
                 self._emit_cycle_metrics(cycle_result, context)
 
@@ -367,6 +387,17 @@ class RepairCycleStage(PipelineStage):
             if self._agent_call_count >= self.max_total_agent_calls:
                 logger.error(f"Circuit breaker triggered: max agent calls " f"({self.max_total_agent_calls}) reached")
                 
+                # Note: Completion event will be emitted by caller
+                return CycleResult(
+                    test_type=config.test_type,
+                    passed=False,
+                    iterations=test_cycle_iteration,
+                    final_result=None,
+                    error="Circuit breaker: max agent calls reached",
+                    files_fixed=files_fixed,
+                    warnings_reviewed=warnings_reviewed,
+                )
+                
                 # Emit test cycle completed event with failure
                 if obs:
                     obs.emit(
@@ -487,46 +518,7 @@ class RepairCycleStage(PipelineStage):
                 # Success!
                 logger.info(f"Test cycle completed successfully after {test_cycle_iteration} iterations")
                 
-                # Emit test cycle completed event with success
-                if obs:
-                    obs.emit(
-                        EventType.REPAIR_CYCLE_TEST_CYCLE_COMPLETED,
-                        "repair_cycle",
-                        task_id,
-                        project,
-                        {
-                            "test_type": config.test_type.value,
-                            "passed": True,
-                            "test_cycle_iterations": test_cycle_iteration,
-                            "files_fixed": files_fixed,
-                            "warnings_reviewed": warnings_reviewed,
-                            "final_passed": test_result.passed,
-                            "final_failed": test_result.failed,
-                            "final_warnings": test_result.warnings,
-                        },
-                        pipeline_run_id=pipeline_run_id,
-                    )
-                
-                # Emit cycle completed event with success
-                if obs:
-                    obs.emit(
-                        EventType.REPAIR_CYCLE_COMPLETED,
-                        "repair_cycle",
-                        task_id,
-                        project,
-                        {
-                            "test_type": config.test_type.value,
-                            "passed": True,
-                            "test_cycle_iterations": test_cycle_iteration,
-                            "files_fixed": files_fixed,
-                            "warnings_reviewed": warnings_reviewed,
-                            "final_passed": test_result.passed,
-                            "final_failed": test_result.failed,
-                            "final_warnings": test_result.warnings,
-                        },
-                        pipeline_run_id=pipeline_run_id,
-                    )
-                
+                # Note: Completion event will be emitted by caller
                 return CycleResult(
                     test_type=config.test_type,
                     passed=True,
@@ -586,46 +578,7 @@ class RepairCycleStage(PipelineStage):
         logger.error(f"Max iterations ({config.max_iterations}) reached for " f"{config.test_type.value} tests")
         final_result = await self._run_tests(config, context, test_cycle_iteration, test_type_index)
 
-        # Emit test cycle completed event with failure
-        if obs:
-            obs.emit(
-                EventType.REPAIR_CYCLE_TEST_CYCLE_COMPLETED,
-                "repair_cycle",
-                task_id,
-                project,
-                {
-                    "test_type": config.test_type.value,
-                    "passed": False,
-                    "test_cycle_iterations": test_cycle_iteration,
-                    "error": "Max iterations reached",
-                    "files_fixed": files_fixed,
-                    "warnings_reviewed": warnings_reviewed,
-                    "final_passed": final_result.passed if final_result else 0,
-                    "final_failed": final_result.failed if final_result else 0,
-                },
-                pipeline_run_id=pipeline_run_id,
-            )
-
-        # Emit cycle completed event with failure
-        if obs:
-            obs.emit(
-                EventType.REPAIR_CYCLE_COMPLETED,
-                "repair_cycle",
-                task_id,
-                project,
-                {
-                    "test_type": config.test_type.value,
-                    "passed": False,
-                    "test_cycle_iterations": test_cycle_iteration,
-                    "error": "Max iterations reached",
-                    "files_fixed": files_fixed,
-                    "warnings_reviewed": warnings_reviewed,
-                    "final_passed": final_result.passed if final_result else 0,
-                    "final_failed": final_result.failed if final_result else 0,
-                },
-                pipeline_run_id=pipeline_run_id,
-            )
-
+        # Note: Completion event will be emitted by caller
         return CycleResult(
             test_type=config.test_type,
             passed=False,
@@ -698,6 +651,12 @@ class RepairCycleStage(PipelineStage):
             "direct_prompt": f"""Run all {config.test_type.value} tests for this project.
 
 Please identify the appropriate test framework and location for {config.test_type.value} tests.
+
+These tests runs can take some time to complete, please be patient and don't put time limits on the test execution.
+
+Also, make sure you are capturing the full output of the test runs, including any warnings and errors, to disk to avoid having to re-run the tests multiple times.
+
+Be mindful of environment setup steps like installing dependencies and activating virtual environments.
 
 CRITICAL: You MUST return ONLY valid JSON in this EXACT format (no markdown, no explanation):
 {{
@@ -963,6 +922,11 @@ DO NOT include any explanation, markdown formatting, or other text - ONLY the JS
                 "direct_prompt": f"""Fix these test failures in {test_file}:
 
 {failure_text}
+
+**IMPORTANT**: For each failure:
+- Identify the root cause in the source code, explore similar functionality elsewhere in the code to see how this is handled
+- Evaluate if the test is still relevant and necessary, if it's not, remove it completely
+- If the test is meant for functionality which is not implemented, remove the test entirely
 """,
             }
 

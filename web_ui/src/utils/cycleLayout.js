@@ -10,115 +10,259 @@ const DEBUG_CYCLE_LAYOUT = false
 
 /**
  * Detects cycle boundaries from decision events
+ * Uses the orchestrator's decision events for accurate cycle boundary detection.
+ * Handles three types of cycles:
+ * 1. Review cycles: review_cycle_started -> review_cycle_completed
+ * 2. Repair cycles: repair_cycle_*_cycle_started -> repair_cycle_*_cycle_completed
+ * 3. Conversational loops: conversational_loop_started -> conversational_loop_completed
+ * 
  * @param {Array} events - All pipeline run events (sorted chronologically)
  * @returns {Array} Array of cycle objects with start/end timestamps and type
  */
 export function detectCycleBoundaries(events) {
   if (DEBUG_CYCLE_LAYOUT) {
-    console.group('🔍 detectCycleBoundaries')
+    console.group('🔍 detectCycleBoundaries - Enhanced with orchestrator decision events')
     console.log('📋 Total events:', events.length)
   }
   
   const cycles = []
-  let openCycle = null
   
   // Sort events chronologically
   const sortedEvents = [...events].sort((a, b) => 
     new Date(a.timestamp) - new Date(b.timestamp)
   )
   
-  // Log decision events
+  // Filter to decision events only
+  const decisionEvents = sortedEvents.filter(e => e.event_category === 'decision')
+  
   if (DEBUG_CYCLE_LAYOUT) {
-    const decisionEvents = sortedEvents.filter(e => e.event_category === 'decision')
     console.log('🎯 Decision events:', decisionEvents.length)
-    console.table(decisionEvents.map(e => ({
-      timestamp: e.timestamp,
-      category: e.decision_category,
-      type: e.event_type,
-      agent: e.agent || e.decision?.agent_name || '-'
-    })))
+    const eventTypeCounts = {}
+    decisionEvents.forEach(e => {
+      eventTypeCounts[e.event_type] = (eventTypeCounts[e.event_type] || 0) + 1
+    })
+    console.table(eventTypeCounts)
   }
   
-  sortedEvents.forEach(event => {
-    if (event.event_category !== 'decision') return
-    
-    const category = event.decision_category
+  // Track open cycles by type (to handle nested/parallel cycles)
+  // Repair cycles can have multiple nested cycles (test_cycle and fix_cycle)
+  const openCycles = {
+    review_cycle: null,
+    repair_test_cycle: null,
+    repair_fix_cycle: null,
+    conversational_loop: null
+  }
+  
+  decisionEvents.forEach(event => {
     const eventType = event.event_type
     
-    // Detect cycle start events
-    const isCycleStart = (
-      // Review cycle starts
-      (category === 'review_cycle' && 
-       (eventType === 'review_cycle_started' || 
-        eventType === 'review_cycle_iteration' ||
-        eventType === 'review_feedback_provided')) ||
-      
-      // Error/repair cycle starts
-      (category === 'error_handling' && 
-       (eventType === 'error_encountered' ||
-        eventType === 'circuit_breaker_opened')) ||
-      
-      // Conversational loop starts
-      (category === 'conversational_loop' && 
-       (eventType === 'conversational_loop_started' ||
-        eventType === 'conversational_question_routed'))
-    )
-    
-    // Detect cycle end events
-    const isCycleEnd = (
-      // Review cycle ends
-      (category === 'review_cycle' && 
-       eventType === 'review_cycle_completed') ||
-      
-      // Error recovered (cycle ends)
-      (category === 'error_handling' && 
-       eventType === 'error_recovered') ||
-      
-      // Conversational loop ends
-      (category === 'conversational_loop' && 
-       eventType === 'conversational_loop_completed')
-    )
-    
-    // If a cycle is starting
-    if (isCycleStart) {
-      // Close any open cycle first
-      if (openCycle) {
-        openCycle.endTime = event.timestamp
-        openCycle.endEvent = event
-        cycles.push(openCycle)
-      }
-      
-      // Start new cycle
-      openCycle = {
-        id: `cycle-${cycles.length}`,
-        type: category, // 'review_cycle', 'error_handling', 'conversational_loop'
+    // === REVIEW CYCLES ===
+    if (eventType === 'review_cycle_started') {
+      // Start a new review cycle
+      const cycleId = `review_cycle_${cycles.length + 1}`
+      openCycles.review_cycle = {
+        id: cycleId,
+        type: 'review_cycle',
         startTime: event.timestamp,
         startEvent: event,
         endTime: null,
         endEvent: null,
-        agentExecutions: [], // Will be populated later
+        agentExecutions: [],
+        metadata: {
+          maker_agent: event.inputs?.maker_agent,
+          reviewer_agent: event.inputs?.reviewer_agent,
+          max_iterations: event.max_iterations
+        }
       }
+      
+      if (DEBUG_CYCLE_LAYOUT) {
+        console.log(`✅ Review cycle started: ${cycleId} (${event.inputs?.maker_agent} -> ${event.inputs?.reviewer_agent})`)
+      }
+    } 
+    else if (eventType === 'review_cycle_completed' && openCycles.review_cycle) {
+      // Complete the review cycle
+      openCycles.review_cycle.endTime = event.timestamp
+      openCycles.review_cycle.endEvent = event
+      openCycles.review_cycle.metadata.status = event.status
+      openCycles.review_cycle.metadata.total_iterations = event.total_iterations
+      
+      cycles.push(openCycles.review_cycle)
+      
+      if (DEBUG_CYCLE_LAYOUT) {
+        console.log(`✅ Review cycle completed: ${openCycles.review_cycle.id} (status: ${event.status}, iterations: ${event.total_iterations})`)
+      }
+      
+      openCycles.review_cycle = null
     }
     
-    // If a cycle is ending
-    if (isCycleEnd && openCycle) {
-      openCycle.endTime = event.timestamp
-      openCycle.endEvent = event
-      cycles.push(openCycle)
-      openCycle = null
+    // === REPAIR CYCLES ===
+    // Repair cycles can be: repair_cycle_test_cycle_started/completed, repair_cycle_fix_cycle_started/completed
+    // These can be nested (fix_cycle inside test_cycle)
+    else if (eventType === 'repair_cycle_test_cycle_started') {
+      // Start a test cycle (outer cycle)
+      const cycleId = `repair_test_cycle_${cycles.length + 1}`
+      
+      openCycles.repair_test_cycle = {
+        id: cycleId,
+        type: 'repair_cycle',
+        subtype: 'test_cycle',
+        startTime: event.timestamp,
+        startEvent: event,
+        endTime: null,
+        endEvent: null,
+        agentExecutions: [],
+        metadata: {
+          test_type: event.test_type,
+          test_type_index: event.test_type_index,
+          total_test_types: event.total_test_types,
+          max_iterations: event.max_iterations
+        }
+      }
+      
+      if (DEBUG_CYCLE_LAYOUT) {
+        console.log(`✅ Repair test cycle started: ${cycleId} (test_type: ${event.test_type})`)
+      }
+    }
+    else if (eventType === 'repair_cycle_test_cycle_completed' && openCycles.repair_test_cycle) {
+      // Complete the test cycle
+      openCycles.repair_test_cycle.endTime = event.timestamp
+      openCycles.repair_test_cycle.endEvent = event
+      
+      cycles.push(openCycles.repair_test_cycle)
+      
+      if (DEBUG_CYCLE_LAYOUT) {
+        console.log(`✅ Repair test cycle completed: ${openCycles.repair_test_cycle.id}`)
+      }
+      
+      openCycles.repair_test_cycle = null
+    }
+    else if (eventType === 'repair_cycle_fix_cycle_started') {
+      // Start a fix cycle (can be nested inside test cycle)
+      const cycleId = `repair_fix_cycle_${cycles.length + 1}`
+      
+      openCycles.repair_fix_cycle = {
+        id: cycleId,
+        type: 'repair_cycle',
+        subtype: 'fix_cycle',
+        startTime: event.timestamp,
+        startEvent: event,
+        endTime: null,
+        endEvent: null,
+        agentExecutions: [],
+        metadata: {
+          test_type: event.test_type,
+          test_cycle_iteration: event.test_cycle_iteration,
+          file_count: event.file_count,
+          total_failures: event.total_failures
+        }
+      }
+      
+      if (DEBUG_CYCLE_LAYOUT) {
+        console.log(`✅ Repair fix cycle started: ${cycleId} (${event.file_count} files, ${event.total_failures} failures)`)
+      }
+    }
+    else if (eventType === 'repair_cycle_fix_cycle_completed' && openCycles.repair_fix_cycle) {
+      // Complete the fix cycle
+      openCycles.repair_fix_cycle.endTime = event.timestamp
+      openCycles.repair_fix_cycle.endEvent = event
+      openCycles.repair_fix_cycle.metadata.files_fixed = event.files_fixed || event.total_files_fixed
+      
+      cycles.push(openCycles.repair_fix_cycle)
+      
+      if (DEBUG_CYCLE_LAYOUT) {
+        console.log(`✅ Repair fix cycle completed: ${openCycles.repair_fix_cycle.id} (${event.files_fixed} files fixed)`)
+      }
+      
+      openCycles.repair_fix_cycle = null
+    }
+    
+    // === CONVERSATIONAL LOOPS ===
+    else if (eventType === 'conversational_loop_started') {
+      // Start conversational loop
+      const cycleId = `conv_loop_${cycles.length + 1}`
+      openCycles.conversational_loop = {
+        id: cycleId,
+        type: 'conversational_loop',
+        startTime: event.timestamp,
+        startEvent: event,
+        endTime: null,
+        endEvent: null,
+        agentExecutions: [],
+        metadata: {
+          agent: event.agent,
+          workspace_type: event.workspace_type
+        }
+      }
+      
+      if (DEBUG_CYCLE_LAYOUT) {
+        console.log(`✅ Conversational loop started: ${cycleId} (agent: ${event.agent})`)
+      }
+    }
+    else if (eventType === 'conversational_loop_completed' && openCycles.conversational_loop) {
+      // Complete conversational loop
+      openCycles.conversational_loop.endTime = event.timestamp
+      openCycles.conversational_loop.endEvent = event
+      
+      cycles.push(openCycles.conversational_loop)
+      
+      if (DEBUG_CYCLE_LAYOUT) {
+        console.log(`✅ Conversational loop completed: ${openCycles.conversational_loop.id}`)
+      }
+      
+      openCycles.conversational_loop = null
     }
   })
   
-  // Close any remaining open cycle at the end
-  if (openCycle) {
-    openCycle.endTime = sortedEvents[sortedEvents.length - 1]?.timestamp
-    cycles.push(openCycle)
-  }
+  // Close any remaining open cycles (still in progress)
+  Object.values(openCycles).forEach(openCycle => {
+    if (openCycle) {
+      openCycle.endTime = sortedEvents[sortedEvents.length - 1]?.timestamp
+      openCycle.isOpen = true // Mark as incomplete
+      cycles.push(openCycle)
+      
+      if (DEBUG_CYCLE_LAYOUT) {
+        console.log(`⚠️ Closed incomplete cycle: ${openCycle.id} (still running)`)
+      }
+    }
+  })
+  
+  // Establish parent-child relationships based on time containment
+  // A cycle is a child of another if it's completely contained within the parent's time range
+  cycles.forEach(potentialChild => {
+    const childStart = new Date(potentialChild.startTime).getTime()
+    const childEnd = potentialChild.endTime ? new Date(potentialChild.endTime).getTime() : Date.now()
+    
+    cycles.forEach(potentialParent => {
+      // Skip self and don't nest cycles of the same subtype
+      if (potentialChild.id === potentialParent.id) return
+      if (potentialChild.subtype === potentialParent.subtype) return
+      
+      const parentStart = new Date(potentialParent.startTime).getTime()
+      const parentEnd = potentialParent.endTime ? new Date(potentialParent.endTime).getTime() : Date.now()
+      
+      // Check if child is contained within parent
+      if (childStart >= parentStart && childEnd <= parentEnd) {
+        // Repair fix cycles should be children of repair test cycles
+        if (potentialChild.subtype === 'fix_cycle' && potentialParent.subtype === 'test_cycle') {
+          potentialChild.parentCycleId = potentialParent.id
+          
+          if (DEBUG_CYCLE_LAYOUT) {
+            console.log(`🔗 Parent-child: ${potentialChild.id} is child of ${potentialParent.id}`)
+          }
+        }
+      }
+    })
+  })
   
   if (DEBUG_CYCLE_LAYOUT) {
-    console.log('✅ Detected cycles:', cycles.length)
+    console.log(`✅ Detected ${cycles.length} cycles total:`)
     cycles.forEach(cycle => {
-      console.log(`  ${cycle.id}: ${cycle.type} (${cycle.startTime} → ${cycle.endTime || 'open'})`)
+      const duration = cycle.endTime 
+        ? ((new Date(cycle.endTime) - new Date(cycle.startTime)) / 1000).toFixed(1) 
+        : 'ongoing'
+      const parentInfo = cycle.parentCycleId ? ` (child of ${cycle.parentCycleId})` : ''
+      const openInfo = cycle.isOpen ? ' [OPEN]' : ''
+      console.log(`  ${cycle.id}: ${cycle.type}/${cycle.subtype || 'unknown'} (${duration}s)${parentInfo}${openInfo}`)
     })
     console.groupEnd()
   }
@@ -496,16 +640,16 @@ export function identifyCycles(events, agentExecutions, workflowConfig = null) {
     const cycles = new Map()
     
     boundaries.forEach((boundary, index) => {
-      const cycleId = `${boundary.type}_${index + 1}`
+      const cycleId = boundary.id // Use the ID from detectCycleBoundaries
       
       // Find all agent executions within this time range
-      const startTime = new Date(boundary.startTimestamp).getTime()
-      const endTime = new Date(boundary.endTimestamp).getTime()
+      const startTime = new Date(boundary.startTime).getTime()
+      const endTime = boundary.endTime ? new Date(boundary.endTime).getTime() : Date.now()
       
       const cycleExecutions = []
       agentExecutions.forEach((executions, agent) => {
         executions.forEach(execution => {
-          const executionTime = new Date(execution.timestamp).getTime()
+          const executionTime = new Date(execution.startTime).getTime()
           if (executionTime >= startTime && executionTime <= endTime) {
             cycleExecutions.push({
               agent,
@@ -516,10 +660,8 @@ export function identifyCycles(events, agentExecutions, workflowConfig = null) {
       })
       
       cycles.set(cycleId, {
+        ...boundary, // Include all metadata from detectCycleBoundaries
         id: cycleId,
-        type: boundary.type,
-        startTime: boundary.startTimestamp,
-        endTime: boundary.endTimestamp,
         agentExecutions: cycleExecutions,
         isCollapsed: false,
       })
@@ -699,9 +841,26 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
     })
   
   // Add cycles with their internal horizontal layout
+  // Only process parent cycles (top-level) - child cycles will be nested inside
   const cycleNodes = []
   for (const [cycleId, cycleData] of cycles.entries()) {
+    // Skip child cycles - they'll be rendered inside their parent
+    if (cycleData.parentCycleId) {
+      if (DEBUG_CYCLE_LAYOUT) {
+        console.log(`⏭️  Skipping child cycle ${cycleId} (parent: ${cycleData.parentCycleId})`)
+      }
+      continue
+    }
+    
     const cycleNodeList = nodesByCycle.get(cycleId) || []
+    
+    // Also include nodes from child cycles
+    const childCycles = Array.from(cycles.values()).filter(c => c.parentCycleId === cycleId)
+    childCycles.forEach(childCycle => {
+      const childNodes = nodesByCycle.get(childCycle.id) || []
+      cycleNodeList.push(...childNodes)
+    })
+    
     if (cycleNodeList.length === 0) continue
     
     if (DEBUG_CYCLE_LAYOUT) {
@@ -780,11 +939,28 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
     // Get cycle type label
     const typeLabels = {
       'review_cycle': 'Review Cycle',
-      'error_handling': 'Repair Cycle',
+      'repair_cycle': 'Repair Cycle',
+      'error_handling': 'Repair Cycle', // Legacy support
       'conversational_loop': 'Conversational Loop',
       'unknown': 'Cycle',
     }
-    const cycleLabel = typeLabels[cycleData.type] || 'Cycle'
+    let cycleLabel = typeLabels[cycleData.type] || 'Cycle'
+    
+    // Add subtype for repair cycles
+    if (cycleData.type === 'repair_cycle' && cycleData.subtype) {
+      cycleLabel = cycleData.subtype === 'test_cycle' ? 'Test Repair Cycle' : 'Fix Repair Cycle'
+    }
+    
+    // Show if cycle is still open
+    if (cycleData.isOpen) {
+      cycleLabel += ' (In Progress)'
+    }
+    
+    // Count child cycles
+    const childCount = childCycles.length
+    if (childCount > 0) {
+      cycleLabel += ` [${childCount} nested cycle${childCount > 1 ? 's' : ''}]`
+    }
     
     // Create cycle bounding node (parent node)
     const cycleNode = {
