@@ -23,6 +23,7 @@ import {
   toggleCycleCollapsed,
   updateEdgesForCycles,
 } from '../utils/cycleLayout'
+import { mergePipelineRunEvents } from '../utils/eventMerging'
 
 /**
  * Custom node component for pipeline run events with candy-stripe animation
@@ -330,9 +331,15 @@ function PipelineRunView() {
     // State update will trigger useEffect to rebuild flowchart
   }, [])
   
+  // Merge API events with live WebSocket events
+  const mergedEvents = useMemo(() => {
+    if (!selectedPipelineRun) return []
+    return mergePipelineRunEvents(pipelineRunEvents, socketEvents, selectedPipelineRun)
+  }, [pipelineRunEvents, socketEvents, selectedPipelineRun])
+  
   // Build flowchart from events
   const buildFlowchart = useCallback(() => {
-    if (!pipelineRunEvents.length || !selectedPipelineRun) {
+    if (!mergedEvents.length || !selectedPipelineRun) {
       setNodes([])
       setEdges([])
       setChartHeight(600)
@@ -370,7 +377,7 @@ function PipelineRunView() {
     const agentExecutions = new Map()
     
     // First pass: identify all agent executions
-    pipelineRunEvents.forEach(event => {
+    mergedEvents.forEach(event => {
       if (event.event_category === 'agent_lifecycle') {
         const agent = event.agent
         const taskId = event.task_id
@@ -645,7 +652,7 @@ function PipelineRunView() {
         reactFlowInstance.fitView({ padding: 0.1, duration: 300 })
       }, 50)
     }
-  }, [pipelineRunEvents, selectedPipelineRun, socketEvents, cycles, workflowConfig, setNodes, setEdges, reactFlowInstance, handleToggleCycle])
+  }, [mergedEvents, selectedPipelineRun, socketEvents, cycles, workflowConfig, setNodes, setEdges, reactFlowInstance, handleToggleCycle])
   
   // Initial load
   useEffect(() => {
@@ -671,13 +678,13 @@ function PipelineRunView() {
   
   // Detect and update cycles when events or workflow config changes
   useEffect(() => {
-    if (!pipelineRunEvents.length) return
+    if (!mergedEvents.length) return
     
     console.log('🔄 [Pipeline Run] Detecting cycles with workflow config:', workflowConfig ? 'loaded' : 'not loaded')
     
     // Build agent executions map
     const agentExecutions = new Map()
-    pipelineRunEvents.forEach(event => {
+    mergedEvents.forEach(event => {
       if (event.event_category === 'agent_lifecycle' && event.event_type === 'agent_initialized') {
         const agent = event.agent
         if (!agentExecutions.has(agent)) {
@@ -692,7 +699,7 @@ function PipelineRunView() {
     
     // Debug: Log detailed information about what we're passing to cycle detection
     console.group('📊 [Pipeline Run] Cycle Detection Input Data')
-    console.log('Total events:', pipelineRunEvents.length)
+    console.log('Total events:', mergedEvents.length)
     console.log('Agent execution map:')
     agentExecutions.forEach((executions, agent) => {
       console.log(`  - ${agent}: ${executions.length} execution(s)`, executions.map(e => e.taskId))
@@ -734,7 +741,7 @@ function PipelineRunView() {
       })
       return updated
     })
-  }, [pipelineRunEvents, workflowConfig, selectedPipelineRun])
+  }, [mergedEvents, workflowConfig, selectedPipelineRun])
   
   // Rebuild flowchart when events or socket events change
   useEffect(() => {

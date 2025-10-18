@@ -378,6 +378,7 @@ class WorkExecutionStateTracker:
             # Check if trigger indicates programmatic change
             trigger = status_change.get('trigger', '')
             if trigger in ['agent_auto_advance', 'pipeline_progression', 'review_cycle', 
+                          'review_cycle_completion', 'repair_cycle_completion',
                           'agent_completion', 'auto']:
                 # Check if it's recent
                 try:
@@ -396,6 +397,71 @@ class WorkExecutionStateTracker:
                     continue
         
         return False
+
+    def _check_redis_tracking_for_agent(self, project: str, agent: str, issue_number: int) -> bool:
+        """
+        Check if there's a Redis tracking key for an active agent container.
+        
+        Args:
+            project: Project name
+            agent: Agent name
+            issue_number: Issue number
+            
+        Returns:
+            True if Redis tracking exists for this agent, False otherwise
+        """
+        try:
+            import redis
+            redis_client = redis.Redis(host='redis', port=6379, decode_responses=True)
+            
+            # Get all agent container tracking keys
+            agent_keys = redis_client.keys('agent:container:*')
+            
+            for key in agent_keys:
+                try:
+                    container_info = redis_client.hgetall(key)
+                    if (container_info.get('project') == project and
+                        container_info.get('agent') == agent and
+                        container_info.get('issue_number') == str(issue_number)):
+                        return True
+                except Exception as e:
+                    logger.warning(f"Error checking Redis key {key}: {e}")
+                    continue
+            
+            return False
+            
+        except Exception as e:
+            logger.error(f"Error checking Redis tracking: {e}")
+            return False
+    
+    def _check_redis_repair_cycle_tracking(self, project: str, issue_number: int) -> bool:
+        """
+        Check if there's a Redis tracking key for an active repair cycle container.
+        
+        Args:
+            project: Project name
+            issue_number: Issue number
+            
+        Returns:
+            True if Redis tracking exists for this repair cycle, False otherwise
+        """
+        try:
+            import redis
+            redis_client = redis.Redis(host='redis', port=6379, decode_responses=True)
+            
+            # Check for repair cycle tracking key (format: repair_cycle:container:{project}:{issue})
+            redis_key = f"repair_cycle:container:{project}:{issue_number}"
+            exists = redis_client.exists(redis_key)
+            
+            if exists:
+                logger.debug(f"Found repair cycle tracking in Redis: {redis_key}")
+                return True
+            
+            return False
+            
+        except Exception as e:
+            logger.error(f"Error checking repair cycle Redis tracking: {e}")
+            return False
 
     def cleanup_stuck_in_progress_states(self):
         """
@@ -451,21 +517,54 @@ class WorkExecutionStateTracker:
                             f"{agent} in {column} from {timestamp}"
                         )
 
-                        # Check if agent container still exists
-                        # Container names follow pattern: claude-agent-{project}-{task_id}
-                        # We can't determine exact container name, so we check if ANY agent container
-                        # for this project/agent is running
-                        container_pattern = f"claude-agent-{project_name}-*{agent}*"
-
+                        # Check if agent/repair cycle container still exists using two methods:
+                        # 1. Docker ps (checks if container actually exists)
+                        # 2. Redis tracking keys (checks orchestrator's view of active agents)
+                        
+                        # Method 1: Check Docker for RUNNING agent containers (not exited ones)
                         result = subprocess.run(
-                            ['docker', 'ps', '-a', '--filter', f'name={project_name}',
+                            ['docker', 'ps', '--filter', f'name={project_name}',
                              '--filter', f'name={agent}', '--format', '{{.Names}}'],
                             capture_output=True,
                             text=True,
                             timeout=5
                         )
-
-                        has_running_container = bool(result.stdout.strip())
+                        has_agent_container = bool(result.stdout.strip())
+                        
+                        # Also check for RUNNING repair cycle containers (format: repair-cycle-{project}-{issue}-{run_id})
+                        # Important: Use 'docker ps' not 'docker ps -a' to only find running containers
+                        result = subprocess.run(
+                            ['docker', 'ps', '--filter', f'name=repair-cycle-{project_name}-{issue_number}',
+                             '--format', '{{.Names}}'],
+                            capture_output=True,
+                            text=True,
+                            timeout=5
+                        )
+                        has_repair_cycle_container = bool(result.stdout.strip())
+                        
+                        has_docker_container = has_agent_container or has_repair_cycle_container
+                        
+                        # Method 2: Check Redis tracking keys for agents
+                        has_redis_tracking = self._check_redis_tracking_for_agent(project_name, agent, issue_number)
+                        
+                        # Also check for repair cycle Redis tracking
+                        has_repair_cycle_tracking = self._check_redis_repair_cycle_tracking(project_name, issue_number)
+                        
+                        has_redis_tracking = has_redis_tracking or has_repair_cycle_tracking
+                        
+                        # Container is running if either Docker or Redis tracking shows it
+                        has_running_container = has_docker_container or has_redis_tracking
+                        
+                        if has_docker_container and not has_redis_tracking:
+                            logger.warning(
+                                f"Container exists in Docker but not in Redis tracking for "
+                                f"{project_name}/#{issue_number} {agent}"
+                            )
+                        elif has_redis_tracking and not has_docker_container:
+                            logger.warning(
+                                f"Redis tracking exists but container not found in Docker for "
+                                f"{project_name}/#{issue_number} {agent} (orphaned tracking key)"
+                            )
 
                         if not has_running_container:
                             # No container found, mark as failed due to orchestrator restart

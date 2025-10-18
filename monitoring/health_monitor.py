@@ -1,9 +1,12 @@
 import psutil
 import subprocess
 import requests
+import logging
 from typing import Dict, Any
 from datetime import datetime
 from config.environment import Environment
+
+logger = logging.getLogger(__name__)
 
 class HealthMonitor:
     """Monitor system health and trigger recovery"""
@@ -224,6 +227,37 @@ class HealthMonitor:
         # Determine if we have degraded functionality
         degraded = not github_capabilities.has_capability(GitHubCapability.GITHUB_APP_AUTH)
 
+        # Get GitHub API rate limit and circuit breaker status
+        # Note: The rate limit data includes default values (5000/5000) until the background
+        # rate limit checker first runs (every 5 minutes). The /health endpoint will fetch
+        # fresh rate limit data to avoid returning stale cached values.
+        from services.github_api_client import get_github_client
+        try:
+            github_client = get_github_client()
+            client_status = github_client.get_status()
+            
+            rate_limit_info = {
+                'remaining': client_status['rate_limit']['remaining'],
+                'limit': client_status['rate_limit']['limit'],
+                'percentage_used': client_status['rate_limit']['percentage_used'],
+                'reset_time': client_status['rate_limit']['reset_time'],
+            }
+            
+            circuit_breaker_info = {
+                'state': client_status['breaker']['state'],
+                'is_open': client_status['breaker']['is_open'],
+                'opened_at': client_status['breaker']['opened_at'],
+                'reset_time': client_status['breaker']['reset_time'],
+            }
+            
+            # Check if rate limit is critically low
+            if client_status['rate_limit']['percentage_used'] > 95:
+                degraded = True
+        except Exception as e:
+            logger.debug(f"Failed to get GitHub API client status: {e}")
+            rate_limit_info = None
+            circuit_breaker_info = None
+
         result = {
             'healthy': True,  # Core functionality works with PAT
             'degraded': degraded,  # Some features unavailable
@@ -236,7 +270,9 @@ class HealthMonitor:
             'repo_access': 'granted',
             'projects_access': 'granted',
             'tested_org': org,
-            'tested_repo': f'{org}/{repo}'
+            'tested_repo': f'{org}/{repo}',
+            'api_rate_limit': rate_limit_info,
+            'circuit_breaker': circuit_breaker_info,
         }
         
         # Cache successful result

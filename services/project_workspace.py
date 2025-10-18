@@ -34,14 +34,15 @@ class ProjectWorkspaceManager:
 
     def initialize_all_projects(self) -> Dict[str, bool]:
         """
-        Initialize workspaces for all configured projects
+        Initialize workspaces for all configured projects (excludes hidden/test projects)
 
         Returns:
             Dict mapping project names to whether they need dev environment setup (True = newly cloned/missing Dockerfile.agent)
         """
         logger.info("Initializing all project workspaces")
 
-        projects = config_manager.list_projects()
+        # Only initialize visible (non-hidden) projects
+        projects = config_manager.list_visible_projects()
         needs_setup = {}
 
         for project_name in projects:

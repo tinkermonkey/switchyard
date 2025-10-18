@@ -408,6 +408,7 @@ def enrich_claude_log(log_data: dict) -> dict:
         "agent_name": log_data.get("agent"),
         "project": log_data.get("project"),
         "task_id": log_data.get("task_id"),
+        "pipeline_run_id": log_data.get("pipeline_run_id"),  # Extract pipeline_run_id
         "raw_event": raw_event
     }
 

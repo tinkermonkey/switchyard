@@ -551,11 +551,24 @@ class PipelineRunManager:
                         self._end_run_in_elasticsearch(run, f"Issue in column '{current_column}' with no agent")
                         ended_count += 1
                     else:
-                        logger.debug(
-                            f"Issue #{issue_number} in column '{current_column}' with agent {column_config.agent}, "
-                            f"keeping run {pipeline_run_id} active"
+                        # Column has an agent - now verify work is actually in progress
+                        is_actually_active = self._verify_pipeline_run_is_active(
+                            pipeline_run_id, project, issue_number, current_column
                         )
-                        kept_active_count += 1
+                        
+                        if is_actually_active:
+                            logger.debug(
+                                f"Issue #{issue_number} in column '{current_column}' with agent {column_config.agent}, "
+                                f"keeping run {pipeline_run_id} active (work verified)"
+                            )
+                            kept_active_count += 1
+                        else:
+                            logger.info(
+                                f"Issue #{issue_number} in column '{current_column}' appears stalled "
+                                f"(no active agents, no queued tasks), ending run {pipeline_run_id}"
+                            )
+                            self._end_run_in_elasticsearch(run, "No work in progress detected")
+                            ended_count += 1
                     
                 except Exception as e:
                     logger.error(
@@ -572,6 +585,130 @@ class PipelineRunManager:
             
         except Exception as e:
             logger.error(f"Error during stale pipeline run cleanup: {e}")
+    
+    def _verify_pipeline_run_is_active(self, pipeline_run_id: str, project: str, 
+                                       issue_number: int, current_column: str) -> bool:
+        """
+        Verify that a pipeline run actually has work in progress.
+        
+        Checks:
+        1. Are there any active agent containers running in Docker for this issue?
+        2. Are there any active agents in Redis tracking for this issue?
+        3. Are there any tasks in the queue for this issue?
+        4. Has there been any recent activity (agent events in last 10 minutes)?
+        
+        Args:
+            pipeline_run_id: Pipeline run ID
+            project: Project name
+            issue_number: Issue number
+            current_column: Current column name
+            
+        Returns:
+            True if work is actually in progress, False if stalled
+        """
+        try:
+            import redis
+            import subprocess
+            from datetime import datetime, timedelta
+            
+            # Check 1: Are there actual Docker containers running for this issue?
+            try:
+                result = subprocess.run(
+                    ['docker', 'ps', '--filter', f'name={project}', 
+                     '--filter', f'name={issue_number}', '--format', '{{.Names}}'],
+                    capture_output=True,
+                    text=True,
+                    timeout=5
+                )
+                
+                if result.returncode == 0 and result.stdout.strip():
+                    container_names = result.stdout.strip().split('\n')
+                    logger.info(
+                        f"Pipeline run {pipeline_run_id} has running Docker containers: {container_names}"
+                    )
+                    return True
+            except Exception as e:
+                logger.warning(f"Error checking Docker containers: {e}")
+            
+            # Check 2: Are there active agents in Redis tracking for this issue?
+            redis_client = redis.Redis(host='redis', port=6379, decode_responses=True)
+            agent_keys = redis_client.keys('agent:container:*')
+            
+            for key in agent_keys:
+                try:
+                    container_info = redis_client.hgetall(key)
+                    if (container_info.get('project') == project and 
+                        container_info.get('issue_number') == str(issue_number)):
+                        logger.info(
+                            f"Pipeline run {pipeline_run_id} has active agent in Redis: "
+                            f"{container_info.get('container_name')}"
+                        )
+                        return True
+                except Exception as e:
+                    logger.warning(f"Error checking agent key {key}: {e}")
+                    continue
+            
+            # Check 3: Are there queued tasks for this issue?
+            # Tasks in the queue have the project and issue_number in their context
+            queue_length = redis_client.llen('orchestrator:task_queue')
+            if queue_length > 0:
+                # Check up to 100 tasks in the queue
+                tasks = redis_client.lrange('orchestrator:task_queue', 0, min(100, queue_length - 1))
+                for task_json in tasks:
+                    try:
+                        import json
+                        task = json.loads(task_json)
+                        task_context = task.get('context', {})
+                        if (task_context.get('project') == project and 
+                            task_context.get('issue_number') == issue_number):
+                            logger.info(
+                                f"Pipeline run {pipeline_run_id} has queued task for issue #{issue_number}"
+                            )
+                            return True
+                    except Exception as e:
+                        continue
+            
+            # Check 4: Has there been recent activity? (agent events in last 10 minutes)
+            if self.es:
+                try:
+                    ten_minutes_ago = (datetime.utcnow() - timedelta(minutes=10)).isoformat() + 'Z'
+                    
+                    activity_query = {
+                        "query": {
+                            "bool": {
+                                "must": [
+                                    {"term": {"project.keyword": project}},
+                                    {"term": {"issue_number": issue_number}},
+                                    {"range": {"timestamp": {"gte": ten_minutes_ago}}}
+                                ]
+                            }
+                        },
+                        "size": 1
+                    }
+                    
+                    result = self.es.search(index="agent-events-*", body=activity_query)
+                    
+                    if result['hits']['total']['value'] > 0:
+                        logger.info(
+                            f"Pipeline run {pipeline_run_id} has recent activity "
+                            f"(events in last 10 minutes)"
+                        )
+                        return True
+                        
+                except Exception as e:
+                    logger.warning(f"Error checking recent activity for {pipeline_run_id}: {e}")
+            
+            # No active work detected
+            logger.debug(
+                f"Pipeline run {pipeline_run_id} appears stalled: "
+                f"no active agents, no queued tasks, no recent activity"
+            )
+            return False
+            
+        except Exception as e:
+            logger.error(f"Error verifying pipeline run {pipeline_run_id}: {e}")
+            # Return True on error to be safe (don't end runs if we can't verify)
+            return True
     
     def _get_issue_column_from_github(self, project_config, pipeline_config, issue_number: int) -> Optional[str]:
         """
@@ -612,23 +749,33 @@ class PipelineRunManager:
             project_number = board_state.project_number
             
             # Query GitHub Projects v2 API for this specific issue
-            query = f'''{{
-                user(login: "{org}") {{
-                    projectV2(number: {project_number}) {{
-                        items(first: 100) {{
-                            nodes {{
-                                content {{
-                                    ... on Issue {{
-                                        number
+            from services.github_owner_utils import get_owner_type
+            
+            owner_type = get_owner_type(org)
+            if owner_type is None:
+                logger.error(f"Cannot query project items - unable to determine owner type for '{org}'")
+                return None
+            
+            # Build the correct query based on owner type
+            if owner_type == 'user':
+                query = f'''{{
+                    user(login: "{org}") {{
+                        projectV2(number: {project_number}) {{
+                            items(first: 100) {{
+                                nodes {{
+                                    content {{
+                                        ... on Issue {{
+                                            number
+                                        }}
                                     }}
-                                }}
-                                fieldValues(first: 10) {{
-                                    nodes {{
-                                        ... on ProjectV2ItemFieldSingleSelectValue {{
-                                            name
-                                            field {{
-                                                ... on ProjectV2SingleSelectField {{
-                                                    name
+                                    fieldValues(first: 10) {{
+                                        nodes {{
+                                            ... on ProjectV2ItemFieldSingleSelectValue {{
+                                                name
+                                                field {{
+                                                    ... on ProjectV2SingleSelectField {{
+                                                        name
+                                                    }}
                                                 }}
                                             }}
                                         }}
@@ -637,8 +784,35 @@ class PipelineRunManager:
                             }}
                         }}
                     }}
-                }}
-            }}'''
+                }}'''
+            else:  # organization
+                query = f'''{{
+                    organization(login: "{org}") {{
+                        projectV2(number: {project_number}) {{
+                            items(first: 100) {{
+                                nodes {{
+                                    content {{
+                                        ... on Issue {{
+                                            number
+                                        }}
+                                    }}
+                                    fieldValues(first: 10) {{
+                                        nodes {{
+                                            ... on ProjectV2ItemFieldSingleSelectValue {{
+                                                name
+                                                field {{
+                                                    ... on ProjectV2SingleSelectField {{
+                                                        name
+                                                    }}
+                                                }}
+                                            }}
+                                        }}
+                                    }}
+                                }}
+                            }}
+                        }}
+                    }}
+                }}'''
             
             result = subprocess.run(
                 ['gh', 'api', 'graphql', '-f', f'query={query}'],
@@ -646,7 +820,10 @@ class PipelineRunManager:
             )
             
             data = json.loads(result.stdout)
-            project_data = data['data']['user']['projectV2']
+            
+            # Get project data from the correct path based on owner type
+            owner_key = 'user' if owner_type == 'user' else 'organization'
+            project_data = data['data'][owner_key]['projectV2']
             
             # Find the item matching our issue number
             for node in project_data['items']['nodes']:

@@ -7,6 +7,7 @@ import { useCircuitBreakers } from '../hooks/useCircuitBreakers'
 
 export default function HeaderCircuitBreakers() {
   const { circuitBreakers, loading } = useCircuitBreakers()
+  const maxDisplayedBreakers = 5
 
   if (loading) {
     return (
@@ -61,26 +62,34 @@ export default function HeaderCircuitBreakers() {
         {circuitBreakers.length === 0 ? (
           <p className="text-xs text-gh-fg-muted">No breakers</p>
         ) : (
-          circuitBreakers.slice(0, 4).map((cb, idx) => (
-            <div key={idx} className="flex items-center justify-between text-xs">
-              <div className="flex items-center gap-1.5">
-                {getStateIcon(cb.state)}
-                <span className="text-gh-fg-default truncate max-w-[100px]" title={cb.name}>
-                  {cb.name}
+          circuitBreakers.slice(0, maxDisplayedBreakers).map((cb, idx) => (
+            <div key={idx}>
+              <div className="flex items-center justify-between text-xs">
+                <div className="flex items-center gap-1.5">
+                  {getStateIcon(cb.state)}
+                  <span className="text-gh-fg-default truncate max-w-[100px]" title={cb.name}>
+                    {cb.name}
+                  </span>
+                </div>
+                <span className={getStateColor(cb.state)}>
+                  {getStateLabel(cb.state)}
                 </span>
               </div>
-              <span className={getStateColor(cb.state)}>
-                {getStateLabel(cb.state)}
-              </span>
+              {cb.rate_limit && (
+                <div className="text-xs text-gh-fg-muted ml-5">
+                  API: {cb.rate_limit.remaining}/{cb.rate_limit.limit} ({cb.rate_limit.percentage_used.toFixed(0)}%)
+                </div>
+              )}
             </div>
           ))
         )}
-        {circuitBreakers.length > 4 && (
+        {circuitBreakers.length > maxDisplayedBreakers && (
           <p className="text-xs text-gh-fg-muted italic">
-            +{circuitBreakers.length - 4} more
+            +{circuitBreakers.length - maxDisplayedBreakers} more
           </p>
         )}
       </div>
     </HeaderBox>
   )
 }
+

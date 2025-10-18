@@ -54,12 +54,22 @@ class ScheduledTasksService:
             replace_existing=True
         )
 
+        # Schedule orphaned container cleanup - every 15 minutes
+        self.scheduler.add_job(
+            self._cleanup_orphaned_containers,
+            trigger=CronTrigger(minute='*/15'),
+            id='cleanup_orphaned_containers',
+            name='Cleanup orphaned agent container tracking keys',
+            replace_existing=True
+        )
+
         self.scheduler.start()
         self.running = True
         logger.info("Scheduled tasks service started")
         logger.info("- Orphaned branch cleanup: Daily at 2 AM")
         logger.info("- Review learning pipeline: Daily at 3 AM")
         logger.info("- Stale branch checks: Daily at 9 AM")
+        logger.info("- Orphaned container cleanup: Every 15 minutes")
 
     def stop(self):
         """Stop the scheduler"""
@@ -79,24 +89,27 @@ class ScheduledTasksService:
             from services.github_integration import GitHubIntegration
             from config.manager import config_manager
 
-            # Get all projects
-            project_configs = config_manager.get_all_project_configs()
+            # Get all visible projects
+            project_names = config_manager.list_visible_projects()
 
             cleanup_count = 0
             error_count = 0
 
-            for project_name, project_config in project_configs.items():
+            for project_name in project_names:
+                project_config = config_manager.get_project_config(project_name)
                 try:
-                    if not hasattr(project_config, 'repository'):
+                    # Get repository info from github config
+                    if 'github' not in project_config.__dict__ or not project_config.github:
+                        logger.warning(f"No GitHub config for project {project_name}")
                         continue
 
-                    # Parse repository
-                    repo_parts = project_config.repository.split('/')
-                    if len(repo_parts) != 2:
-                        logger.warning(f"Invalid repository format for {project_name}")
+                    repo_owner = project_config.github.get('org')
+                    repo_name = project_config.github.get('repo')
+                    
+                    if not repo_owner or not repo_name:
+                        logger.warning(f"Invalid GitHub config for {project_name}")
                         continue
 
-                    repo_owner, repo_name = repo_parts
                     gh_integration = GitHubIntegration(repo_owner=repo_owner, repo_name=repo_name)
 
                     # Run cleanup
@@ -129,23 +142,27 @@ class ScheduledTasksService:
             from services.github_integration import GitHubIntegration
             from config.manager import config_manager
 
-            # Get all projects
-            project_configs = config_manager.get_all_project_configs()
+            # Get all visible projects
+            project_names = config_manager.list_visible_projects()
 
             warning_count = 0
             error_count = 0
 
-            for project_name, project_config in project_configs.items():
+            for project_name in project_names:
+                project_config = config_manager.get_project_config(project_name)
                 try:
-                    if not hasattr(project_config, 'repository'):
+                    # Get repository info from github config
+                    if 'github' not in project_config.__dict__ or not project_config.github:
+                        logger.warning(f"No GitHub config for project {project_name}")
                         continue
 
-                    # Parse repository
-                    repo_parts = project_config.repository.split('/')
-                    if len(repo_parts) != 2:
+                    repo_owner = project_config.github.get('org')
+                    repo_name = project_config.github.get('repo')
+                    
+                    if not repo_owner or not repo_name:
+                        logger.warning(f"Invalid GitHub config for {project_name}")
                         continue
 
-                    repo_owner, repo_name = repo_parts
                     gh_integration = GitHubIntegration(repo_owner=repo_owner, repo_name=repo_name)
 
                     # Get all feature branches
@@ -291,6 +308,21 @@ class ScheduledTasksService:
         except Exception as e:
             logger.error(f"Fatal error in review learning cycle: {e}", exc_info=True)
 
+    async def _cleanup_orphaned_containers(self):
+        """Cleanup orphaned agent container tracking keys in Redis"""
+        logger.info("Starting scheduled cleanup of orphaned agent container tracking keys")
+
+        try:
+            from claude.docker_runner import DockerAgentRunner
+            
+            # Run the cleanup (it's synchronous)
+            DockerAgentRunner.cleanup_orphaned_redis_keys()
+            
+            logger.info("Orphaned container cleanup completed successfully")
+
+        except Exception as e:
+            logger.error(f"Error in orphaned container cleanup: {e}", exc_info=True)
+
     def run_cleanup_now(self):
         """Run cleanup task immediately (for testing/manual trigger)"""
         logger.info("Manually triggering orphaned branch cleanup")
@@ -305,6 +337,11 @@ class ScheduledTasksService:
         """Run review learning cycle immediately (for testing/manual trigger)"""
         logger.info("Manually triggering review learning cycle")
         asyncio.create_task(self._run_review_learning_cycle())
+
+    def run_container_cleanup_now(self):
+        """Run container cleanup immediately (for testing/manual trigger)"""
+        logger.info("Manually triggering orphaned container cleanup")
+        asyncio.create_task(self._cleanup_orphaned_containers())
 
 
 # Global instance

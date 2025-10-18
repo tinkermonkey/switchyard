@@ -1,0 +1,11 @@
+I'm still struggling with #file:pipeline-run.jsx , so to help me debug I'd like to create another page which is simpler, named Pipeline Run Debug:
+- Use the same sidebar from #file:pipeline-run.jsx showing the pipeline runs (active & completed)
+- Create a component PipelineRunEventLog to use as the main content for this page
+  - It should list every event for the pipeline run, with the oldest at the top and the newest at the bottom
+  - It should live update if the run is active
+  - Each event should have the relavant details displayed
+    - Create a base class PipelineRunEventLogEvent for displaying the common meta data (timestamp, name, etc)
+    - Create re-useable components derived from the base class for each of the event types in #file:decision_events.py so that we can fine-tune the display of each
+- Create another AgentExecutionView which can be opened into a new tab from the PipelineRunEventLog to view everything for a specific agent execution (it should still have the same Header from the existing views)
+  - The layout should start like the AgentState (replicate the layout, and make sure all of the information is for this specific agent execution)
+  - Below that should be the full set of live logs for this specific agent execution with the oldest message at the top and the newest message at the bottom, and these should live update if the agent is executing

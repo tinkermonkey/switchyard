@@ -87,6 +87,13 @@ class EventType(Enum):
     REPAIR_CYCLE_WARNING_REVIEW_FAILED = "repair_cycle_warning_review_failed"
     REPAIR_CYCLE_COMPLETED = "repair_cycle_completed"
     
+    # Repair Cycle Container Lifecycle
+    REPAIR_CYCLE_CONTAINER_STARTED = "repair_cycle_container_started"
+    REPAIR_CYCLE_CONTAINER_CHECKPOINT_UPDATED = "repair_cycle_container_checkpoint_updated"
+    REPAIR_CYCLE_CONTAINER_RECOVERED = "repair_cycle_container_recovered"
+    REPAIR_CYCLE_CONTAINER_KILLED = "repair_cycle_container_killed"
+    REPAIR_CYCLE_CONTAINER_COMPLETED = "repair_cycle_container_completed"
+    
     # Conversational Loop Routing
     CONVERSATIONAL_LOOP_STARTED = "conversational_loop_started"
     CONVERSATIONAL_QUESTION_ROUTED = "conversational_question_routed"
@@ -149,17 +156,21 @@ class ObservabilityManager:
         if redis_client:
             self.redis = redis_client
         else:
-            # Create default Redis connection
+            # Create default Redis connection from environment
             try:
+                import os
+                redis_host = os.getenv('REDIS_HOST', 'redis')
+                redis_port = int(os.getenv('REDIS_PORT', '6379'))
+                
                 self.redis = redis.Redis(
-                    host='redis',
-                    port=6379,
+                    host=redis_host,
+                    port=redis_port,
                     decode_responses=True,
                     socket_connect_timeout=5
                 )
                 # Test connection
                 self.redis.ping()
-                logger.info("Observability manager connected to Redis")
+                logger.info(f"Observability manager connected to Redis at {redis_host}:{redis_port}")
             except Exception as e:
                 logger.error(f"Failed to connect to Redis for observability: {e}")
                 self.enabled = False
@@ -167,8 +178,13 @@ class ObservabilityManager:
         # Connect to Elasticsearch if not provided
         if not self.es:
             try:
-                self.es = Elasticsearch(['http://elasticsearch:9200'])
-                logger.info("Observability manager connected to Elasticsearch")
+                import os
+                es_host = os.getenv('ELASTICSEARCH_HOST', 'elasticsearch')
+                es_port = os.getenv('ELASTICSEARCH_PORT', '9200')
+                es_url = f'http://{es_host}:{es_port}'
+                
+                self.es = Elasticsearch([es_url])
+                logger.info(f"Observability manager connected to Elasticsearch at {es_url}")
             except Exception as e:
                 logger.warning(f"Failed to connect to Elasticsearch for observability: {e}")
                 self.es = None
@@ -366,7 +382,11 @@ class ObservabilityManager:
                               container_name: Optional[str] = None,
                               pipeline_run_id: Optional[str] = None):
         """Emit agent initialized event"""
+        # Generate unique agent execution ID for tracking this specific execution
+        agent_execution_id = str(uuid.uuid4())
+        
         data = {
+            'agent_execution_id': agent_execution_id,
             'model': config.get('model'),
             'timeout': config.get('timeout'),
             'tools_enabled': config.get('tools_enabled'),
@@ -378,6 +398,9 @@ class ObservabilityManager:
             data['container_name'] = container_name
 
         self.emit(EventType.AGENT_INITIALIZED, agent, task_id, project, data, pipeline_run_id)
+        
+        # Return the execution ID so caller can use it for subsequent events
+        return agent_execution_id
 
     def emit_prompt_constructed(self, agent: str, task_id: str, project: str,
                                prompt: str, estimated_tokens: Optional[int] = None):
@@ -451,7 +474,8 @@ class ObservabilityManager:
                             duration_ms: float, success: bool,
                             error: Optional[str] = None,
                             pipeline_run_id: Optional[str] = None,
-                            output: Optional[str] = None):
+                            output: Optional[str] = None,
+                            agent_execution_id: Optional[str] = None):
         """Emit agent completion event"""
         event_type = EventType.AGENT_COMPLETED if success else EventType.AGENT_FAILED
 
@@ -461,6 +485,10 @@ class ObservabilityManager:
             'error': error
         }
         
+        # Include agent_execution_id for tracking
+        if agent_execution_id:
+            data['agent_execution_id'] = agent_execution_id
+        
         # Include output if provided (truncate if too long)
         if output:
             # Store full output (for display in UI)
@@ -469,6 +497,29 @@ class ObservabilityManager:
             data['output_preview'] = output[:1000] + "..." if len(output) > 1000 else output
         
         self.emit(event_type, agent, task_id, project, data, pipeline_run_id)
+    
+    def emit_branch_selected(self, agent: str, task_id: str, project: str,
+                            branch_name: str, reason: str, 
+                            issue_number: Optional[int] = None,
+                            parent_issue: Optional[int] = None,
+                            is_new: bool = False,
+                            confidence: Optional[float] = None,
+                            pipeline_run_id: Optional[str] = None):
+        """Emit branch selection event"""
+        data = {
+            'branch_name': branch_name,
+            'reason': reason,
+            'is_new': is_new
+        }
+        
+        if issue_number:
+            data['issue_number'] = issue_number
+        if parent_issue:
+            data['parent_issue'] = parent_issue
+        if confidence is not None:
+            data['confidence'] = confidence
+        
+        self.emit(EventType.BRANCH_SELECTED, agent, task_id, project, data, pipeline_run_id)
     
     def cleanup_stale_agent_events_on_startup(self):
         """
@@ -581,6 +632,71 @@ class ObservabilityManager:
                 
         except Exception as e:
             logger.error(f"Error during stale agent event cleanup: {e}")
+    
+    # ========== REPAIR CYCLE CONTAINER EVENT HELPERS ==========
+    
+    def emit_repair_cycle_container_started(self, project: str, issue_number: int, 
+                                           container_name: str, run_id: str,
+                                           pipeline_run_id: Optional[str] = None):
+        """Emit repair cycle container started event"""
+        self.emit(EventType.REPAIR_CYCLE_CONTAINER_STARTED, 'repair_cycle', 
+                 f'repair-{project}-{issue_number}', project, {
+            'issue_number': issue_number,
+            'container_name': container_name,
+            'run_id': run_id
+        }, pipeline_run_id)
+    
+    def emit_repair_cycle_container_checkpoint_updated(self, project: str, issue_number: int,
+                                                      container_name: str, checkpoint: Dict[str, Any],
+                                                      pipeline_run_id: Optional[str] = None):
+        """Emit repair cycle container checkpoint updated event"""
+        self.emit(EventType.REPAIR_CYCLE_CONTAINER_CHECKPOINT_UPDATED, 'repair_cycle',
+                 f'repair-{project}-{issue_number}', project, {
+            'issue_number': issue_number,
+            'container_name': container_name,
+            'iteration': checkpoint.get('iteration'),
+            'test_type': checkpoint.get('test_type'),
+            'agent_call_count': checkpoint.get('agent_call_count'),
+            'files_fixed': checkpoint.get('files_fixed', [])
+        }, pipeline_run_id)
+    
+    def emit_repair_cycle_container_recovered(self, project: str, issue_number: int,
+                                             container_name: str, checkpoint: Dict[str, Any],
+                                             pipeline_run_id: Optional[str] = None):
+        """Emit repair cycle container recovered event"""
+        self.emit(EventType.REPAIR_CYCLE_CONTAINER_RECOVERED, 'repair_cycle',
+                 f'repair-{project}-{issue_number}', project, {
+            'issue_number': issue_number,
+            'container_name': container_name,
+            'iteration': checkpoint.get('iteration') if checkpoint else None,
+            'test_type': checkpoint.get('test_type') if checkpoint else None,
+            'checkpoint_age_seconds': checkpoint.get('checkpoint_age_seconds') if checkpoint else None
+        }, pipeline_run_id)
+    
+    def emit_repair_cycle_container_killed(self, project: str, issue_number: int,
+                                          container_name: str, reason: str,
+                                          pipeline_run_id: Optional[str] = None):
+        """Emit repair cycle container killed event"""
+        self.emit(EventType.REPAIR_CYCLE_CONTAINER_KILLED, 'repair_cycle',
+                 f'repair-{project}-{issue_number}', project, {
+            'issue_number': issue_number,
+            'container_name': container_name,
+            'reason': reason
+        }, pipeline_run_id)
+    
+    def emit_repair_cycle_container_completed(self, project: str, issue_number: int,
+                                             container_name: str, success: bool,
+                                             total_agent_calls: int, duration_seconds: float,
+                                             pipeline_run_id: Optional[str] = None):
+        """Emit repair cycle container completed event"""
+        self.emit(EventType.REPAIR_CYCLE_CONTAINER_COMPLETED, 'repair_cycle',
+                 f'repair-{project}-{issue_number}', project, {
+            'issue_number': issue_number,
+            'container_name': container_name,
+            'success': success,
+            'total_agent_calls': total_agent_calls,
+            'duration_seconds': duration_seconds
+        }, pipeline_run_id)
 
 # Global observability manager instance
 _observability_manager: Optional[ObservabilityManager] = None

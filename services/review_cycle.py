@@ -138,6 +138,18 @@ class ReviewCycleExecutor:
             
         return GitHubIntegration(repo_owner=repo_owner, repo_name=cycle_state.repository)
 
+    def _get_github_for_project(self, project_name: str, repository: str) -> GitHubIntegration:
+        """Get properly initialized GitHubIntegration for a project/repository"""
+        from config.manager import config_manager
+        
+        project_config = config_manager.get_project_config(project_name)
+        repo_owner = project_config.github.get('org') if project_config and hasattr(project_config, 'github') else None
+        
+        if not repo_owner:
+            raise ValueError(f"Cannot determine repo owner for project {project_name}")
+            
+        return GitHubIntegration(repo_owner=repo_owner, repo_name=repository)
+
     async def _analyze_review_cycle_outcomes(self, cycle_state: ReviewCycleState):
         """
         Analyze completed review cycle for learning.
@@ -276,6 +288,34 @@ class ReviewCycleExecutor:
                 f"Resuming cycle for issue #{cycle_state.issue_number} "
                 f"(status: {cycle_state.status}, iteration: {cycle_state.current_iteration}/{cycle_state.max_iterations})"
             )
+            
+            # Validate that the cycle hasn't exceeded max iterations (corrupted state check)
+            if cycle_state.current_iteration >= cycle_state.max_iterations:
+                logger.warning(
+                    f"Cycle for issue #{cycle_state.issue_number} has exceeded max iterations "
+                    f"({cycle_state.current_iteration}/{cycle_state.max_iterations}). "
+                    f"Removing corrupted cycle state and ending pipeline run."
+                )
+                
+                # End the pipeline run if it exists
+                if cycle_state.pipeline_run_id:
+                    try:
+                        from services.pipeline_run import get_pipeline_run_manager
+                        pipeline_run_manager = get_pipeline_run_manager()
+                        pipeline_run_manager.end_pipeline_run(
+                            cycle_state.project_name,
+                            cycle_state.issue_number,
+                            reason="review_cycle_exceeded_max_iterations_on_resume"
+                        )
+                        logger.info(f"Ended pipeline run {cycle_state.pipeline_run_id} due to max iterations exceeded on resume")
+                    except Exception as e:
+                        logger.error(f"Failed to end pipeline run {cycle_state.pipeline_run_id}: {e}", exc_info=True)
+                
+                # Remove the corrupted state
+                self._remove_cycle_state(cycle_state)
+                if cycle_state.issue_number in self.active_cycles:
+                    del self.active_cycles[cycle_state.issue_number]
+                continue
 
             try:
                 # If this cycle uses discussions, verify the discussion still exists
@@ -422,6 +462,20 @@ class ReviewCycleExecutor:
                     self._remove_cycle_state(existing_cycle)
                     del self.active_cycles[issue_number]
                     
+                    # End the pipeline run if it exists
+                    if existing_cycle.pipeline_run_id:
+                        try:
+                            from services.pipeline_run import get_pipeline_run_manager
+                            pipeline_run_manager = get_pipeline_run_manager()
+                            pipeline_run_manager.end_pipeline_run(
+                                project_name,
+                                issue_number,
+                                reason="review_cycle_exceeded_max_iterations"
+                            )
+                            logger.info(f"Ended pipeline run {existing_cycle.pipeline_run_id} due to max iterations exceeded")
+                        except Exception as e:
+                            logger.error(f"Failed to end pipeline run {existing_cycle.pipeline_run_id}: {e}", exc_info=True)
+                    
                     # Post escalation message
                     escalation_message = (
                         f"⚠️ **Review Cycle Exceeded Max Iterations**\n\n"
@@ -438,7 +492,8 @@ class ReviewCycleExecutor:
                         discussions = GitHubDiscussions()
                         discussions.add_discussion_comment(discussion_id, escalation_message)
                     else:
-                        await self.github.post_issue_comment(
+                        github = self._get_github_for_project(project_name, repository)
+                        await github.post_issue_comment(
                             issue_number,
                             escalation_message,
                             repository
@@ -475,6 +530,20 @@ class ReviewCycleExecutor:
                     if issue_number in self.active_cycles:
                         del self.active_cycles[issue_number]
 
+                    # End the pipeline run if it exists
+                    if hasattr(existing_cycle, 'pipeline_run_id') and existing_cycle.pipeline_run_id:
+                        try:
+                            from services.pipeline_run import get_pipeline_run_manager
+                            pipeline_run_manager = get_pipeline_run_manager()
+                            pipeline_run_manager.end_pipeline_run(
+                                project_name,
+                                issue_number,
+                                reason=f"review_cycle_failed: {str(e)[:100]}"
+                            )
+                            logger.info(f"Ended pipeline run {existing_cycle.pipeline_run_id} due to review cycle failure")
+                        except Exception as prm_error:
+                            logger.error(f"Failed to end pipeline run {existing_cycle.pipeline_run_id}: {prm_error}", exc_info=True)
+
                     # Post error comment (workspace-aware)
                     error_message = f"⚠️ **Review Cycle Error**\n\nThe automated review cycle encountered an error:\n```\n{str(e)}\n```\n\nPlease review manually."
 
@@ -483,7 +552,8 @@ class ReviewCycleExecutor:
                         discussions = GitHubDiscussions()
                         discussions.add_discussion_comment(discussion_id, error_message)
                     else:
-                        await self.github.post_issue_comment(
+                        github = self._get_github_for_project(project_name, repository)
+                        await github.post_issue_comment(
                             issue_number,
                             error_message,
                             repository
@@ -588,7 +658,8 @@ class ReviewCycleExecutor:
                 discussions = GitHubDiscussions()
                 discussions.add_discussion_comment(discussion_id, error_message)
             else:
-                await self.github.post_issue_comment(
+                github = self._get_github_for_project(project_name, repository)
+                await github.post_issue_comment(
                     issue_number,
                     error_message,
                     repository
@@ -623,7 +694,8 @@ class ReviewCycleExecutor:
                 logger.error(f"No review column found for {cycle_state.board_name}")
                 return
 
-            issue_data = await self.github.get_issue_details(cycle_state.issue_number, cycle_state.repository)
+            github = self._get_github_integration(cycle_state)
+            issue_data = await github.get_issue_details(cycle_state.issue_number, cycle_state.repository)
 
             # Continue with appropriate action based on review status
             if review_result.status == ReviewStatus.APPROVED:
@@ -828,7 +900,8 @@ class ReviewCycleExecutor:
                 return
 
             # Get issue data
-            issue_data = await self.github.get_issue_details(cycle_state.issue_number, cycle_state.repository)
+            github = self._get_github_integration(cycle_state)
+            issue_data = await github.get_issue_details(cycle_state.issue_number, cycle_state.repository)
 
             # Update state: human feedback received, reviewer working
             cycle_state.status = 'reviewer_working'
@@ -1685,7 +1758,10 @@ class ReviewCycleExecutor:
                 else:
                     # Create branch if it doesn't exist - use FeatureBranchManager to respect parent/sub-issue relationships
                     from services.feature_branch_manager import feature_branch_manager
-                    from services.integrations.github_integration import github_integration
+                    from services.github_integration import GitHubIntegration
+                    
+                    # Get github integration instance
+                    github_integration = self._get_github_for_project(cycle_state.project_name, cycle_state.repository)
                     
                     try:
                         project_dir = workspace_manager.get_project_dir(cycle_state.project_name)
@@ -1701,17 +1777,15 @@ class ReviewCycleExecutor:
                         # Track the branch for git workflow (this will be done by feature_branch_manager too, but ensure it)
                         if not git_workflow_manager.get_branch_info(cycle_state.project_name, cycle_state.issue_number):
                             # Check if this is a sub-issue
-                            all_feature_branches = feature_branch_manager.get_all_feature_branches(cycle_state.project_name)
-                            for feature_branch in all_feature_branches:
-                                if any(si.number == cycle_state.issue_number for si in feature_branch.sub_issues):
-                                    # Track against parent for PR creation
-                                    git_workflow_manager.track_branch(
-                                        cycle_state.project_name,
-                                        feature_branch.parent_issue,  # Track with parent issue number
-                                        branch_name
-                                    )
-                                    logger.info(f"Tracked sub-issue #{cycle_state.issue_number} branch {branch_name} under parent #{feature_branch.parent_issue}")
-                                    break
+                            feature_branch = feature_branch_manager.get_feature_branch_for_issue(cycle_state.project_name, cycle_state.issue_number)
+                            if feature_branch:
+                                # Track against parent for PR creation
+                                git_workflow_manager.track_branch(
+                                    cycle_state.project_name,
+                                    feature_branch.parent_issue,  # Track with parent issue number
+                                    branch_name
+                                )
+                                logger.info(f"Tracked sub-issue #{cycle_state.issue_number} branch {branch_name} under parent #{feature_branch.parent_issue}")
                             else:
                                 # Standalone issue
                                 git_workflow_manager.track_branch(
@@ -2176,7 +2250,8 @@ _Automated review cycle by Claude Code Orchestrator_
             discussions.add_discussion_comment(cycle_state.discussion_id, summary)
         else:
             # Post to issue
-            await self.github.post_issue_comment(
+            github = self._get_github_integration(cycle_state)
+            await github.post_issue_comment(
                 cycle_state.issue_number,
                 summary,
                 cycle_state.repository
@@ -2257,7 +2332,8 @@ _Escalated by Claude Code Orchestrator - Monitoring for your response..._
             discussions.add_discussion_comment(cycle_state.discussion_id, escalation_comment)
         else:
             # Post to issue
-            await self.github.post_issue_comment(
+            github = self._get_github_integration(cycle_state)
+            await github.post_issue_comment(
                 cycle_state.issue_number,
                 escalation_comment,
                 cycle_state.repository
@@ -2330,7 +2406,8 @@ _Escalated by Claude Code Orchestrator_
             discussions.add_discussion_comment(cycle_state.discussion_id, escalation_comment)
         else:
             # Post to issue
-            await self.github.post_issue_comment(
+            github = self._get_github_integration(cycle_state)
+            await github.post_issue_comment(
                 cycle_state.issue_number,
                 escalation_comment,
                 cycle_state.repository

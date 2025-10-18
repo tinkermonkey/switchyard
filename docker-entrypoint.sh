@@ -48,9 +48,9 @@ if [ -n "$GITHUB_TOKEN" ]; then
     chmod 700 /home/orchestrator/.config 2>/dev/null || true
     
     # Authenticate gh CLI with token
-    echo "$GITHUB_TOKEN" | gh auth login --with-token 2>/dev/null || {
-        echo "Warning: gh auth login failed, but GITHUB_TOKEN is available for API calls"
-    }
+    # Suppress all output (both stdout and stderr) since gh may fail if config is read-only
+    # The token will still be available as GITHUB_TOKEN environment variable for API calls
+    echo "$GITHUB_TOKEN" | gh auth login --with-token >/dev/null 2>&1 || true
 fi
 
 # Execute the main command

@@ -16,6 +16,8 @@ from typing import Dict, List, Optional, Any
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
 
+from services.github_api_client import get_github_client
+
 logger = logging.getLogger(__name__)
 
 
@@ -83,8 +85,18 @@ class FeatureBranchManager:
         if not state_file.exists():
             return {"feature_branches": []}
 
-        with open(state_file, 'r') as f:
-            return yaml.safe_load(f) or {"feature_branches": []}
+        try:
+            with open(state_file, 'r') as f:
+                state = yaml.safe_load(f)
+                # Ensure we always return a dict with feature_branches key
+                if state is None or not isinstance(state, dict):
+                    return {"feature_branches": []}
+                if "feature_branches" not in state or state["feature_branches"] is None:
+                    state["feature_branches"] = []
+                return state
+        except Exception as e:
+            logger.error(f"Failed to load feature branch state for {project}: {e}", exc_info=True)
+            return {"feature_branches": []}
 
     def _save_state(self, project: str, state: Dict[str, Any]):
         """Save feature branch state to YAML"""
@@ -100,6 +112,20 @@ class FeatureBranchManager:
                 # Convert sub_issues dicts back to SubIssueState objects
                 sub_issues = [SubIssueState(**si) for si in fb_data.get("sub_issues", [])]
                 fb_data["sub_issues"] = sub_issues
+                
+                # Validate branch name consistency
+                import re
+                branch_name = fb_data.get("branch_name", "")
+                branch_match = re.search(r'issue-(\d+)', branch_name)
+                if branch_match:
+                    branch_issue_num = int(branch_match.group(1))
+                    if branch_issue_num != parent_issue:
+                        logger.warning(
+                            f"State inconsistency detected: Parent issue #{parent_issue} has "
+                            f"branch_name '{branch_name}' which references issue #{branch_issue_num}. "
+                            f"This may cause branch checkout failures."
+                        )
+                
                 return FeatureBranch(**fb_data)
         return None
 
@@ -111,6 +137,19 @@ class FeatureBranchManager:
             if fb_data["parent_issue"] == issue_number:
                 sub_issues = [SubIssueState(**si) for si in fb_data.get("sub_issues", [])]
                 fb_data["sub_issues"] = sub_issues
+                
+                # Validate branch name consistency
+                import re
+                branch_name = fb_data.get("branch_name", "")
+                branch_match = re.search(r'issue-(\d+)', branch_name)
+                if branch_match:
+                    branch_issue_num = int(branch_match.group(1))
+                    if branch_issue_num != fb_data["parent_issue"]:
+                        logger.warning(
+                            f"State inconsistency for issue #{issue_number}: Parent issue #{fb_data['parent_issue']} "
+                            f"has branch_name '{branch_name}' which references issue #{branch_issue_num}"
+                        )
+                
                 return FeatureBranch(**fb_data)
 
             # Check if this is a sub-issue
@@ -118,6 +157,19 @@ class FeatureBranchManager:
                 if si["number"] == issue_number:
                     sub_issues = [SubIssueState(**s) for s in fb_data.get("sub_issues", [])]
                     fb_data["sub_issues"] = sub_issues
+                    
+                    # Validate branch name consistency
+                    import re
+                    branch_name = fb_data.get("branch_name", "")
+                    branch_match = re.search(r'issue-(\d+)', branch_name)
+                    if branch_match:
+                        branch_issue_num = int(branch_match.group(1))
+                        if branch_issue_num != fb_data["parent_issue"]:
+                            logger.warning(
+                                f"State inconsistency for sub-issue #{issue_number}: Parent issue #{fb_data['parent_issue']} "
+                                f"has branch_name '{branch_name}' which references issue #{branch_issue_num}"
+                            )
+                    
                     return FeatureBranch(**fb_data)
 
         return None
@@ -125,6 +177,12 @@ class FeatureBranchManager:
     def get_all_feature_branches(self, project: str) -> List[FeatureBranch]:
         """Get all feature branches for a project"""
         state = self._load_state(project)
+        
+        # Defensive check: ensure state is a dict with feature_branches key
+        if not isinstance(state, dict):
+            logger.warning(f"Feature branch state for {project} is not a dict: {type(state)}")
+            return []
+        
         branches = []
         for fb_data in state.get("feature_branches", []):
             sub_issues = [SubIssueState(**si) for si in fb_data.get("sub_issues", [])]
@@ -235,26 +293,24 @@ class FeatureBranchManager:
         Returns parent issue number if found, None otherwise
         """
         import re
-        import subprocess
 
         # Step 1: Try to get parent from GitHub's parent_issue_url field (REST API)
         try:
-            # Use gh API to query the issue with parent_issue_url field
-            result = subprocess.run(
-                ['gh', 'api', f'repos/{github_integration.github_org}/{github_integration.repo_name}/issues/{issue_number}',
-                 '--jq', '.parent_issue_url'],
-                capture_output=True, text=True, check=True, timeout=10
-            )
+            # Use GitHub API client to query the issue with parent_issue_url field
+            github_client = get_github_client()
+            endpoint = f'repos/{github_integration.github_org}/{github_integration.repo_name}/issues/{issue_number}'
+            success, result = github_client.rest('GET', endpoint)
             
-            parent_issue_url = result.stdout.strip()
-            
-            # Extract issue number from URL like "https://api.github.com/repos/owner/repo/issues/146"
-            if parent_issue_url and parent_issue_url != "null":
-                url_match = re.search(r'/issues/(\d+)$', parent_issue_url)
-                if url_match:
-                    parent_num = int(url_match.group(1))
-                    logger.info(f"Issue #{issue_number} is sub-issue of parent #{parent_num} (from parent_issue_url)")
-                    return parent_num
+            if success and 'parent_issue_url' in result:
+                parent_issue_url = result.get('parent_issue_url')
+                
+                # Extract issue number from URL like "https://api.github.com/repos/owner/repo/issues/146"
+                if parent_issue_url and parent_issue_url != "null":
+                    url_match = re.search(r'/issues/(\d+)$', parent_issue_url)
+                    if url_match:
+                        parent_num = int(url_match.group(1))
+                        logger.info(f"Issue #{issue_number} is sub-issue of parent #{parent_num} (from parent_issue_url)")
+                        return parent_num
         except Exception as e:
             logger.debug(f"Failed to query parent_issue_url from GitHub REST API: {e}")
             # Fall through to body parsing
@@ -386,6 +442,15 @@ class FeatureBranchManager:
         import subprocess
 
         try:
+            # Prune stale remote references first to avoid detecting deleted branches
+            subprocess.run(
+                ["git", "fetch", "--prune"],
+                cwd=project_dir,
+                capture_output=True,
+                text=True,
+                check=False  # Don't fail if fetch has issues
+            )
+            
             result = subprocess.run(
                 ["git", "branch", "-a"],
                 cwd=project_dir,
@@ -540,7 +605,7 @@ class FeatureBranchManager:
     async def git_push(self, project_dir: str, branch_name: str):
         """Push branch to remote"""
         from services.git_workflow_manager import git_workflow_manager
-        await git_workflow_manager.push_branch(project_dir, branch_name)
+        return await git_workflow_manager.push_branch(project_dir, branch_name)
 
     async def escalate_merge_conflict(
         self,
@@ -760,6 +825,19 @@ git push --force-with-lease
 
                     # Mark sub-issue as in progress
                     self.mark_sub_issue_in_progress(project, feature_branch, issue_number)
+                
+                # EMIT BRANCH_SELECTED EVENT: Reused existing branch
+                self.obs.emit_branch_selected(
+                    agent="feature_branch_manager",
+                    task_id=f"issue_{issue_number}",
+                    project=project,
+                    branch_name=branch_name,
+                    reason=f"Reused existing branch (confidence: {best_match['confidence']:.2f}) - {best_match['reason']}",
+                    issue_number=issue_number,
+                    parent_issue=parent_issue,
+                    is_new=False,
+                    confidence=best_match['confidence']
+                )
 
                 return branch_name
 
@@ -827,6 +905,18 @@ Waiting for human decision...
             from services.git_workflow_manager import git_workflow_manager
             git_workflow_manager.track_branch(project, issue_number, branch_name)
             logger.info(f"Tracked branch {branch_name} for issue #{issue_number} in GitWorkflowManager")
+            
+            # EMIT BRANCH_SELECTED EVENT: New standalone branch
+            self.obs.emit_branch_selected(
+                agent="feature_branch_manager",
+                task_id=f"issue_{issue_number}",
+                project=project,
+                branch_name=branch_name,
+                reason="Created new standalone branch (no parent issue, no related branches found)",
+                issue_number=issue_number,
+                parent_issue=None,
+                is_new=True
+            )
 
             return branch_name
 
@@ -837,6 +927,25 @@ Waiting for human decision...
             # First sub-issue - create feature branch
             parent_details = await github_integration.get_issue(parent_issue)
             branch_name = self.create_feature_branch_name(parent_issue, parent_details.get("title", ""))
+            
+            # Validate branch name matches parent issue
+            import re
+            branch_issue_match = re.search(r'issue-(\d+)', branch_name)
+            if branch_issue_match:
+                branch_issue_num = int(branch_issue_match.group(1))
+                if branch_issue_num != parent_issue:
+                    logger.error(
+                        f"CRITICAL: Branch name mismatch! Created branch '{branch_name}' for parent "
+                        f"issue #{parent_issue} but branch contains issue #{branch_issue_num}. "
+                        f"This is a bug in create_feature_branch_name or issue data."
+                    )
+                    # Force correct branch name
+                    safe_title = parent_details.get("title", "feature")[:30].lower().replace(" ", "-")
+                    safe_title = "".join(c for c in safe_title if c.isalnum() or c == "-").strip("-")
+                    while "--" in safe_title:
+                        safe_title = safe_title.replace("--", "-")
+                    branch_name = f"feature/issue-{parent_issue}-{safe_title}"
+                    logger.warning(f"Corrected branch name to: {branch_name}")
 
             # EMIT DECISION EVENT: New feature branch created
             self.decision_events.emit_branch_created(
@@ -942,6 +1051,21 @@ Waiting for human decision...
 
         # Mark sub-issue as in progress
         self.mark_sub_issue_in_progress(project, feature_branch, issue_number)
+        
+        # EMIT BRANCH_SELECTED EVENT: Parent feature branch
+        # Determine if this is a newly created branch or existing
+        is_new_branch = len(feature_branch.sub_issues) == 1 and feature_branch.sub_issues[0].number == issue_number
+        reason_suffix = "first sub-issue" if is_new_branch else f"continuing work on parent #{parent_issue}"
+        self.obs.emit_branch_selected(
+            agent="feature_branch_manager",
+            task_id=f"issue_{issue_number}",
+            project=project,
+            branch_name=feature_branch.branch_name,
+            reason=f"Using parent feature branch for issue #{issue_number} ({reason_suffix})",
+            issue_number=issue_number,
+            parent_issue=parent_issue,
+            is_new=is_new_branch
+        )
 
         return feature_branch.branch_name
 
@@ -988,26 +1112,87 @@ Waiting for human decision...
                 logger.error(f"Failed to finalize standalone branch for issue #{issue_number}: {e}")
                 return {"success": False, "error": str(e)}
 
-        # Step 1: Commit changes
+        # Step 1: Get the actual current branch (source of truth)
+        current_branch = await self.get_current_branch(project_dir)
+        
+        # Step 2: Validate branch name consistency
+        # Extract issue number from stored branch name to detect mismatches
+        import re
+        stored_branch_match = re.search(r'issue-(\d+)', feature_branch.branch_name)
+        if stored_branch_match:
+            stored_issue_num = int(stored_branch_match.group(1))
+            if stored_issue_num != feature_branch.parent_issue:
+                logger.warning(
+                    f"Branch name mismatch detected! Parent issue #{feature_branch.parent_issue} has "
+                    f"branch name '{feature_branch.branch_name}' which references issue #{stored_issue_num}. "
+                    f"Using actual current branch '{current_branch}' as source of truth."
+                )
+                # Update feature_branch object to use current branch (don't persist yet)
+                feature_branch.branch_name = current_branch
+        
+        # Step 3: If we're not on the expected branch, check if stored branch exists
+        if current_branch != feature_branch.branch_name:
+            logger.warning(
+                f"Current branch '{current_branch}' doesn't match expected branch '{feature_branch.branch_name}'."
+            )
+            
+            # Check if the stored branch actually exists
+            stored_branch_exists = await self.branch_exists(project_dir, feature_branch.branch_name)
+            
+            if not stored_branch_exists:
+                # Stored branch doesn't exist - use current branch as source of truth
+                logger.warning(
+                    f"Stored branch '{feature_branch.branch_name}' does not exist. "
+                    f"Using current branch '{current_branch}' and updating state."
+                )
+                feature_branch.branch_name = current_branch
+                self.save_feature_branch_state(project, feature_branch)
+            else:
+                # Stored branch exists but we're on wrong branch - try to checkout
+                logger.info(f"Checking out expected branch '{feature_branch.branch_name}'...")
+                await self.git_checkout(project_dir, feature_branch.branch_name)
+                current_branch = await self.get_current_branch(project_dir)
+                
+                if current_branch != feature_branch.branch_name:
+                    error_msg = (
+                        f"Failed to checkout correct branch. Current: {current_branch}, "
+                        f"Expected: {feature_branch.branch_name}"
+                    )
+                    logger.error(error_msg)
+                    return {"success": False, "error": error_msg}
+
+        # Step 2: Commit changes
         await self.git_add_all(project_dir)
         await self.git_commit(project_dir, commit_message)
 
-        # Step 2: Push to remote
-        await self.git_push(project_dir, feature_branch.branch_name)
+        # Step 3: Verify branch exists before pushing
+        branch_exists = await self.branch_exists(project_dir, feature_branch.branch_name)
+        if not branch_exists:
+            error_msg = f"Branch {feature_branch.branch_name} does not exist locally, cannot push"
+            logger.error(error_msg)
+            return {"success": False, "error": error_msg}
+
+        # Step 4: Push to remote
+        push_success = await self.git_push(project_dir, feature_branch.branch_name)
+        
+        if not push_success:
+            error_msg = f"Failed to push branch {feature_branch.branch_name}"
+            logger.error(error_msg)
+            return {"success": False, "error": error_msg}
 
         logger.info(f"Pushed changes for issue #{issue_number} to {feature_branch.branch_name}")
 
-        # Step 3: Update sub-issue status
+        # Step 5: Update sub-issue status
         self.mark_sub_issue_complete(project, feature_branch, issue_number)
 
-        # Step 4: Create or update PR
+        # Step 6: Create or update PR
         pr_result = await self.create_or_update_feature_pr(
             project=project,
             feature_branch=feature_branch,
             github_integration=github_integration
         )
 
-        # Step 5: Check if all sub-issues complete
+        # Step 7: Check if all sub-issues complete
         all_complete = self.check_all_sub_issues_complete(feature_branch)
 
         if all_complete:

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import os
 import time
 import json
 import subprocess
@@ -10,6 +11,7 @@ from dataclasses import dataclass
 from monitoring.timestamp_utils import utc_isoformat
 from task_queue.task_manager import TaskQueue, Task, TaskPriority
 from config.manager import ConfigManager
+from services.github_api_client import get_github_client
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +25,290 @@ class ProjectItem:
     status: str
     repository: str
     last_updated: str
+
+
+def _save_repair_cycle_context(
+    project_dir: str,
+    context: Dict[str, Any],
+    test_configs: List[Any]
+) -> str:
+    """
+    Save repair cycle context to JSON file for container execution.
+    
+    Args:
+        project_dir: Project directory path (for reference, not used for file location)
+        context: Stage context dictionary
+        test_configs: List of RepairTestRunConfig objects
+        
+    Returns:
+        Path to saved context file (in orchestrator_data directory)
+    """
+    from pathlib import Path
+    
+    # Serialize test configs
+    serialized_configs = []
+    for tc in test_configs:
+        serialized_configs.append({
+            'test_type': tc.test_type.value,
+            'timeout': tc.timeout,
+            'max_iterations': tc.max_iterations,
+            'review_warnings': tc.review_warnings,
+            'max_file_iterations': tc.max_file_iterations
+        })
+    
+    # Build context for container
+    container_context = {
+        'project': context.get('project'),
+        'board': context.get('board'),
+        'pipeline': context.get('pipeline'),
+        'repository': context.get('repository'),
+        'issue_number': context.get('issue_number'),
+        'issue': context.get('issue'),
+        'previous_stage_output': context.get('previous_stage_output'),
+        'column': context.get('column'),
+        'workspace_type': context.get('workspace_type'),
+        'discussion_id': context.get('discussion_id'),
+        'pipeline_run_id': context.get('pipeline_run_id'),
+        'project_dir': context.get('project_dir'),  # Keep original project_dir path
+        'use_docker': True,
+        'task_id': context.get('task_id'),
+        'test_configs': serialized_configs,
+        'agent_name': context.get('agent_name'),
+        'max_total_agent_calls': context.get('max_total_agent_calls'),
+        'checkpoint_interval': context.get('checkpoint_interval'),
+        'stage_name': context.get('stage_name')
+    }
+    
+    # Save to orchestrator_data directory (keeps project workspace clean)
+    project_name = context.get('project')
+    issue_number = context.get('issue_number')
+    
+    # Create directory structure: clauditoreum/orchestrator_data/repair_cycles/{project}/{issue}/
+    orchestrator_data_dir = Path("/workspace/clauditoreum/orchestrator_data/repair_cycles")
+    repair_cycle_dir = orchestrator_data_dir / project_name / str(issue_number)
+    repair_cycle_dir.mkdir(parents=True, exist_ok=True)
+    
+    context_file = repair_cycle_dir / "context.json"
+    with open(context_file, 'w') as f:
+        json.dump(container_context, f, indent=2, default=str)
+    
+    logger.info(f"Saved repair cycle context to {context_file}")
+    return str(context_file)
+
+
+def _launch_repair_cycle_container(
+    project_name: str,
+    issue_number: int,
+    pipeline_run_id: str,
+    stage_name: str,
+    context_file: str,
+    project_dir: str
+) -> Optional[str]:
+    """
+    Launch a Docker container to run the repair cycle.
+    
+    Args:
+        project_name: Project name
+        issue_number: GitHub issue number
+        pipeline_run_id: Pipeline run ID
+        stage_name: Stage name (e.g., "Testing")
+        context_file: Path to context JSON file
+        project_dir: Project directory path
+        
+    Returns:
+        Container name if successful, None otherwise
+    """
+    from claude.docker_runner import DockerAgentRunner
+    
+    # Generate container name
+    # Format: repair-cycle-{project}-{issue}-{run_id[:8]}
+    short_run_id = pipeline_run_id[:8] if len(pipeline_run_id) >= 8 else pipeline_run_id
+    container_name = f"repair-cycle-{project_name}-{issue_number}-{short_run_id}"
+    
+    # Sanitize container name
+    container_name = DockerAgentRunner._sanitize_container_name(container_name)
+    
+    logger.info(f"Launching repair cycle container: {container_name}")
+    
+    try:
+        # Get Docker runner for path detection
+        docker_runner = DockerAgentRunner()
+        host_workspace_path = docker_runner._detect_host_workspace_path()
+        
+        # Get environment variables
+        from config.environment import load_environment
+        env = load_environment()
+        
+        # Repair cycle containers use the orchestrator image
+        # (which contains the repair cycle runner code)
+        # The project workspace is mounted to provide project files
+        # Agents are launched as sub-containers with the project's agent image
+        repair_cycle_image = "clauditoreum-orchestrator"
+        
+        # Build Docker run command
+        docker_cmd = [
+            'docker', 'run',
+            '--name', container_name,
+            '--network', docker_runner.network_name,
+            '--detach',  # Run in background
+            '--user', '1000',  # Run as orchestrator user (UID only, inherit groups from image)
+            
+            # Volume mounts
+            # Mount orchestrator code (live code for development)
+            '-v', f'{host_workspace_path}/clauditoreum:/app',
+            # ALSO mount orchestrator at /workspace/clauditoreum for checkpoint paths
+            '-v', f'{host_workspace_path}/clauditoreum:/workspace/clauditoreum',
+            # Mount project workspace at standard path (same as agent containers)
+            '-v', f'{host_workspace_path}/{project_name}:/workspace/{project_name}',
+            # Mount Docker socket (for launching agent containers)
+            '-v', '/var/run/docker.sock:/var/run/docker.sock',
+            # Mount GitHub App private key directory (if it exists)
+            '-v', f'{os.path.expanduser("~")}/.orchestrator:/home/orchestrator/.orchestrator:ro',
+            
+            # Environment variables
+            '-e', f'REDIS_HOST={env.redis_url.split("://")[1].split(":")[0]}',
+            '-e', 'ELASTICSEARCH_HOST=elasticsearch',  # Elasticsearch host for observability events
+            '-e', f'ANTHROPIC_API_KEY={env.anthropic_api_key.get_secret_value() if env.anthropic_api_key else ""}',
+            '-e', f'CLAUDE_CODE_OAUTH_TOKEN={env.claude_code_oauth_token.get_secret_value() if env.claude_code_oauth_token else ""}',
+            '-e', f'GITHUB_TOKEN={env.github_token.get_secret_value() if env.github_token else ""}',
+            '-e', f'GH_TOKEN={env.github_token.get_secret_value() if env.github_token else ""}',  # For gh CLI
+            '-e', f'HOST_WORKSPACE_PATH={host_workspace_path}',  # Pass host workspace path for Docker-in-Docker
+            '-e', f'HOST_HOME={os.path.expanduser("~")}',  # Pass host home for SSH/git mounts
+            '-e', 'PYTHONUNBUFFERED=1',  # Ensure logs are flushed
+            '-e', f'PIPELINE_RUN_ID={pipeline_run_id}',  # Pass pipeline_run_id for event tracking
+            
+            # Image and command
+            repair_cycle_image,
+            'python', '-m', 'pipeline.repair_cycle_runner',
+            '--project', project_name,
+            '--issue', str(issue_number),
+            '--pipeline-run-id', pipeline_run_id,
+            '--stage', stage_name,
+            '--context', f'/workspace/clauditoreum/orchestrator_data/repair_cycles/{project_name}/{issue_number}/context.json'
+        ]
+        
+        # Launch container
+        logger.debug(f"Docker command: {' '.join(docker_cmd)}")
+        result = subprocess.run(
+            docker_cmd,
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+        
+        if result.returncode != 0:
+            logger.error(
+                f"Failed to launch repair cycle container: {result.stderr}"
+            )
+            return None
+        
+        container_id = result.stdout.strip()
+        logger.info(
+            f"Repair cycle container launched: {container_name} (ID: {container_id[:12]})"
+        )
+        
+        # Emit container started event
+        try:
+            from monitoring.observability import get_observability_manager
+            obs_manager = get_observability_manager()
+            obs_manager.emit_repair_cycle_container_started(
+                project=project_name,
+                issue_number=issue_number,
+                container_name=container_name,
+                run_id=pipeline_run_id,
+                pipeline_run_id=pipeline_run_id
+            )
+        except Exception as e:
+            logger.warning(f"Failed to emit container started event: {e}")
+        
+        return container_name
+        
+    except subprocess.TimeoutExpired:
+        logger.error("Timeout launching repair cycle container")
+        return None
+    except Exception as e:
+        logger.error(f"Error launching repair cycle container: {e}", exc_info=True)
+        return None
+
+
+def _register_repair_cycle_container(
+    project_name: str,
+    issue_number: int,
+    container_name: str,
+    redis_client
+) -> bool:
+    """
+    Register repair cycle container in Redis for recovery tracking.
+    
+    Args:
+        project_name: Project name
+        issue_number: Issue number
+        container_name: Docker container name
+        redis_client: Redis client instance
+        
+    Returns:
+        True if registered successfully
+    """
+    try:
+        # Key format: repair_cycle:container:{project}:{issue}
+        redis_key = f"repair_cycle:container:{project_name}:{issue_number}"
+        
+        # Store with 2 hour TTL (repair cycles shouldn't take longer)
+        redis_client.setex(redis_key, 7200, container_name)
+        
+        logger.info(
+            f"Registered repair cycle container in Redis: {redis_key} -> {container_name}"
+        )
+        return True
+        
+    except Exception as e:
+        logger.error(f"Failed to register repair cycle container in Redis: {e}")
+        return False
+
+
+def _cleanup_repair_cycle_files(project_name: str, issue_number: int) -> bool:
+    """
+    Clean up repair cycle state files after successful completion.
+    
+    Removes context, checkpoint, and result files from orchestrator_data directory.
+    
+    Args:
+        project_name: Project name
+        issue_number: Issue number
+        
+    Returns:
+        True if cleanup successful
+    """
+    try:
+        from pathlib import Path
+        import shutil
+        
+        orchestrator_data_dir = Path("/workspace/clauditoreum/orchestrator_data/repair_cycles")
+        repair_cycle_dir = orchestrator_data_dir / project_name / str(issue_number)
+        
+        if repair_cycle_dir.exists():
+            # Remove the entire directory
+            shutil.rmtree(repair_cycle_dir)
+            logger.info(f"Cleaned up repair cycle files for {project_name} issue #{issue_number}")
+            
+            # Try to clean up parent directories if empty
+            try:
+                project_rc_dir = orchestrator_data_dir / project_name
+                if project_rc_dir.exists() and not any(project_rc_dir.iterdir()):
+                    project_rc_dir.rmdir()
+                    logger.debug(f"Removed empty project repair cycle directory: {project_rc_dir}")
+            except Exception as e:
+                logger.debug(f"Could not remove parent directory (may not be empty): {e}")
+            
+            return True
+        else:
+            logger.debug(f"No repair cycle files to clean up for {project_name} issue #{issue_number}")
+            return True
+        
+    except Exception as e:
+        logger.warning(f"Failed to cleanup repair cycle files: {e}")
+        return False
+
 
 class ProjectMonitor:
     """Monitor GitHub Projects v2 boards for changes and trigger agent workflows"""
@@ -63,6 +349,8 @@ class ProjectMonitor:
     def get_project_items(self, project_owner: str, project_number: int) -> List[ProjectItem]:
         """Query GitHub Projects v2 API to get current project items (excludes closed issues)"""
         from services.github_owner_utils import build_projects_v2_query, get_owner_type
+        from services.github_api_client import get_github_client
+        import time
         
         # Build the correct query based on owner type
         query = build_projects_v2_query(project_owner, project_number)
@@ -71,64 +359,87 @@ class ProjectMonitor:
             logger.error(f"Cannot query project items - unable to determine owner type for '{project_owner}'")
             return []
 
-        try:
-            result = subprocess.run(
-                ['gh', 'api', 'graphql', '-f', f'query={query}'],
-                capture_output=True, text=True, check=True
-            )
-
-            data = json.loads(result.stdout)
-            
-            # Get project data from the correct path based on owner type
-            owner_type = get_owner_type(project_owner)
-            if owner_type == 'user':
-                project_data = data['data']['user']['projectV2']
-            else:  # organization
-                project_data = data['data']['organization']['projectV2']
-
-            items = []
-            for node in project_data['items']['nodes']:
-                content = node.get('content')
-                if not content:  # Skip draft items
-                    continue
-
-                # Skip closed issues - they should not trigger any agents
-                issue_state = content.get('state', '').upper()
-                if issue_state == 'CLOSED':
-                    logger.debug(f"Skipping closed issue #{content['number']} in project query")
-                    continue
-
-                # Find status field
-                status = "No Status"
-                for field_value in node['fieldValues']['nodes']:
-                    if field_value and field_value.get('field', {}).get('name') == 'Status':
-                        status = field_value.get('name', 'No Status')
-                        break
-
-                item = ProjectItem(
-                    item_id=node['id'],
-                    content_id=content['id'],
-                    issue_number=content['number'],
-                    title=content['title'],
-                    status=status,
-                    repository=content['repository']['name'],
-                    last_updated=content['updatedAt']
-                )
-                items.append(item)
-
-            return items
-
-        except subprocess.CalledProcessError as e:
-            if "Resource not accessible by personal access token" in str(e):
-                logger.error("GitHub token missing Projects v2 permissions!")
-                logger.error("Please update your GITHUB_TOKEN to include 'project' or 'read:project' scope")
-                logger.error("Visit: https://github.com/settings/tokens")
-            else:
-                logger.error(f"GraphQL query failed: {e}")
+        # Check if circuit breaker is already open - if so, don't waste time retrying
+        github_client = get_github_client()
+        if github_client.breaker.is_open():
+            time_until = (github_client.breaker.reset_time - datetime.now()).total_seconds() if github_client.breaker.reset_time else None
+            if time_until and time_until > 0:
+                logger.debug(f"Circuit breaker is open for {time_until:.0f}s, skipping project item query")
             return []
-        except Exception as e:
-            logger.error(f"Error querying project items: {e}")
-            return []
+
+        # Retry up to 3 times with exponential backoff for transient errors
+        max_retries = 3
+        retry_delay = 1  # Start with 1 second
+        
+        for attempt in range(max_retries):
+            try:
+                github_client = get_github_client()
+                
+                # Check again before each attempt (in case breaker opened during a previous call)
+                if github_client.breaker.is_open():
+                    logger.debug(f"Circuit breaker opened during retry loop, stopping retries")
+                    return []
+                
+                success, data = github_client.graphql(query)
+
+                if not success:
+                    logger.warning(f"GraphQL query failed (attempt {attempt + 1}/{max_retries}): {data}")
+                    if attempt < max_retries - 1:
+                        logger.info(f"Retrying in {retry_delay} seconds...")
+                        time.sleep(retry_delay)
+                        retry_delay *= 2  # Exponential backoff
+                    continue
+                
+                # Get project data from the correct path based on owner type
+                owner_type = get_owner_type(project_owner)
+                if owner_type == 'user':
+                    project_data = data['user']['projectV2']
+                else:  # organization
+                    project_data = data['organization']['projectV2']
+
+                items = []
+                for node in project_data['items']['nodes']:
+                    content = node.get('content')
+                    if not content:  # Skip draft items
+                        continue
+
+                    # Skip closed issues - they should not trigger any agents
+                    issue_state = content.get('state', '').upper()
+                    if issue_state == 'CLOSED':
+                        logger.debug(f"Skipping closed issue #{content['number']} in project query")
+                        continue
+
+                    # Find status field
+                    status = "No Status"
+                    for field_value in node['fieldValues']['nodes']:
+                        if field_value and field_value.get('field', {}).get('name') == 'Status':
+                            status = field_value.get('name', 'No Status')
+                            break
+
+                    item = ProjectItem(
+                        item_id=node['id'],
+                        content_id=content['id'],
+                        issue_number=content['number'],
+                        title=content['title'],
+                        status=status,
+                        repository=content['repository']['name'],
+                        last_updated=content['updatedAt']
+                    )
+                    items.append(item)
+
+                return items
+
+            except Exception as e:
+                logger.warning(f"GraphQL query failed (attempt {attempt + 1}/{max_retries}): {e}")
+                if attempt < max_retries - 1:
+                    logger.info(f"Retrying in {retry_delay} seconds...")
+                    time.sleep(retry_delay)
+                    retry_delay *= 2  # Exponential backoff
+                else:
+                    logger.error("Max retries exceeded for GraphQL query")
+                    return []
+
+        return []  # Should never reach here, but just in case
 
     def detect_changes(self, project_name: str, current_items: List[ProjectItem]) -> List[Dict[str, Any]]:
         """Detect changes in project items since last poll"""
@@ -1652,6 +1963,256 @@ _Review cycle initiated by Claude Code Orchestrator_
             logger.error(traceback.format_exc())
             return None
 
+    def _monitor_repair_cycle_container(
+        self,
+        container_name: str,
+        project_name: str,
+        board_name: str,
+        issue_number: int,
+        status: str,
+        repository: str,
+        project_config,
+        workflow_template
+    ):
+        """
+        Monitor repair cycle container completion and handle auto-advance.
+        
+        Runs in background thread, waits for container to finish, then:
+        - Posts summary comment
+        - Auto-advances if successful
+        - Records execution outcome
+        """
+        import threading
+        import subprocess
+        import asyncio
+        
+        def monitor_thread():
+            exit_code = None
+            overall_success = False
+            repair_result = None
+            error_message = None
+            
+            try:
+                logger.info(f"Starting container monitor for {container_name}")
+                
+                # Wait for container to finish
+                wait_cmd = ['docker', 'wait', container_name]
+                result = subprocess.run(
+                    wait_cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=7200  # 2 hour max
+                )
+                
+                exit_code = int(result.stdout.strip()) if result.stdout.strip() else 2
+                logger.info(f"Container {container_name} exited with code {exit_code}")
+                
+                # Load result file from orchestrator_data directory
+                from pathlib import Path
+                orchestrator_data_dir = Path("/workspace/clauditoreum/orchestrator_data/repair_cycles")
+                result_file = orchestrator_data_dir / project_name / str(issue_number) / "result.json"
+                
+                repair_result = None
+                if result_file.exists():
+                    try:
+                        with open(result_file, 'r') as f:
+                            repair_result = json.load(f)
+                    except Exception as e:
+                        logger.error(f"Failed to load repair result: {e}")
+                        error_message = f"Failed to load result file: {e}"
+                
+                # Determine success
+                overall_success = (exit_code == 0) and (
+                    repair_result.get('overall_success', False) if repair_result else False
+                )
+                
+                # Emit container completed event
+                try:
+                    from monitoring.observability import get_observability_manager
+                    obs_manager = get_observability_manager()
+                    obs_manager.emit_repair_cycle_container_completed(
+                        project=project_name,
+                        issue_number=issue_number,
+                        container_name=container_name,
+                        success=overall_success,
+                        total_agent_calls=repair_result.get('total_agent_calls', 0) if repair_result else 0,
+                        duration_seconds=repair_result.get('duration_seconds', 0.0) if repair_result else 0.0,
+                        pipeline_run_id=None  # Could extract from repair_result if needed
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to emit container completed event: {e}")
+                
+                # Post summary comment
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                
+                from services.github_integration import GitHubIntegration
+                from config.state_manager import state_manager
+                
+                github = GitHubIntegration(
+                    repo_owner=project_config.github['org'],
+                    repo_name=repository
+                )
+                
+                # Get workspace info - default to 'issues' for repair cycles
+                # (Repair cycles always work with issues, not discussions)
+                workspace_type = 'issues'
+                discussion_id = None
+                
+                comment_context = {
+                    'issue_number': issue_number,
+                    'repository': repository,
+                    'workspace_type': workspace_type,
+                    'discussion_id': discussion_id
+                }
+                
+                # Build summary
+                if repair_result:
+                    test_results = repair_result.get('test_results', [])
+                    summary_lines = [
+                        f"## ✅ Repair Cycle Complete" if overall_success else "## ❌ Repair Cycle Failed",
+                        "",
+                        f"**Container**: `{container_name}`",
+                        f"**Exit Code**: {exit_code}",
+                        f"**Total Agent Calls**: {repair_result.get('total_agent_calls', 0)}",
+                        f"**Duration**: {repair_result.get('duration_seconds', 0):.1f}s",
+                        ""
+                    ]
+                    
+                    for test_result in test_results:
+                        test_type = test_result.get('test_type', 'unknown')
+                        passed = test_result.get('passed', False)
+                        iterations = test_result.get('iterations', 0)
+                        summary_lines.append(
+                            f"- **{test_type}**: {'✅ PASSED' if passed else '❌ FAILED'} "
+                            f"({iterations} iterations)"
+                        )
+                else:
+                    summary_lines = [
+                        f"## ❌ Repair Cycle Failed",
+                        "",
+                        f"**Container**: `{container_name}`",
+                        f"**Exit Code**: {exit_code}",
+                        f"**Error**: No result file found",
+                        ""
+                    ]
+                
+                summary_lines.append("")
+                summary_lines.append("---")
+                summary_lines.append("_Repair cycle executed by Claude Code Orchestrator (containerized)_")
+                
+                loop.run_until_complete(
+                    github.post_agent_output(
+                        comment_context,
+                        "\n".join(summary_lines)
+                    )
+                )
+                
+                # Auto-advance if successful
+                if overall_success:
+                    current_index = next(
+                        (i for i, col in enumerate(workflow_template.columns) if col.name == status),
+                        None
+                    )
+                    
+                    if current_index is not None and current_index + 1 < len(workflow_template.columns):
+                        next_column = workflow_template.columns[current_index + 1]
+                        
+                        logger.info(f"Auto-advancing issue #{issue_number} from {status} to {next_column.name}")
+                        
+                        from services.pipeline_progression import PipelineProgression
+                        progression_service = PipelineProgression(self.task_queue)
+                        progression_service.move_issue_to_column(
+                            project_name=project_name,
+                            board_name=board_name,
+                            issue_number=issue_number,
+                            target_column=next_column.name,
+                            trigger='repair_cycle_completion'
+                        )
+                        logger.info(f"Successfully moved issue #{issue_number} to {next_column.name}")
+                
+                # NOTE: Execution outcome is recorded in finally block to ensure it happens even on error
+                
+                # Cleanup repair cycle state files (only on success)
+                if overall_success:
+                    _cleanup_repair_cycle_files(project_name, issue_number)
+                
+                # Cleanup container
+                try:
+                    subprocess.run(
+                        ['docker', 'rm', container_name],
+                        capture_output=True,
+                        timeout=30
+                    )
+                    logger.info(f"Removed container {container_name}")
+                except Exception as e:
+                    logger.warning(f"Failed to remove container: {e}")
+                
+                # Clear Redis tracking
+                try:
+                    if self.task_queue.redis_client:
+                        redis_key = f"repair_cycle:container:{project_name}:{issue_number}"
+                        self.task_queue.redis_client.delete(redis_key)
+                        logger.debug(f"Cleared Redis tracking key: {redis_key}")
+                except Exception as e:
+                    logger.warning(f"Failed to clear Redis tracking: {e}")
+                
+                loop.close()
+                
+            except subprocess.TimeoutExpired:
+                logger.error(f"Container {container_name} timed out after 2 hours")
+                error_message = "Container timed out after 2 hours"
+                overall_success = False
+                # Kill container
+                try:
+                    subprocess.run(['docker', 'kill', container_name], timeout=30)
+                except Exception as e:
+                    logger.error(f"Failed to kill timed-out container: {e}")
+            except Exception as e:
+                logger.error(f"Error monitoring container: {e}", exc_info=True)
+                error_message = f"Monitoring thread error: {str(e)}"
+                overall_success = False
+            finally:
+                # CRITICAL: Always update execution state, even if monitoring thread crashes
+                # This prevents stale 'in_progress' states that block future work
+                try:
+                    from services.work_execution_state import work_execution_tracker
+                    agent_name = (
+                        repair_result.get('stage', 'senior_software_engineer') 
+                        if repair_result 
+                        else 'senior_software_engineer'
+                    )
+                    
+                    outcome = 'success' if overall_success else 'failure'
+                    
+                    # If we never got an exit code, container failed during launch
+                    if exit_code is None:
+                        error_message = error_message or "Container failed to start or exited immediately"
+                    
+                    work_execution_tracker.record_execution_outcome(
+                        issue_number=issue_number,
+                        column=status,
+                        agent=agent_name,
+                        outcome=outcome,
+                        project_name=project_name,
+                        error=error_message
+                    )
+                    
+                    logger.info(
+                        f"Execution state updated for {project_name}/#{issue_number}: "
+                        f"outcome={outcome}, exit_code={exit_code}"
+                    )
+                except Exception as state_error:
+                    logger.error(
+                        f"CRITICAL: Failed to update execution state for {project_name}/#{issue_number}: "
+                        f"{state_error}", exc_info=True
+                    )
+        
+        # Start monitor thread
+        thread = threading.Thread(target=monitor_thread, daemon=True)
+        thread.start()
+        logger.info(f"Container monitor thread started for {container_name}")
+
     def _start_repair_cycle_for_issue(
         self,
         project_name: str,
@@ -1726,164 +2287,179 @@ _Review cycle initiated by Claude Code Orchestrator_
             logger.debug(f"Using pipeline run {pipeline_run.id} for repair cycle on issue #{issue_number}")
 
             logger.info(
-                f"Starting repair cycle for issue #{issue_number} in background thread "
+                f"Starting repair cycle for issue #{issue_number} in Docker container "
                 f"(agent: {stage_config.default_agent}, test types: {[tc.test_type.value for tc in test_configs]})"
             )
 
-            def run_cycle_in_thread():
-                """Run the repair cycle in a background thread"""
+            # Build context for stage execution
+            from services.project_workspace import workspace_manager
+            from monitoring.observability import get_observability_manager
+            
+            project_dir = workspace_manager.get_project_dir(project_name)
+            obs = get_observability_manager()
+
+            stage_context = {
+                'project': project_name,
+                'board': board_name,
+                'pipeline': pipeline_config.name,
+                'repository': repository,
+                'issue_number': issue_number,
+                'issue': issue_data,
+                'previous_stage_output': previous_stage_context,
+                'column': status,
+                'workspace_type': workspace_type,
+                'discussion_id': discussion_id,
+                'pipeline_run_id': pipeline_run.id,
+                'project_dir': project_dir,
+                'use_docker': True,
+                'task_id': f"repair_cycle_{issue_number}_{pipeline_run.id}",
+                'agent_name': stage_config.default_agent,
+                'max_total_agent_calls': max_total_agent_calls,
+                'checkpoint_interval': checkpoint_interval,
+                'stage_name': status
+            }
+
+            # Prepare workspace branch for issues workspace (git checkout feature branch)
+            branch_name = None
+            if workspace_type == 'issues':
                 try:
-                    # Create new event loop for this thread
+                    import asyncio
+                    from services.feature_branch_manager import feature_branch_manager
+                    from services.github_integration import GitHubIntegration
+                    
+                    github = GitHubIntegration(
+                        repo_owner=project_config.github['org'],
+                        repo_name=repository
+                    )
+                    
+                    issue_title = issue_data.get('title', '')
+                    
+                    logger.info(
+                        f"Preparing feature branch for repair cycle on issue #{issue_number}"
+                    )
+                    
+                    # We're in a thread context, create and use new event loop
                     loop = asyncio.new_event_loop()
                     asyncio.set_event_loop(loop)
+                    try:
+                        branch_name = loop.run_until_complete(
+                            feature_branch_manager.prepare_feature_branch(
+                                project=project_name,
+                                issue_number=issue_number,
+                                github_integration=github,
+                                issue_title=issue_title
+                            )
+                        )
+                    finally:
+                        loop.close()
+                    
+                    logger.info(f"Checked out feature branch for repair cycle: {branch_name}")
+                    stage_context['branch_name'] = branch_name
+                    
+                except Exception as e:
+                    logger.error(f"Failed to prepare feature branch for repair cycle: {e}", exc_info=True)
+                    # Don't fail the repair cycle if branch prep fails - it might still work
+                    logger.warning("Continuing with repair cycle despite branch preparation failure")
+            
+            # Save context to JSON file
+            try:
+                context_file = _save_repair_cycle_context(
+                    project_dir=project_dir,
+                    context=stage_context,
+                    test_configs=test_configs
+                )
+            except Exception as e:
+                logger.error(f"Failed to save repair cycle context: {e}", exc_info=True)
+                return None
 
-                    # Post initial comment (workspace-aware)
-                    from services.github_integration import GitHubIntegration
-                    github = GitHubIntegration(repo_owner=project_config.github['org'], repo_name=repository)
+            # Post initial comment (workspace-aware)
+            try:
+                from services.github_integration import GitHubIntegration
+                github = GitHubIntegration(
+                    repo_owner=project_config.github['org'],
+                    repo_name=repository
+                )
 
-                    start_context = {
-                        'issue_number': issue_number,
-                        'repository': repository,
-                        'workspace_type': workspace_type,
-                        'discussion_id': discussion_id
-                    }
+                start_context = {
+                    'issue_number': issue_number,
+                    'repository': repository,
+                    'workspace_type': workspace_type,
+                    'discussion_id': discussion_id
+                }
 
-                    loop.run_until_complete(
-                        github.post_agent_output(
-                            start_context,
-                            f"""## 🔧 Starting Repair Cycle (Testing)
+                # Build comment with optional branch info
+                branch_info = f"\n**Branch**: `{branch_name}`" if branch_name else ""
+                
+                comment_text = f"""## 🔧 Starting Repair Cycle (Testing)
 
 **Agent**: {stage_config.default_agent.replace('_', ' ').title()}
 **Test Types**: {', '.join([tc.test_type.value for tc in test_configs])}
 **Max Iterations**: {max_total_agent_calls}
+**Container**: Isolated Docker container{branch_info}
 
-The automated test-fix-validate cycle is now starting. Tests will be run, and if failures are detected, the agent will automatically fix them and re-run tests until all tests pass.
+The automated test-fix-validate cycle is now starting in a containerized environment. Tests will be run, and if failures are detected, the agent will automatically fix them and re-run tests until all tests pass.
+
+**Container Features**:
+- ✅ Survives orchestrator restarts
+- ✅ Automatic checkpointing every {checkpoint_interval} iterations
+- ✅ Progress preserved on restart
 
 ---
 _Repair cycle initiated by Claude Code Orchestrator_
 """
-                        )
-                    )
 
-                    # Create RepairCycleStage
-                    stage = RepairCycleStage(
-                        name=status,
-                        test_configs=test_configs,
-                        agent_name=stage_config.default_agent,
-                        max_total_agent_calls=max_total_agent_calls,
-                        checkpoint_interval=checkpoint_interval
-                    )
-
-                    # Build context for stage execution
-                    from services.project_workspace import workspace_manager
-                    from monitoring.observability import get_observability_manager
-                    
-                    project_dir = workspace_manager.get_project_dir(project_name)
-                    obs = get_observability_manager()
-
-                    stage_context = {
-                        'project': project_name,
-                        'board': board_name,
-                        'pipeline': pipeline_config.name,
-                        'repository': repository,
-                        'issue_number': issue_number,
-                        'issue': issue_data,
-                        'previous_stage_output': previous_stage_context,
-                        'column': status,
-                        'workspace_type': workspace_type,
-                        'discussion_id': discussion_id,
-                        'pipeline_run_id': pipeline_run.id,
-                        'project_dir': project_dir,
-                        'use_docker': True,  # Repair cycle should use Docker
-                        'observability': obs,  # REQUIRED: Observability manager for event tracking
-                        'task_id': f"repair_cycle_{issue_number}_{pipeline_run.id}"  # For observability tracking
-                    }
-
-                    # Execute repair cycle
-                    result = loop.run_until_complete(stage.execute(stage_context))
-
-                    overall_success = result.get('overall_success', False)
-                    test_results = result.get('test_results', [])
-
-                    logger.info(
-                        f"Repair cycle completed for issue #{issue_number}, "
-                        f"success={overall_success}, total_agent_calls={result.get('total_agent_calls', 0)}"
-                    )
-
-                    # Post summary comment
-                    summary_lines = [
-                        f"## ✅ Repair Cycle Complete" if overall_success else "## ❌ Repair Cycle Failed",
-                        "",
-                        f"**Total Agent Calls**: {result.get('total_agent_calls', 0)}",
-                        f"**Duration**: {result.get('duration_seconds', 0):.1f}s",
-                        ""
-                    ]
-
-                    for test_result in test_results:
-                        test_type = test_result.get('test_type', 'unknown')
-                        passed = test_result.get('passed', False)
-                        iterations = test_result.get('iterations', 0)
-                        summary_lines.append(
-                            f"- **{test_type}**: {'✅ PASSED' if passed else '❌ FAILED'} "
-                            f"({iterations} iterations)"
-                        )
-
-                    summary_lines.append("")
-                    summary_lines.append("---")
-                    summary_lines.append("_Repair cycle executed by Claude Code Orchestrator_")
-
+                # We're in a thread context (not async), so create and run a new event loop
+                import asyncio
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
                     loop.run_until_complete(
-                        github.post_agent_output(
-                            start_context,
-                            "\n".join(summary_lines)
-                        )
+                        github.post_agent_output(start_context, comment_text)
                     )
-
-                    # If successful, auto-advance to next column
-                    if overall_success:
-                        # Find next column in workflow
-                        current_index = next(
-                            (i for i, col in enumerate(workflow_template.columns) if col.name == status),
-                            None
-                        )
-                        
-                        if current_index is not None and current_index + 1 < len(workflow_template.columns):
-                            next_column = workflow_template.columns[current_index + 1]
-                            
-                            logger.info(f"Auto-advancing issue #{issue_number} from {status} to {next_column.name}")
-                            
-                            from services.pipeline_progression import PipelineProgression
-                            progression_service = PipelineProgression(self.task_queue)
-                            progression_service.move_issue_to_column(
-                                project_name=project_name,
-                                board_name=board_name,
-                                issue_number=issue_number,
-                                target_column=next_column.name,
-                                trigger='repair_cycle_completion'
-                            )
-                            logger.info(f"Successfully moved issue #{issue_number} to {next_column.name}")
-
-                    # Record execution completion in work execution state
-                    from services.work_execution_state import work_execution_tracker
-                    work_execution_tracker.record_execution_outcome(
-                        issue_number=issue_number,
-                        column=status,
-                        agent=stage_config.default_agent,
-                        outcome='success' if overall_success else 'failure',
-                        project_name=project_name
-                    )
-
+                finally:
                     loop.close()
-                except Exception as e:
-                    logger.error(f"Error in repair cycle thread: {e}")
-                    import traceback
-                    logger.error(traceback.format_exc())
+            except Exception as e:
+                logger.warning(f"Failed to post initial comment: {e}")
 
-            # Start in background thread (non-blocking)
-            thread = threading.Thread(target=run_cycle_in_thread, daemon=True)
-            thread.start()
+            # Launch Docker container
+            container_name = _launch_repair_cycle_container(
+                project_name=project_name,
+                issue_number=issue_number,
+                pipeline_run_id=pipeline_run.id,
+                stage_name=status,
+                context_file=context_file,
+                project_dir=project_dir
+            )
 
-            logger.info(f"Repair cycle thread started for issue #{issue_number}")
+            if not container_name:
+                logger.error(f"Failed to launch repair cycle container for issue #{issue_number}")
+                return None
+
+            # Register container in Redis
+            try:
+                if self.task_queue.redis_client:
+                    _register_repair_cycle_container(
+                        project_name=project_name,
+                        issue_number=issue_number,
+                        container_name=container_name,
+                        redis_client=self.task_queue.redis_client
+                    )
+            except Exception as e:
+                logger.warning(f"Failed to register container in Redis: {e}")
+
+            logger.info(f"Repair cycle container started for issue #{issue_number}: {container_name}")
+
+            # Start monitoring thread for container completion
+            self._monitor_repair_cycle_container(
+                container_name=container_name,
+                project_name=project_name,
+                board_name=board_name,
+                issue_number=issue_number,
+                status=status,
+                repository=repository,
+                project_config=project_config,
+                workflow_template=workflow_template
+            )
 
             # Record execution start in work execution state
             from services.work_execution_state import work_execution_tracker
@@ -1903,11 +2479,110 @@ _Repair cycle initiated by Claude Code Orchestrator_
             logger.error(traceback.format_exc())
             return None
 
+    def _rescan_boards_for_stalled_items(self):
+        """
+        Rescan all boards after startup to dispatch agents for items already in action-required columns.
+        
+        This handles the case where:
+        1. Orchestrator cleaned up stale pipeline runs during startup
+        2. Items are sitting in columns that require agent action (Development, Testing, etc.)
+        3. No active pipeline runs exist for these items
+        
+        We simulate an "item_added" event for each item in an action-required column
+        that doesn't have an active pipeline run.
+        """
+        from config.state_manager import state_manager
+        
+        try:
+            dispatched_count = 0
+            
+            for project_name in self.config_manager.list_visible_projects():
+                project_config = self.config_manager.get_project_config(project_name)
+                project_state = state_manager.load_project_state(project_name)
+                
+                if not project_state:
+                    continue
+                
+                for pipeline in project_config.pipelines:
+                    if not pipeline.active:
+                        continue
+                    
+                    board_state = project_state.boards.get(pipeline.board_name)
+                    if not board_state:
+                        continue
+                    
+                    # Get workflow template to check which columns need agents
+                    workflow_template = self.config_manager.get_workflow_template(pipeline.workflow)
+                    
+                    # Get current items on the board
+                    board_key = f"{project_name}_{pipeline.board_name}"
+                    if board_key not in self.last_state:
+                        continue
+                    
+                    current_items = self.last_state[board_key].values()
+                    
+                    for item in current_items:
+                        # Find column config
+                        column_config = next(
+                            (c for c in workflow_template.columns if c.name == item.status),
+                            None
+                        )
+                        
+                        if not column_config:
+                            continue
+                        
+                        # Check if column requires agent action
+                        has_agent = column_config.agent and column_config.agent != 'null'
+                        
+                        if not has_agent:
+                            continue
+                        
+                        # Check if there's already an active pipeline run
+                        has_active_run = self.pipeline_run_manager.get_active_pipeline_run(
+                            project_name, item.issue_number
+                        )
+                        
+                        if has_active_run:
+                            logger.debug(
+                                f"Issue #{item.issue_number} in {item.status} already has active pipeline run, skipping"
+                            )
+                            continue
+                        
+                        # Item needs action - simulate item_added event
+                        logger.info(
+                            f"Dispatching agent for stalled item: {project_name} issue #{item.issue_number} "
+                            f"in column '{item.status}' (agent: {column_config.agent})"
+                        )
+                        
+                        change = {
+                            'type': 'item_added',
+                            'item': item,
+                            'title': item.title,
+                            'status': item.status,  # Use 'status' key for consistency with process_board_changes
+                            'issue_number': item.issue_number,
+                            'repository': item.repository
+                        }
+                        
+                        # Process this as a board change
+                        self.process_board_changes([change], project_name, pipeline.board_name)
+                        dispatched_count += 1
+            
+            if dispatched_count > 0:
+                logger.info(f"Dispatched agents for {dispatched_count} stalled items after startup")
+            else:
+                logger.info("No stalled items found needing agent dispatch")
+                
+        except Exception as e:
+            logger.error(f"Error during board rescan: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+
     def monitor_projects(self):
         """Main monitoring loop using new configuration system"""
         import sys
         import asyncio
         from config.state_manager import state_manager
+        from services.github_api_client import get_github_client
 
         logger.info("Starting GitHub Projects v2 monitor...")
         sys.stdout.flush()
@@ -1923,10 +2598,125 @@ _Repair cycle initiated by Claude Code Orchestrator_
             # Run async resume method
             asyncio.run(review_cycle_executor.resume_active_cycles(project_name, org))
 
-        logger.info("Review cycle recovery complete, starting main monitoring loop...")
+        logger.info("Review cycle recovery complete")
+        
+        # Check GitHub API circuit breaker before attempting initialization queries
+        github_client = get_github_client()
+        if github_client.breaker.is_open():
+            time_until = (github_client.breaker.reset_time - datetime.now()).total_seconds() if github_client.breaker.reset_time else None
+            if time_until and time_until > 0:
+                logger.warning(
+                    f"⏸️  GitHub API circuit breaker is OPEN during initialization. "
+                    f"Rate limit resets in {time_until:.0f}s. Skipping initialization queries..."
+                )
+            else:
+                logger.warning(
+                    f"⏸️  GitHub API circuit breaker is OPEN during initialization. "
+                    f"Skipping initialization queries..."
+                )
+        else:
+            # CRITICAL: Initialize last_state to avoid false "item_added" events on startup
+            # Do an initial poll of all projects to populate last_state without processing changes
+            logger.info("Initializing project state (initial poll without change detection)...")
+            try:
+                for project_name in self.config_manager.list_visible_projects():
+                    # Check breaker again before each project (in case rate limit hit during loop)
+                    if github_client.breaker.is_open():
+                        logger.warning(
+                            f"⏸️  GitHub API circuit breaker opened during initialization. "
+                            f"Skipping remaining initialization queries..."
+                        )
+                        break
+                    
+                    project_config = self.config_manager.get_project_config(project_name)
+                    project_state = state_manager.load_project_state(project_name)
+                    
+                    if not project_state:
+                        logger.warning(f"No GitHub state found for project '{project_name}' during initialization")
+                        continue
+                    
+                    for pipeline in project_config.pipelines:
+                        if not pipeline.active:
+                            continue
+                        
+                        board_state = project_state.boards.get(pipeline.board_name)
+                        if not board_state:
+                            logger.warning(f"No board state for '{pipeline.board_name}' in project '{project_name}'")
+                            continue
+                        
+                        # Get current items and populate last_state WITHOUT processing changes
+                        current_items = self.get_project_items(project_config.github['org'], board_state.project_number)
+                        if current_items:
+                            board_key = f"{project_name}_{pipeline.board_name}"
+                            current_by_issue = {item.issue_number: item for item in current_items}
+                            self.last_state[board_key] = current_by_issue
+                            logger.info(f"Initialized state for {project_name}/{pipeline.board_name}: {len(current_items)} items")
+            except Exception as e:
+                logger.warning(f"Error during project state initialization: {e}")
+                logger.info("Will use empty state, may detect false 'item_added' events on first poll")
+        
+        logger.info("Project state initialization complete, starting main monitoring loop...")
+        
+        # After cleanup and state initialization, rescan boards for items needing action
+        logger.info("Rescanning boards for items that need action after startup...")
+        self._rescan_boards_for_stalled_items()
+        logger.info("Board rescan complete")
 
         while True:
             try:
+                # Check Claude Code circuit breaker - if open, skip all monitoring
+                from monitoring.claude_code_breaker import get_breaker
+                from monitoring.claude_token_scheduler import get_scheduler
+                from services.github_api_client import get_github_client
+                import asyncio
+                
+                breaker = get_breaker()
+                scheduler = get_scheduler()
+                github_client = get_github_client()
+                
+                # Run token availability check/test
+                asyncio.run(scheduler.check_and_run_test())
+                
+                # Check GitHub API circuit breaker - if open, skip all monitoring
+                if github_client.breaker.is_open():
+                    # Log warning only once every 60 seconds to reduce noise
+                    now = datetime.now()
+                    if not hasattr(self, '_last_github_breaker_warning') or \
+                       (now - self._last_github_breaker_warning).total_seconds() >= 60:
+                        time_until = (github_client.breaker.reset_time - datetime.now()).total_seconds() if github_client.breaker.reset_time else None
+                        if time_until and time_until > 0:
+                            logger.warning(
+                                f"⏸️  GitHub API circuit breaker is OPEN. "
+                                f"Rate limit resets in {time_until:.0f}s. Pausing all monitoring..."
+                            )
+                        else:
+                            logger.warning(
+                                f"⏸️  GitHub API circuit breaker is OPEN. Pausing all monitoring..."
+                            )
+                        self._last_github_breaker_warning = now
+                    time.sleep(5)  # Sleep briefly before checking again
+                    continue
+                
+                if breaker and breaker.is_open():
+                    # Log warning only once every 60 seconds to reduce noise
+                    now = datetime.now()
+                    if not hasattr(self, '_last_claude_breaker_warning') or \
+                       (now - self._last_claude_breaker_warning).total_seconds() >= 60:
+                        status = breaker.get_status()
+                        time_until = status.get('time_until_reset')
+                        if time_until and time_until > 0:
+                            logger.warning(
+                                f"⏸️  Claude Code circuit breaker is OPEN. "
+                                f"Tokens reset in {time_until:.0f}s. Pausing all monitoring..."
+                            )
+                        else:
+                            logger.warning(
+                                f"⏸️  Claude Code circuit breaker is OPEN. Pausing all monitoring..."
+                            )
+                        self._last_claude_breaker_warning = now
+                    time.sleep(5)  # Sleep briefly before checking again
+                    continue
+                
                 # Get all configured visible projects (exclude hidden/test projects)
                 for project_name in self.config_manager.list_visible_projects():
                     project_config = self.config_manager.get_project_config(project_name)

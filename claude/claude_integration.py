@@ -22,6 +22,12 @@ async def run_claude_code(prompt: str, context: Dict[str, Any]) -> str:
     task_id = context.get('task_id', 'unknown')
     agent = context.get('agent', 'unknown')
     project = context.get('project', 'unknown')
+    
+    # CRITICAL: Log if project is unknown - this should NEVER happen in production
+    if project == 'unknown':
+        logger.error(f"CRITICAL: project='unknown' in claude_integration context!")
+        logger.error(f"Context keys: {list(context.keys())}")
+        logger.error(f"Agent: {agent}, Task ID: {task_id}")
 
     # Emit prompt constructed event
     if obs:
@@ -50,7 +56,17 @@ async def run_claude_code(prompt: str, context: Dict[str, Any]) -> str:
         use_docker = context.get('use_docker', True)
         logger.warning(f"Agent {agent}: No agent_config.requires_docker, using context value: {use_docker}")
 
-    if use_docker and project != 'unknown':
+    if use_docker:
+        if project == 'unknown':
+            logger.error(f"CRITICAL: Agent {agent} requires Docker but project='unknown'")
+            logger.error(f"Task ID: {task_id}")
+            logger.error(f"Context keys present: {list(context.keys())}")
+            logger.error(f"This indicates a bug in the pipeline - context should always have 'project'")
+            raise Exception(
+                f"Agent {agent} requires Docker but project is unknown - cannot determine project directory. "
+                f"Context keys: {list(context.keys())}"
+            )
+        
         logger.info(f"Running agent in Docker container for project {project}")
 
         # Get project directory from workspace manager
@@ -59,7 +75,7 @@ async def run_claude_code(prompt: str, context: Dict[str, Any]) -> str:
         if not project_dir.exists():
             raise Exception(f"Project directory does not exist: {project_dir}")
 
-        # Run in Docker container
+        # Run in Docker container - if this fails, we MUST fail, not fall back
         return await docker_runner.run_agent_in_container(
             prompt=prompt,
             context=context,
@@ -68,8 +84,8 @@ async def run_claude_code(prompt: str, context: Dict[str, Any]) -> str:
             stream_callback=context.get('stream_callback')
         )
 
-    # Fall back to local execution (for orchestrator-internal tasks)
-    logger.info("Running agent locally (not in Docker)")
+    # Only reach here if use_docker=False (dev_environment_setup and dev_environment_verifier only)
+    logger.warning(f"Running agent {agent} locally (not in Docker) - this should ONLY be dev_environment_setup or dev_environment_verifier!")
 
     # Prepare working directory
     work_dir = Path(context.get('work_dir', '.'))

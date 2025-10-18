@@ -169,26 +169,86 @@ def kill_agent(container_name):
             'container_name': container_name
         }), 500
 
+@app.errorhandler(500)
+def handle_500(e):
+    """Handle 500 errors gracefully"""
+    logger.error(f"500 Error: {e}", exc_info=True)
+    return jsonify({
+        'status': 'error',
+        'message': 'Internal server error'
+    }), 500
+
+@app.errorhandler(Exception)
+def handle_exception(e):
+    """Handle all uncaught exceptions"""
+    logger.error(f"Unhandled exception: {e}", exc_info=True)
+    return jsonify({
+        'status': 'error',
+        'message': str(e)
+    }), 500
+
 @app.route('/health')
 def health():
     """Health check endpoint - returns orchestrator health status"""
     import json
 
     # Get last health check result from Redis (cross-process shared state)
+    redis_client = None
     try:
         redis_client = redis.Redis(host='redis', port=6379, decode_responses=True)
         health_json = redis_client.get('orchestrator:health')
 
         if health_json is None:
             # No health check has run yet
-            return jsonify({
+            response_data = {
                 'status': 'starting',
                 'message': 'Orchestrator is starting, no health check completed yet',
                 'connected_clients': len(connected_clients),
                 'subscriber_health': subscriber_health
-            }), 503
+            }
+            return jsonify(response_data), 503
 
-        health_data = json.loads(health_json)
+        try:
+            health_data = json.loads(health_json)
+        except json.JSONDecodeError:
+            # Invalid JSON in Redis
+            response_data = {
+                'status': 'error',
+                'message': 'Invalid health data in cache',
+                'connected_clients': len(connected_clients)
+            }
+            return jsonify(response_data), 503
+        
+        # IMPORTANT: Always fetch fresh rate limit data instead of using cached values
+        # The rate limit changes frequently (every API call), so we should not rely on
+        # cached values that may be stale. The background rate limit checker updates
+        # the client object every 5 minutes, so always get the latest status.
+        try:
+            from services.github_api_client import get_github_client
+            github_client = get_github_client()
+            client_status = github_client.get_status()
+            
+            fresh_rate_limit = {
+                'remaining': client_status['rate_limit']['remaining'],
+                'limit': client_status['rate_limit']['limit'],
+                'percentage_used': client_status['rate_limit']['percentage_used'],
+                'reset_time': client_status['rate_limit']['reset_time'],
+            }
+            
+            fresh_circuit_breaker = {
+                'state': client_status['breaker']['state'],
+                'is_open': client_status['breaker']['is_open'],
+                'opened_at': client_status['breaker']['opened_at'],
+                'reset_time': client_status['breaker']['reset_time'],
+            }
+            
+            # Update the cached health data with fresh rate limit and circuit breaker info
+            if 'checks' in health_data and 'github' in health_data['checks']:
+                health_data['checks']['github']['api_rate_limit'] = fresh_rate_limit
+                health_data['checks']['github']['circuit_breaker'] = fresh_circuit_breaker
+        except Exception as e:
+            logger.debug(f"Failed to fetch fresh rate limit data: {e}")
+            # Continue with cached data if fresh fetch fails
         
         # Add subscriber health to response
         health_data['subscriber_health'] = subscriber_health
@@ -202,20 +262,29 @@ def health():
             status = 'unhealthy'
             status_code = 503
 
-        response = {
+        response_data = {
             'status': status,
             'connected_clients': len(connected_clients),
             'orchestrator': health_data
         }
 
-        return jsonify(response), status_code
+        return jsonify(response_data), status_code
 
+    except redis.ConnectionError:
+        response_data = {
+            'status': 'error',
+            'message': 'Cannot connect to Redis',
+            'connected_clients': len(connected_clients)
+        }
+        return jsonify(response_data), 503
     except Exception as e:
-        return jsonify({
+        logger.error(f"Error in /health endpoint: {e}", exc_info=True)
+        response_data = {
             'status': 'error',
             'message': f'Failed to retrieve health status: {str(e)}',
             'connected_clients': len(connected_clients)
-        }), 503
+        }
+        return jsonify(response_data), 503
 
 @app.route('/history')
 def get_history():
@@ -798,6 +867,153 @@ def get_completed_pipeline_runs():
             'runs': []
         }), 500
 
+@app.route('/api/agent-execution/<execution_id>')
+def get_agent_execution(execution_id):
+    """Get details for a specific agent execution"""
+    try:
+        # Query Elasticsearch for agent execution in agent-events index
+        # Look for agent_initialized event with this execution_id
+        query = {
+            "query": {
+                "bool": {
+                    "must": [
+                        {"term": {"event_type": "agent_initialized"}},
+                        {"term": {"agent_execution_id.keyword": execution_id}}
+                    ]
+                }
+            },
+            "size": 1
+        }
+        
+        result = es_client.search(
+            index="agent-events-*",
+            body=query
+        )
+        
+        if result['hits']['total']['value'] == 0:
+            return jsonify({
+                'success': False,
+                'error': 'Execution not found'
+            }), 404
+        
+        # Get the agent_initialized event
+        init_event = result['hits']['hits'][0]['_source']
+        
+        # Look for corresponding completion/failure event
+        end_query = {
+            "query": {
+                "bool": {
+                    "must": [
+                        {"terms": {"event_type": ["agent_completed", "agent_failed"]}},
+                        {"term": {"agent": init_event['agent']}},
+                        {"term": {"task_id": init_event['task_id']}}
+                    ],
+                    "filter": [
+                        {"range": {"timestamp": {"gte": init_event['timestamp']}}}
+                    ]
+                }
+            },
+            "sort": [{"timestamp": "asc"}],
+            "size": 1
+        }
+        
+        end_result = es_client.search(
+            index="agent-events-*",
+            body=end_query
+        )
+        
+        # Build execution object
+        execution = {
+            'id': execution_id,
+            'agent': init_event['agent'],
+            'task_id': init_event['task_id'],
+            'project': init_event['project'],
+            'pipeline_run_id': init_event.get('pipeline_run_id'),
+            'branch_name': init_event.get('branch_name'),
+            'started_at': init_event['timestamp'],
+            'ended_at': None,
+            'status': 'running',
+            'duration': None
+        }
+        
+        # Add end information if found
+        if end_result['hits']['total']['value'] > 0:
+            end_event = end_result['hits']['hits'][0]['_source']
+            execution['ended_at'] = end_event['timestamp']
+            execution['status'] = 'completed' if end_event['event_type'] == 'agent_completed' else 'failed'
+            
+            # Calculate duration
+            try:
+                from datetime import datetime
+                start = datetime.fromisoformat(execution['started_at'].replace('Z', '+00:00'))
+                end = datetime.fromisoformat(execution['ended_at'].replace('Z', '+00:00'))
+                execution['duration'] = (end - start).total_seconds()
+            except Exception as e:
+                logger.warning(f"Error calculating execution duration: {e}")
+        
+        # Fetch Claude logs for this execution
+        logs = []
+        try:
+            # Query by task_id only - it's unique to this execution
+            logs_query = {
+                "query": {
+                    "term": {"task_id": execution['task_id']}
+                },
+                "sort": [{"timestamp": "asc"}],
+                "size": 10000
+            }
+            
+            logs_result = es_client.search(
+                index="claude-streams-*",
+                body=logs_query
+            )
+            
+            for hit in logs_result['hits']['hits']:
+                log_data = hit['_source']
+                logs.append(log_data)
+        except Exception as e:
+            logger.warning(f"Error fetching logs for execution: {e}")
+        
+        # Fetch prompt_constructed event for this execution
+        prompt_event = None
+        try:
+            prompt_query = {
+                "query": {
+                    "bool": {
+                        "must": [
+                            {"term": {"event_type": "prompt_constructed"}},
+                            {"term": {"task_id": execution['task_id']}}
+                        ]
+                    }
+                },
+                "sort": [{"timestamp": "asc"}],
+                "size": 1
+            }
+            
+            prompt_result = es_client.search(
+                index="agent-events-*",
+                body=prompt_query
+            )
+            
+            if prompt_result['hits']['total']['value'] > 0:
+                prompt_event = prompt_result['hits']['hits'][0]['_source']
+        except Exception as e:
+            logger.warning(f"Error fetching prompt event for execution: {e}")
+        
+        return jsonify({
+            'success': True,
+            'execution': execution,
+            'logs': logs,
+            'prompt_event': prompt_event
+        })
+        
+    except Exception as e:
+        logger.error(f"Error fetching agent execution: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
 # =======================================================================================
 # REVIEW FILTER API ENDPOINTS
 # =======================================================================================
@@ -1121,7 +1337,7 @@ def get_review_outcomes():
 
 @app.route('/api/circuit-breakers', methods=['GET'])
 def get_circuit_breakers():
-    """Get circuit breaker status from pattern ingestion service"""
+    """Get circuit breaker status from pattern ingestion service and Claude Code"""
     try:
         # Connect to Redis
         redis_client = redis.Redis(
@@ -1183,10 +1399,59 @@ def get_circuit_breakers():
             'total_rejected': pattern_cb['total_rejected'],
             'time_in_state': pattern_cb['time_in_state']
         })
+        
+        # Claude Code circuit breaker
+        try:
+            from monitoring.claude_code_breaker import get_breaker
+            breaker = get_breaker()
+            if breaker:
+                status = breaker.get_status()
+                logger.debug(f"Claude Code breaker status: {status}")
+                logger.debug(f"🔍 BREAKER DEBUG - Object ID: {id(breaker)}, State: {breaker.state}, is_open(): {breaker.is_open()}, opened_at: {breaker.opened_at}, reset_time: {breaker.reset_time}")
+                circuit_breakers.append({
+                    'name': 'Claude Code Token Limit',
+                    'service': 'claude_code',
+                    'state': status['state'],
+                    'is_open': status['is_open'],
+                    'opened_at': status['opened_at'],
+                    'reset_time': status['reset_time'],
+                    'time_until_reset': status['time_until_reset'],
+                    'failure_count': status['failure_count'],
+                })
+                logger.debug(f"Added Claude Code breaker to circuit breakers list - state: {breaker.state}, is_open: {breaker.is_open()}")
+            else:
+                logger.warning("Claude Code breaker is None!")
+        except Exception as e:
+            logger.error(f"Could not get Claude Code breaker status: {e}", exc_info=True)
+
+        # GitHub API circuit breaker
+        try:
+            from services.github_api_client import get_github_client
+            github_client = get_github_client()
+            github_status = github_client.get_status()
+            
+            circuit_breakers.append({
+                'name': 'GitHub API Rate Limit',
+                'service': 'github_api',
+                'state': github_status['breaker']['state'],
+                'is_open': github_status['breaker']['is_open'],
+                'opened_at': github_status['breaker']['opened_at'],
+                'reset_time': github_status['breaker']['reset_time'],
+                'rate_limit': {
+                    'remaining': github_status['rate_limit']['remaining'],
+                    'limit': github_status['rate_limit']['limit'],
+                    'percentage_used': github_status['rate_limit']['percentage_used'],
+                    'reset_time': github_status['rate_limit']['reset_time'],
+                }
+            })
+        except Exception as e:
+            logger.error(f"Could not get GitHub API breaker status: {e}", exc_info=True)
 
         # Calculate summary
-        open_count = sum(1 for cb in circuit_breakers if cb['state'] == 'open')
-        half_open_count = sum(1 for cb in circuit_breakers if cb['state'] == 'half_open')
+        open_count = sum(1 for cb in circuit_breakers 
+                        if cb.get('state') == 'open' or cb.get('is_open') == True)
+        half_open_count = sum(1 for cb in circuit_breakers 
+                             if cb.get('state') == 'half_open')
 
         return jsonify({
             'success': True,
@@ -1205,6 +1470,28 @@ def get_circuit_breakers():
             'success': False,
             'error': str(e),
             'circuit_breakers': []
+        }), 500
+
+@app.route('/api/github-api-status', methods=['GET'])
+def get_github_api_status():
+    """Get GitHub API client status including rate limit and circuit breaker."""
+    try:
+        from services.github_api_client import get_github_client
+        client = get_github_client()
+        status = client.get_status()
+        
+        # Call alarm check to log warnings if needed
+        client.alarm_if_needed()
+        
+        return jsonify({
+            'success': True,
+            'status': status
+        })
+    except Exception as e:
+        logger.error(f"Error fetching GitHub API status: {e}", exc_info=True)
+        return jsonify({
+            'success': False,
+            'error': str(e)
         }), 500
 
 def collect_git_branch_data(project_name, workspace_path):
@@ -1405,8 +1692,8 @@ def git_branch_collector_thread():
                         git_branch_cache['clauditoreum'] = branch_data
                     logger.debug("Updated git branch cache for clauditoreum")
 
-            # Check configured projects in workspace
-            project_configs = config_manager.list_projects()
+            # Check configured visible (non-hidden) projects in workspace
+            project_configs = config_manager.list_visible_projects()
 
             for project_name in project_configs:
                 workspace_path = Path(f"/workspace/{project_name}")
@@ -1633,6 +1920,215 @@ def get_workflow_config(project, board):
             'success': False,
             'error': str(e)
         }), 500
+
+# ============================================================================
+# REPAIR CYCLE CONTAINER MONITORING ENDPOINTS
+# ============================================================================
+
+@app.route('/api/repair-cycle-containers', methods=['GET'])
+def get_repair_cycle_containers():
+    """Get all running repair cycle containers with status and progress"""
+    try:
+        from services.agent_container_recovery import get_agent_container_recovery
+        from services import project_workspace
+        import subprocess
+        
+        recovery = get_agent_container_recovery()
+        
+        # Get running containers
+        containers = recovery.get_running_repair_cycle_containers()
+        
+        result = []
+        for container in containers:
+            # Parse container name
+            info = recovery.parse_repair_cycle_container_name(container['name'])
+            if not info:
+                continue
+                
+            project = info['project']
+            issue_number = info['issue_number']
+            run_id = info['run_id']
+            
+            # Get checkpoint
+            checkpoint = recovery.check_repair_cycle_checkpoint(project)
+            
+            # Get result
+            result_data = recovery.check_repair_cycle_result(project)
+            
+            # Get container age
+            container_age_seconds = None
+            try:
+                import dateutil.parser
+                created_str = container.get('created_at', '')
+                if created_str:
+                    created_time = dateutil.parser.parse(created_str)
+                    container_age_seconds = (datetime.utcnow() - created_time.replace(tzinfo=None)).total_seconds()
+            except:
+                pass
+            
+            result.append({
+                'container_name': container['name'],
+                'container_id': container['id'],
+                'project': project,
+                'issue_number': issue_number,
+                'run_id': run_id,
+                'status': container.get('status', 'running'),
+                'created_at': container.get('created_at'),
+                'container_age_seconds': container_age_seconds,
+                'checkpoint': checkpoint,
+                'result': result_data,
+                'is_finished': result_data is not None
+            })
+        
+        return jsonify({
+            'success': True,
+            'containers': result
+        }), 200
+        
+    except Exception as e:
+        logger.error(f"Failed to get repair cycle containers: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/repair-cycle-containers/<project>/<int:issue>/checkpoint', methods=['GET'])
+def get_repair_cycle_checkpoint(project, issue):
+    """Get current checkpoint state for a specific repair cycle"""
+    try:
+        from services.agent_container_recovery import get_agent_container_recovery
+        
+        recovery = get_agent_container_recovery()
+        checkpoint = recovery.check_repair_cycle_checkpoint(project)
+        
+        if checkpoint:
+            return jsonify({
+                'success': True,
+                'checkpoint': checkpoint
+            }), 200
+        else:
+            return jsonify({
+                'success': False,
+                'error': 'No checkpoint found'
+            }), 404
+            
+    except Exception as e:
+        logger.error(f"Failed to get checkpoint for {project}/{issue}: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/repair-cycle-containers/<project>/<int:issue>/logs', methods=['GET'])
+def get_repair_cycle_logs(project, issue):
+    """Get container logs for a specific repair cycle"""
+    try:
+        import subprocess
+        
+        # Find container by project and issue
+        from services.agent_container_recovery import get_agent_container_recovery
+        recovery = get_agent_container_recovery()
+        
+        containers = recovery.get_running_repair_cycle_containers()
+        target_container = None
+        
+        for container in containers:
+            info = recovery.parse_repair_cycle_container_name(container['name'])
+            if info and info['project'] == project and info['issue_number'] == str(issue):
+                target_container = container
+                break
+        
+        if not target_container:
+            return jsonify({
+                'success': False,
+                'error': f'No running container found for {project} issue #{issue}'
+            }), 404
+        
+        # Get logs (last 500 lines)
+        result = subprocess.run(
+            ['docker', 'logs', '--tail', '500', target_container['name']],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        
+        if result.returncode == 0:
+            return jsonify({
+                'success': True,
+                'logs': result.stdout + result.stderr,
+                'container_name': target_container['name']
+            }), 200
+        else:
+            return jsonify({
+                'success': False,
+                'error': f'Failed to get logs: {result.stderr}'
+            }), 500
+            
+    except Exception as e:
+        logger.error(f"Failed to get logs for {project}/{issue}: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/repair-cycle-containers/<project>/<int:issue>/kill', methods=['POST'])
+def kill_repair_cycle_container(project, issue):
+    """Kill a repair cycle container"""
+    try:
+        import subprocess
+        
+        # Find container by project and issue
+        from services.agent_container_recovery import get_agent_container_recovery
+        recovery = get_agent_container_recovery()
+        
+        containers = recovery.get_running_repair_cycle_containers()
+        target_container = None
+        
+        for container in containers:
+            info = recovery.parse_repair_cycle_container_name(container['name'])
+            if info and info['project'] == project and info['issue_number'] == str(issue):
+                target_container = container
+                break
+        
+        if not target_container:
+            return jsonify({
+                'success': False,
+                'error': f'No running container found for {project} issue #{issue}'
+            }), 404
+        
+        logger.warning(f"KILL SWITCH ACTIVATED for repair cycle container: {target_container['name']}")
+        
+        # Stop the container immediately
+        result = subprocess.run(
+            ['docker', 'rm', '-f', target_container['name']],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        
+        if result.returncode == 0:
+            logger.info(f"Successfully killed repair cycle container: {target_container['name']}")
+            
+            # Remove from Redis tracking
+            redis_client = redis.Redis(host='redis', port=6379, decode_responses=True)
+            redis_client.delete(f'repair_cycle:container:{project}:{issue}')
+            
+            return jsonify({
+                'success': True,
+                'message': f'Container {target_container["name"]} stopped',
+                'container_name': target_container['name']
+            }), 200
+        else:
+            logger.error(f"Failed to kill container {target_container['name']}: {result.stderr}")
+            return jsonify({
+                'success': False,
+                'error': f'Failed to kill container: {result.stderr}'
+            }), 500
+            
+    except Exception as e:
+        logger.error(f"Failed to kill container for {project}/{issue}: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+# ============================================================================
+# END REPAIR CYCLE CONTAINER MONITORING ENDPOINTS
+# ============================================================================
 
 def redis_subscriber_thread():
     """Background thread that listens to Redis pub/sub and broadcasts to WebSocket clients"""

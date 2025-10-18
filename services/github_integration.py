@@ -8,6 +8,8 @@ import os
 import logging
 from typing import Dict, Any, List, Optional
 
+from services.github_api_client import get_github_client
+
 logger = logging.getLogger(__name__)
 
 class GitHubIntegration:
@@ -43,53 +45,56 @@ class GitHubIntegration:
         return env
 
     async def post_issue_comment(self, issue_number: int, comment: str, repo: Optional[str] = None) -> Dict[str, Any]:
-        """Post a comment to a GitHub issue"""
+        """Post a comment to a GitHub issue using REST API with rate limiting"""
         try:
-            repo_arg = f"{self.github_org}/{repo}" if repo else ""
-
-            cmd = [
-                'gh', 'issue', 'comment', str(issue_number),
-                '--body', comment
-            ]
-
-            if repo:
-                cmd.extend(['--repo', repo_arg])
-
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True, env=self._get_gh_env())
-
-            # Get the comment URL (GitHub CLI doesn't return it directly)
-            # So we'll construct it manually
-            issue_url = f"https://github.com/{self.github_org}/{repo}/issues/{issue_number}"
-
+            repo_name = repo or self.repo_name
+            endpoint = f"/repos/{self.github_org}/{repo_name}/issues/{issue_number}/comments"
+            
+            success, response = get_github_client().rest(
+                method='POST',
+                endpoint=endpoint,
+                data={'body': comment}
+            )
+            
+            if not success:
+                logger.error(f"Failed to post issue comment: {response}")
+                return {'success': False, 'error': response.get('error', 'Unknown error')}
+            
             return {
                 'success': True,
-                'html_url': issue_url,
-                'id': None  # Would need API call to get actual comment ID
+                'html_url': response.get('html_url'),
+                'id': response.get('id')
             }
 
-        except subprocess.CalledProcessError as e:
-            logger.error(f"Failed to post GitHub comment: {e.stderr}")
+        except Exception as e:
+            logger.error(f"Failed to post GitHub comment: {e}", exc_info=True)
             return {'success': False, 'error': str(e)}
 
     async def post_pr_comment(self, pr_number: int, comment: str, repo: Optional[str] = None) -> Dict[str, Any]:
-        """Post a comment to a GitHub pull request"""
+        """Post a comment to a GitHub pull request using REST API with rate limiting"""
         try:
-            repo_arg = f"{self.github_org}/{repo}" if repo else ""
+            repo_name = repo or self.repo_name
+            # PR comments are posted to issues endpoint (PRs are issues in GitHub API)
+            endpoint = f"/repos/{self.github_org}/{repo_name}/issues/{pr_number}/comments"
+            
+            success, response = get_github_client().rest(
+                method='POST',
+                endpoint=endpoint,
+                data={'body': comment}
+            )
+            
+            if not success:
+                logger.error(f"Failed to post PR comment: {response}")
+                return {'success': False, 'error': response.get('error', 'Unknown error')}
+            
+            return {
+                'success': True,
+                'html_url': response.get('html_url'),
+                'id': response.get('id')
+            }
 
-            cmd = [
-                'gh', 'pr', 'comment', str(pr_number),
-                '--body', comment
-            ]
-
-            if repo:
-                cmd.extend(['--repo', repo_arg])
-
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True, env=self._get_gh_env())
-
-            return {'success': True}
-
-        except subprocess.CalledProcessError as e:
-            logger.error(f"Failed to post PR comment: {e.stderr}")
+        except Exception as e:
+            logger.error(f"Failed to post PR comment: {e}", exc_info=True)
             return {'success': False, 'error': str(e)}
 
     async def create_pr_review(
@@ -99,43 +104,57 @@ class GitHubIntegration:
         body: str,
         repo: Optional[str] = None
     ) -> Dict[str, Any]:
-        """Create a formal PR review"""
+        """Create a formal PR review using REST API with rate limiting"""
         try:
-            repo_arg = f"{self.github_org}/{repo}" if repo else ""
+            repo_name = repo or self.repo_name
+            endpoint = f"/repos/{self.github_org}/{repo_name}/pulls/{pr_number}/reviews"
+            
+            # Map review_type to GitHub API event
+            event_map = {
+                'approve': 'APPROVE',
+                'request-changes': 'REQUEST_CHANGES',
+                'comment': 'COMMENT'
+            }
+            event = event_map.get(review_type, review_type.upper())
+            
+            success, response = get_github_client().rest(
+                method='POST',
+                endpoint=endpoint,
+                data={
+                    'body': body,
+                    'event': event
+                }
+            )
+            
+            if not success:
+                logger.error(f"Failed to create PR review: {response}")
+                return {'success': False, 'error': response.get('error', 'Unknown error')}
+            
+            return {'success': True, 'review_id': response.get('id')}
 
-            cmd = [
-                'gh', 'pr', 'review', str(pr_number),
-                f'--{review_type}',
-                '--body', body
-            ]
-
-            if repo:
-                cmd.extend(['--repo', repo_arg])
-
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True, env=self._get_gh_env())
-
-            return {'success': True}
-
-        except subprocess.CalledProcessError as e:
-            logger.error(f"Failed to create PR review: {e.stderr}")
+        except Exception as e:
+            logger.error(f"Failed to create PR review: {e}", exc_info=True)
             return {'success': False, 'error': str(e)}
 
     async def get_issue_details(self, issue_number: int, repo: Optional[str] = None) -> Dict[str, Any]:
-        """Get issue details"""
+        """Get issue details using REST API with rate limiting"""
         try:
-            repo_arg = f"{self.github_org}/{repo}" if repo else ""
+            repo_name = repo or self.repo_name
+            endpoint = f"/repos/{self.github_org}/{repo_name}/issues/{issue_number}"
+            
+            success, response = get_github_client().rest(
+                method='GET',
+                endpoint=endpoint
+            )
+            
+            if not success:
+                logger.error(f"Failed to get issue details: {response}")
+                return {}
+            
+            return response
 
-            cmd = ['gh', 'issue', 'view', str(issue_number), '--json', 'title,body,state,labels,assignees']
-
-            if repo:
-                cmd.extend(['--repo', repo_arg])
-
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True, env=self._get_gh_env())
-
-            return json.loads(result.stdout)
-
-        except subprocess.CalledProcessError as e:
-            logger.error(f"Failed to get issue details: {e.stderr}")
+        except Exception as e:
+            logger.error(f"Failed to get issue details: {e}", exc_info=True)
             return {}
 
     async def has_agent_processed_issue(self, issue_number: int, agent_name: str, repo: Optional[str] = None) -> bool:
@@ -229,22 +248,27 @@ class GitHubIntegration:
 
     async def get_feedback_comments(self, issue_number: int, repo: Optional[str] = None,
                                     since_timestamp: Optional[str] = None) -> List[Dict[str, Any]]:
-        """Get comments that mention @orchestrator-bot for feedback"""
+        """Get comments that mention @orchestrator-bot for feedback using REST API with rate limiting"""
         try:
-            repo_arg = f"{self.github_org}/{repo}" if repo else ""
-
-            cmd = ['gh', 'issue', 'view', str(issue_number), '--json', 'comments']
-
-            if repo:
-                cmd.extend(['--repo', repo_arg])
-
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True, env=self._get_gh_env())
-            data = json.loads(result.stdout)
-
+            repo_name = repo or self.repo_name
+            endpoint = f"/repos/{self.github_org}/{repo_name}/issues/{issue_number}/comments"
+            
+            success, response = get_github_client().rest(
+                method='GET',
+                endpoint=endpoint
+            )
+            
+            if not success:
+                logger.error(f"Failed to fetch feedback comments: {response}")
+                return []
+            
+            # Handle both list and dict responses
+            comments_list = response if isinstance(response, list) else response.get('comments', [])
+            
             feedback_comments = []
-            for comment in data.get('comments', []):
+            for comment in comments_list:
                 body = comment.get('body', '')
-                created_at = comment.get('createdAt', '')
+                created_at = comment.get('created_at', '')
                 comment_id = comment.get('id', '')
 
                 # Check if comment mentions @orchestrator-bot
@@ -279,16 +303,13 @@ class GitHubIntegration:
                     feedback_comments.append({
                         'id': comment_id,
                         'body': body,
-                        'author': comment.get('author', {}).get('login', 'unknown'),
+                        'author': comment.get('user', {}).get('login', 'unknown'),
                         'created_at': created_at,
-                        'is_bot': comment.get('author', {}).get('isBot', False)
+                        'is_bot': comment.get('user', {}).get('type') == 'Bot'
                     })
 
             return feedback_comments
 
-        except subprocess.CalledProcessError as e:
-            logger.error(f"Failed to fetch feedback comments: {e.stderr}")
-            return []
         except Exception as e:
             import traceback
             logger.warning(f"Error processing feedback comments: {e}")
@@ -296,21 +317,24 @@ class GitHubIntegration:
             return []
 
     async def get_pr_details(self, pr_number: int, repo: Optional[str] = None) -> Dict[str, Any]:
-        """Get pull request details"""
+        """Get pull request details using REST API with rate limiting"""
         try:
-            repo_arg = f"{self.github_org}/{repo}" if repo else ""
+            repo_name = repo or self.repo_name
+            endpoint = f"/repos/{self.github_org}/{repo_name}/pulls/{pr_number}"
+            
+            success, response = get_github_client().rest(
+                method='GET',
+                endpoint=endpoint
+            )
+            
+            if not success:
+                logger.error(f"Failed to get PR details: {response}")
+                return {}
+            
+            return response
 
-            cmd = ['gh', 'pr', 'view', str(pr_number), '--json', 'title,body,state,headRefName,baseRefName']
-
-            if repo:
-                cmd.extend(['--repo', repo_arg])
-
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True, env=self._get_gh_env())
-
-            return json.loads(result.stdout)
-
-        except subprocess.CalledProcessError as e:
-            logger.error(f"Failed to get PR details: {e.stderr}")
+        except Exception as e:
+            logger.error(f"Failed to get PR details: {e}", exc_info=True)
             return {}
 
     async def mention_user(self, username: str) -> str:
@@ -454,31 +478,19 @@ class GitHubIntegration:
             return {'success': False, 'error': str(e)}
 
     async def graphql_query(self, query: str, variables: Dict[str, Any]) -> Dict[str, Any]:
-        """Execute a GraphQL query using gh CLI"""
+        """Execute a GraphQL query using the GitHub API client"""
         try:
-            query_json = json.dumps({'query': query, 'variables': variables})
+            github_client = get_github_client()
+            success, result = github_client.graphql(query, variables)
+            
+            if success:
+                return result
+            else:
+                logger.error(f"GraphQL query failed: {result}")
+                return {}
 
-            cmd = ['gh', 'api', 'graphql', '-f', f'query={query}']
-
-            # Add variables
-            for key, value in variables.items():
-                if isinstance(value, int):
-                    cmd.extend(['-F', f'{key}={value}'])
-                else:
-                    cmd.extend(['-f', f'{key}={value}'])
-
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                check=True,
-                env=self._get_gh_env()
-            )
-
-            return json.loads(result.stdout)
-
-        except subprocess.CalledProcessError as e:
-            logger.error(f"GraphQL query failed: {e.stderr}")
+        except Exception as e:
+            logger.error(f"GraphQL query failed: {e}")
             return {}
 
     async def get_issue(self, issue_number: int) -> Dict[str, Any]:

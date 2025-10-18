@@ -11,8 +11,10 @@
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as ReviewLearningRouteImport } from './routes/review-learning'
 import { Route as ProjectsRouteImport } from './routes/projects'
+import { Route as PipelineRunDebugRouteImport } from './routes/pipeline-run-debug'
 import { Route as PipelineRunRouteImport } from './routes/pipeline-run'
 import { Route as IndexRouteImport } from './routes/index'
+import { Route as AgentExecutionExecutionIdRouteImport } from './routes/agent-execution.$executionId'
 
 const ReviewLearningRoute = ReviewLearningRouteImport.update({
   id: '/review-learning',
@@ -22,6 +24,11 @@ const ReviewLearningRoute = ReviewLearningRouteImport.update({
 const ProjectsRoute = ProjectsRouteImport.update({
   id: '/projects',
   path: '/projects',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const PipelineRunDebugRoute = PipelineRunDebugRouteImport.update({
+  id: '/pipeline-run-debug',
+  path: '/pipeline-run-debug',
   getParentRoute: () => rootRouteImport,
 } as any)
 const PipelineRunRoute = PipelineRunRouteImport.update({
@@ -34,39 +41,72 @@ const IndexRoute = IndexRouteImport.update({
   path: '/',
   getParentRoute: () => rootRouteImport,
 } as any)
+const AgentExecutionExecutionIdRoute =
+  AgentExecutionExecutionIdRouteImport.update({
+    id: '/agent-execution/$executionId',
+    path: '/agent-execution/$executionId',
+    getParentRoute: () => rootRouteImport,
+  } as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/pipeline-run': typeof PipelineRunRoute
+  '/pipeline-run-debug': typeof PipelineRunDebugRoute
   '/projects': typeof ProjectsRoute
   '/review-learning': typeof ReviewLearningRoute
+  '/agent-execution/$executionId': typeof AgentExecutionExecutionIdRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/pipeline-run': typeof PipelineRunRoute
+  '/pipeline-run-debug': typeof PipelineRunDebugRoute
   '/projects': typeof ProjectsRoute
   '/review-learning': typeof ReviewLearningRoute
+  '/agent-execution/$executionId': typeof AgentExecutionExecutionIdRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
   '/pipeline-run': typeof PipelineRunRoute
+  '/pipeline-run-debug': typeof PipelineRunDebugRoute
   '/projects': typeof ProjectsRoute
   '/review-learning': typeof ReviewLearningRoute
+  '/agent-execution/$executionId': typeof AgentExecutionExecutionIdRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
-  fullPaths: '/' | '/pipeline-run' | '/projects' | '/review-learning'
+  fullPaths:
+    | '/'
+    | '/pipeline-run'
+    | '/pipeline-run-debug'
+    | '/projects'
+    | '/review-learning'
+    | '/agent-execution/$executionId'
   fileRoutesByTo: FileRoutesByTo
-  to: '/' | '/pipeline-run' | '/projects' | '/review-learning'
-  id: '__root__' | '/' | '/pipeline-run' | '/projects' | '/review-learning'
+  to:
+    | '/'
+    | '/pipeline-run'
+    | '/pipeline-run-debug'
+    | '/projects'
+    | '/review-learning'
+    | '/agent-execution/$executionId'
+  id:
+    | '__root__'
+    | '/'
+    | '/pipeline-run'
+    | '/pipeline-run-debug'
+    | '/projects'
+    | '/review-learning'
+    | '/agent-execution/$executionId'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   PipelineRunRoute: typeof PipelineRunRoute
+  PipelineRunDebugRoute: typeof PipelineRunDebugRoute
   ProjectsRoute: typeof ProjectsRoute
   ReviewLearningRoute: typeof ReviewLearningRoute
+  AgentExecutionExecutionIdRoute: typeof AgentExecutionExecutionIdRoute
 }
 
 declare module '@tanstack/react-router' {
@@ -85,6 +125,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof ProjectsRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/pipeline-run-debug': {
+      id: '/pipeline-run-debug'
+      path: '/pipeline-run-debug'
+      fullPath: '/pipeline-run-debug'
+      preLoaderRoute: typeof PipelineRunDebugRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/pipeline-run': {
       id: '/pipeline-run'
       path: '/pipeline-run'
@@ -99,14 +146,23 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof IndexRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/agent-execution/$executionId': {
+      id: '/agent-execution/$executionId'
+      path: '/agent-execution/$executionId'
+      fullPath: '/agent-execution/$executionId'
+      preLoaderRoute: typeof AgentExecutionExecutionIdRouteImport
+      parentRoute: typeof rootRouteImport
+    }
   }
 }
 
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   PipelineRunRoute: PipelineRunRoute,
+  PipelineRunDebugRoute: PipelineRunDebugRoute,
   ProjectsRoute: ProjectsRoute,
   ReviewLearningRoute: ReviewLearningRoute,
+  AgentExecutionExecutionIdRoute: AgentExecutionExecutionIdRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)

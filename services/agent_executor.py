@@ -60,8 +60,11 @@ class AgentExecutor:
         # Emit task received event
         self.obs.emit_task_received(agent_name, task_id, project_name, task_context)
 
+        # Extract pipeline_run_id from task_context for stream callback
+        pipeline_run_id = task_context.get('pipeline_run_id')
+
         # Create stream callback for live Claude Code output
-        stream_callback = self._create_stream_callback(agent_name, task_id, project_name)
+        stream_callback = self._create_stream_callback(agent_name, task_id, project_name, pipeline_run_id)
 
         # Build execution context with ALL required fields
         execution_context = self._build_execution_context(
@@ -76,9 +79,16 @@ class AgentExecutor:
         agent_stage = self.factory.create_agent(agent_name, project_name)
 
         # Prepare workspace using abstraction layer
+        # Skip if we're in a repair cycle (workspace already prepared by parent execution)
         workspace_context = None
         branch_name = None
-        if 'issue_number' in task_context:
+        skip_workspace_prep = task_context.get('skip_workspace_prep', False)
+        
+        if skip_workspace_prep:
+            logger.info(f"Skipping workspace preparation (skip_workspace_prep=True) for {agent_name}")
+            # Extract branch_name from context if available
+            branch_name = task_context.get('branch_name')
+        elif 'issue_number' in task_context:
             try:
                 from services.workspace import WorkspaceContextFactory
                 from services.github_integration import GitHubIntegration
@@ -107,6 +117,11 @@ class AgentExecutor:
 
                         # Prepare workspace (git branch OR discussion context)
                         prep_result = await workspace_context.prepare_execution()
+                        
+                        if prep_result is None:
+                            logger.error(f"Workspace prepare_execution returned None for {workspace_type} workspace")
+                            raise ValueError(f"Workspace preparation failed: prepare_execution returned None")
+                        
                         task_context.update(prep_result)
                         
                         # Extract branch name if available
@@ -117,7 +132,7 @@ class AgentExecutor:
                         )
 
             except Exception as e:
-                logger.warning(f"Failed to prepare workspace: {e}")
+                logger.warning(f"Failed to prepare workspace: {e}", exc_info=True)
                 # Continue execution even if workspace preparation fails
         
         # Generate container name if agent will use Docker
@@ -133,10 +148,13 @@ class AgentExecutor:
         pipeline_run_id = task_context.get('pipeline_run_id')
 
         # Emit agent initialized event (after workspace prep to include branch_name and container_name)
+        # This returns the agent_execution_id for tracking this specific execution
         agent_config = agent_stage.agent_config or {}
-        self.obs.emit_agent_initialized(
+        agent_execution_id = self.obs.emit_agent_initialized(
             agent_name, task_id, project_name, agent_config, branch_name, container_name, pipeline_run_id
         )
+        
+        logger.info(f"Agent execution started with ID: {agent_execution_id}")
 
         # Mark dev container as in_progress when setup agent starts
         if agent_name == 'dev_environment_setup':
@@ -166,7 +184,7 @@ class AgentExecutor:
 
             duration_ms = (time.time() - start_time) * 1000
             self.obs.emit_agent_completed(
-                agent_name, task_id, project_name, duration_ms, True, None, pipeline_run_id, output_text
+                agent_name, task_id, project_name, duration_ms, True, None, pipeline_run_id, output_text, agent_execution_id
             )
 
             # If dev_environment_setup completed successfully, queue verifier
@@ -212,7 +230,7 @@ class AgentExecutor:
         except Exception as e:
             duration_ms = (time.time() - start_time) * 1000
             self.obs.emit_agent_completed(
-                agent_name, task_id, project_name, duration_ms, False, str(e), pipeline_run_id, None
+                agent_name, task_id, project_name, duration_ms, False, str(e), pipeline_run_id, None, agent_execution_id
             )
 
             # Record failed execution outcome
@@ -230,7 +248,7 @@ class AgentExecutor:
             logger.error(f"Agent {agent_name} failed after {duration_ms:.0f}ms: {e}")
             raise
 
-    def _create_stream_callback(self, agent_name: str, task_id: str, project_name: str):
+    def _create_stream_callback(self, agent_name: str, task_id: str, project_name: str, pipeline_run_id: str = None):
         """Create callback for streaming Claude Code output to Redis"""
         def stream_callback(event):
             """Publish Claude stream events to Redis for websocket forwarding and history"""
@@ -240,6 +258,7 @@ class AgentExecutor:
                         'agent': agent_name,
                         'task_id': task_id,
                         'project': project_name,
+                        'pipeline_run_id': pipeline_run_id,
                         'timestamp': event.get('timestamp') or time.time(),
                         'event': event
                     }

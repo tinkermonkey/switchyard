@@ -248,7 +248,7 @@ class RepairCycleStage(PipelineStage):
                         {
                             "test_type": test_config.test_type.value,
                             "test_type_index": test_type_index,
-                            "passed": cycle_result.passed,
+                            "passed": 1 if cycle_result.passed else 0,  # Convert bool to int for ES schema
                             "test_cycle_iterations": cycle_result.iterations,
                             "files_fixed": cycle_result.files_fixed,
                             "warnings_reviewed": cycle_result.warnings_reviewed,
@@ -408,7 +408,7 @@ class RepairCycleStage(PipelineStage):
                         {
                             "test_type": config.test_type.value,
                             "test_type_index": test_type_index,
-                            "passed": False,
+                            "passed": 0,  # Convert bool to int for ES schema
                             "test_cycle_iterations": test_cycle_iteration,
                             "error": "Circuit breaker: max agent calls reached",
                         },
@@ -425,7 +425,7 @@ class RepairCycleStage(PipelineStage):
                         {
                             "test_type": config.test_type.value,
                             "test_type_index": test_type_index,
-                            "passed": False,
+                            "passed": 0,  # Convert bool to int for ES schema
                             "test_cycle_iterations": test_cycle_iteration,
                             "error": "Circuit breaker: max agent calls reached",
                         },
@@ -462,7 +462,7 @@ class RepairCycleStage(PipelineStage):
                         {
                             "test_type": config.test_type.value,
                             "test_type_index": test_type_index,
-                            "passed": False,
+                            "passed": 0,  # Convert bool to int for ES schema
                             "test_cycle_iterations": test_cycle_iteration,
                             "error": f"Infrastructure failure: {infrastructure_failures[0].message}",
                         },
@@ -479,7 +479,7 @@ class RepairCycleStage(PipelineStage):
                         {
                             "test_type": config.test_type.value,
                             "test_type_index": test_type_index,
-                            "passed": False,
+                            "passed": 0,  # Convert bool to int for ES schema
                             "test_cycle_iterations": test_cycle_iteration,
                             "error": f"Infrastructure failure: {infrastructure_failures[0].message}",
                         },
@@ -645,6 +645,8 @@ class RepairCycleStage(PipelineStage):
             "pipeline_run_id": pipeline_run_id,  # Ensure pipeline_run_id flows through
             "task_description": f"Run {config.test_type.value} tests (test cycle iteration {test_cycle_iteration})",
             "timeout": config.timeout,
+            # Skip workspace preparation - repair cycle already runs in prepared workspace
+            "skip_workspace_prep": True,
             # Clear review_cycle context to avoid iteration count confusion from previous review cycles
             "review_cycle": None,
             # Provide the custom instructions as a 'direct_prompt' so the agent can use it
@@ -652,9 +654,11 @@ class RepairCycleStage(PipelineStage):
 
 Please identify the appropriate test framework and location for {config.test_type.value} tests.
 
-These tests runs can take some time to complete, please be patient and don't put time limits on the test execution.
+**IMPORTANT**: When running tests, save the test results to a file in /tmp so that you can refer back to them and so they're not made part of the codebase.
 
-Also, make sure you are capturing the full output of the test runs, including any warnings and errors, to disk to avoid having to re-run the tests multiple times.
+These tests runs can take some time to complete, please be patient and don't put time limits on the test execution. Make sure you're capturing the information you need to identify failures without having to re-run the tests multiple times.
+
+Also, make sure you are capturing the **full** output of the test runs, including any warnings and errors, to disk to avoid having to re-run the tests multiple times.
 
 Be mindful of environment setup steps like installing dependencies and activating virtual environments.
 
@@ -916,6 +920,8 @@ DO NOT include any explanation, markdown formatting, or other text - ONLY the JS
                 "pipeline_run_id": pipeline_run_id,  # Ensure pipeline_run_id flows through
                 "task_description": f"Fix failures in {test_file}",
                 "timeout": config.timeout,
+                # Skip workspace preparation - repair cycle already runs in prepared workspace
+                "skip_workspace_prep": True,
                 # Clear review_cycle context to avoid iteration count confusion from previous review cycles
                 "review_cycle": None,
                 # Provide the fix instructions as a 'direct_prompt' so the agent can use it
@@ -1038,6 +1044,8 @@ DO NOT include any explanation, markdown formatting, or other text - ONLY the JS
                 "pipeline_run_id": pipeline_run_id,  # Ensure pipeline_run_id flows through
                 "task_description": f"Review warnings in {source_file}",
                 "timeout": config.timeout,
+                # Skip workspace preparation - repair cycle already runs in prepared workspace
+                "skip_workspace_prep": True,
                 # Clear review_cycle context to avoid iteration count confusion from previous review cycles
                 "review_cycle": None,
                 # Provide the review instructions as a 'direct_prompt' so the agent can use it
@@ -1177,17 +1185,38 @@ For each warning:
         """Save checkpoint for recovery"""
         logger.info(f"Checkpointing {test_type.value} test cycle at iteration {test_cycle_iteration}")
 
-        # Implementation would integrate with state_management/checkpointing.py
-        # For now, just log
-        checkpoint_data = {
-            "stage": self.name,
-            "test_type": test_type.value,
-            "test_cycle_iteration": test_cycle_iteration,
-            "agent_call_count": self._agent_call_count,
-            "timestamp": utc_isoformat(),
-        }
-
-        logger.info(f"Checkpoint data: {json.dumps(checkpoint_data, indent=2)}")
+        # Get checkpoint manager from context or create one
+        from pipeline.repair_cycle_checkpoint import RepairCycleCheckpoint, create_checkpoint_state
+        
+        project_dir = context.get('project_dir')
+        if not project_dir:
+            logger.warning("No project_dir in context, skipping checkpoint")
+            return
+        
+        checkpoint_manager = RepairCycleCheckpoint(project_dir)
+        
+        # Create checkpoint state
+        checkpoint_state = create_checkpoint_state(
+            project=context.get('project', 'unknown'),
+            issue_number=context.get('issue_number', 0),
+            pipeline_run_id=context.get('pipeline_run_id', 'unknown'),
+            stage_name=self.name,
+            test_type=test_type.value,
+            test_type_index=self.test_configs.index(
+                next(tc for tc in self.test_configs if tc.test_type == test_type)
+            ),
+            iteration=test_cycle_iteration,
+            agent_call_count=self._agent_call_count,
+            files_fixed=[],  # TODO: Track files fixed
+            test_results=None,  # TODO: Track latest test results
+            cycle_results=[]  # TODO: Track completed cycle results
+        )
+        
+        # Save checkpoint
+        if checkpoint_manager.save_checkpoint(checkpoint_state):
+            logger.info(f"Checkpoint saved successfully at iteration {test_cycle_iteration}")
+        else:
+            logger.error(f"Failed to save checkpoint at iteration {test_cycle_iteration}")
 
     def _emit_cycle_metrics(self, cycle_result: CycleResult, context: Dict[str, Any]):
         """Emit observability metrics for a completed cycle"""

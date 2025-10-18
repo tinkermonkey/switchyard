@@ -47,6 +47,12 @@ class SeniorSoftwareEngineerAgent(MakerAgent):
         """Override to provide code implementation guidelines"""
         return """
 Implement the code changes to meet the requirements specified.
+
+**Important Implementation Guidelines**:
+- Don't over-engineer. Implement only what is necessary to meet the requirements
+- Focus on re-use of existing code, libraries and patterns
+- Don't name files "phase 1", "phase 2", etc. Use descriptive names
+- Don't create reports or documentation, your output should be code only
 """
 
     def _build_initial_prompt(self, task_context: Dict[str, Any]) -> str:

@@ -137,7 +137,7 @@ export default function Header() {
   return (
     <div className="space-y-3">
       {/* System Health Alert Banner */}
-      {systemHealth && (healthStatus === 'unhealthy' || healthStatus === 'degraded' || healthStatus === 'starting' || healthStatus === 'error') && (
+      {systemHealth && (healthStatus === 'unhealthy' || healthStatus === 'error' || healthStatus === 'starting' || (healthStatus === 'degraded' && unhealthyComponents.length > 0)) && (
         <div className={`p-4 rounded-md border ${healthStatus === 'error' || healthStatus === 'unhealthy'
           ? 'bg-red-50 dark:bg-red-900/20 border-gh-danger'
           : 'bg-yellow-50 dark:bg-yellow-900/20 border-yellow-500'
@@ -271,9 +271,9 @@ export default function Header() {
             {connected && (
               <>
                 <HeaderActiveAgents />
+                <HeaderClaudeUsage />
                 <HeaderSystemHealth />
                 <HeaderCircuitBreakers />
-                <HeaderClaudeUsage />
               </>
             )}
           </div>

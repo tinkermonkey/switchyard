@@ -109,6 +109,11 @@ export function SocketProvider({ children }) {
     })
 
     socketInstance.on('claude_stream_event', (data) => {
+      console.log('[SocketContext] Received claude_stream_event:', {
+        agent: data.agent,
+        timestamp: data.timestamp,
+        hasEvent: !!data.event
+      })
       setLogs(prev => [...prev, data].slice(-200))
     })
 

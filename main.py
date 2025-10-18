@@ -1,7 +1,12 @@
 import asyncio
 import threading
 import time
+import signal
+import os
+import logging
 from pathlib import Path
+from elasticsearch import Elasticsearch
+from elasticsearch.exceptions import ConnectionError as ESConnectionError
 
 from flask.cli import F
 from monitoring.timestamp_utils import utc_now, utc_isoformat
@@ -21,7 +26,87 @@ from services.scheduled_tasks import get_scheduled_tasks_service
 from services.dev_container_state import dev_container_state
 from agents.orchestrator_integration import process_task_integrated
 
+
+def wait_for_elasticsearch(max_retries=30, retry_delay=2):
+    """
+    Wait for Elasticsearch to be ready before proceeding with startup.
+    
+    This prevents cleanup operations from failing due to Elasticsearch 
+    not being ready yet when the orchestrator starts.
+    
+    Args:
+        max_retries: Maximum number of connection attempts (default: 30)
+        retry_delay: Delay in seconds between retries (default: 2)
+        
+    Returns:
+        True if Elasticsearch is ready, False if max retries exceeded
+    """
+    logger = logging.getLogger("orchestrator")
+    es_host = os.environ.get('ELASTICSEARCH_HOST', 'elasticsearch:9200')
+    
+    logger.info(f"Waiting for Elasticsearch at {es_host} to be ready...")
+    
+    for attempt in range(1, max_retries + 1):
+        try:
+            es = Elasticsearch([f"http://{es_host}"])
+            
+            # Try to ping Elasticsearch
+            if es.ping():
+                # Also verify we can actually query (ensures indices are ready)
+                es.cluster.health(wait_for_status='yellow', timeout='5s')
+                logger.info(f"Elasticsearch is ready (attempt {attempt}/{max_retries})")
+                return True
+            else:
+                logger.debug(f"Elasticsearch ping failed (attempt {attempt}/{max_retries})")
+                
+        except ESConnectionError as e:
+            logger.debug(f"Elasticsearch connection refused (attempt {attempt}/{max_retries}): {e}")
+        except Exception as e:
+            logger.warning(f"Elasticsearch health check failed (attempt {attempt}/{max_retries}): {e}")
+        
+        if attempt < max_retries:
+            time.sleep(retry_delay)
+    
+    logger.error(f"Elasticsearch did not become ready after {max_retries} attempts")
+    return False
+
+
+def setup_zombie_process_reaper():
+    """
+    Setup SIGCHLD signal handler to automatically reap zombie child processes.
+    
+    This is critical for long-running processes that spawn many subprocesses
+    (especially from daemon threads), as Python's automatic subprocess cleanup
+    doesn't always work correctly when subprocess.run() is called from threads
+    with custom asyncio event loops.
+    
+    Without this, git processes and other subprocess calls accumulate as zombies,
+    eventually causing resource exhaustion and mysterious hanging behavior.
+    """
+    def sigchld_handler(signum, frame):
+        """Reap all zombie child processes"""
+        # Use WNOHANG to avoid blocking
+        while True:
+            try:
+                pid, status = os.waitpid(-1, os.WNOHANG)
+                if pid == 0:
+                    # No more zombie processes
+                    break
+            except ChildProcessError:
+                # No child processes
+                break
+            except Exception:
+                # Ignore other errors in signal handler
+                break
+    
+    # Register the signal handler
+    signal.signal(signal.SIGCHLD, sigchld_handler)
+
 async def main():
+    # Setup zombie process reaper FIRST before any other initialization
+    # This prevents accumulation of defunct child processes from subprocess calls
+    setup_zombie_process_reaper()
+    
     # Load configuration
     env_config = Environment()
 
@@ -42,6 +127,7 @@ async def main():
         root_logger.addHandler(console)
 
     root_logger.info("=== Orchestrator starting up ===")
+    root_logger.info("Zombie process reaper enabled (SIGCHLD handler registered)")
 
     metrics = MetricsCollector()
 
@@ -62,6 +148,27 @@ async def main():
     projects_needing_setup = workspace_manager.initialize_all_projects()
     logger.info("Project workspaces initialized")
 
+    # Wait for Elasticsearch to be ready before cleanup operations
+    # This prevents cleanup failures when Elasticsearch isn't ready yet
+    elasticsearch_ready = wait_for_elasticsearch(max_retries=30, retry_delay=2)
+    if not elasticsearch_ready:
+        logger.warning(
+            "Elasticsearch is not ready - some cleanup operations may be skipped. "
+            "Pipeline runs and events will not be cleaned up properly."
+        )
+
+    # NEW: Recover or cleanup running agent containers first
+    logger.info("Recovering or cleaning up running agent containers")
+    from services.agent_container_recovery import get_agent_container_recovery
+    container_recovery = get_agent_container_recovery()
+    recovered, killed, errors = container_recovery.recover_or_cleanup_containers()
+    logger.info(f"Container recovery: {recovered} recovered, {killed} killed, {errors} errors")
+
+    # NEW: Recover or cleanup running repair cycle containers
+    logger.info("Recovering or cleaning up running repair cycle containers")
+    rc_recovered, rc_killed, rc_errors = container_recovery.recover_or_cleanup_repair_cycle_containers()
+    logger.info(f"Repair cycle container recovery: {rc_recovered} recovered, {rc_killed} killed, {rc_errors} errors")
+
     # Clean up orphaned Redis keys from agent containers that completed after orchestrator restart
     logger.info("Cleaning up orphaned agent container tracking keys")
     from claude.docker_runner import DockerAgentRunner
@@ -69,24 +176,31 @@ async def main():
     logger.info("Orphaned Redis key cleanup complete")
 
     # Clean up stuck in_progress execution states from interrupted agent runs
+    # This now runs AFTER container recovery, so it won't clean up states for recovered containers
     logger.info("Cleaning up stuck in_progress execution states")
     from services.work_execution_state import work_execution_tracker
     work_execution_tracker.cleanup_stuck_in_progress_states()
     logger.info("Execution state cleanup complete")
     
-    # Clean up stale active pipeline runs
-    logger.info("Cleaning up stale active pipeline runs")
-    from services.pipeline_run import get_pipeline_run_manager
-    pipeline_run_manager = get_pipeline_run_manager()
-    pipeline_run_manager.cleanup_stale_active_runs_on_startup()
-    logger.info("Pipeline run cleanup complete")
+    # Clean up stale active pipeline runs (requires Elasticsearch)
+    if elasticsearch_ready:
+        logger.info("Cleaning up stale active pipeline runs")
+        from services.pipeline_run import get_pipeline_run_manager
+        pipeline_run_manager = get_pipeline_run_manager()
+        pipeline_run_manager.cleanup_stale_active_runs_on_startup()
+        logger.info("Pipeline run cleanup complete")
+    else:
+        logger.warning("Skipping pipeline run cleanup - Elasticsearch not available")
     
-    # Clean up stale agent events from Redis stream
-    logger.info("Cleaning up stale agent events from Redis stream")
-    from monitoring.observability import get_observability_manager
-    observability = get_observability_manager()
-    observability.cleanup_stale_agent_events_on_startup()
-    logger.info("Stale agent event cleanup complete")
+    # Clean up stale agent events from Redis stream (requires Elasticsearch)
+    if elasticsearch_ready:
+        logger.info("Cleaning up stale agent events from Redis stream")
+        from monitoring.observability import get_observability_manager
+        observability = get_observability_manager()
+        observability.cleanup_stale_agent_events_on_startup()
+        logger.info("Stale agent event cleanup complete")
+    else:
+        logger.warning("Skipping agent event cleanup - Elasticsearch not available")
 
     # Verify Docker images for all projects marked as verified
     # This handles cases where Docker context changed or images were lost
@@ -128,8 +242,9 @@ async def main():
             task_queue.enqueue(task)
             logger.info(f"Queued dev_environment_setup task: {task.id}")
 
-    # Reconcile all projects on startup
-    projects = config_manager.list_projects()
+    # Reconcile all visible (non-hidden) projects on startup
+    # Hidden projects (like test-project) are excluded from normal operations
+    projects = config_manager.list_visible_projects()
     for project_name in projects:
         failure_count = 0
         # Always verify boards exist in GitHub, even if config hasn't changed

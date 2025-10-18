@@ -8,6 +8,14 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+# Import Claude Code breaker for token limit detection
+try:
+    from monitoring.claude_code_breaker import get_breaker
+except ImportError:
+    # Fallback if module not available
+    def get_breaker():
+        return None
+
 
 class DockerAgentRunner:
     """Runs Claude Code agents in isolated Docker containers"""
@@ -187,6 +195,19 @@ class DockerAgentRunner:
         # docker_cmd structure: ['docker', 'run', '--rm', '--name', 'name', ..., 'image']
         test_cmd = docker_cmd[:-1]  # Remove the image name
 
+        # Remove all -e environment variables to avoid gh auth warnings in write test
+        filtered_cmd = []
+        skip_next = False
+        for i, arg in enumerate(test_cmd):
+            if skip_next:
+                skip_next = False
+                continue
+            if arg == '-e':
+                skip_next = True  # Skip the next argument (the env var value)
+                continue
+            filtered_cmd.append(arg)
+        test_cmd = filtered_cmd
+
         # Replace the container name if it exists
         if '--name' in test_cmd:
             name_index = test_cmd.index('--name')
@@ -262,6 +283,20 @@ class DockerAgentRunner:
         project = context.get('project', 'unknown')
 
         logger.info(f"Running agent {agent} in Docker container for project {project}")
+        
+        # Check Claude Code circuit breaker before launching agent
+        breaker = get_breaker()
+        if breaker and breaker.is_open():
+            can_execute, error_msg = (False, "Circuit breaker open")
+        else:
+            can_execute, error_msg = (True, None)
+            
+        if not can_execute:
+            from monitoring.claude_code_breaker import check_breaker_before_agent_execution
+            can_execute, error_msg = check_breaker_before_agent_execution(agent)
+            if not can_execute:
+                logger.error(f"Agent execution blocked: {error_msg}")
+                raise Exception(error_msg)
 
         # Prepare MCP configuration if needed
         mcp_config = None
@@ -421,7 +456,14 @@ class DockerAgentRunner:
 
             # Environment variables
             '-e', f'GITHUB_TOKEN={os.environ.get("GITHUB_TOKEN", "")}',
+            '-e', 'GH_AUTH_SETUP_REQUIRED=true',
         ])
+        
+        # Pass PIPELINE_RUN_ID if available in context (for event tracking)
+        pipeline_run_id = context.get('pipeline_run_id')
+        if pipeline_run_id:
+            cmd.extend(['-e', f'PIPELINE_RUN_ID={pipeline_run_id}'])
+            logger.info(f"Passing PIPELINE_RUN_ID={pipeline_run_id} to agent container")
 
         # Pass CLAUDE_CODE_OAUTH_TOKEN if available (subscription), else ANTHROPIC_API_KEY (pay-per-use)
         oauth_token = os.environ.get('CLAUDE_CODE_OAUTH_TOKEN', '').strip()
@@ -557,8 +599,30 @@ class DockerAgentRunner:
         # Always pass prompt via stdin (use '-' to tell claude to read from stdin)
         claude_cmd.append('-')
 
-        # Combine docker command with claude command
-        full_cmd = docker_cmd + claude_cmd
+        # Prepare the command - if we have GITHUB_TOKEN, wrap with gh auth setup
+        github_token = os.environ.get('GITHUB_TOKEN')
+        logger.info(f"DEBUG: Checking for GITHUB_TOKEN, got: {'***' if github_token else 'None'}")
+        if github_token:
+            # Create a wrapper that sets up gh with token, then runs claude
+            # Use printf for reliable YAML generation
+            yaml_content = (
+                'version: 1\\n'
+                'auth:\\n'
+                '  github.com:\\n'
+                '    oauth_token: $GITHUB_TOKEN\\n'
+                '    git_protocol: https\\n'
+            )
+            setup_and_run = (
+                'mkdir -p ~/.config/gh && '
+                f'printf \'{yaml_content}\' > ~/.config/gh/hosts.yml && '
+                'exec ' + ' '.join(claude_cmd)
+            )
+            docker_cmd_with_entrypoint = docker_cmd + ['sh', '-c', setup_and_run]
+            logger.info("Added gh configuration setup before claude execution")
+            full_cmd = docker_cmd_with_entrypoint
+        else:
+            # Combine docker command with claude command directly
+            full_cmd = docker_cmd + claude_cmd
 
         logger.info(f"Executing: docker run ... claude ...")
         # Log the complete docker command (sanitize tokens)
@@ -664,6 +728,14 @@ class DockerAgentRunner:
                         input_tokens = event['usage'].get('input_tokens', input_tokens)
                         output_tokens = event['usage'].get('output_tokens', output_tokens)
 
+                    # CRITICAL: Capture error events (including session limit errors)
+                    # These come on stdout as JSON, not stderr!
+                    if event_type in ('error', 'error_detail', 'error_event'):
+                        error_msg = event.get('message') or event.get('error') or str(event)
+                        error_text = f"CLAUDE_CODE_ERROR ({event_type}): {error_msg}"
+                        logger.error(f"🔴 Captured Claude Code error event: {error_text}")
+                        stderr_parts.append(f"{error_text}\n")
+
                     # Collect result text from assistant messages only
                     # Note: Do not collect from 'result' events as they duplicate the assistant content
                     if event_type == 'assistant':
@@ -673,6 +745,12 @@ class DockerAgentRunner:
                             if isinstance(item, dict) and item.get('type') == 'text':
                                 text = item.get('text', '')
                                 if text:
+                                    # CRITICAL: Check for session limit in assistant response text!
+                                    # Claude returns "Session limit reached ∙ resets 12am" as assistant text
+                                    if 'session limit' in text.lower():
+                                        logger.error(f"🔴 Detected session limit in assistant response: {text}")
+                                        stderr_parts.append(f"SESSION_LIMIT_IN_RESPONSE: {text}\n")
+                                    
                                     result_parts.append(text)
 
                 except json.JSONDecodeError:
@@ -706,6 +784,19 @@ class DockerAgentRunner:
             else:
                 stderr_text = ''.join(stderr_parts) if stderr_parts else "No error output captured"
                 logger.error(f"Agent failed in container (returncode={process.returncode}): {stderr_text}")
+                
+                # Check for Claude Code session limit error and trip breaker if detected
+                breaker = get_breaker()
+                if breaker:
+                    is_session_limited, reset_time = breaker.detect_session_limit(stderr_text)
+                    if is_session_limited:
+                        breaker.trip(reset_time)
+                        logger.error("🔴 Claude Code token limit detected - circuit breaker OPEN")
+                        
+                        # Mark all in-progress executions as failed
+                        from services.claude_code_failure_handler import mark_in_progress_executions_as_failed
+                        mark_in_progress_executions_as_failed("Claude Code session limit reached")
+                
                 raise Exception(f"Agent execution failed (returncode={process.returncode}): {stderr_text}")
 
         except subprocess.TimeoutExpired:

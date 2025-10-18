@@ -15,6 +15,8 @@ from typing import Optional, Dict, Any, List
 from dataclasses import dataclass
 from datetime import datetime
 
+from services.github_api_client import get_github_client
+
 logger = logging.getLogger(__name__)
 
 
@@ -86,23 +88,19 @@ class GitWorkflowManager:
             Dict with pr_number, pr_url, created (bool)
         """
         branch_info = self.get_branch_info(project, issue_number)
-        
-        # If no branch found, check if this is a sub-issue with a parent
+
+        # If no branch found, try to find feature branch for this issue (parent or sub-issue)
         if not branch_info:
             try:
                 from services.feature_branch_manager import feature_branch_manager
-                # Check if there's a feature branch for a parent issue
-                all_feature_branches = feature_branch_manager.get_all_feature_branches(project)
-                for feature_branch in all_feature_branches:
-                    if any(si.number == issue_number for si in feature_branch.sub_issues):
-                        logger.info(f"Issue #{issue_number} is sub-issue of #{feature_branch.parent_issue}, using parent's branch")
-                        # Track this sub-issue against the parent's branch for future PR operations
-                        self.track_branch(project, issue_number, feature_branch.branch_name)
-                        branch_info = self.get_branch_info(project, issue_number)
-                        break
+                feature_branch = feature_branch_manager.get_feature_branch_for_issue(project, issue_number)
+                if feature_branch:
+                    logger.info(f"Found feature branch for issue #{issue_number}: {feature_branch.branch_name}")
+                    self.track_branch(project, issue_number, feature_branch.branch_name)
+                    branch_info = self.get_branch_info(project, issue_number)
             except Exception as e:
-                logger.warning(f"Could not check for parent issue branch: {e}")
-        
+                logger.warning(f"Could not check for feature branch for issue #{issue_number}: {e}", exc_info=True)
+
         if not branch_info:
             logger.error(f"No branch tracked for issue #{issue_number}")
             return {'success': False, 'error': 'No branch tracked'}
@@ -156,6 +154,13 @@ class GitWorkflowManager:
                 branch_info.pr_number = pr_number
                 branch_info.pr_url = pr_url
                 branch_info.pr_state = 'draft' if draft else 'open'
+
+                # Track the API call
+                github_client = get_github_client()
+                github_client.track_gh_operation(
+                    'gh_pr_create',
+                    f"Created PR #{pr_number} for issue #{issue_number} in {org}/{repo}"
+                )
 
                 logger.info(f"Created PR #{pr_number} for issue #{issue_number}: {pr_url}")
 
@@ -233,6 +238,14 @@ class GitWorkflowManager:
 
                 if result.returncode == 0:
                     branch_info.pr_state = 'open'
+                    
+                    # Track the API call
+                    github_client = get_github_client()
+                    github_client.track_gh_operation(
+                        'gh_pr_ready',
+                        f"Marked PR #{pr_number} as ready for review in {org}/{repo}"
+                    )
+                    
                     logger.info(f"Marked PR #{pr_number} as ready for review")
                     return True
                 else:
@@ -250,6 +263,13 @@ class GitWorkflowManager:
                 )
 
                 if result.returncode == 0:
+                    # Track the API call
+                    github_client = get_github_client()
+                    github_client.track_gh_operation(
+                        'gh_pr_edit_add_label',
+                        f"Added 'approved' label to PR #{pr_number} in {org}/{repo}"
+                    )
+                    
                     logger.info(f"Added 'approved' label to PR #{pr_number}")
                     return True
                 else:
@@ -293,6 +313,13 @@ class GitWorkflowManager:
                 import json
                 prs = json.loads(result.stdout)
                 if prs:
+                    # Track the API call
+                    github_client = get_github_client()
+                    github_client.track_gh_operation(
+                        'gh_pr_list',
+                        f"Retrieved existing PR for branch {branch_name} in {org}/{repo}"
+                    )
+                    
                     return {
                         'number': prs[0]['number'],
                         'url': prs[0]['url'],
@@ -378,8 +405,38 @@ class GitWorkflowManager:
             return False
 
     async def checkout_branch(self, project_dir: str, branch_name: str) -> bool:
-        """Checkout a git branch"""
+        """Checkout a git branch, handling dirty working directory"""
         try:
+            # Check for uncommitted changes
+            status_result = subprocess.run(
+                ['git', 'status', '--porcelain'],
+                cwd=project_dir,
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+            
+            has_changes = bool(status_result.stdout.strip())
+            
+            if has_changes:
+                logger.info(f"Working directory has uncommitted changes, stashing before checkout")
+                
+                # Stash changes including untracked files
+                stash_result = subprocess.run(
+                    ['git', 'stash', 'push', '--include-untracked', '-m', f'Auto-stash before checkout {branch_name}'],
+                    cwd=project_dir,
+                    capture_output=True,
+                    text=True,
+                    timeout=30
+                )
+                
+                if stash_result.returncode != 0:
+                    logger.error(f"Failed to stash changes: {stash_result.stderr}")
+                    raise Exception(f"Failed to stash changes: {stash_result.stderr}")
+                
+                logger.info("Successfully stashed uncommitted changes")
+            
+            # Now checkout the branch
             result = subprocess.run(
                 ['git', 'checkout', branch_name],
                 cwd=project_dir,
@@ -393,11 +450,11 @@ class GitWorkflowManager:
                 return True
             else:
                 logger.error(f"Failed to checkout branch {branch_name}: {result.stderr}")
-                return False
+                raise Exception(f"Failed to checkout branch {branch_name}: {result.stderr}")
 
         except Exception as e:
             logger.error(f"Failed to checkout branch: {e}")
-            return False
+            raise
 
     async def pull_branch(self, project_dir: str) -> bool:
         """Pull latest changes from remote"""

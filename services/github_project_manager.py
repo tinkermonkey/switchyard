@@ -16,6 +16,7 @@ import logging
 
 from config.manager import ConfigManager, ProjectConfig, WorkflowTemplate
 from config.state_manager import GitHubStateManager
+from services.github_api_client import get_github_client
 
 logger = logging.getLogger(__name__)
 
@@ -190,6 +191,8 @@ class GitHubProjectManager:
 
             # Create the GitHub project at the organization level first
             # Then link it to the repository to make it repository-scoped
+            github_client = get_github_client()
+            
             cmd = [
                 'gh', 'project', 'create',
                 '--owner', project_config.github['org'],
@@ -197,9 +200,19 @@ class GitHubProjectManager:
                 '--format', 'json'
             ]
 
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-            project_data = json.loads(result.stdout)
-
+            success, result = github_client.gh_cli(cmd)
+            if not success:
+                logger.error(f"Failed to create GitHub project board '{pipeline_config.board_name}' for {project_name}")
+                logger.error(f"Error: {result}")
+                
+                # Automatically diagnose the issue
+                logger.error("AUTOMATIC DIAGNOSTICS:")
+                await self._diagnose_github_issue(project_config.github['org'])
+                
+                logger.error("Orchestrator cannot manage GitHub projects without successful board creation")
+                return None
+            
+            project_data = result
             project_id = project_data.get('id')
             project_number = project_data.get('number')
             node_id = project_data.get('node_id')
@@ -212,11 +225,12 @@ class GitHubProjectManager:
                 '--owner', project_config.github['org'],
                 '--repo', project_config.github['repo']
             ]
-            try:
-                subprocess.run(link_cmd, capture_output=True, text=True, check=True)
+            
+            link_success, link_result = github_client.gh_cli(link_cmd)
+            if link_success:
                 logger.info(f"Linked project #{project_number} to repository {project_config.github['repo']}")
-            except subprocess.CalledProcessError as link_error:
-                logger.warning(f"Failed to link project to repository: {link_error.stderr}")
+            else:
+                logger.warning(f"Failed to link project to repository: {link_result}")
                 logger.warning("Project created but not linked to repository - will be org-level instead of repo-level")
 
             # Configure columns
@@ -239,32 +253,33 @@ class GitHubProjectManager:
                 'title': f"{project_name} - {pipeline_config.description}"
             }
 
-        except subprocess.CalledProcessError as e:
-            logger.error(f"Failed to create GitHub project board '{pipeline_config.board_name}' for {project_name}")
-            logger.error(f"GitHub CLI command failed with exit code {e.returncode}")
-            logger.error(f"Command: {' '.join(e.cmd)}")
-            if e.stdout:
-                logger.error(f"STDOUT: {e.stdout}")
-            if e.stderr:
-                logger.error(f"STDERR: {e.stderr}")
-
+        except Exception as e:
+            logger.error(f"Failed to create GitHub project board '{pipeline_config.board_name}' for {project_name}: {e}")
+            
             # Automatically diagnose the issue
             logger.error("AUTOMATIC DIAGNOSTICS:")
-            await self._diagnose_github_issue(project_config.github['org'])
-
+            try:
+                await self._diagnose_github_issue(project_config.github['org'])
+            except:
+                pass
+            
             logger.error("Orchestrator cannot manage GitHub projects without successful board creation")
-            return None
-        except json.JSONDecodeError as e:
-            logger.error(f"Failed to parse GitHub CLI response for board '{pipeline_config.board_name}': {e}")
             return None
 
     async def _configure_board_columns(self, project_number: int, workflow_template: WorkflowTemplate, github_org: str) -> List[Dict[str, str]]:
         """Configure project board columns using GraphQL"""
         try:
+            github_client = get_github_client()
+            
             # Get the project's field information using project number
             cmd = ['gh', 'project', 'field-list', str(project_number), '--owner', github_org, '--format', 'json']
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-            fields_data = json.loads(result.stdout)
+            success, result = github_client.gh_cli(cmd)
+            
+            if not success:
+                logger.error(f"Failed to get project fields: {result}")
+                return []
+            
+            fields_data = result
 
             # Find the Status field
             status_field = None
@@ -340,10 +355,6 @@ class GitHubProjectManager:
             List of option dictionaries with 'id' and 'name' keys, or None on failure
         """
         try:
-            # Get GitHub token
-            token_result = subprocess.run(['gh', 'auth', 'token'], capture_output=True, text=True, check=True)
-            token = token_result.stdout.strip()
-
             # GraphQL mutation to update field options
             mutation = """
             mutation UpdateProjectV2Field($input: UpdateProjectV2FieldInput!) {
@@ -369,31 +380,18 @@ class GitHubProjectManager:
                 }
             }
 
-            # Make GraphQL request
-            headers = {
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json"
-            }
+            # Make GraphQL request using the client
+            github_client = get_github_client()
+            success, result = github_client.graphql(mutation, variables)
 
-            response = requests.post(
-                "https://api.github.com/graphql",
-                json={"query": mutation, "variables": variables},
-                headers=headers
-            )
-
-            if response.status_code == 200:
-                result_data = response.json()
-                if "errors" in result_data:
-                    logger.error(f"GraphQL errors: {result_data['errors']}")
-                    return None
-                else:
-                    # Extract the option IDs from the response
-                    field_data = result_data.get('data', {}).get('updateProjectV2Field', {}).get('projectV2Field', {})
-                    returned_options = field_data.get('options', [])
-                    logger.info(f"Configured {len(returned_options)} columns via GraphQL")
-                    return returned_options
+            if success:
+                # Extract the option IDs from the response
+                field_data = result.get('updateProjectV2Field', {}).get('projectV2Field', {})
+                returned_options = field_data.get('options', [])
+                logger.info(f"Configured {len(returned_options)} columns via GraphQL")
+                return returned_options
             else:
-                logger.error(f"GraphQL request failed: {response.status_code}")
+                logger.error(f"GraphQL request failed: {result}")
                 return None
 
         except Exception as e:

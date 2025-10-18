@@ -57,7 +57,8 @@ RUN if [ "${DOCKER_GID}" = "0" ]; then \
     fi && \
     mkdir -p /home/orchestrator/.ssh && \
     chown orchestrator:orchestrator /home/orchestrator/.ssh && \
-    chmod 700 /home/orchestrator/.ssh
+    chmod 700 /home/orchestrator/.ssh && \
+    rm -rf /home/orchestrator/.gitconfig /home/orchestrator/.orchestrator
 
 # Install Python dependencies
 COPY requirements.txt .
