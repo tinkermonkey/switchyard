@@ -782,7 +782,29 @@ class DockerAgentRunner:
                 # Return just the result text (callers expect string, not dict)
                 return result_text
             else:
-                stderr_text = ''.join(stderr_parts) if stderr_parts else "No error output captured"
+                # Collect error information
+                stderr_text = ''.join(stderr_parts) if stderr_parts else ""
+                
+                # If no stderr captured, try to get container logs
+                if not stderr_text:
+                    try:
+                        logger.warning(f"No stderr captured, attempting to fetch container logs for {container_name}")
+                        logs_result = subprocess.run(
+                            ['docker', 'logs', '--tail', '100', container_name],
+                            capture_output=True,
+                            text=True,
+                            timeout=5
+                        )
+                        if logs_result.stdout or logs_result.stderr:
+                            stderr_text = f"Container logs (last 100 lines):\n{logs_result.stdout}\n{logs_result.stderr}"
+                            logger.info(f"Captured container logs: {len(stderr_text)} chars")
+                    except Exception as log_err:
+                        logger.warning(f"Failed to fetch container logs: {log_err}")
+                
+                # Final fallback
+                if not stderr_text:
+                    stderr_text = "No error output captured. Container may have crashed or been killed."
+                
                 logger.error(f"Agent failed in container (returncode={process.returncode}): {stderr_text}")
                 
                 # Check for Claude Code session limit error and trip breaker if detected

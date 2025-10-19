@@ -441,6 +441,57 @@ class ProjectMonitor:
 
         return []  # Should never reach here, but just in case
 
+    async def get_issue_column_async(self, project_name: str, board_name: str, issue_number: int) -> Optional[str]:
+        """
+        Get the current column/status for a specific issue asynchronously
+        
+        Args:
+            project_name: Project name (e.g., 'what_am_i_watching')
+            board_name: Board/pipeline name (e.g., 'Planning & Design')
+            issue_number: GitHub issue number
+            
+        Returns:
+            Column name (status) if found, None otherwise
+        """
+        try:
+            from config.manager import config_manager
+            import asyncio
+            
+            # Get project config
+            project_config = config_manager.get_project_config(project_name)
+            
+            # Find the board state
+            board_state = None
+            for pipeline in project_config.pipelines:
+                if pipeline.board_name == board_name:
+                    board_state = self.board_state.get(f"{project_name}_{board_name}")
+                    break
+            
+            if not board_state:
+                logger.debug(f"No board state found for {project_name}/{board_name}")
+                return None
+            
+            # Query project items (run in thread pool to avoid blocking)
+            loop = asyncio.get_event_loop()
+            items = await loop.run_in_executor(
+                None, 
+                self.get_project_items,
+                project_config.github['org'],
+                board_state.project_number
+            )
+            
+            # Find the specific issue
+            for item in items:
+                if item.issue_number == issue_number:
+                    return item.status
+                    
+            logger.debug(f"Issue #{issue_number} not found in {project_name}/{board_name}")
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error getting column for issue #{issue_number}: {e}")
+            return None
+
     def detect_changes(self, project_name: str, current_items: List[ProjectItem]) -> List[Dict[str, Any]]:
         """Detect changes in project items since last poll"""
         changes = []
@@ -2108,7 +2159,33 @@ _Review cycle initiated by Claude Code Orchestrator_
                     )
                 )
                 
-                # Auto-advance if successful
+                # NOTE: Execution outcome is recorded in finally block to ensure it happens even on error
+                
+                # Auto-commit changes if repair cycle succeeded (BEFORE auto-advance to ensure code is pushed first)
+                if overall_success:
+                    try:
+                        logger.info(f"Auto-committing repair cycle changes for issue #{issue_number}")
+                        from services.auto_commit import auto_commit_service
+                        
+                        commit_success = loop.run_until_complete(
+                            auto_commit_service.commit_agent_changes(
+                                project=project_name,
+                                agent='repair_cycle',
+                                task_id=f'repair_cycle_{issue_number}',
+                                issue_number=issue_number,
+                                custom_message=f"Complete repair cycle for issue #{issue_number}\n\nAutomated test-fix-validate cycle completed successfully.\nAll tests passing."
+                            )
+                        )
+                        
+                        if commit_success:
+                            logger.info(f"Successfully committed repair cycle changes for issue #{issue_number}")
+                        else:
+                            logger.warning(f"No changes to commit for repair cycle on issue #{issue_number}")
+                    except Exception as e:
+                        logger.error(f"Failed to auto-commit repair cycle changes: {e}", exc_info=True)
+                        # Don't fail the repair cycle if commit fails - changes are still in workspace
+                
+                # Auto-advance if successful (AFTER commit to ensure code is pushed before moving to next stage)
                 if overall_success:
                     current_index = next(
                         (i for i, col in enumerate(workflow_template.columns) if col.name == status),
@@ -2130,8 +2207,6 @@ _Review cycle initiated by Claude Code Orchestrator_
                             trigger='repair_cycle_completion'
                         )
                         logger.info(f"Successfully moved issue #{issue_number} to {next_column.name}")
-                
-                # NOTE: Execution outcome is recorded in finally block to ensure it happens even on error
                 
                 # Cleanup repair cycle state files (only on success)
                 if overall_success:

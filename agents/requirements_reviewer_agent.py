@@ -210,7 +210,7 @@ Business Analyst's Output:
 - Your response should begin directly with the review format shown below
 
 Provide a comprehensive review focusing on:
-1. **Simplicity**: Do the requirements avoid unnecessary complexity?
+1. **Simplicity**: Do the requirements avoid unnecessary complexity? Is there anything that can be removed or simplified?
 2. **Clarity**: Are the requirements clearly and unambiguously stated?
 3. **Completeness**: Are all aspects of the issue addressed?
 4. **Context awareness**: Do the requirements consider the broader project context? Do they align with project goals and constraints? Do they reuse existing components where possible?

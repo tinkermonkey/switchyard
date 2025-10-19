@@ -252,9 +252,35 @@ class HumanFeedbackLoopExecutor:
 
             # Check if card has moved to a different column
             # This would indicate human intervention or workflow progression
-            # For now, we rely on the daemon thread terminating with the process
-            # In the future, we could query GitHub to check current column
-            # and exit gracefully if the card has moved
+            try:
+                from services.project_monitor import ProjectMonitor
+                monitor = ProjectMonitor()
+                
+                # Get current column for this issue
+                current_column = await monitor.get_issue_column_async(
+                    state.project_name,
+                    state.board_name,
+                    state.issue_number
+                )
+                
+                # If issue has moved to a different column, or to Backlog, stop monitoring
+                if current_column and current_column != column.name:
+                    logger.info(
+                        f"Issue #{state.issue_number} moved from '{column.name}' to '{current_column}'. "
+                        f"Stopping feedback monitoring."
+                    )
+                    return (None, True)  # Exit the loop
+                
+                # Special case: If issue is in Backlog (no agent), stop monitoring
+                if current_column and current_column.lower() == 'backlog':
+                    logger.info(
+                        f"Issue #{state.issue_number} is in Backlog column. "
+                        f"Stopping feedback monitoring."
+                    )
+                    return (None, True)  # Exit the loop
+                    
+            except Exception as e:
+                logger.debug(f"Could not check current column (will continue monitoring): {e}")
 
     async def _execute_agent(
         self,

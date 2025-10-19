@@ -26,13 +26,14 @@ class IdeaResearcherAgent(AnalysisAgent):
 
     @property
     def agent_role_description(self) -> str:
-        return "I conduct technical research and concept analysis, exploring solution landscapes, prior art, and architectural implications."
+        return "I conduct business research and concept analysis, exploring solution landscapes, prior art, and architectural implications."
 
     @property
     def output_sections(self) -> List[str]:
         return [
-            "Problem Abstraction",
             "Executive Summary",
+            "Idea Exploration",
+            "Potential Directions"
             "References and Prior Art",
             "Technical Considerations"
         ]
@@ -43,16 +44,10 @@ class IdeaResearcherAgent(AnalysisAgent):
 
     def get_initial_guidelines(self) -> str:
         return """
-## Research Guidelines
 
-- Break down ideas into core abstract problems
-- Research common solutions and approaches in the industry
-- Find and document prior art (open source, papers, blog posts)
-- Analyze how this would change or extend the current architecture
-- Identify novel aspects vs. established patterns
-- Document trade-offs between different solution strategies
+Please explore and build out the idea through thorough research and analysis so that they can be better communicated and evaluated.
 
-Focus on understanding the landscape before implementation decisions.
+Please don't build requirements of designs yet, focus on research and analysis and enriching the ideas in the ticket.
 
 **Important:** Your reports should returned as markdown content, don't create any files. Provide a succinct, insightful summary and analyses that demonstrate a progression of the idea.
 
