@@ -73,6 +73,9 @@ class WorkBreakdownAgent(AnalysisAgent):
 - Keep phase titles concise: "Phase 1: Infrastructure setup"
 - Do NOT include effort estimates or timeline predictions
 - Focus on WHAT needs to be done in each phase, not HOW long it will take
+
+**IMPORTANT**: The engineer won't be given the full requirements/design again, so ensure each sub-issue is self-contained including all necessary details.
+
 """
 
     def get_quality_standards(self) -> str:
@@ -392,24 +395,50 @@ Make sure to:
 
     def _extract_list_field(self, content: str, field_name: str) -> List[str]:
         """Extract a bulleted list field from markdown content"""
-        # Find the field header
-        pattern = rf'\*\*{re.escape(field_name)}\*\*:\s*\n((?:- .+?\n)+)'
+        # Find the field header and capture until the next field or end
+        pattern = rf'\*\*{re.escape(field_name)}\*\*:\s*\n(.*?)(?=\n\*\*[A-Z]|\Z)'
         match = re.search(pattern, content, re.DOTALL)
         if match:
-            list_content = match.group(1)
-            items = re.findall(r'- (.+)', list_content)
-            return [item.strip() for item in items]
+            list_content = match.group(1).strip()
+            # Extract all list items (handles multi-line items)
+            items = []
+            current_item = None
+            for line in list_content.split('\n'):
+                if line.strip().startswith('- '):
+                    # New list item
+                    if current_item:
+                        items.append(current_item)
+                    current_item = line.strip()[2:]  # Remove '- ' prefix
+                elif line.strip() and current_item is not None:
+                    # Continuation of current item
+                    current_item += ' ' + line.strip()
+            if current_item:
+                items.append(current_item)
+            return items
         return []
 
     def _extract_checklist_field(self, content: str, field_name: str) -> List[str]:
         """Extract a checklist field from markdown content"""
-        # Find the field header
-        pattern = rf'\*\*{re.escape(field_name)}\*\*:\s*\n((?:- \[ \] .+?\n)+)'
+        # Find the field header and capture until the next field or end
+        pattern = rf'\*\*{re.escape(field_name)}\*\*:\s*\n(.*?)(?=\n\*\*[A-Z]|\Z)'
         match = re.search(pattern, content, re.DOTALL)
         if match:
-            list_content = match.group(1)
-            items = re.findall(r'- \[ \] (.+)', list_content)
-            return [item.strip() for item in items]
+            list_content = match.group(1).strip()
+            # Extract all checklist items (handles multi-line items)
+            items = []
+            current_item = None
+            for line in list_content.split('\n'):
+                if line.strip().startswith('- [ ] ') or line.strip().startswith('- [x] '):
+                    # New checklist item
+                    if current_item:
+                        items.append(current_item)
+                    current_item = line.strip()[6:]  # Remove '- [ ] ' or '- [x] ' prefix
+                elif line.strip() and current_item is not None:
+                    # Continuation of current item
+                    current_item += ' ' + line.strip()
+            if current_item:
+                items.append(current_item)
+            return items
         return []
 
     async def _create_sub_issues(
@@ -534,6 +563,120 @@ Make sure to:
                     text=True,
                     check=True
                 )
+
+                # Get the project item ID and set status to "Backlog"
+                try:
+                    # Query to get all project items for this issue
+                    query = f'''{{
+                        repository(owner: "{github_config['org']}", name: "{github_config['repo']}") {{
+                            issue(number: {issue_number}) {{
+                                projectItems(first: 10) {{
+                                    nodes {{
+                                        id
+                                        project {{
+                                            number
+                                            id
+                                            title
+                                        }}
+                                    }}
+                                }}
+                            }}
+                        }}
+                    }}'''
+
+                    result = subprocess.run(
+                        ['gh', 'api', 'graphql', '-f', f'query={query}'],
+                        capture_output=True,
+                        text=True,
+                        check=True
+                    )
+
+                    query_data = json_lib.loads(result.stdout)
+                    project_items = query_data['data']['repository']['issue']['projectItems']['nodes']
+
+                    logger.info(f"Issue #{issue_number} is in {len(project_items)} project(s): {[p['project']['title'] for p in project_items]}")
+
+                    # Find the item ID for the SDLC board and remove from other boards
+                    sdlc_item_id = None
+                    other_project_items = []
+                    
+                    for item in project_items:
+                        if item['project']['number'] == sdlc_board.project_number:
+                            sdlc_item_id = item['id']
+                            logger.info(f"Found issue #{issue_number} in SDLC board (project #{sdlc_board.project_number})")
+                        else:
+                            # Track items in other projects to remove them
+                            other_project_items.append(item)
+                            logger.info(f"Found issue #{issue_number} in other board: {item['project']['title']} (project #{item['project']['number']})")
+
+                    # Remove from other boards (like Planning & Design)
+                    if other_project_items:
+                        logger.info(f"Removing issue #{issue_number} from {len(other_project_items)} non-SDLC board(s)")
+                        for item in other_project_items:
+                            try:
+                                delete_mutation = f'''
+                                mutation {{
+                                    deleteProjectV2Item(input: {{
+                                        projectId: "{item['project']['id']}"
+                                        itemId: "{item['id']}"
+                                    }}) {{
+                                        deletedItemId
+                                    }}
+                                }}
+                                '''
+                                delete_result = subprocess.run(
+                                    ['gh', 'api', 'graphql', '-f', f'query={delete_mutation}'],
+                                    capture_output=True,
+                                    text=True,
+                                    check=True
+                                )
+                                logger.info(f"✓ Removed issue #{issue_number} from project '{item['project']['title']}' (#{item['project']['number']})")
+                            except Exception as e:
+                                logger.warning(f"✗ Failed to remove issue #{issue_number} from project #{item['project']['number']}: {e}")
+                    else:
+                        logger.info(f"Issue #{issue_number} is only in SDLC board - no removal needed")
+
+                    if sdlc_item_id:
+                        # Get the Backlog column option ID
+                        backlog_option_id = backlog_column.id
+                        status_field_id = sdlc_board.status_field_id
+
+                        if not status_field_id:
+                            logger.warning(f"No status_field_id found in SDLC board state")
+                        else:
+                            # Set the status to Backlog
+                            status_mutation = f'''
+                            mutation {{
+                                updateProjectV2ItemFieldValue(
+                                    input: {{
+                                        projectId: "{sdlc_board.project_id}"
+                                        itemId: "{sdlc_item_id}"
+                                        fieldId: "{status_field_id}"
+                                        value: {{
+                                            singleSelectOptionId: "{backlog_option_id}"
+                                        }}
+                                    }}
+                                ) {{
+                                    projectV2Item {{
+                                        id
+                                    }}
+                                }}
+                            }}
+                            '''
+
+                            subprocess.run(
+                                ['gh', 'api', 'graphql', '-f', f'query={status_mutation}'],
+                                capture_output=True,
+                                text=True,
+                                check=True
+                            )
+                            logger.info(f"Set issue #{issue_number} status to Backlog in SDLC board")
+                    else:
+                        logger.warning(f"Could not find project item ID for issue #{issue_number} in SDLC board")
+
+                except Exception as e:
+                    logger.error(f"Failed to set status for issue #{issue_number}: {e}")
+                    # Don't fail the entire operation - the issue was created and added to the board
 
                 # Link as sub-issue to parent using GraphQL
                 if parent_issue_id:
