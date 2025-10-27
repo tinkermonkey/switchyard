@@ -59,6 +59,7 @@ services:
       - LOG_LEVEL=INFO
       - CONTEXT7_MCP_URL=https://mcp.context7.com/mcp
       - CONTEXT7_API_KEY=${CONTEXT7_API_KEY}
+      - RECONCILIATION_FRESHNESS_HOURS=${RECONCILIATION_FRESHNESS_HOURS:-1}
       # Host paths for Docker-in-Docker mounting
       # These are intentionally NOT set - the code has correct defaults:
       # - HOST_WORKSPACE_PATH defaults to '/workspace' (the mounted parent dir)

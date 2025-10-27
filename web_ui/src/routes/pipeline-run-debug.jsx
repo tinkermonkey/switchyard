@@ -3,7 +3,7 @@ import { RefreshCw, Activity, CheckCircle } from 'lucide-react'
 import Header from '../components/Header'
 import NavigationTabs from '../components/NavigationTabs'
 import PipelineRunEventLog from '../components/PipelineRunEventLog'
-import { useState, useEffect, useCallback, useMemo } from 'react'
+import { useState, useEffect, useCallback, useMemo, useRef, useLayoutEffect } from 'react'
 import { useSocket } from '../contexts/SocketContext'
 import { formatDuration } from '../utils/stateHelpers'
 import { mergePipelineRunEvents } from '../utils/eventMerging'
@@ -21,57 +21,168 @@ function PipelineRunDebugView() {
   const [hasMoreCompleted, setHasMoreCompleted] = useState(true)
   const completedLimit = 10
   const { events: socketEvents } = useSocket()
-  
-  // Fetch active pipeline runs
+
+  // Use refs to track current values without causing re-renders
+  const selectedPipelineRunRef = useRef(selectedPipelineRun)
+  const selectedTabRef = useRef(selectedTab)
+  const isFetchingActiveRef = useRef(false)
+  const isFetchingCompletedRef = useRef(false)
+
+  // Refs for scroll position preservation
+  const activeListScrollRef = useRef(null)
+  const completedListScrollRef = useRef(null)
+  const savedActiveScrollPos = useRef(0)
+  const savedCompletedScrollPos = useRef(0)
+
+  // Update refs when state changes
+  useEffect(() => {
+    selectedPipelineRunRef.current = selectedPipelineRun
+  }, [selectedPipelineRun])
+
+  useEffect(() => {
+    selectedTabRef.current = selectedTab
+  }, [selectedTab])
+
+  // Continuously save scroll position to handle updates
+  useEffect(() => {
+    const activeEl = activeListScrollRef.current
+    const completedEl = completedListScrollRef.current
+
+    const handleActiveScroll = () => {
+      if (activeEl) {
+        savedActiveScrollPos.current = activeEl.scrollTop
+      }
+    }
+
+    const handleCompletedScroll = () => {
+      if (completedEl) {
+        savedCompletedScrollPos.current = completedEl.scrollTop
+      }
+    }
+
+    if (activeEl) {
+      activeEl.addEventListener('scroll', handleActiveScroll, { passive: true })
+    }
+    if (completedEl) {
+      completedEl.addEventListener('scroll', handleCompletedScroll, { passive: true })
+    }
+
+    return () => {
+      if (activeEl) {
+        activeEl.removeEventListener('scroll', handleActiveScroll)
+      }
+      if (completedEl) {
+        completedEl.removeEventListener('scroll', handleCompletedScroll)
+      }
+    }
+  }, [selectedTab])
+
+  // Restore scroll position after render (before paint)
+  useLayoutEffect(() => {
+    if (activeListScrollRef.current && savedActiveScrollPos.current > 0) {
+      activeListScrollRef.current.scrollTop = savedActiveScrollPos.current
+    }
+  }, [activePipelineRuns])
+
+  useLayoutEffect(() => {
+    if (completedListScrollRef.current && savedCompletedScrollPos.current > 0) {
+      completedListScrollRef.current.scrollTop = savedCompletedScrollPos.current
+    }
+  }, [completedPipelineRuns])
+
+  // Fetch active pipeline runs - no dependencies to avoid circular re-creation
   const fetchActivePipelineRuns = useCallback(async () => {
+    // Guard against concurrent fetches
+    if (isFetchingActiveRef.current) {
+      console.log('[PipelineRunDebug] Skipping active fetch - already in progress')
+      return
+    }
+
     try {
+      isFetchingActiveRef.current = true
       setLoading(true)
       const response = await fetch('/active-pipeline-runs')
       const data = await response.json()
-      
+
       if (data.success) {
         console.log('[PipelineRunDebug] Fetched active pipeline runs:', data.runs)
         setActivePipelineRuns(data.runs)
-        
-        // Auto-select first run if none selected
-        if (!selectedPipelineRun && data.runs.length > 0) {
-          setSelectedPipelineRun(data.runs[0])
-        }
+
+        // Update selectedPipelineRun if it exists in the refreshed data
+        // Use functional update to avoid dependency
+        setSelectedPipelineRun(currentSelected => {
+          if (currentSelected) {
+            const updatedRun = data.runs.find(run => run.id === currentSelected.id)
+            if (updatedRun) {
+              console.log('[PipelineRunDebug] Updating selected pipeline run with fresh data')
+              return updatedRun
+            }
+            return currentSelected
+          } else if (data.runs.length > 0) {
+            // Auto-select first run if none selected
+            return data.runs[0]
+          }
+          return currentSelected
+        })
       }
     } catch (error) {
       console.error('Error fetching active pipeline runs:', error)
     } finally {
       setLoading(false)
+      isFetchingActiveRef.current = false
     }
-  }, [selectedPipelineRun])
+  }, [])
   
-  // Fetch completed pipeline runs with pagination
+  // Fetch completed pipeline runs with pagination - no dependencies to avoid circular re-creation
   const fetchCompletedPipelineRuns = useCallback(async (offset = 0, append = false) => {
+    // Guard against concurrent fetches
+    if (isFetchingCompletedRef.current) {
+      console.log('[PipelineRunDebug] Skipping completed fetch - already in progress')
+      return
+    }
+
     try {
+      isFetchingCompletedRef.current = true
       setLoadingCompleted(true)
       const response = await fetch(`/completed-pipeline-runs?limit=${completedLimit}&offset=${offset}`)
       const data = await response.json()
-      
+
       if (data.success) {
         console.log('[PipelineRunDebug] Fetched completed pipeline runs:', data.runs.length)
-        if (append) {
-          setCompletedPipelineRuns(prev => [...prev, ...data.runs])
-        } else {
-          setCompletedPipelineRuns(data.runs)
-        }
+
+        // Use functional update to avoid dependency on completedPipelineRuns
+        setCompletedPipelineRuns(currentCompleted => {
+          const allCompletedRuns = append ? [...currentCompleted, ...data.runs] : data.runs
+
+          // Update selectedPipelineRun if it exists in the completed runs
+          // Use ref to get current value without dependency
+          setSelectedPipelineRun(currentSelected => {
+            if (currentSelected) {
+              const updatedRun = allCompletedRuns.find(run => run.id === currentSelected.id)
+              if (updatedRun) {
+                console.log('[PipelineRunDebug] Updating selected pipeline run from completed list')
+                return updatedRun
+              }
+              return currentSelected
+            } else if (data.runs.length > 0 && selectedTabRef.current === 'completed') {
+              // Auto-select first completed run if on completed tab and none selected
+              return data.runs[0]
+            }
+            return currentSelected
+          })
+
+          return allCompletedRuns
+        })
+
         setHasMoreCompleted(data.runs.length === completedLimit)
-        
-        // Auto-select first completed run if on completed tab and none selected
-        if (!selectedPipelineRun && data.runs.length > 0 && selectedTab === 'completed') {
-          setSelectedPipelineRun(data.runs[0])
-        }
       }
     } catch (error) {
       console.error('Error fetching completed pipeline runs:', error)
     } finally {
       setLoadingCompleted(false)
+      isFetchingCompletedRef.current = false
     }
-  }, [selectedPipelineRun, selectedTab, completedLimit])
+  }, [completedLimit])
   
   // Load more completed runs
   const loadMoreCompleted = useCallback(() => {
@@ -104,6 +215,21 @@ function PipelineRunDebugView() {
     fetchActivePipelineRuns()
     fetchCompletedPipelineRuns(0, false)
   }, [])
+
+  // Periodic refresh to keep data up-to-date
+  useEffect(() => {
+    const intervalId = setInterval(() => {
+      console.log('[PipelineRunDebug] Periodic refresh')
+      fetchActivePipelineRuns()
+      // Use ref to check current tab without adding dependency
+      if (selectedTabRef.current === 'completed') {
+        fetchCompletedPipelineRuns(0, false)
+      }
+    }, 10000) // Refresh every 10 seconds
+
+    return () => clearInterval(intervalId)
+    // Callbacks are now stable (no dependencies), so only depend on them
+  }, [fetchActivePipelineRuns, fetchCompletedPipelineRuns])
   
   // Fetch data when tab changes
   useEffect(() => {
@@ -119,26 +245,39 @@ function PipelineRunDebugView() {
     }
   }, [selectedPipelineRun, fetchPipelineRunEvents])
   
+  // Track last processed socket event to prevent duplicate processing
+  const lastProcessedEventRef = useRef(null)
+
   // Update on socket events
   useEffect(() => {
     if (socketEvents.length > 0) {
-      // Refresh pipeline runs and events when new events arrive
       const latestEvent = socketEvents[socketEvents.length - 1]
+
+      // Skip if we've already processed this event
+      if (lastProcessedEventRef.current === latestEvent) {
+        return
+      }
+      lastProcessedEventRef.current = latestEvent
+
+      // Refresh pipeline runs and events when new events arrive
       if (['agent_initialized', 'agent_completed', 'agent_failed'].includes(latestEvent.event_type)) {
-        if (selectedPipelineRun) {
-          fetchPipelineRunEvents(selectedPipelineRun.id)
+        // Use ref to get current value without dependency
+        if (selectedPipelineRunRef.current) {
+          fetchPipelineRunEvents(selectedPipelineRunRef.current.id)
         }
+        // Refresh both active and completed runs to catch status transitions
         fetchActivePipelineRuns()
+        fetchCompletedPipelineRuns(0, false)
       }
     }
-  }, [socketEvents])
+  }, [socketEvents, fetchPipelineRunEvents, fetchActivePipelineRuns, fetchCompletedPipelineRuns])
   
   // Merge API events with live WebSocket events
   const mergedEvents = useMemo(() => {
     if (!selectedPipelineRun) return []
     return mergePipelineRunEvents(pipelineRunEvents, socketEvents, selectedPipelineRun)
   }, [pipelineRunEvents, socketEvents, selectedPipelineRun])
-  
+
   return (
     <div className="min-h-screen p-5 bg-gh-canvas text-gh-fg">
       <Header />
@@ -195,7 +334,11 @@ function PipelineRunDebugView() {
                   <p className="text-gh-fg-muted text-sm">No active pipeline runs</p>
                 </div>
               ) : (
-                <div className="space-y-2">
+                <div
+                  ref={activeListScrollRef}
+                  className="space-y-2 max-h-[70vh] overflow-y-auto overscroll-contain"
+                  style={{ scrollBehavior: 'auto' }}
+                >
                   {activePipelineRuns.map(run => (
                     <button
                       key={run.id}
@@ -237,7 +380,11 @@ function PipelineRunDebugView() {
                 </div>
               ) : (
                 <>
-                  <div className="space-y-2">
+                  <div
+                    ref={completedListScrollRef}
+                    className="space-y-2 max-h-[70vh] overflow-y-auto overscroll-contain"
+                    style={{ scrollBehavior: 'auto' }}
+                  >
                     {completedPipelineRuns.map(run => (
                       <button
                         key={run.id}
@@ -272,7 +419,7 @@ function PipelineRunDebugView() {
                       </button>
                     ))}
                   </div>
-                  
+
                   {/* Load More Button */}
                   {hasMoreCompleted && (
                     <button
@@ -303,7 +450,7 @@ function PipelineRunDebugView() {
               <RefreshCw className="w-8 h-8 animate-spin text-gh-accent-primary" />
             </div>
           ) : (
-            <PipelineRunEventLog 
+            <PipelineRunEventLog
               pipelineRun={selectedPipelineRun}
               events={mergedEvents}
               isActive={selectedPipelineRun?.status === 'running'}

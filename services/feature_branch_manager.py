@@ -56,148 +56,213 @@ class FeatureBranchManager:
 
     def __init__(self, workspace_root: str = "/workspace"):
         self.workspace_root = workspace_root
-        self.state_dir = Path(workspace_root) / "clauditoreum" / "state" / "projects"
-        # Don't create directories until actually needed (lazy creation)
-        self._state_dir_initialized = False
-        
+
+        # In-memory cache for branch discovery (ephemeral, process-lifetime)
+        # Cache structure: {(project, parent_issue): "branch_name"}
+        self._branch_cache: Dict[tuple, str] = {}
+
         # Initialize decision observability
         from monitoring.observability import get_observability_manager
         from monitoring.decision_events import DecisionEventEmitter
         self.obs = get_observability_manager()
         self.decision_events = DecisionEventEmitter(self.obs)
 
-    def _ensure_state_dir(self):
-        """Ensure state directory exists (lazy initialization)"""
-        if not self._state_dir_initialized:
-            self.state_dir.mkdir(parents=True, exist_ok=True)
-            self._state_dir_initialized = True
+    def _parse_issue_from_branch_name(self, branch_name: str) -> Optional[int]:
+        """
+        Extract parent issue number from feature branch name.
 
-    def _get_state_file(self, project: str) -> Path:
-        """Get path to feature branch state file for project"""
-        self._ensure_state_dir()
-        project_state_dir = self.state_dir / project
-        project_state_dir.mkdir(parents=True, exist_ok=True)
-        return project_state_dir / "feature_branches.yaml"
+        Handles patterns like:
+        - feature/issue-53-llm-tool-use-model → 53
+        - feature/issue-123 → 123
 
-    def _load_state(self, project: str) -> Dict[str, Any]:
-        """Load feature branch state from YAML"""
-        state_file = self._get_state_file(project)
-        if not state_file.exists():
-            return {"feature_branches": []}
+        Returns None if not a feature branch or unparseable.
+        """
+        import re
+
+        if not branch_name.startswith("feature/issue-"):
+            return None
+
+        # Extract number after "issue-"
+        match = re.match(r"feature/issue-(\d+)", branch_name)
+        if match:
+            return int(match.group(1))
+        return None
+
+    def _find_branch_for_parent(self, project_dir: str, parent_issue: int) -> Optional[str]:
+        """
+        Find the feature branch for a parent issue by querying git.
+
+        Returns branch name if found, None otherwise.
+        """
+        try:
+            all_branches = self._get_all_feature_branches_sync(project_dir)
+
+            for branch in all_branches:
+                issue_num = self._parse_issue_from_branch_name(branch)
+                if issue_num == parent_issue:
+                    logger.debug(f"Found branch for parent #{parent_issue}: {branch}")
+                    return branch
+
+            logger.debug(f"No branch found for parent #{parent_issue}")
+            return None
+        except Exception as e:
+            logger.error(f"Error finding branch for parent #{parent_issue}: {e}")
+            return None
+
+    def _get_cached_branch(self, project: str, parent_issue: int) -> Optional[str]:
+        """Get cached branch name for parent issue"""
+        return self._branch_cache.get((project, parent_issue))
+
+    def _cache_branch(self, project: str, parent_issue: int, branch_name: str):
+        """Cache branch name for parent issue"""
+        self._branch_cache[(project, parent_issue)] = branch_name
+        logger.debug(f"Cached branch for {project} parent #{parent_issue}: {branch_name}")
+
+    def _clear_cache(self, project: str, parent_issue: int):
+        """Remove cached branch for parent issue"""
+        key = (project, parent_issue)
+        if key in self._branch_cache:
+            del self._branch_cache[key]
+            logger.debug(f"Cleared cache for {project} parent #{parent_issue}")
+
+    def _get_all_feature_branches_sync(self, project_dir: str) -> List[str]:
+        """
+        Get all feature branches from git (synchronous version).
+
+        This is used in contexts where we can't use async/await.
+        """
+        import subprocess
 
         try:
-            with open(state_file, 'r') as f:
-                state = yaml.safe_load(f)
-                # Ensure we always return a dict with feature_branches key
-                if state is None or not isinstance(state, dict):
-                    return {"feature_branches": []}
-                if "feature_branches" not in state or state["feature_branches"] is None:
-                    state["feature_branches"] = []
-                return state
-        except Exception as e:
-            logger.error(f"Failed to load feature branch state for {project}: {e}", exc_info=True)
-            return {"feature_branches": []}
+            # Prune stale remote references first to avoid detecting deleted branches
+            subprocess.run(
+                ["git", "fetch", "--prune"],
+                cwd=project_dir,
+                capture_output=True,
+                text=True,
+                check=False  # Don't fail if fetch has issues
+            )
 
-    def _save_state(self, project: str, state: Dict[str, Any]):
-        """Save feature branch state to YAML"""
-        state_file = self._get_state_file(project)
-        with open(state_file, 'w') as f:
-            yaml.dump(state, f, default_flow_style=False, sort_keys=False)
+            result = subprocess.run(
+                ["git", "branch", "-a"],
+                cwd=project_dir,
+                capture_output=True,
+                text=True,
+                check=True
+            )
+
+            branches = []
+            for line in result.stdout.splitlines():
+                line = line.strip()
+                # Remove the * for current branch
+                if line.startswith("*"):
+                    line = line[1:].strip()
+                # Extract branch name from remotes/origin/branch-name
+                if "remotes/origin/" in line:
+                    line = line.split("remotes/origin/")[1]
+                # Only include feature branches
+                if line.startswith("feature/"):
+                    branches.append(line)
+
+            return list(set(branches))  # Remove duplicates
+        except Exception as e:
+            logger.error(f"Failed to get branches from {project_dir}: {e}")
+            return []
+
+    # State file methods removed - git is now the source of truth
+    # Keeping empty methods for backward compatibility during transition
 
     def get_feature_branch_state(self, project: str, parent_issue: int) -> Optional[FeatureBranch]:
-        """Get feature branch state for a parent issue"""
-        state = self._load_state(project)
-        for fb_data in state.get("feature_branches", []):
-            if fb_data["parent_issue"] == parent_issue:
-                # Convert sub_issues dicts back to SubIssueState objects
-                sub_issues = [SubIssueState(**si) for si in fb_data.get("sub_issues", [])]
-                fb_data["sub_issues"] = sub_issues
-                
-                # Validate branch name consistency
-                import re
-                branch_name = fb_data.get("branch_name", "")
-                branch_match = re.search(r'issue-(\d+)', branch_name)
-                if branch_match:
-                    branch_issue_num = int(branch_match.group(1))
-                    if branch_issue_num != parent_issue:
-                        logger.warning(
-                            f"State inconsistency detected: Parent issue #{parent_issue} has "
-                            f"branch_name '{branch_name}' which references issue #{branch_issue_num}. "
-                            f"This may cause branch checkout failures."
-                        )
-                
-                return FeatureBranch(**fb_data)
+        """
+        Get feature branch for a parent issue by querying git.
+
+        This method now queries git directly instead of reading from state file.
+        Returns a FeatureBranch object if found, None otherwise.
+        """
+        # Check cache first
+        cached_branch = self._get_cached_branch(project, parent_issue)
+        if cached_branch:
+            return FeatureBranch(
+                parent_issue=parent_issue,
+                branch_name=cached_branch,
+                created_at=datetime.now().isoformat(),
+                sub_issues=[]
+            )
+
+        # Query git for the branch (synchronous call)
+        project_dir = os.path.join(self.workspace_root, project)
+        if not os.path.exists(project_dir):
+            return None
+
+        try:
+            branch_name = self._find_branch_for_parent(project_dir, parent_issue)
+            if branch_name:
+                self._cache_branch(project, parent_issue, branch_name)
+                return FeatureBranch(
+                    parent_issue=parent_issue,
+                    branch_name=branch_name,
+                    created_at=datetime.now().isoformat(),
+                    sub_issues=[]
+                )
+        except Exception as e:
+            logger.error(f"Error getting feature branch for parent #{parent_issue}: {e}")
+
         return None
 
     def get_feature_branch_for_issue(self, project: str, issue_number: int) -> Optional[FeatureBranch]:
-        """Get feature branch for a sub-issue or parent issue"""
-        state = self._load_state(project)
-        for fb_data in state.get("feature_branches", []):
-            # Check if this is the parent issue
-            if fb_data["parent_issue"] == issue_number:
-                sub_issues = [SubIssueState(**si) for si in fb_data.get("sub_issues", [])]
-                fb_data["sub_issues"] = sub_issues
-                
-                # Validate branch name consistency
-                import re
-                branch_name = fb_data.get("branch_name", "")
-                branch_match = re.search(r'issue-(\d+)', branch_name)
-                if branch_match:
-                    branch_issue_num = int(branch_match.group(1))
-                    if branch_issue_num != fb_data["parent_issue"]:
-                        logger.warning(
-                            f"State inconsistency for issue #{issue_number}: Parent issue #{fb_data['parent_issue']} "
-                            f"has branch_name '{branch_name}' which references issue #{branch_issue_num}"
-                        )
-                
-                return FeatureBranch(**fb_data)
+        """
+        Get feature branch for a sub-issue or parent issue.
 
-            # Check if this is a sub-issue
-            for si in fb_data.get("sub_issues", []):
-                if si["number"] == issue_number:
-                    sub_issues = [SubIssueState(**s) for s in fb_data.get("sub_issues", [])]
-                    fb_data["sub_issues"] = sub_issues
-                    
-                    # Validate branch name consistency
-                    import re
-                    branch_name = fb_data.get("branch_name", "")
-                    branch_match = re.search(r'issue-(\d+)', branch_name)
-                    if branch_match:
-                        branch_issue_num = int(branch_match.group(1))
-                        if branch_issue_num != fb_data["parent_issue"]:
-                            logger.warning(
-                                f"State inconsistency for sub-issue #{issue_number}: Parent issue #{fb_data['parent_issue']} "
-                                f"has branch_name '{branch_name}' which references issue #{branch_issue_num}"
-                            )
-                    
-                    return FeatureBranch(**fb_data)
-
-        return None
+        For sub-issues, you must provide the parent_issue separately via get_feature_branch_state().
+        This method now just checks if the issue_number itself is a parent (has a branch).
+        """
+        # Assume issue_number is a parent issue and try to find its branch
+        return self.get_feature_branch_state(project, issue_number)
 
     def get_all_feature_branches(self, project: str) -> List[FeatureBranch]:
-        """Get all feature branches for a project"""
-        state = self._load_state(project)
-        
-        # Defensive check: ensure state is a dict with feature_branches key
-        if not isinstance(state, dict):
-            logger.warning(f"Feature branch state for {project} is not a dict: {type(state)}")
+        """
+        Get all feature branches for a project by querying git.
+
+        Returns list of FeatureBranch objects, one per feature branch found.
+        """
+        project_dir = os.path.join(self.workspace_root, project)
+        if not os.path.exists(project_dir):
             return []
-        
-        branches = []
-        for fb_data in state.get("feature_branches", []):
-            sub_issues = [SubIssueState(**si) for si in fb_data.get("sub_issues", [])]
-            fb_data["sub_issues"] = sub_issues
-            branches.append(FeatureBranch(**fb_data))
-        return branches
+
+        try:
+            branch_names = self._get_all_feature_branches_sync(project_dir)
+            branches = []
+
+            for branch_name in branch_names:
+                parent_issue = self._parse_issue_from_branch_name(branch_name)
+                if parent_issue:
+                    branches.append(FeatureBranch(
+                        parent_issue=parent_issue,
+                        branch_name=branch_name,
+                        created_at=datetime.now().isoformat(),
+                        sub_issues=[]
+                    ))
+
+            return branches
+        except Exception as e:
+            logger.error(f"Error getting all feature branches for {project}: {e}")
+            return []
 
     def create_feature_branch_state(
         self,
         project: str,
         parent_issue: int,
         branch_name: str,
-        sub_issues: List[int]
+        sub_issues: List[int] = None
     ) -> FeatureBranch:
-        """Create new feature branch state"""
+        """
+        Create new feature branch state (in-memory only).
+
+        No longer persists to file. Just caches the branch and returns the object.
+        """
+        if sub_issues is None:
+            sub_issues = []
+
         feature_branch = FeatureBranch(
             parent_issue=parent_issue,
             branch_name=branch_name,
@@ -205,74 +270,76 @@ class FeatureBranchManager:
             sub_issues=[SubIssueState(number=si, status="pending") for si in sub_issues]
         )
 
-        self.save_feature_branch_state(project, feature_branch)
-        logger.info(f"Created feature branch state for parent #{parent_issue}: {branch_name}")
+        # Cache the branch
+        self._cache_branch(project, parent_issue, branch_name)
+        logger.info(f"Created feature branch state (in-memory) for parent #{parent_issue}: {branch_name}")
         return feature_branch
 
     def save_feature_branch_state(self, project: str, feature_branch: FeatureBranch):
-        """Save feature branch state"""
+        """
+        Save feature branch state (NO-OP).
+
+        State is no longer persisted. Git is the source of truth.
+        This method is kept for backward compatibility but does nothing.
+        """
         feature_branch.last_updated = datetime.now().isoformat()
-
-        state = self._load_state(project)
-
-        # Convert to dict for serialization
-        fb_dict = asdict(feature_branch)
-
-        # Update or append
-        updated = False
-        for i, fb_data in enumerate(state.get("feature_branches", [])):
-            if fb_data["parent_issue"] == feature_branch.parent_issue:
-                state["feature_branches"][i] = fb_dict
-                updated = True
-                break
-
-        if not updated:
-            if "feature_branches" not in state:
-                state["feature_branches"] = []
-            state["feature_branches"].append(fb_dict)
-
-        self._save_state(project, state)
+        # Update cache
+        self._cache_branch(project, feature_branch.parent_issue, feature_branch.branch_name)
 
     def delete_feature_branch_state(self, project: str, parent_issue: int):
-        """Delete feature branch state"""
-        state = self._load_state(project)
-        state["feature_branches"] = [
-            fb for fb in state.get("feature_branches", [])
-            if fb["parent_issue"] != parent_issue
-        ]
-        self._save_state(project, state)
-        logger.info(f"Deleted feature branch state for parent #{parent_issue}")
+        """
+        Delete feature branch state (NO-OP).
+
+        State is no longer persisted. This method is kept for backward compatibility.
+        Just clears the cache.
+        """
+        self._clear_cache(project, parent_issue)
+        logger.info(f"Cleared cached branch for parent #{parent_issue}")
 
     def add_sub_issue_to_branch(self, project: str, feature_branch: FeatureBranch, issue_number: int):
-        """Add sub-issue to feature branch tracking if not already present"""
+        """
+        Add sub-issue to feature branch tracking (in-memory only).
+
+        No longer persists to file.
+        """
         if not any(si.number == issue_number for si in feature_branch.sub_issues):
             feature_branch.sub_issues.append(
                 SubIssueState(number=issue_number, status="pending")
             )
-            self.save_feature_branch_state(project, feature_branch)
-            logger.info(f"Added sub-issue #{issue_number} to feature branch {feature_branch.branch_name}")
+            logger.info(f"Added sub-issue #{issue_number} to feature branch {feature_branch.branch_name} (in-memory)")
 
     def mark_sub_issue_in_progress(self, project: str, feature_branch: FeatureBranch, issue_number: int):
-        """Mark sub-issue as in progress"""
+        """
+        Mark sub-issue as in progress (in-memory only).
+
+        No longer persists to file.
+        """
         for si in feature_branch.sub_issues:
             if si.number == issue_number:
                 si.status = "in_progress"
                 si.started_at = datetime.now().isoformat()
                 break
-        self.save_feature_branch_state(project, feature_branch)
 
     def mark_sub_issue_complete(self, project: str, feature_branch: FeatureBranch, issue_number: int):
-        """Mark sub-issue as completed"""
+        """
+        Mark sub-issue as completed (in-memory only).
+
+        No longer persists to file.
+        """
         for si in feature_branch.sub_issues:
             if si.number == issue_number:
                 si.status = "completed"
                 si.completed_at = datetime.now().isoformat()
                 break
-        self.save_feature_branch_state(project, feature_branch)
-        logger.info(f"Marked sub-issue #{issue_number} as completed in {feature_branch.branch_name}")
+        logger.info(f"Marked sub-issue #{issue_number} as completed in {feature_branch.branch_name} (in-memory)")
 
     def check_all_sub_issues_complete(self, feature_branch: FeatureBranch) -> bool:
-        """Check if all sub-issues are completed or cancelled"""
+        """
+        Check if all sub-issues are completed or cancelled.
+
+        Note: Since we no longer track sub-issue status persistently,
+        this method only works with the in-memory FeatureBranch object provided.
+        """
         return all(
             si.status in ["completed", "cancelled"]
             for si in feature_branch.sub_issues
@@ -538,24 +605,16 @@ class FeatureBranchManager:
                         "reason": f"Branch for parent issue #{parent_issue}"
                     })
 
-        # 3. Check feature branch state tracking
-        feature_branches = self.get_all_feature_branches(project)
-        for fb in feature_branches:
-            # Check if this issue is already tracked in a feature branch
-            if any(si.number == issue_number for si in fb.sub_issues):
+        # 3. Check cache for recently used branches
+        cached_branch = self._get_cached_branch(project, parent_issue or issue_number)
+        if cached_branch and cached_branch in all_branches:
+            # Only add if not already in matches
+            if not any(m["branch_name"] == cached_branch for m in matches):
                 matches.append({
-                    "branch_name": fb.branch_name,
-                    "match_type": "feature_state",
-                    "confidence": 0.98,
-                    "reason": f"Issue already tracked in feature branch state"
-                })
-            # Check if parent matches
-            elif parent_issue and fb.parent_issue == parent_issue:
-                matches.append({
-                    "branch_name": fb.branch_name,
-                    "match_type": "feature_state",
-                    "confidence": 0.95,
-                    "reason": f"Feature branch for parent issue #{parent_issue}"
+                    "branch_name": cached_branch,
+                    "match_type": "cached",
+                    "confidence": 0.90,
+                    "reason": f"Recently used branch (cached)"
                 })
 
         # 4. Semantic similarity with branch names
@@ -1112,54 +1171,18 @@ Waiting for human decision...
                 logger.error(f"Failed to finalize standalone branch for issue #{issue_number}: {e}")
                 return {"success": False, "error": str(e)}
 
-        # Step 1: Get the actual current branch (source of truth)
+        # Step 1: Get the actual current branch (git is source of truth)
         current_branch = await self.get_current_branch(project_dir)
-        
-        # Step 2: Validate branch name consistency
-        # Extract issue number from stored branch name to detect mismatches
-        import re
-        stored_branch_match = re.search(r'issue-(\d+)', feature_branch.branch_name)
-        if stored_branch_match:
-            stored_issue_num = int(stored_branch_match.group(1))
-            if stored_issue_num != feature_branch.parent_issue:
-                logger.warning(
-                    f"Branch name mismatch detected! Parent issue #{feature_branch.parent_issue} has "
-                    f"branch name '{feature_branch.branch_name}' which references issue #{stored_issue_num}. "
-                    f"Using actual current branch '{current_branch}' as source of truth."
-                )
-                # Update feature_branch object to use current branch (don't persist yet)
-                feature_branch.branch_name = current_branch
-        
-        # Step 3: If we're not on the expected branch, check if stored branch exists
+
+        # Step 2: Trust git - use whatever branch we're currently on
+        # The feature_branch object now comes from git queries, so it should match
+        # But if there's any mismatch, git wins
         if current_branch != feature_branch.branch_name:
             logger.warning(
-                f"Current branch '{current_branch}' doesn't match expected branch '{feature_branch.branch_name}'."
+                f"Current branch '{current_branch}' doesn't match feature branch '{feature_branch.branch_name}'. "
+                f"Git is the source of truth - using current branch '{current_branch}'."
             )
-            
-            # Check if the stored branch actually exists
-            stored_branch_exists = await self.branch_exists(project_dir, feature_branch.branch_name)
-            
-            if not stored_branch_exists:
-                # Stored branch doesn't exist - use current branch as source of truth
-                logger.warning(
-                    f"Stored branch '{feature_branch.branch_name}' does not exist. "
-                    f"Using current branch '{current_branch}' and updating state."
-                )
-                feature_branch.branch_name = current_branch
-                self.save_feature_branch_state(project, feature_branch)
-            else:
-                # Stored branch exists but we're on wrong branch - try to checkout
-                logger.info(f"Checking out expected branch '{feature_branch.branch_name}'...")
-                await self.git_checkout(project_dir, feature_branch.branch_name)
-                current_branch = await self.get_current_branch(project_dir)
-                
-                if current_branch != feature_branch.branch_name:
-                    error_msg = (
-                        f"Failed to checkout correct branch. Current: {current_branch}, "
-                        f"Expected: {feature_branch.branch_name}"
-                    )
-                    logger.error(error_msg)
-                    return {"success": False, "error": error_msg}
+            feature_branch.branch_name = current_branch
 
         # Step 2: Commit changes
         await self.git_add_all(project_dir)

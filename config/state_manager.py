@@ -206,6 +206,54 @@ class GitHubStateManager:
             logger.error(f"Failed to save state for project {state.project_name}: {e}")
             raise
 
+    def is_state_fresh(self, project_name: str, max_age_hours: int = 24) -> bool:
+        """
+        Check if project state is fresh (recently synced and valid).
+
+        Args:
+            project_name: Name of the project
+            max_age_hours: Maximum age in hours to consider state fresh (default: 24)
+
+        Returns:
+            True if state exists, is complete, and was synced within max_age_hours
+        """
+        try:
+            state = self.load_project_state(project_name)
+            if state is None:
+                return False
+
+            # Check if state has all required components
+            if not state.boards:
+                logger.debug(f"State for {project_name} is not fresh: no boards")
+                return False
+
+            # Check if all boards have complete data
+            for board_name, board in state.boards.items():
+                if not board.project_id or not board.status_field_id or not board.columns:
+                    logger.debug(f"State for {project_name} is not fresh: incomplete board '{board_name}'")
+                    return False
+
+            # Check if state is recent enough
+            if state.last_sync:
+                try:
+                    last_sync_time = datetime.fromisoformat(state.last_sync.replace('Z', '+00:00'))
+                    age_hours = (datetime.now(last_sync_time.tzinfo) - last_sync_time).total_seconds() / 3600
+
+                    if age_hours > max_age_hours:
+                        logger.debug(f"State for {project_name} is stale: {age_hours:.1f} hours old (max: {max_age_hours})")
+                        return False
+
+                    logger.debug(f"State for {project_name} is fresh: {age_hours:.1f} hours old")
+                    return True
+                except Exception as e:
+                    logger.warning(f"Could not parse last_sync timestamp for {project_name}: {e}")
+                    return False
+
+            return False
+        except Exception as e:
+            logger.error(f"Error checking state freshness for {project_name}: {e}")
+            return False
+
     def needs_reconciliation(self, project_name: str) -> bool:
         """Check if project configuration has changed and needs reconciliation"""
         try:

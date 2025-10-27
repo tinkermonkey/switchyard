@@ -41,9 +41,19 @@ class ClaudeCodeBreaker:
     # - "Session limit reached ∙ resets 12am" (in assistant content)
     # - "session limit exceeded. Reset at 1:30pm"
     # - "SESSION_LIMIT_IN_RESPONSE: ..."
-    # - "token limit" / "request limit"
+    # - "token limit reached/exceeded" (with action verb)
+    # - "Session limit reached" (without reset time)
+    #
+    # IMPORTANT: Must be specific to avoid false positives!
+    # Only match when there's an action verb (reached, exceeded, hit, etc.)
+    # to distinguish actual errors from content discussing these concepts.
     SESSION_LIMIT_PATTERN = re.compile(
-        r'(?:SESSION_LIMIT_IN_RESPONSE:\s+)?(session\s+limit|token.*limit|request.*limit).*?(?:resets?|reset)(?:\s+at)?\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)?',
+        r'(?:SESSION_LIMIT_IN_RESPONSE:\s+)?(?:'
+        r'(?:session|token|request|rate|usage)\s+(?:limit|quota)\s+(?:reached|exceeded|hit|met|violated)'
+        r'|(?:reached|exceeded|hit|met|violated)\s+(?:session|token|request|rate|usage)\s+(?:limit|quota)'
+        r'|limit\s+reached'
+        r'|quota\s+exceeded'
+        r')(?:.*?(?:resets?|reset)(?:\s+at)?\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)?)?',
         re.IGNORECASE | re.DOTALL
     )
     
@@ -207,13 +217,29 @@ class ClaudeCodeBreaker:
     def check_and_close(self) -> bool:
         """
         Check if tokens are available again and close the breaker if so.
-        
+        Also checks Redis to detect if breaker was externally reset.
+
         Returns:
             True if breaker is now closed, False if still open
         """
+        # First check if breaker was externally reset via Redis
+        if self.state != self.CLOSED and self.redis_client:
+            try:
+                state_json = self.redis_client.get(self.REDIS_KEY)
+                if not state_json:
+                    # Redis key deleted = breaker was externally closed
+                    logger.info("🟢 Detected external breaker reset via Redis - closing breaker")
+                    self.state = self.CLOSED
+                    self.opened_at = None
+                    self.reset_time = None
+                    self.failure_count = 0
+                    return True
+            except Exception as e:
+                logger.debug(f"Error checking Redis for external reset: {e}")
+
         if self.state == self.CLOSED:
             return True
-        
+
         if self.reset_time and datetime.now() >= self.reset_time:
             self.state = self.HALF_OPEN
             self._save_to_redis()
@@ -221,7 +247,7 @@ class ClaudeCodeBreaker:
                 "🟡 CLAUDE CODE BREAKER HALF-OPEN - Testing token availability..."
             )
             return False  # Still not fully closed, need successful test
-        
+
         return False
     
     def close(self):
@@ -243,7 +269,11 @@ class ClaudeCodeBreaker:
             logger.info("🟢 CLAUDE CODE BREAKER CLOSED - Tokens available, resuming operations")
     
     def is_open(self) -> bool:
-        """Check if breaker is open (agents cannot run)."""
+        """Check if breaker is open (agents cannot run).
+        Also checks Redis to detect external resets."""
+        # Check Redis for external reset before checking state
+        if self.state == self.OPEN:
+            self.check_and_close()  # Will detect and apply external reset
         return self.state == self.OPEN
     
     def is_half_open(self) -> bool:
@@ -251,14 +281,41 @@ class ClaudeCodeBreaker:
         return self.state == self.HALF_OPEN
     
     def get_status(self) -> dict:
-        """Get current breaker status."""
+        """Get current breaker status.
+        Syncs from Redis first to ensure accuracy across processes."""
+        # Sync from Redis to get latest state (especially important for observability server)
+        if self.redis_client:
+            try:
+                state_json = self.redis_client.get(self.REDIS_KEY)
+                if state_json:
+                    # Load latest state from Redis
+                    state_dict = json.loads(state_json)
+                    self.state = state_dict.get('state', self.CLOSED)
+
+                    opened_at_str = state_dict.get('opened_at')
+                    self.opened_at = datetime.fromisoformat(opened_at_str) if opened_at_str else None
+
+                    reset_time_str = state_dict.get('reset_time')
+                    self.reset_time = datetime.fromisoformat(reset_time_str) if reset_time_str else None
+
+                    self.failure_count = state_dict.get('failure_count', 0)
+                elif self.state != self.CLOSED:
+                    # Redis key missing but we think we're open = external reset
+                    logger.debug("Redis key missing in get_status, closing breaker")
+                    self.state = self.CLOSED
+                    self.opened_at = None
+                    self.reset_time = None
+                    self.failure_count = 0
+            except Exception as e:
+                logger.debug(f"Could not sync from Redis in get_status: {e}")
+
         return {
             'state': self.state,
             'opened_at': self.opened_at.isoformat() if self.opened_at else None,
             'reset_time': self.reset_time.isoformat() if self.reset_time else None,
             'time_until_reset': (
-                (self.reset_time - datetime.now()).total_seconds() 
-                if self.reset_time and self.state != self.CLOSED 
+                (self.reset_time - datetime.now()).total_seconds()
+                if self.reset_time and self.state != self.CLOSED
                 else None
             ),
             'is_open': self.is_open(),

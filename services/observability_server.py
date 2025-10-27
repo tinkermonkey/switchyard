@@ -241,7 +241,7 @@ def health():
                 'opened_at': client_status['breaker']['opened_at'],
                 'reset_time': client_status['breaker']['reset_time'],
             }
-            
+
             # Update the cached health data with fresh rate limit and circuit breaker info
             if 'checks' in health_data and 'github' in health_data['checks']:
                 health_data['checks']['github']['api_rate_limit'] = fresh_rate_limit
@@ -249,6 +249,31 @@ def health():
         except Exception as e:
             logger.debug(f"Failed to fetch fresh rate limit data: {e}")
             # Continue with cached data if fresh fetch fails
+
+        # IMPORTANT: Also fetch fresh Claude Code circuit breaker status
+        try:
+            from monitoring.claude_code_breaker import get_breaker
+            claude_breaker = get_breaker()
+            if claude_breaker:
+                claude_status = claude_breaker.get_status()
+                fresh_claude_breaker = {
+                    'state': claude_status['state'],
+                    'is_open': claude_status['is_open'],
+                    'opened_at': claude_status['opened_at'],
+                    'reset_time': claude_status['reset_time'],
+                    'time_until_reset': claude_status['time_until_reset'],
+                }
+
+                # Add Claude Code breaker to checks
+                if 'checks' not in health_data:
+                    health_data['checks'] = {}
+                health_data['checks']['claude_code'] = {
+                    'healthy': not claude_status['is_open'],
+                    'circuit_breaker': fresh_claude_breaker
+                }
+        except Exception as e:
+            logger.debug(f"Failed to fetch Claude Code breaker status: {e}")
+            # Continue without Claude Code breaker data if fetch fails
         
         # Add subscriber health to response
         health_data['subscriber_health'] = subscriber_health
@@ -706,7 +731,7 @@ def get_pipeline_run_events():
             agent_events_query = {
                 "query": {
                     "term": {
-                        "pipeline_run_id": pipeline_run_id
+                        "pipeline_run_id.keyword": pipeline_run_id
                     }
                 },
                 "sort": [{"timestamp": "asc"}],
@@ -989,12 +1014,12 @@ def get_agent_execution(execution_id):
                 "sort": [{"timestamp": "asc"}],
                 "size": 1
             }
-            
+
             prompt_result = es_client.search(
-                index="agent-events-*",
+                index="claude-streams-*",
                 body=prompt_query
             )
-            
+
             if prompt_result['hits']['total']['value'] > 0:
                 prompt_event = prompt_result['hits']['hits'][0]['_source']
         except Exception as e:
@@ -1470,6 +1495,73 @@ def get_circuit_breakers():
             'success': False,
             'error': str(e),
             'circuit_breakers': []
+        }), 500
+
+@app.route('/api/circuit-breakers/claude-code/reset', methods=['POST'])
+def reset_claude_code_breaker():
+    """Manually reset the Claude Code circuit breaker"""
+    try:
+        from monitoring.claude_code_breaker import get_breaker
+
+        breaker = get_breaker()
+        if not breaker:
+            return jsonify({
+                'success': False,
+                'error': 'Claude Code breaker not available'
+            }), 500
+
+        # Close the breaker
+        breaker.close()
+
+        logger.info("🟢 Claude Code circuit breaker manually reset via API")
+
+        return jsonify({
+            'success': True,
+            'message': 'Claude Code circuit breaker has been reset',
+            'status': breaker.get_status()
+        })
+
+    except Exception as e:
+        logger.error(f"Error resetting Claude Code breaker: {e}", exc_info=True)
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+@app.route('/api/circuit-breakers/github-api/reset', methods=['POST'])
+def reset_github_api_breaker():
+    """Manually reset the GitHub API circuit breaker"""
+    try:
+        from services.github_api_client import get_github_client
+
+        client = get_github_client()
+        if not client:
+            return jsonify({
+                'success': False,
+                'error': 'GitHub API client not available'
+            }), 500
+
+        # Close the breaker
+        client.breaker.close()
+
+        logger.info("🟢 GitHub API circuit breaker manually reset via API")
+
+        return jsonify({
+            'success': True,
+            'message': 'GitHub API circuit breaker has been reset',
+            'status': {
+                'state': client.breaker.state,
+                'is_open': client.breaker.is_open(),
+                'opened_at': client.breaker.opened_at.isoformat() if client.breaker.opened_at else None,
+                'reset_time': client.breaker.reset_time.isoformat() if client.breaker.reset_time else None
+            }
+        })
+
+    except Exception as e:
+        logger.error(f"Error resetting GitHub API breaker: {e}", exc_info=True)
+        return jsonify({
+            'success': False,
+            'error': str(e)
         }), 500
 
 @app.route('/api/github-api-status', methods=['GET'])

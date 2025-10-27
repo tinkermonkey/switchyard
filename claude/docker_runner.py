@@ -283,14 +283,14 @@ class DockerAgentRunner:
         project = context.get('project', 'unknown')
 
         logger.info(f"Running agent {agent} in Docker container for project {project}")
-        
+
         # Check Claude Code circuit breaker before launching agent
         breaker = get_breaker()
         if breaker and breaker.is_open():
             can_execute, error_msg = (False, "Circuit breaker open")
         else:
             can_execute, error_msg = (True, None)
-            
+
         if not can_execute:
             from monitoring.claude_code_breaker import check_breaker_before_agent_execution
             can_execute, error_msg = check_breaker_before_agent_execution(agent)
@@ -300,8 +300,11 @@ class DockerAgentRunner:
 
         # Prepare MCP configuration if needed
         mcp_config = None
+        mcp_config_path = None
         if mcp_servers and len(mcp_servers) > 0:
             mcp_config = self._prepare_mcp_config(mcp_servers, project_dir)
+            # Write MCP config to a temp file
+            mcp_config_path = self._write_mcp_config_file(mcp_config, agent, task_id)
 
         # Build docker run command
         raw_container_name = f"claude-agent-{project}-{task_id}"
@@ -313,7 +316,7 @@ class DockerAgentRunner:
         docker_cmd = self._build_docker_command(
             container_name=container_name,
             project_dir=project_dir,
-            mcp_config=mcp_config,
+            mcp_config_path=mcp_config_path,
             context=context,
             use_stdin=use_stdin
         )
@@ -325,7 +328,8 @@ class DockerAgentRunner:
                 prompt=prompt,
                 container_name=container_name,
                 stream_callback=stream_callback,
-                context=context
+                context=context,
+                mcp_config_path=mcp_config_path
             )
 
             return result_text
@@ -334,6 +338,13 @@ class DockerAgentRunner:
             # Clean up container and tracking
             self._cleanup_container(container_name)
             self._unregister_active_container(container_name)
+            # Clean up MCP config file
+            if mcp_config_path and os.path.exists(mcp_config_path):
+                try:
+                    os.remove(mcp_config_path)
+                    logger.debug(f"Cleaned up MCP config file: {mcp_config_path}")
+                except Exception as e:
+                    logger.warning(f"Failed to clean up MCP config file: {e}")
 
     def _prepare_mcp_config(self, mcp_servers: list, project_dir: Path) -> Dict:
         """Prepare MCP configuration for the container"""
@@ -372,11 +383,44 @@ class DockerAgentRunner:
 
         return mcp_config_data
 
+    def _write_mcp_config_file(self, mcp_config: Dict, agent: str, task_id: str) -> str:
+        """
+        Write MCP configuration to a temporary JSON file.
+
+        Args:
+            mcp_config: The MCP configuration dict
+            agent: Agent name (for logging)
+            task_id: Task ID (for unique filename)
+
+        Returns:
+            Path to the created MCP config file
+        """
+        import tempfile
+        import time
+
+        # Create a temp file in /app/tmp (accessible from Docker-in-Docker)
+        # /app is mounted from the host, so files here are accessible to child containers
+        temp_dir = "/app/tmp" if os.path.exists("/app") else "/tmp"
+        os.makedirs(temp_dir, exist_ok=True)
+
+        timestamp = int(time.time())
+        mcp_config_filename = f"mcp_config_{agent}_{task_id}_{timestamp}.json"
+        mcp_config_path = os.path.join(temp_dir, mcp_config_filename)
+
+        # Write the config
+        with open(mcp_config_path, 'w') as f:
+            json.dump(mcp_config, f, indent=2)
+
+        logger.info(f"Wrote MCP config to {mcp_config_path}")
+        logger.debug(f"MCP config contents: {json.dumps(mcp_config, indent=2)}")
+
+        return mcp_config_path
+
     def _build_docker_command(
         self,
         container_name: str,
         project_dir: Path,
-        mcp_config: Optional[Dict],
+        mcp_config_path: Optional[str],
         context: Dict[str, Any],
         use_stdin: bool = False
     ) -> list:
@@ -450,7 +494,28 @@ class DockerAgentRunner:
 
             # Mount git config (read-only)
             '-v', f'{host_home}/.gitconfig:/home/orchestrator/.gitconfig:ro',
+        ])
 
+        # Mount MCP config file if provided
+        # The MCP config is written to /app/tmp which is accessible from host
+        # We need to convert container path to host path for Docker-in-Docker mounting
+        if mcp_config_path:
+            # If running in orchestrator container, /app maps to host directory
+            # Convert /app/tmp/file.json -> host_path/tmp/file.json
+            if mcp_config_path.startswith('/app/'):
+                # Running in orchestrator - /app is mounted from host
+                # Get the relative path from /app and prepend host workspace
+                relative_from_app = mcp_config_path.replace('/app/', '')
+                host_mcp_path = f'{host_workspace}/clauditoreum/{relative_from_app}'
+            else:
+                # Running locally - use as-is
+                host_mcp_path = mcp_config_path
+
+            # Mount to /home/orchestrator/.mcp_config.json to ensure parent dir exists
+            cmd.extend(['-v', f'{host_mcp_path}:/home/orchestrator/.mcp_config.json:ro'])
+            logger.info(f"Mounting MCP config: {host_mcp_path} -> /home/orchestrator/.mcp_config.json")
+
+        cmd.extend([
             # Working directory inside container
             '-w', '/workspace',
 
@@ -545,7 +610,8 @@ class DockerAgentRunner:
         prompt: str,
         container_name: str,
         stream_callback: Optional[Callable],
-        context: Dict[str, Any]
+        context: Dict[str, Any],
+        mcp_config_path: Optional[str] = None
     ) -> str:
         """Execute Claude Code inside the container"""
 
@@ -585,6 +651,12 @@ class DockerAgentRunner:
             '--output-format', 'stream-json',
             '--model', claude_model,
         ]
+
+        # Add MCP config if provided
+        if mcp_config_path:
+            # Always use the fixed mount point inside the agent container
+            claude_cmd.extend(['--mcp-config', '/home/orchestrator/.mcp_config.json'])
+            logger.info("Using MCP config: /home/orchestrator/.mcp_config.json")
 
         # Use bypassPermissions for all agents in containerized environment
         # The container provides isolation, so we can safely bypass permission checks
@@ -736,6 +808,12 @@ class DockerAgentRunner:
                         logger.error(f"🔴 Captured Claude Code error event: {error_text}")
                         stderr_parts.append(f"{error_text}\n")
 
+                        # Also check if this error is a token/rate limit
+                        error_msg_lower = str(error_msg).lower()
+                        if any(pattern in error_msg_lower for pattern in ['session limit', 'token limit', 'rate limit', 'usage limit', 'quota', 'overloaded']):
+                            logger.error(f"🔴 Detected limit in error event: {error_msg}")
+                            stderr_parts.append(f"SESSION_LIMIT_IN_ERROR: {error_msg}\n")
+
                     # Collect result text from assistant messages only
                     # Note: Do not collect from 'result' events as they duplicate the assistant content
                     if event_type == 'assistant':
@@ -745,12 +823,13 @@ class DockerAgentRunner:
                             if isinstance(item, dict) and item.get('type') == 'text':
                                 text = item.get('text', '')
                                 if text:
-                                    # CRITICAL: Check for session limit in assistant response text!
+                                    # CRITICAL: Check for session/token/rate limit in assistant response text!
                                     # Claude returns "Session limit reached ∙ resets 12am" as assistant text
-                                    if 'session limit' in text.lower():
-                                        logger.error(f"🔴 Detected session limit in assistant response: {text}")
+                                    text_lower = text.lower()
+                                    if any(pattern in text_lower for pattern in ['session limit', 'token limit', 'rate limit', 'usage limit', 'quota']):
+                                        logger.error(f"🔴 Detected limit in assistant response: {text}")
                                         stderr_parts.append(f"SESSION_LIMIT_IN_RESPONSE: {text}\n")
-                                    
+
                                     result_parts.append(text)
 
                 except json.JSONDecodeError:
@@ -774,6 +853,26 @@ class DockerAgentRunner:
             if process.returncode == 0:
                 result_text = ''.join(result_parts)
                 logger.info(f"Agent completed successfully in container, result length: {len(result_text)}, session_id: {session_id}")
+
+                # CRITICAL: Check for session limit even on success
+                # Claude Code can return session limit in response but still exit with code 0
+                # Check both stderr_parts (which includes captured session limit messages) and result_text
+                stderr_text = ''.join(stderr_parts) if stderr_parts else ""
+                combined_output = stderr_text + "\n" + result_text
+
+                breaker = get_breaker()
+                if breaker:
+                    is_session_limited, reset_time = breaker.detect_session_limit(combined_output)
+                    if is_session_limited:
+                        breaker.trip(reset_time)
+                        logger.error("🔴 Claude Code token limit detected in successful response - circuit breaker OPEN")
+
+                        # Mark all in-progress executions as failed
+                        from services.claude_code_failure_handler import mark_in_progress_executions_as_failed
+                        mark_in_progress_executions_as_failed("Claude Code session limit reached")
+
+                        # Raise exception to prevent further execution
+                        raise Exception(f"Claude Code session limit reached. Resets at: {reset_time}")
 
                 # Store session_id in context for session continuity
                 if session_id:

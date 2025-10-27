@@ -136,14 +136,23 @@ class PipelineProgression:
                     capture_output=True, text=True, check=True
                 )
                 data = json.loads(result.stdout)
-                project_items = data['data']['repository']['issue']['projectItems']['nodes']
-                
-                for item in project_items:
-                    if item['project']['number'] == board_state.project_number:
-                        field_value = item.get('fieldValueByName')
-                        if field_value:
-                            current_status = field_value.get('name')
-                        break
+
+                # Safely access nested dictionary structure
+                if data and data.get('data'):
+                    repo_data = data['data'].get('repository')
+                    if repo_data:
+                        issue_data = repo_data.get('issue')
+                        if issue_data:
+                            project_items_data = issue_data.get('projectItems')
+                            if project_items_data:
+                                project_items = project_items_data.get('nodes', [])
+
+                                for item in project_items:
+                                    if item.get('project', {}).get('number') == board_state.project_number:
+                                        field_value = item.get('fieldValueByName')
+                                        if field_value:
+                                            current_status = field_value.get('name')
+                                        break
             except Exception as e:
                 logger.debug(f"Could not determine current status: {e}")
             
@@ -203,17 +212,40 @@ class PipelineProgression:
             )
 
             data = json.loads(result.stdout)
-            project_items = data['data']['repository']['issue']['projectItems']['nodes']
+
+            # Safely access nested dictionary structure
+            project_items = []
+            issue_exists = False
+            if data and data.get('data'):
+                repo_data = data['data'].get('repository')
+                if repo_data:
+                    issue_data = repo_data.get('issue')
+                    if issue_data:
+                        issue_exists = True
+                        project_items_data = issue_data.get('projectItems')
+                        if project_items_data:
+                            project_items = project_items_data.get('nodes', [])
+
+            # Check if issue exists in repository
+            if not issue_exists:
+                logger.error(f"Issue #{issue_number} does not exist in repository {github_org}/{github_repo}")
+                logger.error(f"The issue may have been deleted, or the task has stale data")
+                return False
 
             # Find the item for our project
             item_id = None
             for item in project_items:
-                if item['project']['number'] == board_state.project_number:
-                    item_id = item['id']
+                if item.get('project', {}).get('number') == board_state.project_number:
+                    item_id = item.get('id')
                     break
 
             if not item_id:
-                logger.error(f"Issue #{issue_number} not found in project")
+                logger.error(f"Issue #{issue_number} exists but is not in project '{board_name}' (project #{board_state.project_number})")
+                if project_items:
+                    other_projects = [item.get('project', {}).get('number') for item in project_items]
+                    logger.error(f"Issue is in projects: {other_projects}")
+                else:
+                    logger.error(f"Issue #{issue_number} is not in any projects")
                 return False
 
             # Update the item's status field

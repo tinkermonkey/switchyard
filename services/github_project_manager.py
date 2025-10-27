@@ -11,6 +11,7 @@ import json
 import subprocess
 import requests
 import time
+from datetime import datetime
 from typing import Dict, Any, List, Optional, Tuple
 import logging
 
@@ -49,7 +50,29 @@ class GitHubProjectManager:
             True if reconciliation was successful, False otherwise
         """
         try:
-            logger.info(f"Starting reconciliation for project: {project_name}")
+            # Check if circuit breaker is open before attempting reconciliation
+            github_client = get_github_client()
+            if github_client.breaker.is_open():
+                time_until_reset = github_client.breaker.reset_time - datetime.now() if github_client.breaker.reset_time else None
+                wait_msg = f" (resets in {int(time_until_reset.total_seconds())}s)" if time_until_reset else ""
+                logger.warning(f"Skipping reconciliation for '{project_name}' - GitHub API circuit breaker is OPEN{wait_msg}")
+                return False
+
+            # Check if state is fresh and config hasn't changed - skip reconciliation to save API quota
+            # Freshness threshold: 1 hour (configurable via environment variable)
+            freshness_hours = int(os.environ.get('RECONCILIATION_FRESHNESS_HOURS', '1'))
+
+            config_changed = self.state_manager.needs_reconciliation(project_name)
+            state_is_fresh = self.state_manager.is_state_fresh(project_name, max_age_hours=freshness_hours)
+
+            if not config_changed and state_is_fresh:
+                logger.info(f"Skipping reconciliation for '{project_name}' - state is fresh and config unchanged (saves ~18-27 API calls)")
+                return True
+
+            if config_changed:
+                logger.info(f"Starting reconciliation for project: {project_name} (config changed)")
+            else:
+                logger.info(f"Starting reconciliation for project: {project_name} (state is stale or incomplete)")
 
             # Load project configuration
             project_config = self.config_manager.get_project_config(project_name)
@@ -88,14 +111,30 @@ class GitHubProjectManager:
             # Check if board already exists in state
             existing_board = self.state_manager.get_board_by_name(project_name, pipeline_config.board_name)
 
-            # If we have state, verify the board still exists in GitHub
+            # If we have state, check if it's complete to skip verification
             if existing_board is not None:
-                logger.info(f"Verifying board exists in GitHub: {pipeline_config.board_name} (#{existing_board.project_number})")
-                board_exists = await self._verify_board_exists(existing_board.project_number, project_config.github['org'])
+                # Check if board state is complete - if so, trust it without verifying
+                workflow_template = self.config_manager.get_workflow_template(pipeline_config.workflow)
+                expected_column_names = set(col.name for col in workflow_template.columns)
+                existing_column_names = set(col.name for col in existing_board.columns)
 
-                if not board_exists:
-                    logger.warning(f"Board #{existing_board.project_number} no longer exists in GitHub, will search for existing board by name")
-                    existing_board = None
+                board_is_complete = (
+                    existing_board.project_id and
+                    existing_board.status_field_id and
+                    len(existing_board.columns) > 0 and
+                    expected_column_names == existing_column_names
+                )
+
+                # Only verify board exists if state is incomplete
+                if not board_is_complete:
+                    logger.info(f"Verifying board exists in GitHub: {pipeline_config.board_name} (#{existing_board.project_number})")
+                    board_exists = await self._verify_board_exists(existing_board.project_number, project_config.github['org'])
+
+                    if not board_exists:
+                        logger.warning(f"Board #{existing_board.project_number} no longer exists in GitHub, will search for existing board by name")
+                        existing_board = None
+                else:
+                    logger.debug(f"Board state complete for '{pipeline_config.board_name}' - skipping existence verification")
 
             # If no state or board doesn't exist, try to discover existing board by name
             if existing_board is None:
@@ -120,9 +159,15 @@ class GitHubProjectManager:
                     workflow_template = self.config_manager.get_workflow_template(pipeline_config.workflow)
                     columns = await self._configure_board_columns(
                         discovered_board['number'],
+                        discovered_board['id'],
                         workflow_template,
                         project_config.github['org']
                     )
+
+                    # Only update state if we successfully retrieved columns
+                    if not columns:
+                        logger.error(f"Failed to configure columns for discovered board '{pipeline_config.board_name}' - skipping state update to preserve existing state")
+                        return False
 
                     self.state_manager.update_board_state(
                         project_name,
@@ -145,8 +190,24 @@ class GitHubProjectManager:
                     if not board_data:
                         return False
             else:
+                # Check if board state is already complete and valid
+                workflow_template = self.config_manager.get_workflow_template(pipeline_config.workflow)
+                expected_column_names = set(col.name for col in workflow_template.columns)
+                existing_column_names = set(col.name for col in existing_board.columns)
+
+                board_is_complete = (
+                    existing_board.project_id and
+                    existing_board.status_field_id and
+                    len(existing_board.columns) > 0 and
+                    expected_column_names == existing_column_names
+                )
+
+                if board_is_complete:
+                    logger.info(f"Board state is complete and valid for '{pipeline_config.board_name}' - skipping column configuration to reduce API usage")
+                    return True
+
                 logger.info(f"Board exists in GitHub: {pipeline_config.board_name}, updating columns")
-                
+
                 # Link existing board to repository if not already linked
                 await self._link_board_to_repository(
                     existing_board.project_number,
@@ -154,9 +215,8 @@ class GitHubProjectManager:
                     project_config.github['repo'],
                     pipeline_config.board_name
                 )
-                
+
                 # Update existing board columns
-                workflow_template = self.config_manager.get_workflow_template(pipeline_config.workflow)
                 project_number = existing_board.project_number
 
                 if project_number:
@@ -166,6 +226,11 @@ class GitHubProjectManager:
                         workflow_template,
                         project_config.github['org']
                     )
+
+                    # Only update state if we successfully retrieved columns
+                    if not columns:
+                        logger.error(f"Failed to configure columns for existing board '{pipeline_config.board_name}' - skipping state update to preserve existing state")
+                        return False
 
                     # Update state with new columns
                     self.state_manager.update_board_state(
@@ -236,6 +301,11 @@ class GitHubProjectManager:
 
             # Configure columns
             columns = await self._configure_board_columns(project_number, project_id, workflow_template, project_config.github['org'])
+
+            # Only update state if we successfully retrieved columns
+            if not columns:
+                logger.error(f"Failed to configure columns for newly created board '{pipeline_config.board_name}' - board created but state not updated")
+                return None
 
             # Update state
             self.state_manager.update_board_state(

@@ -1,6 +1,6 @@
-import { createFileRoute } from '@tanstack/react-router'
+import { createFileRoute, useNavigate } from '@tanstack/react-router'
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
-import { RefreshCw, CheckCircle2, Circle, PlayCircle, ChevronDown, ChevronUp } from 'lucide-react'
+import { RefreshCw, CheckCircle2, Circle, PlayCircle, ChevronDown, ChevronUp, ChevronLeft, ChevronRight } from 'lucide-react'
 import Header from '../components/Header'
 import NavigationTabs from '../components/NavigationTabs'
 import { useSocket } from '../contexts/SocketContext'
@@ -15,6 +15,7 @@ import { normalizeTimestamp, formatTimestamp, mergeAgentExecutionEvents } from '
 
 function AgentExecutionView() {
   const { executionId } = Route.useParams()
+  const navigate = useNavigate()
   const { logs: allLogs } = useSocket()
   const [executionData, setExecutionData] = useState(null)
   const [executionLogs, setExecutionLogs] = useState([])
@@ -26,19 +27,41 @@ function AgentExecutionView() {
   const [isPreviousResultExpanded, setIsPreviousResultExpanded] = useState(false)
   const [autoScroll, setAutoScroll] = useState(true)
   const logsContainerRef = useRef(null)
-  
+
+  // Agent execution navigation state
+  const [pipelineRunId, setPipelineRunId] = useState(null)
+  const [pipelineExecutions, setPipelineExecutions] = useState([])
+  const [autoAdvance, setAutoAdvance] = useState(true)
+  const [loadingExecutions, setLoadingExecutions] = useState(false)
+
+  // Refs to prevent concurrent fetches and track state
+  const isFetchingExecutionsRef = useRef(false)
+  const pipelineRunIdRef = useRef(pipelineRunId)
+  const lastProcessedSocketEventRef = useRef(null)
+  const previousExecutionsLengthRef = useRef(0)
+
+  // Update pipelineRunId ref when it changes
+  useEffect(() => {
+    pipelineRunIdRef.current = pipelineRunId
+  }, [pipelineRunId])
+
   // Fetch execution data
   const fetchExecutionData = useCallback(async () => {
     try {
       setLoading(true)
       const response = await fetch(`/api/agent-execution/${executionId}`)
       const data = await response.json()
-      
+
       if (data.success) {
         setExecutionData(data.execution)
         setExecutionLogs(data.logs || [])
         setPromptEvent(data.prompt_event || null)
         setError(null)
+
+        // Extract pipeline_run_id from execution data
+        if (data.execution?.pipeline_run_id) {
+          setPipelineRunId(data.execution.pipeline_run_id)
+        }
       } else {
         setError(data.error || 'Failed to load execution data')
       }
@@ -49,11 +72,161 @@ function AgentExecutionView() {
       setLoading(false)
     }
   }, [executionId])
-  
+
+  // Fetch all executions in the pipeline run
+  const fetchPipelineExecutions = useCallback(async (runId) => {
+    if (!runId) return
+
+    // Guard against concurrent fetches
+    if (isFetchingExecutionsRef.current) {
+      console.log('[AgentExecution] Skipping pipeline executions fetch - already in progress')
+      return
+    }
+
+    try {
+      isFetchingExecutionsRef.current = true
+      setLoadingExecutions(true)
+      const response = await fetch(`/pipeline-run-events?pipeline_run_id=${runId}`)
+      const data = await response.json()
+
+      if (data.success) {
+        // Extract agent executions from events
+        const executionMap = new Map()
+
+        data.events.forEach(event => {
+          if (event.event_type === 'agent_initialized') {
+            const execId = event.agent_execution_id
+            if (execId && !executionMap.has(execId)) {
+              executionMap.set(execId, {
+                execution_id: execId,
+                agent_name: event.agent,
+                started_at: event.timestamp,
+                status: 'running'
+              })
+            }
+          } else if (event.event_type === 'agent_completed' || event.event_type === 'agent_failed') {
+            const execId = event.agent_execution_id
+            if (execId && executionMap.has(execId)) {
+              executionMap.get(execId).status = event.event_type === 'agent_completed' ? 'completed' : 'failed'
+              executionMap.get(execId).ended_at = event.timestamp
+            }
+          }
+        })
+
+        const executions = Array.from(executionMap.values())
+        // Sort by start time
+        executions.sort((a, b) => new Date(a.started_at) - new Date(b.started_at))
+
+        console.log('[AgentExecution] Found pipeline executions:', executions.length)
+        setPipelineExecutions(executions)
+      }
+    } catch (err) {
+      console.error('Error fetching pipeline executions:', err)
+    } finally {
+      setLoadingExecutions(false)
+      isFetchingExecutionsRef.current = false
+    }
+  }, [])
+
   useEffect(() => {
     fetchExecutionData()
   }, [fetchExecutionData])
-  
+
+  // Fetch pipeline executions when pipeline_run_id is available
+  useEffect(() => {
+    if (pipelineRunId) {
+      fetchPipelineExecutions(pipelineRunId)
+    }
+  }, [pipelineRunId, fetchPipelineExecutions])
+
+  // Periodic refresh to detect new agent executions
+  useEffect(() => {
+    if (!pipelineRunId) return
+
+    const intervalId = setInterval(() => {
+      console.log('[AgentExecution] Periodic refresh of pipeline executions')
+      // Use ref to get current pipeline run ID
+      if (pipelineRunIdRef.current) {
+        fetchPipelineExecutions(pipelineRunIdRef.current)
+      }
+    }, 10000) // Refresh every 10 seconds
+
+    return () => clearInterval(intervalId)
+  }, [fetchPipelineExecutions, pipelineRunId])
+
+  // WebSocket event handling to detect new agent executions
+  useEffect(() => {
+    if (allLogs.length > 0 && pipelineRunIdRef.current) {
+      const latestLog = allLogs[allLogs.length - 1]
+
+      // Skip if we've already processed this event
+      if (lastProcessedSocketEventRef.current === latestLog) {
+        return
+      }
+      lastProcessedSocketEventRef.current = latestLog
+
+      // Refresh pipeline executions on agent lifecycle events
+      if (latestLog.event_type === 'agent_initialized' ||
+          latestLog.event_type === 'agent_completed' ||
+          latestLog.event_type === 'agent_failed') {
+        console.log('[AgentExecution] WebSocket event detected:', latestLog.event_type)
+        fetchPipelineExecutions(pipelineRunIdRef.current)
+      }
+    }
+  }, [allLogs, fetchPipelineExecutions])
+
+  // Get current execution index
+  const currentExecutionIndex = useMemo(() => {
+    return pipelineExecutions.findIndex(exec => exec.execution_id === executionId)
+  }, [pipelineExecutions, executionId])
+
+  // Auto-advance to latest execution when new executions appear
+  useEffect(() => {
+    const currentLength = pipelineExecutions.length
+    const previousLength = previousExecutionsLengthRef.current
+
+    // Only auto-advance when length actually increases (new execution added)
+    if (autoAdvance && currentLength > previousLength && currentLength > 0) {
+      const latestExecution = pipelineExecutions[pipelineExecutions.length - 1]
+      // Only auto-advance if we're not already viewing the latest execution
+      if (latestExecution.execution_id !== executionId) {
+        console.log('[AgentExecution] Auto-advancing to latest execution:', latestExecution.execution_id)
+        navigate({ to: '/agent-execution/$executionId', params: { executionId: latestExecution.execution_id } })
+      }
+    }
+
+    // Update ref after processing
+    previousExecutionsLengthRef.current = currentLength
+  }, [pipelineExecutions, autoAdvance, executionId, navigate])
+
+  // Navigation handlers
+  const handlePreviousExecution = useCallback(() => {
+    if (currentExecutionIndex > 0) {
+      setAutoAdvance(false)
+      const prevExecution = pipelineExecutions[currentExecutionIndex - 1]
+      navigate({ to: '/agent-execution/$executionId', params: { executionId: prevExecution.execution_id } })
+    }
+  }, [currentExecutionIndex, pipelineExecutions, navigate])
+
+  const handleNextExecution = useCallback(() => {
+    if (currentExecutionIndex < pipelineExecutions.length - 1) {
+      setAutoAdvance(false)
+      const nextExecution = pipelineExecutions[currentExecutionIndex + 1]
+      navigate({ to: '/agent-execution/$executionId', params: { executionId: nextExecution.execution_id } })
+    }
+  }, [currentExecutionIndex, pipelineExecutions, navigate])
+
+  const handleAutoAdvanceToggle = useCallback((e) => {
+    const checked = e.target.checked
+    setAutoAdvance(checked)
+    if (checked && pipelineExecutions.length > 0) {
+      const latestExecution = pipelineExecutions[pipelineExecutions.length - 1]
+      if (latestExecution.execution_id !== executionId) {
+        navigate({ to: '/agent-execution/$executionId', params: { executionId: latestExecution.execution_id } })
+      }
+    }
+  }, [pipelineExecutions, executionId, navigate])
+
   // Merge API logs with live WebSocket updates and build agent state
   const { executionEvents, agentState, mergedLogs } = useMemo(() => {
     if (!executionData) {
@@ -182,13 +355,13 @@ function AgentExecutionView() {
     
     // Use prompt_event from API response instead of searching events
     let inputPrompt = null
-    if (promptEvent && promptEvent.data?.prompt) {
+    if (promptEvent && promptEvent.raw_event?.data?.prompt) {
       const eventTimestamp = normalizeTimestamp(promptEvent.timestamp)
       if (eventTimestamp) {
         inputPrompt = {
-          text: promptEvent.data.prompt,
+          text: promptEvent.raw_event.data.prompt,
           timestamp: eventTimestamp,
-          agent: promptEvent.agent
+          agent: promptEvent.agent_name || promptEvent.agent
         }
       }
     }
@@ -387,6 +560,69 @@ function AgentExecutionView() {
   
   return (
     <div className="min-h-screen p-5 bg-gh-canvas text-gh-fg">
+
+      {/* Agent Execution Navigation Header */}
+      {pipelineExecutions.length > 0 && currentExecutionIndex >= 0 && (
+        <div className="mb-3 p-3 bg-gh-canvas-subtle rounded-md border border-gh-border">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-3">
+              {/* Navigation buttons */}
+              <div className="flex gap-1">
+                <button
+                  onClick={handlePreviousExecution}
+                  disabled={currentExecutionIndex === 0}
+                  className="p-2 bg-gh-canvas border border-gh-border rounded hover:bg-gh-border-muted transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
+                  title="Previous agent execution"
+                >
+                  <ChevronLeft className="w-4 h-4" />
+                </button>
+                <button
+                  onClick={handleNextExecution}
+                  disabled={currentExecutionIndex === pipelineExecutions.length - 1}
+                  className="p-2 bg-gh-canvas border border-gh-border rounded hover:bg-gh-border-muted transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
+                  title="Next agent execution"
+                >
+                  <ChevronRight className="w-4 h-4" />
+                </button>
+              </div>
+
+              {/* Execution counter and agent info */}
+              <div className="flex items-center gap-2 pl-2 border-l border-gh-border">
+                <span className="text-sm font-mono font-semibold">
+                  {currentExecutionIndex + 1} / {pipelineExecutions.length}
+                </span>
+                <span className="text-gh-fg-muted">·</span>
+                <span className="text-sm font-medium">
+                  {formatAgentName(executionData.agent)}
+                </span>
+                <span
+                  className={`text-xs px-2 py-0.5 rounded-full ${
+                    executionData.status === 'completed'
+                      ? 'bg-green-900/30 text-green-400'
+                      : executionData.status === 'failed'
+                      ? 'bg-red-900/30 text-red-400'
+                      : 'bg-blue-900/30 text-blue-400'
+                  }`}
+                >
+                  {executionData.status}
+                </span>
+              </div>
+            </div>
+
+            {/* Auto-advance checkbox */}
+            <label className="flex items-center gap-2 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={autoAdvance}
+                onChange={handleAutoAdvanceToggle}
+                className="w-4 h-4 rounded border-gh-border bg-gh-canvas text-gh-accent-emphasis focus:ring-2 focus:ring-gh-accent-emphasis focus:ring-offset-0"
+              />
+              <span className="text-sm">Auto-advance</span>
+            </label>
+          </div>
+        </div>
+      )}
+
       {/* Agent State Section - Replicated from AgentState component */}
       <div className="bg-gh-canvas-subtle rounded-md border border-gh-border mb-5">
         <div className="p-4 border-b border-gh-border flex items-center justify-between">
@@ -686,7 +922,7 @@ function AgentExecutionView() {
           </div>
         </div>
       </div>
-      
+
       {/* Live Logs Section */}
       <div className="bg-gh-canvas-subtle rounded-md border border-gh-border">
         <div className="p-4 border-b border-gh-border flex justify-between items-center">

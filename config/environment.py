@@ -56,6 +56,9 @@ class Environment(BaseSettings):
     # Monitoring
     log_level: str = "INFO"
 
+    # Performance and API Optimization
+    reconciliation_freshness_hours: int = 1  # Skip reconciliation if state is fresh (default: 1 hour)
+
     # Docker/Host Configuration (used by docker-compose for file permissions)
     host_uid: Optional[int] = 1000
     host_gid: Optional[int] = 1000

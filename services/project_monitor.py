@@ -2751,7 +2751,10 @@ _Repair cycle initiated by Claude Code Orchestrator_
                 
                 # Run token availability check/test
                 asyncio.run(scheduler.check_and_run_test())
-                
+
+                # Check if GitHub API rate limit has reset and close breaker if so
+                github_client.breaker.check_and_close()
+
                 # Check GitHub API circuit breaker - if open, skip all monitoring
                 if github_client.breaker.is_open():
                     # Log warning only once every 60 seconds to reduce noise

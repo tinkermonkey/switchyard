@@ -10,6 +10,7 @@
 
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as ReviewLearningRouteImport } from './routes/review-learning'
+import { Route as RepairCyclesRouteImport } from './routes/repair-cycles'
 import { Route as ProjectsRouteImport } from './routes/projects'
 import { Route as PipelineRunDebugRouteImport } from './routes/pipeline-run-debug'
 import { Route as PipelineRunRouteImport } from './routes/pipeline-run'
@@ -19,6 +20,11 @@ import { Route as AgentExecutionExecutionIdRouteImport } from './routes/agent-ex
 const ReviewLearningRoute = ReviewLearningRouteImport.update({
   id: '/review-learning',
   path: '/review-learning',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const RepairCyclesRoute = RepairCyclesRouteImport.update({
+  id: '/repair-cycles',
+  path: '/repair-cycles',
   getParentRoute: () => rootRouteImport,
 } as any)
 const ProjectsRoute = ProjectsRouteImport.update({
@@ -53,6 +59,7 @@ export interface FileRoutesByFullPath {
   '/pipeline-run': typeof PipelineRunRoute
   '/pipeline-run-debug': typeof PipelineRunDebugRoute
   '/projects': typeof ProjectsRoute
+  '/repair-cycles': typeof RepairCyclesRoute
   '/review-learning': typeof ReviewLearningRoute
   '/agent-execution/$executionId': typeof AgentExecutionExecutionIdRoute
 }
@@ -61,6 +68,7 @@ export interface FileRoutesByTo {
   '/pipeline-run': typeof PipelineRunRoute
   '/pipeline-run-debug': typeof PipelineRunDebugRoute
   '/projects': typeof ProjectsRoute
+  '/repair-cycles': typeof RepairCyclesRoute
   '/review-learning': typeof ReviewLearningRoute
   '/agent-execution/$executionId': typeof AgentExecutionExecutionIdRoute
 }
@@ -70,6 +78,7 @@ export interface FileRoutesById {
   '/pipeline-run': typeof PipelineRunRoute
   '/pipeline-run-debug': typeof PipelineRunDebugRoute
   '/projects': typeof ProjectsRoute
+  '/repair-cycles': typeof RepairCyclesRoute
   '/review-learning': typeof ReviewLearningRoute
   '/agent-execution/$executionId': typeof AgentExecutionExecutionIdRoute
 }
@@ -80,6 +89,7 @@ export interface FileRouteTypes {
     | '/pipeline-run'
     | '/pipeline-run-debug'
     | '/projects'
+    | '/repair-cycles'
     | '/review-learning'
     | '/agent-execution/$executionId'
   fileRoutesByTo: FileRoutesByTo
@@ -88,6 +98,7 @@ export interface FileRouteTypes {
     | '/pipeline-run'
     | '/pipeline-run-debug'
     | '/projects'
+    | '/repair-cycles'
     | '/review-learning'
     | '/agent-execution/$executionId'
   id:
@@ -96,6 +107,7 @@ export interface FileRouteTypes {
     | '/pipeline-run'
     | '/pipeline-run-debug'
     | '/projects'
+    | '/repair-cycles'
     | '/review-learning'
     | '/agent-execution/$executionId'
   fileRoutesById: FileRoutesById
@@ -105,6 +117,7 @@ export interface RootRouteChildren {
   PipelineRunRoute: typeof PipelineRunRoute
   PipelineRunDebugRoute: typeof PipelineRunDebugRoute
   ProjectsRoute: typeof ProjectsRoute
+  RepairCyclesRoute: typeof RepairCyclesRoute
   ReviewLearningRoute: typeof ReviewLearningRoute
   AgentExecutionExecutionIdRoute: typeof AgentExecutionExecutionIdRoute
 }
@@ -116,6 +129,13 @@ declare module '@tanstack/react-router' {
       path: '/review-learning'
       fullPath: '/review-learning'
       preLoaderRoute: typeof ReviewLearningRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/repair-cycles': {
+      id: '/repair-cycles'
+      path: '/repair-cycles'
+      fullPath: '/repair-cycles'
+      preLoaderRoute: typeof RepairCyclesRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/projects': {
@@ -161,6 +181,7 @@ const rootRouteChildren: RootRouteChildren = {
   PipelineRunRoute: PipelineRunRoute,
   PipelineRunDebugRoute: PipelineRunDebugRoute,
   ProjectsRoute: ProjectsRoute,
+  RepairCyclesRoute: RepairCyclesRoute,
   ReviewLearningRoute: ReviewLearningRoute,
   AgentExecutionExecutionIdRoute: AgentExecutionExecutionIdRoute,
 }
