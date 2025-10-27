@@ -162,6 +162,7 @@ class GitHubProjectManager:
                 if project_number:
                     columns = await self._configure_board_columns(
                         project_number,
+                        existing_board.project_id,
                         workflow_template,
                         project_config.github['org']
                     )
@@ -234,7 +235,7 @@ class GitHubProjectManager:
                 logger.warning("Project created but not linked to repository - will be org-level instead of repo-level")
 
             # Configure columns
-            columns = await self._configure_board_columns(project_number, workflow_template, project_config.github['org'])
+            columns = await self._configure_board_columns(project_number, project_id, workflow_template, project_config.github['org'])
 
             # Update state
             self.state_manager.update_board_state(
@@ -266,7 +267,7 @@ class GitHubProjectManager:
             logger.error("Orchestrator cannot manage GitHub projects without successful board creation")
             return None
 
-    async def _configure_board_columns(self, project_number: int, workflow_template: WorkflowTemplate, github_org: str) -> List[Dict[str, str]]:
+    async def _configure_board_columns(self, project_number: int, project_id: str, workflow_template: WorkflowTemplate, github_org: str) -> List[Dict[str, str]]:
         """Configure project board columns using GraphQL"""
         try:
             github_client = get_github_client()
@@ -314,7 +315,7 @@ class GitHubProjectManager:
             else:
                 logger.info(f"Status field options differ from configuration, updating: {current_option_names} -> {desired_option_names}")
                 # Update the Status field with GraphQL
-                graphql_options = await self._update_status_field_graphql(status_field['id'], desired_options)
+                graphql_options = await self._update_status_field_graphql(project_id, status_field['id'], desired_options)
 
             if graphql_options:
                 # Return column data for state management with actual GraphQL option IDs
@@ -348,8 +349,13 @@ class GitHubProjectManager:
             logger.error(f"Failed to configure columns: {e}")
             return []
 
-    async def _update_status_field_graphql(self, field_id: str, options: List[Dict[str, str]]) -> Optional[List[Dict[str, str]]]:
+    async def _update_status_field_graphql(self, project_id: str, field_id: str, options: List[Dict[str, str]]) -> Optional[List[Dict[str, str]]]:
         """Update Status field options using GraphQL
+
+        Args:
+            project_id: The global ID of the project (e.g., PVT_kwHOABgBzM4BGgJa)
+            field_id: The global ID of the Status field
+            options: List of option dictionaries with 'name', 'description', 'color' keys
 
         Returns:
             List of option dictionaries with 'id' and 'name' keys, or None on failure
@@ -379,6 +385,14 @@ class GitHubProjectManager:
                     "singleSelectOptions": options
                 }
             }
+
+            # Debug logging
+            import json
+            logger.info(f"UpdateProjectV2Field mutation input:")
+            logger.info(f"  projectId (context): {project_id}")
+            logger.info(f"  fieldId: {field_id}")
+            logger.info(f"  options count: {len(options)}")
+            logger.info(f"  Full variables JSON: {json.dumps(variables, indent=2)}")
 
             # Make GraphQL request using the client
             github_client = get_github_client()

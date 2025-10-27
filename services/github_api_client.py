@@ -268,16 +268,28 @@ class GitHubAPIClient:
         self._apply_backoff()
         
         # Build command for GraphQL
-        # gh api graphql expects: gh api graphql -F query=query_string [-F variables=json_object]
+        # When variables are present, use stdin to pass the full JSON payload
+        # This avoids issues with -F flag not properly handling complex GraphQL variables
         cmd = ['gh', 'api', 'graphql']
-        cmd.extend(['-F', f'query={query}'])
+        input_data = None
+
         if variables:
-            cmd.extend(['-F', f'variables={json.dumps(variables)}'])
-        
+            # Build JSON payload with query and variables
+            payload = {
+                "query": query,
+                "variables": variables
+            }
+            input_data = json.dumps(payload)
+            cmd.extend(['--input', '-'])
+        else:
+            # For simple queries without variables, use -F flag
+            cmd.extend(['-F', f'query={query}'])
+
         try:
             logger.debug(f"Executing GraphQL query (usage: {usage_percent:.1f}%)")
             result = subprocess.run(
                 cmd,
+                input=input_data,
                 capture_output=True,
                 text=True,
                 timeout=30
