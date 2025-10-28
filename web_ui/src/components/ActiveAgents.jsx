@@ -1,8 +1,7 @@
-import React, { useState, useEffect } from 'react'
+import React, { useState } from 'react'
 import { AlertTriangle, XCircle, Activity } from 'lucide-react'
 import { useActiveAgents } from '../hooks/useActiveAgents'
 import { useAgentActions } from '../hooks/useAgentActions'
-import { useSocket } from '../contexts/SocketContext'
 import { formatDuration, getRuntimeMs } from '../utils/stateHelpers'
 
 /**
@@ -38,23 +37,14 @@ const getAgentStatusColor = (startedAt) => {
  * @param {React.Component} ContainerComponent - Component to wrap each agent (default: div)
  * @param {string} containerClassName - Additional classes for the container
  */
-const ActiveAgents = ({ 
+const ActiveAgents = ({
   ContainerComponent = 'div',
   containerClassName = 'bg-gh-canvas p-3 rounded-md border border-gh-border'
 }) => {
-  const { events } = useSocket()
-  const { agents: activeAgents, agentCount } = useActiveAgents()
+  const { agents: activeAgents, agentCount, loading, fetchError } = useActiveAgents()
   const { killAgent, isKillingAgent, error: actionError, clearError } = useAgentActions()
-  const [loading, setLoading] = useState(true)
   const [showKillModal, setShowKillModal] = useState(false)
   const [selectedAgent, setSelectedAgent] = useState(null)
-
-  useEffect(() => {
-    // Set loading to false once we have checked for agents or have events
-    if (agentCount > 0 || events.length > 0 || !loading) {
-      setLoading(false)
-    }
-  }, [agentCount, events.length, loading])
 
   const handleKillClick = (agent) => {
     setSelectedAgent(agent)
@@ -181,6 +171,13 @@ const ActiveAgents = ({
         <div className="mb-4 p-3 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded flex items-center gap-2 text-red-700 dark:text-red-400">
           <AlertTriangle className="w-4 h-4" />
           {actionError}
+        </div>
+      )}
+
+      {fetchError && (
+        <div className="mb-4 p-3 bg-yellow-50 dark:bg-yellow-900/20 border border-yellow-200 dark:border-yellow-800 rounded flex items-center gap-2 text-yellow-700 dark:text-yellow-400">
+          <AlertTriangle className="w-4 h-4" />
+          Error fetching agents: {fetchError}
         </div>
       )}
 

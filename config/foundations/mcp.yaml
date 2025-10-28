@@ -11,24 +11,22 @@ mcp_servers:
       - package_search
     description: "Context7 MCP server for library documentation and API references"
 
-  puppeteer:
+  playwright:
     type: stdio
-    command: docker
+    command: npx
     args:
-      - run
-      - -i
-      - --rm
-      - -e
-      - DOCKER_CONTAINER
-      - mcp/puppeteer
+      - -y
+      - "@playwright/mcp"
     env:
-      DOCKER_CONTAINER: "true"
+      PLAYWRIGHT_CHROMIUM_WS_ENDPOINT: "ws://browserless:3000"
     capabilities:
       - browser_automation
-      - web_scraping
+      - ui_testing
       - screenshot_capture
-      - page_navigation
-    description: "Puppeteer MCP server for browser automation and web scraping"
+      - accessibility_testing
+      - network_interception
+      - form_interaction
+    description: "Playwright MCP for browser automation and UX testing via browserless service"
 
   serena:
     type: stdio

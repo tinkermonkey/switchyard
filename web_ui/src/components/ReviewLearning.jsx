@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react'
 import { Plus, Trash2, Pencil, CheckCircle, XCircle } from 'lucide-react'
 import Header from './Header'
 import NavigationTabs from './NavigationTabs'
+import { mergeArrayByIdStable } from '../utils/eventMerging'
 
 const API_BASE = 'http://localhost:5001'
 
@@ -20,7 +21,12 @@ export default function ReviewLearning() {
       .then(res => res.json())
       .then(data => {
         if (data.success) {
-          setAgents(data.agents)
+          // Agents is likely a simple string array, so stable merge might not help much
+          // But we'll use it for consistency
+          setAgents(current => {
+            const agentsEqual = JSON.stringify(current) === JSON.stringify(data.agents)
+            return agentsEqual ? current : data.agents
+          })
         }
       })
       .catch(err => console.error('Error fetching agents:', err))
@@ -37,7 +43,8 @@ export default function ReviewLearning() {
       .then(res => res.json())
       .then(data => {
         if (data.success) {
-          setFilters(data.filters)
+          // Use stable merge to prevent unnecessary re-renders
+          setFilters(current => mergeArrayByIdStable(current, data.filters, 'id'))
         } else {
           setError(data.error)
         }

@@ -24,18 +24,22 @@ class ClaudeTokenScheduler:
         """
         Check if it's time to test token availability.
         Should be called periodically from the main loop.
-        
+
         Returns:
             True if test was run and tokens are available
         """
         from monitoring.claude_code_breaker import get_breaker
-        
+
         breaker = get_breaker()
         if not breaker:
             return True
-        
+
+        # Sync from Redis to get latest state (important for cross-process state changes)
+        status = breaker.get_status()
+        current_state = status['state']
+
         # Only test if breaker is open or half-open
-        if breaker.state == breaker.CLOSED:
+        if current_state == breaker.CLOSED:
             return True
         
         # If no test scheduled yet and reset time is known, schedule one
@@ -45,13 +49,13 @@ class ClaudeTokenScheduler:
             logger.info(
                 f"Scheduled Claude Code token availability test for {self.test_scheduled_for.strftime('%Y-%m-%d %H:%M:%S')}"
             )
-        
+
         # Check if it's time to run the test
         if self.test_scheduled_for and datetime.now() >= self.test_scheduled_for:
             if not self.is_testing:
                 self.is_testing = True
                 logger.warning("🟡 Testing Claude Code token availability...")
-                
+
                 try:
                     success = await self._run_token_test()
                     if success:
@@ -66,11 +70,11 @@ class ClaudeTokenScheduler:
                         self.test_scheduled_for = datetime.now() + timedelta(minutes=2)
                         self.is_testing = False
                 except Exception as e:
-                    logger.error(f"Error testing token availability: {e}")
+                    logger.error(f"Error testing token availability: {e}", exc_info=True)
                     # Reschedule for 5 minutes later
                     self.test_scheduled_for = datetime.now() + timedelta(minutes=5)
                     self.is_testing = False
-        
+
         return False
     
     async def _run_token_test(self) -> bool:

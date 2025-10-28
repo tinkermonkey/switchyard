@@ -342,7 +342,7 @@ class ProjectMonitor:
         projects = self.config_manager.list_projects()
         if projects:
             first_project = self.config_manager.get_project_config(projects[0])
-            self.poll_interval = first_project.orchestrator.get("polling_interval", 30)
+            self.poll_interval = first_project.orchestrator.get("polling_interval", 15)
         else:
             self.poll_interval = 30
 
@@ -1378,7 +1378,8 @@ class ProjectMonitor:
                                                 project_name=project_name,
                                                 board_name=board_name,
                                                 workspace_type=workspace_type,
-                                                discussion_id=discussion_id
+                                                discussion_id=discussion_id,
+                                                pipeline_run_id=pipeline_run.id
                                             )
 
                                             # Load persisted session_id for continuity across restarts
@@ -1466,7 +1467,8 @@ class ProjectMonitor:
                                                 project_name=project_name,
                                                 board_name=board_name,
                                                 workspace_type='issues',
-                                                discussion_id=None  # Issues don't have discussion IDs
+                                                discussion_id=None,  # Issues don't have discussion IDs
+                                                pipeline_run_id=pipeline_run.id
                                             )
 
                                             # Load persisted session_id for continuity across restarts
@@ -1544,7 +1546,8 @@ class ProjectMonitor:
                     return self._start_conversational_loop_for_issue(
                         project_name, board_name, issue_number, status,
                         repository, project_config, pipeline_config,
-                        workflow_template, column
+                        workflow_template, column,
+                        pipeline_run_id=pipeline_run.id
                     )
                 elif column.type == 'review':
                     logger.info(f"Starting review cycle for issue #{issue_number} in {status}")
@@ -1678,7 +1681,8 @@ class ProjectMonitor:
         project_config,
         pipeline_config,
         workflow_template,
-        column
+        column,
+        pipeline_run_id: Optional[str] = None
     ) -> Optional[str]:
         """Start a conversational loop (human feedback mode) for an issue"""
         try:
@@ -1747,7 +1751,8 @@ class ProjectMonitor:
                             org=project_config.github['org'],
                             workflow_columns=workflow_template.columns,
                             workspace_type=workspace_type,
-                            discussion_id=discussion_id
+                            discussion_id=discussion_id,
+                            pipeline_run_id=pipeline_run_id
                         )
                     )
 
@@ -2748,9 +2753,12 @@ _Repair cycle initiated by Claude Code Orchestrator_
                 breaker = get_breaker()
                 scheduler = get_scheduler()
                 github_client = get_github_client()
-                
+
                 # Run token availability check/test
-                asyncio.run(scheduler.check_and_run_test())
+                try:
+                    asyncio.run(scheduler.check_and_run_test())
+                except Exception as e:
+                    logger.error(f"Error running token scheduler: {e}", exc_info=True)
 
                 # Check if GitHub API rate limit has reset and close breaker if so
                 github_client.breaker.check_and_close()

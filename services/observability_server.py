@@ -731,7 +731,7 @@ def get_pipeline_run_events():
             agent_events_query = {
                 "query": {
                     "term": {
-                        "pipeline_run_id.keyword": pipeline_run_id
+                        "pipeline_run_id": pipeline_run_id  # Already keyword type, no .keyword needed
                     }
                 },
                 "sort": [{"timestamp": "asc"}],
@@ -742,7 +742,7 @@ def get_pipeline_run_events():
                 index="agent-events-*",
                 body=agent_events_query
             )
-            
+
             for hit in agent_result['hits']['hits']:
                 event_data = hit['_source']
                 event_data['event_category'] = 'agent_lifecycle'
@@ -756,7 +756,7 @@ def get_pipeline_run_events():
             claude_logs_query = {
                 "query": {
                     "term": {
-                        "pipeline_run_id.keyword": pipeline_run_id
+                        "pipeline_run_id": pipeline_run_id  # Already keyword type, no .keyword needed
                     }
                 },
                 "sort": [{"timestamp": "asc"}],
@@ -829,6 +829,149 @@ def get_active_pipeline_runs():
             'success': False,
             'error': str(e),
             'runs': []
+        }), 500
+
+@app.route('/api/active-agents')
+def get_active_agents_from_pipelines():
+    """
+    Get all currently active agents across all pipeline runs
+    Returns agents that have been initialized but not completed/failed
+    This is the source of truth for active agent tracking in the UI
+    """
+    try:
+        # Get all active pipeline runs AND recently completed ones (within last 2 hours)
+        # This catches edge cases where agents start after pipeline is marked complete
+        from datetime import datetime, timedelta
+        two_hours_ago = (datetime.utcnow() - timedelta(hours=2)).isoformat()
+
+        pipeline_runs_query = {
+            "query": {
+                "bool": {
+                    "should": [
+                        {"term": {"status": "active"}},
+                        {
+                            "bool": {
+                                "must": [
+                                    {"term": {"status": "completed"}},
+                                    {"range": {"ended_at": {"gte": two_hours_ago}}}
+                                ]
+                            }
+                        }
+                    ],
+                    "minimum_should_match": 1
+                }
+            },
+            "size": 100
+        }
+        pipeline_runs = es_client.search(
+            index="pipeline-runs",
+            body=pipeline_runs_query
+        )
+
+        active_agents = []
+
+        for pipeline_hit in pipeline_runs['hits']['hits']:
+            pipeline_run = pipeline_hit['_source']
+            pipeline_run_id = pipeline_run['id']
+
+            # Get agent lifecycle events for this pipeline
+            agent_events_query = {
+                "query": {
+                    "bool": {
+                        "must": [
+                            {"term": {"pipeline_run_id.keyword": pipeline_run_id}},
+                            {"terms": {"event_type": ["agent_initialized", "agent_completed", "agent_failed"]}}
+                        ]
+                    }
+                },
+                "sort": [{"timestamp": "asc"}],
+                "size": 1000
+            }
+
+            try:
+                events_result = es_client.search(
+                    index="agent-events-*",
+                    body=agent_events_query
+                )
+            except Exception as e:
+                logger.warning(f"Error fetching agent events for pipeline {pipeline_run_id}: {e}")
+                continue
+
+            # Track agent states
+            agent_states = {}
+            for hit in events_result['hits']['hits']:
+                event = hit['_source']
+                agent_key = f"{event['agent']}_{event.get('task_id', '')}"
+
+                if event['event_type'] == 'agent_initialized':
+                    agent_states[agent_key] = {
+                        'agent': event['agent'],
+                        'status': 'running',
+                        'container_name': event.get('container_name'),
+                        'branch_name': event.get('branch_name'),
+                        'started_at': event['timestamp'],
+                        'project': pipeline_run.get('project', 'unknown'),
+                        'issue_number': pipeline_run.get('issue_number', 'unknown'),
+                        'issue_title': pipeline_run.get('issue_title', ''),
+                        'board': pipeline_run.get('board', 'unknown'),
+                        'pipeline_run_id': pipeline_run_id,
+                        'is_containerized': bool(event.get('container_name')),
+                        'task_id': event.get('task_id', ''),
+                    }
+                elif event['event_type'] in ['agent_completed', 'agent_failed']:
+                    if agent_key in agent_states:
+                        agent_states[agent_key]['status'] = 'completed' if event['event_type'] == 'agent_completed' else 'failed'
+
+            # Add running agents to result
+            for agent_data in agent_states.values():
+                if agent_data['status'] == 'running':
+                    active_agents.append(agent_data)
+
+        # Also check Redis for standalone agents (not associated with pipeline runs)
+        # This catches repair cycles and other ad-hoc tasks
+        try:
+            redis_client = redis.Redis(host='redis', port=6379, decode_responses=True)
+            agent_keys = redis_client.keys('agent:container:*')
+
+            for key in agent_keys:
+                container_info = redis_client.hgetall(key)
+                if container_info:
+                    # Check if this agent is already in our list (by container_name)
+                    container_name = container_info.get('container_name')
+                    if container_name and not any(a.get('container_name') == container_name for a in active_agents):
+                        # Add Redis agent to our list
+                        pipeline_run_id = container_info.get('pipeline_run_id', '')
+                        active_agents.append({
+                            'agent': container_info.get('agent'),
+                            'project': container_info.get('project', 'unknown'),
+                            'issue_number': container_info.get('issue_number', 'unknown'),
+                            'issue_title': '',  # Not available in Redis
+                            'branch_name': None,  # Not available in Redis
+                            'container_name': container_name,
+                            'started_at': container_info.get('started_at'),
+                            'is_containerized': True,
+                            'pipeline_run_id': pipeline_run_id if pipeline_run_id else None,
+                            'board': 'unknown',
+                            'task_id': container_info.get('task_id', ''),
+                            'source': 'redis'  # Mark as from Redis for debugging
+                        })
+        except Exception as e:
+            logger.warning(f"Error fetching Redis agents: {e}")
+
+        logger.info(f"Active agents endpoint returning {len(active_agents)} agents ({len([a for a in active_agents if a.get('source') != 'redis'])} from pipelines, {len([a for a in active_agents if a.get('source') == 'redis'])} from Redis)")
+
+        return jsonify({
+            'success': True,
+            'agents': active_agents,
+            'count': len(active_agents)
+        })
+
+    except Exception as e:
+        logger.error(f"Error fetching active agents: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e),
+            'agents': []
         }), 500
 
 @app.route('/completed-pipeline-runs')
@@ -1431,8 +1574,6 @@ def get_circuit_breakers():
             breaker = get_breaker()
             if breaker:
                 status = breaker.get_status()
-                logger.debug(f"Claude Code breaker status: {status}")
-                logger.debug(f"🔍 BREAKER DEBUG - Object ID: {id(breaker)}, State: {breaker.state}, is_open(): {breaker.is_open()}, opened_at: {breaker.opened_at}, reset_time: {breaker.reset_time}")
                 circuit_breakers.append({
                     'name': 'Claude Code Token Limit',
                     'service': 'claude_code',
@@ -1443,7 +1584,6 @@ def get_circuit_breakers():
                     'time_until_reset': status['time_until_reset'],
                     'failure_count': status['failure_count'],
                 })
-                logger.debug(f"Added Claude Code breaker to circuit breakers list - state: {breaker.state}, is_open: {breaker.is_open()}")
             else:
                 logger.warning("Claude Code breaker is None!")
         except Exception as e:

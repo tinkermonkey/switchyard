@@ -3,10 +3,53 @@ import { RefreshCw, Activity, CheckCircle } from 'lucide-react'
 import Header from '../components/Header'
 import NavigationTabs from '../components/NavigationTabs'
 import PipelineRunEventLog from '../components/PipelineRunEventLog'
-import { useState, useEffect, useCallback, useMemo, useRef, useLayoutEffect } from 'react'
+import { useState, useEffect, useCallback, useMemo, useRef, useLayoutEffect, memo } from 'react'
 import { useSocket } from '../contexts/SocketContext'
 import { formatDuration } from '../utils/stateHelpers'
-import { mergePipelineRunEvents } from '../utils/eventMerging'
+import { mergePipelineRunEvents, mergeArrayByIdStable } from '../utils/eventMerging'
+
+// Memoized component for pipeline run list item
+// Custom comparison function that only compares run object and isSelected
+const PipelineRunItem = memo(({ run, isSelected, onClick }) => {
+  return (
+    <button
+      onClick={onClick}
+      className={`w-full text-left p-3 rounded border transition-colors ${
+        isSelected
+          ? 'bg-gh-accent-emphasis border-gh-accent-emphasis text-white'
+          : 'bg-gh-canvas border-gh-border hover:border-gh-border-muted'
+      }`}
+    >
+      <div className="font-semibold text-sm truncate">
+        {run.issue_title}
+      </div>
+      <div className="text-xs mt-1 opacity-75">
+        {run.project} #{run.issue_number}
+      </div>
+      <div className="text-xs mt-1 opacity-75 font-mono">
+        ID: {run.id.substring(0, 8)}...
+      </div>
+      <div className="text-xs mt-1 opacity-75">
+        {run.ended_at ? (
+          <>Completed {formatDuration(run.ended_at)} ago</>
+        ) : (
+          <>Started {formatDuration(run.started_at)} ago</>
+        )}
+      </div>
+      {run.duration && (
+        <div className="text-xs mt-1 opacity-75">
+          Duration: {Math.floor(run.duration / 60)}m {Math.floor(run.duration % 60)}s
+        </div>
+      )}
+    </button>
+  )
+}, (prevProps, nextProps) => {
+  // Custom comparison: only re-render if run object changed (by reference) or isSelected changed
+  // Ignore onClick changes since it's recreated but functionally the same
+  return prevProps.run === nextProps.run && prevProps.isSelected === nextProps.isSelected
+})
+
+PipelineRunItem.displayName = 'PipelineRunItem'
 
 function PipelineRunDebugView() {
   const [activePipelineRuns, setActivePipelineRuns] = useState([])
@@ -91,7 +134,7 @@ function PipelineRunDebugView() {
   }, [completedPipelineRuns])
 
   // Fetch active pipeline runs - no dependencies to avoid circular re-creation
-  const fetchActivePipelineRuns = useCallback(async () => {
+  const fetchActivePipelineRuns = useCallback(async (isInitialLoad = false) => {
     // Guard against concurrent fetches
     if (isFetchingActiveRef.current) {
       console.log('[PipelineRunDebug] Skipping active fetch - already in progress')
@@ -100,35 +143,45 @@ function PipelineRunDebugView() {
 
     try {
       isFetchingActiveRef.current = true
-      setLoading(true)
+      // Only show loading spinner on initial load, not on background refreshes
+      if (isInitialLoad) {
+        setLoading(true)
+      }
       const response = await fetch('/active-pipeline-runs')
       const data = await response.json()
 
       if (data.success) {
-        console.log('[PipelineRunDebug] Fetched active pipeline runs:', data.runs)
-        setActivePipelineRuns(data.runs)
+        //console.log('[PipelineRunDebug] Fetched active pipeline runs:', data.runs)
 
-        // Update selectedPipelineRun if it exists in the refreshed data
-        // Use functional update to avoid dependency
-        setSelectedPipelineRun(currentSelected => {
-          if (currentSelected) {
-            const updatedRun = data.runs.find(run => run.id === currentSelected.id)
-            if (updatedRun) {
-              console.log('[PipelineRunDebug] Updating selected pipeline run with fresh data')
-              return updatedRun
+        // Use stable merge to preserve object references when data hasn't changed
+        setActivePipelineRuns(currentRuns => {
+          const mergedRuns = mergeArrayByIdStable(currentRuns, data.runs)
+
+          // Update selectedPipelineRun if it exists in the refreshed data
+          setSelectedPipelineRun(currentSelected => {
+            if (currentSelected) {
+              const updatedRun = mergedRuns.find(run => run.id === currentSelected.id)
+              if (updatedRun) {
+                //console.log('[PipelineRunDebug] Updating selected pipeline run with fresh data')
+                return updatedRun
+              }
+              return currentSelected
+            } else if (mergedRuns.length > 0) {
+              // Auto-select first run if none selected
+              return mergedRuns[0]
             }
             return currentSelected
-          } else if (data.runs.length > 0) {
-            // Auto-select first run if none selected
-            return data.runs[0]
-          }
-          return currentSelected
+          })
+
+          return mergedRuns
         })
       }
     } catch (error) {
       console.error('Error fetching active pipeline runs:', error)
     } finally {
-      setLoading(false)
+      if (isInitialLoad) {
+        setLoading(false)
+      }
       isFetchingActiveRef.current = false
     }
   }, [])
@@ -148,30 +201,36 @@ function PipelineRunDebugView() {
       const data = await response.json()
 
       if (data.success) {
-        console.log('[PipelineRunDebug] Fetched completed pipeline runs:', data.runs.length)
+        //console.log('[PipelineRunDebug] Fetched completed pipeline runs:', data.runs.length)
 
         // Use functional update to avoid dependency on completedPipelineRuns
         setCompletedPipelineRuns(currentCompleted => {
-          const allCompletedRuns = append ? [...currentCompleted, ...data.runs] : data.runs
+          // Append new runs if loading more, or replace if refreshing
+          const combinedRuns = append ? [...currentCompleted, ...data.runs] : data.runs
+
+          // Use stable merge to preserve object references
+          const mergedRuns = mergeArrayByIdStable(
+            append ? currentCompleted : [],
+            combinedRuns
+          )
 
           // Update selectedPipelineRun if it exists in the completed runs
-          // Use ref to get current value without dependency
           setSelectedPipelineRun(currentSelected => {
             if (currentSelected) {
-              const updatedRun = allCompletedRuns.find(run => run.id === currentSelected.id)
+              const updatedRun = mergedRuns.find(run => run.id === currentSelected.id)
               if (updatedRun) {
-                console.log('[PipelineRunDebug] Updating selected pipeline run from completed list')
+                //console.log('[PipelineRunDebug] Updating selected pipeline run from completed list')
                 return updatedRun
               }
               return currentSelected
             } else if (data.runs.length > 0 && selectedTabRef.current === 'completed') {
               // Auto-select first completed run if on completed tab and none selected
-              return data.runs[0]
+              return mergedRuns[0]
             }
             return currentSelected
           })
 
-          return allCompletedRuns
+          return mergedRuns
         })
 
         setHasMoreCompleted(data.runs.length === completedLimit)
@@ -194,14 +253,27 @@ function PipelineRunDebugView() {
   // Fetch events for selected pipeline run
   const fetchPipelineRunEvents = useCallback(async (pipelineRunId) => {
     if (!pipelineRunId) return
-    
+
     try {
       setLoadingEvents(true)
       const response = await fetch(`/pipeline-run-events?pipeline_run_id=${pipelineRunId}`)
       const data = await response.json()
-      
+
       if (data.success) {
-        setPipelineRunEvents(data.events)
+        // Use stable merge for events too (events might have an 'id' or use index)
+        setPipelineRunEvents(currentEvents => {
+          // For events, we'll use timestamp as a pseudo-ID since they might not have IDs
+          const newEventsWithKeys = data.events.map((event, idx) => ({
+            ...event,
+            _key: event.id || `${event.timestamp}_${idx}`
+          }))
+          const currentEventsWithKeys = currentEvents.map((event, idx) => ({
+            ...event,
+            _key: event.id || event._key || `${event.timestamp}_${idx}`
+          }))
+
+          return mergeArrayByIdStable(currentEventsWithKeys, newEventsWithKeys, '_key')
+        })
       }
     } catch (error) {
       console.error('Error fetching pipeline run events:', error)
@@ -212,15 +284,15 @@ function PipelineRunDebugView() {
   
   // Initial load
   useEffect(() => {
-    fetchActivePipelineRuns()
+    fetchActivePipelineRuns(true) // Pass true for initial load
     fetchCompletedPipelineRuns(0, false)
   }, [])
 
   // Periodic refresh to keep data up-to-date
   useEffect(() => {
     const intervalId = setInterval(() => {
-      console.log('[PipelineRunDebug] Periodic refresh')
-      fetchActivePipelineRuns()
+      //console.log('[PipelineRunDebug] Periodic refresh')
+      fetchActivePipelineRuns(false) // Background refresh, no loading spinner
       // Use ref to check current tab without adding dependency
       if (selectedTabRef.current === 'completed') {
         fetchCompletedPipelineRuns(0, false)
@@ -266,7 +338,7 @@ function PipelineRunDebugView() {
           fetchPipelineRunEvents(selectedPipelineRunRef.current.id)
         }
         // Refresh both active and completed runs to catch status transitions
-        fetchActivePipelineRuns()
+        fetchActivePipelineRuns(false) // Background refresh from WebSocket event
         fetchCompletedPipelineRuns(0, false)
       }
     }
@@ -275,7 +347,12 @@ function PipelineRunDebugView() {
   // Merge API events with live WebSocket events
   const mergedEvents = useMemo(() => {
     if (!selectedPipelineRun) return []
-    return mergePipelineRunEvents(pipelineRunEvents, socketEvents, selectedPipelineRun)
+    const allEvents = mergePipelineRunEvents(pipelineRunEvents, socketEvents, selectedPipelineRun)
+    // Filter to only show agent lifecycle and decision events (exclude Claude logs)
+    return allEvents.filter(event =>
+      event.event_category === 'agent_lifecycle' ||
+      event.event_category === 'decision'
+    )
   }, [pipelineRunEvents, socketEvents, selectedPipelineRun])
 
   return (
@@ -285,7 +362,7 @@ function PipelineRunDebugView() {
       <div className="flex items-center justify-between my-3">
         <NavigationTabs />
         <button
-          onClick={fetchActivePipelineRuns}
+          onClick={() => fetchActivePipelineRuns(true)}
           disabled={loading}
           className="px-4 py-2 bg-gh-canvas-subtle border border-gh-border rounded-md hover:bg-gh-border-muted transition-colors text-sm"
         >
@@ -340,28 +417,12 @@ function PipelineRunDebugView() {
                   style={{ scrollBehavior: 'auto' }}
                 >
                   {activePipelineRuns.map(run => (
-                    <button
+                    <PipelineRunItem
                       key={run.id}
+                      run={run}
+                      isSelected={selectedPipelineRun?.id === run.id}
                       onClick={() => setSelectedPipelineRun(run)}
-                      className={`w-full text-left p-3 rounded border transition-colors ${
-                        selectedPipelineRun?.id === run.id
-                          ? 'bg-gh-accent-emphasis border-gh-accent-emphasis text-white'
-                          : 'bg-gh-canvas border-gh-border hover:border-gh-border-muted'
-                      }`}
-                    >
-                      <div className="font-semibold text-sm truncate">
-                        {run.issue_title}
-                      </div>
-                      <div className="text-xs mt-1 opacity-75">
-                        {run.project} #{run.issue_number}
-                      </div>
-                      <div className="text-xs mt-1 opacity-75 font-mono">
-                        ID: {run.id.substring(0, 8)}...
-                      </div>
-                      <div className="text-xs mt-1 opacity-75">
-                        Started {formatDuration(run.started_at)} ago
-                      </div>
-                    </button>
+                    />
                   ))}
                 </div>
               )}
@@ -386,37 +447,12 @@ function PipelineRunDebugView() {
                     style={{ scrollBehavior: 'auto' }}
                   >
                     {completedPipelineRuns.map(run => (
-                      <button
+                      <PipelineRunItem
                         key={run.id}
+                        run={run}
+                        isSelected={selectedPipelineRun?.id === run.id}
                         onClick={() => setSelectedPipelineRun(run)}
-                        className={`w-full text-left p-3 rounded border transition-colors ${
-                          selectedPipelineRun?.id === run.id
-                            ? 'bg-gh-accent-emphasis border-gh-accent-emphasis text-white'
-                            : 'bg-gh-canvas border-gh-border hover:border-gh-border-muted'
-                        }`}
-                      >
-                        <div className="font-semibold text-sm truncate">
-                          {run.issue_title}
-                        </div>
-                        <div className="text-xs mt-1 opacity-75">
-                          {run.project} #{run.issue_number}
-                        </div>
-                        <div className="text-xs mt-1 opacity-75 font-mono">
-                          ID: {run.id.substring(0, 8)}...
-                        </div>
-                        <div className="text-xs mt-1 opacity-75">
-                          {run.ended_at ? (
-                            <>Completed {formatDuration(run.ended_at)} ago</>
-                          ) : (
-                            <>Started {formatDuration(run.started_at)} ago</>
-                          )}
-                        </div>
-                        {run.duration && (
-                          <div className="text-xs mt-1 opacity-75">
-                            Duration: {Math.floor(run.duration / 60)}m {Math.floor(run.duration % 60)}s
-                          </div>
-                        )}
-                      </button>
+                      />
                     ))}
                   </div>
 

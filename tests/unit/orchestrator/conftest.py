@@ -142,7 +142,7 @@ def mock_config_manager(test_project_config, test_workflow_template):
     project_config.pipelines[0].board_name = 'dev'
     project_config.pipelines[0].workflow = 'test-workflow'
     project_config.pipelines[0].workspace = 'issues'
-    project_config.orchestrator = {'polling_interval': 30}
+    project_config.orchestrator = {'polling_interval': 15}
     
     mock.get_project_config.return_value = project_config
     mock.list_projects.return_value = ['test-project']

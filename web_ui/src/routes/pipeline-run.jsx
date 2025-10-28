@@ -23,7 +23,7 @@ import {
   toggleCycleCollapsed,
   updateEdgesForCycles,
 } from '../utils/cycleLayout'
-import { mergePipelineRunEvents } from '../utils/eventMerging'
+import { mergePipelineRunEvents, mergeArrayByIdStable } from '../utils/eventMerging'
 
 /**
  * Custom node component for pipeline run events with candy-stripe animation
@@ -225,19 +225,23 @@ function PipelineRunView() {
   const { events: socketEvents } = useSocket()
   
   // Fetch active pipeline runs
-  const fetchActivePipelineRuns = useCallback(async () => {
+  const fetchActivePipelineRuns = useCallback(async (isInitialLoad = false) => {
     try {
-      setLoading(true)
+      // Only show loading spinner on initial load, not on background refreshes
+      if (isInitialLoad) {
+        setLoading(true)
+      }
       const response = await fetch('/active-pipeline-runs')
       const data = await response.json()
-      
+
       if (data.success) {
         console.log('[PipelineRun] Fetched active pipeline runs:', data.runs)
         data.runs.forEach(run => {
           console.log(`[PipelineRun] Run ${run.id.substring(0, 8)}: started_at=${run.started_at}, status=${run.status}`)
         })
-        setActivePipelineRuns(data.runs)
-        
+        // Use stable merge to prevent unnecessary re-renders
+        setActivePipelineRuns(current => mergeArrayByIdStable(current, data.runs))
+
         // Auto-select first run if none selected
         if (!selectedPipelineRun && data.runs.length > 0) {
           setSelectedPipelineRun(data.runs[0])
@@ -246,7 +250,9 @@ function PipelineRunView() {
     } catch (error) {
       console.error('Error fetching active pipeline runs:', error)
     } finally {
-      setLoading(false)
+      if (isInitialLoad) {
+        setLoading(false)
+      }
     }
   }, [selectedPipelineRun])
   
@@ -259,11 +265,11 @@ function PipelineRunView() {
       
       if (data.success) {
         console.log('[PipelineRun] Fetched completed pipeline runs:', data.runs.length)
-        if (append) {
-          setCompletedPipelineRuns(prev => [...prev, ...data.runs])
-        } else {
-          setCompletedPipelineRuns(data.runs)
-        }
+        // Use stable merge to prevent unnecessary re-renders
+        setCompletedPipelineRuns(current => {
+          const combinedRuns = append ? [...current, ...data.runs] : data.runs
+          return mergeArrayByIdStable(append ? current : [], combinedRuns)
+        })
         setHasMoreCompleted(data.runs.length === completedLimit)
         
         // Auto-select first completed run if on completed tab and none selected
@@ -316,7 +322,19 @@ function PipelineRunView() {
       const data = await response.json()
       
       if (data.success) {
-        setPipelineRunEvents(data.events)
+        // Use stable merge for events
+        setPipelineRunEvents(current => {
+          // Events might not have IDs, so we'll use a composite key
+          const eventsWithKeys = data.events.map((event, idx) => ({
+            ...event,
+            _key: event.id || event.event_id || `${event.timestamp}_${idx}`
+          }))
+          const currentEventsWithKeys = current.map((event, idx) => ({
+            ...event,
+            _key: event.id || event.event_id || event._key || `${event.timestamp}_${idx}`
+          }))
+          return mergeArrayByIdStable(currentEventsWithKeys, eventsWithKeys, '_key')
+        })
       }
     } catch (error) {
       console.error('Error fetching pipeline run events:', error)
@@ -656,7 +674,7 @@ function PipelineRunView() {
   
   // Initial load
   useEffect(() => {
-    fetchActivePipelineRuns()
+    fetchActivePipelineRuns(true) // Pass true for initial load
     fetchCompletedPipelineRuns(0, false)
   }, [])
   
@@ -757,7 +775,7 @@ function PipelineRunView() {
         if (selectedPipelineRun) {
           fetchPipelineRunEvents(selectedPipelineRun.id)
         }
-        fetchActivePipelineRuns()
+        fetchActivePipelineRuns(false) // Background refresh from WebSocket event
       }
     }
   }, [socketEvents])

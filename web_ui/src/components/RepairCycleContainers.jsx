@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react'
 import { AlertTriangle, CheckCircle, XCircle, Loader, Wrench, FileText, Trash2 } from 'lucide-react'
 import { useSocket } from '../contexts/SocketContext'
 import { formatDuration } from '../utils/stateHelpers'
+import { mergeArrayByIdStable, mergeObjectMapStable } from '../utils/eventMerging'
 
 /**
  * RepairCycleContainers - Display active repair cycle containers with progress tracking
@@ -17,13 +18,19 @@ const RepairCycleContainers = () => {
   const [killingContainer, setKillingContainer] = useState({})
 
   // Fetch containers on mount and periodically
-  const fetchContainers = async () => {
+  const fetchContainers = async (isInitialLoad = false) => {
     try {
+      // Only show loading spinner on initial load, not on background refreshes
+      if (isInitialLoad) {
+        setLoading(true)
+      }
       const response = await fetch('http://localhost:5001/api/repair-cycle-containers')
       const data = await response.json()
-      
+
       if (data.success) {
-        setContainers(data.containers)
+        // Use stable merge to prevent unnecessary re-renders
+        // Containers might not have an 'id' field, so we'll use 'container_name' as the key
+        setContainers(current => mergeArrayByIdStable(current, data.containers, 'container_name'))
         setError(null)
       } else {
         setError(data.error || 'Failed to fetch containers')
@@ -31,16 +38,18 @@ const RepairCycleContainers = () => {
     } catch (err) {
       setError(`Error fetching containers: ${err.message}`)
     } finally {
-      setLoading(false)
+      if (isInitialLoad) {
+        setLoading(false)
+      }
     }
   }
 
   useEffect(() => {
-    fetchContainers()
-    
-    // Refresh every 5 seconds
-    const interval = setInterval(fetchContainers, 5000)
-    
+    fetchContainers(true) // Pass true for initial load
+
+    // Refresh every 5 seconds (background refresh, no loading spinner)
+    const interval = setInterval(() => fetchContainers(false), 5000)
+
     return () => clearInterval(interval)
   }, [])
 
@@ -49,10 +58,10 @@ const RepairCycleContainers = () => {
     if (!events || events.length === 0) return
 
     const latestEvent = events[events.length - 1]
-    
+
     if (latestEvent.event_type?.startsWith('repair_cycle_container_')) {
-      // Refresh containers when any repair cycle event occurs
-      fetchContainers()
+      // Refresh containers when any repair cycle event occurs (background refresh)
+      fetchContainers(false)
     }
   }, [events])
 
@@ -66,12 +75,13 @@ const RepairCycleContainers = () => {
       const data = await response.json()
       
       if (data.success) {
-        setContainerLogs(prev => ({ ...prev, [key]: data.logs }))
+        // Use stable merge for object map updates
+        setContainerLogs(prev => mergeObjectMapStable(prev, { [key]: data.logs }))
       } else {
-        setContainerLogs(prev => ({ ...prev, [key]: `Error: ${data.error}` }))
+        setContainerLogs(prev => mergeObjectMapStable(prev, { [key]: `Error: ${data.error}` }))
       }
     } catch (err) {
-      setContainerLogs(prev => ({ ...prev, [key]: `Error fetching logs: ${err.message}` }))
+      setContainerLogs(prev => mergeObjectMapStable(prev, { [key]: `Error fetching logs: ${err.message}` }))
     } finally {
       setLoadingLogs(prev => ({ ...prev, [key]: false }))
     }
@@ -95,8 +105,8 @@ const RepairCycleContainers = () => {
       const data = await response.json()
       
       if (data.success) {
-        // Refresh containers
-        await fetchContainers()
+        // Refresh containers (background refresh after kill)
+        await fetchContainers(false)
       } else {
         alert(`Failed to kill container: ${data.error}`)
       }

@@ -1,23 +1,22 @@
-import { createContext, useContext, useState, useMemo } from 'react'
-import { useSocket } from './SocketContext'
+import { createContext, useContext, useState } from 'react'
 import { agentApi } from '../services/agentApi'
-import { deriveActiveAgentsFromEvents } from '../utils/stateHelpers'
+import { useActivePipelineAgents } from '../hooks/useActivePipelineAgents'
 
 const AgentStateContext = createContext()
 
 /**
- * AgentStateProvider - Manages agent state derived from WebSocket events
+ * AgentStateProvider - Manages agent state from pipeline runs (source of truth)
  * and provides agent control operations
+ *
+ * REDESIGNED: Now uses pipeline-centric approach instead of event-based derivation
+ * for more accurate and reliable active agent tracking.
  */
 export function AgentStateProvider({ children }) {
-  const { events } = useSocket()
   const [killingAgents, setKillingAgents] = useState(new Set())
   const [actionError, setActionError] = useState(null)
 
-  // Derive active agents from WebSocket events
-  const activeAgents = useMemo(() => {
-    return deriveActiveAgentsFromEvents(events)
-  }, [events])
+  // Get active agents from pipeline runs (NEW: source of truth)
+  const { agents: activeAgents, loading, error: fetchError } = useActivePipelineAgents()
 
   // Kill agent operation
   const killAgent = async (containerName) => {
@@ -76,8 +75,12 @@ export function AgentStateProvider({ children }) {
     isKillingAgent,
     isKillingAny: killingAgents.size > 0,
 
+    // Loading state (NEW)
+    loading,
+
     // Error handling
     actionError,
+    fetchError,
     clearError,
   }
 

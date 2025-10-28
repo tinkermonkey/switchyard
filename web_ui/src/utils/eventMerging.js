@@ -166,28 +166,148 @@ export const mergePipelineRunEvents = (apiEvents, webSocketEvents, pipelineRun) 
 
 /**
  * Format timestamp for display
- * 
+ *
  * @param {number|string} timestamp - Timestamp to format
  * @returns {string} Formatted timestamp string
  */
 export const formatTimestamp = (timestamp) => {
   if (!timestamp) return ''
-  
+
   try {
     const normalizedTimestamp = normalizeTimestamp(timestamp)
     if (!normalizedTimestamp) return 'Invalid date'
-    
+
     const date = new Date(normalizedTimestamp * 1000)
-    
+
     if (isNaN(date.getTime())) {
       console.error('[EventMerging] Invalid timestamp after normalization:', timestamp)
       return 'Invalid date'
     }
-    
+
     // Use browser's local timezone for easier reading
     return date.toLocaleTimeString('en-US', { hour12: false })
   } catch (e) {
     console.error('[EventMerging] Error formatting timestamp:', timestamp, e)
     return 'Error'
   }
+}
+
+/**
+ * Deep comparison of two objects (shallow properties only)
+ * Used to detect if data has actually changed to avoid unnecessary re-renders
+ *
+ * @param {Object} obj1 - First object
+ * @param {Object} obj2 - Second object
+ * @returns {boolean} True if objects are equal
+ */
+const shallowEqual = (obj1, obj2) => {
+  if (obj1 === obj2) return true
+  if (!obj1 || !obj2) return false
+
+  const keys1 = Object.keys(obj1)
+  const keys2 = Object.keys(obj2)
+
+  if (keys1.length !== keys2.length) return false
+
+  for (const key of keys1) {
+    if (obj1[key] !== obj2[key]) return false
+  }
+
+  return true
+}
+
+/**
+ * Intelligently merge a new array of items with an existing array,
+ * preserving object references when data hasn't changed.
+ * This prevents React from unnecessarily re-rendering components.
+ *
+ * @param {Array} existingItems - Current array of items
+ * @param {Array} newItems - New array of items from API
+ * @param {string} idKey - Key to use for identifying items (default: 'id')
+ * @returns {Array} Merged array with stable object references
+ */
+export const mergeArrayByIdStable = (existingItems, newItems, idKey = 'id') => {
+  if (!Array.isArray(existingItems) || existingItems.length === 0) {
+    return newItems
+  }
+  if (!Array.isArray(newItems) || newItems.length === 0) {
+    return newItems
+  }
+
+  // Create a map of existing items by ID for quick lookup
+  const existingMap = new Map(existingItems.map(item => [item[idKey], item]))
+
+  // Merge new items, reusing existing objects when data hasn't changed
+  const merged = newItems.map(newItem => {
+    const existingItem = existingMap.get(newItem[idKey])
+
+    // If item exists and data is the same, reuse the existing object reference
+    if (existingItem && shallowEqual(existingItem, newItem)) {
+      return existingItem
+    }
+
+    // Otherwise use the new item (data has changed or it's a new item)
+    return newItem
+  })
+
+  return merged
+}
+
+/**
+ * Merge a single object, preserving the reference if data hasn't changed.
+ * Useful for single entity updates like execution data, user profiles, etc.
+ *
+ * @param {Object} existingObject - Current object
+ * @param {Object} newObject - New object from API
+ * @returns {Object} The existing object if unchanged, otherwise the new object
+ */
+export const mergeObjectStable = (existingObject, newObject) => {
+  // If no existing object, use new one
+  if (!existingObject) return newObject
+
+  // If no new object, keep existing
+  if (!newObject) return existingObject
+
+  // If data is the same, return existing object reference
+  if (shallowEqual(existingObject, newObject)) {
+    return existingObject
+  }
+
+  // Data has changed, return new object
+  return newObject
+}
+
+/**
+ * Merge an object map/dictionary, preserving object references for unchanged entries.
+ * Useful for state like { [key]: value } where keys map to objects.
+ *
+ * @param {Object} existingMap - Current object map
+ * @param {Object} updates - Object with keys to update
+ * @returns {Object} Merged object map with stable references
+ */
+export const mergeObjectMapStable = (existingMap, updates) => {
+  if (!existingMap || Object.keys(existingMap).length === 0) {
+    return updates
+  }
+  if (!updates || Object.keys(updates).length === 0) {
+    return existingMap
+  }
+
+  const result = { ...existingMap }
+  let hasChanges = false
+
+  // Update only changed entries
+  Object.keys(updates).forEach(key => {
+    const existingValue = existingMap[key]
+    const newValue = updates[key]
+
+    // Check if value has changed
+    if (!existingValue || !shallowEqual(existingValue, newValue)) {
+      result[key] = newValue
+      hasChanges = true
+    }
+  })
+
+  // Return existing map if nothing changed
+  return hasChanges ? result : existingMap
 }

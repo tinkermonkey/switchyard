@@ -45,14 +45,12 @@ class ClaudeCodeBreaker:
     # - "Session limit reached" (without reset time)
     #
     # IMPORTANT: Must be specific to avoid false positives!
-    # Only match when there's an action verb (reached, exceeded, hit, etc.)
-    # to distinguish actual errors from content discussing these concepts.
+    # Only match specific limit types (session/token/rate/request/usage) with action verbs
+    # Don't match generic "limit reached" which appears in documentation
     SESSION_LIMIT_PATTERN = re.compile(
         r'(?:SESSION_LIMIT_IN_RESPONSE:\s+)?(?:'
         r'(?:session|token|request|rate|usage)\s+(?:limit|quota)\s+(?:reached|exceeded|hit|met|violated)'
         r'|(?:reached|exceeded|hit|met|violated)\s+(?:session|token|request|rate|usage)\s+(?:limit|quota)'
-        r'|limit\s+reached'
-        r'|quota\s+exceeded'
         r')(?:.*?(?:resets?|reset)(?:\s+at)?\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)?)?',
         re.IGNORECASE | re.DOTALL
     )
@@ -144,8 +142,8 @@ class ClaudeCodeBreaker:
             return False, None
         
         try:
-            # With new pattern: group(2) is the reset time (if present)
-            reset_time_str = match.group(2) if match.group(2) else None
+            # group(1) is the reset time (if present)
+            reset_time_str = match.group(1) if match.lastindex and match.lastindex >= 1 else None
             
             if reset_time_str:
                 reset_time = self._parse_reset_time(reset_time_str.strip())
@@ -257,7 +255,7 @@ class ClaudeCodeBreaker:
             self.opened_at = None
             self.reset_time = None
             self.failure_count = 0
-            
+
             # Save to Redis and clear the key
             if self.redis_client:
                 try:
@@ -265,7 +263,7 @@ class ClaudeCodeBreaker:
                     logger.debug(f"Cleared breaker state from Redis")
                 except Exception as e:
                     logger.error(f"Error clearing breaker state from Redis: {e}")
-            
+
             logger.info("🟢 CLAUDE CODE BREAKER CLOSED - Tokens available, resuming operations")
     
     def is_open(self) -> bool:

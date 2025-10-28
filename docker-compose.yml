@@ -105,6 +105,28 @@ services:
     ports:
       - "3000:80"
 
+  browserless:
+    image: ghcr.io/browserless/chromium:latest
+    container_name: browserless
+    environment:
+      - CONCURRENT=5
+      - MAX_CONCURRENT_SESSIONS=5
+      - TIMEOUT=30000
+      - ENABLE_DEBUGGER=true
+      # Optional: Add token for authentication
+      # - TOKEN=your-secure-token-here
+    networks:
+      - orchestrator-net
+    ports:
+      - "3001:3000"  # Expose for debugging (web-ui uses 3000)
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+        reservations:
+          memory: 512M
+
   elasticsearch:
     image: docker.elastic.co/elasticsearch/elasticsearch:9.0.0
     environment:

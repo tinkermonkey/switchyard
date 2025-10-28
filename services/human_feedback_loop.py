@@ -43,7 +43,8 @@ class HumanFeedbackState:
         project_name: str,
         board_name: str,
         workspace_type: str = 'discussions',
-        discussion_id: Optional[str] = None
+        discussion_id: Optional[str] = None,
+        pipeline_run_id: Optional[str] = None
     ):
         self.issue_number = issue_number
         self.repository = repository
@@ -52,6 +53,7 @@ class HumanFeedbackState:
         self.board_name = board_name
         self.workspace_type = workspace_type
         self.discussion_id = discussion_id
+        self.pipeline_run_id = pipeline_run_id
         self.current_iteration = 0
         self.agent_outputs = []
         self.created_at = datetime.now().isoformat()
@@ -78,7 +80,8 @@ class HumanFeedbackLoopExecutor:
         org: str,
         workflow_columns: list = None,
         workspace_type: str = 'discussions',
-        discussion_id: Optional[str] = None
+        discussion_id: Optional[str] = None,
+        pipeline_run_id: Optional[str] = None
     ) -> Tuple[str, bool]:
         """
         Start a human feedback loop where agent responds to human comments
@@ -115,7 +118,8 @@ class HumanFeedbackLoopExecutor:
             project_name=project_name,
             board_name=board_name,
             workspace_type=workspace_type,
-            discussion_id=discussion_id
+            discussion_id=discussion_id,
+            pipeline_run_id=pipeline_run_id
         )
 
         # Register active loop
@@ -306,6 +310,7 @@ class HumanFeedbackLoopExecutor:
             'trigger': 'feedback_loop' if human_feedback else 'conversational_loop',
             'workspace_type': state.workspace_type,
             'discussion_id': state.discussion_id,
+            'pipeline_run_id': state.pipeline_run_id,  # Include pipeline run ID for event tracking
             'timestamp': datetime.now().isoformat(),
             'use_docker': True,  # Run agents in Docker for filesystem isolation
             'agent': state.agent  # Pass agent name for observability

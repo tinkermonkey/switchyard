@@ -6,7 +6,7 @@ import NavigationTabs from '../components/NavigationTabs'
 import { useSocket } from '../contexts/SocketContext'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
-import { normalizeTimestamp, formatTimestamp, mergeAgentExecutionEvents } from '../utils/eventMerging'
+import { normalizeTimestamp, formatTimestamp, mergeAgentExecutionEvents, mergeObjectStable, mergeArrayByIdStable } from '../utils/eventMerging'
 
   const formatAgentName = (agentName) => {
     if (!agentName || typeof agentName !== 'string' || agentName.trim() === '') return 'Unknown Agent'
@@ -46,16 +46,20 @@ function AgentExecutionView() {
   }, [pipelineRunId])
 
   // Fetch execution data
-  const fetchExecutionData = useCallback(async () => {
+  const fetchExecutionData = useCallback(async (isInitialLoad = false) => {
     try {
-      setLoading(true)
+      // Only show loading spinner on initial load, not on background refreshes
+      if (isInitialLoad) {
+        setLoading(true)
+      }
       const response = await fetch(`/api/agent-execution/${executionId}`)
       const data = await response.json()
 
       if (data.success) {
-        setExecutionData(data.execution)
-        setExecutionLogs(data.logs || [])
-        setPromptEvent(data.prompt_event || null)
+        // Use stable merge to prevent unnecessary re-renders
+        setExecutionData(current => mergeObjectStable(current, data.execution))
+        setExecutionLogs(current => mergeArrayByIdStable(current, data.logs || [], 'id'))
+        setPromptEvent(current => mergeObjectStable(current, data.prompt_event || null))
         setError(null)
 
         // Extract pipeline_run_id from execution data
@@ -69,12 +73,14 @@ function AgentExecutionView() {
       console.error('Error fetching execution data:', err)
       setError('Failed to load execution data')
     } finally {
-      setLoading(false)
+      if (isInitialLoad) {
+        setLoading(false)
+      }
     }
   }, [executionId])
 
   // Fetch all executions in the pipeline run
-  const fetchPipelineExecutions = useCallback(async (runId) => {
+  const fetchPipelineExecutions = useCallback(async (runId, isInitialLoad = false) => {
     if (!runId) return
 
     // Guard against concurrent fetches
@@ -85,7 +91,10 @@ function AgentExecutionView() {
 
     try {
       isFetchingExecutionsRef.current = true
-      setLoadingExecutions(true)
+      // Only show loading spinner on initial load, not on background refreshes
+      if (isInitialLoad) {
+        setLoadingExecutions(true)
+      }
       const response = await fetch(`/pipeline-run-events?pipeline_run_id=${runId}`)
       const data = await response.json()
 
@@ -118,24 +127,27 @@ function AgentExecutionView() {
         executions.sort((a, b) => new Date(a.started_at) - new Date(b.started_at))
 
         console.log('[AgentExecution] Found pipeline executions:', executions.length)
-        setPipelineExecutions(executions)
+        // Use stable merge to prevent unnecessary re-renders
+        setPipelineExecutions(current => mergeArrayByIdStable(current, executions, 'execution_id'))
       }
     } catch (err) {
       console.error('Error fetching pipeline executions:', err)
     } finally {
-      setLoadingExecutions(false)
+      if (isInitialLoad) {
+        setLoadingExecutions(false)
+      }
       isFetchingExecutionsRef.current = false
     }
   }, [])
 
   useEffect(() => {
-    fetchExecutionData()
+    fetchExecutionData(true) // Pass true for initial load
   }, [fetchExecutionData])
 
   // Fetch pipeline executions when pipeline_run_id is available
   useEffect(() => {
     if (pipelineRunId) {
-      fetchPipelineExecutions(pipelineRunId)
+      fetchPipelineExecutions(pipelineRunId, true) // Pass true for initial load
     }
   }, [pipelineRunId, fetchPipelineExecutions])
 
@@ -147,7 +159,7 @@ function AgentExecutionView() {
       console.log('[AgentExecution] Periodic refresh of pipeline executions')
       // Use ref to get current pipeline run ID
       if (pipelineRunIdRef.current) {
-        fetchPipelineExecutions(pipelineRunIdRef.current)
+        fetchPipelineExecutions(pipelineRunIdRef.current, false) // Background refresh, no loading spinner
       }
     }, 10000) // Refresh every 10 seconds
 
@@ -170,7 +182,7 @@ function AgentExecutionView() {
           latestLog.event_type === 'agent_completed' ||
           latestLog.event_type === 'agent_failed') {
         console.log('[AgentExecution] WebSocket event detected:', latestLog.event_type)
-        fetchPipelineExecutions(pipelineRunIdRef.current)
+        fetchPipelineExecutions(pipelineRunIdRef.current, false) // Background refresh from WebSocket event
       }
     }
   }, [allLogs, fetchPipelineExecutions])
@@ -694,232 +706,469 @@ function AgentExecutionView() {
             </div>
           </div>
           
-          <div className="flex gap-4">
-            {/* Left column - 70% width */}
-            <div className="flex-[7] space-y-4">
-              {inputPrompt && (
-                <div className="bg-gh-canvas rounded-md border border-gh-border p-3">
-                  <div className="flex items-center justify-between mb-2">
-                    <div className="flex items-center gap-2">
-                      <h3 className="text-sm font-semibold text-gh-fg">Input Prompt</h3>
-                      <span className="text-xs text-gh-fg-muted">
-                        {formatTimestamp(inputPrompt.timestamp)}
-                      </span>
-                    </div>
-                    <button
-                      onClick={() => setIsPromptExpanded(!isPromptExpanded)}
-                      className="text-gh-accent-primary hover:bg-gh-border-muted rounded p-1 transition-colors"
-                      title={isPromptExpanded ? 'Collapse' : 'Expand'}
-                    >
-                      {isPromptExpanded ? (
-                        <ChevronUp className="w-4 h-4" />
-                      ) : (
-                        <ChevronDown className="w-4 h-4" />
-                      )}
-                    </button>
-                  </div>
-                  <div className="relative">
-                    <div
-                      className={`prose prose-sm prose-invert font-mono text-xs max-w-none transition-all break-words ${
-                        isPromptExpanded ? '' : 'max-h-[200px] overflow-y-auto'
-                      }`}
-                      style={{ overflowWrap: 'break-word' }}
-                    >
-                      <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                        {inputPrompt.text}
-                      </ReactMarkdown>
-                    </div>
-                    {!isPromptExpanded && inputPrompt.text.length > 500 && (
-                      <div className="absolute bottom-0 left-0 right-0 h-12 bg-gradient-to-t from-gh-canvas via-gh-canvas/80 to-transparent pointer-events-none" />
-                    )}
-                  </div>
-                </div>
-              )}
-              
-              {lastTextMessage && (
-                <div className="bg-gh-canvas rounded-md border border-gh-border p-3">
-                  <div className="flex items-center justify-between mb-2">
-                    <div className="flex items-center gap-2">
-                      <h3 className="text-sm font-semibold text-gh-fg">Latest Message</h3>
-                      <span className="text-xs text-gh-fg-muted">
-                        {formatTimestamp(lastTextMessage.timestamp)}
-                      </span>
-                    </div>
-                    <button
-                      onClick={() => setIsMessageExpanded(!isMessageExpanded)}
-                      className="text-gh-accent-primary hover:bg-gh-border-muted rounded p-1 transition-colors"
-                      title={isMessageExpanded ? 'Collapse' : 'Expand'}
-                    >
-                      {isMessageExpanded ? (
-                        <ChevronUp className="w-4 h-4" />
-                      ) : (
-                        <ChevronDown className="w-4 h-4" />
-                      )}
-                    </button>
-                  </div>
-                  <div className="relative">
-                    <div
-                      className={`prose prose-sm prose-invert font-mono text-xs max-w-none transition-all break-words ${
-                        isMessageExpanded ? '' : 'max-h-[200px] overflow-y-auto'
-                      }`}
-                      style={{ overflowWrap: 'break-word' }}
-                    >
-                      <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                        {lastTextMessage.text}
-                      </ReactMarkdown>
-                    </div>
-                    {!isMessageExpanded && lastTextMessage.text.length > 500 && (
-                      <div className="absolute bottom-0 left-0 right-0 h-12 bg-gradient-to-t from-gh-canvas via-gh-canvas/80 to-transparent pointer-events-none" />
-                    )}
-                  </div>
-                </div>
-              )}
-              
-              {lastToolCall && (
-                <div className="bg-gh-canvas rounded-md border border-gh-border p-3">
-                  <div className="flex items-center gap-2 mb-2">
-                    <h3 className="text-sm font-semibold text-gh-fg">Latest Tool Call</h3>
-                    <span className="text-xs text-gh-fg-muted">
-                      {formatTimestamp(lastToolCall.timestamp)}
-                    </span>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <span className="px-2 py-1 bg-gh-warning rounded text-xs font-semibold text-white">
-                      {lastToolCall.name}
-                    </span>
-                    <span className="text-sm text-gh-fg font-mono">
-                      {formatToolCall(lastToolCall)}
-                    </span>
-                  </div>
-                </div>
-              )}
-              
-              {previousToolCall && (
-                <div className="bg-gh-canvas rounded-md border border-gh-border p-3">
-                  <div className="flex items-center gap-2 mb-2">
-                    <h3 className="text-sm font-semibold text-gh-fg">Previous Tool Call</h3>
-                    <span className="text-xs text-gh-fg-muted">
-                      {formatTimestamp(previousToolCall.timestamp)}
-                    </span>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <span className="px-2 py-1 bg-gh-warning rounded text-xs font-semibold text-white">
-                      {previousToolCall.name}
-                    </span>
-                    <span className="text-sm text-gh-fg font-mono">
-                      {formatToolCall(previousToolCall)}
-                    </span>
-                  </div>
-                </div>
-              )}
-              
-              {previousToolResult && (
-                <div className="bg-gh-canvas rounded-md border border-gh-border p-3">
-                  <div className="flex items-center justify-between mb-2">
-                    <div className="flex items-center gap-2">
-                      <h3 className="text-sm font-semibold text-gh-fg">Previous Tool Result</h3>
-                      <span className="text-xs text-gh-fg-muted">
-                        {formatTimestamp(previousToolResult.timestamp)}
-                      </span>
-                    </div>
-                    <button
-                      onClick={() => setIsPreviousResultExpanded(!isPreviousResultExpanded)}
-                      className="text-gh-accent-primary hover:bg-gh-border-muted rounded p-1 transition-colors"
-                      title={isPreviousResultExpanded ? 'Collapse' : 'Expand'}
-                    >
-                      {isPreviousResultExpanded ? (
-                        <ChevronUp className="w-4 h-4" />
-                      ) : (
-                        <ChevronDown className="w-4 h-4" />
-                      )}
-                    </button>
-                  </div>
-                  <div className="relative">
-                    <div
-                      className={`prose prose-sm prose-invert font-mono text-xs max-w-none transition-all break-words ${
-                        isPreviousResultExpanded ? '' : 'max-h-[200px] overflow-y-auto'
-                      }`}
-                      style={{ overflowWrap: 'break-word' }}
-                    >
-                      {typeof previousToolResult.content === 'string' ? (
-                        <pre className="whitespace-pre-wrap break-words" style={{ overflowWrap: 'break-word' }}>{previousToolResult.content}</pre>
-                      ) : (
-                        <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                          {JSON.stringify(previousToolResult.content, null, 2)}
-                        </ReactMarkdown>
-                      )}
-                    </div>
-                    {!isPreviousResultExpanded && JSON.stringify(previousToolResult.content).length > 500 && (
-                      <div className="absolute bottom-0 left-0 right-0 h-12 bg-gradient-to-t from-gh-canvas via-gh-canvas/80 to-transparent pointer-events-none" />
-                    )}
-                  </div>
-                </div>
-              )}
-            </div>
-            
-            {/* Right column - 30% width */}
-            <div className="flex-[3]">
-              <div className="bg-gh-canvas rounded-md border border-gh-border p-3">
-                <div className="mb-3">
-                  <div className="flex items-center justify-between mb-1">
-                    <div className="flex items-center gap-2">
-                      <h3 className="text-sm font-semibold text-gh-fg">Current Tasks</h3>
-                      {lastTodoWrite && (
+          {/* When completed, use two-row layout */}
+          {executionData.status === 'completed' ? (
+            <div className="space-y-4">
+              {/* First row: Input Prompt and Latest Message side-by-side */}
+              {inputPrompt && lastTextMessage && (
+                <div className="flex gap-4">
+                  {/* Input Prompt - 50% width */}
+                  <div className="flex-1 bg-gh-canvas rounded-md border border-gh-border p-3">
+                    <div className="flex items-center justify-between mb-2">
+                      <div className="flex items-center gap-2">
+                        <h3 className="text-sm font-semibold text-gh-fg">Input Prompt</h3>
                         <span className="text-xs text-gh-fg-muted">
-                          {formatTimestamp(lastTodoWrite.timestamp)}
+                          {formatTimestamp(inputPrompt.timestamp)}
                         </span>
+                      </div>
+                      <button
+                        onClick={() => setIsPromptExpanded(!isPromptExpanded)}
+                        className="text-gh-accent-primary hover:bg-gh-border-muted rounded p-1 transition-colors"
+                        title={isPromptExpanded ? 'Collapse' : 'Expand'}
+                      >
+                        {isPromptExpanded ? (
+                          <ChevronUp className="w-4 h-4" />
+                        ) : (
+                          <ChevronDown className="w-4 h-4" />
+                        )}
+                      </button>
+                    </div>
+                    <div className="relative">
+                      <div
+                        className={`prose prose-sm prose-invert font-mono text-xs max-w-none transition-all break-words ${
+                          isPromptExpanded ? '' : 'max-h-[200px] overflow-y-auto'
+                        }`}
+                        style={{ overflowWrap: 'break-word' }}
+                      >
+                        <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                          {inputPrompt.text}
+                        </ReactMarkdown>
+                      </div>
+                      {!isPromptExpanded && inputPrompt.text.length > 500 && (
+                        <div className="absolute bottom-0 left-0 right-0 h-12 bg-gradient-to-t from-gh-canvas via-gh-canvas/80 to-transparent pointer-events-none" />
                       )}
                     </div>
-                    {lastTodoWrite && lastTodoWrite.todos.length > 0 && (
-                      <span className="text-xs text-gh-success">
-                        {todoStats.completed}/{todoStats.total}
-                      </span>
-                    )}
+                  </div>
+
+                  {/* Latest Message - 50% width */}
+                  <div className="flex-1 bg-gh-canvas rounded-md border border-gh-border p-3">
+                    <div className="flex items-center justify-between mb-2">
+                      <div className="flex items-center gap-2">
+                        <h3 className="text-sm font-semibold text-gh-fg">Latest Message</h3>
+                        <span className="text-xs text-gh-fg-muted">
+                          {formatTimestamp(lastTextMessage.timestamp)}
+                        </span>
+                      </div>
+                      <button
+                        onClick={() => setIsMessageExpanded(!isMessageExpanded)}
+                        className="text-gh-accent-primary hover:bg-gh-border-muted rounded p-1 transition-colors"
+                        title={isMessageExpanded ? 'Collapse' : 'Expand'}
+                      >
+                        {isMessageExpanded ? (
+                          <ChevronUp className="w-4 h-4" />
+                        ) : (
+                          <ChevronDown className="w-4 h-4" />
+                        )}
+                      </button>
+                    </div>
+                    <div className="relative">
+                      <div
+                        className={`prose prose-sm prose-invert font-mono text-xs max-w-none transition-all break-words ${
+                          isMessageExpanded ? '' : 'max-h-[200px] overflow-y-auto'
+                        }`}
+                        style={{ overflowWrap: 'break-word' }}
+                      >
+                        <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                          {lastTextMessage.text}
+                        </ReactMarkdown>
+                      </div>
+                      {!isMessageExpanded && lastTextMessage.text.length > 500 && (
+                        <div className="absolute bottom-0 left-0 right-0 h-12 bg-gradient-to-t from-gh-canvas via-gh-canvas/80 to-transparent pointer-events-none" />
+                      )}
+                    </div>
                   </div>
                 </div>
-                {lastTodoWrite && lastTodoWrite.todos.length > 0 ? (
-                  <div className="space-y-2">
-                    {lastTodoWrite.todos.map((todo, idx) => {
-                      const isCompleted = todo.status === 'completed'
-                      const isInProgress = todo.status === 'in_progress'
-                      
-                      return (
-                        <div
-                          key={idx}
-                          className={`flex items-start gap-2 p-2 rounded ${
-                            isInProgress ? 'bg-gh-warning-subtle border border-gh-warning' : ''
-                          }`}
-                        >
-                          {isCompleted ? (
-                            <CheckCircle2 className="w-4 h-4 mt-0.5 text-gh-success flex-shrink-0" />
-                          ) : isInProgress ? (
-                            <PlayCircle className="w-4 h-4 mt-0.5 text-gh-warning flex-shrink-0" />
-                          ) : (
-                            <Circle className="w-4 h-4 mt-0.5 text-gh-fg-muted flex-shrink-0" />
-                          )}
-                          <span
-                            className={`text-sm ${
-                              isCompleted
-                                ? 'line-through text-gh-fg-muted'
-                                : isInProgress
-                                ? 'text-gh-fg font-medium'
-                                : 'text-gh-fg'
-                            }`}
-                          >
-                            {todo.content}
+              )}
+
+              {/* Second row: Tool calls/results (left 70%) and Current Tasks (right 30%) */}
+              <div className="flex gap-4">
+                {/* Left side - Tool calls and results */}
+                <div className="flex-[7] space-y-4">
+                  {lastToolCall && (
+                    <div className="bg-gh-canvas rounded-md border border-gh-border p-3">
+                      <div className="flex items-center gap-2 mb-2">
+                        <h3 className="text-sm font-semibold text-gh-fg">Latest Tool Call</h3>
+                        <span className="text-xs text-gh-fg-muted">
+                          {formatTimestamp(lastToolCall.timestamp)}
+                        </span>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <span className="px-2 py-1 bg-gh-warning rounded text-xs font-semibold text-white">
+                          {lastToolCall.name}
+                        </span>
+                        <span className="text-sm text-gh-fg font-mono">
+                          {formatToolCall(lastToolCall)}
+                        </span>
+                      </div>
+                    </div>
+                  )}
+
+                  {previousToolCall && (
+                    <div className="bg-gh-canvas rounded-md border border-gh-border p-3">
+                      <div className="flex items-center gap-2 mb-2">
+                        <h3 className="text-sm font-semibold text-gh-fg">Previous Tool Call</h3>
+                        <span className="text-xs text-gh-fg-muted">
+                          {formatTimestamp(previousToolCall.timestamp)}
+                        </span>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <span className="px-2 py-1 bg-gh-warning rounded text-xs font-semibold text-white">
+                          {previousToolCall.name}
+                        </span>
+                        <span className="text-sm text-gh-fg font-mono">
+                          {formatToolCall(previousToolCall)}
+                        </span>
+                      </div>
+                    </div>
+                  )}
+
+                  {previousToolResult && (
+                    <div className="bg-gh-canvas rounded-md border border-gh-border p-3">
+                      <div className="flex items-center justify-between mb-2">
+                        <div className="flex items-center gap-2">
+                          <h3 className="text-sm font-semibold text-gh-fg">Previous Tool Result</h3>
+                          <span className="text-xs text-gh-fg-muted">
+                            {formatTimestamp(previousToolResult.timestamp)}
                           </span>
                         </div>
-                      )
-                    })}
+                        <button
+                          onClick={() => setIsPreviousResultExpanded(!isPreviousResultExpanded)}
+                          className="text-gh-accent-primary hover:bg-gh-border-muted rounded p-1 transition-colors"
+                          title={isPreviousResultExpanded ? 'Collapse' : 'Expand'}
+                        >
+                          {isPreviousResultExpanded ? (
+                            <ChevronUp className="w-4 h-4" />
+                          ) : (
+                            <ChevronDown className="w-4 h-4" />
+                          )}
+                        </button>
+                      </div>
+                      <div className="relative">
+                        <div
+                          className={`prose prose-sm prose-invert font-mono text-xs max-w-none transition-all break-words ${
+                            isPreviousResultExpanded ? '' : 'max-h-[200px] overflow-y-auto'
+                          }`}
+                          style={{ overflowWrap: 'break-word' }}
+                        >
+                          {typeof previousToolResult.content === 'string' ? (
+                            <pre className="whitespace-pre-wrap break-words" style={{ overflowWrap: 'break-word' }}>{previousToolResult.content}</pre>
+                          ) : (
+                            <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                              {JSON.stringify(previousToolResult.content, null, 2)}
+                            </ReactMarkdown>
+                          )}
+                        </div>
+                        {!isPreviousResultExpanded && JSON.stringify(previousToolResult.content).length > 500 && (
+                          <div className="absolute bottom-0 left-0 right-0 h-12 bg-gradient-to-t from-gh-canvas via-gh-canvas/80 to-transparent pointer-events-none" />
+                        )}
+                      </div>
+                    </div>
+                  )}
+                </div>
+
+                {/* Right side - Current Tasks */}
+                <div className="flex-[3]">
+                  <div className="bg-gh-canvas rounded-md border border-gh-border p-3">
+                    <div className="mb-3">
+                      <div className="flex items-center justify-between mb-1">
+                        <div className="flex items-center gap-2">
+                          <h3 className="text-sm font-semibold text-gh-fg">Current Tasks</h3>
+                          {lastTodoWrite && (
+                            <span className="text-xs text-gh-fg-muted">
+                              {formatTimestamp(lastTodoWrite.timestamp)}
+                            </span>
+                          )}
+                        </div>
+                        {lastTodoWrite && lastTodoWrite.todos.length > 0 && (
+                          <span className="text-xs text-gh-success">
+                            {todoStats.completed}/{todoStats.total}
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                    {lastTodoWrite && lastTodoWrite.todos.length > 0 ? (
+                      <div className="space-y-2">
+                        {lastTodoWrite.todos.map((todo, idx) => {
+                          const isCompleted = todo.status === 'completed'
+                          const isInProgress = todo.status === 'in_progress'
+
+                          return (
+                            <div
+                              key={idx}
+                              className={`flex items-start gap-2 p-2 rounded ${
+                                isInProgress ? 'bg-gh-warning-subtle border border-gh-warning' : ''
+                              }`}
+                            >
+                              {isCompleted ? (
+                                <CheckCircle2 className="w-4 h-4 mt-0.5 text-gh-success flex-shrink-0" />
+                              ) : isInProgress ? (
+                                <PlayCircle className="w-4 h-4 mt-0.5 text-gh-warning flex-shrink-0" />
+                              ) : (
+                                <Circle className="w-4 h-4 mt-0.5 text-gh-fg-muted flex-shrink-0" />
+                              )}
+                              <span
+                                className={`text-sm ${
+                                  isCompleted
+                                    ? 'line-through text-gh-fg-muted'
+                                    : isInProgress
+                                    ? 'text-gh-fg font-medium'
+                                    : 'text-gh-fg'
+                                }`}
+                              >
+                                {todo.content}
+                              </span>
+                            </div>
+                          )
+                        })}
+                      </div>
+                    ) : (
+                      <div className="text-center text-gh-fg-muted text-sm py-4">
+                        No current task list
+                      </div>
+                    )}
                   </div>
-                ) : (
-                  <div className="text-center text-gh-fg-muted text-sm py-4">
-                    No current task list
+                </div>
+              </div>
+            </div>
+          ) : (
+            /* When not completed, use original layout */
+            <div className="flex gap-4">
+              {/* Left column - 70% width */}
+              <div className="flex-[7] space-y-4">
+                {inputPrompt && (
+                  <div className="bg-gh-canvas rounded-md border border-gh-border p-3">
+                    <div className="flex items-center justify-between mb-2">
+                      <div className="flex items-center gap-2">
+                        <h3 className="text-sm font-semibold text-gh-fg">Input Prompt</h3>
+                        <span className="text-xs text-gh-fg-muted">
+                          {formatTimestamp(inputPrompt.timestamp)}
+                        </span>
+                      </div>
+                      <button
+                        onClick={() => setIsPromptExpanded(!isPromptExpanded)}
+                        className="text-gh-accent-primary hover:bg-gh-border-muted rounded p-1 transition-colors"
+                        title={isPromptExpanded ? 'Collapse' : 'Expand'}
+                      >
+                        {isPromptExpanded ? (
+                          <ChevronUp className="w-4 h-4" />
+                        ) : (
+                          <ChevronDown className="w-4 h-4" />
+                        )}
+                      </button>
+                    </div>
+                    <div className="relative">
+                      <div
+                        className={`prose prose-sm prose-invert font-mono text-xs max-w-none transition-all break-words ${
+                          isPromptExpanded ? '' : 'max-h-[200px] overflow-y-auto'
+                        }`}
+                        style={{ overflowWrap: 'break-word' }}
+                      >
+                        <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                          {inputPrompt.text}
+                        </ReactMarkdown>
+                      </div>
+                      {!isPromptExpanded && inputPrompt.text.length > 500 && (
+                        <div className="absolute bottom-0 left-0 right-0 h-12 bg-gradient-to-t from-gh-canvas via-gh-canvas/80 to-transparent pointer-events-none" />
+                      )}
+                    </div>
+                  </div>
+                )}
+
+                {lastTextMessage && (
+                  <div className="bg-gh-canvas rounded-md border border-gh-border p-3">
+                    <div className="flex items-center justify-between mb-2">
+                      <div className="flex items-center gap-2">
+                        <h3 className="text-sm font-semibold text-gh-fg">Latest Message</h3>
+                        <span className="text-xs text-gh-fg-muted">
+                          {formatTimestamp(lastTextMessage.timestamp)}
+                        </span>
+                      </div>
+                      <button
+                        onClick={() => setIsMessageExpanded(!isMessageExpanded)}
+                        className="text-gh-accent-primary hover:bg-gh-border-muted rounded p-1 transition-colors"
+                        title={isMessageExpanded ? 'Collapse' : 'Expand'}
+                      >
+                        {isMessageExpanded ? (
+                          <ChevronUp className="w-4 h-4" />
+                        ) : (
+                          <ChevronDown className="w-4 h-4" />
+                        )}
+                      </button>
+                    </div>
+                    <div className="relative">
+                      <div
+                        className={`prose prose-sm prose-invert font-mono text-xs max-w-none transition-all break-words ${
+                          isMessageExpanded ? '' : 'max-h-[200px] overflow-y-auto'
+                        }`}
+                        style={{ overflowWrap: 'break-word' }}
+                      >
+                        <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                          {lastTextMessage.text}
+                        </ReactMarkdown>
+                      </div>
+                      {!isMessageExpanded && lastTextMessage.text.length > 500 && (
+                        <div className="absolute bottom-0 left-0 right-0 h-12 bg-gradient-to-t from-gh-canvas via-gh-canvas/80 to-transparent pointer-events-none" />
+                      )}
+                    </div>
+                  </div>
+                )}
+
+                {lastToolCall && (
+                  <div className="bg-gh-canvas rounded-md border border-gh-border p-3">
+                    <div className="flex items-center gap-2 mb-2">
+                      <h3 className="text-sm font-semibold text-gh-fg">Latest Tool Call</h3>
+                      <span className="text-xs text-gh-fg-muted">
+                        {formatTimestamp(lastToolCall.timestamp)}
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <span className="px-2 py-1 bg-gh-warning rounded text-xs font-semibold text-white">
+                        {lastToolCall.name}
+                      </span>
+                      <span className="text-sm text-gh-fg font-mono">
+                        {formatToolCall(lastToolCall)}
+                      </span>
+                    </div>
+                  </div>
+                )}
+
+                {previousToolCall && (
+                  <div className="bg-gh-canvas rounded-md border border-gh-border p-3">
+                    <div className="flex items-center gap-2 mb-2">
+                      <h3 className="text-sm font-semibold text-gh-fg">Previous Tool Call</h3>
+                      <span className="text-xs text-gh-fg-muted">
+                        {formatTimestamp(previousToolCall.timestamp)}
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <span className="px-2 py-1 bg-gh-warning rounded text-xs font-semibold text-white">
+                        {previousToolCall.name}
+                      </span>
+                      <span className="text-sm text-gh-fg font-mono">
+                        {formatToolCall(previousToolCall)}
+                      </span>
+                    </div>
+                  </div>
+                )}
+
+                {previousToolResult && (
+                  <div className="bg-gh-canvas rounded-md border border-gh-border p-3">
+                    <div className="flex items-center justify-between mb-2">
+                      <div className="flex items-center gap-2">
+                        <h3 className="text-sm font-semibold text-gh-fg">Previous Tool Result</h3>
+                        <span className="text-xs text-gh-fg-muted">
+                          {formatTimestamp(previousToolResult.timestamp)}
+                        </span>
+                      </div>
+                      <button
+                        onClick={() => setIsPreviousResultExpanded(!isPreviousResultExpanded)}
+                        className="text-gh-accent-primary hover:bg-gh-border-muted rounded p-1 transition-colors"
+                        title={isPreviousResultExpanded ? 'Collapse' : 'Expand'}
+                      >
+                        {isPreviousResultExpanded ? (
+                          <ChevronUp className="w-4 h-4" />
+                        ) : (
+                          <ChevronDown className="w-4 h-4" />
+                        )}
+                      </button>
+                    </div>
+                    <div className="relative">
+                      <div
+                        className={`prose prose-sm prose-invert font-mono text-xs max-w-none transition-all break-words ${
+                          isPreviousResultExpanded ? '' : 'max-h-[200px] overflow-y-auto'
+                        }`}
+                        style={{ overflowWrap: 'break-word' }}
+                      >
+                        {typeof previousToolResult.content === 'string' ? (
+                          <pre className="whitespace-pre-wrap break-words" style={{ overflowWrap: 'break-word' }}>{previousToolResult.content}</pre>
+                        ) : (
+                          <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                            {JSON.stringify(previousToolResult.content, null, 2)}
+                          </ReactMarkdown>
+                        )}
+                      </div>
+                      {!isPreviousResultExpanded && JSON.stringify(previousToolResult.content).length > 500 && (
+                        <div className="absolute bottom-0 left-0 right-0 h-12 bg-gradient-to-t from-gh-canvas via-gh-canvas/80 to-transparent pointer-events-none" />
+                      )}
+                    </div>
                   </div>
                 )}
               </div>
+
+              {/* Right column - 30% width */}
+              <div className="flex-[3]">
+                <div className="bg-gh-canvas rounded-md border border-gh-border p-3">
+                  <div className="mb-3">
+                    <div className="flex items-center justify-between mb-1">
+                      <div className="flex items-center gap-2">
+                        <h3 className="text-sm font-semibold text-gh-fg">Current Tasks</h3>
+                        {lastTodoWrite && (
+                          <span className="text-xs text-gh-fg-muted">
+                            {formatTimestamp(lastTodoWrite.timestamp)}
+                          </span>
+                        )}
+                      </div>
+                      {lastTodoWrite && lastTodoWrite.todos.length > 0 && (
+                        <span className="text-xs text-gh-success">
+                          {todoStats.completed}/{todoStats.total}
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                  {lastTodoWrite && lastTodoWrite.todos.length > 0 ? (
+                    <div className="space-y-2">
+                      {lastTodoWrite.todos.map((todo, idx) => {
+                        const isCompleted = todo.status === 'completed'
+                        const isInProgress = todo.status === 'in_progress'
+
+                        return (
+                          <div
+                            key={idx}
+                            className={`flex items-start gap-2 p-2 rounded ${
+                              isInProgress ? 'bg-gh-warning-subtle border border-gh-warning' : ''
+                            }`}
+                          >
+                            {isCompleted ? (
+                              <CheckCircle2 className="w-4 h-4 mt-0.5 text-gh-success flex-shrink-0" />
+                            ) : isInProgress ? (
+                              <PlayCircle className="w-4 h-4 mt-0.5 text-gh-warning flex-shrink-0" />
+                            ) : (
+                              <Circle className="w-4 h-4 mt-0.5 text-gh-fg-muted flex-shrink-0" />
+                            )}
+                            <span
+                              className={`text-sm ${
+                                isCompleted
+                                  ? 'line-through text-gh-fg-muted'
+                                  : isInProgress
+                                  ? 'text-gh-fg font-medium'
+                                  : 'text-gh-fg'
+                              }`}
+                            >
+                              {todo.content}
+                            </span>
+                          </div>
+                        )
+                      })}
+                    </div>
+                  ) : (
+                    <div className="text-center text-gh-fg-muted text-sm py-4">
+                      No current task list
+                    </div>
+                  )}
+                </div>
+              </div>
             </div>
-          </div>
+          )}
         </div>
       </div>
 

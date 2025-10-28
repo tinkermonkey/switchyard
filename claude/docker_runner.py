@@ -808,9 +808,19 @@ class DockerAgentRunner:
                         logger.error(f"🔴 Captured Claude Code error event: {error_text}")
                         stderr_parts.append(f"{error_text}\n")
 
-                        # Also check if this error is a token/rate limit
+                        # Also check if this error is a token/rate limit (less strict for actual errors)
                         error_msg_lower = str(error_msg).lower()
-                        if any(pattern in error_msg_lower for pattern in ['session limit', 'token limit', 'rate limit', 'usage limit', 'quota', 'overloaded']):
+                        # For error events, simpler patterns are OK since they're already errors
+                        limit_error_patterns = [
+                            r'session\s+limit',
+                            r'token\s+limit',
+                            r'rate\s+limit',
+                            r'usage\s+limit',
+                            r'request\s+limit',
+                            r'quota',
+                            r'overloaded'
+                        ]
+                        if any(re.search(pattern, error_msg_lower) for pattern in limit_error_patterns):
                             logger.error(f"🔴 Detected limit in error event: {error_msg}")
                             stderr_parts.append(f"SESSION_LIMIT_IN_ERROR: {error_msg}\n")
 
@@ -825,8 +835,19 @@ class DockerAgentRunner:
                                 if text:
                                     # CRITICAL: Check for session/token/rate limit in assistant response text!
                                     # Claude returns "Session limit reached ∙ resets 12am" as assistant text
+                                    # Use regex to avoid false positives from documentation (e.g., "rate limiting features")
                                     text_lower = text.lower()
-                                    if any(pattern in text_lower for pattern in ['session limit', 'token limit', 'rate limit', 'usage limit', 'quota']):
+                                    # Only flag if it looks like an actual error (has action verbs or error indicators)
+                                    limit_error_patterns = [
+                                        r'session\s+limit\s+(?:reached|exceeded|hit|met)',
+                                        r'token\s+limit\s+(?:reached|exceeded|hit|met)',
+                                        r'rate\s+limit\s+(?:reached|exceeded|hit|met)',
+                                        r'usage\s+limit\s+(?:reached|exceeded|hit|met)',
+                                        r'request\s+limit\s+(?:reached|exceeded|hit|met)',
+                                        r'quota\s+(?:reached|exceeded|hit|met)',
+                                        r'(?:reached|exceeded|hit)\s+.*?(?:session|token|rate|usage|request)\s+(?:limit|quota)',
+                                    ]
+                                    if any(re.search(pattern, text_lower) for pattern in limit_error_patterns):
                                         logger.error(f"🔴 Detected limit in assistant response: {text}")
                                         stderr_parts.append(f"SESSION_LIMIT_IN_RESPONSE: {text}\n")
 
@@ -937,20 +958,44 @@ class DockerAgentRunner:
             redis_client = redis.Redis(host='redis', port=6379, decode_responses=True)
 
             # Store container info
+            # Note: agent_executor nests task_context in context['context']
+            task_context = context.get('context', {})
+
+            # Get container ID from running container (with retry since container might not be fully started)
+            container_id = None
+            for attempt in range(3):
+                try:
+                    result = subprocess.run(
+                        ['docker', 'ps', '--filter', f'name={container_name}', '--format', '{{.ID}}'],
+                        capture_output=True, text=True, timeout=5
+                    )
+                    if result.returncode == 0 and result.stdout.strip():
+                        container_id = result.stdout.strip()
+                        break
+                    # Container not found yet, wait briefly
+                    if attempt < 2:
+                        import time
+                        time.sleep(0.5)
+                except Exception as e:
+                    logger.debug(f"Could not get container ID (attempt {attempt+1}): {e}")
+
             container_info = {
                 'container_name': container_name,
+                'container_id': container_id or '',
                 'agent': agent,
                 'project': project,
                 'task_id': task_id,
                 'started_at': datetime.now().isoformat(),
-                'issue_number': str(context.get('issue_number', 'unknown'))
+                # Try nested context first, then top-level (for backwards compatibility)
+                'issue_number': str(task_context.get('issue_number') or context.get('issue_number', 'unknown')),
+                'pipeline_run_id': task_context.get('pipeline_run_id') or context.get('pipeline_run_id', '')  # Track pipeline association
             }
 
             # Store in Redis with 2 hour expiry (safety cleanup)
             redis_client.hset(f'agent:container:{container_name}', mapping=container_info)
             redis_client.expire(f'agent:container:{container_name}', 7200)
 
-            logger.info(f"Registered active container: {container_name} (agent={agent}, project={project})")
+            logger.info(f"Registered active container: {container_name} (agent={agent}, project={project}, id={container_id})")
 
         except Exception as e:
             logger.warning(f"Failed to register container in Redis: {e}")
