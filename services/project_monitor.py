@@ -2028,7 +2028,8 @@ _Review cycle initiated by Claude Code Orchestrator_
         status: str,
         repository: str,
         project_config,
-        workflow_template
+        workflow_template,
+        pipeline_run_id: Optional[str] = None
     ):
         """
         Monitor repair cycle container completion and handle auto-advance.
@@ -2047,7 +2048,8 @@ _Review cycle initiated by Claude Code Orchestrator_
             overall_success = False
             repair_result = None
             error_message = None
-            
+            pipeline_run_ended = False
+
             try:
                 logger.info(f"Starting container monitor for {container_name}")
                 
@@ -2093,7 +2095,7 @@ _Review cycle initiated by Claude Code Orchestrator_
                         success=overall_success,
                         total_agent_calls=repair_result.get('total_agent_calls', 0) if repair_result else 0,
                         duration_seconds=repair_result.get('duration_seconds', 0.0) if repair_result else 0.0,
-                        pipeline_run_id=None  # Could extract from repair_result if needed
+                        pipeline_run_id=pipeline_run_id
                     )
                 except Exception as e:
                     logger.warning(f"Failed to emit container completed event: {e}")
@@ -2243,6 +2245,50 @@ _Review cycle initiated by Claude Code Orchestrator_
                 logger.error(f"Container {container_name} timed out after 2 hours")
                 error_message = "Container timed out after 2 hours"
                 overall_success = False
+
+                # Emit container killed event
+                try:
+                    from monitoring.observability import get_observability_manager
+                    obs_manager = get_observability_manager()
+                    obs_manager.emit_repair_cycle_container_killed(
+                        project=project_name,
+                        issue_number=issue_number,
+                        container_name=container_name,
+                        reason="Exceeded 2 hour time limit",
+                        pipeline_run_id=pipeline_run_id
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to emit container killed event: {e}")
+
+                # Emit container completed event (failure)
+                try:
+                    from monitoring.observability import get_observability_manager
+                    obs_manager = get_observability_manager()
+                    obs_manager.emit_repair_cycle_container_completed(
+                        project=project_name,
+                        issue_number=issue_number,
+                        container_name=container_name,
+                        success=False,
+                        total_agent_calls=0,
+                        duration_seconds=7200.0,  # 2 hours
+                        pipeline_run_id=pipeline_run_id
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to emit container completed event: {e}")
+
+                # End pipeline run
+                try:
+                    ended = self.pipeline_run_manager.end_pipeline_run(
+                        project=project_name,
+                        issue_number=issue_number,
+                        reason="Container timeout after 2 hours"
+                    )
+                    if ended:
+                        pipeline_run_ended = True
+                        logger.info(f"Ended pipeline run for {project_name}/#{issue_number} due to timeout")
+                except Exception as e:
+                    logger.error(f"Failed to end pipeline run: {e}")
+
                 # Kill container
                 try:
                     subprocess.run(['docker', 'kill', container_name], timeout=30)
@@ -2282,6 +2328,20 @@ _Review cycle initiated by Claude Code Orchestrator_
                         f"Execution state updated for {project_name}/#{issue_number}: "
                         f"outcome={outcome}, exit_code={exit_code}"
                     )
+
+                    # End pipeline run if failed (success case is handled in normal flow)
+                    # Only end if not already ended (e.g., in timeout handler)
+                    if not overall_success and not pipeline_run_ended:
+                        try:
+                            ended = self.pipeline_run_manager.end_pipeline_run(
+                                project=project_name,
+                                issue_number=issue_number,
+                                reason=f"Repair cycle failed: {error_message or 'Unknown error'}"
+                            )
+                            if ended:
+                                logger.info(f"Ended pipeline run for {project_name}/#{issue_number} due to failure")
+                        except Exception as e:
+                            logger.error(f"Failed to end pipeline run in finally block: {e}")
                 except Exception as state_error:
                     logger.error(
                         f"CRITICAL: Failed to update execution state for {project_name}/#{issue_number}: "
@@ -2538,7 +2598,8 @@ _Repair cycle initiated by Claude Code Orchestrator_
                 status=status,
                 repository=repository,
                 project_config=project_config,
-                workflow_template=workflow_template
+                workflow_template=workflow_template,
+                pipeline_run_id=pipeline_run.id
             )
 
             # Record execution start in work execution state

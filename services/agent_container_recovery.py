@@ -661,13 +661,17 @@ class AgentContainerRecovery:
                         f"Container {container_name} has completed (result file exists), "
                         f"success={result.get('overall_success')}"
                     )
-                    # Container finished but wasn't cleaned up
-                    # Kill it and let normal completion flow handle it
-                    self.kill_repair_cycle_container_with_event(
-                        container_name, container_id, project, issue_number,
-                        "Container already finished (result file exists)"
-                    )
-                    killed += 1
+                    # Container finished but orchestrator restarted before processing result
+                    # Process the result now to complete the workflow
+                    try:
+                        self._process_completed_repair_cycle(
+                            container_name, container_id, project, issue_number, result
+                        )
+                        logger.info(f"Successfully processed completed repair cycle for {project}/#{issue_number}")
+                        recovered += 1
+                    except Exception as e:
+                        logger.error(f"Failed to process completed repair cycle: {e}", exc_info=True)
+                        errors += 1
                     continue
                 
                 # Check checkpoint to see if making progress
@@ -799,7 +803,197 @@ class AgentContainerRecovery:
             logger.warning(f"Failed to index recovery metrics to Elasticsearch: {e}")
         
         return (recovered, killed, errors)
-    
+
+    def _process_completed_repair_cycle(self, container_name: str, container_id: str,
+                                       project: str, issue_number: int, result: Dict) -> None:
+        """
+        Process a completed repair cycle that finished while orchestrator was restarting.
+
+        This handles:
+        1. Loading context
+        2. Posting summary to GitHub
+        3. Auto-committing changes if successful
+        4. Auto-advancing ticket if successful
+        5. Cleaning up container
+
+        Args:
+            container_name: Container name
+            container_id: Container ID
+            project: Project name
+            issue_number: Issue number
+            result: Result dict from result.json
+        """
+        import asyncio
+        from pathlib import Path
+
+        logger.info(f"Processing completed repair cycle for {project}/#{issue_number}")
+
+        # Load context file
+        context_file = Path(f"/workspace/clauditoreum/orchestrator_data/repair_cycles/{project}/{issue_number}/context.json")
+        if not context_file.exists():
+            logger.error(f"Context file not found: {context_file}")
+            raise FileNotFoundError(f"Context file not found: {context_file}")
+
+        with open(context_file, 'r') as f:
+            context = json.load(f)
+
+        board_name = context['board']
+        repository = context['repository']
+        column = context['column']
+        pipeline_run_id = context.get('pipeline_run_id')
+
+        # Get success status
+        overall_success = result.get('overall_success', False)
+
+        # Load project config to get org
+        from config.manager import ConfigManager
+        config_manager = ConfigManager()
+        project_config = config_manager.get_project_config(project)
+
+        # Post summary comment to GitHub
+        from services.github_integration import GitHubIntegration
+        github = GitHubIntegration(
+            repo_owner=project_config.github['org'],
+            repo_name=repository
+        )
+
+        # Build summary
+        test_results = result.get('test_results', [])
+        summary_lines = [
+            f"## ✅ Repair Cycle Complete" if overall_success else "## ❌ Repair Cycle Failed",
+            "",
+            f"**Container**: `{container_name}`",
+            f"**Total Agent Calls**: {result.get('total_agent_calls', 0)}",
+            f"**Duration**: {result.get('duration_seconds', 0):.1f}s",
+            ""
+        ]
+
+        for test_result in test_results:
+            test_type = test_result.get('test_type', 'unknown')
+            passed = test_result.get('passed', False)
+            iterations = test_result.get('iterations', 0)
+            summary_lines.append(
+                f"- **{test_type}**: {'✅ PASSED' if passed else '❌ FAILED'} "
+                f"({iterations} iterations)"
+            )
+
+        summary_lines.append("")
+        summary_lines.append("---")
+        summary_lines.append("_Repair cycle recovered after orchestrator restart_")
+
+        # Post comment
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+        comment_context = {
+            'issue_number': issue_number,
+            'repository': repository,
+            'workspace_type': context.get('workspace_type', 'issues'),
+            'discussion_id': context.get('discussion_id')
+        }
+
+        loop.run_until_complete(
+            github.post_agent_output(comment_context, "\n".join(summary_lines))
+        )
+
+        # Auto-commit if successful
+        if overall_success:
+            try:
+                logger.info(f"Auto-committing repair cycle changes for issue #{issue_number}")
+                from services.auto_commit import auto_commit_service
+
+                commit_success = loop.run_until_complete(
+                    auto_commit_service.commit_agent_changes(
+                        project=project,
+                        agent='repair_cycle',
+                        task_id=f'repair_cycle_{issue_number}',
+                        issue_number=issue_number,
+                        custom_message=f"Complete repair cycle for issue #{issue_number}\n\nAutomated test-fix-validate cycle completed successfully.\nAll tests passing."
+                    )
+                )
+
+                if commit_success:
+                    logger.info(f"Successfully committed repair cycle changes for issue #{issue_number}")
+                else:
+                    logger.warning(f"No changes to commit for repair cycle on issue #{issue_number}")
+            except Exception as e:
+                logger.error(f"Failed to auto-commit repair cycle changes: {e}", exc_info=True)
+
+        # Auto-advance if successful
+        if overall_success:
+            try:
+                # Get workflow columns
+                workflow_name = None
+
+                # Find the pipeline for this board
+                for pipeline in project_config.pipelines:
+                    if pipeline.board_name == board_name:
+                        workflow_name = pipeline.workflow
+                        break
+
+                if workflow_name:
+                    workflow_template = config_manager.get_workflow_template(workflow_name)
+                    current_index = next(
+                        (i for i, col in enumerate(workflow_template.columns) if col.name == column),
+                        None
+                    )
+
+                    if current_index is not None and current_index + 1 < len(workflow_template.columns):
+                        next_column = workflow_template.columns[current_index + 1]
+
+                        logger.info(f"Auto-advancing issue #{issue_number} from {column} to {next_column.name}")
+
+                        from services.pipeline_progression import PipelineProgression
+                        from task_queue.task_manager import TaskManager
+
+                        task_queue = TaskManager()
+                        progression_service = PipelineProgression(task_queue)
+                        progression_service.move_issue_to_column(
+                            project_name=project,
+                            board_name=board_name,
+                            issue_number=issue_number,
+                            target_column=next_column.name,
+                            trigger='repair_cycle_completion'
+                        )
+                        logger.info(f"Successfully moved issue #{issue_number} to {next_column.name}")
+            except Exception as e:
+                logger.error(f"Failed to auto-advance issue: {e}", exc_info=True)
+
+        # Clean up container
+        try:
+            subprocess.run(['docker', 'rm', '-f', container_id], capture_output=True, timeout=30)
+            logger.info(f"Removed container {container_name}")
+        except Exception as e:
+            logger.warning(f"Failed to remove container: {e}")
+
+        # Clear Redis tracking
+        try:
+            if self.redis:
+                redis_key = f"repair_cycle:container:{project}:{issue_number}"
+                self.redis.delete(redis_key)
+                logger.debug(f"Cleared Redis tracking key: {redis_key}")
+        except Exception as e:
+            logger.warning(f"Failed to clear Redis tracking: {e}")
+
+        # Emit completion event
+        try:
+            from monitoring.observability import get_observability_manager
+            obs_manager = get_observability_manager()
+            obs_manager.emit_repair_cycle_container_completed(
+                project=project,
+                issue_number=issue_number,
+                container_name=container_name,
+                success=overall_success,
+                total_agent_calls=result.get('total_agent_calls', 0),
+                duration_seconds=result.get('duration_seconds', 0.0),
+                pipeline_run_id=pipeline_run_id
+            )
+        except Exception as e:
+            logger.warning(f"Failed to emit container completed event: {e}")
+
+        loop.close()
+        logger.info(f"Completed processing of repair cycle for {project}/#{issue_number}")
+
     def kill_repair_cycle_container_with_event(self, container_name: str, container_id: str,
                                                project: str, issue_number: int, reason: str):
         """Kill a repair cycle container and emit event"""

@@ -578,13 +578,22 @@ class RepairCycleStage(PipelineStage):
         logger.error(f"Max iterations ({config.max_iterations}) reached for " f"{config.test_type.value} tests")
         final_result = await self._run_tests(config, context, test_cycle_iteration, test_type_index)
 
+        # Check if tests actually passed, regardless of warnings
+        # If all tests pass but warnings remain, that's still success
+        tests_passed = not final_result.has_failures()
+
+        if tests_passed:
+            logger.info(f"Max iterations reached, but all tests passed. Success! (warnings may remain)")
+        else:
+            logger.error(f"Max iterations reached with {final_result.failed} test failures")
+
         # Note: Completion event will be emitted by caller
         return CycleResult(
             test_type=config.test_type,
-            passed=False,
+            passed=tests_passed,  # Based on test results, not iterations
             iterations=test_cycle_iteration,
             final_result=final_result,
-            error="Max iterations reached",
+            error="Max iterations reached" if not tests_passed else None,
             files_fixed=files_fixed,
             warnings_reviewed=warnings_reviewed,
         )
