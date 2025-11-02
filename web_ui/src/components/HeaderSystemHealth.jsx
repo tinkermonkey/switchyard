@@ -1,7 +1,7 @@
 /**
- * HeaderSystemHealth - Shows individual health check statuses
+ * HeaderSystemHealth - Shows GitHub API and Claude token usage metrics
  */
-import { CheckCircle, XCircle, AlertTriangle } from 'lucide-react'
+import { Activity, Zap } from 'lucide-react'
 import HeaderBox from './HeaderBox'
 import { useSystemHealth } from '../hooks/useSystemHealth'
 
@@ -10,50 +10,83 @@ export default function HeaderSystemHealth() {
 
   if (loading || !checks) {
     return (
-      <HeaderBox title="System Health" minWidth="min-w-[200px]">
+      <HeaderBox title="API Usage" minWidth="min-w-[240px]">
         <p className="text-xs text-gh-fg-muted">Loading...</p>
       </HeaderBox>
     )
   }
 
-  // Priority order of checks to display
-  const priorityChecks = ['github', 'claude', 'disk', 'memory']
-  
-  const getHealthIcon = (check) => {
-    if (!check) return <AlertTriangle className="w-3 h-3 text-gh-fg-muted" />
-    if (check.healthy) return <CheckCircle className="w-3 h-3 text-gh-success" />
-    return <XCircle className="w-3 h-3 text-gh-danger" />
+  const githubCheck = checks.github
+  const claudeCheck = checks.claude
+
+  // Helper to format large numbers with commas
+  const formatNumber = (num) => {
+    if (!num && num !== 0) return 'N/A'
+    return num.toLocaleString()
   }
 
-  const getHealthLabel = (key) => {
-    const labels = {
-      'github': 'GitHub',
-      'claude': 'Claude',
-      'disk': 'Disk',
-      'memory': 'Memory'
-    }
-    return labels[key] || key
+  // Helper to get color based on percentage used (for GitHub API only)
+  const getUsageColor = (percentageUsed) => {
+    if (percentageUsed >= 90) return 'text-gh-danger'
+    if (percentageUsed >= 75) return 'text-yellow-500'
+    return 'text-gh-success'
   }
 
   return (
-    <HeaderBox title="System Health" minWidth="min-w-[200px]">
-      <div className="space-y-1">
-        {priorityChecks.map((key) => {
-          const check = checks[key]
-          if (!check) return null
-          
-          return (
-            <div key={key} className="flex items-center justify-between text-xs">
-              <div className="flex items-center gap-1.5">
-                {getHealthIcon(check)}
-                <span className="text-gh-fg-default">{getHealthLabel(key)}</span>
-              </div>
-              <span className={check.healthy ? 'text-gh-success' : 'text-gh-danger'}>
-                {check.healthy ? 'OK' : 'Error'}
-              </span>
+    <HeaderBox title="API Usage" minWidth="min-w-[180px]">
+      <div className="space-y-2.5">
+        {/* GitHub API Usage */}
+        {githubCheck?.api_usage && (
+          <div className="space-y-1">
+            <div className="flex items-center gap-1.5 text-xs">
+              <Activity className="w-3 h-3 text-gh-fg-muted" />
+              <span className="text-gh-fg-default font-medium">GitHub API</span>
             </div>
-          )
-        })}
+            <div className="pl-4.5 space-y-0.5">
+              <div className="flex items-center justify-between text-xs">
+                <span className="text-gh-fg-muted">Remaining</span>
+                <span className={getUsageColor(githubCheck.api_usage.percentage_used)}>
+                  {formatNumber(githubCheck.api_usage.remaining)} / {formatNumber(githubCheck.api_usage.limit)}
+                </span>
+              </div>
+              <div className="flex items-center justify-between text-xs">
+                <span className="text-gh-fg-muted">Used</span>
+                <span className={getUsageColor(githubCheck.api_usage.percentage_used)}>
+                  {githubCheck.api_usage.percentage_used?.toFixed(1)}%
+                </span>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Claude Token Usage */}
+        {claudeCheck?.token_usage && (
+          <div className="space-y-1">
+            <div className="flex items-center gap-1.5 text-xs">
+              <Zap className="w-3 h-3 text-gh-fg-muted" />
+              <span className="text-gh-fg-default font-medium">Claude Tokens</span>
+            </div>
+            <div className="pl-4.5 space-y-0.5">
+              <div className="flex items-center justify-between text-xs">
+                <span className="text-gh-fg-muted">4 Hours</span>
+                <span className="text-gh-fg-default">
+                  {formatNumber(claudeCheck.token_usage.tokens_4h)}
+                </span>
+              </div>
+              <div className="flex items-center justify-between text-xs">
+                <span className="text-gh-fg-muted">7 Days</span>
+                <span className="text-gh-fg-default">
+                  {formatNumber(claudeCheck.token_usage.tokens_7d)}
+                </span>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Show error if data not available */}
+        {!githubCheck?.api_usage && !claudeCheck?.token_usage && (
+          <p className="text-xs text-gh-fg-muted">No usage data available</p>
+        )}
       </div>
     </HeaderBox>
   )

@@ -169,6 +169,76 @@ def kill_agent(container_name):
             'container_name': container_name
         }), 500
 
+def get_claude_token_usage():
+    """
+    Query Elasticsearch for Claude Code token usage metrics
+    Returns token usage for the last 4 hours and 7 days
+    """
+    try:
+        from datetime import datetime, timedelta
+
+        # Calculate time ranges
+        now = datetime.utcnow()
+        four_hours_ago = now - timedelta(hours=4)
+        seven_days_ago = now - timedelta(days=7)
+
+        # Query for last 4 hours
+        query_4h = {
+            "query": {
+                "bool": {
+                    "must": [
+                        {"exists": {"field": "context_tokens"}},
+                        {"range": {"timestamp": {"gte": four_hours_ago.isoformat()}}}
+                    ]
+                }
+            },
+            "aggs": {
+                "total_tokens": {
+                    "sum": {"field": "context_tokens"}
+                }
+            },
+            "size": 0
+        }
+
+        result_4h = es_client.search(index="agent-events-*", body=query_4h)
+        tokens_4h = int(result_4h.get('aggregations', {}).get('total_tokens', {}).get('value', 0))
+
+        # Query for last 7 days
+        query_7d = {
+            "query": {
+                "bool": {
+                    "must": [
+                        {"exists": {"field": "context_tokens"}},
+                        {"range": {"timestamp": {"gte": seven_days_ago.isoformat()}}}
+                    ]
+                }
+            },
+            "aggs": {
+                "total_tokens": {
+                    "sum": {"field": "context_tokens"}
+                }
+            },
+            "size": 0
+        }
+
+        result_7d = es_client.search(index="agent-events-*", body=query_7d)
+        tokens_7d = int(result_7d.get('aggregations', {}).get('total_tokens', {}).get('value', 0))
+
+        return {
+            'tokens_4h': tokens_4h,
+            'tokens_7d': tokens_7d,
+            'collected_at': now.isoformat() + 'Z'
+        }
+
+    except Exception as e:
+        logger.warning(f"Failed to fetch Claude token usage metrics: {e}")
+        return {
+            'tokens_4h': 0,
+            'tokens_7d': 0,
+            'error': str(e),
+            'collected_at': datetime.utcnow().isoformat() + 'Z'
+        }
+
 @app.errorhandler(500)
 def handle_500(e):
     """Handle 500 errors gracefully"""
@@ -246,11 +316,18 @@ def health():
             if 'checks' in health_data and 'github' in health_data['checks']:
                 health_data['checks']['github']['api_rate_limit'] = fresh_rate_limit
                 health_data['checks']['github']['circuit_breaker'] = fresh_circuit_breaker
+                # Add dedicated api_usage section for UI consumption
+                health_data['checks']['github']['api_usage'] = {
+                    'remaining': fresh_rate_limit['remaining'],
+                    'limit': fresh_rate_limit['limit'],
+                    'percentage_used': fresh_rate_limit['percentage_used'],
+                    'reset_time': fresh_rate_limit['reset_time']
+                }
         except Exception as e:
             logger.debug(f"Failed to fetch fresh rate limit data: {e}")
             # Continue with cached data if fresh fetch fails
 
-        # IMPORTANT: Also fetch fresh Claude Code circuit breaker status
+        # IMPORTANT: Also fetch fresh Claude Code circuit breaker status and token usage
         try:
             from monitoring.claude_code_breaker import get_breaker
             claude_breaker = get_breaker()
@@ -264,12 +341,16 @@ def health():
                     'time_until_reset': claude_status['time_until_reset'],
                 }
 
-                # Add Claude Code breaker to checks
+                # Get token usage metrics
+                token_usage = get_claude_token_usage()
+
+                # Add Claude Code breaker and token usage to checks
                 if 'checks' not in health_data:
                     health_data['checks'] = {}
-                health_data['checks']['claude_code'] = {
+                health_data['checks']['claude'] = {
                     'healthy': not claude_status['is_open'],
-                    'circuit_breaker': fresh_claude_breaker
+                    'circuit_breaker': fresh_claude_breaker,
+                    'token_usage': token_usage
                 }
         except Exception as e:
             logger.debug(f"Failed to fetch Claude Code breaker status: {e}")
@@ -1589,25 +1670,19 @@ def get_circuit_breakers():
         except Exception as e:
             logger.error(f"Could not get Claude Code breaker status: {e}", exc_info=True)
 
-        # GitHub API circuit breaker
+        # GitHub API circuit breaker (breaker state only, usage metrics moved to /health)
         try:
             from services.github_api_client import get_github_client
             github_client = get_github_client()
             github_status = github_client.get_status()
-            
+
             circuit_breakers.append({
                 'name': 'GitHub API Rate Limit',
                 'service': 'github_api',
                 'state': github_status['breaker']['state'],
                 'is_open': github_status['breaker']['is_open'],
                 'opened_at': github_status['breaker']['opened_at'],
-                'reset_time': github_status['breaker']['reset_time'],
-                'rate_limit': {
-                    'remaining': github_status['rate_limit']['remaining'],
-                    'limit': github_status['rate_limit']['limit'],
-                    'percentage_used': github_status['rate_limit']['percentage_used'],
-                    'reset_time': github_status['rate_limit']['reset_time'],
-                }
+                'reset_time': github_status['breaker']['reset_time']
             })
         except Exception as e:
             logger.error(f"Could not get GitHub API breaker status: {e}", exc_info=True)

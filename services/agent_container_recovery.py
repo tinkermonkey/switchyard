@@ -79,72 +79,68 @@ class AgentContainerRecovery:
     def parse_container_name(self, container_name: str) -> Optional[Dict[str, str]]:
         """
         Parse agent container name to extract metadata
-        
-        Container name format: claude-agent-{project}-{task_id}
-        After sanitization: claude-agent-{project}-{agent}_{project}_{board}_{issue_number}_{timestamp}
-        
-        Note: The hyphen before task_id is important - we need to find the LAST hyphen
-        before the task_id starts (task_id contains underscores, not hyphens)
-        
+
+        ACTUAL container name format: claude-agent-{project}-{task_id}
+        Where task_id is: {task_id_prefix}_{agent}_{timestamp}
+
+        For example:
+        - claude-agent-what_am_i_watching-review_cycle_senior_software_engineer_1762082586
+        - claude-agent-project_name-task_business_analyst_1234567890
+
+        The task_id always ends with a numeric timestamp and contains underscores (not hyphens).
+        The project may contain hyphens (e.g., "my-project-name").
+
         Args:
             container_name: Container name
-            
+
         Returns:
-            Dict with project, task_id components, or None if invalid format
+            Dict with project, agent, task_id components, or None if invalid format
         """
         if not container_name.startswith('claude-agent-'):
             return None
-        
+
         # Remove prefix: claude-agent-
         remainder = container_name.replace('claude-agent-', '', 1)
-        
-        # Find the last hyphen - everything after it should be the task_id
-        # Task ID format: {agent}_{project}_{board}_{issue_number}_{timestamp}
-        # Board names might have hyphens (e.g., "SDLC-Execution")
-        # But task_id always has underscores between components
-        
-        # Split on hyphens
-        parts = remainder.split('-')
-        
-        # Find where task_id starts by checking for the pattern agent_project_board_issue_timestamp
-        # We know:
-        # - Last component should be timestamp (numeric)
-        # - Second to last should be issue_number (numeric)
-        # - Task ID has exactly 5 underscore-separated parts
-        
-        task_id = None
-        project_with_hyphen = None
-        
-        for i in range(len(parts) - 1, -1, -1):
-            # Check if this part matches task_id pattern
-            test_task_id = parts[i]
-            underscore_parts = test_task_id.split('_')
-            
-            # Need exactly 5 parts for valid task_id
-            if len(underscore_parts) == 5:
-                # Last part should be numeric (timestamp)
-                if underscore_parts[-1].isdigit() and underscore_parts[-2].isdigit():
-                    task_id = test_task_id
-                    # Project is everything before this part
-                    project_with_hyphen = '-'.join(parts[:i])
-                    break
-        
-        if not task_id:
-            logger.warning(f"Could not find valid task_id in container name: {container_name}")
+
+        # Find the LAST hyphen - everything after it is the task_id
+        # The task_id contains underscores, not hyphens, so the last hyphen separates project from task_id
+        last_hyphen_idx = remainder.rfind('-')
+
+        if last_hyphen_idx == -1:
+            logger.warning(f"No hyphen found in container name after prefix: {container_name}")
             return None
-        
-        # Parse task_id components
-        task_id_parts = task_id.split('_')
-        
+
+        project = remainder[:last_hyphen_idx]
+        task_id = remainder[last_hyphen_idx + 1:]
+
+        # Validate task_id format: should have at least 2 underscores and end with numeric timestamp
+        task_parts = task_id.split('_')
+
+        if len(task_parts) < 3:
+            logger.warning(f"Task ID has too few parts (expected at least 3): {task_id}")
+            return None
+
+        # Last part should be numeric timestamp
+        if not task_parts[-1].isdigit():
+            logger.warning(f"Task ID does not end with numeric timestamp: {task_id}")
+            return None
+
+        # Extract agent name (everything except the last part which is timestamp)
+        # The agent name might be multiple words joined by underscores (e.g., "senior_software_engineer")
+        # Format is: {task_id_prefix}_{agent_parts...}_{timestamp}
+        timestamp = task_parts[-1]
+
+        # The agent is typically the last word(s) before timestamp
+        # We can't reliably determine where task_id_prefix ends and agent begins
+        # So we'll extract what we can and use the full task_id
+        agent = '_'.join(task_parts[:-1])  # Everything except timestamp
+
         return {
-            'agent': task_id_parts[0],
-            'project': task_id_parts[1],
-            'board': task_id_parts[2],
-            'issue_number': task_id_parts[3],
-            'timestamp': task_id_parts[4],
+            'agent': agent,
+            'project': project,
             'task_id': task_id,
-            'container_name': container_name,
-            'project_with_hyphen': project_with_hyphen  # For debugging
+            'timestamp': timestamp,
+            'container_name': container_name
         }
     
     def check_execution_history(self, project: str, issue_number: int) -> Optional[Dict[str, any]]:
@@ -256,29 +252,52 @@ class AgentContainerRecovery:
                     continue
                 
                 project = metadata['project']
-                issue_number = int(metadata['issue_number'])
                 agent = metadata['agent']
-                
-                # Check if there's an in_progress execution for this issue
-                execution = self.check_execution_history(project, issue_number)
-                
-                if not execution:
-                    logger.warning(
-                        f"Container {container_name} has no in_progress execution history, killing it"
+                task_id = metadata['task_id']
+
+                # Try to get additional metadata from Redis (if still available after restart)
+                redis_key = f'agent:container:{container_name}'
+                issue_number = None
+
+                try:
+                    redis_data = self.redis.hgetall(redis_key)
+                    if redis_data and 'issue_number' in redis_data:
+                        issue_number_str = redis_data.get('issue_number', '')
+                        if issue_number_str and issue_number_str != 'unknown':
+                            issue_number = int(issue_number_str)
+                            logger.info(f"Found issue number {issue_number} in Redis for container {container_name}")
+                except Exception as e:
+                    logger.debug(f"Could not get Redis data for container: {e}")
+
+                # If we have issue_number, validate against execution history
+                if issue_number:
+                    execution = self.check_execution_history(project, issue_number)
+
+                    if not execution:
+                        logger.warning(
+                            f"Container {container_name} has no in_progress execution history, killing it"
+                        )
+                        self.kill_container(container_name, container_id)
+                        killed += 1
+                        continue
+
+                    # Check if execution matches the container
+                    # Note: execution['agent'] might have full underscores while our parsed agent is simplified
+                    # So we check if parsed agent is contained in execution agent
+                    exec_agent = execution.get('agent', '')
+                    if exec_agent and exec_agent not in agent and agent not in exec_agent:
+                        logger.warning(
+                            f"Container {container_name} agent mismatch (container: {agent}, history: {exec_agent}), killing it"
+                        )
+                        self.kill_container(container_name, container_id)
+                        self.cleanup_execution_state(project, issue_number, agent, "agent_mismatch")
+                        killed += 1
+                        continue
+                else:
+                    logger.info(
+                        f"Container {container_name} has no issue number in Redis, "
+                        f"will re-register without validation"
                     )
-                    self.kill_container(container_name, container_id)
-                    killed += 1
-                    continue
-                
-                # Check if execution matches the container
-                if execution.get('agent') != agent:
-                    logger.warning(
-                        f"Container {container_name} agent mismatch (container: {agent}, history: {execution.get('agent')}), killing it"
-                    )
-                    self.kill_container(container_name, container_id)
-                    self.cleanup_execution_state(project, issue_number, agent, "agent_mismatch")
-                    killed += 1
-                    continue
                 
                 # Check container age - if older than 2 hours, kill it
                 # Docker CreatedAt format: "2025-10-17 16:27:28 +0000 UTC"
@@ -293,7 +312,8 @@ class AgentContainerRecovery:
                             f"Container {container_name} is too old ({age.total_seconds()/3600:.1f}h), killing it"
                         )
                         self.kill_container(container_name, container_id)
-                        self.cleanup_execution_state(project, issue_number, agent, "container_timeout")
+                        if issue_number:
+                            self.cleanup_execution_state(project, issue_number, agent, "container_timeout")
                         killed += 1
                         continue
                 except Exception as e:
@@ -303,18 +323,27 @@ class AgentContainerRecovery:
                 logger.info(
                     f"Container {container_name} appears valid, re-registering for tracking"
                 )
-                
+
                 # Re-register container in Redis
                 container_info = {
                     'container_name': container_name,
                     'agent': agent,
                     'project': project,
-                    'task_id': metadata['task_id'],
-                    'started_at': execution.get('timestamp', datetime.utcnow().isoformat()),
-                    'issue_number': str(issue_number),
+                    'task_id': task_id,
+                    'started_at': datetime.utcnow().isoformat(),
                     'recovered': 'true'
                 }
-                
+
+                # Add optional fields if available
+                if issue_number:
+                    container_info['issue_number'] = str(issue_number)
+
+                # Get started_at from execution history if available
+                if issue_number:
+                    execution = self.check_execution_history(project, issue_number)
+                    if execution and 'timestamp' in execution:
+                        container_info['started_at'] = execution['timestamp']
+
                 self.redis.hset(f'agent:container:{container_name}', mapping=container_info)
                 self.redis.expire(f'agent:container:{container_name}', 7200)
                 

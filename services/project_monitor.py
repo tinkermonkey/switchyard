@@ -148,6 +148,7 @@ def _launch_repair_cycle_container(
         # Build Docker run command
         docker_cmd = [
             'docker', 'run',
+            '--rm',  # Auto-remove container when it exits
             '--name', container_name,
             '--network', docker_runner.network_name,
             '--detach',  # Run in background

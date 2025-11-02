@@ -171,7 +171,23 @@ class HumanFeedbackLoopExecutor:
             f"Monitoring discussion {state.discussion_id} for human feedback "
             f"(will poll indefinitely until card moves to different column)"
         )
-        
+
+        # Emit decision event for feedback listening started
+        from monitoring.decision_events import DecisionEventEmitter
+        from monitoring.observability import get_observability_manager
+
+        obs = get_observability_manager()
+        decision_events = DecisionEventEmitter(obs)
+
+        decision_events.emit_feedback_listening_started(
+            issue_number=state.issue_number,
+            project=state.project_name,
+            board=state.board_name,
+            agent=state.agent,
+            monitoring_for=['discussion_replies', 'issue_comments'],
+            workspace_type=state.workspace_type
+        )
+
         # Safety check: Verify we have valid state
         if not state.agent_outputs:
             logger.warning(
@@ -273,6 +289,17 @@ class HumanFeedbackLoopExecutor:
                         f"Issue #{state.issue_number} moved from '{column.name}' to '{current_column}'. "
                         f"Stopping feedback monitoring."
                     )
+
+                    # Emit feedback listening stopped event
+                    decision_events.emit_feedback_listening_stopped(
+                        issue_number=state.issue_number,
+                        project=state.project_name,
+                        board=state.board_name,
+                        agent=state.agent,
+                        reason=f"Card moved from '{column.name}' to '{current_column}'",
+                        feedback_received=state.current_iteration > 0
+                    )
+
                     return (None, True)  # Exit the loop
                 
                 # Special case: If issue is in Backlog (no agent), stop monitoring
@@ -281,6 +308,17 @@ class HumanFeedbackLoopExecutor:
                         f"Issue #{state.issue_number} is in Backlog column. "
                         f"Stopping feedback monitoring."
                     )
+
+                    # Emit feedback listening stopped event
+                    decision_events.emit_feedback_listening_stopped(
+                        issue_number=state.issue_number,
+                        project=state.project_name,
+                        board=state.board_name,
+                        agent=state.agent,
+                        reason="Card moved to Backlog",
+                        feedback_received=state.current_iteration > 0
+                    )
+
                     return (None, True)  # Exit the loop
                     
             except Exception as e:
