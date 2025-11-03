@@ -86,6 +86,7 @@ def build_projects_v2_query(owner_login: str, project_number: int) -> Optional[s
                         nodes {{
                             id
                             content {{
+                                __typename
                                 ... on Issue {{
                                     id
                                     number
@@ -124,6 +125,7 @@ def build_projects_v2_query(owner_login: str, project_number: int) -> Optional[s
                         nodes {{
                             id
                             content {{
+                                __typename
                                 ... on Issue {{
                                     id
                                     number

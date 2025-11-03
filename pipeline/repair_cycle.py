@@ -1198,11 +1198,18 @@ For each warning:
         from pipeline.repair_cycle_checkpoint import RepairCycleCheckpoint, create_checkpoint_state
         
         project_dir = context.get('project_dir')
+        project = context.get('project', 'unknown')
+        issue_number = context.get('issue_number')
+
         if not project_dir:
             logger.warning("No project_dir in context, skipping checkpoint")
             return
-        
-        checkpoint_manager = RepairCycleCheckpoint(project_dir)
+
+        if not issue_number:
+            logger.warning("No issue_number in context, skipping checkpoint")
+            return
+
+        checkpoint_manager = RepairCycleCheckpoint(project_dir, project_name=project, issue_number=issue_number)
         
         # Create checkpoint state
         checkpoint_state = create_checkpoint_state(

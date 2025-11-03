@@ -1039,7 +1039,7 @@ def get_active_agents_from_pipelines():
         except Exception as e:
             logger.warning(f"Error fetching Redis agents: {e}")
 
-        logger.info(f"Active agents endpoint returning {len(active_agents)} agents ({len([a for a in active_agents if a.get('source') != 'redis'])} from pipelines, {len([a for a in active_agents if a.get('source') == 'redis'])} from Redis)")
+        logger.debug(f"Active agents endpoint returning {len(active_agents)} agents ({len([a for a in active_agents if a.get('source') != 'redis'])} from pipelines, {len([a for a in active_agents if a.get('source') == 'redis'])} from Redis)")
 
         return jsonify({
             'success': True,
@@ -2215,7 +2215,9 @@ def get_workflow_config(project, board):
             'success': True,
             'workflow': {
                 'name': workflow_template.name,
-                'columns': columns
+                'columns': columns,
+                'pipeline_trigger_columns': workflow_template.pipeline_trigger_columns,
+                'pipeline_exit_columns': workflow_template.pipeline_exit_columns
             }
         }), 200
         
@@ -2435,6 +2437,169 @@ def kill_repair_cycle_container(project, issue):
 
 # ============================================================================
 # END REPAIR CYCLE CONTAINER MONITORING ENDPOINTS
+# ============================================================================
+
+
+# ============================================================================
+# PIPELINE QUEUE AND LOCK STATUS ENDPOINTS
+# ============================================================================
+
+@app.route('/api/pipeline-queue/<project>/<board>', methods=['GET'])
+def get_pipeline_queue_status(project, board):
+    """
+    Get current pipeline queue status with fresh GitHub ordering.
+
+    Returns queue state, lock status, and waiting issues ordered by
+    their position on the GitHub board.
+    """
+    try:
+        from services.pipeline_lock_manager import get_pipeline_lock_manager
+        from services.pipeline_queue_manager import get_pipeline_queue_manager
+        from config.manager import config_manager
+
+        lock_manager = get_pipeline_lock_manager()
+        pipeline_queue = get_pipeline_queue_manager(project, board)
+
+        # Get current lock
+        lock = lock_manager.get_lock(project, board)
+
+        # Get queue summary
+        queue_summary = pipeline_queue.get_queue_summary()
+
+        # Build response
+        response = {
+            'project': project,
+            'board': board,
+            'locked': lock is not None and lock.lock_status == 'locked',
+            'locked_by': None,
+            'waiting': [],
+            'total_in_queue': queue_summary['total_issues'],
+            'last_updated': datetime.utcnow().isoformat() + 'Z'
+        }
+
+        # Add lock holder info
+        if lock and lock.lock_status == 'locked':
+            active_issue = queue_summary.get('active_issue')
+            if active_issue:
+                response['locked_by'] = {
+                    'issue_number': lock.locked_by_issue,
+                    'locked_at': lock.lock_acquired_at,
+                    'current_column': None,  # Would need to query GitHub for this
+                    'queued_at': active_issue.get('queued_at')
+                }
+
+        # Add waiting issues with fresh order
+        waiting_issues = queue_summary.get('waiting_issues', [])
+
+        # Sort by position
+        waiting_issues.sort(key=lambda x: x.get('position_in_column', 999))
+
+        response['waiting'] = [
+            {
+                'issue_number': issue['issue_number'],
+                'position': issue.get('position_in_column', 0),
+                'queued_at': issue['queued_at'],
+                'initial_column': issue['initial_column'],
+                'wait_time_seconds': int(
+                    (datetime.fromisoformat(response['last_updated'].replace('Z', ''))
+                     - datetime.fromisoformat(issue['queued_at'].replace('Z', ''))).total_seconds()
+                )
+            }
+            for issue in waiting_issues
+        ]
+
+        return jsonify(response), 200
+
+    except Exception as e:
+        logger.error(f"Failed to get pipeline queue status for {project}/{board}: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/pipeline-locks', methods=['GET'])
+def get_all_pipeline_locks():
+    """
+    Get all active pipeline locks across all projects.
+
+    Useful for monitoring which pipelines are currently executing.
+    """
+    try:
+        from services.pipeline_lock_manager import get_pipeline_lock_manager
+        from config.manager import config_manager
+
+        lock_manager = get_pipeline_lock_manager()
+
+        all_locks = []
+
+        # Iterate through all visible projects
+        for project_name in config_manager.list_visible_projects():
+            try:
+                project_config = config_manager.get_project_config(project_name)
+
+                for pipeline in project_config.pipelines:
+                    if not pipeline.active:
+                        continue
+
+                    lock = lock_manager.get_lock(project_name, pipeline.board_name)
+
+                    if lock and lock.lock_status == 'locked':
+                        all_locks.append({
+                            'project': lock.project,
+                            'board': lock.board,
+                            'locked_by_issue': lock.locked_by_issue,
+                            'lock_acquired_at': lock.lock_acquired_at,
+                            'lock_status': lock.lock_status
+                        })
+            except Exception as e:
+                logger.error(f"Error checking locks for project {project_name}: {e}")
+                continue
+
+        return jsonify({
+            'locks': all_locks,
+            'total_locks': len(all_locks),
+            'timestamp': datetime.utcnow().isoformat() + 'Z'
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Failed to get all pipeline locks: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/pipeline-queue/<project>/<board>/refresh', methods=['POST'])
+def refresh_pipeline_queue_order(project, board):
+    """
+    Manually refresh queue order from GitHub board.
+
+    Fetches current board order and updates queue positions.
+    Useful for debugging or forcing a sync after manual reordering.
+    """
+    try:
+        from services.pipeline_queue_manager import get_pipeline_queue_manager
+
+        pipeline_queue = get_pipeline_queue_manager(project, board)
+
+        # Get next waiting issue (this fetches fresh order from GitHub)
+        next_issue = pipeline_queue.get_next_waiting_issue()
+
+        # Get updated queue summary
+        queue_summary = pipeline_queue.get_queue_summary()
+
+        return jsonify({
+            'success': True,
+            'message': 'Queue order refreshed from GitHub',
+            'next_issue': next_issue['issue_number'] if next_issue else None,
+            'total_waiting': queue_summary['waiting_count'],
+            'timestamp': datetime.utcnow().isoformat() + 'Z'
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Failed to refresh queue order for {project}/{board}: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+# ============================================================================
+# END PIPELINE QUEUE AND LOCK STATUS ENDPOINTS
 # ============================================================================
 
 def redis_subscriber_thread():

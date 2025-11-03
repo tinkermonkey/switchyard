@@ -146,36 +146,39 @@ class AgentContainerRecovery:
     def check_execution_history(self, project: str, issue_number: int) -> Optional[Dict[str, any]]:
         """
         Check execution history for an issue
-        
+
         Args:
             project: Project name
             issue_number: Issue number
-            
+
         Returns:
             Most recent in_progress execution record, or None
         """
         try:
             from services.work_execution_state import work_execution_tracker
-            
-            # Load execution history
-            history_file = work_execution_tracker._get_history_file(project, issue_number)
-            if not history_file.exists():
-                return None
-            
-            import yaml
-            with open(history_file, 'r') as f:
-                history_data = yaml.safe_load(f)
-            
+
+            logger.debug(f"Checking execution history for {project} issue #{issue_number}")
+
+            # Load execution state using the proper API
+            state = work_execution_tracker.load_state(project, issue_number)
+
+            logger.debug(f"Loaded state for {project}/#{issue_number}: {len(state.get('execution_history', []))} executions")
+
             # Find most recent in_progress execution
-            executions = history_data.get('execution_history', [])
+            executions = state.get('execution_history', [])
             for execution in reversed(executions):
+                logger.debug(f"Checking execution: outcome={execution.get('outcome')}, agent={execution.get('agent')}")
                 if execution.get('outcome') == 'in_progress':
+                    logger.info(f"Found in_progress execution for {project}/#{issue_number}: {execution}")
                     return execution
-            
+
+            logger.warning(f"No in_progress execution found for {project}/#{issue_number}")
             return None
-            
+
         except Exception as e:
-            logger.error(f"Error checking execution history: {e}")
+            logger.error(f"Error checking execution history for {project}/#{issue_number}: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             return None
     
     def kill_container(self, container_name: str, container_id: str):
@@ -241,8 +244,16 @@ class AgentContainerRecovery:
         for container in running_containers:
             container_name = container['name']
             container_id = container['id']
-            
+
             try:
+                # Skip agent containers that are part of repair cycles
+                # These are managed by the repair cycle container itself
+                if 'repair_' in container_name or 'repair-' in container_name:
+                    logger.debug(
+                        f"Skipping {container_name} - managed by repair cycle container"
+                    )
+                    continue
+
                 # Parse container name
                 metadata = self.parse_container_name(container_name)
                 if not metadata:
@@ -250,7 +261,7 @@ class AgentContainerRecovery:
                     self.kill_container(container_name, container_id)
                     killed += 1
                     continue
-                
+
                 project = metadata['project']
                 agent = metadata['agent']
                 task_id = metadata['task_id']
@@ -278,6 +289,13 @@ class AgentContainerRecovery:
                             f"Container {container_name} has no in_progress execution history, killing it"
                         )
                         self.kill_container(container_name, container_id)
+                        # Clean up execution state to prevent deadlock
+                        self.cleanup_execution_state(
+                            project=project,
+                            issue_number=issue_number,
+                            agent=agent,
+                            reason="Container killed during recovery: no execution history found"
+                        )
                         killed += 1
                         continue
 
@@ -715,8 +733,8 @@ class AgentContainerRecovery:
                     try:
                         created_dt = datetime.strptime(created_str[:19], '%Y-%m-%d %H:%M:%S')
                         age = datetime.utcnow() - created_dt
-                        
-                        if age < timedelta(minutes=10):
+
+                        if age < timedelta(minutes=60):
                             logger.info(f"Container is young ({age.total_seconds()/60:.1f}min), keeping it")
                             # Don't reconnect yet, just leave it running
                             continue
@@ -737,9 +755,9 @@ class AgentContainerRecovery:
                         killed += 1
                         continue
                 
-                # Check checkpoint age - if checkpoint is stale (>10 min old), container might be stuck
+                # Check checkpoint age - if checkpoint is stale (>60 min old), container might be stuck
                 checkpoint_age = checkpoint.get('checkpoint_age_seconds', 0)
-                if checkpoint_age > 600:  # 10 minutes
+                if checkpoint_age > 3600:  # 60 minutes
                     logger.warning(
                         f"Container {container_name} checkpoint is stale "
                         f"({checkpoint_age/60:.1f}min old), container may be stuck"

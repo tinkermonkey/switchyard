@@ -181,7 +181,84 @@ async def main():
     from services.work_execution_state import work_execution_tracker
     work_execution_tracker.cleanup_stuck_in_progress_states()
     logger.info("Execution state cleanup complete")
-    
+
+    # NEW: Recover pipeline locks on startup
+    # Check for stale locks and release them, then process waiting issues
+    logger.info("Recovering pipeline locks from orchestrator restart")
+    from services.pipeline_lock_manager import get_pipeline_lock_manager
+    from services.pipeline_queue_manager import get_pipeline_queue_manager
+    from services.project_monitor import ProjectMonitor
+
+    lock_manager = get_pipeline_lock_manager()
+    locks_recovered = 0
+    locks_released = 0
+
+    # Create a temporary ProjectMonitor instance for checking issue columns
+    temp_monitor = ProjectMonitor(task_queue, config_manager)
+
+    for project_name in config_manager.list_visible_projects():
+        try:
+            project_config = config_manager.get_project_config(project_name)
+            for pipeline in project_config.pipelines:
+                if not pipeline.active:
+                    continue
+
+                lock = lock_manager.get_lock(project_name, pipeline.board_name)
+
+                if lock and lock.lock_status == 'locked':
+                    logger.info(
+                        f"Found pipeline lock for {project_name}/{pipeline.board_name} "
+                        f"held by issue #{lock.locked_by_issue}"
+                    )
+
+                    # Check if the lock holder is still in an active column
+                    # or has reached an exit column
+                    lock_holder_column = temp_monitor.get_issue_column_sync(
+                        project_name, pipeline.board_name, lock.locked_by_issue
+                    )
+
+                    workflow_template = config_manager.get_workflow_template(pipeline.workflow)
+                    exit_columns = getattr(workflow_template, 'pipeline_exit_columns', [])
+
+                    if not lock_holder_column or lock_holder_column in exit_columns:
+                        # Lock holder is no longer active or in exit column - release lock
+                        logger.info(
+                            f"Releasing orphaned lock for {project_name}/{pipeline.board_name} "
+                            f"(issue #{lock.locked_by_issue} in column: {lock_holder_column or 'removed'})"
+                        )
+
+                        lock_manager.release_lock(
+                            project_name, pipeline.board_name, lock.locked_by_issue
+                        )
+                        locks_released += 1
+
+                        # Mark issue as completed in queue if present
+                        pipeline_queue = get_pipeline_queue_manager(
+                            project_name, pipeline.board_name
+                        )
+                        if pipeline_queue.is_issue_in_queue(lock.locked_by_issue):
+                            pipeline_queue.mark_issue_completed(lock.locked_by_issue)
+
+                        # NOTE: We don't process the next waiting issue here
+                        # The regular monitoring loop will pick it up
+                    else:
+                        # Lock holder is still active - keep the lock
+                        logger.info(
+                            f"Keeping lock for {project_name}/{pipeline.board_name} "
+                            f"(issue #{lock.locked_by_issue} still in column '{lock_holder_column}')"
+                        )
+                        locks_recovered += 1
+
+        except Exception as e:
+            logger.error(f"Error recovering locks for project {project_name}: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+
+    logger.info(
+        f"Pipeline lock recovery complete: {locks_recovered} locks kept, "
+        f"{locks_released} locks released"
+    )
+
     # Clean up stale active pipeline runs (requires Elasticsearch)
     if elasticsearch_ready:
         logger.info("Cleaning up stale active pipeline runs")

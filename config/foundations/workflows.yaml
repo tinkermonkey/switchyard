@@ -6,6 +6,11 @@ workflow_templates:
     name: "Planning & Design Workflow"
     description: "Pre-SDLC planning, design, and work breakdown workflow"
     pipeline_mapping: "planning_design"
+    pipeline_trigger_columns:  # Not strictly serialized (conversational workflow)
+      - "Research"
+    pipeline_exit_columns:     # Planning complete
+      - "In Development"
+      - "Done"
     columns:
       - name: "Backlog"
         stage_mapping: null
@@ -161,6 +166,11 @@ workflow_templates:
     name: "SDLC Execution Workflow"
     description: "Implementation-focused workflow for sub-issues"
     pipeline_mapping: "sdlc_execution"
+    pipeline_trigger_columns:  # Columns that trigger pipeline start (acquire lock)
+      - "Development"
+    pipeline_exit_columns:     # Columns that release the pipeline lock
+      - "Staged"
+      - "Done"
     columns:
       - name: "Backlog"
         stage_mapping: null
@@ -246,6 +256,10 @@ workflow_templates:
     name: "Environment Support Workflow"
     description: "Environment troubleshooting and configuration workflow"
     pipeline_mapping: "environment_support"
+    pipeline_trigger_columns:  # Environment setup start
+      - "In Progress"
+    pipeline_exit_columns:     # Environment setup complete
+      - "Done"
     columns:
       - name: "Backlog"
         stage_mapping: null

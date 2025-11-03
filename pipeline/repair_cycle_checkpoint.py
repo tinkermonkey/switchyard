@@ -60,12 +60,12 @@ class RepairCycleCheckpoint:
         self.project_name = project_name
         self.issue_number = issue_number
         
-        # Store checkpoint in orchestrator_data directory (keeps project workspace clean)
+        # Store checkpoint in state directory (keeps project workspace clean)
         if issue_number is not None:
-            orchestrator_data_dir = Path("/workspace/clauditoreum/orchestrator_data/repair_cycles")
-            repair_cycle_dir = orchestrator_data_dir / project_name / str(issue_number)
+            state_dir = Path("/workspace/clauditoreum/state/projects")
+            repair_cycle_dir = state_dir / project_name / "repair_cycles" / str(issue_number)
             repair_cycle_dir.mkdir(parents=True, exist_ok=True)
-            
+
             self.checkpoint_file = repair_cycle_dir / "checkpoint.json"
             self.backup_file = repair_cycle_dir / "checkpoint.backup.json"
         else:

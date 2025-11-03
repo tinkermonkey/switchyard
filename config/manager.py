@@ -92,6 +92,8 @@ class WorkflowTemplate:
     description: str
     pipeline_mapping: str
     columns: List[WorkflowColumn]
+    pipeline_trigger_columns: Optional[List[str]] = None  # Columns that trigger pipeline start (acquire lock)
+    pipeline_exit_columns: Optional[List[str]] = None  # Columns that release the pipeline lock
 
 
 @dataclass
@@ -298,7 +300,9 @@ class ConfigManager:
                 name=template_data['name'],
                 description=template_data['description'],
                 pipeline_mapping=template_data['pipeline_mapping'],
-                columns=columns
+                columns=columns,
+                pipeline_trigger_columns=template_data.get('pipeline_trigger_columns'),
+                pipeline_exit_columns=template_data.get('pipeline_exit_columns')
             )
 
         return templates
