@@ -18,12 +18,19 @@ Container Lifecycle:
     2. Check for existing checkpoint
     3. Resume from checkpoint or start fresh
     4. Execute repair cycle with periodic checkpointing
-    5. Save final result and exit with status code
+    5. Save final result to Redis (with 24-hour TTL)
+    6. Exit with status code
+
+State Storage:
+    - Context and checkpoints: File-based in orchestrator_data/
+    - Final results: Redis (key: repair_cycle:result:{project}:{issue}:{run_id})
+    - Redis results survive container removal and orchestrator restarts
+    - Results auto-expire after 24 hours
 
 Exit Codes:
     0: Success - all tests passed
     1: Failure - tests failed or max iterations reached
-    2: Error - execution error or agent failure
+    2: Error - execution error, agent failure, or failed to save result
     3: Timeout - repair cycle exceeded timeout
     4: Cancelled - repair cycle cancelled by user
 """
@@ -220,26 +227,59 @@ class RepairCycleRunner:
             logger.error(f"Repair cycle execution failed: {e}", exc_info=True)
             return {'overall_success': False, 'error': str(e)}
 
-    def save_result(self, result: Dict[str, Any]) -> bool:
-        """Save final result to file in orchestrator_data directory"""
+    def save_result_to_redis(self, result: Dict[str, Any]) -> bool:
+        """
+        Save final result to Redis for recovery and monitoring.
+
+        This replaces file-based result storage to avoid polluting project repos.
+        Results are stored in Redis with a 24-hour TTL.
+
+        Args:
+            result: Result dictionary from repair cycle execution
+
+        Returns:
+            True if saved successfully, False otherwise
+        """
         try:
-            # Save to orchestrator_data directory (keeps project workspace clean)
+            import redis
+
             project_name = self.context.get('project')
             issue_number = self.context.get('issue_number')
-            
-            orchestrator_data_dir = Path("/workspace/clauditoreum/orchestrator_data/repair_cycles")
-            repair_cycle_dir = orchestrator_data_dir / project_name / str(issue_number)
-            repair_cycle_dir.mkdir(parents=True, exist_ok=True)
-            
-            result_file = repair_cycle_dir / "result.json"
-            with open(result_file, 'w') as f:
-                json.dump(result, f, indent=2, default=str)
+            run_id = self.args.pipeline_run_id
 
-            logger.info(f"Result saved to {result_file}")
+            # Connect to Redis
+            redis_host = os.environ.get('REDIS_HOST', 'redis')
+            redis_client = redis.Redis(
+                host=redis_host,
+                port=6379,
+                decode_responses=True,
+                socket_connect_timeout=5,  # 5 second timeout
+                socket_timeout=5
+            )
+
+            # Test connection
+            redis_client.ping()
+            logger.debug(f"Redis connection successful to {redis_host}")
+
+            # Store result in Redis with 24-hour TTL
+            # Key format: repair_cycle:result:{project}:{issue}:{run_id}
+            redis_key = f"repair_cycle:result:{project_name}:{issue_number}:{run_id}"
+
+            # Convert result to JSON string
+            result_json = json.dumps(result, default=str)
+
+            # Store with 24 hour TTL (86400 seconds)
+            redis_client.setex(redis_key, 86400, result_json)
+
+            logger.info(f"Result saved to Redis: {redis_key}")
+            logger.info(f"Result summary: success={result.get('overall_success')}, "
+                       f"agent_calls={result.get('total_agent_calls')}, "
+                       f"duration={result.get('duration_seconds', 0):.1f}s")
+
             return True
 
         except Exception as e:
-            logger.error(f"Failed to save result: {e}", exc_info=True)
+            logger.error(f"CRITICAL: Failed to save result to Redis: {e}", exc_info=True)
             return False
 
     def run(self) -> int:
@@ -273,8 +313,10 @@ class RepairCycleRunner:
                 logger.warning("Repair cycle was cancelled")
                 return 4
 
-            # Save result
-            self.save_result(result)
+            # Save result to Redis (CRITICAL: must succeed for recovery)
+            if not self.save_result_to_redis(result):
+                logger.error("CRITICAL: Failed to save result to Redis - container cannot be recovered!")
+                return 2  # Return error if we can't persist state
 
             # Determine exit code
             if result.get('overall_success'):

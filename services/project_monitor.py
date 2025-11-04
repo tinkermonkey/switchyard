@@ -240,58 +240,111 @@ def _register_repair_cycle_container(
 ) -> bool:
     """
     Register repair cycle container in Redis for recovery tracking.
-    
+
     Args:
         project_name: Project name
         issue_number: Issue number
         container_name: Docker container name
         redis_client: Redis client instance
-        
+
     Returns:
         True if registered successfully
     """
     try:
         # Key format: repair_cycle:container:{project}:{issue}
         redis_key = f"repair_cycle:container:{project_name}:{issue_number}"
-        
+
         # Store with 2 hour TTL (repair cycles shouldn't take longer)
         redis_client.setex(redis_key, 7200, container_name)
-        
+
         logger.info(
             f"Registered repair cycle container in Redis: {redis_key} -> {container_name}"
         )
         return True
-        
+
     except Exception as e:
         logger.error(f"Failed to register repair cycle container in Redis: {e}")
         return False
 
 
-def _cleanup_repair_cycle_files(project_name: str, issue_number: int) -> bool:
+def _load_repair_cycle_result_from_redis(
+    project_name: str,
+    issue_number: int,
+    run_id: str
+) -> Optional[Dict[str, Any]]:
     """
-    Clean up repair cycle state files after successful completion.
-    
-    Removes context, checkpoint, and result files from orchestrator_data directory.
-    
+    Load repair cycle result from Redis.
+
+    This replaces file-based result loading to avoid polluting project repos.
+
     Args:
         project_name: Project name
         issue_number: Issue number
-        
+        run_id: Pipeline run ID
+
+    Returns:
+        Result dictionary if found, None otherwise
+    """
+    try:
+        import redis
+
+        # Connect to Redis
+        redis_client = redis.Redis(
+            host='redis',
+            port=6379,
+            decode_responses=True
+        )
+
+        # Key format: repair_cycle:result:{project}:{issue}:{run_id}
+        redis_key = f"repair_cycle:result:{project_name}:{issue_number}:{run_id}"
+
+        # Get result from Redis
+        result_json = redis_client.get(redis_key)
+
+        if not result_json:
+            logger.warning(f"No result found in Redis for key: {redis_key}")
+            return None
+
+        # Parse JSON
+        result = json.loads(result_json)
+        logger.debug(f"Loaded result from Redis: {redis_key}")
+
+        return result
+
+    except Exception as e:
+        logger.error(f"Failed to load result from Redis: {e}", exc_info=True)
+        return None
+
+
+def _cleanup_repair_cycle_state(project_name: str, issue_number: int, run_id: str = None) -> bool:
+    """
+    Clean up repair cycle state after successful completion.
+
+    Removes checkpoint and context files from orchestrator_data directory,
+    and deletes result from Redis.
+
+    Args:
+        project_name: Project name
+        issue_number: Issue number
+        run_id: Pipeline run ID (optional, for Redis cleanup)
+
     Returns:
         True if cleanup successful
     """
     try:
         from pathlib import Path
         import shutil
-        
+        import redis
+
+        # Clean up file-based state (context and checkpoint)
         orchestrator_data_dir = Path("/workspace/clauditoreum/orchestrator_data/repair_cycles")
         repair_cycle_dir = orchestrator_data_dir / project_name / str(issue_number)
-        
+
         if repair_cycle_dir.exists():
             # Remove the entire directory
             shutil.rmtree(repair_cycle_dir)
             logger.info(f"Cleaned up repair cycle files for {project_name} issue #{issue_number}")
-            
+
             # Try to clean up parent directories if empty
             try:
                 project_rc_dir = orchestrator_data_dir / project_name
@@ -300,14 +353,21 @@ def _cleanup_repair_cycle_files(project_name: str, issue_number: int) -> bool:
                     logger.debug(f"Removed empty project repair cycle directory: {project_rc_dir}")
             except Exception as e:
                 logger.debug(f"Could not remove parent directory (may not be empty): {e}")
-            
-            return True
-        else:
-            logger.debug(f"No repair cycle files to clean up for {project_name} issue #{issue_number}")
-            return True
-        
+
+        # Clean up Redis result
+        if run_id:
+            try:
+                redis_client = redis.Redis(host='redis', port=6379, decode_responses=True)
+                redis_key = f"repair_cycle:result:{project_name}:{issue_number}:{run_id}"
+                redis_client.delete(redis_key)
+                logger.debug(f"Deleted repair cycle result from Redis: {redis_key}")
+            except Exception as e:
+                logger.warning(f"Failed to delete result from Redis: {e}")
+
+        return True
+
     except Exception as e:
-        logger.warning(f"Failed to cleanup repair cycle files: {e}")
+        logger.warning(f"Failed to cleanup repair cycle state: {e}")
         return False
 
 
@@ -1233,42 +1293,58 @@ class ProjectMonitor:
                 lock_manager = get_pipeline_lock_manager()
                 pipeline_queue = get_pipeline_queue_manager(project_name, board_name)
 
-                # Add issue to queue if not already there
-                if not pipeline_queue.is_issue_in_queue(issue_number):
-                    pipeline_queue.enqueue_issue(
-                        issue_number=issue_number,
-                        column=status,
-                        timestamp=utc_isoformat()
-                    )
-                    logger.info(f"Added issue #{issue_number} to pipeline queue")
-
-                # CRITICAL: Check if this issue is next in line based on GitHub board order
-                # This ensures we respect the user's ordering on the GitHub board
-                next_issue = pipeline_queue.get_next_waiting_issue()
-                if next_issue and next_issue['issue_number'] != issue_number:
-                    logger.info(
-                        f"Issue #{issue_number} waiting in queue: "
-                        f"issue #{next_issue['issue_number']} is ahead in GitHub board order "
-                        f"(position {next_issue.get('position_in_column', '?')})"
-                    )
-                    return None  # Wait for higher-priority issues to execute first
-
-                # Try to acquire pipeline lock
-                can_execute, reason = lock_manager.try_acquire_lock(
-                    project=project_name,
-                    board=board_name,
-                    issue_number=issue_number
+                # Always call enqueue_issue to handle re-queueing of completed issues
+                # The enqueue_issue method handles all cases:
+                # - New issue: adds to queue
+                # - Completed issue moved back: resets to waiting
+                # - Already queued: no-op
+                pipeline_queue.enqueue_issue(
+                    issue_number=issue_number,
+                    column=status,
+                    timestamp=utc_isoformat()
                 )
 
-                if not can_execute:
-                    logger.info(
-                        f"Issue #{issue_number} waiting for pipeline access: {reason}"
-                    )
-                    return None  # Don't create task yet - waiting in queue
+                # Check if this issue already holds the pipeline lock
+                # If it does, skip queue priority check to avoid race conditions
+                # (The lock was already acquired with priority validation)
+                current_lock = lock_manager.get_lock(project_name, board_name)
+                already_has_lock = (current_lock and
+                                   current_lock.lock_status == 'locked' and
+                                   current_lock.locked_by_issue == issue_number)
 
-                # Lock acquired - mark issue as active in queue
-                pipeline_queue.mark_issue_active(issue_number)
-                logger.info(f"Issue #{issue_number} acquired pipeline lock, proceeding with execution")
+                if not already_has_lock:
+                    # CRITICAL: Check if this issue is next in line based on GitHub board order
+                    # This ensures we respect the user's ordering on the GitHub board
+                    next_issue = pipeline_queue.get_next_waiting_issue()
+                    if next_issue and next_issue['issue_number'] != issue_number:
+                        logger.info(
+                            f"Issue #{issue_number} waiting in queue: "
+                            f"issue #{next_issue['issue_number']} is ahead in GitHub board order "
+                            f"(position {next_issue.get('position_in_column', '?')})"
+                        )
+                        return None  # Wait for higher-priority issues to execute first
+
+                    # Try to acquire pipeline lock
+                    can_execute, reason = lock_manager.try_acquire_lock(
+                        project=project_name,
+                        board=board_name,
+                        issue_number=issue_number
+                    )
+
+                    if not can_execute:
+                        logger.info(
+                            f"Issue #{issue_number} waiting for pipeline access: {reason}"
+                        )
+                        return None  # Don't create task yet - waiting in queue
+
+                    # Lock acquired - mark issue as active in queue
+                    pipeline_queue.mark_issue_active(issue_number)
+                    logger.info(f"Issue #{issue_number} acquired pipeline lock, proceeding with execution")
+                else:
+                    # Issue already holds the lock (called from queue processor after lock acquisition)
+                    # Ensure it's marked as active in the queue
+                    pipeline_queue.mark_issue_active(issue_number)
+                    logger.info(f"Issue #{issue_number} already holds pipeline lock, proceeding with execution")
 
             if agent and agent != 'null':
                 # Determine workspace type and get discussion ID FIRST, before using them
@@ -1721,7 +1797,7 @@ class ProjectMonitor:
             else:
                 # No agent for this column - end pipeline run if one exists
                 logger.info(f"No agent assigned to column '{status}' in {board_name}")
-                
+
                 # End active pipeline run (issue has reached end of pipeline)
                 ended = self.pipeline_run_manager.end_pipeline_run(
                     project=project_name,
@@ -1730,7 +1806,21 @@ class ProjectMonitor:
                 )
                 if ended:
                     logger.info(f"Ended pipeline run for issue #{issue_number} (no agent in column '{status}')")
-                
+
+                # Release pipeline lock if held by this issue
+                from services.pipeline_lock_manager import get_pipeline_lock_manager
+                lock_manager = get_pipeline_lock_manager()
+                lock = lock_manager.get_lock(project_name, board_name)
+
+                if lock and lock.locked_by_issue == issue_number:
+                    logger.info(f"Releasing pipeline lock for {project_name}/{board_name} (issue #{issue_number} moved to no-agent column '{status}')")
+                    lock_manager.release_lock(project_name, board_name, issue_number)
+
+                # Reset queue status so issue can be re-queued if moved back to trigger column
+                from services.pipeline_queue_manager import get_pipeline_queue_manager
+                pipeline_queue = get_pipeline_queue_manager(project_name, board_name)
+                pipeline_queue.reset_issue_to_waiting(issue_number)
+
                 return None
 
         except Exception as e:
@@ -1787,9 +1877,10 @@ class ProjectMonitor:
                     logger.warning(f"Failed to release lock for issue #{issue_number}")
                     return
 
-            # Mark issue as completed in queue
+            # Remove issue from queue (it has exited the pipeline)
+            # It will be re-added if moved back to trigger column
             if pipeline_queue.is_issue_in_queue(issue_number):
-                pipeline_queue.mark_issue_completed(issue_number)
+                pipeline_queue.remove_issue_from_queue(issue_number)
 
             # End the pipeline run for this issue (it has exited the pipeline)
             ended = self.pipeline_run_manager.end_pipeline_run(
@@ -2298,21 +2389,22 @@ _Review cycle initiated by Claude Code Orchestrator_
                 
                 exit_code = int(result.stdout.strip()) if result.stdout.strip() else 2
                 logger.info(f"Container {container_name} exited with code {exit_code}")
-                
-                # Load result file from orchestrator_data directory
-                from pathlib import Path
-                orchestrator_data_dir = Path("/workspace/clauditoreum/orchestrator_data/repair_cycles")
-                result_file = orchestrator_data_dir / project_name / str(issue_number) / "result.json"
-                
+
+                # Load result from Redis
                 repair_result = None
-                if result_file.exists():
-                    try:
-                        with open(result_file, 'r') as f:
-                            repair_result = json.load(f)
-                    except Exception as e:
-                        logger.error(f"Failed to load repair result: {e}")
-                        error_message = f"Failed to load result file: {e}"
-                
+                try:
+                    repair_result = _load_repair_cycle_result_from_redis(
+                        project_name, issue_number, pipeline_run_id
+                    )
+                    if repair_result:
+                        logger.info(f"Loaded repair cycle result from Redis for {project_name}/#{issue_number}")
+                    else:
+                        logger.warning(f"No result found in Redis for {project_name}/#{issue_number}")
+                        error_message = "Result not found in Redis (container may have failed to save result)"
+                except Exception as e:
+                    logger.error(f"Failed to load repair result from Redis: {e}")
+                    error_message = f"Failed to load result from Redis: {e}"
+
                 # Determine success
                 overall_success = (exit_code == 0) and (
                     repair_result.get('overall_success', False) if repair_result else False
@@ -2448,10 +2540,26 @@ _Review cycle initiated by Claude Code Orchestrator_
                             trigger='repair_cycle_completion'
                         )
                         logger.info(f"Successfully moved issue #{issue_number} to {next_column.name}")
-                
-                # Cleanup repair cycle state files (only on success)
+
+                # End pipeline run on success
+                if pipeline_run_id:
+                    try:
+                        ended = self.pipeline_run_manager.end_pipeline_run(
+                            project=project_name,
+                            issue_number=issue_number,
+                            reason="Repair cycle completed successfully"
+                        )
+                        if ended:
+                            pipeline_run_ended = True
+                            logger.info(f"Ended pipeline run {pipeline_run_id} for {project_name}/#{issue_number}")
+                        else:
+                            logger.warning(f"Pipeline run {pipeline_run_id} was already ended or not found")
+                    except Exception as e:
+                        logger.error(f"Failed to end pipeline run {pipeline_run_id}: {e}", exc_info=True)
+
+                # Cleanup repair cycle state (only on success)
                 if overall_success:
-                    _cleanup_repair_cycle_files(project_name, issue_number)
+                    _cleanup_repair_cycle_state(project_name, issue_number, pipeline_run_id)
                 
                 # Cleanup container
                 try:
@@ -2908,21 +3016,35 @@ _Repair cycle initiated by Claude Code Orchestrator_
                         
                         # Check if column requires agent action
                         has_agent = column_config.agent and column_config.agent != 'null'
-                        
+
                         if not has_agent:
                             continue
-                        
+
                         # Check if there's already an active pipeline run
                         has_active_run = self.pipeline_run_manager.get_active_pipeline_run(
                             project_name, item.issue_number
                         )
-                        
+
                         if has_active_run:
                             logger.debug(
                                 f"Issue #{item.issue_number} in {item.status} already has active pipeline run, skipping"
                             )
                             continue
-                        
+
+                        # Check if issue holds the pipeline lock (may be in process of re-triggering from recovery)
+                        from services.pipeline_lock_manager import get_pipeline_lock_manager
+                        lock_manager = get_pipeline_lock_manager()
+                        current_lock = lock_manager.get_lock(project_name, pipeline.board_name)
+                        holds_lock = (current_lock and
+                                     current_lock.lock_status == 'locked' and
+                                     current_lock.locked_by_issue == item.issue_number)
+
+                        if holds_lock:
+                            logger.debug(
+                                f"Issue #{item.issue_number} holds pipeline lock, likely being re-triggered by recovery, skipping"
+                            )
+                            continue
+
                         # Item needs action - simulate item_added event
                         logger.info(
                             f"Dispatching agent for stalled item: {project_name} issue #{item.issue_number} "

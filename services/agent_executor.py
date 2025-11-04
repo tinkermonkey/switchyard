@@ -214,14 +214,30 @@ class AgentExecutor:
                     # Continue execution even if finalization fails
 
             # Record successful execution outcome
-            if 'issue_number' in task_context and 'column' in task_context:
+            # CRITICAL: Always try to record outcome to prevent stuck "in_progress" states
+            if 'issue_number' in task_context:
                 from services.work_execution_state import work_execution_tracker
+                column = task_context.get('column', 'unknown')
+
+                # Warn if column is missing (shouldn't happen in normal flow)
+                if column == 'unknown':
+                    logger.warning(
+                        f"Recording execution outcome without column for issue #{task_context['issue_number']} "
+                        f"(agent={agent_name}, project={project_name}). This may indicate a bug in task creation."
+                    )
+
                 work_execution_tracker.record_execution_outcome(
                     issue_number=task_context['issue_number'],
-                    column=task_context['column'],
+                    column=column,
                     agent=agent_name,
                     outcome='success',
                     project_name=project_name
+                )
+            else:
+                # Log warning if we can't record outcome due to missing context
+                logger.warning(
+                    f"Cannot record execution outcome for {agent_name}: missing issue_number in task_context. "
+                    f"This execution will not be tracked in work execution state. task_id={task_id}"
                 )
 
             logger.info(f"Agent {agent_name} completed successfully (duration: {duration_ms:.0f}ms)")
@@ -234,15 +250,31 @@ class AgentExecutor:
             )
 
             # Record failed execution outcome
-            if 'issue_number' in task_context and 'column' in task_context:
+            # CRITICAL: Always try to record outcome to prevent stuck "in_progress" states
+            if 'issue_number' in task_context:
                 from services.work_execution_state import work_execution_tracker
+                column = task_context.get('column', 'unknown')
+
+                # Warn if column is missing (shouldn't happen in normal flow)
+                if column == 'unknown':
+                    logger.warning(
+                        f"Recording execution outcome without column for issue #{task_context['issue_number']} "
+                        f"(agent={agent_name}, project={project_name}). This may indicate a bug in task creation."
+                    )
+
                 work_execution_tracker.record_execution_outcome(
                     issue_number=task_context['issue_number'],
-                    column=task_context['column'],
+                    column=column,
                     agent=agent_name,
                     outcome='failure',
                     project_name=project_name,
                     error=str(e)
+                )
+            else:
+                # Log warning if we can't record outcome due to missing context
+                logger.warning(
+                    f"Cannot record execution outcome for {agent_name}: missing issue_number in task_context. "
+                    f"This execution will not be tracked in work execution state. task_id={task_id}, error={str(e)}"
                 )
 
             logger.error(f"Agent {agent_name} failed after {duration_ms:.0f}ms: {e}")

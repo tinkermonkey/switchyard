@@ -59,6 +59,9 @@ class Environment(BaseSettings):
     # Performance and API Optimization
     reconciliation_freshness_hours: int = 1  # Skip reconciliation if state is fresh (default: 1 hour)
 
+    # Worker Pool Configuration
+    orchestrator_workers: int = 1  # Number of worker threads for parallel task execution (default: 1 = single-threaded)
+
     # Docker/Host Configuration (used by docker-compose for file permissions)
     host_uid: Optional[int] = 1000
     host_gid: Optional[int] = 1000

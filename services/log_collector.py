@@ -389,12 +389,12 @@ class LogCollector:
                 for error in errors[:3]:  # Log first 3 errors
                     logger.warning(f"Index error: {error}")
 
-            logger.info(f"Indexed {success_count} events to {index_name}")
+            logger.debug(f"Indexed {success_count} events to {index_name}")
 
         self.events_indexed += total_success
         self.errors += total_errors
 
-        logger.info(f"Batch flush complete: {total_success} indexed (total: {self.events_indexed})")
+        logger.debug(f"Batch flush complete: {total_success} indexed (total: {self.events_indexed})")
 
         # Clear batch
         self.batch = []

@@ -97,13 +97,19 @@ class PipelineLockManager:
                 logger.warning(f"Failed to get lock from Redis: {e}")
 
         # Fallback to YAML
+        from utils.file_lock import file_lock
+
         state_file = self._get_state_file(project, board)
         if state_file.exists():
             try:
-                with open(state_file, 'r') as f:
-                    lock_data = yaml.safe_load(f)
-                    if lock_data and lock_data.get('lock_status') == 'locked':
-                        return PipelineLock(**lock_data)
+                # Use file lock when reading to prevent reading partial writes
+                lock_file = state_file.with_suffix(state_file.suffix + '.lock')
+                with file_lock(lock_file):
+                    if state_file.exists():  # Check again inside lock
+                        with open(state_file, 'r') as f:
+                            lock_data = yaml.safe_load(f)
+                            if lock_data and lock_data.get('lock_status') == 'locked':
+                                return PipelineLock(**lock_data)
             except Exception as e:
                 logger.error(f"Failed to load lock state from YAML: {e}")
 
@@ -226,11 +232,17 @@ class PipelineLockManager:
                 logger.error(f"Failed to delete lock from Redis: {e}")
 
         # Update YAML to unlocked state
+        from utils.file_lock import file_lock
+
         state_file = self._get_state_file(project, board)
         if state_file.exists():
             try:
-                state_file.unlink()
-                logger.debug(f"Deleted lock YAML file: {state_file}")
+                # Use file lock when deleting to prevent race with writers
+                lock_file = state_file.with_suffix(state_file.suffix + '.lock')
+                with file_lock(lock_file):
+                    if state_file.exists():  # Check again inside lock
+                        state_file.unlink()
+                        logger.debug(f"Deleted lock YAML file: {state_file}")
             except Exception as e:
                 logger.error(f"Failed to delete lock YAML: {e}")
 
@@ -240,11 +252,14 @@ class PipelineLockManager:
         return True
 
     def _save_lock_to_yaml(self, lock: PipelineLock):
-        """Save lock state to YAML file"""
+        """Save lock state to YAML file with thread-safe file locking"""
+        from utils.file_lock import safe_yaml_write
+
         state_file = self._get_state_file(lock.project, lock.board)
         try:
-            with open(state_file, 'w') as f:
-                yaml.dump(asdict(lock), f, default_flow_style=False, sort_keys=False)
+            with safe_yaml_write(state_file):
+                with open(state_file, 'w') as f:
+                    yaml.dump(asdict(lock), f, default_flow_style=False, sort_keys=False)
             logger.debug(f"Saved lock to YAML: {state_file}")
         except Exception as e:
             logger.error(f"Failed to save lock to YAML: {e}")

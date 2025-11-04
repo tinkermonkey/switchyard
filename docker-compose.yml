@@ -60,6 +60,10 @@ services:
       - CONTEXT7_MCP_URL=https://mcp.context7.com/mcp
       - CONTEXT7_API_KEY=${CONTEXT7_API_KEY}
       - RECONCILIATION_FRESHNESS_HOURS=${RECONCILIATION_FRESHNESS_HOURS:-1}
+      # Worker pool configuration
+      # Set to 1 for single-threaded (default), 2-8 for multi-threaded parallel execution
+      # Recommended: 2-3 workers for multi-project deployments
+      - ORCHESTRATOR_WORKERS=${ORCHESTRATOR_WORKERS:-1}
       # Host paths for Docker-in-Docker mounting
       # These are intentionally NOT set - the code has correct defaults:
       # - HOST_WORKSPACE_PATH defaults to '/workspace' (the mounted parent dir)

@@ -2095,11 +2095,31 @@ def get_projects():
                         'url': f"https://github.com/{project_config.github.get('org')}/{project_config.github.get('repo')}"
                     }
 
-                # Get pipeline info
+                # Get pipeline info with lock status
                 pipelines = []
                 if hasattr(project_config, 'pipelines') and project_config.pipelines:
+                    from services.pipeline_lock_manager import get_pipeline_lock_manager
+                    lock_manager = get_pipeline_lock_manager()
+
                     # pipelines is a list of ProjectPipeline objects
-                    pipelines = [p.name for p in project_config.pipelines if hasattr(p, 'name')]
+                    for p in project_config.pipelines:
+                        if hasattr(p, 'name') and hasattr(p, 'board_name'):
+                            # Get lock status for this pipeline
+                            lock = lock_manager.get_lock(project_name, p.board_name)
+                            pipeline_info = {
+                                'name': p.name,
+                                'board': p.board_name,
+                                'lock': None
+                            }
+
+                            if lock and lock.lock_status == 'locked':
+                                pipeline_info['lock'] = {
+                                    'locked_by_issue': lock.locked_by_issue,
+                                    'locked_at': lock.lock_acquired_at,
+                                    'is_locked': True
+                                }
+
+                            pipelines.append(pipeline_info)
 
                 # Get cached git branch data
                 git_branches = None
@@ -2147,6 +2167,92 @@ def get_projects():
             'success': False,
             'error': str(e),
             'projects': []
+        }), 500
+
+@app.route('/api/projects/<project>/pipelines/<board>/release-lock', methods=['POST'])
+def release_pipeline_lock(project, board):
+    """
+    Manually release a pipeline lock for a project/board.
+
+    This is useful when a lock is stuck due to agent crashes or other issues.
+
+    Args:
+        project: Project name
+        board: Board name (e.g., "SDLC Execution")
+
+    Request body (optional):
+        {
+            "issue_number": 123  # If provided, only releases lock if held by this issue
+        }
+
+    Returns:
+        JSON with success status and details
+    """
+    try:
+        from services.pipeline_lock_manager import get_pipeline_lock_manager
+        from services.pipeline_queue_manager import get_pipeline_queue_manager
+
+        lock_manager = get_pipeline_lock_manager()
+        queue_manager = get_pipeline_queue_manager(project, board)
+
+        # Get optional issue_number from request body
+        request_data = request.get_json() if request.is_json else {}
+        specified_issue = request_data.get('issue_number')
+
+        # Check current lock status
+        lock = lock_manager.get_lock(project, board)
+
+        if not lock or lock.lock_status != 'locked':
+            return jsonify({
+                'success': False,
+                'message': f'No active lock found for {project}/{board}',
+                'lock_status': None
+            }), 404
+
+        # If issue_number specified, verify it matches
+        if specified_issue and lock.locked_by_issue != specified_issue:
+            return jsonify({
+                'success': False,
+                'message': f'Lock is held by issue #{lock.locked_by_issue}, not #{specified_issue}',
+                'lock_status': {
+                    'locked_by_issue': lock.locked_by_issue,
+                    'locked_at': lock.lock_acquired_at
+                }
+            }), 400
+
+        locked_by_issue = lock.locked_by_issue
+
+        # Release the lock
+        released = lock_manager.release_lock(project, board, locked_by_issue)
+
+        if released:
+            # Also reset the issue in the queue from active to waiting
+            queue_manager.reset_issue_to_waiting(locked_by_issue)
+
+            logger.info(
+                f"Manually released pipeline lock for {project}/{board} "
+                f"(issue #{locked_by_issue})"
+            )
+
+            return jsonify({
+                'success': True,
+                'message': f'Successfully released lock for issue #{locked_by_issue}',
+                'released_issue': locked_by_issue
+            }), 200
+        else:
+            return jsonify({
+                'success': False,
+                'message': 'Failed to release lock (may have already been released)',
+                'lock_status': None
+            }), 500
+
+    except Exception as e:
+        logger.error(f"Error releasing pipeline lock: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return jsonify({
+            'success': False,
+            'error': str(e)
         }), 500
 
 @app.route('/api/workflow-config/<project>/<board>', methods=['GET'])
@@ -2257,12 +2363,12 @@ def get_repair_cycle_containers():
             project = info['project']
             issue_number = info['issue_number']
             run_id = info['run_id']
-            
+
             # Get checkpoint
-            checkpoint = recovery.check_repair_cycle_checkpoint(project)
-            
+            checkpoint = recovery.check_repair_cycle_checkpoint(project, int(issue_number))
+
             # Get result
-            result_data = recovery.check_repair_cycle_result(project)
+            result_data = recovery.check_repair_cycle_result(project, int(issue_number), run_id)
             
             # Get container age
             container_age_seconds = None

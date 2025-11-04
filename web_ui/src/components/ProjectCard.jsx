@@ -24,7 +24,7 @@ export default function ProjectCard({ project }) {
           <div className="mt-3 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
             <DevContainerStatus devContainer={project.dev_container} />
             <WorkspaceStatus workspace={project.workspace} />
-            <PipelinesStatus pipelines={project.pipelines} />
+            <PipelinesStatus pipelines={project.pipelines} projectName={project.name} />
           </div>
         </div>
       </div>

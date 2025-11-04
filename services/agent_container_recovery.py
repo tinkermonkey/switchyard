@@ -272,11 +272,18 @@ class AgentContainerRecovery:
 
                 try:
                     redis_data = self.redis.hgetall(redis_key)
-                    if redis_data and 'issue_number' in redis_data:
-                        issue_number_str = redis_data.get('issue_number', '')
-                        if issue_number_str and issue_number_str != 'unknown':
-                            issue_number = int(issue_number_str)
-                            logger.info(f"Found issue number {issue_number} in Redis for container {container_name}")
+                    if redis_data:
+                        # Use project from Redis if available (more reliable than parsing container name)
+                        if 'project' in redis_data and redis_data['project']:
+                            project = redis_data['project']
+                            logger.debug(f"Using project '{project}' from Redis for container {container_name}")
+
+                        # Get issue number
+                        if 'issue_number' in redis_data:
+                            issue_number_str = redis_data.get('issue_number', '')
+                            if issue_number_str and issue_number_str != 'unknown':
+                                issue_number = int(issue_number_str)
+                                logger.info(f"Found issue number {issue_number} in Redis for container {container_name}")
                 except Exception as e:
                     logger.debug(f"Could not get Redis data for container: {e}")
 
@@ -535,45 +542,135 @@ class AgentContainerRecovery:
             logger.error(f"Error checking repair cycle checkpoint: {e}")
             return None
     
-    def check_repair_cycle_result(self, project: str, issue_number: int = None) -> Optional[Dict[str, any]]:
+    def check_repair_cycle_result(self, project: str, issue_number: int = None, run_id: str = None) -> Optional[Dict[str, any]]:
         """
-        Check repair cycle result file to see if container completed
-        
+        Check repair cycle result in Redis to see if container completed.
+
+        This replaces file-based result checking to avoid polluting project repos.
+
         Args:
             project: Project name
-            issue_number: Issue number (if known, enables new path lookup)
-            
+            issue_number: Issue number (required for Redis lookup)
+            run_id: Pipeline run ID (optional, will try to find if not provided)
+
         Returns:
             Result data if exists, None otherwise
         """
         try:
-            # Try new location first (in orchestrator_data)
-            if issue_number is not None:
-                orchestrator_data_dir = Path("/workspace/clauditoreum/orchestrator_data/repair_cycles")
-                result_file = orchestrator_data_dir / project / str(issue_number) / "result.json"
-                
-                if result_file.exists():
-                    with open(result_file, 'r') as f:
-                        result = json.load(f)
-                    return result
-            
-            # Fallback: try old location in project directory (for backward compatibility)
-            from services.project_workspace import workspace_manager
-            project_dir = workspace_manager.get_project_dir(project)
-            result_file = Path(project_dir) / ".repair_cycle_result.json"
-            
-            if not result_file.exists():
+            if issue_number is None:
+                logger.warning("Cannot check repair cycle result without issue_number")
                 return None
-            
-            with open(result_file, 'r') as f:
-                result = json.load(f)
-            
+
+            # If run_id not provided, try to find it from recent pipeline runs
+            if run_id is None:
+                # Try to get the most recent run_id for this issue from Redis
+                # Key pattern: repair_cycle:result:{project}:{issue}:*
+                try:
+                    # Scan for keys matching pattern
+                    pattern = f"repair_cycle:result:{project}:{issue_number}:*"
+                    keys = list(self.redis.scan_iter(match=pattern, count=10))
+
+                    if keys:
+                        # Use the most recently created key (latest run)
+                        redis_key = keys[0]  # Just use first match
+                        result_json = self.redis.get(redis_key)
+
+                        if result_json:
+                            result = json.loads(result_json)
+                            logger.info(f"Found repair cycle result in Redis: {redis_key}")
+                            return result
+                except Exception as e:
+                    logger.warning(f"Failed to scan for repair cycle results: {e}")
+
+                return None
+
+            # Load result from Redis with known run_id
+            redis_key = f"repair_cycle:result:{project}:{issue_number}:{run_id}"
+            result_json = self.redis.get(redis_key)
+
+            if not result_json:
+                logger.debug(f"No result found in Redis for key: {redis_key}")
+                return None
+
+            result = json.loads(result_json)
+            logger.info(f"Loaded repair cycle result from Redis: {redis_key}")
+
             return result
-            
+
         except Exception as e:
-            logger.error(f"Error checking repair cycle result: {e}")
+            logger.error(f"Error checking repair cycle result: {e}", exc_info=True)
             return None
-    
+
+    def find_orphaned_repair_cycle_results(self) -> List[Dict]:
+        """
+        Find repair cycle results in Redis where the container has exited.
+
+        An orphaned result is one where:
+        1. A result exists in Redis (repair_cycle:result:{project}:{issue}:{run_id})
+        2. The corresponding container is no longer running
+
+        This can happen when a repair cycle completes between orchestrator restarts.
+
+        Returns:
+            List of dicts with keys: project, issue_number, run_id, result
+        """
+        orphaned = []
+
+        try:
+            # Get all running repair cycle containers
+            running_containers = self.get_running_repair_cycle_containers()
+            running_container_names = {c['name'] for c in running_containers}
+
+            # Scan Redis for all result keys
+            pattern = "repair_cycle:result:*"
+            for redis_key in self.redis.scan_iter(match=pattern, count=100):
+                try:
+                    # Parse key: repair_cycle:result:{project}:{issue}:{run_id}
+                    key_parts = redis_key.split(":")
+                    if len(key_parts) < 5:
+                        logger.warning(f"Malformed result key: {redis_key}")
+                        continue
+
+                    project = key_parts[2]
+                    issue_number = int(key_parts[3])
+                    run_id = key_parts[4]
+
+                    # Construct expected container name
+                    container_name = f"repair-cycle-{project}-{issue_number}-{run_id[:8]}"
+
+                    # Check if container is still running
+                    if container_name not in running_container_names:
+                        # Container is gone - this is an orphaned result
+                        logger.info(
+                            f"Found orphaned result: {redis_key} (container {container_name} not running)"
+                        )
+
+                        # Load the result
+                        result_json = self.redis.get(redis_key)
+                        if result_json:
+                            result = json.loads(result_json)
+                            orphaned.append({
+                                'project': project,
+                                'issue_number': issue_number,
+                                'run_id': run_id,
+                                'result': result
+                            })
+                        else:
+                            logger.warning(f"Result key {redis_key} exists but has no data")
+
+                except Exception as e:
+                    logger.error(f"Error processing result key {redis_key}: {e}", exc_info=True)
+
+            if orphaned:
+                logger.info(f"Found {len(orphaned)} orphaned repair cycle results")
+            else:
+                logger.debug("No orphaned repair cycle results found")
+
+        except Exception as e:
+            logger.error(f"Error scanning for orphaned results: {e}", exc_info=True)
+
+        return orphaned
+
     def reconnect_repair_cycle_container(
         self,
         container_name: str,
@@ -617,28 +714,30 @@ class AgentContainerRecovery:
                 logger.warning(f"Could not find project config for {project}")
                 return
             
-            # Find workflow template
-            # Try dev pipeline first
-            pipeline_config = project_config.pipeline.get('dev')
+            # Find the dev/SDLC pipeline
+            pipeline_config = None
+            for pipeline in project_config.pipelines:
+                if 'SDLC' in pipeline.board_name or 'dev' in pipeline.board_name.lower():
+                    pipeline_config = pipeline
+                    break
+
             if not pipeline_config:
-                logger.warning(f"No dev pipeline found for {project}")
+                logger.warning(f"No SDLC/dev pipeline found for {project}")
                 return
-            
-            workflow_name = pipeline_config.get('workflow')
+
+            workflow_name = pipeline_config.workflow
             workflow_template = config_manager.get_workflow_template(workflow_name)
             
             if not workflow_template:
                 logger.warning(f"Could not find workflow template {workflow_name}")
                 return
-            
-            # Get board name from state
-            from config.state_manager import state_manager
-            github_state = state_manager.get_github_state(project)
-            board_name = github_state.get('board_name', project)
-            
+
+            # Get board name from pipeline config
+            board_name = pipeline_config.board_name
+
             # Determine status from checkpoint or assume "Testing"
             status = checkpoint.get('stage_name', 'Testing') if checkpoint else 'Testing'
-            
+
             # Get repository
             repository = project_config.github.get('repo', project)
             
@@ -655,7 +754,8 @@ class AgentContainerRecovery:
                 status=status,
                 repository=repository,
                 project_config=project_config,
-                workflow_template=workflow_template
+                workflow_template=workflow_template,
+                pipeline_run_id=run_id
             )
             
             logger.info(f"✓ Reconnected to repair cycle container: {container_name}")
@@ -671,14 +771,14 @@ class AgentContainerRecovery:
             Tuple of (recovered_count, killed_count, error_count)
         """
         logger.info("Starting repair cycle container recovery process")
-        
+
         running_containers = self.get_running_repair_cycle_containers()
-        
+
         if not running_containers:
             logger.info("No running repair cycle containers found")
-            return (0, 0, 0)
-        
-        logger.info(f"Found {len(running_containers)} running repair cycle containers")
+            # Don't return early - still need to check for orphaned results
+        else:
+            logger.info(f"Found {len(running_containers)} running repair cycle containers")
         
         recovered = 0
         killed = 0
@@ -700,12 +800,12 @@ class AgentContainerRecovery:
                 project = metadata['project']
                 issue_number = int(metadata['issue_number'])
                 run_id = metadata['run_id']
-                
-                # Check for result file (container may have finished)
-                result = self.check_repair_cycle_result(project, issue_number)
+
+                # Check for result in Redis (container may have finished)
+                result = self.check_repair_cycle_result(project, issue_number, run_id)
                 if result:
                     logger.info(
-                        f"Container {container_name} has completed (result file exists), "
+                        f"Container {container_name} has completed (result in Redis), "
                         f"success={result.get('overall_success')}"
                     )
                     # Container finished but orchestrator restarted before processing result
@@ -735,8 +835,19 @@ class AgentContainerRecovery:
                         age = datetime.utcnow() - created_dt
 
                         if age < timedelta(minutes=60):
-                            logger.info(f"Container is young ({age.total_seconds()/60:.1f}min), keeping it")
-                            # Don't reconnect yet, just leave it running
+                            logger.info(f"Container is young ({age.total_seconds()/60:.1f}min), keeping it and reconnecting")
+                            # Re-attach monitoring thread for this young container
+                            try:
+                                self.reconnect_repair_cycle_container(
+                                    container_name=container_name,
+                                    project=project,
+                                    issue_number=issue_number,
+                                    run_id=run_id
+                                )
+                                recovered += 1
+                            except Exception as reconnect_error:
+                                logger.error(f"Failed to reconnect to young container: {reconnect_error}", exc_info=True)
+                                errors += 1
                             continue
                         else:
                             logger.warning(f"Container is old ({age.total_seconds()/60:.1f}min) with no checkpoint, killing it")
@@ -820,7 +931,35 @@ class AgentContainerRecovery:
             except Exception as e:
                 logger.error(f"Error processing repair cycle container {container_name}: {e}", exc_info=True)
                 errors += 1
-        
+
+        # Check for orphaned results in Redis (results where container has exited but wasn't processed)
+        logger.info("Checking for orphaned repair cycle results in Redis")
+        try:
+            orphaned_results = self.find_orphaned_repair_cycle_results()
+            for result_info in orphaned_results:
+                try:
+                    project = result_info['project']
+                    issue_number = result_info['issue_number']
+                    run_id = result_info['run_id']
+                    result = result_info['result']
+
+                    logger.info(
+                        f"Found orphaned result for {project}/#{issue_number} (run {run_id}), processing it"
+                    )
+                    self._process_completed_repair_cycle(
+                        f"repair-cycle-{project}-{issue_number}-{run_id[:8]}",  # Reconstruct container name
+                        "exited",  # Container ID (doesn't matter, container is gone)
+                        project,
+                        issue_number,
+                        result
+                    )
+                    recovered += 1
+                except Exception as e:
+                    logger.error(f"Failed to process orphaned result: {e}", exc_info=True)
+                    errors += 1
+        except Exception as e:
+            logger.error(f"Failed to check for orphaned results: {e}", exc_info=True)
+
         logger.info(
             f"Repair cycle container recovery complete: {recovered} recovered, {killed} killed, {errors} errors"
         )
@@ -929,8 +1068,8 @@ class AgentContainerRecovery:
         summary_lines.append("_Repair cycle recovered after orchestrator restart_")
 
         # Post comment
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+        # Run async code in a new thread to avoid event loop conflicts
+        import threading
 
         comment_context = {
             'issue_number': issue_number,
@@ -939,9 +1078,19 @@ class AgentContainerRecovery:
             'discussion_id': context.get('discussion_id')
         }
 
-        loop.run_until_complete(
-            github.post_agent_output(comment_context, "\n".join(summary_lines))
-        )
+        def post_comment():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                loop.run_until_complete(
+                    github.post_agent_output(comment_context, "\n".join(summary_lines))
+                )
+            finally:
+                loop.close()
+
+        thread = threading.Thread(target=post_comment)
+        thread.start()
+        thread.join(timeout=30)  # Wait up to 30 seconds
 
         # Auto-commit if successful
         if overall_success:
@@ -949,17 +1098,32 @@ class AgentContainerRecovery:
                 logger.info(f"Auto-committing repair cycle changes for issue #{issue_number}")
                 from services.auto_commit import auto_commit_service
 
-                commit_success = loop.run_until_complete(
-                    auto_commit_service.commit_agent_changes(
-                        project=project,
-                        agent='repair_cycle',
-                        task_id=f'repair_cycle_{issue_number}',
-                        issue_number=issue_number,
-                        custom_message=f"Complete repair cycle for issue #{issue_number}\n\nAutomated test-fix-validate cycle completed successfully.\nAll tests passing."
-                    )
-                )
+                def do_commit():
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    try:
+                        return loop.run_until_complete(
+                            auto_commit_service.commit_agent_changes(
+                                project=project,
+                                agent='repair_cycle',
+                                task_id=f'repair_cycle_{issue_number}',
+                                issue_number=issue_number,
+                                custom_message=f"Complete repair cycle for issue #{issue_number}\n\nAutomated test-fix-validate cycle completed successfully.\nAll tests passing."
+                            )
+                        )
+                    finally:
+                        loop.close()
 
-                if commit_success:
+                # Run in separate thread
+                commit_success = [False]
+                def commit_thread():
+                    commit_success[0] = do_commit()
+
+                thread = threading.Thread(target=commit_thread)
+                thread.start()
+                thread.join(timeout=60)  # Wait up to 60 seconds for commit
+
+                if commit_success[0]:
                     logger.info(f"Successfully committed repair cycle changes for issue #{issue_number}")
                 else:
                     logger.warning(f"No changes to commit for repair cycle on issue #{issue_number}")
@@ -991,9 +1155,9 @@ class AgentContainerRecovery:
                         logger.info(f"Auto-advancing issue #{issue_number} from {column} to {next_column.name}")
 
                         from services.pipeline_progression import PipelineProgression
-                        from task_queue.task_manager import TaskManager
+                        from task_queue.task_manager import TaskQueue
 
-                        task_queue = TaskManager()
+                        task_queue = TaskQueue()
                         progression_service = PipelineProgression(task_queue)
                         progression_service.move_issue_to_column(
                             project_name=project,
@@ -1006,6 +1170,23 @@ class AgentContainerRecovery:
             except Exception as e:
                 logger.error(f"Failed to auto-advance issue: {e}", exc_info=True)
 
+        # End pipeline run
+        if pipeline_run_id:
+            try:
+                from services.pipeline_run import get_pipeline_run_manager
+                pipeline_run_manager = get_pipeline_run_manager()
+                ended = pipeline_run_manager.end_pipeline_run(
+                    project=project,
+                    issue_number=issue_number,
+                    reason="Repair cycle completed successfully" if overall_success else "Repair cycle failed"
+                )
+                if ended:
+                    logger.info(f"Ended pipeline run {pipeline_run_id} for {project}/#{issue_number}")
+                else:
+                    logger.warning(f"Pipeline run {pipeline_run_id} was already ended or not found")
+            except Exception as e:
+                logger.error(f"Failed to end pipeline run {pipeline_run_id}: {e}", exc_info=True)
+
         # Clean up container
         try:
             subprocess.run(['docker', 'rm', '-f', container_id], capture_output=True, timeout=30)
@@ -1016,9 +1197,16 @@ class AgentContainerRecovery:
         # Clear Redis tracking
         try:
             if self.redis:
+                # Clear container tracking
                 redis_key = f"repair_cycle:container:{project}:{issue_number}"
                 self.redis.delete(redis_key)
                 logger.debug(f"Cleared Redis tracking key: {redis_key}")
+
+                # Clear result (only if successful, keep failed results for debugging)
+                if overall_success:
+                    result_key = f"repair_cycle:result:{project}:{issue_number}:{pipeline_run_id}"
+                    self.redis.delete(result_key)
+                    logger.debug(f"Cleared Redis result key: {result_key}")
         except Exception as e:
             logger.warning(f"Failed to clear Redis tracking: {e}")
 
@@ -1038,7 +1226,6 @@ class AgentContainerRecovery:
         except Exception as e:
             logger.warning(f"Failed to emit container completed event: {e}")
 
-        loop.close()
         logger.info(f"Completed processing of repair cycle for {project}/#{issue_number}")
 
     def kill_repair_cycle_container_with_event(self, container_name: str, container_id: str,

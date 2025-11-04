@@ -210,7 +210,11 @@ class PipelineQueueManager:
 
     def enqueue_issue(self, issue_number: int, column: str, timestamp: str):
         """
-        Add issue to pipeline queue.
+        Add issue to pipeline queue or update if already exists.
+
+        This method is simplified - it no longer handles "completed" status.
+        Issues are automatically removed from the queue when they leave the trigger column
+        via sync_queue_with_github().
 
         Args:
             issue_number: Issue number to add
@@ -219,9 +223,20 @@ class PipelineQueueManager:
         """
         queue = self.load_queue()
 
-        # Don't add if already in queue
-        if self.is_issue_in_queue(issue_number):
-            logger.debug(f"Issue #{issue_number} already in queue")
+        # Check if already in queue
+        existing_issue = next((issue for issue in queue if issue['issue_number'] == issue_number), None)
+
+        if existing_issue:
+            # If issue is active, don't modify it (work in progress)
+            if existing_issue['status'] == 'active':
+                logger.debug(f"Issue #{issue_number} already active in queue, skipping enqueue")
+                return
+
+            # If waiting, update the timestamp (issue was re-detected)
+            existing_issue['queued_at'] = timestamp
+            existing_issue['last_position_check'] = timestamp
+            self.save_queue(queue)
+            logger.debug(f"Updated timestamp for issue #{issue_number} in queue")
             return
 
         # Fetch current position from GitHub
@@ -262,19 +277,77 @@ class PipelineQueueManager:
 
         logger.info(f"Marked issue #{issue_number} as active in pipeline queue")
 
-    def mark_issue_completed(self, issue_number: int):
-        """Mark issue as completed (reached exit column)"""
+    def sync_queue_with_github(self) -> None:
+        """
+        Synchronize queue state with GitHub column positions.
+
+        This is the key method that makes GitHub the source of truth:
+        - Removes issues that are no longer in the trigger column
+        - Updates positions for issues still in the column
+        - Re-calculates status based on GitHub state
+
+        Call this before selecting the next issue to execute.
+        """
+        trigger_column = self._get_pipeline_trigger_column()
+
+        # Fetch current issues in trigger column from GitHub
+        issues_in_column = self.get_issues_in_column_order(trigger_column)
+        github_issue_numbers = {item['issue_number'] for item in issues_in_column}
+
+        if not issues_in_column:
+            logger.debug(f"No issues in trigger column '{trigger_column}', queue sync skipped")
+            return
+
         queue = self.load_queue()
+        updated_queue = []
 
         for issue in queue:
-            if issue['issue_number'] == issue_number:
-                issue['status'] = 'completed'
-                issue['completed_at'] = datetime.now(timezone.utc).isoformat()
-                break
+            issue_number = issue['issue_number']
 
-        self.save_queue(queue)
+            # If issue is no longer in trigger column, remove it from queue
+            # (unless it's currently active - let the agent finish)
+            if issue_number not in github_issue_numbers:
+                if issue['status'] == 'active':
+                    # Keep active issues even if moved out - they need to complete
+                    logger.info(
+                        f"Issue #{issue_number} moved out of trigger column but still active, "
+                        f"keeping in queue until completion"
+                    )
+                    updated_queue.append(issue)
+                else:
+                    logger.info(
+                        f"Issue #{issue_number} no longer in trigger column '{trigger_column}', "
+                        f"removing from queue"
+                    )
+                    # Don't add to updated_queue (effectively removing it)
+                continue
 
-        logger.info(f"Marked issue #{issue_number} as completed in pipeline queue")
+            # Issue is still in column - update its position
+            github_position = next(
+                (item['position'] for item in issues_in_column
+                 if item['issue_number'] == issue_number),
+                None
+            )
+
+            if github_position is not None:
+                old_position = issue.get('position_in_column')
+                if old_position != github_position:
+                    logger.info(
+                        f"Issue #{issue_number} position changed: {old_position} → {github_position}"
+                    )
+                    issue['position_in_column'] = github_position
+                    issue['last_position_check'] = datetime.now(timezone.utc).isoformat()
+
+            updated_queue.append(issue)
+
+        # Save the synchronized queue
+        if len(updated_queue) != len(queue):
+            logger.info(
+                f"Queue sync complete: {len(queue)} → {len(updated_queue)} issues "
+                f"({len(queue) - len(updated_queue)} removed)"
+            )
+
+        self.save_queue(updated_queue)
 
     def remove_issue_from_queue(self, issue_number: int):
         """Remove issue from queue entirely"""
@@ -283,6 +356,41 @@ class PipelineQueueManager:
         self.save_queue(queue)
 
         logger.info(f"Removed issue #{issue_number} from pipeline queue")
+
+    def reset_issue_to_waiting(self, issue_number: int):
+        """
+        Reset an issue from active back to waiting status.
+
+        This is used to recover from stale locks when an agent was killed/crashed.
+
+        Args:
+            issue_number: Issue number to reset
+        """
+        queue = self.load_queue()
+
+        for issue in queue:
+            if issue['issue_number'] == issue_number:
+                if issue['status'] == 'active':
+                    issue['status'] = 'waiting'
+
+                    # Clear activation timestamp
+                    if 'activated_at' in issue:
+                        del issue['activated_at']
+
+                    self.save_queue(queue)
+                    logger.info(
+                        f"Reset issue #{issue_number} from active to waiting in queue "
+                        f"(recovering from stale lock)"
+                    )
+                    return True
+                else:
+                    logger.debug(
+                        f"Issue #{issue_number} has status {issue['status']}, no reset needed"
+                    )
+                    return False
+
+        logger.debug(f"Issue #{issue_number} not found in queue, no reset performed")
+        return False
 
     def get_issue_status(self, issue_number: int) -> Optional[str]:
         """Get status of issue in queue"""
@@ -323,12 +431,19 @@ class PipelineQueueManager:
         """
         Get the next issue that should execute based on CURRENT GitHub board order.
 
-        This fetches fresh ordering from GitHub before selecting the next issue,
-        ensuring we respect any re-ordering the user has done.
+        This method first syncs with GitHub to ensure queue state is accurate,
+        then selects the highest priority waiting issue.
 
         Returns:
             Issue dict with 'issue_number', 'position', etc., or None
         """
+        # CRITICAL: Sync with GitHub first to ensure accurate state
+        logger.info(
+            f"Syncing queue with GitHub for {self.project_name}/{self.board_name}"
+        )
+        self.sync_queue_with_github()
+
+        # Load queue after sync
         queue = self.load_queue()
 
         # Filter to 'waiting' issues only
@@ -344,75 +459,11 @@ class PipelineQueueManager:
             )
             return None
 
-        # CRITICAL: Fetch current board order from GitHub
-        # This is the source of truth for execution order
-        logger.info(
-            f"Fetching current board order from GitHub for "
-            f"{self.project_name}/{self.board_name}"
-        )
+        # Sort by position (lowest = topmost on board = highest priority)
+        waiting_issues.sort(key=lambda x: x.get('position_in_column', 999))
+        next_issue = waiting_issues[0]
 
         trigger_column = self._get_pipeline_trigger_column()
-        current_board_order = self.get_issues_in_column_order(trigger_column)
-
-        if not current_board_order:
-            logger.warning(
-                f"Could not fetch board order from GitHub, "
-                f"falling back to cached positions"
-            )
-            # Fallback: use cached positions
-            waiting_issues.sort(key=lambda x: x.get('position_in_column', 999))
-            return waiting_issues[0]
-
-        # Update cached positions from GitHub
-        board_positions = {
-            item['issue_number']: item['position']
-            for item in current_board_order
-        }
-
-        for issue in waiting_issues:
-            if issue['issue_number'] in board_positions:
-                old_position = issue.get('position_in_column')
-                new_position = board_positions[issue['issue_number']]
-
-                if old_position != new_position:
-                    logger.info(
-                        f"Issue #{issue['issue_number']} position changed: "
-                        f"{old_position} → {new_position}"
-                    )
-                    issue['position_in_column'] = new_position
-                    issue['last_position_check'] = datetime.now(timezone.utc).isoformat()
-
-        # Save updated positions
-        self.save_queue(queue)
-
-        # Sort waiting issues by their current GitHub board position
-        waiting_issues_with_positions = [
-            issue for issue in waiting_issues
-            if issue['issue_number'] in board_positions
-        ]
-
-        if not waiting_issues_with_positions:
-            logger.warning(
-                f"Waiting issues not found in GitHub board column: "
-                f"{[issue['issue_number'] for issue in waiting_issues]}"
-            )
-            # Clean up queue - remove issues not found on board
-            for issue in waiting_issues:
-                if issue['issue_number'] not in board_positions:
-                    logger.info(
-                        f"Removing issue #{issue['issue_number']} from queue "
-                        f"(no longer in trigger column)"
-                    )
-                    self.remove_issue_from_queue(issue['issue_number'])
-            return None
-
-        # Sort by position (lowest = topmost on board = highest priority)
-        waiting_issues_with_positions.sort(
-            key=lambda x: x['position_in_column']
-        )
-
-        next_issue = waiting_issues_with_positions[0]
-
         logger.info(
             f"Next issue to execute: #{next_issue['issue_number']} "
             f"(position {next_issue['position_in_column']} in '{trigger_column}')"
@@ -431,7 +482,6 @@ class PipelineQueueManager:
 
         active_issues = [i for i in queue if i['status'] == 'active']
         waiting_issues = [i for i in queue if i['status'] == 'waiting']
-        completed_issues = [i for i in queue if i['status'] == 'completed']
 
         return {
             'project': self.project_name,
@@ -439,7 +489,6 @@ class PipelineQueueManager:
             'total_issues': len(queue),
             'active_count': len(active_issues),
             'waiting_count': len(waiting_issues),
-            'completed_count': len(completed_issues),
             'active_issue': active_issues[0] if active_issues else None,
             'waiting_issues': waiting_issues,
             'last_updated': datetime.now(timezone.utc).isoformat()

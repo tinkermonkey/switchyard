@@ -74,12 +74,27 @@ class WorkExecutionStateTracker:
             }
 
         try:
-            with open(state_file, 'r') as f:
-                state = yaml.safe_load(f)
-                # Ensure all expected keys exist
-                state.setdefault('execution_history', [])
-                state.setdefault('status_changes', [])
-                return state
+            from utils.file_lock import file_lock
+
+            # Use file lock when reading to prevent reading partial writes
+            lock_file = state_file.with_suffix(state_file.suffix + '.lock')
+            with file_lock(lock_file):
+                if state_file.exists():  # Check again inside lock
+                    with open(state_file, 'r') as f:
+                        state = yaml.safe_load(f)
+                        # Ensure all expected keys exist
+                        state.setdefault('execution_history', [])
+                        state.setdefault('status_changes', [])
+                        return state
+            # File doesn't exist inside lock, return default
+            return {
+                'issue_number': issue_number,
+                'project_name': project_name,
+                'execution_history': [],
+                'status_changes': [],
+                'current_status': None,
+                'last_updated': None
+            }
         except Exception as e:
             logger.error(f"Failed to load state for {project_name}/#{issue_number}: {e}")
             return {
@@ -92,13 +107,16 @@ class WorkExecutionStateTracker:
             }
 
     def save_state(self, project_name: str, issue_number: int, state: Dict):
-        """Save execution state for an issue"""
+        """Save execution state for an issue with thread-safe file locking"""
+        from utils.file_lock import safe_yaml_write
+
         state_file = self.get_state_file(project_name, issue_number)
 
         try:
             state['last_updated'] = datetime.now(timezone.utc).isoformat()
-            with open(state_file, 'w') as f:
-                yaml.dump(state, f, default_flow_style=False, sort_keys=False)
+            with safe_yaml_write(state_file):
+                with open(state_file, 'w') as f:
+                    yaml.dump(state, f, default_flow_style=False, sort_keys=False)
 
             logger.debug(f"Saved execution state for {project_name}/#{issue_number}")
         except Exception as e:
@@ -494,105 +512,122 @@ class WorkExecutionStateTracker:
         cleaned_count = 0
         for state_file in state_files:
             try:
-                # Load state
-                with open(state_file, 'r') as f:
-                    state = yaml.safe_load(f)
+                from utils.file_lock import file_lock
 
-                if not state or 'execution_history' not in state:
-                    continue
+                # Use file lock for entire read-modify-write cycle
+                lock_file = state_file.with_suffix(state_file.suffix + '.lock')
+                with file_lock(lock_file):
+                    # Load state
+                    if not state_file.exists():  # Check inside lock
+                        continue
+                    with open(state_file, 'r') as f:
+                        state = yaml.safe_load(f)
 
-                project_name = state.get('project_name')
-                issue_number = state.get('issue_number')
+                    if not state or 'execution_history' not in state:
+                        continue
 
-                # Find in_progress executions
-                modified = False
-                for execution in state['execution_history']:
-                    if execution.get('outcome') == 'in_progress':
-                        agent = execution.get('agent')
-                        column = execution.get('column')
-                        timestamp = execution.get('timestamp')
+                    project_name = state.get('project_name')
+                    issue_number = state.get('issue_number')
 
-                        logger.info(
-                            f"Found stuck in_progress execution: {project_name}/#{issue_number} "
-                            f"{agent} in {column} from {timestamp}"
-                        )
-
-                        # Check if agent/repair cycle container still exists using two methods:
-                        # 1. Docker ps (checks if container actually exists)
-                        # 2. Redis tracking keys (checks orchestrator's view of active agents)
-                        
-                        # Method 1: Check Docker for RUNNING agent containers (not exited ones)
-                        result = subprocess.run(
-                            ['docker', 'ps', '--filter', f'name={project_name}',
-                             '--filter', f'name={agent}', '--format', '{{.Names}}'],
-                            capture_output=True,
-                            text=True,
-                            timeout=5
-                        )
-                        has_agent_container = bool(result.stdout.strip())
-                        
-                        # Also check for RUNNING repair cycle containers (format: repair-cycle-{project}-{issue}-{run_id})
-                        # Important: Use 'docker ps' not 'docker ps -a' to only find running containers
-                        result = subprocess.run(
-                            ['docker', 'ps', '--filter', f'name=repair-cycle-{project_name}-{issue_number}',
-                             '--format', '{{.Names}}'],
-                            capture_output=True,
-                            text=True,
-                            timeout=5
-                        )
-                        has_repair_cycle_container = bool(result.stdout.strip())
-                        
-                        has_docker_container = has_agent_container or has_repair_cycle_container
-                        
-                        # Method 2: Check Redis tracking keys for agents
-                        has_redis_tracking = self._check_redis_tracking_for_agent(project_name, agent, issue_number)
-                        
-                        # Also check for repair cycle Redis tracking
-                        has_repair_cycle_tracking = self._check_redis_repair_cycle_tracking(project_name, issue_number)
-                        
-                        has_redis_tracking = has_redis_tracking or has_repair_cycle_tracking
-                        
-                        # Container is running if either Docker or Redis tracking shows it
-                        has_running_container = has_docker_container or has_redis_tracking
-                        
-                        if has_docker_container and not has_redis_tracking:
-                            logger.warning(
-                                f"Container exists in Docker but not in Redis tracking for "
-                                f"{project_name}/#{issue_number} {agent}"
-                            )
-                        elif has_redis_tracking and not has_docker_container:
-                            logger.warning(
-                                f"Redis tracking exists but container not found in Docker for "
-                                f"{project_name}/#{issue_number} {agent} (orphaned tracking key)"
-                            )
-
-                        if not has_running_container:
-                            # No container found, mark as failed due to orchestrator restart
-                            execution['outcome'] = 'failure'
-                            execution['error'] = (
-                                'Agent execution interrupted by orchestrator restart. '
-                                'Container no longer exists. This execution did not complete normally.'
-                            )
-                            modified = True
-                            cleaned_count += 1
+                    # Find in_progress executions
+                    modified = False
+                    for execution in state['execution_history']:
+                        if execution.get('outcome') == 'in_progress':
+                            agent = execution.get('agent')
+                            column = execution.get('column')
+                            timestamp = execution.get('timestamp')
 
                             logger.info(
-                                f"Marked stuck execution as failed: {project_name}/#{issue_number} "
-                                f"{agent} in {column} (no container found)"
-                            )
-                        else:
-                            logger.info(
-                                f"Agent container still running for {project_name}/#{issue_number}, "
-                                f"keeping in_progress state"
+                                f"Found stuck in_progress execution: {project_name}/#{issue_number} "
+                                f"{agent} in {column} from {timestamp}"
                             )
 
-                # Save if modified
-                if modified:
-                    state['last_updated'] = datetime.now(timezone.utc).isoformat()
-                    with open(state_file, 'w') as f:
-                        yaml.dump(state, f, default_flow_style=False, sort_keys=False)
+                            # Check if agent/repair cycle container still exists using two methods:
+                            # 1. Docker ps (checks if container actually exists)
+                            # 2. Redis tracking keys (checks orchestrator's view of active agents)
 
-                    logger.info(f"Updated state file: {state_file}")
+                            # Method 1: Check Docker for RUNNING agent containers (not exited ones)
+                            result = subprocess.run(
+                                ['docker', 'ps', '--filter', f'name={project_name}',
+                                 '--filter', f'name={agent}', '--format', '{{.Names}}'],
+                                capture_output=True,
+                                text=True,
+                                timeout=5
+                            )
+                            has_agent_container = bool(result.stdout.strip())
+
+                            # Also check for RUNNING repair cycle containers (format: repair-cycle-{project}-{issue}-{run_id})
+                            # Important: Use 'docker ps' not 'docker ps -a' to only find running containers
+                            result = subprocess.run(
+                                ['docker', 'ps', '--filter', f'name=repair-cycle-{project_name}-{issue_number}',
+                                 '--format', '{{.Names}}'],
+                                capture_output=True,
+                                text=True,
+                                timeout=5
+                            )
+                            has_repair_cycle_container = bool(result.stdout.strip())
+
+                            has_docker_container = has_agent_container or has_repair_cycle_container
+
+                            # Method 2: Check Redis tracking keys for agents
+                            has_redis_tracking = self._check_redis_tracking_for_agent(project_name, agent, issue_number)
+
+                            # Also check for repair cycle Redis tracking
+                            has_repair_cycle_tracking = self._check_redis_repair_cycle_tracking(project_name, issue_number)
+
+                            has_redis_tracking = has_redis_tracking or has_repair_cycle_tracking
+
+                            # Container is running if either Docker or Redis tracking shows it
+                            has_running_container = has_docker_container or has_redis_tracking
+
+                            if has_docker_container and not has_redis_tracking:
+                                logger.warning(
+                                    f"Container exists in Docker but not in Redis tracking for "
+                                    f"{project_name}/#{issue_number} {agent}"
+                                )
+                            elif has_redis_tracking and not has_docker_container:
+                                logger.warning(
+                                    f"Redis tracking exists but container not found in Docker for "
+                                    f"{project_name}/#{issue_number} {agent} (orphaned tracking key)"
+                                )
+
+                            if not has_running_container:
+                                # No container found - agent may have finished or been killed
+                                # Check if we can determine the actual outcome by looking for output
+
+                                # For now, we conservatively mark as failed since we can't verify success
+                                # If the agent completed successfully, agent_executor should have recorded it
+                                # The fact that it's still in_progress means either:
+                                # 1. Agent crashed/was killed before completing
+                                # 2. Orchestrator was killed before outcome could be recorded
+                                # 3. Bug in execution outcome recording (which we just fixed above)
+
+                                execution['outcome'] = 'failure'
+                                execution['error'] = (
+                                    'Agent execution interrupted by orchestrator restart. '
+                                    'Container no longer exists and execution state was not updated. '
+                                    'This indicates the agent did not complete normally or the outcome was not recorded before restart.'
+                                )
+                                modified = True
+                                cleaned_count += 1
+
+                                logger.info(
+                                    f"Marked stuck execution as failed: {project_name}/#{issue_number} "
+                                    f"{agent} in {column} (no container found, outcome not recorded)"
+                                )
+                            else:
+                                logger.info(
+                                    f"Agent container still running for {project_name}/#{issue_number}, "
+                                    f"keeping in_progress state"
+                                )
+
+                    # Save if modified (still inside the lock)
+                    if modified:
+                        state['last_updated'] = datetime.now(timezone.utc).isoformat()
+                        with open(state_file, 'w') as f:
+                            yaml.dump(state, f, default_flow_style=False, sort_keys=False)
+
+                        logger.info(f"Updated state file: {state_file}")
 
             except Exception as e:
                 logger.error(f"Error processing state file {state_file}: {e}")

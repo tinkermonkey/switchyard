@@ -220,11 +220,34 @@ async def main():
                     workflow_template = config_manager.get_workflow_template(pipeline.workflow)
                     exit_columns = getattr(workflow_template, 'pipeline_exit_columns', [])
 
-                    if not lock_holder_column or lock_holder_column in exit_columns:
+                    # Check if the lock holder's column has an agent
+                    column_has_agent = False
+                    if lock_holder_column:
+                        for col in workflow_template.columns:
+                            if col.name == lock_holder_column:
+                                column_has_agent = col.agent and col.agent != 'null'
+                                break
+
+                    # Release lock if:
+                    # 1. Issue is removed from board (no column)
+                    # 2. Issue is in an exit column
+                    # 3. Issue is in a column with no agent (like Backlog)
+                    should_release = (
+                        not lock_holder_column or
+                        lock_holder_column in exit_columns or
+                        not column_has_agent
+                    )
+
+                    if should_release:
                         # Lock holder is no longer active or in exit column - release lock
+                        reason = (
+                            'removed' if not lock_holder_column
+                            else 'no agent' if not column_has_agent
+                            else 'exit column'
+                        )
                         logger.info(
                             f"Releasing orphaned lock for {project_name}/{pipeline.board_name} "
-                            f"(issue #{lock.locked_by_issue} in column: {lock_holder_column or 'removed'})"
+                            f"(issue #{lock.locked_by_issue} in column '{lock_holder_column or 'removed'}', reason: {reason})"
                         )
 
                         lock_manager.release_lock(
@@ -232,22 +255,44 @@ async def main():
                         )
                         locks_released += 1
 
-                        # Mark issue as completed in queue if present
+                        # Remove issue from queue if present
+                        # (it will be re-added if moved back to trigger column)
                         pipeline_queue = get_pipeline_queue_manager(
                             project_name, pipeline.board_name
                         )
                         if pipeline_queue.is_issue_in_queue(lock.locked_by_issue):
-                            pipeline_queue.mark_issue_completed(lock.locked_by_issue)
+                            pipeline_queue.remove_issue_from_queue(lock.locked_by_issue)
 
                         # NOTE: We don't process the next waiting issue here
                         # The regular monitoring loop will pick it up
                     else:
-                        # Lock holder is still active - keep the lock
+                        # Lock holder is still active - keep the lock and re-trigger agent
                         logger.info(
                             f"Keeping lock for {project_name}/{pipeline.board_name} "
                             f"(issue #{lock.locked_by_issue} still in column '{lock_holder_column}')"
                         )
                         locks_recovered += 1
+
+                        # Re-trigger agent for this issue to resume work
+                        # (May have been interrupted mid-execution during restart)
+                        try:
+                            logger.info(
+                                f"Re-triggering agent for recovered lock holder "
+                                f"issue #{lock.locked_by_issue} in column '{lock_holder_column}'"
+                            )
+                            temp_monitor.trigger_agent_for_status(
+                                project_name=project_name,
+                                board_name=pipeline.board_name,
+                                issue_number=lock.locked_by_issue,
+                                status=lock_holder_column,
+                                repository=project_config.github['repo']
+                            )
+                        except Exception as trigger_error:
+                            logger.error(
+                                f"Failed to re-trigger agent for issue #{lock.locked_by_issue}: {trigger_error}"
+                            )
+                            import traceback
+                            logger.error(traceback.format_exc())
 
         except Exception as e:
             logger.error(f"Error recovering locks for project {project_name}: {e}")
@@ -357,6 +402,23 @@ async def main():
     scheduler.start()
     logger.info("Scheduled tasks service started")
 
+    # Initialize worker pool for parallel task processing
+    # orchestrator_workers controls concurrency:
+    #   1 = single-threaded (backward compatible, default)
+    #   2-8 = multi-threaded (recommended for multi-project deployments)
+    num_workers = env_config.orchestrator_workers
+    logger.info(f"Configuring task execution with {num_workers} worker(s)")
+
+    worker_pool = None
+    if num_workers > 1:
+        # Multi-threaded execution via worker pool
+        from services.worker_pool import WorkerPoolManager
+        worker_pool = WorkerPoolManager(num_workers, task_queue, metrics, logger)
+        worker_pool.start()
+        logger.info(f"Worker pool started with {num_workers} workers (multi-threaded mode)")
+    else:
+        logger.info("Single-threaded mode enabled (orchestrator_workers=1)")
+
     # Main orchestration loop
     logger.debug("Entering main orchestration loop")
 
@@ -369,103 +431,120 @@ async def main():
     # even when health checks are running at max_backoff (300s) with execution delays
     last_health_check = 0
 
-    while True:
-        try:
-            # Periodic health check with exponential backoff on failures
-            current_time = time.time()
-            if current_time - last_health_check >= health_check_backoff:
-                logger.debug("Running health check")
-                health = await health_monitor.check_health()
-                last_health_check = current_time
-                logger.debug(f"Health check complete: healthy={health['healthy']}")
+    try:
+        while True:
+            try:
+                # Periodic health check with exponential backoff on failures
+                current_time = time.time()
+                if current_time - last_health_check >= health_check_backoff:
+                    logger.debug("Running health check")
+                    health = await health_monitor.check_health()
+                    last_health_check = current_time
+                    logger.debug(f"Health check complete: healthy={health['healthy']}")
 
-                if not health['healthy']:
-                    consecutive_health_failures += 1
-                    logger.log_warning(f"System health check failed (attempt {consecutive_health_failures}/{max_consecutive_failures}): {health}")
+                    if not health['healthy']:
+                        consecutive_health_failures += 1
+                        logger.log_warning(f"System health check failed (attempt {consecutive_health_failures}/{max_consecutive_failures}): {health}")
 
-                    # Check specifically for GitHub project management failures
-                    github_check = health['checks'].get('github', {})
-                    if not github_check.get('healthy', False):
-                        error_msg = github_check.get('error', 'Unknown error')
+                        # Check specifically for GitHub project management failures
+                        github_check = health['checks'].get('github', {})
+                        if not github_check.get('healthy', False):
+                            error_msg = github_check.get('error', 'Unknown error')
 
-                        # Check if this is a transient network error
-                        is_transient = any(keyword in error_msg.lower() for keyword in [
-                            'eof', 'timeout', 'connection', 'network', 'temporary'
-                        ])
+                            # Check if this is a transient network error
+                            is_transient = any(keyword in error_msg.lower() for keyword in [
+                                'eof', 'timeout', 'connection', 'network', 'temporary'
+                            ])
 
-                        if is_transient:
-                            logger.log_warning(f"Transient GitHub connectivity issue detected: {error_msg}")
-                            logger.log_warning(f"Will retry with {health_check_backoff}s backoff")
-                            # Exponential backoff for transient errors
-                            health_check_backoff = min(health_check_backoff * 2, max_backoff)
+                            if is_transient:
+                                logger.log_warning(f"Transient GitHub connectivity issue detected: {error_msg}")
+                                logger.log_warning(f"Will retry with {health_check_backoff}s backoff")
+                                # Exponential backoff for transient errors
+                                health_check_backoff = min(health_check_backoff * 2, max_backoff)
+                            else:
+                                logger.log_error(f"GitHub connectivity/permissions failed: {error_msg}")
+                                if github_check.get('critical'):
+                                    logger.log_error(f"Critical issue: {github_check['critical']}")
+
+                                # Only exit if we've failed consistently (not a transient issue)
+                                if consecutive_health_failures >= max_consecutive_failures:
+                                    logger.log_error(f"GitHub access has failed {max_consecutive_failures} consecutive times")
+                                    logger.log_error("Exiting due to persistent GitHub connectivity failure")
+                                    exit(1)
                         else:
-                            logger.log_error(f"GitHub connectivity/permissions failed: {error_msg}")
-                            if github_check.get('critical'):
-                                logger.log_error(f"Critical issue: {github_check['critical']}")
-
-                            # Only exit if we've failed consistently (not a transient issue)
-                            if consecutive_health_failures >= max_consecutive_failures:
-                                logger.log_error(f"GitHub access has failed {max_consecutive_failures} consecutive times")
-                                logger.log_error("Exiting due to persistent GitHub connectivity failure")
-                                exit(1)
+                            # Non-GitHub health issues can continue with warnings
+                            logger.log_warning("Non-critical health check failures detected - continuing with degraded functionality")
                     else:
-                        # Non-GitHub health issues can continue with warnings
-                        logger.log_warning("Non-critical health check failures detected - continuing with degraded functionality")
+                        # Health check passed - reset counters and backoff
+                        if consecutive_health_failures > 0:
+                            logger.info(f"Health check recovered after {consecutive_health_failures} failures")
+                        consecutive_health_failures = 0
+                        health_check_backoff = 10  # Reset to 10 seconds
+
+                # Worker pool mode vs single-threaded mode
+                if worker_pool:
+                    # Multi-threaded: Workers handle tasks, main loop just monitors
+                    active_tasks = worker_pool.get_active_tasks()
+                    if active_tasks:
+                        logger.debug(f"Active tasks: {len(active_tasks)} across {num_workers} workers")
+
+                    # Sleep longer since workers are doing the work
+                    await asyncio.sleep(10)
                 else:
-                    # Health check passed - reset counters and backoff
-                    if consecutive_health_failures > 0:
-                        logger.info(f"Health check recovered after {consecutive_health_failures} failures")
-                    consecutive_health_failures = 0
-                    health_check_backoff = 10  # Reset to 10 seconds
+                    # Single-threaded: Main loop processes tasks (original behavior)
+                    logger.debug("Checking task queue for new tasks")
+                    task = task_queue.dequeue()
+                    logger.debug(f"Dequeued task: {task.id if task else 'None'}")
+                    if task:
+                        logger.log_agent_start(task.agent, task.id, task.context)
 
-            # Process next task
-            logger.debug("Checking task queue for new tasks")
-            task = task_queue.dequeue()
-            logger.debug(f"Dequeued task: {task.id if task else 'None'}")
-            if task:
-                logger.log_agent_start(task.agent, task.id, task.context)
-                
-                start_time = time.time()
-                try:
-                    result = await process_task_integrated(task, state_manager, logger)
-                    duration = time.time() - start_time
-                    
-                    logger.log_agent_complete(
-                        task.agent, 
-                        task.id, 
-                        duration, 
-                        result
-                    )
-                    metrics.record_task_complete(
-                        task.agent,
-                        duration,
-                        success=True
-                    )
+                        start_time = time.time()
+                        try:
+                            result = await process_task_integrated(task, state_manager, logger)
+                            duration = time.time() - start_time
 
-                    # Record pipeline-specific metrics
-                    if hasattr(result, 'get') and result.get('quality_metrics'):
-                        quality_scores = result['quality_metrics']
-                        for metric_name, score in quality_scores.items():
-                            # Record quality metrics if the method exists
-                            if hasattr(metrics, 'record_quality_metric'):
-                                metrics.record_quality_metric(task.agent, metric_name, score)
-                    
-                except Exception as e:
-                    logger.log_error(f"Task failed: {e}")
-                    metrics.record_task_complete(
-                        task.agent,
-                        time.time() - start_time,
-                        success=False
-                    )
-            
-            await asyncio.sleep(5)
-            
-        except KeyboardInterrupt:
-            logger.info("Shutting down orchestrator")
-            break
-        except Exception as e:
-            logger.log_error(f"Orchestrator error: {e}")
-            await asyncio.sleep(5)
+                            logger.log_agent_complete(
+                                task.agent,
+                                task.id,
+                                duration,
+                                result
+                            )
+                            metrics.record_task_complete(
+                                task.agent,
+                                duration,
+                                success=True
+                            )
+
+                            # Record pipeline-specific metrics
+                            if hasattr(result, 'get') and result.get('quality_metrics'):
+                                quality_scores = result['quality_metrics']
+                                for metric_name, score in quality_scores.items():
+                                    # Record quality metrics if the method exists
+                                    if hasattr(metrics, 'record_quality_metric'):
+                                        metrics.record_quality_metric(task.agent, metric_name, score)
+
+                        except Exception as e:
+                            logger.log_error(f"Task failed: {e}")
+                            metrics.record_task_complete(
+                                task.agent,
+                                time.time() - start_time,
+                                success=False
+                            )
+
+                    await asyncio.sleep(5)
+
+            except KeyboardInterrupt:
+                logger.info("Shutting down orchestrator")
+                break
+            except Exception as e:
+                logger.log_error(f"Orchestrator error: {e}")
+                await asyncio.sleep(5)
+
+    finally:
+        # Cleanup: Stop worker pool if running
+        if worker_pool:
+            logger.info("Stopping worker pool...")
+            worker_pool.stop()
 
 if __name__ == "__main__":
     asyncio.run(main())

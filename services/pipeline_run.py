@@ -611,22 +611,90 @@ class PipelineRunManager:
             import subprocess
             from datetime import datetime, timedelta
             
-            # Check 1: Are there actual Docker containers running for this issue?
+            # Check 0: CRITICAL - Check execution state FIRST before looking at containers
+            # If there's an in_progress execution, the run is definitely active
+            # This prevents race conditions during startup where containers might be
+            # in the process of being recovered
             try:
+                from services.work_execution_state import work_execution_tracker
+                execution_history = work_execution_tracker.get_execution_history(project, issue_number)
+
+                # Check if there's any in_progress execution
+                for execution in reversed(execution_history):
+                    if execution.get('outcome') == 'in_progress':
+                        logger.info(
+                            f"Pipeline run {pipeline_run_id} has in_progress execution: "
+                            f"agent={execution.get('agent')}, column={execution.get('column')}"
+                        )
+                        return True
+            except Exception as e:
+                logger.warning(f"Error checking execution state: {e}")
+
+            # Check 1: Are there actual Docker containers running for this issue?
+            # CRITICAL FIX: Use proper container name parsing to handle projects with dashes
+            try:
+                # Get ALL agent containers and parse them properly
+                # We can't use precise Docker filters because project names can contain dashes
                 result = subprocess.run(
-                    ['docker', 'ps', '--filter', f'name={project}', 
-                     '--filter', f'name={issue_number}', '--format', '{{.Names}}'],
+                    ['docker', 'ps', '--filter', 'name=claude-agent-',
+                     '--format', '{{.Names}}'],
                     capture_output=True,
                     text=True,
                     timeout=5
                 )
-                
+
                 if result.returncode == 0 and result.stdout.strip():
                     container_names = result.stdout.strip().split('\n')
-                    logger.info(
-                        f"Pipeline run {pipeline_run_id} has running Docker containers: {container_names}"
-                    )
-                    return True
+
+                    # Use the proper parsing logic from agent_container_recovery
+                    from services.agent_container_recovery import get_agent_container_recovery
+                    recovery_service = get_agent_container_recovery()
+
+                    for container_name in container_names:
+                        # Parse the container name properly
+                        metadata = recovery_service.parse_container_name(container_name)
+
+                        if metadata and metadata['project'] == project:
+                            # Check if this container is for our issue
+                            # The task_id or container name might contain the issue number
+                            issue_str = str(issue_number)
+                            if issue_str in container_name:
+                                logger.info(
+                                    f"Pipeline run {pipeline_run_id} has running agent container: {container_name} "
+                                    f"(project={metadata['project']}, task_id={metadata.get('task_id')})"
+                                )
+                                return True
+
+                # Check for repair cycle containers (format: repair-cycle-{project}-{issue}-{run_id})
+                # Get all repair cycle containers and parse them properly
+                result = subprocess.run(
+                    ['docker', 'ps', '--filter', 'name=repair-cycle-',
+                     '--format', '{{.Names}}'],
+                    capture_output=True,
+                    text=True,
+                    timeout=5
+                )
+
+                if result.returncode == 0 and result.stdout.strip():
+                    container_names = result.stdout.strip().split('\n')
+
+                    # Use the proper parsing logic from agent_container_recovery
+                    from services.agent_container_recovery import get_agent_container_recovery
+                    recovery_service = get_agent_container_recovery()
+
+                    for container_name in container_names:
+                        # Parse repair cycle container name properly
+                        metadata = recovery_service.parse_repair_cycle_container_name(container_name)
+
+                        if (metadata and
+                            metadata['project'] == project and
+                            int(metadata['issue_number']) == issue_number):
+                            logger.info(
+                                f"Pipeline run {pipeline_run_id} has running repair cycle container: {container_name} "
+                                f"(project={metadata['project']}, issue={metadata['issue_number']})"
+                            )
+                            return True
+
             except Exception as e:
                 logger.warning(f"Error checking Docker containers: {e}")
             
