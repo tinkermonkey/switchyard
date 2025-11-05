@@ -577,8 +577,10 @@ class WorkExecutionStateTracker:
 
                             has_redis_tracking = has_redis_tracking or has_repair_cycle_tracking
 
-                            # Container is running if either Docker or Redis tracking shows it
-                            has_running_container = has_docker_container or has_redis_tracking
+                            # IMPORTANT: Docker is the source of truth for running containers.
+                            # Redis tracking keys can persist after containers die (orphaned keys).
+                            # Only trust Docker to determine if a container is actually running.
+                            has_running_container = has_docker_container
 
                             if has_docker_container and not has_redis_tracking:
                                 logger.warning(
@@ -590,6 +592,20 @@ class WorkExecutionStateTracker:
                                     f"Redis tracking exists but container not found in Docker for "
                                     f"{project_name}/#{issue_number} {agent} (orphaned tracking key)"
                                 )
+                                # Clean up orphaned Redis tracking keys
+                                try:
+                                    import redis
+                                    redis_client = redis.Redis(host='redis', port=6379, decode_responses=True)
+
+                                    # Clean up agent tracking key if exists
+                                    agent_key = f"agent:container:claude-agent-{project_name}-*"
+                                    # For repair cycle tracking
+                                    repair_cycle_key = f"repair_cycle:container:{project_name}:{issue_number}"
+                                    deleted = redis_client.delete(repair_cycle_key)
+                                    if deleted:
+                                        logger.info(f"Cleaned up orphaned repair cycle Redis key: {repair_cycle_key}")
+                                except Exception as e:
+                                    logger.warning(f"Failed to clean up orphaned Redis keys: {e}")
 
                             if not has_running_container:
                                 # No container found - agent may have finished or been killed
