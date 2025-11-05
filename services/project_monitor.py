@@ -379,6 +379,10 @@ class ProjectMonitor:
         self.config_manager = config_manager or ConfigManager()
         self.last_state = {}  # Store last known state of each project
 
+        # Signal when startup rescan is complete (for coordinating worker startup)
+        import threading
+        self.rescan_complete = threading.Event()
+
         # Initialize feedback manager
         from services.feedback_manager import FeedbackManager
         self.feedback_manager = FeedbackManager()
@@ -2684,6 +2688,32 @@ _Review cycle initiated by Claude Code Orchestrator_
                                 logger.info(f"Ended pipeline run for {project_name}/#{issue_number} due to failure")
                         except Exception as e:
                             logger.error(f"Failed to end pipeline run in finally block: {e}")
+
+                    # CRITICAL: Release pipeline lock on failure
+                    # On success, the lock will be released when auto-advancing to next column
+                    # On failure, the issue stays in Testing, so we must explicitly release the lock
+                    if not overall_success:
+                        try:
+                            from services.pipeline_lock_manager import get_pipeline_lock_manager
+                            lock_manager = get_pipeline_lock_manager()
+                            current_lock = lock_manager.get_lock(project_name, board_name)
+
+                            if current_lock and current_lock.locked_by_issue == issue_number:
+                                logger.info(
+                                    f"Releasing pipeline lock for {project_name}/{board_name} "
+                                    f"(repair cycle for issue #{issue_number} failed)"
+                                )
+                                lock_manager.release_lock(project_name, board_name, issue_number)
+                            else:
+                                logger.warning(
+                                    f"Lock for {project_name}/{board_name} not held by issue #{issue_number} "
+                                    f"during repair cycle failure cleanup"
+                                )
+                        except Exception as lock_error:
+                            logger.error(
+                                f"CRITICAL: Failed to release lock for {project_name}/{board_name} "
+                                f"after repair cycle failure: {lock_error}", exc_info=True
+                            )
                 except Exception as state_error:
                     logger.error(
                         f"CRITICAL: Failed to update execution state for {project_name}/#{issue_number}: "
@@ -2712,7 +2742,44 @@ _Review cycle initiated by Claude Code Orchestrator_
         try:
             import asyncio
             import threading
+            import subprocess
             from pipeline.repair_cycle import RepairCycleStage, RepairTestRunConfig, RepairTestType
+
+            # CRITICAL: Check if a repair cycle container is already running for this issue
+            # This prevents duplicate containers when recovery reconnects to an existing container
+            # and the normal monitoring loop also tries to start one
+            if self.task_queue.redis_client:
+                try:
+                    redis_key = f"repair_cycle:container:{project_name}:{issue_number}"
+                    existing_container_name = self.task_queue.redis_client.get(redis_key)
+
+                    if existing_container_name:
+                        # Redis says there's a container - verify it's actually running in Docker
+                        result = subprocess.run(
+                            ['docker', 'ps', '--filter', f'name={existing_container_name}',
+                             '--format', '{{.Names}}'],
+                            capture_output=True,
+                            text=True,
+                            timeout=5
+                        )
+
+                        if result.stdout.strip():
+                            # Container is actually running - don't start a duplicate
+                            logger.warning(
+                                f"Repair cycle container already running for {project_name}/#{issue_number}: "
+                                f"{existing_container_name}. Skipping duplicate launch."
+                            )
+                            return stage_config.default_agent
+                        else:
+                            # Orphaned Redis key - container not running, clean it up
+                            logger.warning(
+                                f"Found orphaned repair cycle Redis key for {project_name}/#{issue_number} "
+                                f"(container {existing_container_name} not running). Cleaning up and proceeding."
+                            )
+                            self.task_queue.redis_client.delete(redis_key)
+                except Exception as e:
+                    logger.warning(f"Error checking for existing repair cycle container: {e}")
+                    # Continue anyway - better to risk a duplicate than block work
 
             # Get issue details
             issue_data = self.get_issue_details(repository, issue_number, project_config.github['org'])
@@ -2767,6 +2834,31 @@ _Review cycle initiated by Claude Code Orchestrator_
                 board=board_name
             )
             logger.debug(f"Using pipeline run {pipeline_run.id} for repair cycle on issue #{issue_number}")
+
+            # CRITICAL: Acquire pipeline lock before starting repair cycle
+            # Repair cycles have PRIORITY over Development items - they can steal the lock if needed
+            from services.pipeline_lock_manager import get_pipeline_lock_manager
+            lock_manager = get_pipeline_lock_manager()
+
+            current_lock = lock_manager.get_lock(project_name, board_name)
+
+            if current_lock and current_lock.locked_by_issue != issue_number:
+                # Lock held by another issue - repair cycle has priority, so force-steal it
+                logger.warning(
+                    f"Repair cycle for issue #{issue_number} is stealing pipeline lock from issue #{current_lock.locked_by_issue} "
+                    f"(repair cycles have priority over {status})"
+                )
+                # Release the old lock
+                lock_manager.release_lock(project_name, board_name, current_lock.locked_by_issue)
+                # Acquire for this issue
+                lock_manager._create_lock(project_name, board_name, issue_number)
+            elif not current_lock:
+                # No lock exists, acquire it
+                logger.info(f"Repair cycle for issue #{issue_number} acquiring pipeline lock")
+                lock_manager._create_lock(project_name, board_name, issue_number)
+            else:
+                # Already hold the lock (may have held it from Development stage)
+                logger.debug(f"Repair cycle for issue #{issue_number} already holds pipeline lock")
 
             logger.info(
                 f"Starting repair cycle for issue #{issue_number} in Docker container "
@@ -2978,56 +3070,109 @@ _Repair cycle initiated by Claude Code Orchestrator_
         
         try:
             dispatched_count = 0
-            
+
+            # PHASE 1: Collect all stalled items and categorize by priority
+            # Repair cycles (Testing) get priority over Development items
+            repair_cycle_items = []  # High priority - already in progress
+            other_items = []  # Lower priority - new work
+
             for project_name in self.config_manager.list_visible_projects():
                 project_config = self.config_manager.get_project_config(project_name)
                 project_state = state_manager.load_project_state(project_name)
-                
+
                 if not project_state:
                     continue
-                
+
                 for pipeline in project_config.pipelines:
                     if not pipeline.active:
                         continue
-                    
+
                     board_state = project_state.boards.get(pipeline.board_name)
                     if not board_state:
                         continue
-                    
+
                     # Get workflow template to check which columns need agents
                     workflow_template = self.config_manager.get_workflow_template(pipeline.workflow)
-                    
+
+                    # Get pipeline template to check for repair_cycle stages
+                    pipeline_template = self.config_manager.get_pipeline_template(pipeline.template)
+
                     # Get current items on the board
                     board_key = f"{project_name}_{pipeline.board_name}"
                     if board_key not in self.last_state:
                         continue
-                    
+
                     current_items = self.last_state[board_key].values()
-                    
+
                     for item in current_items:
                         # Find column config
                         column_config = next(
                             (c for c in workflow_template.columns if c.name == item.status),
                             None
                         )
-                        
+
                         if not column_config:
                             continue
-                        
+
                         # Check if column requires agent action
                         has_agent = column_config.agent and column_config.agent != 'null'
 
                         if not has_agent:
                             continue
 
+                        # Determine if this is a repair_cycle stage (need this early for container checks)
+                        is_repair_cycle = False
+                        if pipeline_template:
+                            stage_name = column_config.stage_mapping if hasattr(column_config, 'stage_mapping') else None
+                            if stage_name:
+                                for stage in pipeline_template.stages:
+                                    if stage.stage == stage_name and getattr(stage, 'stage_type', None) == 'repair_cycle':
+                                        is_repair_cycle = True
+                                        break
+
                         # Check if there's already an active pipeline run
                         has_active_run = self.pipeline_run_manager.get_active_pipeline_run(
                             project_name, item.issue_number
                         )
 
-                        if has_active_run:
+                        # CRITICAL: For repair cycles, check if container is actually running
+                        # If container is missing, we need to restart even with active pipeline run
+                        container_is_running = False
+                        if is_repair_cycle and has_active_run:
+                            # Check Redis for repair cycle container tracking
+                            if self.task_queue.redis_client:
+                                redis_key = f"repair_cycle:container:{project_name}:{item.issue_number}"
+                                container_name = self.task_queue.redis_client.get(redis_key)
+
+                                if container_name:
+                                    # Check if container actually exists
+                                    try:
+                                        result = subprocess.run(
+                                            ['docker', 'inspect', container_name.decode() if isinstance(container_name, bytes) else container_name],
+                                            capture_output=True,
+                                            timeout=5
+                                        )
+                                        container_is_running = (result.returncode == 0)
+
+                                        if not container_is_running:
+                                            logger.warning(
+                                                f"Repair cycle for issue #{item.issue_number} has active pipeline run "
+                                                f"but container {container_name} is not running - will restart"
+                                            )
+                                    except Exception as e:
+                                        logger.warning(f"Error checking container status for issue #{item.issue_number}: {e}")
+                                        container_is_running = False
+                                else:
+                                    logger.warning(
+                                        f"Repair cycle for issue #{item.issue_number} has active pipeline run "
+                                        f"but no container tracking in Redis - will restart"
+                                    )
+
+                        # Skip if active pipeline run exists AND (not repair cycle OR container is running)
+                        if has_active_run and (not is_repair_cycle or container_is_running):
                             logger.debug(
-                                f"Issue #{item.issue_number} in {item.status} already has active pipeline run, skipping"
+                                f"Issue #{item.issue_number} in {item.status} already has active pipeline run "
+                                f"{'with running container ' if container_is_running else ''}skipping"
                             )
                             continue
 
@@ -3045,24 +3190,94 @@ _Repair cycle initiated by Claude Code Orchestrator_
                             )
                             continue
 
-                        # Item needs action - simulate item_added event
-                        logger.info(
-                            f"Dispatching agent for stalled item: {project_name} issue #{item.issue_number} "
-                            f"in column '{item.status}' (agent: {column_config.agent})"
-                        )
-                        
+                        # CRITICAL: Check if work has already been completed for this column/agent
+                        # Prevents re-triggering agents when output already exists
+                        has_existing_output = False
+                        if not is_repair_cycle:  # Repair cycles should always run if no container exists
+                            try:
+                                # Check workspace for existing agent output
+                                workspace_type = pipeline_config.workspace if hasattr(pipeline_config, 'workspace') else 'issues'
+
+                                if workspace_type == 'discussions':
+                                    # For discussions workspace, check if discussion has agent output
+                                    from config.state_manager import state_manager
+                                    discussion_id = state_manager.get_discussion_for_issue(project_name, item.issue_number)
+
+                                    if discussion_id:
+                                        # Check if discussion has comments from this agent
+                                        from services.github_discussions import GitHubDiscussions
+                                        discussions = GitHubDiscussions()
+                                        comments = discussions.get_discussion_comments(
+                                            project_config.github['org'],
+                                            project_config.github['repo'],
+                                            discussion_id
+                                        )
+
+                                        # Look for agent output in discussion
+                                        agent_name = column_config.agent
+                                        for comment in comments:
+                                            if comment.get('author', {}).get('login') in ['orchestrator-bot', 'github-actions[bot]']:
+                                                body = comment.get('body', '')
+                                                # Check if this comment is from the current agent
+                                                if f'_Processed by the {agent_name} agent_' in body:
+                                                    has_existing_output = True
+                                                    logger.info(
+                                                        f"Issue #{item.issue_number} in {item.status} already has output from "
+                                                        f"{agent_name} in discussion {discussion_id} - skipping"
+                                                    )
+                                                    break
+                            except Exception as e:
+                                logger.warning(f"Error checking for existing output on issue #{item.issue_number}: {e}")
+                                # Continue anyway - better to re-run than skip valid work
+
+                        if has_existing_output:
+                            continue
+
+                        # Build change object
                         change = {
                             'type': 'item_added',
                             'item': item,
                             'title': item.title,
-                            'status': item.status,  # Use 'status' key for consistency with process_board_changes
+                            'status': item.status,
                             'issue_number': item.issue_number,
                             'repository': item.repository
                         }
-                        
-                        # Process this as a board change
-                        self.process_board_changes([change], project_name, pipeline.board_name)
-                        dispatched_count += 1
+
+                        # Add metadata for processing
+                        item_data = {
+                            'change': change,
+                            'project_name': project_name,
+                            'board_name': pipeline.board_name,
+                            'column_config': column_config,
+                            'is_repair_cycle': is_repair_cycle
+                        }
+
+                        if is_repair_cycle:
+                            repair_cycle_items.append(item_data)
+                        else:
+                            other_items.append(item_data)
+
+            # PHASE 2: Process repair cycles FIRST (they have priority and may steal locks)
+            if repair_cycle_items:
+                logger.info(f"Processing {len(repair_cycle_items)} repair cycle items first (high priority)")
+                for item_data in repair_cycle_items:
+                    logger.info(
+                        f"Dispatching agent for stalled item: {item_data['project_name']} issue #{item_data['change']['issue_number']} "
+                        f"in column '{item_data['change']['status']}' (agent: {item_data['column_config'].agent}) [REPAIR CYCLE - HIGH PRIORITY]"
+                    )
+                    self.process_board_changes([item_data['change']], item_data['project_name'], item_data['board_name'])
+                    dispatched_count += 1
+
+            # PHASE 3: Process other items (Development, etc.)
+            if other_items:
+                logger.info(f"Processing {len(other_items)} other stalled items")
+                for item_data in other_items:
+                    logger.info(
+                        f"Dispatching agent for stalled item: {item_data['project_name']} issue #{item_data['change']['issue_number']} "
+                        f"in column '{item_data['change']['status']}' (agent: {item_data['column_config'].agent})"
+                    )
+                    self.process_board_changes([item_data['change']], item_data['project_name'], item_data['board_name'])
+                    dispatched_count += 1
             
             if dispatched_count > 0:
                 logger.info(f"Dispatched agents for {dispatched_count} stalled items after startup")
@@ -3153,11 +3368,15 @@ _Repair cycle initiated by Claude Code Orchestrator_
                 logger.info("Will use empty state, may detect false 'item_added' events on first poll")
         
         logger.info("Project state initialization complete, starting main monitoring loop...")
-        
+
         # After cleanup and state initialization, rescan boards for items needing action
         logger.info("Rescanning boards for items that need action after startup...")
         self._rescan_boards_for_stalled_items()
         logger.info("Board rescan complete")
+
+        # Signal that rescan is complete - workers can now safely start
+        self.rescan_complete.set()
+        logger.info("Startup rescan complete - worker pool can now process tasks")
 
         while True:
             try:
