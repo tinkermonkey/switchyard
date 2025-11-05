@@ -547,9 +547,11 @@ class WorkExecutionStateTracker:
                             # 2. Redis tracking keys (checks orchestrator's view of active agents)
 
                             # Method 1: Check Docker for RUNNING agent containers (not exited ones)
+                            # Use specific prefix pattern to avoid false positives from other projects
+                            # Agent container naming: claude-agent-{project}-{task_id}
                             result = subprocess.run(
-                                ['docker', 'ps', '--filter', f'name={project_name}',
-                                 '--filter', f'name={agent}', '--format', '{{.Names}}'],
+                                ['docker', 'ps', '--filter', f'name=claude-agent-{project_name}-',
+                                 '--format', '{{.Names}}'],
                                 capture_output=True,
                                 text=True,
                                 timeout=5
