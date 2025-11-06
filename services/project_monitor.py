@@ -2029,6 +2029,33 @@ class ProjectMonitor:
             if workspace_type in ['discussions', 'hybrid']:
                 discussion_id = state_manager.get_discussion_for_issue(project_name, issue_number)
 
+                # CRITICAL FIX: If no discussion exists for discussions workspace, create one NOW
+                # before starting the conversational loop. This prevents agents from posting
+                # to the issue instead of the discussion thread.
+                if not discussion_id:
+                    logger.info(
+                        f"No discussion exists for issue #{issue_number} in discussions workspace, "
+                        f"creating one before starting conversational loop"
+                    )
+                    try:
+                        self._create_discussion_from_issue(
+                            project_name,
+                            issue_number,
+                            repository,
+                            pipeline_config,
+                            project_config
+                        )
+                        # Retrieve the newly created discussion ID
+                        discussion_id = state_manager.get_discussion_for_issue(project_name, issue_number)
+                        if discussion_id:
+                            logger.info(f"Created discussion {discussion_id} for issue #{issue_number}")
+                        else:
+                            logger.error(f"Failed to retrieve discussion ID after creation for issue #{issue_number}")
+                    except Exception as e:
+                        logger.error(f"Failed to create discussion for issue #{issue_number}: {e}")
+                        import traceback
+                        logger.error(traceback.format_exc())
+
             # Get the stage config from pipeline template for this column
             pipeline_template_data = self.config_manager.get_pipeline_template(pipeline_config.template)
             current_stage_config = None

@@ -465,32 +465,44 @@ class PipelineRunManager:
     def get_pipeline_run_by_id(self, pipeline_run_id: str) -> Optional[PipelineRun]:
         """
         Get pipeline run by ID (from Redis or Elasticsearch)
-        
+
         Args:
             pipeline_run_id: Pipeline run ID
-            
+
         Returns:
             PipelineRun if found, None otherwise
         """
         # Try Redis first
         redis_key = self._get_redis_key(pipeline_run_id)
         data = self.redis.get(redis_key)
-        
+
         if data:
             try:
                 return PipelineRun.from_dict(json.loads(data))
             except Exception as e:
                 logger.error(f"Error deserializing pipeline run from Redis: {e}")
-        
-        # Fall back to Elasticsearch
+
+        # Fall back to Elasticsearch (search across all date-based indices)
         if self.es:
             try:
-                result = self.es.get(index=self.es_index, id=pipeline_run_id)
-                if result and result.get('found'):
-                    return PipelineRun.from_dict(result['_source'])
+                # Use search instead of get to query across date-based indices
+                result = self.es.search(
+                    index=f"{self.es_index_pattern}-*",
+                    body={
+                        "query": {
+                            "term": {
+                                "_id": pipeline_run_id
+                            }
+                        },
+                        "size": 1
+                    }
+                )
+
+                if result and result['hits']['total']['value'] > 0:
+                    return PipelineRun.from_dict(result['hits']['hits'][0]['_source'])
             except Exception as e:
                 logger.debug(f"Pipeline run {pipeline_run_id} not found in Elasticsearch: {e}")
-        
+
         return None
     
     def _persist_to_elasticsearch(self, pipeline_run: PipelineRun):

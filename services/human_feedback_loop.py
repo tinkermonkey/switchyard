@@ -58,6 +58,8 @@ class HumanFeedbackState:
         self.agent_outputs = []
         self.created_at = datetime.now().isoformat()
         self.claude_session_id: Optional[str] = None  # Track Claude Code session for continuity
+        # FIX #3: Track which comments we've already responded to (prevents duplicate responses)
+        self.processed_comment_ids: set = set()
 
 
 class HumanFeedbackLoopExecutor:
@@ -110,6 +112,35 @@ class HumanFeedbackLoopExecutor:
             discussion_id=discussion_id
         )
 
+        # FIX #1: Check if loop already active (in-memory duplicate prevention)
+        if issue_number in self.active_loops:
+            logger.warning(
+                f"⚠️  Conversational loop already active for issue #{issue_number}, "
+                f"skipping duplicate start (agent={column.agent}, project={project_name})"
+            )
+            return (None, False)
+
+        # FIX #2: Acquire Redis distributed lock (prevents duplicate loops across instances)
+        import redis
+        redis_client = redis.Redis(host='redis', port=6379, decode_responses=True)
+        lock_key = f"orchestrator:conversational_loop:{project_name}:{issue_number}"
+
+        # Try to acquire lock with 30 minute TTL (safety timeout)
+        lock_acquired = redis_client.set(lock_key, column.agent, nx=True, ex=1800)
+        if not lock_acquired:
+            existing_agent = redis_client.get(lock_key)
+            logger.warning(
+                f"⚠️  Another orchestrator instance is already running conversational loop "
+                f"for issue #{issue_number} (locked by agent={existing_agent}). "
+                f"Skipping duplicate start."
+            )
+            return (None, False)
+
+        logger.info(
+            f"✅ Acquired distributed lock for conversational loop: "
+            f"{project_name}#{issue_number} (agent={column.agent})"
+        )
+
         # Create state
         state = HumanFeedbackState(
             issue_number=issue_number,
@@ -146,9 +177,19 @@ class HumanFeedbackLoopExecutor:
             logger.error(f"Conversational loop failed for issue #{issue_number}: {e}")
             raise
         finally:
-            # Clean up
+            # Clean up in-memory state
             if issue_number in self.active_loops:
                 del self.active_loops[issue_number]
+
+            # Release Redis distributed lock
+            try:
+                redis_client.delete(lock_key)
+                logger.info(
+                    f"✅ Released distributed lock for conversational loop: "
+                    f"{project_name}#{issue_number}"
+                )
+            except Exception as e:
+                logger.error(f"Failed to release distributed lock for issue #{issue_number}: {e}")
 
     async def _conversational_loop(
         self,
@@ -260,6 +301,12 @@ class HumanFeedbackLoopExecutor:
                     is_initial=False,
                     human_feedback=human_feedback
                 )
+
+                # FIX #3: Mark comment as processed to prevent duplicate responses
+                comment_id = human_feedback.get('comment_id')
+                if comment_id:
+                    state.processed_comment_ids.add(comment_id)
+                    logger.info(f"✅ Marked comment {comment_id} as processed")
 
                 logger.debug("Agent responded to feedback, continuing to monitor")
 
@@ -558,8 +605,15 @@ class HumanFeedbackLoopExecutor:
                 if 'author' in comment and 'createdAt' in comment:
                     author = comment['author']['login']
                     created_at = date_parser.parse(comment['createdAt'])
+                    comment_id = comment.get('id')
+
                     if created_at.tzinfo:
                         created_at = created_at.replace(tzinfo=None)
+
+                    # FIX #3: Skip if already processed
+                    if comment_id in state.processed_comment_ids:
+                        logger.debug(f"Skipping already-processed issue comment {comment_id}")
+                        continue
 
                     if not is_bot_user(author) and created_at > last_agent_time:
                         logger.info(f"Found human feedback in issue comment from {author}")
@@ -567,7 +621,7 @@ class HumanFeedbackLoopExecutor:
                             'author': author,
                             'body': comment.get('body', ''),
                             'created_at': created_at.isoformat(),
-                            'comment_id': comment.get('id')
+                            'comment_id': comment_id
                         }
 
             return None
@@ -668,8 +722,15 @@ class HumanFeedbackLoopExecutor:
                 if 'author' in comment and 'createdAt' in comment:
                     author = comment['author']['login']
                     created_at = date_parser.parse(comment['createdAt'])
+                    comment_id = comment.get('id')
+
                     if created_at.tzinfo:
                         created_at = created_at.replace(tzinfo=None)
+
+                    # FIX #3: Skip if already processed
+                    if comment_id in state.processed_comment_ids:
+                        logger.debug(f"Skipping already-processed comment {comment_id}")
+                        continue
 
                     if not is_bot_user(author) and created_at > last_agent_time:
                         logger.info(f"Found human feedback in top-level comment from {author}")
@@ -677,7 +738,7 @@ class HumanFeedbackLoopExecutor:
                             'author': author,
                             'body': comment.get('body', ''),
                             'created_at': created_at.isoformat(),
-                            'comment_id': comment.get('id'),
+                            'comment_id': comment_id,
                             'parent_comment': None  # Top-level, no parent
                         }
 
@@ -688,12 +749,18 @@ class HumanFeedbackLoopExecutor:
                 for reply in replies:
                     author = reply['author']['login']
                     created_at = date_parser.parse(reply['createdAt'])
+                    reply_id = reply.get('id')
 
                     # Convert to naive datetime
                     if created_at.tzinfo:
                         created_at = created_at.replace(tzinfo=None)
 
                     logger.debug(f"Reply from {author} at {created_at} (last_agent: {last_agent_time})")
+
+                    # FIX #3: Skip if already processed
+                    if reply_id in state.processed_comment_ids:
+                        logger.debug(f"Skipping already-processed reply {reply_id}")
+                        continue
 
                     # Check if human comment after last agent output
                     if not is_bot_user(author) and created_at > last_agent_time:
@@ -703,7 +770,7 @@ class HumanFeedbackLoopExecutor:
                             'author': author,
                             'body': reply['body'],
                             'created_at': created_at.isoformat(),
-                            'comment_id': reply.get('id'),
+                            'comment_id': reply_id,
                             'parent_comment': {
                                 'id': comment.get('id'),
                                 'body': comment.get('body', ''),

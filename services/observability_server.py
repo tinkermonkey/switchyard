@@ -2,6 +2,10 @@
 WebSocket server for streaming agent observability events to web UI
 """
 
+# Monkey patch for eventlet MUST be first
+import eventlet
+eventlet.monkey_patch()
+
 import asyncio
 import json
 import logging
@@ -22,7 +26,13 @@ logger = setup_service_logging('observability_server')
 
 app = Flask(__name__)
 CORS(app)  # Enable CORS for web UI
-socketio = SocketIO(app, cors_allowed_origins="*")
+socketio = SocketIO(
+    app,
+    cors_allowed_origins="*",
+    async_mode='eventlet',
+    ping_timeout=10,
+    ping_interval=5
+)
 
 # Initialize Elasticsearch client
 es_client = Elasticsearch(['http://elasticsearch:9200'])
@@ -787,18 +797,18 @@ def get_pipeline_run_events():
             decision_events_query = {
                 "query": {
                     "term": {
-                        "pipeline_run_id.keyword": pipeline_run_id
+                        "pipeline_run_id": pipeline_run_id
                     }
                 },
                 "sort": [{"timestamp": "asc"}],
                 "size": 1000
             }
-            
+
             decision_result = es_client.search(
                 index="decision-events-*",
                 body=decision_events_query
             )
-            
+
             for hit in decision_result['hits']['hits']:
                 event_data = hit['_source']
                 event_data['event_category'] = 'decision'
@@ -1595,59 +1605,59 @@ def get_circuit_breakers():
             decode_responses=True
         )
 
-        # Get stats from Redis
-        stats_json = redis_client.get('orchestrator:pattern_ingestion_stats')
-
-        if not stats_json:
-            return jsonify({
-                'success': False,
-                'error': 'Pattern ingestion service stats not available',
-                'circuit_breakers': []
-            }), 503
-
-        stats = json.loads(stats_json)
-
         # Extract circuit breaker states
         circuit_breakers = []
 
-        # Redis circuit breaker
-        redis_cb = stats['log_collector']['circuit_breakers']['redis']
-        circuit_breakers.append({
-            'name': 'Redis Streams',
-            'service': 'log_collector',
-            'state': redis_cb['state'],
-            'failure_count': redis_cb['failure_count'],
-            'total_failures': redis_cb['total_failures'],
-            'total_successes': redis_cb['total_successes'],
-            'total_rejected': redis_cb['total_rejected'],
-            'time_in_state': redis_cb['time_in_state']
-        })
+        # Get stats from Redis (optional - pattern services may be disabled)
+        stats_json = redis_client.get('orchestrator:pattern_ingestion_stats')
 
-        # Elasticsearch indexing circuit breaker
-        es_indexing_cb = stats['log_collector']['circuit_breakers']['elasticsearch']
-        circuit_breakers.append({
-            'name': 'Elasticsearch Indexing',
-            'service': 'log_collector',
-            'state': es_indexing_cb['state'],
-            'failure_count': es_indexing_cb['failure_count'],
-            'total_failures': es_indexing_cb['total_failures'],
-            'total_successes': es_indexing_cb['total_successes'],
-            'total_rejected': es_indexing_cb['total_rejected'],
-            'time_in_state': es_indexing_cb['time_in_state']
-        })
+        if stats_json:
+            try:
+                stats = json.loads(stats_json)
 
-        # Pattern detection circuit breaker
-        pattern_cb = stats['pattern_detector']['circuit_breaker']
-        circuit_breakers.append({
-            'name': 'Pattern Detection Queries',
-            'service': 'pattern_detector',
-            'state': pattern_cb['state'],
-            'failure_count': pattern_cb['failure_count'],
-            'total_failures': pattern_cb['total_failures'],
-            'total_successes': pattern_cb['total_successes'],
-            'total_rejected': pattern_cb['total_rejected'],
-            'time_in_state': pattern_cb['time_in_state']
-        })
+                # Redis circuit breaker
+                redis_cb = stats['log_collector']['circuit_breakers']['redis']
+                circuit_breakers.append({
+                    'name': 'Redis Streams',
+                    'service': 'log_collector',
+                    'state': redis_cb['state'],
+                    'failure_count': redis_cb['failure_count'],
+                    'total_failures': redis_cb['total_failures'],
+                    'total_successes': redis_cb['total_successes'],
+                    'total_rejected': redis_cb['total_rejected'],
+                    'time_in_state': redis_cb['time_in_state']
+                })
+
+                # Elasticsearch indexing circuit breaker
+                es_indexing_cb = stats['log_collector']['circuit_breakers']['elasticsearch']
+                circuit_breakers.append({
+                    'name': 'Elasticsearch Indexing',
+                    'service': 'log_collector',
+                    'state': es_indexing_cb['state'],
+                    'failure_count': es_indexing_cb['failure_count'],
+                    'total_failures': es_indexing_cb['total_failures'],
+                    'total_successes': es_indexing_cb['total_successes'],
+                    'total_rejected': es_indexing_cb['total_rejected'],
+                    'time_in_state': es_indexing_cb['time_in_state']
+                })
+
+                # Pattern detection circuit breaker
+                pattern_cb = stats['pattern_detector']['circuit_breaker']
+                circuit_breakers.append({
+                    'name': 'Pattern Detection Queries',
+                    'service': 'pattern_detector',
+                    'state': pattern_cb['state'],
+                    'failure_count': pattern_cb['failure_count'],
+                    'total_failures': pattern_cb['total_failures'],
+                    'total_successes': pattern_cb['total_successes'],
+                    'total_rejected': pattern_cb['total_rejected'],
+                    'time_in_state': pattern_cb['time_in_state']
+                })
+            except Exception as e:
+                logger.warning(f"Could not parse pattern ingestion stats: {e}")
+        else:
+            logger.info("Pattern ingestion service stats not available (services may be disabled)")
+
         
         # Claude Code circuit breaker
         try:
@@ -2812,8 +2822,8 @@ def start_observability_server(host='0.0.0.0', port=5001):
     git_collector = threading.Thread(target=git_branch_collector_thread, daemon=True)
     git_collector.start()
 
-    logger.info(f"Starting observability server on {host}:{port}")
-    socketio.run(app, host=host, port=port, debug=False, allow_unsafe_werkzeug=True)
+    logger.info(f"Starting observability server on {host}:{port} with eventlet backend")
+    socketio.run(app, host=host, port=port, debug=False)
 
 if __name__ == '__main__':
     start_observability_server()

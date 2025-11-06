@@ -85,16 +85,23 @@ export function SocketProvider({ children }) {
   }
 
   useEffect(() => {
+    // Load history immediately on mount (don't wait for socket)
+    loadHistoryAndStats()
+
     // In development, Vite proxies /socket.io to the observability server
     // In production, nginx handles the proxy
     const socketInstance = io({
       path: '/socket.io',
-      transports: ['websocket', 'polling']
+      transports: ['websocket', 'polling'],
+      reconnectionDelay: 1000,
+      reconnectionDelayMax: 5000,
+      timeout: 3000
     })
 
     socketInstance.on('connect', () => {
       console.log('Socket connected')
       setConnected(true)
+      // Refresh data on reconnect
       loadHistoryAndStats()
     })
 
