@@ -16,6 +16,72 @@ from monitoring.timestamp_utils import utc_now, utc_isoformat
 
 logger = logging.getLogger(__name__)
 
+# ILM Policy for decision events (7-day retention)
+DECISION_EVENTS_ILM_POLICY = {
+    "policy": {
+        "phases": {
+            "hot": {
+                "min_age": "0ms",
+                "actions": {
+                    "set_priority": {
+                        "priority": 100
+                    }
+                }
+            },
+            "warm": {
+                "min_age": "3d",
+                "actions": {
+                    "set_priority": {
+                        "priority": 50
+                    }
+                }
+            },
+            "delete": {
+                "min_age": "7d",
+                "actions": {
+                    "delete": {
+                        "delete_searchable_snapshot": True
+                    }
+                }
+            }
+        }
+    }
+}
+
+# Index template for decision events
+DECISION_EVENTS_TEMPLATE = {
+    "index_patterns": ["decision-events-*"],
+    "template": {
+        "settings": {
+            "number_of_shards": 1,
+            "number_of_replicas": 1,
+            "index": {
+                "lifecycle": {
+                    "name": "decision-events-ilm-policy"
+                }
+            }
+        },
+        "mappings": {
+            "properties": {
+                "timestamp": {"type": "date"},
+                "event_type": {"type": "keyword"},
+                "event_category": {"type": "keyword"},
+                "agent": {"type": "keyword"},
+                "task_id": {"type": "keyword"},
+                "project": {"type": "keyword"},
+                "pipeline_run_id": {"type": "keyword"},
+                "decision_category": {"type": "keyword"},
+                "selected_agent": {"type": "keyword"},
+                "from_status": {"type": "keyword"},
+                "to_status": {"type": "keyword"},
+                "iteration": {"type": "integer"},
+                "feedback_source": {"type": "keyword"}
+            }
+        }
+    },
+    "priority": 200
+}
+
 class EventType(Enum):
     """Types of observability events"""
     # Lifecycle events
@@ -196,7 +262,38 @@ class ObservabilityManager:
         self.stream_key = "orchestrator:event_stream"
         self.stream_maxlen = 1000  # Keep last 1000 events
         self.stream_ttl = 7200  # 2 hours in seconds
-    
+
+        # Setup Elasticsearch indices on initialization if ES is available
+        if self.es:
+            self.setup_elasticsearch()
+
+    def setup_elasticsearch(self):
+        """Setup Elasticsearch ILM policies and index templates for decision events"""
+        if not self.es:
+            logger.warning("Elasticsearch not available, skipping setup")
+            return False
+
+        try:
+            # Create ILM policy for decision events (7-day retention)
+            self.es.ilm.put_lifecycle(
+                name="decision-events-ilm-policy",
+                body=DECISION_EVENTS_ILM_POLICY
+            )
+            logger.info("Created/updated ILM policy: decision-events-ilm-policy (7-day retention)")
+
+            # Create index template for decision events
+            self.es.indices.put_index_template(
+                name="decision-events-template",
+                body=DECISION_EVENTS_TEMPLATE
+            )
+            logger.info("Created/updated index template: decision-events-template")
+
+            return True
+
+        except Exception as e:
+            logger.error(f"Failed to setup Elasticsearch for decision events: {e}")
+            return False
+
     def _is_decision_event(self, event_type: EventType) -> bool:
         """Check if an event type is a decision event that should be indexed in Elasticsearch"""
         decision_events = {

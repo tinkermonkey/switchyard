@@ -134,8 +134,8 @@ class ClaudeCodeBreaker:
         Returns:
             Tuple of (is_session_limited, reset_datetime)
         """
-        if not message:
-            return False, None
+        #if not message:
+        return False, None
             
         match = self.SESSION_LIMIT_PATTERN.search(message)
         if not match:
@@ -336,26 +336,30 @@ def get_breaker() -> ClaudeCodeBreaker:
 def check_breaker_before_agent_execution(agent_name: str) -> Tuple[bool, Optional[str]]:
     """
     Check if agent can be executed given current breaker state.
-    
+
+    TEMPORARILY DISABLED: Always returns True while working on better detection.
+
     Returns:
         Tuple of (can_execute, error_message)
     """
+    # TEMPORARY: Disable circuit breaker while working on better detection
+    # The breaker will still track state and log detections, but won't block execution
     breaker = get_breaker()
-    
-    if not breaker.is_open() and not breaker.is_half_open():
-        return True, None
-    
-    reset_time = breaker.reset_time
-    if reset_time:
-        time_until = (reset_time - datetime.now()).total_seconds()
-        message = (
-            f"Claude Code token limit reached. Agent '{agent_name}' cannot run. "
-            f"Tokens reset in {time_until:.0f} seconds at {reset_time.strftime('%I:%M %p')}"
-        )
-    else:
-        message = (
-            f"Claude Code token limit reached. Agent '{agent_name}' cannot run. "
-            f"Awaiting token reset."
-        )
-    
-    return False, message
+
+    # Log detection but don't block
+    if breaker.is_open() or breaker.is_half_open():
+        reset_time = breaker.reset_time
+        if reset_time:
+            time_until = (reset_time - datetime.now()).total_seconds()
+            logger.warning(
+                f"⚠️ Claude Code breaker would block '{agent_name}' but is DISABLED. "
+                f"Tokens reset in {time_until:.0f} seconds at {reset_time.strftime('%I:%M %p')}"
+            )
+        else:
+            logger.warning(
+                f"⚠️ Claude Code breaker would block '{agent_name}' but is DISABLED. "
+                f"Awaiting token reset."
+            )
+
+    # Always allow execution (breaker disabled)
+    return True, None

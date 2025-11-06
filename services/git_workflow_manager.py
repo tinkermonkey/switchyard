@@ -93,7 +93,12 @@ class GitWorkflowManager:
         if not branch_info:
             try:
                 from services.feature_branch_manager import feature_branch_manager
-                feature_branch = feature_branch_manager.get_feature_branch_for_issue(project, issue_number)
+                from services.github_integration import GitHubIntegration
+
+                # Create GitHubIntegration for parent detection
+                github_integration = GitHubIntegration(repo_owner=org, repo_name=repo)
+
+                feature_branch = await feature_branch_manager.get_feature_branch_for_issue(project, issue_number, github_integration)
                 if feature_branch:
                     logger.info(f"Found feature branch for issue #{issue_number}: {feature_branch.branch_name}")
                     self.track_branch(project, issue_number, feature_branch.branch_name)

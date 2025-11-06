@@ -16,6 +16,68 @@ from elasticsearch import Elasticsearch
 
 logger = logging.getLogger(__name__)
 
+# ILM Policy for pipeline runs (7-day retention)
+PIPELINE_RUNS_ILM_POLICY = {
+    "policy": {
+        "phases": {
+            "hot": {
+                "min_age": "0ms",
+                "actions": {
+                    "set_priority": {
+                        "priority": 100
+                    }
+                }
+            },
+            "warm": {
+                "min_age": "3d",
+                "actions": {
+                    "set_priority": {
+                        "priority": 50
+                    }
+                }
+            },
+            "delete": {
+                "min_age": "7d",
+                "actions": {
+                    "delete": {
+                        "delete_searchable_snapshot": True
+                    }
+                }
+            }
+        }
+    }
+}
+
+# Index template for pipeline runs
+PIPELINE_RUNS_TEMPLATE = {
+    "index_patterns": ["pipeline-runs-*"],
+    "template": {
+        "settings": {
+            "number_of_shards": 1,
+            "number_of_replicas": 1,
+            "index": {
+                "lifecycle": {
+                    "name": "pipeline-runs-ilm-policy"
+                }
+            }
+        },
+        "mappings": {
+            "properties": {
+                "id": {"type": "keyword"},
+                "issue_number": {"type": "integer"},
+                "issue_title": {"type": "text"},
+                "issue_url": {"type": "keyword"},
+                "project": {"type": "keyword"},
+                "board": {"type": "keyword"},
+                "started_at": {"type": "date"},
+                "ended_at": {"type": "date"},
+                "status": {"type": "keyword"}
+            }
+        }
+    },
+    "priority": 200
+}
+
 
 @dataclass
 class PipelineRun:
@@ -90,12 +152,53 @@ class PipelineRunManager:
         # Redis key prefix
         self.redis_prefix = "orchestrator:pipeline_run"
         self.redis_issue_mapping = "orchestrator:pipeline_run:issue_mapping"
-        
-        # Elasticsearch index
-        self.es_index = "pipeline-runs"
-        
+
+        # Elasticsearch index pattern (date-based for ILM)
+        self.es_index_pattern = "pipeline-runs"
+
+        # Setup Elasticsearch ILM and templates if available
+        if self.es:
+            self._setup_elasticsearch()
+
         logger.info("PipelineRunManager initialized")
-    
+
+    def _setup_elasticsearch(self):
+        """Setup Elasticsearch ILM policy and index templates"""
+        if not self.es:
+            return
+
+        try:
+            # Create ILM policy for pipeline runs (7-day retention)
+            self.es.ilm.put_lifecycle(
+                name="pipeline-runs-ilm-policy",
+                body=PIPELINE_RUNS_ILM_POLICY
+            )
+            logger.info("Created/updated ILM policy: pipeline-runs-ilm-policy (7-day retention)")
+
+            # Create index template for pipeline runs
+            self.es.indices.put_index_template(
+                name="pipeline-runs-template",
+                body=PIPELINE_RUNS_TEMPLATE
+            )
+            logger.info("Created/updated index template: pipeline-runs-template")
+
+        except Exception as e:
+            logger.error(f"Failed to setup Elasticsearch for pipeline runs: {e}")
+
+    def _get_es_index_name(self, date: Optional[datetime] = None) -> str:
+        """
+        Get date-based Elasticsearch index name for pipeline runs
+
+        Args:
+            date: Optional date to use for index name (defaults to today)
+
+        Returns:
+            Index name like 'pipeline-runs-2025-11-05'
+        """
+        if date is None:
+            date = datetime.utcnow()
+        return f"{self.es_index_pattern}-{date.strftime('%Y-%m-%d')}"
+
     def _get_redis_key(self, pipeline_run_id: str) -> str:
         """Get Redis key for pipeline run"""
         return f"{self.redis_prefix}:{pipeline_run_id}"
@@ -264,7 +367,7 @@ class PipelineRunManager:
                     "size": 100  # Get all active runs for this issue
                 }
                 
-                result = self.es.search(index="pipeline-runs", body=query)
+                result = self.es.search(index="pipeline-runs-*", body=query)
                 
                 if result['hits']['total']['value'] > 0:
                     logger.warning(
@@ -281,8 +384,11 @@ class PipelineRunManager:
                         old_run_data['ended_at'] = datetime.utcnow().isoformat() + 'Z'
                         old_run_data['status'] = 'completed'
                         
+                        # Update in the same index where it was found
+                        # Extract the index from the hit's _index field
+                        old_index = hit['_index']
                         self.es.index(
-                            index="pipeline-runs",
+                            index=old_index,
                             id=old_run_id,
                             document=old_run_data
                         )
@@ -389,21 +495,24 @@ class PipelineRunManager:
     
     def _persist_to_elasticsearch(self, pipeline_run: PipelineRun):
         """
-        Persist pipeline run to Elasticsearch
-        
+        Persist pipeline run to Elasticsearch (date-based index)
+
         Args:
             pipeline_run: PipelineRun to persist
         """
         if not self.es:
             return
-        
+
         try:
+            # Use date-based index name
+            index_name = self._get_es_index_name()
+
             self.es.index(
-                index=self.es_index,
+                index=index_name,
                 id=pipeline_run.id,
                 document=pipeline_run.to_dict()
             )
-            logger.debug(f"Persisted pipeline run {pipeline_run.id} to Elasticsearch")
+            logger.debug(f"Persisted pipeline run {pipeline_run.id} to {index_name}")
         except Exception as e:
             logger.error(f"Failed to persist pipeline run to Elasticsearch: {e}")
     
@@ -468,7 +577,7 @@ class PipelineRunManager:
                 "size": 1000  # Get all active runs
             }
             
-            result = self.es.search(index=self.es_index, body=query)
+            result = self.es.search(index=f"{self.es_index_pattern}-*", body=query)
             
             if result['hits']['total']['value'] == 0:
                 logger.info("No active pipeline runs to clean up")

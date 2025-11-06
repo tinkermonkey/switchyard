@@ -209,15 +209,38 @@ class FeatureBranchManager:
 
         return None
 
-    def get_feature_branch_for_issue(self, project: str, issue_number: int) -> Optional[FeatureBranch]:
+    async def get_feature_branch_for_issue(self, project: str, issue_number: int, github_integration) -> Optional[FeatureBranch]:
         """
         Get feature branch for a sub-issue or parent issue.
 
-        For sub-issues, you must provide the parent_issue separately via get_feature_branch_state().
-        This method now just checks if the issue_number itself is a parent (has a branch).
+        Automatically detects if issue is a sub-issue and finds parent's branch.
+
+        Args:
+            project: Project name
+            issue_number: Issue number (can be parent or sub-issue)
+            github_integration: GitHubIntegration instance for API calls
+
+        Returns:
+            FeatureBranch object if found, None otherwise
         """
-        # Assume issue_number is a parent issue and try to find its branch
-        return self.get_feature_branch_state(project, issue_number)
+        # Step 1: Check if this issue itself has a branch (it's a parent)
+        direct_branch = self.get_feature_branch_state(project, issue_number)
+        if direct_branch:
+            logger.debug(f"Found direct branch for issue #{issue_number}: {direct_branch.branch_name}")
+            return direct_branch
+
+        # Step 2: Check if it's a sub-issue - find parent
+        parent_issue = await self.get_parent_issue(github_integration, issue_number, project=project)
+
+        if parent_issue:
+            # Get parent's branch
+            parent_branch = self.get_feature_branch_state(project, parent_issue)
+            if parent_branch:
+                logger.debug(f"Found parent branch for sub-issue #{issue_number}: {parent_branch.branch_name} (parent #{parent_issue})")
+            return parent_branch
+
+        logger.debug(f"No feature branch found for issue #{issue_number}")
+        return None
 
     def get_all_feature_branches(self, project: str) -> List[FeatureBranch]:
         """
@@ -1142,7 +1165,7 @@ Waiting for human decision...
         """
         project_dir = os.path.join(self.workspace_root, project)
 
-        feature_branch = self.get_feature_branch_for_issue(project, issue_number)
+        feature_branch = await self.get_feature_branch_for_issue(project, issue_number, github_integration)
 
         if not feature_branch:
             # This is a standalone issue without parent tracking

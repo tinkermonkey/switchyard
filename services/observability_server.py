@@ -890,7 +890,7 @@ def get_active_pipeline_runs():
         }
         
         result = es_client.search(
-            index="pipeline-runs",
+            index="pipeline-runs-*",
             body=query
         )
         
@@ -1079,7 +1079,7 @@ def get_completed_pipeline_runs():
         }
         
         result = es_client.search(
-            index="pipeline-runs",
+            index="pipeline-runs-*",
             body=query
         )
         

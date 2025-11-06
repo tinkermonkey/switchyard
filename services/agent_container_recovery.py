@@ -15,6 +15,66 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+# ILM Policy for repair cycle recovery metrics (7-day retention)
+REPAIR_CYCLE_RECOVERY_ILM_POLICY = {
+    "policy": {
+        "phases": {
+            "hot": {
+                "min_age": "0ms",
+                "actions": {
+                    "set_priority": {
+                        "priority": 100
+                    }
+                }
+            },
+            "warm": {
+                "min_age": "3d",
+                "actions": {
+                    "set_priority": {
+                        "priority": 50
+                    }
+                }
+            },
+            "delete": {
+                "min_age": "7d",
+                "actions": {
+                    "delete": {
+                        "delete_searchable_snapshot": True
+                    }
+                }
+            }
+        }
+    }
+}
+
+# Index template for repair cycle recovery metrics
+REPAIR_CYCLE_RECOVERY_TEMPLATE = {
+    "index_patterns": ["repair-cycle-recovery-*"],
+    "template": {
+        "settings": {
+            "number_of_shards": 1,
+            "number_of_replicas": 1,
+            "index": {
+                "lifecycle": {
+                    "name": "repair-cycle-recovery-ilm-policy"
+                }
+            }
+        },
+        "mappings": {
+            "properties": {
+                "timestamp": {"type": "date"},
+                "containers_recovered": {"type": "integer"},
+                "containers_killed": {"type": "integer"},
+                "containers_with_errors": {"type": "integer"},
+                "total_containers_found": {"type": "integer"},
+                "recovery_success_rate": {"type": "float"},
+                "stale_rate": {"type": "float"}
+            }
+        }
+    },
+    "priority": 200
+}
+
 
 class AgentContainerRecovery:
     """Manages recovery of agent containers after orchestrator restart"""
@@ -968,11 +1028,26 @@ class AgentContainerRecovery:
         try:
             from monitoring.timestamp_utils import utc_now
             from elasticsearch import Elasticsearch
-            
+
             es = Elasticsearch(['http://elasticsearch:9200'])
+
+            # Setup ILM policy and template (idempotent)
+            try:
+                es.ilm.put_lifecycle(
+                    name="repair-cycle-recovery-ilm-policy",
+                    body=REPAIR_CYCLE_RECOVERY_ILM_POLICY
+                )
+                es.indices.put_index_template(
+                    name="repair-cycle-recovery-template",
+                    body=REPAIR_CYCLE_RECOVERY_TEMPLATE
+                )
+                logger.debug("Created/updated repair-cycle-recovery ILM policy and template")
+            except Exception as setup_error:
+                logger.warning(f"Failed to setup repair-cycle-recovery ILM: {setup_error}")
+
             timestamp = utc_now()
             index_name = f"repair-cycle-recovery-{timestamp.strftime('%Y.%m.%d')}"
-            
+
             doc = {
                 'timestamp': timestamp.isoformat(),
                 'containers_recovered': recovered,
@@ -982,7 +1057,7 @@ class AgentContainerRecovery:
                 'recovery_success_rate': recovered / len(running_containers) if running_containers else 0.0,
                 'stale_rate': killed / len(running_containers) if running_containers else 0.0
             }
-            
+
             es.index(index=index_name, document=doc)
             logger.debug(f"Indexed recovery metrics to {index_name}")
         except Exception as e:

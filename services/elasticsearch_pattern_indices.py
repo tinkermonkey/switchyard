@@ -277,7 +277,8 @@ def create_all_indices(es_client):
         "pattern-insights": PATTERN_INSIGHTS_MAPPING,
         "pattern-claude-md-changes": CLAUDE_MD_CHANGES_MAPPING,
         "pattern-similarity": PATTERN_SIMILARITY_MAPPING,
-        "pipeline-runs": PIPELINE_RUNS_MAPPING
+        # Note: pipeline-runs now uses date-based indices (pipeline-runs-*)
+        # with ILM managed via templates in services/pipeline_run.py
     }
 
     for index_name, mapping in indices.items():

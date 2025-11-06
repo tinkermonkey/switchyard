@@ -2781,6 +2781,28 @@ _Review cycle initiated by Claude Code Orchestrator_
                     logger.warning(f"Error checking for existing repair cycle container: {e}")
                     # Continue anyway - better to risk a duplicate than block work
 
+            # CRITICAL: Check if pipeline is locked by ANOTHER repair cycle
+            # Repair cycles can steal locks from Development, but not from other repair cycles
+            # Only one repair cycle should run at a time per pipeline
+            from services.pipeline_lock_manager import get_pipeline_lock_manager
+            lock_manager = get_pipeline_lock_manager()
+            current_lock = lock_manager.get_lock(project_name, board_name)
+
+            if current_lock and current_lock.locked_by_issue != issue_number:
+                # Another issue holds the lock - check if it's also a repair cycle
+                # by checking for repair cycle container in Redis
+                if self.task_queue.redis_client:
+                    other_redis_key = f"repair_cycle:container:{project_name}:{current_lock.locked_by_issue}"
+                    other_container = self.task_queue.redis_client.get(other_redis_key)
+
+                    if other_container:
+                        # Another repair cycle is running - don't compete with it
+                        logger.warning(
+                            f"Pipeline locked by another repair cycle (issue #{current_lock.locked_by_issue}). "
+                            f"Skipping repair cycle launch for issue #{issue_number} to prevent competition."
+                        )
+                        return None
+
             # Get issue details
             issue_data = self.get_issue_details(repository, issue_number, project_config.github['org'])
 
@@ -2836,14 +2858,16 @@ _Review cycle initiated by Claude Code Orchestrator_
             logger.debug(f"Using pipeline run {pipeline_run.id} for repair cycle on issue #{issue_number}")
 
             # CRITICAL: Acquire pipeline lock before starting repair cycle
+            # Note: We've already checked above that no OTHER repair cycle is running
             # Repair cycles have PRIORITY over Development items - they can steal the lock if needed
+            # But repair cycles do NOT compete with each other (checked above)
             from services.pipeline_lock_manager import get_pipeline_lock_manager
             lock_manager = get_pipeline_lock_manager()
 
             current_lock = lock_manager.get_lock(project_name, board_name)
 
             if current_lock and current_lock.locked_by_issue != issue_number:
-                # Lock held by another issue - repair cycle has priority, so force-steal it
+                # Lock held by another issue (non-repair-cycle) - steal it
                 logger.warning(
                     f"Repair cycle for issue #{issue_number} is stealing pipeline lock from issue #{current_lock.locked_by_issue} "
                     f"(repair cycles have priority over {status})"

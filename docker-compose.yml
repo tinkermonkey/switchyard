@@ -17,6 +17,7 @@ services:
     # Run as orchestrator user (UID 1000) defined in Dockerfile
     # With rootful Docker, container UID 1000 = host UID 1000 directly (no namespace remapping)
     # This allows file access and Claude Code to run with bypass permissions
+    restart: unless-stopped
     volumes:
       # Mount the orchestrator code (this is clauditoreum/)
       - ./:/app
@@ -109,34 +110,55 @@ services:
     ports:
       - "3000:80"
 
-  browserless:
-    image: ghcr.io/browserless/chromium:latest
-    container_name: browserless
+  log-collector:
+    build: .
+    volumes:
+      - ./:/app
     environment:
-      - CONCURRENT=5
-      - MAX_CONCURRENT_SESSIONS=5
-      - TIMEOUT=30000
-      - ENABLE_DEBUGGER=true
-      # Optional: Add token for authentication
-      # - TOKEN=your-secure-token-here
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+      - LOG_BATCH_SIZE=50
+      - LOG_BATCH_TIMEOUT=5.0
+    depends_on:
+      redis:
+        condition: service_started
+      elasticsearch:
+        condition: service_healthy
     networks:
       - orchestrator-net
-    ports:
-      - "3001:3000"  # Expose for debugging (web-ui uses 3000)
+    working_dir: /app
+    command: ["python", "-m", "services.log_collector"]
     restart: unless-stopped
-    deploy:
-      resources:
-        limits:
-          memory: 2G
-        reservations:
-          memory: 512M
+
+  #browserless:
+  #  image: ghcr.io/browserless/chromium:latest
+  #  container_name: browserless
+  #  environment:
+  #    - CONCURRENT=5
+  #    - MAX_CONCURRENT_SESSIONS=5
+  #    - TIMEOUT=30000
+  #    - ENABLE_DEBUGGER=true
+      # Optional: Add token for authentication
+      # - TOKEN=your-secure-token-here
+  #  networks:
+  #    - orchestrator-net
+  #  ports:
+  #    - "3001:3000"  # Expose for debugging (web-ui uses 3000)
+  #  restart: unless-stopped
+  #  deploy:
+  #    resources:
+  #      limits:
+  #        memory: 2G
+  #      reservations:
+  #        memory: 512M
 
   elasticsearch:
     image: docker.elastic.co/elasticsearch/elasticsearch:9.0.0
     environment:
       - discovery.type=single-node
       - xpack.security.enabled=false
-      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+      - "ES_JAVA_OPTS=-Xms2g -Xmx2g"
     volumes:
       - elasticsearch_data:/usr/share/elasticsearch/data
       - ./config/elasticsearch/log4j2.properties:/usr/share/elasticsearch/config/log4j2.properties:ro
@@ -150,57 +172,57 @@ services:
       timeout: 5s
       retries: 5
 
-  pattern-ingestion:
-    build: .
-    volumes:
-      - ./:/app
-    environment:
+#  pattern-ingestion:
+#    build: .
+#    volumes:
+#      - ./:/app
+#    environment:
       # Redis (log collection)
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
+#      - REDIS_HOST=redis
+#      - REDIS_PORT=6379
       # Elasticsearch (shared)
-      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+#      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
       # Log collector
-      - LOG_BATCH_SIZE=50
-      - LOG_BATCH_TIMEOUT=5.0
+#      - LOG_BATCH_SIZE=50
+#      - LOG_BATCH_TIMEOUT=5.0
       # Pattern detector
-      - PATTERNS_DIR=config/patterns
-      - DETECTION_INTERVAL=60
-      - LOOKBACK_MINUTES=5
-    depends_on:
-      redis:
-        condition: service_started
-      elasticsearch:
-        condition: service_healthy
-    networks:
-      - orchestrator-net
-    working_dir: /app
-    command: ["python", "-m", "services.pattern_ingestion_service"]
-    restart: unless-stopped
+#      - PATTERNS_DIR=config/patterns
+#      - DETECTION_INTERVAL=60
+#      - LOOKBACK_MINUTES=5
+#    depends_on:
+#      redis:
+#        condition: service_started
+#      elasticsearch:
+#        condition: service_healthy
+#    networks:
+#      - orchestrator-net
+#    working_dir: /app
+#    command: ["python", "-m", "services.pattern_ingestion_service"]
+#    restart: unless-stopped
 
-  pattern-github-processor:
-    build: .
-    volumes:
-      - ./:/app
-      - ~/.orchestrator:/home/orchestrator/.orchestrator:ro
-    environment:
-      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
-      - GITHUB_ORG=${GITHUB_ORG}
-      - GITHUB_REPO=orchestrator
-      - GITHUB_APP_ID=${GITHUB_APP_ID}
-      - GITHUB_APP_INSTALLATION_ID=${GITHUB_APP_INSTALLATION_ID}
-      - GITHUB_APP_PRIVATE_KEY_PATH=${GITHUB_APP_PRIVATE_KEY_PATH}
-      - GITHUB_PROCESSING_INTERVAL=300
-      - GITHUB_DISCUSSION_CATEGORY=Ideas
-      - MIN_OCCURRENCES_FOR_DISCUSSION=5
-    depends_on:
-      elasticsearch:
-        condition: service_healthy
-    networks:
-      - orchestrator-net
-    working_dir: /app
-    command: ["python", "-m", "services.pattern_github_processor_es"]
-    restart: unless-stopped
+#  pattern-github-processor:
+#    build: .
+#    volumes:
+#      - ./:/app
+#      - ~/.orchestrator:/home/orchestrator/.orchestrator:ro
+#    environment:
+#      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+#      - GITHUB_ORG=${GITHUB_ORG}
+#      - GITHUB_REPO=orchestrator
+#      - GITHUB_APP_ID=${GITHUB_APP_ID}
+#      - GITHUB_APP_INSTALLATION_ID=${GITHUB_APP_INSTALLATION_ID}
+#      - GITHUB_APP_PRIVATE_KEY_PATH=${GITHUB_APP_PRIVATE_KEY_PATH}
+#      - GITHUB_PROCESSING_INTERVAL=300
+#      - GITHUB_DISCUSSION_CATEGORY=Ideas
+#      - MIN_OCCURRENCES_FOR_DISCUSSION=5
+#    depends_on:
+#      elasticsearch:
+#        condition: service_healthy
+#    networks:
+#      - orchestrator-net
+#    working_dir: /app
+#    command: ["python", "-m", "services.pattern_github_processor_es"]
+#    restart: unless-stopped
 
   # pattern-analysis:
   #   build: .

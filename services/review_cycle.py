@@ -1777,7 +1777,7 @@ class ReviewCycleExecutor:
                         # Track the branch for git workflow (this will be done by feature_branch_manager too, but ensure it)
                         if not git_workflow_manager.get_branch_info(cycle_state.project_name, cycle_state.issue_number):
                             # Check if this is a sub-issue
-                            feature_branch = feature_branch_manager.get_feature_branch_for_issue(cycle_state.project_name, cycle_state.issue_number)
+                            feature_branch = await feature_branch_manager.get_feature_branch_for_issue(cycle_state.project_name, cycle_state.issue_number, github_integration)
                             if feature_branch:
                                 # Track against parent for PR creation
                                 git_workflow_manager.track_branch(

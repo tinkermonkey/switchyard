@@ -266,33 +266,62 @@ async def main():
                         # NOTE: We don't process the next waiting issue here
                         # The regular monitoring loop will pick it up
                     else:
-                        # Lock holder is still active - keep the lock and re-trigger agent
+                        # Lock holder is still active - keep the lock
                         logger.info(
                             f"Keeping lock for {project_name}/{pipeline.board_name} "
                             f"(issue #{lock.locked_by_issue} still in column '{lock_holder_column}')"
                         )
                         locks_recovered += 1
 
-                        # Re-trigger agent for this issue to resume work
+                        # CRITICAL: Check if repair cycle container is already running
+                        # Agent container recovery may reconnect to it, so don't re-trigger
+                        should_retrigger = True
+
+                        # Check if there's a repair cycle container for this issue
+                        redis_key = f"repair_cycle:container:{project_name}:{lock.locked_by_issue}"
+                        container_name = None
+                        if task_queue.redis_client:
+                            container_name = task_queue.redis_client.get(redis_key)
+
+                            if container_name:
+                                # Check if container actually exists
+                                import subprocess
+                                try:
+                                    result = subprocess.run(
+                                        ['docker', 'inspect', container_name.decode() if isinstance(container_name, bytes) else container_name],
+                                        capture_output=True,
+                                        timeout=5
+                                    )
+                                    if result.returncode == 0:
+                                        logger.info(
+                                            f"Repair cycle container {container_name} already exists for issue #{lock.locked_by_issue} "
+                                            f"- skipping re-trigger (agent container recovery will reconnect)"
+                                        )
+                                        should_retrigger = False
+                                except Exception as e:
+                                    logger.warning(f"Error checking container {container_name}: {e}")
+
+                        # Re-trigger agent only if no container is running
                         # (May have been interrupted mid-execution during restart)
-                        try:
-                            logger.info(
-                                f"Re-triggering agent for recovered lock holder "
-                                f"issue #{lock.locked_by_issue} in column '{lock_holder_column}'"
-                            )
-                            temp_monitor.trigger_agent_for_status(
-                                project_name=project_name,
-                                board_name=pipeline.board_name,
-                                issue_number=lock.locked_by_issue,
-                                status=lock_holder_column,
-                                repository=project_config.github['repo']
-                            )
-                        except Exception as trigger_error:
-                            logger.error(
-                                f"Failed to re-trigger agent for issue #{lock.locked_by_issue}: {trigger_error}"
-                            )
-                            import traceback
-                            logger.error(traceback.format_exc())
+                        if should_retrigger:
+                            try:
+                                logger.info(
+                                    f"Re-triggering agent for recovered lock holder "
+                                    f"issue #{lock.locked_by_issue} in column '{lock_holder_column}'"
+                                )
+                                temp_monitor.trigger_agent_for_status(
+                                    project_name=project_name,
+                                    board_name=pipeline.board_name,
+                                    issue_number=lock.locked_by_issue,
+                                    status=lock_holder_column,
+                                    repository=project_config.github['repo']
+                                )
+                            except Exception as trigger_error:
+                                logger.error(
+                                    f"Failed to re-trigger agent for issue #{lock.locked_by_issue}: {trigger_error}"
+                                )
+                                import traceback
+                                logger.error(traceback.format_exc())
 
         except Exception as e:
             logger.error(f"Error recovering locks for project {project_name}: {e}")
@@ -401,6 +430,15 @@ async def main():
     scheduler = get_scheduled_tasks_service()
     scheduler.start()
     logger.info("Scheduled tasks service started")
+
+    # CRITICAL: Wait for project monitor to complete startup rescan before starting workers
+    # This ensures repair cycles are prioritized and queued tasks don't execute prematurely
+    logger.info("Waiting for project monitor to complete startup rescan...")
+    rescan_timeout = 300  # 5 minutes should be plenty
+    if project_monitor.rescan_complete.wait(timeout=rescan_timeout):
+        logger.info("Startup rescan complete, proceeding with worker pool initialization")
+    else:
+        logger.log_warning(f"Startup rescan did not complete within {rescan_timeout}s - proceeding anyway")
 
     # Initialize worker pool for parallel task processing
     # orchestrator_workers controls concurrency:
