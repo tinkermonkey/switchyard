@@ -433,6 +433,9 @@ This checklist is **CRITICAL** - it helps the reviewer see you addressed each po
 
             if self.agent_config and 'agent_config' in self.agent_config:
                 enhanced_context['agent_config'] = self.agent_config['agent_config']
+            if self.agent_config and 'mcp_servers' in self.agent_config:
+                enhanced_context['mcp_servers'] = self.agent_config['mcp_servers']
+                logger.info(f"Added {len(enhanced_context['mcp_servers'])} MCP servers to context")
 
             # Execute with Claude Code SDK
             result = await run_claude_code(prompt, enhanced_context)

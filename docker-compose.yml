@@ -89,6 +89,10 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
     environment:
       - REDIS_URL=redis://redis:6379
+      - GITHUB_TOKEN=${GITHUB_TOKEN}
+      - GITHUB_APP_ID=${GITHUB_APP_ID}
+      - GITHUB_APP_INSTALLATION_ID=${GITHUB_APP_INSTALLATION_ID}
+      - GITHUB_APP_PRIVATE_KEY_PATH=${GITHUB_APP_PRIVATE_KEY_PATH}
     depends_on:
       redis:
         condition: service_started
@@ -131,27 +135,27 @@ services:
     command: ["python", "-m", "services.log_collector"]
     restart: unless-stopped
 
-  #browserless:
-  #  image: ghcr.io/browserless/chromium:latest
-  #  container_name: browserless
-  #  environment:
-  #    - CONCURRENT=5
-  #    - MAX_CONCURRENT_SESSIONS=5
-  #    - TIMEOUT=30000
-  #    - ENABLE_DEBUGGER=true
+  browserless:
+    image: ghcr.io/browserless/chromium:latest
+    container_name: browserless
+    environment:
+      - CONCURRENT=5
+      - MAX_CONCURRENT_SESSIONS=5
+      - TIMEOUT=30000
+      - ENABLE_DEBUGGER=true
       # Optional: Add token for authentication
       # - TOKEN=your-secure-token-here
-  #  networks:
-  #    - orchestrator-net
-  #  ports:
-  #    - "3001:3000"  # Expose for debugging (web-ui uses 3000)
-  #  restart: unless-stopped
-  #  deploy:
-  #    resources:
-  #      limits:
-  #        memory: 2G
-  #      reservations:
-  #        memory: 512M
+    networks:
+      - orchestrator-net
+    ports:
+      - "3080:3000"  # Expose for debugging (web-ui uses 3000)
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+        reservations:
+          memory: 512M
 
   elasticsearch:
     image: docker.elastic.co/elasticsearch/elasticsearch:9.0.0

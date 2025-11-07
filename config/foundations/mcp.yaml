@@ -16,9 +16,9 @@ mcp_servers:
     command: npx
     args:
       - -y
-      - "@playwright/mcp"
-    env:
-      PLAYWRIGHT_CHROMIUM_WS_ENDPOINT: "ws://browserless:3000"
+      - "@playwright/mcp@latest"
+      - --cdp-endpoint
+      - ws://browserless:3000
     capabilities:
       - browser_automation
       - ui_testing
@@ -26,7 +26,7 @@ mcp_servers:
       - accessibility_testing
       - network_interception
       - form_interaction
-    description: "Playwright MCP for browser automation and UX testing via browserless service"
+    description: "Playwright MCP for browser automation via browserless service (using Microsoft official MCP with CDP endpoint)"
 
   serena:
     type: stdio

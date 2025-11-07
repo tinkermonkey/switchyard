@@ -48,6 +48,13 @@ class SeniorSoftwareEngineerAgent(MakerAgent):
         return """
 Implement the code changes to meet the requirements specified.
 
+**For UI/Frontend Changes**:
+- Use Playwright MCP to test your changes in the browser before completing
+- Capture screenshots of key UI states for the PR
+- Run accessibility checks (Playwright has built-in a11y testing)
+- Verify responsive behavior on different viewport sizes
+- Test form interactions and validation
+
 **Important Implementation Guidelines**:
 - Don't over-engineer. Implement only what is necessary to meet the requirements
 - Focus on re-use of existing code, libraries and patterns

@@ -189,6 +189,7 @@ agents:
       - git_integration
     mcp_servers:
       - context7
+      - playwright
 
   technical_writer:
     description: "Technical documentation creation"
