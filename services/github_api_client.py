@@ -422,17 +422,31 @@ class GitHubAPIClient:
                     logger.error("🔴 GitHub API rate limit hit (REST)")
                     self.breaker.trip()
                     return False, {"error": "rate_limited", "details": result.stderr}
-                
+
                 self.failed_requests += 1
-                logger.error(f"REST request failed: {result.stderr}")
-                
-                # Retry transient errors
+
+                # Check for HTTP 410 (Gone/Deleted) - permanent error, don't retry
+                if 'HTTP 410' in result.stderr or 'was deleted' in result.stderr:
+                    logger.error(f"REST request failed with HTTP 410 (resource deleted): {method} {endpoint}")
+                    logger.error(f"Error details: {result.stderr}")
+                    return False, {"error": "resource_deleted", "http_code": 410, "stderr": result.stderr}
+
+                # Check for other 4xx errors that shouldn't be retried
+                if any(code in result.stderr for code in ['HTTP 404', 'HTTP 403', 'HTTP 401', 'HTTP 422']):
+                    logger.error(f"REST request failed with client error: {method} {endpoint}")
+                    logger.error(f"Error details: {result.stderr}")
+                    return False, {"error": "client_error", "stderr": result.stderr}
+
+                logger.error(f"REST request failed: {method} {endpoint}")
+                logger.error(f"Error details: {result.stderr}")
+
+                # Retry transient errors (5xx, network issues, etc.)
                 if retries < 3:
                     wait_time = (2 ** retries) * 2
                     logger.info(f"Retrying after {wait_time}s (attempt {retries + 1}/3)")
                     time.sleep(wait_time)
                     return self.rest(method, endpoint, data, retries + 1)
-                
+
                 return False, {"error": "failed_after_retries", "stderr": result.stderr}
             
             # Success - parse response
@@ -783,18 +797,30 @@ class GitHubAPIClient:
         
         except subprocess.CalledProcessError as e:
             self.failed_requests += 1
-            
+
             # Check for rate limit error
             if 'rate limit' in e.stderr.lower() or 'rate limit' in e.stdout.lower():
                 self.rate_limited_requests += 1
                 logger.error("🔴 GitHub API rate limit hit (CLI command)")
                 self.breaker.trip()
                 return False, {"error": "rate_limited", "stderr": e.stderr}
-            
+
+            # Check for HTTP 410 (Gone/Deleted) - permanent error, don't retry
+            if 'HTTP 410' in e.stderr or 'was deleted' in e.stderr:
+                logger.error(f"GitHub CLI command failed with HTTP 410 (resource deleted): {' '.join(cmd)}")
+                logger.error(f"Error details: {e.stderr}")
+                return False, {"error": "resource_deleted", "http_code": 410, "stderr": e.stderr}
+
+            # Check for other 4xx errors that shouldn't be retried
+            if any(code in e.stderr for code in ['HTTP 404', 'HTTP 403', 'HTTP 401', 'HTTP 422']):
+                logger.error(f"GitHub CLI command failed with client error: {' '.join(cmd)}")
+                logger.error(f"Error details: {e.stderr}")
+                return False, {"error": "client_error", "stderr": e.stderr}
+
             logger.error(f"GitHub CLI command failed: {' '.join(cmd)}")
             logger.error(f"Exit code: {e.returncode}")
             logger.error(f"STDERR: {e.stderr[:200]}")
-            
+
             # Retry transient errors on 5xx or timeout-like errors
             if 'temporarily' in e.stderr.lower() or 'timeout' in e.stderr.lower():
                 if retries < 3:
@@ -802,7 +828,7 @@ class GitHubAPIClient:
                     logger.info(f"Retrying transient error after {wait_time}s (attempt {retries + 1}/3)")
                     time.sleep(wait_time)
                     return self.gh_cli(cmd, retries + 1)
-            
+
             return False, {"error": f"cli_error", "exit_code": e.returncode, "stderr": e.stderr}
         
         except subprocess.TimeoutExpired:

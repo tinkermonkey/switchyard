@@ -54,25 +54,6 @@ workflow_templates:
             parameters:
               stage: "requirements"
 
-      - name: "Requirements Review"
-        type: "review"
-        stage_mapping: "requirements_review"
-        agent: "requirements_reviewer"
-        maker_agent: "business_analyst"
-        max_iterations: 3
-        auto_advance_on_approval: true
-        escalate_on_blocked: true
-        description: "Requirements validation and quality assurance"
-        automation_rules:
-          - trigger: "item_moved_to_column"
-            action: "assign_label"
-            parameters:
-              labels: ["stage:requirements-review"]
-          - trigger: "item_moved_to_column"
-            action: "start_review_cycle"
-            parameters:
-              stage: "requirements"
-
       - name: "Design"
         type: "conversational"
         stage_mapping: "design"
@@ -344,9 +325,6 @@ stage_labels:
   - name: "stage:requirements"
     color: "cfd3d7"
     description: "Requirements stage"
-  - name: "stage:requirements-review"
-    color: "cfd3d7"
-    description: "Requirements review stage"
   - name: "stage:design"
     color: "cfd3d7"
     description: "Design stage"

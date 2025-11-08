@@ -14,7 +14,6 @@ from .dev_environment_setup_agent import DevEnvironmentSetupAgent
 from .dev_environment_verifier_agent import DevEnvironmentVerifierAgent
 from .idea_researcher_agent import IdeaResearcherAgent
 from .business_analyst_agent import BusinessAnalystAgent
-from .requirements_reviewer_agent import RequirementsReviewerAgent
 from .software_architect_agent import SoftwareArchitectAgent
 from .work_breakdown_agent import WorkBreakdownAgent
 from .senior_software_engineer_agent import SeniorSoftwareEngineerAgent
@@ -28,7 +27,6 @@ AGENT_REGISTRY = {
     "dev_environment_verifier": DevEnvironmentVerifierAgent,
     "idea_researcher": IdeaResearcherAgent,
     "business_analyst": BusinessAnalystAgent,
-    "requirements_reviewer": RequirementsReviewerAgent,
     "software_architect": SoftwareArchitectAgent,
     "work_breakdown_agent": WorkBreakdownAgent,
     "senior_software_engineer": SeniorSoftwareEngineerAgent,
@@ -45,7 +43,6 @@ __all__ = [
     "DevEnvironmentVerifierAgent",
     "IdeaResearcherAgent",
     "BusinessAnalystAgent",
-    "RequirementsReviewerAgent",
     "SoftwareArchitectAgent",
     "WorkBreakdownAgent",
     "SeniorSoftwareEngineerAgent",

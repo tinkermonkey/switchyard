@@ -5,11 +5,37 @@ import remarkGfm from 'remark-gfm'
 import { Info } from 'lucide-react'
 import Modal from './Modal'
 
-export default function LiveLogs() {
-  const { logs, clearLogs } = useSocket()
+export default function LiveLogs({
+  logs: propLogs,
+  title = "Claude Live Logs",
+  showClearButton = true,
+  formatTimestamp,
+  headerControls,
+  minHeight = "200px",
+  maxHeight = "30vh",
+  onAutoScrollChange
+}) {
+  const { logs: socketLogs, clearLogs } = useSocket()
+  const logs = propLogs !== undefined ? propLogs : socketLogs
   const containerRef = useRef(null)
   const [autoScroll, setAutoScroll] = useState(true)
   const [selectedLog, setSelectedLog] = useState(null)
+
+  const handleAutoScrollToggle = () => {
+    const newValue = !autoScroll
+    setAutoScroll(newValue)
+    if (onAutoScrollChange) {
+      onAutoScrollChange(newValue)
+    }
+  }
+
+  const defaultFormatTimestamp = (timestamp) => {
+    return timestamp
+      ? new Date(timestamp * 1000).toLocaleTimeString('en-US', { timeZone: 'UTC', hour12: false }) + ' UTC'
+      : new Date().toLocaleTimeString('en-US', { timeZone: 'UTC', hour12: false }) + ' UTC'
+  }
+
+  const timestampFormatter = formatTimestamp || defaultFormatTimestamp
 
   useEffect(() => {
     if (autoScroll && containerRef.current) {
@@ -64,7 +90,12 @@ export default function LiveLogs() {
   }
 
   const getLogContent = (data) => {
-    const event = data.event
+    // Handle both direct event structure and raw_event wrapper
+    const event = data.event || data.raw_event?.event
+    if (!event) {
+      return { logType: 'text', logContent: data.event_type || '', toolData: null }
+    }
+
     let logType = 'text'
     let logContent = ''
     let toolData = null
@@ -131,26 +162,30 @@ export default function LiveLogs() {
     <>
       <div className="bg-gh-canvas-subtle rounded-md border border-gh-border mb-5">
         <div className="p-4 border-b border-gh-border flex justify-between items-center">
-          <h2 className="text-gh-accent-primary text-base font-semibold">Claude Live Logs</h2>
+          <h2 className="text-gh-accent-primary text-base font-semibold">{title}</h2>
           <div className="flex gap-2">
+            {headerControls}
             <button
-              onClick={() => setAutoScroll(!autoScroll)}
+              onClick={handleAutoScrollToggle}
               className="px-3 py-1 bg-gh-canvas border border-gh-border rounded text-xs hover:bg-gh-border-muted transition-colors"
             >
               Auto-scroll: {autoScroll ? 'ON' : 'OFF'}
             </button>
-            <button
-              onClick={clearLogs}
-              className="px-3 py-1 bg-gh-canvas border border-gh-border rounded text-xs hover:bg-gh-border-muted transition-colors"
-            >
-              Clear Logs
-            </button>
+            {showClearButton && (
+              <button
+                onClick={clearLogs}
+                className="px-3 py-1 bg-gh-canvas border border-gh-border rounded text-xs hover:bg-gh-border-muted transition-colors"
+              >
+                Clear Logs
+              </button>
+            )}
           </div>
         </div>
 
         <div
           ref={containerRef}
-          className="min-h-[200px] max-h-[30vh] overflow-y-auto font-mono text-xs"
+          className="overflow-y-auto font-mono text-xs"
+          style={{ minHeight, maxHeight }}
         >
           {logs.length === 0 ? (
             <div className="p-4 text-center text-gh-fg-muted">
@@ -167,7 +202,7 @@ export default function LiveLogs() {
                   className="flex gap-3 p-2 border-b border-gh-border-muted hover:bg-gh-canvas transition-colors items-start"
                 >
                   <span className="text-gh-fg-subtle whitespace-nowrap">
-                    {log.timestamp ? new Date(log.timestamp * 1000).toLocaleTimeString('en-US', { timeZone: 'UTC', hour12: false }) + ' UTC' : new Date().toLocaleTimeString('en-US', { timeZone: 'UTC', hour12: false }) + ' UTC'}
+                    {timestampFormatter(log.timestamp)}
                   </span>
                   <span className={`px-2 py-0.5 rounded text-[10px] font-semibold uppercase whitespace-nowrap ${getLogTypeColor(logType)} text-white`}>
                     {logType}

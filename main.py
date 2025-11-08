@@ -333,25 +333,8 @@ async def main():
         f"{locks_released} locks released"
     )
 
-    # Clean up stale active pipeline runs (requires Elasticsearch)
-    if elasticsearch_ready:
-        logger.info("Cleaning up stale active pipeline runs")
-        from services.pipeline_run import get_pipeline_run_manager
-        pipeline_run_manager = get_pipeline_run_manager()
-        pipeline_run_manager.cleanup_stale_active_runs_on_startup()
-        logger.info("Pipeline run cleanup complete")
-    else:
-        logger.warning("Skipping pipeline run cleanup - Elasticsearch not available")
-    
-    # Clean up stale agent events from Redis stream (requires Elasticsearch)
-    if elasticsearch_ready:
-        logger.info("Cleaning up stale agent events from Redis stream")
-        from monitoring.observability import get_observability_manager
-        observability = get_observability_manager()
-        observability.cleanup_stale_agent_events_on_startup()
-        logger.info("Stale agent event cleanup complete")
-    else:
-        logger.warning("Skipping agent event cleanup - Elasticsearch not available")
+    # NOTE: Stall detection moved to after startup rescan completes
+    # This prevents race condition where review cycles haven't queued tasks yet
 
     # Verify Docker images for all projects marked as verified
     # This handles cases where Docker context changed or images were lost
@@ -439,6 +422,27 @@ async def main():
         logger.info("Startup rescan complete, proceeding with worker pool initialization")
     else:
         logger.log_warning(f"Startup rescan did not complete within {rescan_timeout}s - proceeding anyway")
+
+    # Now that startup rescan is complete and review cycles have queued tasks,
+    # it's safe to clean up stale pipeline runs and agent events
+    if elasticsearch_ready:
+        logger.info("Cleaning up stale active pipeline runs")
+        from services.pipeline_run import get_pipeline_run_manager
+        pipeline_run_manager = get_pipeline_run_manager()
+        pipeline_run_manager.cleanup_stale_active_runs_on_startup()
+        logger.info("Pipeline run cleanup complete")
+    else:
+        logger.warning("Skipping pipeline run cleanup - Elasticsearch not available")
+
+    # Clean up stale agent events from Redis stream (requires Elasticsearch)
+    if elasticsearch_ready:
+        logger.info("Cleaning up stale agent events from Redis stream")
+        from monitoring.observability import get_observability_manager
+        observability = get_observability_manager()
+        observability.cleanup_stale_agent_events_on_startup()
+        logger.info("Stale agent event cleanup complete")
+    else:
+        logger.warning("Skipping agent event cleanup - Elasticsearch not available")
 
     # Initialize worker pool for parallel task processing
     # orchestrator_workers controls concurrency:

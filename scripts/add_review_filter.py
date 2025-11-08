@@ -4,10 +4,10 @@ Quick script to add a manual review filter based on learnings.
 
 Usage:
     python scripts/add_review_filter.py \\
-        --agent requirements_reviewer \\
+        --agent code_reviewer \\
         --category project_conventions \\
         --severity high \\
-        --pattern "Requirements violate CLAUDE.md conventions" \\
+        --pattern "Code violates CLAUDE.md conventions" \\
         --samples "Issue #102 created markdown docs despite CLAUDE.md forbidding it" \\
         --action highlight
 
@@ -44,11 +44,11 @@ Examples:
 
   # Highlight CLAUDE.md compliance checks
   python scripts/add_review_filter.py \\
-      --agent requirements_reviewer \\
+      --agent code_reviewer \\
       --category project_conventions \\
       --severity high \\
-      --pattern "Requirements violate project CLAUDE.md conventions" \\
-      --samples "Issue #102 requested 'Documentation updated' but CLAUDE.md says use GitHub issues" \\
+      --pattern "Code violates project CLAUDE.md conventions" \\
+      --samples "Issue #102 created documentation files but CLAUDE.md says avoid creating docs" \\
       --action highlight
 
   # Suppress low-value noise

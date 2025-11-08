@@ -288,7 +288,77 @@ class ReviewCycleExecutor:
                 f"Resuming cycle for issue #{cycle_state.issue_number} "
                 f"(status: {cycle_state.status}, iteration: {cycle_state.current_iteration}/{cycle_state.max_iterations})"
             )
-            
+
+            try:
+                # FIRST: Validate that the issue is still in a column that uses review cycles
+                # This must run BEFORE max iterations check to remove stale cycles
+                # If the issue moved to a different column (e.g., from Code Review to Testing),
+                # the old review cycle state should be removed
+                from services.project_monitor import ProjectMonitor
+                from config.manager import config_manager
+
+                temp_monitor = ProjectMonitor(None, config_manager)
+                current_column = temp_monitor.get_issue_column_sync(
+                    cycle_state.project_name,
+                    cycle_state.board_name,
+                    cycle_state.issue_number
+                )
+
+                if current_column:
+                    # Get workflow template to check if current column uses review cycles
+                    project_config = config_manager.get_project_config(cycle_state.project_name)
+                    pipeline = next((p for p in project_config.pipelines if p.board_name == cycle_state.board_name), None)
+
+                    if pipeline:
+                        workflow_template = config_manager.get_workflow_template(pipeline.workflow)
+                        current_column_config = next((c for c in workflow_template.columns if c.name == current_column), None)
+
+                        # Check if current column uses review cycles (has both agent and maker_agent)
+                        uses_review_cycle = (
+                            current_column_config and
+                            current_column_config.agent and
+                            current_column_config.maker_agent and
+                            current_column_config.agent != 'null' and
+                            current_column_config.maker_agent != 'null'
+                        )
+
+                        if not uses_review_cycle:
+                            logger.warning(
+                                f"Issue #{cycle_state.issue_number} is in column '{current_column}' which doesn't use review cycles. "
+                                f"Removing stale review cycle state (was for {cycle_state.reviewer_agent}/{cycle_state.maker_agent})."
+                            )
+                            self._remove_cycle_state(cycle_state)
+                            if cycle_state.issue_number in self.active_cycles:
+                                del self.active_cycles[cycle_state.issue_number]
+                            continue
+
+                        # Check if the agents match (column config may have changed)
+                        if (current_column_config.agent != cycle_state.reviewer_agent or
+                            current_column_config.maker_agent != cycle_state.maker_agent):
+                            logger.warning(
+                                f"Issue #{cycle_state.issue_number} review cycle agents don't match current column config. "
+                                f"Removing stale state (was: {cycle_state.reviewer_agent}/{cycle_state.maker_agent}, "
+                                f"now: {current_column_config.agent}/{current_column_config.maker_agent})."
+                            )
+                            self._remove_cycle_state(cycle_state)
+                            if cycle_state.issue_number in self.active_cycles:
+                                del self.active_cycles[cycle_state.issue_number]
+                            continue
+                else:
+                    # Issue not found on board, remove stale state
+                    logger.warning(
+                        f"Issue #{cycle_state.issue_number} not found on board '{cycle_state.board_name}'. "
+                        f"Removing stale review cycle state."
+                    )
+                    self._remove_cycle_state(cycle_state)
+                    if cycle_state.issue_number in self.active_cycles:
+                        del self.active_cycles[cycle_state.issue_number]
+                    continue
+
+            except Exception as e:
+                logger.error(f"Failed to validate review cycle column for issue #{cycle_state.issue_number}: {e}", exc_info=True)
+                # Continue with other validation checks
+
             # Validate that the cycle hasn't exceeded max iterations (corrupted state check)
             if cycle_state.current_iteration >= cycle_state.max_iterations:
                 logger.warning(

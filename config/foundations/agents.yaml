@@ -87,26 +87,6 @@ agents:
     mcp_servers:
       - context7
 
-  requirements_reviewer:
-    description: "Requirements validation and quality assurance"
-    model: "claude-opus-4-20250514"
-    timeout: 300
-    retries: 2
-    makes_code_changes: false  # Review only, no changes
-    filesystem_write_allowed: false  # Posts reviews to GitHub, doesn't create files
-    requires_dev_container: false
-    requires_docker: true  # Must run in Docker for security isolation
-    capabilities:
-      - requirements_validation
-      - quality_assessment
-      - gap_analysis
-      - compliance_review
-    tools_enabled:
-      - file_operations
-      - git_integration
-    mcp_servers:
-      - context7
-
   software_architect:
     description: "System architecture and technical design"
     model: "claude-sonnet-4-5-20250929"

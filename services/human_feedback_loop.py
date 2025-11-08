@@ -114,32 +114,67 @@ class HumanFeedbackLoopExecutor:
 
         # FIX #1: Check if loop already active (in-memory duplicate prevention)
         if issue_number in self.active_loops:
-            logger.warning(
-                f"⚠️  Conversational loop already active for issue #{issue_number}, "
-                f"skipping duplicate start (agent={column.agent}, project={project_name})"
-            )
-            return (None, False)
+            existing_agent = self.active_loops[issue_number].agent
 
-        # FIX #2: Acquire Redis distributed lock (prevents duplicate loops across instances)
+            # If same agent, it's a duplicate - reject immediately
+            if existing_agent == column.agent:
+                logger.warning(
+                    f"⚠️  Conversational loop already active for issue #{issue_number}, "
+                    f"skipping duplicate start (agent={column.agent}, project={project_name})"
+                )
+                return (None, False)
+
+            # Different agent - agent transition during manual progression
+            # The old agent's monitoring loop will exit on its next poll (within 30s)
+            # We can proceed immediately and let the old loop clean up naturally
+            logger.info(
+                f"Agent transition detected for issue #{issue_number}: "
+                f"{existing_agent} → {column.agent}. "
+                f"Proceeding with transition (old loop will exit on next poll)."
+            )
+
+        # FIX #2: Acquire/update Redis distributed lock (prevents duplicate loops across instances)
         import redis
         redis_client = redis.Redis(host='redis', port=6379, decode_responses=True)
         lock_key = f"orchestrator:conversational_loop:{project_name}:{issue_number}"
 
-        # Try to acquire lock with 30 minute TTL (safety timeout)
-        lock_acquired = redis_client.set(lock_key, column.agent, nx=True, ex=1800)
-        if not lock_acquired:
-            existing_agent = redis_client.get(lock_key)
-            logger.warning(
-                f"⚠️  Another orchestrator instance is already running conversational loop "
-                f"for issue #{issue_number} (locked by agent={existing_agent}). "
-                f"Skipping duplicate start."
-            )
-            return (None, False)
+        # Check if lock already exists
+        existing_agent = redis_client.get(lock_key)
 
-        logger.info(
-            f"✅ Acquired distributed lock for conversational loop: "
-            f"{project_name}#{issue_number} (agent={column.agent})"
-        )
+        if existing_agent is None:
+            # No lock exists - acquire it with nx=True to prevent race conditions
+            lock_acquired = redis_client.set(lock_key, column.agent, nx=True, ex=1800)
+            if not lock_acquired:
+                # Race condition - another instance acquired between GET and SET
+                existing_agent = redis_client.get(lock_key)
+                logger.warning(
+                    f"⚠️  Lock acquired by another instance during race: "
+                    f"issue #{issue_number} locked by {existing_agent}"
+                )
+                # Fall through to existing_agent handling below
+            else:
+                logger.info(
+                    f"✅ Acquired new distributed lock for conversational loop: "
+                    f"{project_name}#{issue_number} (agent={column.agent})"
+                )
+
+        if existing_agent is not None:
+            # Lock exists - check if it's the same agent or different
+            if existing_agent == column.agent:
+                # Same agent - duplicate loop attempt
+                logger.warning(
+                    f"⚠️  Conversational loop already active for issue #{issue_number}, "
+                    f"locked by same agent {existing_agent}. Skipping duplicate start."
+                )
+                return (None, False)
+            else:
+                # Different agent - agent transition during manual progression
+                # Simply update the lock value to the new agent (no waiting needed!)
+                redis_client.set(lock_key, column.agent, ex=1800)  # No nx=True - just update
+                logger.info(
+                    f"✅ Updated lock ownership for issue #{issue_number}: "
+                    f"{existing_agent} → {column.agent} (agent transition)"
+                )
 
         # Create state
         state = HumanFeedbackState(

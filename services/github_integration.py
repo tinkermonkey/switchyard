@@ -664,7 +664,6 @@ class AgentCommentFormatter:
         agent_info = {
             'idea_researcher': ('🔬', 'Idea Research'),
             'business_analyst': ('📊', 'Business Analysis'),
-            'requirements_reviewer': ('✅', 'Requirements Review'),
             'software_architect': ('🏗️', 'Architecture Design'),
             'senior_software_engineer': ('💻', 'Implementation'),
             'code_reviewer': ('🔍', 'Code Review'),

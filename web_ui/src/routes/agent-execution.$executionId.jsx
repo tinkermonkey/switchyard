@@ -3,6 +3,7 @@ import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import { RefreshCw, CheckCircle2, Circle, PlayCircle, ChevronDown, ChevronUp, ChevronLeft, ChevronRight } from 'lucide-react'
 import Header from '../components/Header'
 import NavigationTabs from '../components/NavigationTabs'
+import LiveLogs from '../components/LiveLogs'
 import { useSocket } from '../contexts/SocketContext'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
@@ -26,7 +27,6 @@ function AgentExecutionView() {
   const [isPromptExpanded, setIsPromptExpanded] = useState(false)
   const [isPreviousResultExpanded, setIsPreviousResultExpanded] = useState(false)
   const [autoScroll, setAutoScroll] = useState(true)
-  const logsContainerRef = useRef(null)
 
   // Agent execution navigation state
   const [pipelineRunId, setPipelineRunId] = useState(null)
@@ -391,14 +391,7 @@ function AgentExecutionView() {
       mergedLogs: logs
     }
   }, [executionData, executionLogs, allLogs, promptEvent])
-  
-  // Auto-scroll logs
-  useEffect(() => {
-    if (autoScroll && logsContainerRef.current) {
-      logsContainerRef.current.scrollTop = logsContainerRef.current.scrollHeight
-    }
-  }, [mergedLogs, autoScroll])
-  
+
   const formatToolCall = (toolCall) => {
     if (!toolCall) return null
     
@@ -447,101 +440,7 @@ function AgentExecutionView() {
     }
     return { color: 'bg-gh-fg-muted', label: 'Idle' }
   }
-  
-  const formatLogContent = (log) => {
-    const event = log.raw_event?.event
-    let logType = 'text'
-    let logContent = ''
-    let toolData = null
-    
-    // If there's no event data (e.g., system events), return empty
-    if (!event) {
-      return { logType: 'text', logContent: log.event_type || '', toolData: null }
-    }
-    
-    if (event?.type === 'assistant') {
-      const msg = event.message
-      if (msg?.content) {
-        const contents = Array.isArray(msg.content) ? msg.content : [msg.content]
-        
-        for (const item of contents) {
-          if (item.type === 'text') {
-            logType = 'text'
-            logContent = item.text || ''
-            break
-          } else if (item.type === 'tool_use') {
-            logType = 'tool'
-            const toolName = item.name
-            const input = item.input || {}
-            
-            switch (toolName) {
-              case 'Bash':
-                logContent = `Bash: ${input.command || ''}`
-                break
-              case 'Read':
-                logContent = `Read: ${input.file_path || ''}`
-                break
-              case 'Grep':
-                logContent = `Grep: "${input.pattern || ''}" in ${input.path || '.'}`
-                break
-              case 'Edit':
-                logContent = `Edit: ${input.file_path || ''}`
-                break
-              case 'Write':
-                logContent = `Write: ${input.file_path || ''}`
-                break
-              case 'Glob':
-                logContent = `Glob: ${input.pattern || ''}`
-                break
-              case 'TodoWrite':
-                logContent = `TodoWrite: ${input.todos?.length || 0} items`
-                toolData = item
-                break
-              default:
-                logContent = `${toolName}${input.description ? ': ' + input.description : ''}`
-            }
-            break
-          }
-        }
-        
-        if (!logContent && msg.usage) {
-          logType = 'usage'
-          const usage = msg.usage
-          const parts = [`${usage.input_tokens || 0} in`, `${usage.output_tokens || 0} out`]
-          if (usage.cache_read_input_tokens) parts.push(`${usage.cache_read_input_tokens} cache`)
-          logContent = `📊 Tokens: ${parts.join(' / ')}`
-        }
-      }
-    } else if (event?.type === 'user') {
-      const msg = event.message
-      if (msg?.content) {
-        const contents = Array.isArray(msg.content) ? msg.content : [msg.content]
-        for (const item of contents) {
-          if (item.type === 'tool_result') {
-            logType = 'result'
-            const contentStr = typeof item.content === 'string' ? item.content : JSON.stringify(item.content)
-            const preview = contentStr?.substring(0, 60) || ''
-            logContent = `Tool result${item.is_error ? ' (error)' : ''}: ${preview}${contentStr?.length > 60 ? '...' : ''}`
-            break
-          }
-        }
-      }
-    }
-    
-    return { logType, logContent, toolData }
-  }
-  
-  const getLogTypeColor = (type) => {
-    switch (type) {
-      case 'tool': return 'bg-gh-warning'
-      case 'text': return 'bg-gh-success'
-      case 'usage': return 'bg-gh-fg-subtle'
-      case 'error': return 'bg-gh-danger'
-      case 'result': return 'bg-gh-accent-emphasis'
-      default: return 'bg-gh-fg-muted'
-    }
-  }
-  
+
   const status = getStatusIndicator()
   const { lastTodoWrite, lastTextMessage, lastToolCall, previousToolCall, previousToolResult, inputPrompt } = agentState
   const todoStats = getTodoStats(lastTodoWrite?.todos)
@@ -1173,87 +1072,25 @@ function AgentExecutionView() {
       </div>
 
       {/* Live Logs Section */}
-      <div className="bg-gh-canvas-subtle rounded-md border border-gh-border">
-        <div className="p-4 border-b border-gh-border flex justify-between items-center">
-          <h2 className="text-gh-accent-primary text-base font-semibold">
-            Live Logs for Execution
-          </h2>
-          <div className="flex gap-2 items-center">
-            <span className="text-xs text-gh-fg-muted">
-              {mergedLogs.length} log entries
-              {mergedLogs.length > executionLogs.length && (
-                <span className="ml-1 text-gh-success">
-                  (+{mergedLogs.length - executionLogs.length} live)
-                </span>
-              )}
-            </span>
-            <button
-              onClick={() => setAutoScroll(!autoScroll)}
-              className="px-3 py-1 bg-gh-canvas border border-gh-border rounded text-xs hover:bg-gh-border-muted transition-colors"
-            >
-              Auto-scroll: {autoScroll ? 'ON' : 'OFF'}
-            </button>
-          </div>
-        </div>
-        
-        <div
-          ref={logsContainerRef}
-          className="min-h-[300px] max-h-[50vh] overflow-y-auto font-mono text-xs"
-        >
-          {mergedLogs.length === 0 ? (
-            <div className="p-4 text-center text-gh-fg-muted">
-              No logs found for this execution
-            </div>
-          ) : (
-            mergedLogs.map((log, idx) => {
-              const { logType, logContent, toolData } = formatLogContent(log)
-              if (!logContent) return null
-              
-              return (
-                <div
-                  key={idx}
-                  className="flex gap-3 p-2 border-b border-gh-border-muted hover:bg-gh-canvas transition-colors items-start"
-                >
-                  <span className="text-gh-fg-subtle whitespace-nowrap">
-                    {formatTimestamp(normalizeTimestamp(log.timestamp))}
-                  </span>
-                  <span className={`px-2 py-0.5 rounded text-[10px] font-semibold uppercase whitespace-nowrap ${getLogTypeColor(logType)} text-white`}>
-                    {logType}
-                  </span>
-                  <div className="flex-1 min-w-0">
-                    {logType === 'text' ? (
-                      <div className="prose prose-sm prose-invert max-w-none">
-                        <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                          {logContent}
-                        </ReactMarkdown>
-                      </div>
-                    ) : (
-                      <span className="break-words">{logContent}</span>
-                    )}
-                    {toolData?.input?.todos && (
-                      <div className="mt-2 space-y-1">
-                        {toolData.input.todos.map((todo, idx) => {
-                          const isCompleted = todo.status === 'completed'
-                          return (
-                            <div key={idx} className="flex items-start gap-2">
-                              <span className={isCompleted ? 'text-gh-success' : 'text-gh-fg-muted'}>
-                                {isCompleted ? '☑' : '☐'}
-                              </span>
-                              <span className={isCompleted ? 'line-through text-gh-fg-muted' : ''}>
-                                {todo.content}
-                              </span>
-                            </div>
-                          )
-                        })}
-                      </div>
-                    )}
-                  </div>
-                </div>
-              )
-            })
-          )}
-        </div>
-      </div>
+      <LiveLogs
+        logs={mergedLogs}
+        title="Live Logs for Execution"
+        showClearButton={false}
+        formatTimestamp={(timestamp) => formatTimestamp(normalizeTimestamp(timestamp))}
+        minHeight="300px"
+        maxHeight="50vh"
+        onAutoScrollChange={setAutoScroll}
+        headerControls={
+          <span className="text-xs text-gh-fg-muted">
+            {mergedLogs.length} log entries
+            {mergedLogs.length > executionLogs.length && (
+              <span className="ml-1 text-gh-success">
+                (+{mergedLogs.length - executionLogs.length} live)
+              </span>
+            )}
+          </span>
+        }
+      />
     </div>
   )
 }

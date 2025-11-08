@@ -602,17 +602,18 @@ class PipelineRunManager:
             
             for hit in result['hits']['hits']:
                 run = hit['_source']
+                original_index = hit['_index']
                 pipeline_run_id = run['id']
                 project = run['project']
                 issue_number = run['issue_number']
                 board = run['board']
-                
+
                 try:
                     # Get project config
                     project_config = config_manager.get_project_config(project)
                     if not project_config:
                         logger.warning(f"No config for project {project}, ending run {pipeline_run_id}")
-                        self._end_run_in_elasticsearch(run, "Project config not found")
+                        self._end_run_in_elasticsearch(run, "Project config not found", original_index)
                         ended_count += 1
                         continue
                     
@@ -624,7 +625,7 @@ class PipelineRunManager:
                     
                     if not pipeline_config:
                         logger.warning(f"No pipeline config for board {board}, ending run {pipeline_run_id}")
-                        self._end_run_in_elasticsearch(run, "Pipeline config not found")
+                        self._end_run_in_elasticsearch(run, "Pipeline config not found", original_index)
                         ended_count += 1
                         continue
                     
@@ -642,7 +643,7 @@ class PipelineRunManager:
                             f"Could not determine column for issue #{issue_number}, "
                             f"ending run {pipeline_run_id} (issue may have been removed from board)"
                         )
-                        self._end_run_in_elasticsearch(run, "Issue not found on board")
+                        self._end_run_in_elasticsearch(run, "Issue not found on board", original_index)
                         ended_count += 1
                         continue
                     
@@ -657,7 +658,7 @@ class PipelineRunManager:
                             f"Column {current_column} not in workflow, "
                             f"ending run {pipeline_run_id}"
                         )
-                        self._end_run_in_elasticsearch(run, f"Column '{current_column}' not in workflow")
+                        self._end_run_in_elasticsearch(run, f"Column '{current_column}' not in workflow", original_index)
                         ended_count += 1
                         continue
                     
@@ -669,7 +670,7 @@ class PipelineRunManager:
                             f"Issue #{issue_number} in column '{current_column}' with no agent, "
                             f"ending run {pipeline_run_id}"
                         )
-                        self._end_run_in_elasticsearch(run, f"Issue in column '{current_column}' with no agent")
+                        self._end_run_in_elasticsearch(run, f"Issue in column '{current_column}' with no agent", original_index)
                         ended_count += 1
                     else:
                         # Column has an agent - now verify work is actually in progress
@@ -688,7 +689,7 @@ class PipelineRunManager:
                                 f"Issue #{issue_number} in column '{current_column}' appears stalled "
                                 f"(no active agents, no queued tasks), ending run {pipeline_run_id}"
                             )
-                            self._end_run_in_elasticsearch(run, "No work in progress detected")
+                            self._end_run_in_elasticsearch(run, "No work in progress detected", original_index)
                             ended_count += 1
                     
                 except Exception as e:
@@ -1035,21 +1036,25 @@ class PipelineRunManager:
             logger.error(f"Error querying issue column: {e}")
             return None
     
-    def _end_run_in_elasticsearch(self, run_data: Dict[str, Any], reason: str):
+    def _end_run_in_elasticsearch(self, run_data: Dict[str, Any], reason: str, index: Optional[str] = None):
         """
         End a pipeline run directly in Elasticsearch (cleanup helper)
-        
+
         Args:
             run_data: Pipeline run data from Elasticsearch
             reason: Reason for ending (for logging)
+            index: Optional index name where the document exists (if not provided, uses today's index)
         """
         try:
             pipeline_run_id = run_data['id']
             run_data['ended_at'] = datetime.utcnow().isoformat() + 'Z'
             run_data['status'] = 'completed'
-            
+
+            # Use the provided index (where the document was found) or fall back to today's index
+            target_index = index if index else self._get_es_index_name()
+
             self.es.index(
-                index=self.es_index,
+                index=target_index,
                 id=pipeline_run_id,
                 document=run_data
             )

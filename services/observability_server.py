@@ -686,7 +686,7 @@ def get_current_pipeline():
             pipeline_type = 'dev_pipeline'
         else:
             # Infer from agents if board not found
-            if any(agent in ['idea_researcher', 'business_analyst', 'requirements_reviewer'] for agent in recent_agents):
+            if any(agent in ['idea_researcher', 'business_analyst'] for agent in recent_agents):
                 if 'senior_software_engineer' in recent_agents:
                     pipeline_type = 'dev_pipeline'
                 elif 'software_architect' in recent_agents:
@@ -1530,9 +1530,8 @@ def get_available_agents():
     return jsonify({
         'success': True,
         'agents': [
-            'requirements_reviewer',
             'code_reviewer',
-            'qa_reviewer'
+            'documentation_editor'
         ]
     })
 
@@ -1656,7 +1655,7 @@ def get_circuit_breakers():
             except Exception as e:
                 logger.warning(f"Could not parse pattern ingestion stats: {e}")
         else:
-            logger.info("Pattern ingestion service stats not available (services may be disabled)")
+            logger.debug("Pattern ingestion service stats not available (services may be disabled)")
 
         
         # Claude Code circuit breaker
