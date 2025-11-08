@@ -317,22 +317,58 @@ function PipelineRunDebugView() {
     }
   }, [selectedPipelineRun, fetchPipelineRunEvents])
   
-  // Track last processed socket event to prevent duplicate processing
-  const lastProcessedEventRef = useRef(null)
+  // Track last processed socket event timestamp to prevent duplicate processing
+  const lastProcessedTimestampRef = useRef(0)
 
   // Update on socket events
   useEffect(() => {
     if (socketEvents.length > 0) {
-      const latestEvent = socketEvents[socketEvents.length - 1]
+      // Get the NEWEST event (first in array since new events are prepended)
+      const latestEvent = socketEvents[0]
 
-      // Skip if we've already processed this event
-      if (lastProcessedEventRef.current === latestEvent) {
+      // Extract timestamp - handle both Unix timestamp and ISO string
+      let eventTimestamp = 0
+      if (latestEvent.timestamp) {
+        if (typeof latestEvent.timestamp === 'number') {
+          eventTimestamp = latestEvent.timestamp > 10000000000
+            ? latestEvent.timestamp / 1000
+            : latestEvent.timestamp
+        } else if (typeof latestEvent.timestamp === 'string') {
+          const date = new Date(latestEvent.timestamp)
+          if (!isNaN(date.getTime())) {
+            eventTimestamp = date.getTime() / 1000
+          }
+        }
+      }
+
+      // Skip if we've already processed this timestamp
+      if (eventTimestamp <= lastProcessedTimestampRef.current) {
         return
       }
-      lastProcessedEventRef.current = latestEvent
 
-      // Refresh pipeline runs and events when new events arrive
-      if (['agent_initialized', 'agent_completed', 'agent_failed'].includes(latestEvent.event_type)) {
+      console.log('[PipelineRunDebug] Processing new socket event:', {
+        event_type: latestEvent.event_type,
+        timestamp: eventTimestamp,
+        lastProcessed: lastProcessedTimestampRef.current
+      })
+
+      lastProcessedTimestampRef.current = eventTimestamp
+
+      // Refresh pipeline runs and events when relevant events arrive
+      // Expand the list of event types we care about for pipeline runs
+      const pipelineEventTypes = [
+        'agent_initialized',
+        'agent_completed',
+        'agent_failed',
+        'pipeline_stage_started',
+        'pipeline_stage_completed',
+        'review_cycle_started',
+        'review_cycle_completed'
+      ]
+
+      if (pipelineEventTypes.includes(latestEvent.event_type)) {
+        console.log('[PipelineRunDebug] Refreshing pipeline data for event type:', latestEvent.event_type)
+
         // Use ref to get current value without dependency
         if (selectedPipelineRunRef.current) {
           fetchPipelineRunEvents(selectedPipelineRunRef.current.id)
@@ -348,11 +384,36 @@ function PipelineRunDebugView() {
   const mergedEvents = useMemo(() => {
     if (!selectedPipelineRun) return []
     const allEvents = mergePipelineRunEvents(pipelineRunEvents, socketEvents, selectedPipelineRun)
-    // Filter to only show agent lifecycle and decision events (exclude Claude logs)
-    return allEvents.filter(event =>
-      event.event_category === 'agent_lifecycle' ||
-      event.event_category === 'decision'
-    )
+
+    console.log('[PipelineRunDebug] All merged events:', {
+      count: allEvents.length,
+      sampleEvents: allEvents.slice(0, 3).map(e => ({
+        event_type: e.event_type,
+        event_category: e.event_category,
+        timestamp: e.timestamp
+      }))
+    })
+
+    // Exclude only Claude streaming logs, show everything else
+    const filtered = allEvents.filter(event => {
+      // Exclude Claude API streaming events
+      if (event.event_category === 'claude_api') return false
+      if (event.event_type === 'claude_stream' || event.event_type === 'claude_stream_event') return false
+
+      // Include everything else
+      return true
+    })
+
+    console.log('[PipelineRunDebug] Filtered events (excluding Claude logs):', {
+      count: filtered.length,
+      excludedCount: allEvents.length - filtered.length,
+      sampleEvents: filtered.slice(0, 3).map(e => ({
+        event_type: e.event_type,
+        event_category: e.event_category
+      }))
+    })
+
+    return filtered
   }, [pipelineRunEvents, socketEvents, selectedPipelineRun])
 
   return (
