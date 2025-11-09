@@ -6,17 +6,17 @@ import {
 } from 'lucide-react'
 
 // Base component for displaying common event metadata
-const PipelineRunEventLogEvent = ({ event, children, icon: Icon, color = 'bg-gray-500' }) => {
+const PipelineRunEventLogEvent = ({ event, children, icon: Icon, color = 'bg-gray-500', onIconClick }) => {
   const formatTimestamp = (timestamp) => {
     if (!timestamp) return ''
     const date = new Date(timestamp)
-    return date.toLocaleString('en-US', { 
-      month: 'short', 
-      day: 'numeric', 
-      hour: '2-digit', 
-      minute: '2-digit', 
+    return date.toLocaleString('en-US', {
+      month: 'short',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
       second: '2-digit',
-      hour12: false 
+      hour12: false
     })
   }
 
@@ -24,9 +24,13 @@ const PipelineRunEventLogEvent = ({ event, children, icon: Icon, color = 'bg-gra
     <div className="flex gap-3 p-3 border-b border-gh-border hover:bg-gh-canvas-inset transition-colors">
       {/* Icon and Timeline Line */}
       <div className="flex flex-col items-center">
-        <div className={`${color} rounded-full p-2 text-white flex-shrink-0`}>
+        <button
+          onClick={() => onIconClick && onIconClick(event)}
+          className={`${color} rounded-full p-2 text-white flex-shrink-0 hover:opacity-80 transition-opacity cursor-pointer`}
+          title="View raw event JSON"
+        >
           {Icon ? <Icon className="w-4 h-4" /> : <Activity className="w-4 h-4" />}
-        </div>
+        </button>
         <div className="flex-1 w-0.5 bg-gh-border mt-2" />
       </div>
 
@@ -58,13 +62,13 @@ const PipelineRunEventLogEvent = ({ event, children, icon: Icon, color = 'bg-gra
 }
 
 // Agent Lifecycle Events
-const AgentInitializedEvent = ({ event }) => {
+const AgentInitializedEvent = ({ event, onIconClick }) => {
   // agent_execution_id can be at top level or in data (for backwards compatibility)
   const agentExecutionId = event.agent_execution_id || event.data?.agent_execution_id
   const taskId = event.task_id || event.data?.task_id
-  
+
   return (
-    <PipelineRunEventLogEvent event={event} icon={PlayCircle} color="bg-blue-600">
+    <PipelineRunEventLogEvent event={event} onIconClick={onIconClick} icon={PlayCircle} color="bg-blue-600">
       <div>Agent initialized: <span className="font-mono text-gh-accent-fg">{event.agent}</span></div>
       {taskId && (
         <div className="text-xs mt-1">Task ID: <span className="font-mono">{taskId.substring(0, 16)}...</span></div>
@@ -85,8 +89,8 @@ const AgentInitializedEvent = ({ event }) => {
   )
 }
 
-const AgentCompletedEvent = ({ event }) => (
-  <PipelineRunEventLogEvent event={event} icon={CheckCircle} color="bg-green-600">
+const AgentCompletedEvent = ({ event, onIconClick }) => (
+  <PipelineRunEventLogEvent event={event} onIconClick={onIconClick} icon={CheckCircle} color="bg-green-600">
     <div>Agent completed successfully: <span className="font-mono text-gh-success">{event.agent}</span></div>
     {event?.duration && (
       <div className="text-xs mt-1">Duration: {Math.floor(event.duration / 60)}m {Math.floor(event.duration % 60)}s</div>
@@ -94,8 +98,8 @@ const AgentCompletedEvent = ({ event }) => (
   </PipelineRunEventLogEvent>
 )
 
-const AgentFailedEvent = ({ event }) => (
-  <PipelineRunEventLogEvent event={event} icon={XCircle} color="bg-red-600">
+const AgentFailedEvent = ({ event, onIconClick }) => (
+  <PipelineRunEventLogEvent event={event} onIconClick={onIconClick} icon={XCircle} color="bg-red-600">
     <div>Agent failed: <span className="font-mono text-gh-danger">{event.agent}</span></div>
     {event?.error && (
       <div className="text-xs mt-1 text-red-400">{event.error}</div>
@@ -104,8 +108,8 @@ const AgentFailedEvent = ({ event }) => (
 )
 
 // Agent Routing Events
-const AgentRoutingDecisionEvent = ({ event }) => (
-  <PipelineRunEventLogEvent event={event} icon={GitBranch} color="bg-blue-500">
+const AgentRoutingDecisionEvent = ({ event, onIconClick }) => (
+  <PipelineRunEventLogEvent event={event} onIconClick={onIconClick} icon={GitBranch} color="bg-blue-500">
     <div className="space-y-1">
       <div>Selected agent: <span className="font-mono text-gh-accent-fg">{event?.data?.decision?.selected_agent || event?.decision?.selected_agent}</span></div>
       {(event?.data?.reason || event?.reason) && (
@@ -118,8 +122,8 @@ const AgentRoutingDecisionEvent = ({ event }) => (
   </PipelineRunEventLogEvent>
 )
 
-const AgentSelectedEvent = ({ event }) => (
-  <PipelineRunEventLogEvent event={event} icon={Users} color="bg-blue-500">
+const AgentSelectedEvent = ({ event, onIconClick }) => (
+  <PipelineRunEventLogEvent event={event} onIconClick={onIconClick} icon={Users} color="bg-blue-500">
     <div className="space-y-1">
       <div>Agent selected: <span className="font-mono text-gh-accent-fg">{event?.data?.decision?.agent || event?.decision?.agent}</span></div>
       {(event?.data?.reason || event?.reason) && (
@@ -130,8 +134,8 @@ const AgentSelectedEvent = ({ event }) => (
 )
 
 // Feedback Events
-const FeedbackDetectedEvent = ({ event }) => (
-  <PipelineRunEventLogEvent event={event} icon={MessageSquare} color="bg-orange-500">
+const FeedbackDetectedEvent = ({ event, onIconClick }) => (
+  <PipelineRunEventLogEvent event={event} onIconClick={onIconClick} icon={MessageSquare} color="bg-orange-500">
     <div className="space-y-1">
       <div>Feedback detected from: {event?.data?.inputs?.feedback_source || event?.inputs?.feedback_source}</div>
       {(event?.data?.decision?.target_agent || event?.decision?.target_agent) && (
@@ -144,8 +148,8 @@ const FeedbackDetectedEvent = ({ event }) => (
   </PipelineRunEventLogEvent>
 )
 
-const FeedbackListeningStartedEvent = ({ event }) => (
-  <PipelineRunEventLogEvent event={event} icon={MessageSquare} color="bg-orange-400">
+const FeedbackListeningStartedEvent = ({ event, onIconClick }) => (
+  <PipelineRunEventLogEvent event={event} onIconClick={onIconClick} icon={MessageSquare} color="bg-orange-400">
     <div>Started listening for feedback</div>
     {(event?.data?.monitoring_agent || event?.monitoring_agent) && (
       <div className="text-xs">Monitoring agent: {event?.data?.monitoring_agent || event.monitoring_agent}</div>
@@ -153,8 +157,8 @@ const FeedbackListeningStartedEvent = ({ event }) => (
   </PipelineRunEventLogEvent>
 )
 
-const FeedbackListeningStoppedEvent = ({ event }) => (
-  <PipelineRunEventLogEvent event={event} icon={MessageSquare} color="bg-orange-400">
+const FeedbackListeningStoppedEvent = ({ event, onIconClick }) => (
+  <PipelineRunEventLogEvent event={event} onIconClick={onIconClick} icon={MessageSquare} color="bg-orange-400">
     <div>Stopped listening for feedback</div>
     {(event?.data?.reason || event?.reason) && (
       <div className="text-xs italic">{event?.data?.reason || event.reason}</div>
@@ -163,8 +167,8 @@ const FeedbackListeningStoppedEvent = ({ event }) => (
 )
 
 // Status Progression Events
-const StatusProgressionStartedEvent = ({ event }) => (
-  <PipelineRunEventLogEvent event={event} icon={RotateCcw} color="bg-green-500">
+const StatusProgressionStartedEvent = ({ event, onIconClick }) => (
+  <PipelineRunEventLogEvent event={event} onIconClick={onIconClick} icon={RotateCcw} color="bg-green-500">
     <div className="space-y-1">
       <div>Status progression: {event?.data?.inputs?.from_status || event?.inputs?.from_status} → {event?.data?.decision?.to_status || event?.decision?.to_status}</div>
       {(event?.data?.inputs?.trigger || event?.inputs?.trigger) && (
@@ -174,14 +178,14 @@ const StatusProgressionStartedEvent = ({ event }) => (
   </PipelineRunEventLogEvent>
 )
 
-const StatusProgressionCompletedEvent = ({ event }) => (
-  <PipelineRunEventLogEvent event={event} icon={CheckCircle} color="bg-green-600">
+const StatusProgressionCompletedEvent = ({ event, onIconClick }) => (
+  <PipelineRunEventLogEvent event={event} onIconClick={onIconClick} icon={CheckCircle} color="bg-green-600">
     <div>Status progression completed: {event?.data?.decision?.to_status || event?.decision?.to_status}</div>
   </PipelineRunEventLogEvent>
 )
 
-const StatusProgressionFailedEvent = ({ event }) => (
-  <PipelineRunEventLogEvent event={event} icon={XCircle} color="bg-red-600">
+const StatusProgressionFailedEvent = ({ event, onIconClick }) => (
+  <PipelineRunEventLogEvent event={event} onIconClick={onIconClick} icon={XCircle} color="bg-red-600">
     <div>Status progression failed</div>
     {(event?.data?.error || event?.error) && (
       <div className="text-xs mt-1 text-red-400">{event?.data?.error || event.error}</div>
@@ -190,8 +194,8 @@ const StatusProgressionFailedEvent = ({ event }) => (
 )
 
 // Review Cycle Events
-const ReviewCycleStartedEvent = ({ event }) => (
-  <PipelineRunEventLogEvent event={event} icon={RotateCcw} color="bg-purple-600">
+const ReviewCycleStartedEvent = ({ event, onIconClick }) => (
+  <PipelineRunEventLogEvent event={event} onIconClick={onIconClick} icon={RotateCcw} color="bg-purple-600">
     <div className="space-y-1">
       <div>Review cycle started</div>
       {(event?.data?.inputs?.maker_agent || event?.inputs?.maker_agent) && (
@@ -204,8 +208,8 @@ const ReviewCycleStartedEvent = ({ event }) => (
   </PipelineRunEventLogEvent>
 )
 
-const ReviewCycleIterationEvent = ({ event }) => (
-  <PipelineRunEventLogEvent event={event} icon={RotateCcw} color="bg-purple-500">
+const ReviewCycleIterationEvent = ({ event, onIconClick }) => (
+  <PipelineRunEventLogEvent event={event} onIconClick={onIconClick} icon={RotateCcw} color="bg-purple-500">
     <div>Review cycle iteration {event?.data?.inputs?.cycle_iteration || event?.inputs?.cycle_iteration || '?'}</div>
     {(event?.data?.reason || event?.reason) && (
       <div className="text-xs italic">{event?.data?.reason || event.reason}</div>
@@ -213,20 +217,20 @@ const ReviewCycleIterationEvent = ({ event }) => (
   </PipelineRunEventLogEvent>
 )
 
-const ReviewCycleMakerSelectedEvent = ({ event }) => (
-  <PipelineRunEventLogEvent event={event} icon={Users} color="bg-purple-500">
+const ReviewCycleMakerSelectedEvent = ({ event, onIconClick }) => (
+  <PipelineRunEventLogEvent event={event} onIconClick={onIconClick} icon={Users} color="bg-purple-500">
     <div>Maker selected: <span className="font-mono">{event?.data?.inputs?.maker_agent || event?.inputs?.maker_agent}</span></div>
   </PipelineRunEventLogEvent>
 )
 
-const ReviewCycleReviewerSelectedEvent = ({ event }) => (
-  <PipelineRunEventLogEvent event={event} icon={Users} color="bg-purple-500">
+const ReviewCycleReviewerSelectedEvent = ({ event, onIconClick }) => (
+  <PipelineRunEventLogEvent event={event} onIconClick={onIconClick} icon={Users} color="bg-purple-500">
     <div>Reviewer selected: <span className="font-mono">{event?.data?.inputs?.reviewer_agent || event?.inputs?.reviewer_agent}</span></div>
   </PipelineRunEventLogEvent>
 )
 
-const ReviewCycleEscalatedEvent = ({ event }) => (
-  <PipelineRunEventLogEvent event={event} icon={AlertTriangle} color="bg-orange-600">
+const ReviewCycleEscalatedEvent = ({ event, onIconClick }) => (
+  <PipelineRunEventLogEvent event={event} onIconClick={onIconClick} icon={AlertTriangle} color="bg-orange-600">
     <div>Review cycle escalated to human</div>
     {(event?.data?.reason || event?.reason) && (
       <div className="text-xs italic">{event?.data?.reason || event.reason}</div>
@@ -234,8 +238,8 @@ const ReviewCycleEscalatedEvent = ({ event }) => (
   </PipelineRunEventLogEvent>
 )
 
-const ReviewCycleCompletedEvent = ({ event }) => (
-  <PipelineRunEventLogEvent event={event} icon={CheckCircle} color="bg-purple-700">
+const ReviewCycleCompletedEvent = ({ event, onIconClick }) => (
+  <PipelineRunEventLogEvent event={event} onIconClick={onIconClick} icon={CheckCircle} color="bg-purple-700">
     <div>Review cycle completed</div>
     {(event?.data?.inputs?.cycle_iteration || event?.inputs?.cycle_iteration) && (
       <div className="text-xs">Total iterations: {event?.data?.inputs?.cycle_iteration || event.inputs.cycle_iteration}</div>
@@ -244,8 +248,8 @@ const ReviewCycleCompletedEvent = ({ event }) => (
 )
 
 // Error Handling Events
-const ErrorEncounteredEvent = ({ event }) => (
-  <PipelineRunEventLogEvent event={event} icon={AlertCircle} color="bg-red-600">
+const ErrorEncounteredEvent = ({ event, onIconClick }) => (
+  <PipelineRunEventLogEvent event={event} onIconClick={onIconClick} icon={AlertCircle} color="bg-red-600">
     <div className="space-y-1">
       <div>Error encountered: {event?.data?.error_type || event?.error_type}</div>
       {(event?.data?.error_message || event?.error_message) && (
@@ -258,8 +262,8 @@ const ErrorEncounteredEvent = ({ event }) => (
   </PipelineRunEventLogEvent>
 )
 
-const ErrorRecoveredEvent = ({ event }) => (
-  <PipelineRunEventLogEvent event={event} icon={CheckCircle} color="bg-green-600">
+const ErrorRecoveredEvent = ({ event, onIconClick }) => (
+  <PipelineRunEventLogEvent event={event} onIconClick={onIconClick} icon={CheckCircle} color="bg-green-600">
     <div>Error recovered: {event?.data?.error_type || event?.error_type}</div>
     {(event?.data?.decision?.recovery_action || event?.decision?.recovery_action) && (
       <div className="text-xs">{event?.data?.decision?.recovery_action || event.decision.recovery_action}</div>
@@ -268,8 +272,8 @@ const ErrorRecoveredEvent = ({ event }) => (
 )
 
 // Task Queue Events
-const TaskQueuedEvent = ({ event }) => (
-  <PipelineRunEventLogEvent event={event} icon={Clock} color="bg-cyan-600">
+const TaskQueuedEvent = ({ event, onIconClick }) => (
+  <PipelineRunEventLogEvent event={event} onIconClick={onIconClick} icon={Clock} color="bg-cyan-600">
     <div className="space-y-1">
       <div>Task queued for agent: <span className="font-mono">{event?.agent}</span></div>
       {(event?.data?.priority || event?.priority) && (
@@ -279,15 +283,15 @@ const TaskQueuedEvent = ({ event }) => (
   </PipelineRunEventLogEvent>
 )
 
-const TaskDequeuedEvent = ({ event }) => (
-  <PipelineRunEventLogEvent event={event} icon={PlayCircle} color="bg-cyan-500">
+const TaskDequeuedEvent = ({ event, onIconClick }) => (
+  <PipelineRunEventLogEvent event={event} onIconClick={onIconClick} icon={PlayCircle} color="bg-cyan-500">
     <div>Task dequeued for execution: <span className="font-mono">{event?.agent}</span></div>
   </PipelineRunEventLogEvent>
 )
 
 // Branch Management Events
-const BranchCreatedEvent = ({ event }) => (
-  <PipelineRunEventLogEvent event={event} icon={GitBranch} color="bg-lime-600">
+const BranchCreatedEvent = ({ event, onIconClick }) => (
+  <PipelineRunEventLogEvent event={event} onIconClick={onIconClick} icon={GitBranch} color="bg-lime-600">
     <div className="space-y-1">
       <div>Branch created: <span className="font-mono">{event?.data?.decision?.branch_name || event?.decision?.branch_name}</span></div>
       {(event?.data?.reason || event?.reason) && (
@@ -297,8 +301,8 @@ const BranchCreatedEvent = ({ event }) => (
   </PipelineRunEventLogEvent>
 )
 
-const BranchReusedEvent = ({ event }) => (
-  <PipelineRunEventLogEvent event={event} icon={GitBranch} color="bg-lime-500">
+const BranchReusedEvent = ({ event, onIconClick }) => (
+  <PipelineRunEventLogEvent event={event} onIconClick={onIconClick} icon={GitBranch} color="bg-lime-500">
     <div className="space-y-1">
       <div>Branch reused: <span className="font-mono">{event?.data?.decision?.branch_name || event?.decision?.branch_name}</span></div>
       {(event?.data?.inputs?.confidence || event?.inputs?.confidence) && (
@@ -309,14 +313,14 @@ const BranchReusedEvent = ({ event }) => (
 )
 
 // Conversational Loop Events
-const ConversationalLoopStartedEvent = ({ event }) => (
-  <PipelineRunEventLogEvent event={event} icon={MessageSquare} color="bg-pink-600">
+const ConversationalLoopStartedEvent = ({ event, onIconClick }) => (
+  <PipelineRunEventLogEvent event={event} onIconClick={onIconClick} icon={MessageSquare} color="bg-pink-600">
     <div>Conversational loop started with: <span className="font-mono">{event?.data?.agent || event?.agent}</span></div>
   </PipelineRunEventLogEvent>
 )
 
-const ConversationalQuestionRoutedEvent = ({ event }) => (
-  <PipelineRunEventLogEvent event={event} icon={MessageSquare} color="bg-pink-500">
+const ConversationalQuestionRoutedEvent = ({ event, onIconClick }) => (
+  <PipelineRunEventLogEvent event={event} onIconClick={onIconClick} icon={MessageSquare} color="bg-pink-500">
     <div className="space-y-1">
       <div>Question routed to: <span className="font-mono">{event?.data?.target_agent || event?.target_agent}</span></div>
       {(event?.data?.question || event?.question) && (
@@ -327,8 +331,8 @@ const ConversationalQuestionRoutedEvent = ({ event }) => (
 )
 
 // Default/Generic Event
-const GenericEvent = ({ event }) => (
-  <PipelineRunEventLogEvent event={event} icon={Activity} color="bg-gray-500">
+const GenericEvent = ({ event, onIconClick }) => (
+  <PipelineRunEventLogEvent event={event} onIconClick={onIconClick} icon={Activity} color="bg-gray-500">
     <div className="space-y-1">
       {(event?.data?.reason || event?.reason) && <div className="text-xs italic">{event?.data?.reason || event.reason}</div>}
       {(event?.data?.decision || event?.decision) && (
@@ -341,27 +345,27 @@ const GenericEvent = ({ event }) => (
 )
 
 // Event renderer mapping
-const getEventComponent = (event) => {
+const getEventComponent = (event, onIconClick) => {
   const eventTypeMap = {
     // Lifecycle
     'agent_initialized': AgentInitializedEvent,
     'agent_completed': AgentCompletedEvent,
     'agent_failed': AgentFailedEvent,
-    
+
     // Routing
     'agent_routing_decision': AgentRoutingDecisionEvent,
     'agent_selected': AgentSelectedEvent,
-    
+
     // Feedback
     'feedback_detected': FeedbackDetectedEvent,
     'feedback_listening_started': FeedbackListeningStartedEvent,
     'feedback_listening_stopped': FeedbackListeningStoppedEvent,
-    
+
     // Status Progression
     'status_progression_started': StatusProgressionStartedEvent,
     'status_progression_completed': StatusProgressionCompletedEvent,
     'status_progression_failed': StatusProgressionFailedEvent,
-    
+
     // Review Cycles
     'review_cycle_started': ReviewCycleStartedEvent,
     'review_cycle_iteration': ReviewCycleIterationEvent,
@@ -369,33 +373,106 @@ const getEventComponent = (event) => {
     'review_cycle_reviewer_selected': ReviewCycleReviewerSelectedEvent,
     'review_cycle_escalated': ReviewCycleEscalatedEvent,
     'review_cycle_completed': ReviewCycleCompletedEvent,
-    
+
     // Error Handling
     'error_encountered': ErrorEncounteredEvent,
     'error_recovered': ErrorRecoveredEvent,
-    
+
     // Task Queue
     'task_queued': TaskQueuedEvent,
     'task_dequeued': TaskDequeuedEvent,
-    
+
     // Branch Management
     'branch_created': BranchCreatedEvent,
     'branch_reused': BranchReusedEvent,
-    
+
     // Conversational
     'conversational_loop_started': ConversationalLoopStartedEvent,
     'conversational_question_routed': ConversationalQuestionRoutedEvent,
   }
-  
+
   const Component = eventTypeMap[event.event_type] || GenericEvent
-  return <Component key={event.event_id} event={event} />
+  return <Component key={event.event_id} event={event} onIconClick={onIconClick} />
+}
+
+// Event JSON Modal Component
+const EventJsonModal = ({ event, onClose }) => {
+  if (!event) return null
+
+  // Close modal on Escape key
+  useEffect(() => {
+    const handleEscape = (e) => {
+      if (e.key === 'Escape') {
+        onClose()
+      }
+    }
+    window.addEventListener('keydown', handleEscape)
+    return () => window.removeEventListener('keydown', handleEscape)
+  }, [onClose])
+
+  return (
+    <div
+      className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4"
+      onClick={onClose}
+    >
+      <div
+        className="bg-gh-canvas border border-gh-border rounded-lg max-w-4xl w-full max-h-[90vh] overflow-hidden flex flex-col"
+        onClick={(e) => e.stopPropagation()}
+      >
+        {/* Modal Header */}
+        <div className="p-4 border-b border-gh-border flex items-center justify-between">
+          <h3 className="text-lg font-semibold text-gh-fg">Event JSON</h3>
+          <button
+            onClick={onClose}
+            className="text-gh-fg-muted hover:text-gh-fg transition-colors"
+          >
+            <XCircle className="w-5 h-5" />
+          </button>
+        </div>
+
+        {/* Modal Body */}
+        <div className="flex-1 overflow-auto p-4">
+          <pre className="text-xs font-mono bg-gh-canvas-subtle p-4 rounded border border-gh-border overflow-x-auto">
+            {JSON.stringify(event, null, 2)}
+          </pre>
+        </div>
+
+        {/* Modal Footer */}
+        <div className="p-4 border-t border-gh-border flex justify-end gap-2">
+          <button
+            onClick={() => {
+              navigator.clipboard.writeText(JSON.stringify(event, null, 2))
+            }}
+            className="px-4 py-2 bg-gh-accent-emphasis text-white rounded hover:bg-opacity-90 transition-colors"
+          >
+            Copy to Clipboard
+          </button>
+          <button
+            onClick={onClose}
+            className="px-4 py-2 bg-gh-canvas-subtle border border-gh-border rounded hover:bg-gh-border-muted transition-colors"
+          >
+            Close
+          </button>
+        </div>
+      </div>
+    </div>
+  )
 }
 
 // Main PipelineRunEventLog component
 export default function PipelineRunEventLog({ pipelineRun, events: initialEvents = [], isActive = false }) {
   const [events, setEvents] = useState(initialEvents)
+  const [selectedEventForModal, setSelectedEventForModal] = useState(null)
   const { events: socketEvents } = useSocket()
-  
+
+  const handleIconClick = (event) => {
+    setSelectedEventForModal(event)
+  }
+
+  const closeModal = () => {
+    setSelectedEventForModal(null)
+  }
+
   // Update events when new socket events arrive for this pipeline run
   useEffect(() => {
     if (!isActive || !pipelineRun) return
@@ -457,10 +534,15 @@ export default function PipelineRunEventLog({ pipelineRun, events: initialEvents
           </div>
         ) : (
           <div className="relative">
-            {sortedEvents.map(event => getEventComponent(event))}
+            {sortedEvents.map(event => getEventComponent(event, handleIconClick))}
           </div>
         )}
       </div>
+
+      {/* Event JSON Modal */}
+      {selectedEventForModal && (
+        <EventJsonModal event={selectedEventForModal} onClose={closeModal} />
+      )}
     </div>
   )
 }

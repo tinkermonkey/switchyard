@@ -396,9 +396,38 @@ function PipelineRunDebugView() {
 
     // Exclude only Claude streaming logs, show everything else
     const filtered = allEvents.filter(event => {
-      // Exclude Claude API streaming events
+      // Exclude Claude API streaming events by category
       if (event.event_category === 'claude_api') return false
-      if (event.event_type === 'claude_stream' || event.event_type === 'claude_stream_event') return false
+
+      // Exclude Claude streaming events by type
+      const claudeStreamEventTypes = [
+        'claude_stream',
+        'claude_stream_event',
+        'text_output',
+        'text_delta',
+        'tool_call',
+        'tool_use',
+        'tool_result',
+        'input_json_delta',
+        'message_start',
+        'message_delta',
+        'message_stop',
+        'content_block_start',
+        'content_block_delta',
+        'content_block_stop'
+      ]
+
+      if (claudeStreamEventTypes.includes(event.event_type)) {
+        return false
+      }
+
+      // Also check raw_event structure for nested Claude streaming data
+      if (event.raw_event) {
+        const rawEventType = event.raw_event?.event?.type || event.raw_event?.type
+        if (claudeStreamEventTypes.includes(rawEventType)) {
+          return false
+        }
+      }
 
       // Include everything else
       return true
