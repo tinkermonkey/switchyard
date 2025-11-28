@@ -390,6 +390,18 @@ async def main():
         else:
             logger.info(f"Verifying project boards exist in GitHub: {project_name}")
 
+        # Check GitHub circuit breaker before reconciliation
+        from services.github_owner_utils import _github_circuit_breaker
+        from services.circuit_breaker import CircuitState
+
+        if _github_circuit_breaker.state == CircuitState.OPEN:
+            logger.log_warning(
+                f"Skipping reconciliation for {project_name} - GitHub circuit breaker is open "
+                f"(will retry when circuit recovers)"
+            )
+            failure_count += 1
+            continue
+
         # Always run reconciliation - it will discover existing boards if they exist
         success = await github_project_manager.reconcile_project(project_name)
         if not success:
@@ -466,7 +478,7 @@ async def main():
 
     # Health check state and retry tracking
     consecutive_health_failures = 0
-    max_consecutive_failures = 10  # Exit only after 10 consecutive failures (transient issues should recover)
+    max_consecutive_failures = 15  # Exit only after 15 consecutive failures (increased for resilience)
     health_check_backoff = 10  # Start with 10 second backoff
     max_backoff = 300  # Max 5 minutes between health checks
     # NOTE: health_monitor.py writes to Redis with 10-minute TTL to ensure key doesn't expire

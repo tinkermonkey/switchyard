@@ -282,8 +282,8 @@ class GitHubAPIClient:
             input_data = json.dumps(payload)
             cmd.extend(['--input', '-'])
         else:
-            # For simple queries without variables, use -F flag
-            cmd.extend(['-F', f'query={query}'])
+            # For simple queries without variables, use -f flag (lowercase for string parameters)
+            cmd.extend(['-f', f'query={query}'])
 
         try:
             logger.debug(f"Executing GraphQL query (usage: {usage_percent:.1f}%)")

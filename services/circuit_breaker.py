@@ -7,6 +7,8 @@ and allowing them time to recover.
 
 import asyncio
 import logging
+import redis
+import json
 from enum import Enum
 from datetime import datetime, timedelta
 from typing import Callable, Any, Optional
@@ -76,7 +78,29 @@ class CircuitBreaker:
         self.success_threshold = success_threshold
         self.expected_exception = expected_exception
 
-        # State tracking
+        # Redis client for state persistence - try multiple hosts
+        self.redis_client = None
+        for host in ['redis', 'localhost', '127.0.0.1']:
+            try:
+                self.redis_client = redis.Redis(
+                    host=host,
+                    port=6379,
+                    decode_responses=True,
+                    socket_connect_timeout=2,
+                    socket_timeout=2
+                )
+                self.redis_client.ping()
+                logger.debug(f"Circuit breaker '{name}' connected to Redis at {host}")
+                break
+            except Exception as e:
+                logger.debug(f"Could not connect to Redis at {host}: {e}")
+                continue
+
+        if not self.redis_client:
+            logger.warning(f"Redis unavailable for circuit breaker '{name}' persistence")
+            self.redis_client = None
+
+        # State tracking (defaults)
         self.state = CircuitState.CLOSED
         self.failure_count = 0
         self.success_count = 0
@@ -88,10 +112,14 @@ class CircuitBreaker:
         self.total_successes = 0
         self.total_rejected = 0
 
+        # Try to restore state from Redis
+        self._load_state()
+
         logger.info(
             f"Circuit breaker '{name}' initialized: "
             f"failure_threshold={failure_threshold}, "
-            f"recovery_timeout={recovery_timeout}s"
+            f"recovery_timeout={recovery_timeout}s, "
+            f"state={self.state.value}"
         )
 
     async def call(self, func: Callable, *args, **kwargs) -> Any:
@@ -196,6 +224,7 @@ class CircuitBreaker:
             f"Circuit '{self.name}' OPENED after {self.failure_count} failures. "
             f"Will retry in {self.recovery_timeout}s"
         )
+        self._save_state()  # Persist state change
 
     def _transition_to_half_open(self):
         """Transition to HALF_OPEN state"""
@@ -205,6 +234,7 @@ class CircuitBreaker:
         self.success_count = 0
 
         logger.info(f"Circuit '{self.name}' entering HALF_OPEN state (testing recovery)")
+        self._save_state()  # Persist state change
 
     def _transition_to_closed(self):
         """Transition to CLOSED state"""
@@ -214,6 +244,7 @@ class CircuitBreaker:
         self.success_count = 0
 
         logger.info(f"Circuit '{self.name}' CLOSED (recovered)")
+        self._save_state()  # Persist state change
 
     def _should_attempt_reset(self) -> bool:
         """Check if enough time has passed to attempt recovery"""
@@ -249,3 +280,64 @@ class CircuitBreaker:
         """Manually reset circuit breaker to CLOSED state"""
         logger.info(f"Circuit '{self.name}' manually reset")
         self._transition_to_closed()
+
+    def _save_state(self):
+        """Save circuit breaker state to Redis for persistence across restarts."""
+        if not self.redis_client:
+            return
+
+        try:
+            state_data = {
+                "state": self.state.value,
+                "failure_count": self.failure_count,
+                "success_count": self.success_count,
+                "last_failure_time": self.last_failure_time.isoformat() if self.last_failure_time else None,
+                "last_state_change": self.last_state_change.isoformat(),
+                "total_failures": self.total_failures,
+                "total_successes": self.total_successes,
+                "total_rejected": self.total_rejected
+            }
+
+            # Store with 24-hour TTL (circuit breaker state shouldn't persist indefinitely)
+            self.redis_client.setex(
+                f"circuit_breaker:{self.name}:state",
+                86400,  # 24 hours
+                json.dumps(state_data)
+            )
+        except Exception as e:
+            logger.warning(f"Failed to save circuit breaker '{self.name}' state to Redis: {e}")
+
+    def _load_state(self):
+        """Load circuit breaker state from Redis if available."""
+        if not self.redis_client:
+            return
+
+        try:
+            state_json = self.redis_client.get(f"circuit_breaker:{self.name}:state")
+            if not state_json:
+                logger.debug(f"No saved state found for circuit breaker '{self.name}'")
+                return
+
+            state_data = json.loads(state_json)
+
+            # Restore state
+            self.state = CircuitState(state_data["state"])
+            self.failure_count = state_data["failure_count"]
+            self.success_count = state_data["success_count"]
+            self.last_failure_time = (
+                datetime.fromisoformat(state_data["last_failure_time"])
+                if state_data["last_failure_time"]
+                else None
+            )
+            self.last_state_change = datetime.fromisoformat(state_data["last_state_change"])
+            self.total_failures = state_data["total_failures"]
+            self.total_successes = state_data["total_successes"]
+            self.total_rejected = state_data["total_rejected"]
+
+            logger.info(
+                f"Circuit breaker '{self.name}' state restored from Redis: "
+                f"state={self.state.value}, failures={self.failure_count}"
+            )
+        except Exception as e:
+            logger.warning(f"Failed to load circuit breaker '{self.name}' state from Redis: {e}")
+            # Keep default state on load failure

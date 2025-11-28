@@ -3227,18 +3227,23 @@ _Repair cycle initiated by Claude Code Orchestrator_
                             )
                             continue
 
-                        # Check if issue holds the pipeline lock (may be in process of re-triggering from recovery)
+                        # Check pipeline lock status
                         from services.pipeline_lock_manager import get_pipeline_lock_manager
                         lock_manager = get_pipeline_lock_manager()
                         current_lock = lock_manager.get_lock(project_name, pipeline.board_name)
-                        holds_lock = (current_lock and
-                                     current_lock.lock_status == 'locked' and
-                                     current_lock.locked_by_issue == item.issue_number)
 
-                        if holds_lock:
-                            logger.debug(
-                                f"Issue #{item.issue_number} holds pipeline lock, likely being re-triggered by recovery, skipping"
-                            )
+                        # Skip if pipeline is locked (by any issue)
+                        if current_lock and current_lock.lock_status == 'locked':
+                            if current_lock.locked_by_issue == item.issue_number:
+                                # This issue holds the lock (may be re-triggering from recovery)
+                                logger.debug(
+                                    f"Issue #{item.issue_number} holds pipeline lock, likely being re-triggered by recovery, skipping"
+                                )
+                            else:
+                                # Another issue holds the lock - CRITICAL: don't dispatch this issue
+                                logger.debug(
+                                    f"Issue #{item.issue_number} in {item.status} skipped - pipeline locked by issue #{current_lock.locked_by_issue}"
+                                )
                             continue
 
                         # CRITICAL: Check if work has already been completed for this column/agent

@@ -915,6 +915,15 @@ def get_active_pipeline_runs():
         })
         
     except Exception as e:
+        # Handle index not found gracefully (returns empty list at debug level)
+        if 'index_not_found_exception' in str(e) or 'no such index' in str(e):
+            logger.debug(f"Pipeline runs index not found (expected on first run): {e}")
+            return jsonify({
+                'success': True,
+                'runs': [],
+                'count': 0
+            })
+        # Other errors log as error
         logger.error(f"Error fetching active pipeline runs: {e}")
         return jsonify({
             'success': False,
@@ -954,10 +963,16 @@ def get_active_agents_from_pipelines():
             },
             "size": 100
         }
-        pipeline_runs = es_client.search(
-            index="pipeline-runs",
-            body=pipeline_runs_query
-        )
+
+        try:
+            pipeline_runs = es_client.search(
+                index="pipeline-runs",
+                body=pipeline_runs_query
+            )
+        except Exception as e:
+            # Index doesn't exist yet or other error - no pipeline runs available
+            logger.debug(f"No pipeline runs found (index may not exist yet): {e}")
+            pipeline_runs = {'hits': {'hits': []}}  # Empty result, will fall through to Redis check
 
         active_agents = []
 

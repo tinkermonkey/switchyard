@@ -1,9 +1,12 @@
-import { createFileRoute, useNavigate } from '@tanstack/react-router'
+import { createFileRoute, useNavigate, Link } from '@tanstack/react-router'
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
-import { RefreshCw, CheckCircle2, Circle, PlayCircle, ChevronDown, ChevronUp, ChevronLeft, ChevronRight } from 'lucide-react'
+import { RefreshCw, CheckCircle2, Circle, PlayCircle, ChevronDown, ChevronUp, ChevronLeft, ChevronRight, ArrowLeft } from 'lucide-react'
 import Header from '../components/Header'
 import NavigationTabs from '../components/NavigationTabs'
 import LiveLogs from '../components/LiveLogs'
+import HeaderActiveAgents from '../components/HeaderActiveAgents'
+import HeaderSystemHealth from '../components/HeaderSystemHealth'
+import HeaderCircuitBreakers from '../components/HeaderCircuitBreakers'
 import { useSocket } from '../contexts/SocketContext'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
@@ -477,8 +480,18 @@ function AgentExecutionView() {
         <div className="mb-3 p-3 bg-gh-canvas-subtle rounded-md border border-gh-border">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-3">
+              {/* Back to Pipeline Run Debug link */}
+              <Link
+                to="/pipeline-run-debug"
+                className="flex items-center gap-1.5 px-3 py-2 bg-gh-canvas border border-gh-border rounded hover:bg-gh-border-muted transition-colors text-sm"
+                title="Back to Pipeline Run Debug"
+              >
+                <ArrowLeft className="w-4 h-4" />
+                <span>Pipeline Runs</span>
+              </Link>
+
               {/* Navigation buttons */}
-              <div className="flex gap-1">
+              <div className="flex gap-1 pl-3 border-l border-gh-border">
                 <button
                   onClick={handlePreviousExecution}
                   disabled={currentExecutionIndex === 0}
@@ -518,18 +531,25 @@ function AgentExecutionView() {
                   {executionData.status}
                 </span>
               </div>
+
+              {/* Auto-advance checkbox */}
+              <label className="flex items-center gap-2 cursor-pointer pl-2 border-l border-gh-border">
+                <input
+                  type="checkbox"
+                  checked={autoAdvance}
+                  onChange={handleAutoAdvanceToggle}
+                  className="w-4 h-4 rounded border-gh-border bg-gh-canvas text-gh-accent-emphasis focus:ring-2 focus:ring-gh-accent-emphasis focus:ring-offset-0"
+                />
+                <span className="text-sm">Auto-advance</span>
+              </label>
             </div>
 
-            {/* Auto-advance checkbox */}
-            <label className="flex items-center gap-2 cursor-pointer">
-              <input
-                type="checkbox"
-                checked={autoAdvance}
-                onChange={handleAutoAdvanceToggle}
-                className="w-4 h-4 rounded border-gh-border bg-gh-canvas text-gh-accent-emphasis focus:ring-2 focus:ring-gh-accent-emphasis focus:ring-offset-0"
-              />
-              <span className="text-sm">Auto-advance</span>
-            </label>
+            {/* Header Cards */}
+            <div className="flex gap-4">
+              <HeaderActiveAgents />
+              <HeaderSystemHealth />
+              <HeaderCircuitBreakers />
+            </div>
           </div>
         </div>
       )}

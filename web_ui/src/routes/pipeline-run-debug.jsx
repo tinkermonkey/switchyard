@@ -1,5 +1,5 @@
-import { createFileRoute } from '@tanstack/react-router'
-import { RefreshCw, Activity, CheckCircle } from 'lucide-react'
+import { createFileRoute, Link } from '@tanstack/react-router'
+import { RefreshCw, Activity, CheckCircle, ArrowRight } from 'lucide-react'
 import Header from '../components/Header'
 import NavigationTabs from '../components/NavigationTabs'
 import PipelineRunEventLog from '../components/PipelineRunEventLog'
@@ -445,6 +445,20 @@ function PipelineRunDebugView() {
     return filtered
   }, [pipelineRunEvents, socketEvents, selectedPipelineRun])
 
+  // Find the most recent agent execution for the selected pipeline run
+  const latestAgentExecutionId = useMemo(() => {
+    if (!mergedEvents || mergedEvents.length === 0) return null
+
+    // Look for agent_initialized events (most recent first since events are sorted)
+    const agentInitEvents = mergedEvents.filter(event => event.event_type === 'agent_initialized')
+
+    if (agentInitEvents.length === 0) return null
+
+    // Get the most recent agent execution ID
+    const latestEvent = agentInitEvents[0]
+    return latestEvent.agent_execution_id || null
+  }, [mergedEvents])
+
   return (
     <div className="min-h-screen p-5 bg-gh-canvas text-gh-fg">
       <Header />
@@ -571,6 +585,20 @@ function PipelineRunDebugView() {
         
         {/* Pipeline Run Event Log */}
         <div className="flex-1">
+          {/* Link to latest agent execution */}
+          {selectedPipelineRun && latestAgentExecutionId && (
+            <div className="mb-3">
+              <Link
+                to="/agent-execution/$executionId"
+                params={{ executionId: latestAgentExecutionId }}
+                className="inline-flex items-center gap-2 px-4 py-2 bg-gh-canvas border border-gh-border rounded-md hover:bg-gh-border-muted transition-colors text-sm"
+              >
+                <span>View Latest Agent Execution</span>
+                <ArrowRight className="w-4 h-4" />
+              </Link>
+            </div>
+          )}
+
           {loadingEvents ? (
             <div className="flex items-center justify-center h-96 bg-gh-canvas-subtle rounded-md border border-gh-border">
               <RefreshCw className="w-8 h-8 animate-spin text-gh-accent-primary" />

@@ -133,7 +133,7 @@ class PipelineProgression:
                 
                 result = subprocess.run(
                     ['gh', 'api', 'graphql', '-f', f'query={query}'],
-                    capture_output=True, text=True, check=True
+                    capture_output=True, text=True, check=True, timeout=30
                 )
                 data = json.loads(result.stdout)
 
@@ -208,7 +208,7 @@ class PipelineProgression:
 
             result = subprocess.run(
                 ['gh', 'api', 'graphql', '-f', f'query={query}'],
-                capture_output=True, text=True, check=True
+                capture_output=True, text=True, check=True, timeout=30
             )
 
             data = json.loads(result.stdout)
@@ -270,7 +270,7 @@ class PipelineProgression:
 
             result = subprocess.run(
                 ['gh', 'api', 'graphql', '-f', f'query={mutation}'],
-                capture_output=True, text=True, check=True
+                capture_output=True, text=True, check=True, timeout=30
             )
 
             # Record status change with trigger (from pipeline progression)

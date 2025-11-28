@@ -2,9 +2,11 @@ import psutil
 import subprocess
 import requests
 import logging
-from typing import Dict, Any
+import asyncio
+from typing import Dict, Any, List
 from datetime import datetime
 from config.environment import Environment
+from services.circuit_breaker import CircuitBreaker, CircuitBreakerOpen
 
 logger = logging.getLogger(__name__)
 
@@ -13,11 +15,19 @@ class HealthMonitor:
 
     # Class-level variable to store last health check result (accessible by observability server)
     last_health_check = None
-    
+
     # Cache GitHub authentication check (username lookup doesn't change frequently)
     _github_auth_cache = None
     _github_auth_cache_time = None
     _github_auth_cache_ttl = 1800  # 30 minutes
+
+    # Circuit breaker for GitHub health checks
+    _github_health_circuit_breaker = CircuitBreaker(
+        name="github_health_checks",
+        failure_threshold=3,
+        recovery_timeout=60,
+        expected_exception=subprocess.CalledProcessError
+    )
 
     def __init__(self, orchestrator=None):
         self.orchestrator = orchestrator
@@ -77,8 +87,97 @@ class HealthMonitor:
             logging.getLogger(__name__).warning(f"Failed to store health check in Redis: {e}")
 
         return health_result
-    
-    
+
+    @staticmethod
+    def _is_rate_limited(error_message: str) -> bool:
+        """Check if error message indicates GitHub rate limiting."""
+        rate_limit_indicators = [
+            "rate limit exceeded",
+            "API rate limit",
+            "You have exceeded",
+            "secondary rate limit",
+            "403",
+            "abuse detection"
+        ]
+        return any(indicator.lower() in error_message.lower() for indicator in rate_limit_indicators)
+
+    async def _run_subprocess_with_retry(
+        self,
+        cmd: List[str],
+        timeout: int = 30,
+        retries: int = 2,
+        description: str = "command"
+    ) -> subprocess.CompletedProcess:
+        """Run subprocess with retry logic for transient failures and rate limits."""
+        last_exception = None
+
+        for attempt in range(retries + 1):
+            try:
+                result = subprocess.run(
+                    cmd, capture_output=True, text=True,
+                    timeout=timeout, check=True
+                )
+                if attempt > 0:
+                    logger.info(f"{description} succeeded on attempt {attempt + 1}")
+                return result
+
+            except subprocess.TimeoutExpired as e:
+                last_exception = e
+                if attempt < retries:
+                    wait = 2 ** attempt  # 1s, 2s
+                    logger.warning(f"{description} timed out, retrying in {wait}s...")
+                    await asyncio.sleep(wait)
+                else:
+                    raise
+
+            except subprocess.CalledProcessError as e:
+                # Don't retry auth errors
+                if 'authentication' in e.stderr.lower():
+                    raise
+
+                # Handle rate limiting with longer backoff
+                if self._is_rate_limited(e.stderr):
+                    wait = 60 * (2 ** attempt)  # 60s, 120s, 240s
+                    logger.warning(
+                        f"{description} hit GitHub rate limit. "
+                        f"Backing off for {wait}s (attempt {attempt + 1}/{retries + 1})"
+                    )
+                    if attempt < retries:
+                        await asyncio.sleep(wait)
+                    else:
+                        logger.error(f"{description} rate limited after {retries + 1} attempts")
+                        raise
+                elif attempt < retries:
+                    wait = 2 ** attempt
+                    logger.warning(f"{description} failed, retrying in {wait}s...")
+                    await asyncio.sleep(wait)
+                else:
+                    raise
+
+        raise last_exception
+
+    async def _github_api_call_with_circuit_breaker(
+        self,
+        cmd: List[str],
+        timeout: int = 30,
+        retries: int = 2,
+        description: str = "command"
+    ) -> subprocess.CompletedProcess:
+        """
+        Run GitHub API call with both retry logic and circuit breaker protection.
+        Checks circuit breaker before making call, then runs with retry logic.
+        """
+        # Define the function to call through circuit breaker
+        async def make_call():
+            return await self._run_subprocess_with_retry(cmd, timeout, retries, description)
+
+        # Use circuit breaker to protect the call
+        try:
+            return await HealthMonitor._github_health_circuit_breaker.call(make_call)
+        except CircuitBreakerOpen as e:
+            logger.warning(f"GitHub health check circuit breaker open: {e}")
+            raise
+
     async def check_github(self) -> Dict[str, Any]:
         """Check GitHub connectivity and project management permissions"""
         import json
@@ -123,11 +222,20 @@ class HealthMonitor:
         # Check PAT authentication via gh CLI
         # Note: gh auth status returns error if token is set via GITHUB_TOKEN env var
         # instead of gh auth login, so we test actual API functionality instead
-        auth_result = subprocess.run(
-            ['gh', 'api', 'user', '--jq', '.login'],
-            capture_output=True, text=True,
-            timeout=5
-        )
+        try:
+            auth_result = await self._github_api_call_with_circuit_breaker(
+                ['gh', 'api', 'user', '--jq', '.login'],
+                timeout=30,
+                retries=2,
+                description="GitHub PAT authentication check"
+            )
+        except (subprocess.TimeoutExpired, subprocess.CalledProcessError, CircuitBreakerOpen) as e:
+            auth_result = subprocess.CompletedProcess(
+                ['gh', 'api', 'user', '--jq', '.login'],
+                returncode=1,
+                stdout='',
+                stderr=str(e)
+            )
 
         pat_status = {
             'authenticated': auth_result.returncode == 0
@@ -145,11 +253,20 @@ class HealthMonitor:
             }
 
         # Check if we can access user info
-        user_result = subprocess.run(
-            ['gh', 'api', 'user'],
-            capture_output=True, text=True,
-            timeout=5
-        )
+        try:
+            user_result = await self._github_api_call_with_circuit_breaker(
+                ['gh', 'api', 'user'],
+                timeout=30,
+                retries=2,
+                description="GitHub user info access check"
+            )
+        except (subprocess.TimeoutExpired, subprocess.CalledProcessError, CircuitBreakerOpen) as e:
+            user_result = subprocess.CompletedProcess(
+                ['gh', 'api', 'user'],
+                returncode=1,
+                stdout='',
+                stderr=str(e)
+            )
 
         if user_result.returncode != 0:
             return {
@@ -188,11 +305,20 @@ class HealthMonitor:
             }
 
         # Check repository access
-        repo_result = subprocess.run(
-            ['gh', 'api', f'repos/{org}/{repo}'],
-            capture_output=True, text=True,
-            timeout=5
-        )
+        try:
+            repo_result = await self._github_api_call_with_circuit_breaker(
+                ['gh', 'api', f'repos/{org}/{repo}'],
+                timeout=30,
+                retries=2,
+                description=f"GitHub repo access check for {org}/{repo}"
+            )
+        except (subprocess.TimeoutExpired, subprocess.CalledProcessError, CircuitBreakerOpen) as e:
+            repo_result = subprocess.CompletedProcess(
+                ['gh', 'api', f'repos/{org}/{repo}'],
+                returncode=1,
+                stdout='',
+                stderr=str(e)
+            )
 
         if repo_result.returncode != 0:
             return {
