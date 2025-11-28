@@ -14,7 +14,9 @@ import { Route as RepairCyclesRouteImport } from './routes/repair-cycles'
 import { Route as ProjectsRouteImport } from './routes/projects'
 import { Route as PipelineRunDebugRouteImport } from './routes/pipeline-run-debug'
 import { Route as PipelineRunRouteImport } from './routes/pipeline-run'
+import { Route as MedicRouteImport } from './routes/medic'
 import { Route as IndexRouteImport } from './routes/index'
+import { Route as MedicFingerprintIdRouteImport } from './routes/medic.$fingerprintId'
 import { Route as AgentExecutionExecutionIdRouteImport } from './routes/agent-execution.$executionId'
 
 const ReviewLearningRoute = ReviewLearningRouteImport.update({
@@ -42,10 +44,20 @@ const PipelineRunRoute = PipelineRunRouteImport.update({
   path: '/pipeline-run',
   getParentRoute: () => rootRouteImport,
 } as any)
+const MedicRoute = MedicRouteImport.update({
+  id: '/medic',
+  path: '/medic',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const IndexRoute = IndexRouteImport.update({
   id: '/',
   path: '/',
   getParentRoute: () => rootRouteImport,
+} as any)
+const MedicFingerprintIdRoute = MedicFingerprintIdRouteImport.update({
+  id: '/$fingerprintId',
+  path: '/$fingerprintId',
+  getParentRoute: () => MedicRoute,
 } as any)
 const AgentExecutionExecutionIdRoute =
   AgentExecutionExecutionIdRouteImport.update({
@@ -56,64 +68,77 @@ const AgentExecutionExecutionIdRoute =
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
+  '/medic': typeof MedicRouteWithChildren
   '/pipeline-run': typeof PipelineRunRoute
   '/pipeline-run-debug': typeof PipelineRunDebugRoute
   '/projects': typeof ProjectsRoute
   '/repair-cycles': typeof RepairCyclesRoute
   '/review-learning': typeof ReviewLearningRoute
   '/agent-execution/$executionId': typeof AgentExecutionExecutionIdRoute
+  '/medic/$fingerprintId': typeof MedicFingerprintIdRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
+  '/medic': typeof MedicRouteWithChildren
   '/pipeline-run': typeof PipelineRunRoute
   '/pipeline-run-debug': typeof PipelineRunDebugRoute
   '/projects': typeof ProjectsRoute
   '/repair-cycles': typeof RepairCyclesRoute
   '/review-learning': typeof ReviewLearningRoute
   '/agent-execution/$executionId': typeof AgentExecutionExecutionIdRoute
+  '/medic/$fingerprintId': typeof MedicFingerprintIdRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
+  '/medic': typeof MedicRouteWithChildren
   '/pipeline-run': typeof PipelineRunRoute
   '/pipeline-run-debug': typeof PipelineRunDebugRoute
   '/projects': typeof ProjectsRoute
   '/repair-cycles': typeof RepairCyclesRoute
   '/review-learning': typeof ReviewLearningRoute
   '/agent-execution/$executionId': typeof AgentExecutionExecutionIdRoute
+  '/medic/$fingerprintId': typeof MedicFingerprintIdRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
   fullPaths:
     | '/'
+    | '/medic'
     | '/pipeline-run'
     | '/pipeline-run-debug'
     | '/projects'
     | '/repair-cycles'
     | '/review-learning'
     | '/agent-execution/$executionId'
+    | '/medic/$fingerprintId'
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/'
+    | '/medic'
     | '/pipeline-run'
     | '/pipeline-run-debug'
     | '/projects'
     | '/repair-cycles'
     | '/review-learning'
     | '/agent-execution/$executionId'
+    | '/medic/$fingerprintId'
   id:
     | '__root__'
     | '/'
+    | '/medic'
     | '/pipeline-run'
     | '/pipeline-run-debug'
     | '/projects'
     | '/repair-cycles'
     | '/review-learning'
     | '/agent-execution/$executionId'
+    | '/medic/$fingerprintId'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
+  MedicRoute: typeof MedicRouteWithChildren
   PipelineRunRoute: typeof PipelineRunRoute
   PipelineRunDebugRoute: typeof PipelineRunDebugRoute
   ProjectsRoute: typeof ProjectsRoute
@@ -159,12 +184,26 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof PipelineRunRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/medic': {
+      id: '/medic'
+      path: '/medic'
+      fullPath: '/medic'
+      preLoaderRoute: typeof MedicRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/': {
       id: '/'
       path: '/'
       fullPath: '/'
       preLoaderRoute: typeof IndexRouteImport
       parentRoute: typeof rootRouteImport
+    }
+    '/medic/$fingerprintId': {
+      id: '/medic/$fingerprintId'
+      path: '/$fingerprintId'
+      fullPath: '/medic/$fingerprintId'
+      preLoaderRoute: typeof MedicFingerprintIdRouteImport
+      parentRoute: typeof MedicRoute
     }
     '/agent-execution/$executionId': {
       id: '/agent-execution/$executionId'
@@ -176,8 +215,19 @@ declare module '@tanstack/react-router' {
   }
 }
 
+interface MedicRouteChildren {
+  MedicFingerprintIdRoute: typeof MedicFingerprintIdRoute
+}
+
+const MedicRouteChildren: MedicRouteChildren = {
+  MedicFingerprintIdRoute: MedicFingerprintIdRoute,
+}
+
+const MedicRouteWithChildren = MedicRoute._addFileChildren(MedicRouteChildren)
+
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
+  MedicRoute: MedicRouteWithChildren,
   PipelineRunRoute: PipelineRunRoute,
   PipelineRunDebugRoute: PipelineRunDebugRoute,
   ProjectsRoute: ProjectsRoute,

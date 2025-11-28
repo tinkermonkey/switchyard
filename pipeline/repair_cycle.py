@@ -785,6 +785,7 @@ DO NOT include any explanation, markdown formatting, or other text - ONLY the JS
                             "failed": test_result.failed,
                             "warnings": test_result.warnings,
                             "has_failures": test_result.has_failures(),
+                            "failures": [asdict(f) for f in test_result.failures],
                         },
                         pipeline_run_id=pipeline_run_id,
                     )
@@ -1039,6 +1040,7 @@ DO NOT include any explanation, markdown formatting, or other text - ONLY the JS
                         "source_file": source_file,
                         "warning_count": len(warnings),
                         "test_type": config.test_type.value,
+                        "warnings": [asdict(w) for w in warnings],
                     },
                     pipeline_run_id=pipeline_run_id,
                 )
@@ -1095,6 +1097,7 @@ For each warning:
                             "warning_count": len(warnings),
                             "test_type": config.test_type.value,
                             "success": True,
+                            "warnings": [asdict(w) for w in warnings],
                         },
                         pipeline_run_id=pipeline_run_id,
                     )

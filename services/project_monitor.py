@@ -740,18 +740,31 @@ class ProjectMonitor:
                     # Create event loop if needed
                     try:
                         loop = asyncio.get_running_loop()
+                        # If a loop is already running (e.g. called from main.py startup),
+                        # we cannot use run_until_complete. Run in a separate thread.
+                        import concurrent.futures
+                        with concurrent.futures.ThreadPoolExecutor() as pool:
+                            parent_issue_number = pool.submit(
+                                asyncio.run, 
+                                feature_branch_manager.get_parent_issue(
+                                    github_integration,
+                                    issue_number,
+                                    project=project_name
+                                )
+                            ).result()
                     except RuntimeError:
+                        # No running loop, create one
                         loop = asyncio.new_event_loop()
                         asyncio.set_event_loop(loop)
-                    
-                    # Get parent issue number
-                    parent_issue_number = loop.run_until_complete(
-                        feature_branch_manager.get_parent_issue(
-                            github_integration,
-                            issue_number,
-                            project=project_name
+                        
+                        # Get parent issue number
+                        parent_issue_number = loop.run_until_complete(
+                            feature_branch_manager.get_parent_issue(
+                                github_integration,
+                                issue_number,
+                                project=project_name
+                            )
                         )
-                    )
                     
                     if parent_issue_number:
                         logger.info(f"Found parent issue #{parent_issue_number}, checking for agent outputs")
@@ -3434,6 +3447,8 @@ _Repair cycle initiated by Claude Code Orchestrator_
         self.rescan_complete.set()
         logger.info("Startup rescan complete - worker pool can now process tasks")
 
+        was_breaker_open = False
+
         while True:
             try:
                 # Check Claude Code circuit breaker - if open, skip all monitoring
@@ -3476,6 +3491,7 @@ _Repair cycle initiated by Claude Code Orchestrator_
                     continue
                 
                 if breaker and breaker.is_open():
+                    was_breaker_open = True
                     # Log warning only once every 60 seconds to reduce noise
                     now = datetime.now()
                     if not hasattr(self, '_last_claude_breaker_warning') or \
@@ -3494,6 +3510,11 @@ _Repair cycle initiated by Claude Code Orchestrator_
                         self._last_claude_breaker_warning = now
                     time.sleep(5)  # Sleep briefly before checking again
                     continue
+                
+                if was_breaker_open:
+                    logger.info("🟢 Claude Code circuit breaker recovered - rescanning for stalled items...")
+                    self._rescan_boards_for_stalled_items()
+                    was_breaker_open = False
                 
                 # Get all configured visible projects (exclude hidden/test projects)
                 for project_name in self.config_manager.list_visible_projects():

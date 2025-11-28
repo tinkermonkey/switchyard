@@ -811,6 +811,16 @@ class PipelineRunManager:
                         if (metadata and
                             metadata['project'] == project and
                             int(metadata['issue_number']) == issue_number):
+                            
+                            # Verify run_id matches if available
+                            container_run_id = metadata.get('run_id')
+                            if container_run_id and not pipeline_run_id.startswith(container_run_id):
+                                logger.debug(
+                                    f"Skipping container {container_name} for run {pipeline_run_id}: "
+                                    f"run_id mismatch ({container_run_id})"
+                                )
+                                continue
+
                             logger.info(
                                 f"Pipeline run {pipeline_run_id} has running repair cycle container: {container_name} "
                                 f"(project={metadata['project']}, issue={metadata['issue_number']})"

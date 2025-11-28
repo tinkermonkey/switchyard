@@ -7,7 +7,7 @@ the detected reset time to verify tokens are available again.
 
 import logging
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -51,7 +51,7 @@ class ClaudeTokenScheduler:
             )
 
         # Check if it's time to run the test
-        if self.test_scheduled_for and datetime.now() >= self.test_scheduled_for:
+        if self.test_scheduled_for and datetime.now(timezone.utc) >= self.test_scheduled_for:
             if not self.is_testing:
                 self.is_testing = True
                 logger.warning("🟡 Testing Claude Code token availability...")
@@ -67,12 +67,12 @@ class ClaudeTokenScheduler:
                     else:
                         logger.warning("❌ Claude Code tokens still unavailable. Will retry soon.")
                         # Reschedule for 2 minutes later
-                        self.test_scheduled_for = datetime.now() + timedelta(minutes=2)
+                        self.test_scheduled_for = datetime.now(timezone.utc) + timedelta(minutes=2)
                         self.is_testing = False
                 except Exception as e:
                     logger.error(f"Error testing token availability: {e}", exc_info=True)
                     # Reschedule for 5 minutes later
-                    self.test_scheduled_for = datetime.now() + timedelta(minutes=5)
+                    self.test_scheduled_for = datetime.now(timezone.utc) + timedelta(minutes=5)
                     self.is_testing = False
 
         return False

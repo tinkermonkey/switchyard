@@ -11,6 +11,7 @@ import { useSocket } from '../contexts/SocketContext'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { normalizeTimestamp, formatTimestamp, mergeAgentExecutionEvents, mergeObjectStable, mergeArrayByIdStable } from '../utils/eventMerging'
+import RepairCycleStatus from '../components/RepairCycleStatus'
 
   const formatAgentName = (agentName) => {
     if (!agentName || typeof agentName !== 'string' || agentName.trim() === '') return 'Unknown Agent'
@@ -34,6 +35,7 @@ function AgentExecutionView() {
   // Agent execution navigation state
   const [pipelineRunId, setPipelineRunId] = useState(null)
   const [pipelineExecutions, setPipelineExecutions] = useState([])
+  const [pipelineEvents, setPipelineEvents] = useState([])
   const [autoAdvance, setAutoAdvance] = useState(true)
   const [loadingExecutions, setLoadingExecutions] = useState(false)
 
@@ -132,6 +134,11 @@ function AgentExecutionView() {
         console.log('[AgentExecution] Found pipeline executions:', executions.length)
         // Use stable merge to prevent unnecessary re-renders
         setPipelineExecutions(current => mergeArrayByIdStable(current, executions, 'execution_id'))
+        
+        // Store all pipeline events for repair cycle status
+        if (data.events) {
+          setPipelineEvents(data.events)
+        }
       }
     } catch (err) {
       console.error('Error fetching pipeline executions:', err)
@@ -243,9 +250,9 @@ function AgentExecutionView() {
   }, [pipelineExecutions, executionId, navigate])
 
   // Merge API logs with live WebSocket updates and build agent state
-  const { executionEvents, agentState, mergedLogs } = useMemo(() => {
+  const { executionEvents, agentState, mergedLogs, mergedPipelineEvents } = useMemo(() => {
     if (!executionData) {
-      return { executionEvents: [], agentState: {}, mergedLogs: [] }
+      return { executionEvents: [], agentState: {}, mergedLogs: [], mergedPipelineEvents: [] }
     }
     
     const agent = executionData.agent
@@ -278,6 +285,32 @@ function AgentExecutionView() {
       if (endTimestamp && eventTimestamp > endTimestamp) return false
       return true
     })
+
+    // Merge pipeline events with live logs for repair cycle status
+    let pipelineEventsList = [...pipelineEvents]
+    if (pipelineRunId) {
+      // Find timestamp of last historical event
+      let lastHistTimestamp = 0
+      if (pipelineEvents.length > 0) {
+        const lastEvent = pipelineEvents[pipelineEvents.length - 1]
+        lastHistTimestamp = normalizeTimestamp(lastEvent.timestamp || lastEvent.created_at) || 0
+      }
+
+      // Add new live events for this pipeline run
+      const livePipelineEvents = allLogs.filter(event => {
+        // Check if event belongs to this pipeline run
+        const eventRunId = event.pipeline_run_id || (event.data && event.data.pipeline_run_id)
+        if (eventRunId !== pipelineRunId) return false
+        
+        // Check if it's newer than historical data
+        const eventTimestamp = normalizeTimestamp(event.timestamp)
+        return eventTimestamp > lastHistTimestamp
+      })
+      
+      if (livePipelineEvents.length > 0) {
+        pipelineEventsList = [...pipelineEventsList, ...livePipelineEvents]
+      }
+    }
     
     // Build agent state from merged logs (API + WebSocket)
     let lastTodoWrite = null
@@ -391,9 +424,10 @@ function AgentExecutionView() {
         previousToolResult,
         inputPrompt
       },
-      mergedLogs: logs
+      mergedLogs: logs,
+      mergedPipelineEvents: pipelineEventsList
     }
-  }, [executionData, executionLogs, allLogs, promptEvent])
+  }, [executionData, executionLogs, allLogs, promptEvent, pipelineEvents, pipelineRunId])
 
   const formatToolCall = (toolCall) => {
     if (!toolCall) return null
@@ -797,6 +831,7 @@ function AgentExecutionView() {
 
                 {/* Right side - Current Tasks */}
                 <div className="flex-[3]">
+                  <RepairCycleStatus events={mergedPipelineEvents} />
                   <div className="bg-gh-canvas rounded-md border border-gh-border p-3">
                     <div className="mb-3">
                       <div className="flex items-center justify-between mb-1">
@@ -1026,6 +1061,7 @@ function AgentExecutionView() {
 
               {/* Right column - 30% width */}
               <div className="flex-[3]">
+                <RepairCycleStatus events={mergedPipelineEvents} />
                 <div className="bg-gh-canvas rounded-md border border-gh-border p-3">
                   <div className="mb-3">
                     <div className="flex items-center justify-between mb-1">

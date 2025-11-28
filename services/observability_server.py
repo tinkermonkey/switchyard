@@ -37,6 +37,32 @@ socketio = SocketIO(
 # Initialize Elasticsearch client
 es_client = Elasticsearch(['http://elasticsearch:9200'])
 
+# Initialize Redis client for investigation queue
+import os
+redis_host = os.getenv('REDIS_HOST', 'redis')
+redis_port = int(os.getenv('REDIS_PORT', 6379))
+redis_client_raw = redis.Redis(host=redis_host, port=redis_port, decode_responses=False)
+
+# Import Medic components (lazy initialization)
+_medic_queue = None
+_medic_report_manager = None
+
+def get_investigation_queue():
+    """Lazy initialization of investigation queue"""
+    global _medic_queue
+    if _medic_queue is None:
+        from services.medic.investigation_queue import InvestigationQueue
+        _medic_queue = InvestigationQueue(redis_client_raw)
+    return _medic_queue
+
+def get_report_manager():
+    """Lazy initialization of report manager"""
+    global _medic_report_manager
+    if _medic_report_manager is None:
+        from services.medic.report_manager import ReportManager
+        _medic_report_manager = ReportManager()
+    return _medic_report_manager
+
 # Track connected clients
 connected_clients = set()
 
@@ -2825,6 +2851,462 @@ def redis_subscriber_thread():
         time.sleep(5)
         logger.warning("Attempting to restart Redis subscriber thread...")
         redis_subscriber_thread()
+
+
+# ========== MEDIC API ENDPOINTS ==========
+
+@app.route('/api/medic/failure-signatures', methods=['GET'])
+def get_failure_signatures():
+    """
+    Get all failure signatures with filtering and pagination.
+
+    Query params:
+    - status: Filter by status (new, recurring, trending, resolved, ignored)
+    - severity: Filter by severity (ERROR, WARNING, CRITICAL)
+    - investigation_status: Filter by investigation status
+    - from_date: Filter by first_seen >= date (ISO format)
+    - to_date: Filter by first_seen <= date (ISO format)
+    - limit: Max results (default 50)
+    - offset: Pagination offset (default 0)
+    """
+    try:
+        # Build Elasticsearch query
+        must_clauses = []
+
+        # Status filter
+        if request.args.get('status'):
+            must_clauses.append({"term": {"status": request.args['status']}})
+
+        # Severity filter
+        if request.args.get('severity'):
+            must_clauses.append({"term": {"severity": request.args['severity']}})
+
+        # Investigation status filter
+        if request.args.get('investigation_status'):
+            must_clauses.append({"term": {"investigation_status": request.args['investigation_status']}})
+
+        # Date range filter
+        date_filter = {}
+        if request.args.get('from_date'):
+            date_filter['gte'] = request.args['from_date']
+        if request.args.get('to_date'):
+            date_filter['lte'] = request.args['to_date']
+        if date_filter:
+            must_clauses.append({"range": {"first_seen": date_filter}})
+
+        # Build query
+        if must_clauses:
+            query = {
+                "query": {
+                    "bool": {"must": must_clauses}
+                },
+                "size": int(request.args.get('limit', 50)),
+                "from": int(request.args.get('offset', 0)),
+                "sort": [{"last_seen": {"order": "desc"}}]
+            }
+        else:
+            query = {
+                "query": {
+                    "match_all": {}
+                },
+                "size": int(request.args.get('limit', 50)),
+                "from": int(request.args.get('offset', 0)),
+                "sort": [{"last_seen": {"order": "desc"}}]
+            }
+
+        # Execute search
+        result = es_client.search(index="medic-failure-signatures-*", body=query)
+
+        signatures = [hit['_source'] for hit in result['hits']['hits']]
+
+        return jsonify({
+            'signatures': signatures,
+            'total': result['hits']['total']['value'],
+            'limit': int(request.args.get('limit', 50)),
+            'offset': int(request.args.get('offset', 0))
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Failed to get failure signatures: {e}", exc_info=True)
+        # Return empty result instead of error for better UX when index doesn't exist
+        return jsonify({
+            'signatures': [],
+            'total': 0,
+            'limit': int(request.args.get('limit', 50)),
+            'offset': int(request.args.get('offset', 0))
+        }), 200
+
+
+@app.route('/api/medic/failure-signatures/<fingerprint_id>', methods=['GET'])
+def get_failure_signature(fingerprint_id):
+    """Get detailed information about a specific failure signature"""
+    try:
+        result = es_client.search(
+            index="medic-failure-signatures-*",
+            body={
+                "query": {
+                    "term": {"fingerprint_id": fingerprint_id}
+                }
+            }
+        )
+
+        if result['hits']['total']['value'] == 0:
+            return jsonify({'error': 'Signature not found'}), 404
+
+        signature = result['hits']['hits'][0]['_source']
+
+        return jsonify(signature), 200
+
+    except Exception as e:
+        logger.error(f"Failed to get signature {fingerprint_id}: {e}", exc_info=True)
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/medic/failure-signatures/<fingerprint_id>/occurrences', methods=['GET'])
+def get_signature_occurrences(fingerprint_id):
+    """
+    Get detailed occurrence history for a signature.
+
+    Query params:
+    - from_date: Filter by timestamp >= date
+    - to_date: Filter by timestamp <= date
+    - limit: Max results (default 100)
+    """
+    try:
+        # Get signature with sample log entries
+        result = es_client.search(
+            index="medic-failure-signatures-*",
+            body={
+                "query": {
+                    "term": {"fingerprint_id": fingerprint_id}
+                },
+                "_source": ["sample_log_entries", "fingerprint_id"]
+            }
+        )
+
+        if result['hits']['total']['value'] == 0:
+            return jsonify({'error': 'Signature not found'}), 404
+
+        occurrences = result['hits']['hits'][0]['_source'].get('sample_log_entries', [])
+
+        # Apply date filters
+        from_date = request.args.get('from_date')
+        to_date = request.args.get('to_date')
+        limit = int(request.args.get('limit', 100))
+
+        if from_date or to_date:
+            filtered = []
+            for entry in occurrences:
+                entry_time = entry['timestamp']
+                if from_date and entry_time < from_date:
+                    continue
+                if to_date and entry_time > to_date:
+                    continue
+                filtered.append(entry)
+            occurrences = filtered
+
+        # Limit results
+        occurrences = occurrences[:limit]
+
+        return jsonify({
+            'fingerprint_id': fingerprint_id,
+            'occurrences': occurrences,
+            'total': len(occurrences)
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Failed to get occurrences for {fingerprint_id}: {e}", exc_info=True)
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/medic/failure-signatures/<fingerprint_id>/status', methods=['PUT'])
+def update_signature_status(fingerprint_id):
+    """
+    Update the status of a failure signature.
+
+    Request body:
+    {
+        "status": "ignored" | "new" | "recurring" | "trending" | "resolved",
+        "reason": "Optional reason for status change"
+    }
+    """
+    try:
+        data = request.get_json()
+        new_status = data.get('status')
+
+        valid_statuses = ['new', 'recurring', 'trending', 'resolved', 'ignored']
+        if new_status not in valid_statuses:
+            return jsonify({'error': f'Invalid status. Must be one of: {valid_statuses}'}), 400
+
+        # Update in Elasticsearch
+        from monitoring.timestamp_utils import utc_isoformat
+
+        result = es_client.update_by_query(
+            index="medic-failure-signatures-*",
+            body={
+                "script": {
+                    "source": "ctx._source.status = params.status; ctx._source.updated_at = params.updated_at;",
+                    "params": {
+                        "status": new_status,
+                        "updated_at": utc_isoformat()
+                    }
+                },
+                "query": {
+                    "term": {"fingerprint_id": fingerprint_id}
+                }
+            }
+        )
+
+        if result['updated'] == 0:
+            return jsonify({'error': 'Signature not found'}), 404
+
+        return jsonify({
+            'fingerprint_id': fingerprint_id,
+            'status': new_status,
+            'updated': True
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Failed to update status for {fingerprint_id}: {e}", exc_info=True)
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/medic/stats', methods=['GET'])
+def get_medic_stats():
+    """Get overall Medic statistics"""
+    try:
+        result = es_client.search(
+            index="medic-failure-signatures-*",
+            body={
+                "size": 0,
+                "aggs": {
+                    "by_status": {
+                        "terms": {"field": "status"}
+                    },
+                    "by_severity": {
+                        "terms": {"field": "severity"}
+                    },
+                    "total_occurrences": {
+                        "sum": {"field": "occurrence_count"}
+                    },
+                    "occurrences_last_hour": {
+                        "sum": {"field": "occurrences_last_hour"}
+                    },
+                    "occurrences_last_day": {
+                        "sum": {"field": "occurrences_last_day"}
+                    }
+                }
+            }
+        )
+
+        aggs = result.get('aggregations', {})
+
+        return jsonify({
+            'total_signatures': result['hits']['total']['value'],
+            'by_status': {bucket['key']: bucket['doc_count'] for bucket in aggs.get('by_status', {}).get('buckets', [])},
+            'by_severity': {bucket['key']: bucket['doc_count'] for bucket in aggs.get('by_severity', {}).get('buckets', [])},
+            'total_occurrences': int(aggs.get('total_occurrences', {}).get('value', 0)),
+            'occurrences_last_hour': int(aggs.get('occurrences_last_hour', {}).get('value', 0)),
+            'occurrences_last_day': int(aggs.get('occurrences_last_day', {}).get('value', 0))
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Failed to get Medic stats: {e}", exc_info=True)
+        # Return empty stats instead of error for better UX
+        return jsonify({
+            'total_signatures': 0,
+            'by_status': {},
+            'by_severity': {},
+            'total_occurrences': 0,
+            'occurrences_last_hour': 0,
+            'occurrences_last_day': 0
+        }), 200
+
+
+# ========================================
+# Medic Investigation API Endpoints (Phase 2)
+# ========================================
+
+@app.route('/api/medic/investigations', methods=['GET'])
+def get_investigations():
+    """Get list of all investigations with status"""
+    try:
+        queue = get_investigation_queue()
+        report_manager = get_report_manager()
+
+        # Get all investigations from reports
+        investigations = report_manager.get_all_investigations_summary()
+
+        # Enhance with Redis status
+        for inv in investigations:
+            fingerprint_id = inv["fingerprint_id"]
+            info = queue.get_investigation_info(fingerprint_id)
+            inv.update(info)
+
+        return jsonify({"investigations": investigations, "total": len(investigations)}), 200
+
+    except Exception as e:
+        logger.error(f"Failed to get investigations: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/medic/investigations/<fingerprint_id>', methods=['POST'])
+def start_investigation(fingerprint_id):
+    """Start/queue an investigation for a signature"""
+    try:
+        queue = get_investigation_queue()
+
+        # Get priority from request
+        data = request.get_json() or {}
+        priority = data.get("priority", "normal")
+
+        if priority not in ["low", "normal", "high"]:
+            return jsonify({"error": "Invalid priority. Must be: low, normal, high"}), 400
+
+        # Enqueue investigation
+        enqueued = queue.enqueue(fingerprint_id, priority=priority)
+
+        if enqueued:
+            # Update ES investigation status
+            from services.medic.failure_signature_store import FailureSignatureStore
+            store = FailureSignatureStore(es_client)
+            import asyncio
+            asyncio.run(store.update_investigation_status(fingerprint_id, "queued"))
+
+            return jsonify({
+                "fingerprint_id": fingerprint_id,
+                "status": "queued",
+                "priority": priority
+            }), 202
+        else:
+            return jsonify({
+                "fingerprint_id": fingerprint_id,
+                "status": queue.get_status(fingerprint_id),
+                "message": "Investigation already queued or in progress"
+            }), 200
+
+    except Exception as e:
+        logger.error(f"Failed to start investigation: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/medic/investigations/<fingerprint_id>/status', methods=['GET'])
+def get_investigation_status(fingerprint_id):
+    """Get current status of an investigation"""
+    try:
+        queue = get_investigation_queue()
+        report_manager = get_report_manager()
+
+        # Get info from Redis
+        info = queue.get_investigation_info(fingerprint_id)
+
+        # Get report status
+        report_status = report_manager.get_report_status(fingerprint_id)
+        info.update(report_status)
+
+        return jsonify(info), 200
+
+    except Exception as e:
+        logger.error(f"Failed to get investigation status: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/medic/investigations/<fingerprint_id>/diagnosis', methods=['GET'])
+def get_diagnosis(fingerprint_id):
+    """Get diagnosis report markdown"""
+    try:
+        report_manager = get_report_manager()
+
+        diagnosis = report_manager.read_diagnosis(fingerprint_id)
+        if diagnosis is None:
+            return jsonify({"error": "Diagnosis not found"}), 404
+
+        report_status = report_manager.get_report_status(fingerprint_id)
+
+        return jsonify({
+            "fingerprint_id": fingerprint_id,
+            "content": diagnosis,
+            "created_at": report_status.get("has_diagnosis_modified")
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Failed to get diagnosis: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/medic/investigations/<fingerprint_id>/fix-plan', methods=['GET'])
+def get_fix_plan(fingerprint_id):
+    """Get fix plan markdown"""
+    try:
+        report_manager = get_report_manager()
+
+        fix_plan = report_manager.read_fix_plan(fingerprint_id)
+        if fix_plan is None:
+            return jsonify({"error": "Fix plan not found"}), 404
+
+        report_status = report_manager.get_report_status(fingerprint_id)
+
+        return jsonify({
+            "fingerprint_id": fingerprint_id,
+            "content": fix_plan,
+            "created_at": report_status.get("has_fix_plan_modified")
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Failed to get fix plan: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/medic/investigations/<fingerprint_id>/ignored', methods=['GET'])
+def get_ignored_report(fingerprint_id):
+    """Get ignored report markdown"""
+    try:
+        report_manager = get_report_manager()
+
+        ignored = report_manager.read_ignored(fingerprint_id)
+        if ignored is None:
+            return jsonify({"error": "Ignored report not found"}), 404
+
+        report_status = report_manager.get_report_status(fingerprint_id)
+
+        return jsonify({
+            "fingerprint_id": fingerprint_id,
+            "content": ignored,
+            "created_at": report_status.get("has_ignored_modified")
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Failed to get ignored report: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/medic/investigations/<fingerprint_id>/log', methods=['GET'])
+def get_investigation_log(fingerprint_id):
+    """Get investigation log (agent output)"""
+    try:
+        report_manager = get_report_manager()
+
+        log_file = report_manager.get_report_dir(fingerprint_id) / "investigation_log.txt"
+        if not log_file.exists():
+            return jsonify({"error": "Investigation log not found"}), 404
+
+        # Read log file
+        with open(log_file, 'r') as f:
+            content = f.read()
+
+        # Get line count
+        line_count = report_manager.count_log_lines(fingerprint_id)
+
+        return jsonify({
+            "fingerprint_id": fingerprint_id,
+            "content": content,
+            "line_count": line_count
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Failed to get investigation log: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
 
 def start_observability_server(host='0.0.0.0', port=5001):
     """Start the observability WebSocket server"""

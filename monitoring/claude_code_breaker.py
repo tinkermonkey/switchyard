@@ -12,7 +12,7 @@ Uses Redis for state persistence so that:
 import logging
 import re
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -89,11 +89,17 @@ class ClaudeCodeBreaker:
                 # Parse ISO format datetime strings
                 opened_at_str = state_dict.get('opened_at')
                 if opened_at_str:
-                    self.opened_at = datetime.fromisoformat(opened_at_str)
+                    dt = datetime.fromisoformat(opened_at_str)
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    self.opened_at = dt
                 
                 reset_time_str = state_dict.get('reset_time')
                 if reset_time_str:
-                    self.reset_time = datetime.fromisoformat(reset_time_str)
+                    dt = datetime.fromisoformat(reset_time_str)
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    self.reset_time = dt
                 
                 self.failure_count = state_dict.get('failure_count', 0)
                 
@@ -134,8 +140,8 @@ class ClaudeCodeBreaker:
         Returns:
             Tuple of (is_session_limited, reset_datetime)
         """
-        #if not message:
-        return False, None
+        if not message:
+            return False, None
             
         match = self.SESSION_LIMIT_PATTERN.search(message)
         if not match:
@@ -152,17 +158,17 @@ class ClaudeCodeBreaker:
             else:
                 # No reset time in message, assume 1 hour
                 logger.warning(f"🔴 Detected Claude Code session limit (no reset time found)")
-                reset_time = datetime.now() + timedelta(hours=1)
+                reset_time = datetime.now(timezone.utc) + timedelta(hours=1)
                 return True, reset_time
         except Exception as e:
             logger.error(f"Failed to parse reset time from message: {e}")
             # Still consider it a session limit even if we can't parse time
-            reset_time = datetime.now() + timedelta(hours=1)
+            reset_time = datetime.now(timezone.utc) + timedelta(hours=1)
             return True, reset_time
     
     def _parse_reset_time(self, time_str: str) -> datetime:
         """Parse reset time string like '12am', '1:30pm', etc."""
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
         
         # Remove whitespace and convert to lowercase
         time_str = time_str.strip().lower()
@@ -200,8 +206,8 @@ class ClaudeCodeBreaker:
         """
         if self.state == self.CLOSED:
             self.state = self.OPEN
-            self.opened_at = datetime.now()
-            self.reset_time = reset_time or (datetime.now() + timedelta(hours=1))
+            self.opened_at = datetime.now(timezone.utc)
+            self.reset_time = reset_time or (datetime.now(timezone.utc) + timedelta(hours=1))
             self.failure_count = 0
             
             # Save to Redis immediately
@@ -238,7 +244,7 @@ class ClaudeCodeBreaker:
         if self.state == self.CLOSED:
             return True
 
-        if self.reset_time and datetime.now() >= self.reset_time:
+        if self.reset_time and datetime.now(timezone.utc) >= self.reset_time:
             self.state = self.HALF_OPEN
             self._save_to_redis()
             logger.warning(
@@ -291,10 +297,22 @@ class ClaudeCodeBreaker:
                     self.state = state_dict.get('state', self.CLOSED)
 
                     opened_at_str = state_dict.get('opened_at')
-                    self.opened_at = datetime.fromisoformat(opened_at_str) if opened_at_str else None
+                    if opened_at_str:
+                        dt = datetime.fromisoformat(opened_at_str)
+                        if dt.tzinfo is None:
+                            dt = dt.replace(tzinfo=timezone.utc)
+                        self.opened_at = dt
+                    else:
+                        self.opened_at = None
 
                     reset_time_str = state_dict.get('reset_time')
-                    self.reset_time = datetime.fromisoformat(reset_time_str) if reset_time_str else None
+                    if reset_time_str:
+                        dt = datetime.fromisoformat(reset_time_str)
+                        if dt.tzinfo is None:
+                            dt = dt.replace(tzinfo=timezone.utc)
+                        self.reset_time = dt
+                    else:
+                        self.reset_time = None
 
                     self.failure_count = state_dict.get('failure_count', 0)
                 elif self.state != self.CLOSED:
@@ -312,7 +330,7 @@ class ClaudeCodeBreaker:
             'opened_at': self.opened_at.isoformat() if self.opened_at else None,
             'reset_time': self.reset_time.isoformat() if self.reset_time else None,
             'time_until_reset': (
-                (self.reset_time - datetime.now()).total_seconds()
+                (self.reset_time - datetime.now(timezone.utc)).total_seconds()
                 if self.reset_time and self.state != self.CLOSED
                 else None
             ),
@@ -350,16 +368,17 @@ def check_breaker_before_agent_execution(agent_name: str) -> Tuple[bool, Optiona
     if breaker.is_open() or breaker.is_half_open():
         reset_time = breaker.reset_time
         if reset_time:
-            time_until = (reset_time - datetime.now()).total_seconds()
+            time_until = (reset_time - datetime.now(timezone.utc)).total_seconds()
             logger.warning(
-                f"⚠️ Claude Code breaker would block '{agent_name}' but is DISABLED. "
+                f"⚠️ Claude Code breaker blocking '{agent_name}'. "
                 f"Tokens reset in {time_until:.0f} seconds at {reset_time.strftime('%I:%M %p')}"
             )
+            return False, f"Claude Code circuit breaker is OPEN. Resets at {reset_time.strftime('%I:%M %p')}"
         else:
             logger.warning(
-                f"⚠️ Claude Code breaker would block '{agent_name}' but is DISABLED. "
+                f"⚠️ Claude Code breaker blocking '{agent_name}'. "
                 f"Awaiting token reset."
             )
+            return False, "Claude Code circuit breaker is OPEN. Awaiting token reset."
 
-    # Always allow execution (breaker disabled)
     return True, None

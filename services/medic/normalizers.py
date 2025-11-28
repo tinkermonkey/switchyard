@@ -1,0 +1,196 @@
+"""
+Message Normalizers for Error Fingerprinting
+
+These normalizers strip variable components from error messages to enable
+effective deduplication and fingerprinting.
+"""
+
+import re
+from abc import ABC, abstractmethod
+from typing import Pattern
+
+
+class BaseNormalizer(ABC):
+    """Base class for message normalizers"""
+
+    @abstractmethod
+    def normalize(self, message: str) -> str:
+        """Normalize a message by removing/replacing variable components"""
+        pass
+
+
+class TimestampNormalizer(BaseNormalizer):
+    """
+    Strips timestamps in various formats.
+
+    Examples:
+    - "2025-11-28 12:45:23" -> "{timestamp}"
+    - "2025-11-28T12:45:23.123456Z" -> "{timestamp}"
+    - "1732800000" (unix timestamp) -> "{timestamp}"
+    """
+
+    PATTERNS = [
+        # ISO 8601 timestamps
+        re.compile(r'\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?'),
+        # Unix timestamps (10-13 digits)
+        re.compile(r'\b\d{10,13}\b'),
+        # Date only
+        re.compile(r'\d{4}-\d{2}-\d{2}'),
+        # Time only
+        re.compile(r'\d{2}:\d{2}:\d{2}(?:\.\d+)?'),
+    ]
+
+    def normalize(self, message: str) -> str:
+        for pattern in self.PATTERNS:
+            message = pattern.sub('{timestamp}', message)
+        return message
+
+
+class UUIDNormalizer(BaseNormalizer):
+    """
+    Strips UUIDs and UUID-like identifiers.
+
+    Examples:
+    - "task_ba_550e8400-e29b-41d4-a716-446655440000" -> "task_ba_{uuid}"
+    - "agent-execution-123e4567-e89b-12d3-a456-426614174000" -> "agent-execution-{uuid}"
+    """
+
+    PATTERN = re.compile(
+        r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
+    )
+
+    def normalize(self, message: str) -> str:
+        return self.PATTERN.sub('{uuid}', message)
+
+
+class PathNormalizer(BaseNormalizer):
+    """
+    Normalizes file paths, especially workspace-relative paths.
+
+    Examples:
+    - "/workspace/what_am_i_watching/src/main.py" -> "/workspace/{project}/src/main.py"
+    - "/tmp/tmpAbc123/file.txt" -> "/tmp/{tmp}/file.txt"
+    - "/home/user/workspace/project-name/file" -> "/home/user/workspace/{project}/file"
+    """
+
+    PATTERNS = [
+        # Workspace paths
+        (re.compile(r'/workspace/([^/]+)/'), r'/workspace/{project}/'),
+        # Temp directories
+        (re.compile(r'/tmp/[a-zA-Z0-9_-]+/'), r'/tmp/{tmp}/'),
+        # Home directory project paths
+        (re.compile(r'/home/[^/]+/workspace/([^/]+)/'), r'/home/{user}/workspace/{project}/'),
+    ]
+
+    def normalize(self, message: str) -> str:
+        for pattern, replacement in self.PATTERNS:
+            message = pattern.sub(replacement, message)
+        return message
+
+
+class IssueNumberNormalizer(BaseNormalizer):
+    """
+    Normalizes issue numbers, task IDs, and similar identifiers.
+
+    Examples:
+    - "issue #123" -> "issue #{issue}"
+    - "task_ba_1234567890" -> "task_{task_id}"
+    - "pipeline_run_1732800000" -> "pipeline_run_{pipeline_id}"
+    - "container orchestrator-1" -> "container orchestrator-{instance}"
+    """
+
+    PATTERNS = [
+        # GitHub issue numbers
+        (re.compile(r'#\d+'), '#{issue}'),
+        # Task IDs with UUIDs (must come before UUID normalizer)
+        (re.compile(r'task_[a-z_]+_[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'), 'task_{task_id}'),
+        # Task IDs with timestamps
+        (re.compile(r'task_[a-z_]+_\d+'), 'task_{task_id}'),
+        # Pipeline run IDs
+        (re.compile(r'pipeline_run_\d+'), 'pipeline_run_{pipeline_id}'),
+        # Pipeline IDs
+        (re.compile(r'pipeline_\d+'), 'pipeline_{pipeline_id}'),
+        # Agent execution IDs
+        (re.compile(r'agent_execution_\d+'), 'agent_execution_{execution_id}'),
+        # Container instance numbers
+        (re.compile(r'(\w+)-\d+(?:\s|$)'), r'\1-{instance} '),
+    ]
+
+    def normalize(self, message: str) -> str:
+        for pattern, replacement in self.PATTERNS:
+            message = pattern.sub(replacement, message)
+        return message
+
+
+class ContainerIDNormalizer(BaseNormalizer):
+    """
+    Strips Docker container IDs and hashes.
+
+    Examples:
+    - "container abc123def456" -> "container {container_id}"
+    - "sha256:abc123..." -> "sha256:{hash}"
+    """
+
+    PATTERNS = [
+        # Docker container IDs (12-64 hex chars)
+        re.compile(r'\b[0-9a-fA-F]{12,64}\b'),
+        # SHA256 hashes
+        re.compile(r'sha256:[0-9a-fA-F]+'),
+        # Generic hashes (8+ hex chars)
+        re.compile(r'\b[0-9a-fA-F]{8,}\b'),
+    ]
+
+    def normalize(self, message: str) -> str:
+        for pattern in self.PATTERNS:
+            message = pattern.sub('{hash}', message)
+        return message
+
+
+class LineNumberNormalizer(BaseNormalizer):
+    """
+    Preserves line numbers in stack traces but normalizes them when embedded in text.
+
+    Examples:
+    - "at file.py:123" -> "at file.py:{line}" (in regular text)
+    - "file.py:123" -> "file.py:{line}" (in stack traces, preserve for signature)
+    """
+
+    # Only normalize line numbers in verbose messages, not in stack traces
+    PATTERN = re.compile(r'line\s+\d+')
+
+    def normalize(self, message: str) -> str:
+        return self.PATTERN.sub('line {line}', message)
+
+
+class JSONBlobNormalizer(BaseNormalizer):
+    """
+    Normalizes JSON blobs and large data structures.
+
+    Examples:
+    - '{"key": "value", ...}' -> '{json}'
+    - Large JSON in error messages
+    """
+
+    PATTERN = re.compile(r'\{["\']?\w+["\']?\s*:\s*[^}]{20,}\}')
+
+    def normalize(self, message: str) -> str:
+        # Only normalize if JSON blob is large (>20 chars of content)
+        return self.PATTERN.sub('{json}', message)
+
+
+def get_default_normalizers() -> list[BaseNormalizer]:
+    """
+    Get the default set of normalizers in order of application.
+
+    Order matters! IssueNumberNormalizer must come before UUIDNormalizer
+    so that task_ba_<UUID> patterns are matched completely.
+    """
+    return [
+        TimestampNormalizer(),
+        IssueNumberNormalizer(),  # Before UUID to catch task_ba_UUID patterns
+        UUIDNormalizer(),
+        PathNormalizer(),
+        ContainerIDNormalizer(),
+        LineNumberNormalizer(),
+        JSONBlobNormalizer(),
+    ]

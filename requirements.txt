@@ -12,6 +12,7 @@ psutil>=5.9.6
 
 # Pattern Detection / Analytics
 elasticsearch>=8.11.0
+docker>=7.0.0  # For Medic Docker log monitoring
 
 # Web/API
 flask>=3.0.0

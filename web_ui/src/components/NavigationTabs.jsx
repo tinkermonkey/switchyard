@@ -1,5 +1,5 @@
 import { Link } from '@tanstack/react-router'
-import { Activity, Sparkles, FolderGit2, Workflow, Bug, Wrench } from 'lucide-react'
+import { Activity, Sparkles, FolderGit2, Workflow, Bug, Wrench, Stethoscope } from 'lucide-react'
 
 export default function NavigationTabs() {
   return (
@@ -75,6 +75,18 @@ export default function NavigationTabs() {
       >
         <Wrench className="inline w-4 h-4 mr-2" />
         Repair Cycles
+      </Link>
+      <Link
+        to="/medic"
+        activeProps={{
+          className: "px-4 py-2 bg-gh-accent-emphasis border border-gh-accent-primary rounded-md hover:bg-gh-accent-primary transition-colors text-sm text-white"
+        }}
+        inactiveProps={{
+          className: "px-4 py-2 bg-gh-canvas-subtle border border-gh-border rounded-md hover:bg-gh-border-muted transition-colors text-sm"
+        }}
+      >
+        <Stethoscope className="inline w-4 h-4 mr-2" />
+        Medic
       </Link>
     </div>
   )

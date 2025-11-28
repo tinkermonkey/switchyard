@@ -176,6 +176,54 @@ services:
       timeout: 5s
       retries: 5
 
+  medic-monitor:
+    build: .
+    volumes:
+      - ./:/app
+      - /var/run/docker.sock:/var/run/docker.sock  # Docker log access
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    depends_on:
+      redis:
+        condition: service_started
+      elasticsearch:
+        condition: service_healthy
+    networks:
+      - orchestrator-net
+    working_dir: /app
+    command: ["python", "-m", "services.medic.docker_log_monitor"]
+    restart: unless-stopped
+
+  medic-investigator:
+    build: .
+    volumes:
+      - ./:/app
+      - ..:/workspace  # Access to orchestrator workspace for projects
+      - /var/run/docker.sock:/var/run/docker.sock  # Docker CLI access for logs
+      - medic-reports:/medic  # Persistent volume for investigation reports
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+      - WORKSPACE_ROOT=/workspace/clauditoreum
+      - MEDIC_DIR=/medic
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    depends_on:
+      redis:
+        condition: service_started
+      elasticsearch:
+        condition: service_healthy
+      medic-monitor:
+        condition: service_started
+    networks:
+      - orchestrator-net
+    working_dir: /app
+    command: ["python", "-m", "services.medic.investigation_orchestrator"]
+    restart: unless-stopped
+
 #  pattern-ingestion:
 #    build: .
 #    volumes:
@@ -260,6 +308,7 @@ services:
 volumes:
   redis_data:
   elasticsearch_data:
+  medic-reports:  # Persistent storage for investigation reports
 
 networks:
   orchestrator-net:
