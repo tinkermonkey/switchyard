@@ -68,3 +68,35 @@ investigation:
   max_concurrent: 3
   timeout_seconds: 14400  # 4 hours
   max_retries: 3
+
+# Claude Medic Configuration (Tool Execution Failure Monitoring)
+claude_failures:
+  enabled: true
+  check_interval_seconds: 300  # Check every 5 minutes
+
+  # Auto-trigger investigation thresholds
+  auto_trigger:
+    enabled: true
+    thresholds:
+      # Cluster-based thresholds (groups of consecutive failures)
+      cluster_count:
+        total: 5          # 5 clusters total = auto-investigate
+        per_hour: 3       # 3 clusters in 1 hour = auto-investigate
+      # Individual failure thresholds (across all clusters)
+      total_failures:
+        total: 15         # 15 total failures = auto-investigate
+        per_hour: 10      # 10 failures in 1 hour = auto-investigate
+
+  # Elasticsearch configuration
+  elasticsearch:
+    index_prefix: "medic-claude-failures"
+    retention_days: 30  # ILM delete phase
+
+  # Clustering configuration
+  clustering:
+    timeout_seconds: 300  # 5 minutes between events breaks cluster
+    max_cluster_size: 50   # Safety limit on cluster size
+
+  # Status tracking
+  status:
+    auto_resolve_days: 7  # Resolve if no occurrences for 7 days

@@ -168,6 +168,32 @@ export function SocketProvider({ children }) {
       setMedicEvents(prev => [{ ...event, event_type: 'investigation_failed' }, ...prev].slice(0, 100))
     })
 
+    // Claude Medic event listeners
+    socketInstance.on('medic_claude_signature_created', (event) => {
+      console.log('[SocketContext] Received medic_claude_signature_created:', event)
+      setMedicEvents(prev => [{ ...event, event_type: 'claude_signature_created' }, ...prev].slice(0, 100))
+    })
+
+    socketInstance.on('medic_claude_signature_updated', (event) => {
+      console.log('[SocketContext] Received medic_claude_signature_updated:', event)
+      setMedicEvents(prev => [{ ...event, event_type: 'claude_signature_updated' }, ...prev].slice(0, 100))
+    })
+
+    socketInstance.on('medic_claude_signature_trending', (event) => {
+      console.log('[SocketContext] Received medic_claude_signature_trending:', event)
+      setMedicEvents(prev => [{ ...event, event_type: 'claude_signature_trending' }, ...prev].slice(0, 100))
+    })
+
+    socketInstance.on('medic_claude_cluster_detected', (event) => {
+      console.log('[SocketContext] Received medic_claude_cluster_detected:', event)
+      setMedicEvents(prev => [{ ...event, event_type: 'claude_cluster_detected' }, ...prev].slice(0, 100))
+    })
+
+    socketInstance.on('medic_claude_investigation_completed', (event) => {
+      console.log('[SocketContext] Received medic_claude_investigation_completed:', event)
+      setMedicEvents(prev => [{ ...event, event_type: 'claude_investigation_completed' }, ...prev].slice(0, 100))
+    })
+
     setSocket(socketInstance)
 
     return () => {

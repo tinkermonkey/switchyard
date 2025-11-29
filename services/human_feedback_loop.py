@@ -799,6 +799,14 @@ class HumanFeedbackLoopExecutor:
 
                     # Check if human comment after last agent output
                     if not is_bot_user(author) and created_at > last_agent_time:
+                        # FIX: Check if parent comment belongs to this agent
+                        parent_body = comment.get('body', '')
+                        agent_signature = f"_Processed by the {state.agent} agent_"
+                        
+                        if agent_signature not in parent_body:
+                            logger.debug(f"Skipping reply to comment {comment.get('id')} - not processed by {state.agent}")
+                            continue
+
                         logger.info(f"Found human feedback in reply from {author} to comment {comment.get('id')}")
                         # Return the parent comment info so we can build correct thread context
                         return {

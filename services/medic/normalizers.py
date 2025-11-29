@@ -35,6 +35,8 @@ class TimestampNormalizer(BaseNormalizer):
     PATTERNS = [
         # ISO 8601 timestamps with timezone
         re.compile(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})'),
+        # Date-time patterns like "2025-11-29 02:15:00 UTC"
+        re.compile(r'\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}(?:\s+[A-Z]{3,4})?'),
         # Unix timestamps (10-13 digits) - must be word boundary
         re.compile(r'\b\d{10,13}\b'),
     ]
@@ -42,6 +44,31 @@ class TimestampNormalizer(BaseNormalizer):
     def normalize(self, message: str) -> str:
         for pattern in self.PATTERNS:
             message = pattern.sub('{timestamp}', message)
+        return message
+
+
+class DurationNormalizer(BaseNormalizer):
+    """
+    Normalizes time durations in error messages.
+
+    Examples:
+    - "missed by 0:00:02.515269" -> "missed by {duration}"
+    - "timeout after 30.123 seconds" -> "timeout after {duration} seconds"
+    - "took 1:23:45.678" -> "took {duration}"
+    """
+
+    PATTERNS = [
+        # Duration with hours:minutes:seconds.microseconds
+        re.compile(r'\d+:\d{2}:\d{2}(?:\.\d+)?'),
+        # Duration with minutes:seconds.microseconds
+        re.compile(r'\d+:\d{2}(?:\.\d+)?(?=\s|$|\))'),
+        # Decimal seconds (e.g., "30.123")
+        re.compile(r'\b\d+\.\d{3,}(?=\s*(?:second|sec|ms|s|$))'),
+    ]
+
+    def normalize(self, message: str) -> str:
+        for pattern in self.PATTERNS:
+            message = pattern.sub('{duration}', message)
         return message
 
 
@@ -111,8 +138,9 @@ class IssueNumberNormalizer(BaseNormalizer):
         (re.compile(r'pipeline_\d+'), 'pipeline_{pipeline_id}'),
         # Agent execution IDs
         (re.compile(r'agent_execution_\d+'), 'agent_execution_{execution_id}'),
-        # Container instance numbers
-        (re.compile(r'(\w+)-\d+(?:\s|$)'), r'\1-{instance} '),
+        # Container instance numbers - IMPROVED: Only match after whitespace/start and before whitespace/end
+        # Avoid matching in contexts like "2025-11-29" where it would incorrectly match "29"
+        (re.compile(r'(?<=\s)(\w+)-(\d+)(?=\s|$)'), r'\1-{instance}'),
     ]
 
     def normalize(self, message: str) -> str:
@@ -181,11 +209,14 @@ def get_default_normalizers() -> list[BaseNormalizer]:
     """
     Get the default set of normalizers in order of application.
 
-    Order matters! IssueNumberNormalizer must come before UUIDNormalizer
-    so that task_ba_<UUID> patterns are matched completely.
+    Order matters!
+    - TimestampNormalizer must come first to normalize dates before IssueNumberNormalizer
+    - DurationNormalizer should come early to normalize durations
+    - IssueNumberNormalizer must come before UUIDNormalizer to catch task_ba_<UUID> patterns
     """
     return [
-        TimestampNormalizer(),
+        TimestampNormalizer(),  # First to normalize dates/times
+        DurationNormalizer(),   # Early to normalize time durations
         IssueNumberNormalizer(),  # Before UUID to catch task_ba_UUID patterns
         UUIDNormalizer(),
         PathNormalizer(),

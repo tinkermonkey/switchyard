@@ -3295,6 +3295,30 @@ _Repair cycle initiated by Claude Code Orchestrator_
                                                         f"{agent_name} in discussion {discussion_id} - skipping"
                                                     )
                                                     break
+                                else:
+                                    # For issues workspace (default), check issue comments
+                                    result = subprocess.run(
+                                        ['gh', 'issue', 'view', str(item.issue_number), '--repo',
+                                         f"{project_config.github['org']}/{item.repository}", '--json', 'comments'],
+                                        capture_output=True, text=True, check=True
+                                    )
+                                    comments_data = json.loads(result.stdout)
+                                    comments = comments_data.get('comments', [])
+                                    
+                                    agent_name = column_config.agent
+                                    for comment in comments:
+                                        # Check for agent signature in comment body
+                                        # Note: Issue comments might be from the user who ran the agent if using PAT, 
+                                        # or bot if using App. We check the body content primarily.
+                                        body = comment.get('body', '')
+                                        if f'_Processed by the {agent_name} agent_' in body:
+                                            has_existing_output = True
+                                            logger.info(
+                                                f"Issue #{item.issue_number} in {item.status} already has output from "
+                                                f"{agent_name} in issue comments - skipping"
+                                            )
+                                            break
+
                             except Exception as e:
                                 logger.warning(f"Error checking for existing output on issue #{item.issue_number}: {e}")
                                 # Continue anyway - better to re-run than skip valid work

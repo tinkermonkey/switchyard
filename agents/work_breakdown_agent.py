@@ -518,43 +518,74 @@ Make sure to:
         created_issues = []
         for idx, sub_issue in enumerate(sub_issues, start=1):
             try:
-                # Create issue using GitHub CLI (returns URL directly)
-                result = subprocess.run(
-                    ['gh', 'issue', 'create',
-                     '-R', repo,
-                     '--title', sub_issue['title'],
-                     '--body', sub_issue['body']],
-                    capture_output=True,
-                    text=True,
-                    check=True
-                )
+                # Check for existing issue with same title to prevent duplicates
+                # This handles the "zombie run" scenario where the agent runs again
+                existing_issue = None
+                try:
+                    # Escape quotes in title for search
+                    search_title = sub_issue['title'].replace('"', '\\"')
+                    search_cmd = ['gh', 'issue', 'list', '-R', repo, '--search', f'"{search_title}" in:title', '--json', 'number,title,id,url', '--state', 'all']
+                    search_result = subprocess.run(
+                        search_cmd,
+                        capture_output=True,
+                        text=True,
+                        check=True
+                    )
+                    search_data = json_lib.loads(search_result.stdout)
+                    
+                    # Find exact match
+                    for item in search_data:
+                        if item['title'] == sub_issue['title']:
+                            existing_issue = item
+                            logger.info(f"Found existing issue #{item['number']} with title '{sub_issue['title']}'")
+                            break
+                except Exception as e:
+                    logger.warning(f"Failed to check for existing issue: {e}")
 
-                # gh issue create returns the issue URL
-                issue_url = result.stdout.strip()
-                
-                # Extract issue number from URL (e.g., https://github.com/org/repo/issues/123)
-                import re as regex
-                url_match = regex.search(r'/issues/(\d+)$', issue_url)
-                if not url_match:
-                    raise Exception(f"Could not extract issue number from URL: {issue_url}")
-                
-                issue_number = url_match.group(1)
-                
-                # Get full issue details including node ID using gh issue view
-                view_result = subprocess.run(
-                    ['gh', 'issue', 'view', issue_number,
-                     '-R', repo,
-                     '--json', 'id,number,url'],
-                    capture_output=True,
-                    text=True,
-                    check=True
-                )
-                
-                issue_data = json_lib.loads(view_result.stdout)
-                issue_id = issue_data['id']
-                issue_number = str(issue_data['number'])
+                if existing_issue:
+                    # Use existing issue
+                    issue_number = str(existing_issue['number'])
+                    issue_url = existing_issue['url']
+                    issue_id = existing_issue['id']
+                    logger.info(f"Skipping creation of '{sub_issue['title']}' - using existing issue #{issue_number}")
+                else:
+                    # Create issue using GitHub CLI (returns URL directly)
+                    result = subprocess.run(
+                        ['gh', 'issue', 'create',
+                         '-R', repo,
+                         '--title', sub_issue['title'],
+                         '--body', sub_issue['body']],
+                        capture_output=True,
+                        text=True,
+                        check=True
+                    )
 
-                # Add issue to SDLC board's Backlog column
+                    # gh issue create returns the issue URL
+                    issue_url = result.stdout.strip()
+                    
+                    # Extract issue number from URL (e.g., https://github.com/org/repo/issues/123)
+                    import re as regex
+                    url_match = regex.search(r'/issues/(\d+)$', issue_url)
+                    if not url_match:
+                        raise Exception(f"Could not extract issue number from URL: {issue_url}")
+                    
+                    issue_number = url_match.group(1)
+                    
+                    # Get full issue details including node ID using gh issue view
+                    view_result = subprocess.run(
+                        ['gh', 'issue', 'view', issue_number,
+                         '-R', repo,
+                         '--json', 'id,number,url'],
+                        capture_output=True,
+                        text=True,
+                        check=True
+                    )
+                    
+                    issue_data = json_lib.loads(view_result.stdout)
+                    issue_id = issue_data['id']
+                    issue_number = str(issue_data['number'])
+
+                # Add issue to SDLC board's Backlog column (idempotent-ish, but good to ensure)
                 subprocess.run(
                     ['gh', 'project', 'item-add', str(sdlc_board.project_number),
                      '--owner', github_config['org'],

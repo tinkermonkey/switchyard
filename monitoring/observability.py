@@ -197,6 +197,15 @@ class EventType(Enum):
     MEDIC_INVESTIGATION_COMPLETED = "medic_investigation_completed"
     MEDIC_INVESTIGATION_FAILED = "medic_investigation_failed"
 
+    # Claude Medic events
+    MEDIC_CLAUDE_SIGNATURE_CREATED = "medic_claude_signature_created"
+    MEDIC_CLAUDE_SIGNATURE_UPDATED = "medic_claude_signature_updated"
+    MEDIC_CLAUDE_SIGNATURE_TRENDING = "medic_claude_signature_trending"
+    MEDIC_CLAUDE_CLUSTER_DETECTED = "medic_claude_cluster_detected"
+    MEDIC_CLAUDE_INVESTIGATION_STARTED = "medic_claude_investigation_started"
+    MEDIC_CLAUDE_INVESTIGATION_COMPLETED = "medic_claude_investigation_completed"
+    MEDIC_CLAUDE_INVESTIGATION_STALLED = "medic_claude_investigation_stalled"
+
 @dataclass
 class ObservabilityEvent:
     """Structured event for agent observability"""

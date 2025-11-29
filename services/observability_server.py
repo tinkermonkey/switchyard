@@ -3323,6 +3323,680 @@ def get_investigation_log(fingerprint_id):
         return jsonify({"error": str(e)}), 500
 
 
+# ============================================================================
+# Claude Medic API Endpoints (Tool Execution Failure Monitoring)
+# ============================================================================
+
+@app.route('/api/medic/claude/failure-signatures', methods=['GET'])
+def get_claude_failure_signatures():
+    """
+    Get all Claude tool execution failure signatures with filtering and pagination.
+
+    Query params:
+    - project: Filter by project name
+    - tool_name: Filter by tool name (Read, Bash, Edit, etc.)
+    - error_type: Filter by error type
+    - status: Filter by status (new, recurring, trending, resolved)
+    - investigation_status: Filter by investigation status
+    - from_date: Filter by first_seen >= date (ISO format)
+    - to_date: Filter by first_seen <= date (ISO format)
+    - limit: Max results (default 50)
+    - offset: Pagination offset (default 0)
+    """
+    try:
+        # Build Elasticsearch query
+        must_clauses = [{"term": {"type": "claude_failure"}}]  # Only Claude failures
+
+        # Project filter
+        if request.args.get('project'):
+            must_clauses.append({"term": {"project": request.args['project']}})
+
+        # Tool name filter
+        if request.args.get('tool_name'):
+            must_clauses.append({"term": {"signature.tool_name": request.args['tool_name']}})
+
+        # Error type filter
+        if request.args.get('error_type'):
+            must_clauses.append({"term": {"signature.error_type": request.args['error_type']}})
+
+        # Status filter
+        if request.args.get('status'):
+            must_clauses.append({"term": {"status": request.args['status']}})
+
+        # Investigation status filter
+        if request.args.get('investigation_status'):
+            must_clauses.append({"term": {"investigation_status": request.args['investigation_status']}})
+
+        # Date range filter
+        date_filter = {}
+        if request.args.get('from_date'):
+            date_filter['gte'] = request.args['from_date']
+        if request.args.get('to_date'):
+            date_filter['lte'] = request.args['to_date']
+        if date_filter:
+            must_clauses.append({"range": {"first_seen": date_filter}})
+
+        # Build query
+        query = {
+            "query": {
+                "bool": {"must": must_clauses}
+            },
+            "size": int(request.args.get('limit', 50)),
+            "from": int(request.args.get('offset', 0)),
+            "sort": [{"last_seen": {"order": "desc"}}]
+        }
+
+        # Execute search
+        result = es_client.search(index="medic-claude-failures-*", body=query)
+
+        signatures = [hit['_source'] for hit in result['hits']['hits']]
+
+        return jsonify({
+            'signatures': signatures,
+            'total': result['hits']['total']['value'],
+            'limit': int(request.args.get('limit', 50)),
+            'offset': int(request.args.get('offset', 0))
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Failed to get Claude failure signatures: {e}", exc_info=True)
+        # Return empty result instead of error for better UX when index doesn't exist
+        return jsonify({
+            'signatures': [],
+            'total': 0,
+            'limit': int(request.args.get('limit', 50)),
+            'offset': int(request.args.get('offset', 0))
+        }), 200
+
+
+@app.route('/api/medic/claude/failure-signatures/<fingerprint_id>', methods=['GET'])
+def get_claude_failure_signature(fingerprint_id):
+    """Get details of a specific Claude failure signature"""
+    try:
+        result = es_client.search(
+            index="medic-claude-failures-*",
+            body={
+                "query": {"term": {"fingerprint_id": fingerprint_id}},
+                "size": 1
+            }
+        )
+
+        if not result['hits']['hits']:
+            return jsonify({"error": "Signature not found"}), 404
+
+        signature = result['hits']['hits'][0]['_source']
+        return jsonify(signature), 200
+
+    except Exception as e:
+        logger.error(f"Failed to get Claude failure signature: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/medic/claude/failure-signatures/<fingerprint_id>/clusters', methods=['GET'])
+def get_claude_failure_clusters(fingerprint_id):
+    """Get sample clusters for a Claude failure signature"""
+    try:
+        result = es_client.search(
+            index="medic-claude-failures-*",
+            body={
+                "query": {"term": {"fingerprint_id": fingerprint_id}},
+                "size": 1
+            }
+        )
+
+        if not result['hits']['hits']:
+            return jsonify({"error": "Signature not found"}), 404
+
+        signature = result['hits']['hits'][0]['_source']
+        sample_clusters = signature.get('sample_clusters', [])
+
+        return jsonify({
+            'fingerprint_id': fingerprint_id,
+            'clusters': sample_clusters,
+            'total_clusters': signature.get('cluster_count', 0),
+            'sample_count': len(sample_clusters)
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Failed to get Claude failure clusters: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/medic/claude/stats', methods=['GET'])
+def get_claude_medic_stats():
+    """Get Claude Medic statistics"""
+    try:
+        # Get signature counts by status
+        status_agg = es_client.search(
+            index="medic-claude-failures-*",
+            body={
+                "query": {"term": {"type": "claude_failure"}},
+                "size": 0,
+                "aggs": {
+                    "by_status": {
+                        "terms": {"field": "status"}
+                    },
+                    "by_tool": {
+                        "terms": {"field": "signature.tool_name", "size": 20}
+                    },
+                    "by_error_type": {
+                        "terms": {"field": "signature.error_type", "size": 20}
+                    },
+                    "by_project": {
+                        "terms": {"field": "project", "size": 50}
+                    }
+                }
+            }
+        )
+
+        # Extract aggregations
+        status_counts = {
+            bucket['key']: bucket['doc_count']
+            for bucket in status_agg.get('aggregations', {}).get('by_status', {}).get('buckets', [])
+        }
+
+        tool_counts = {
+            bucket['key']: bucket['doc_count']
+            for bucket in status_agg.get('aggregations', {}).get('by_tool', {}).get('buckets', [])
+        }
+
+        error_type_counts = {
+            bucket['key']: bucket['doc_count']
+            for bucket in status_agg.get('aggregations', {}).get('by_error_type', {}).get('buckets', [])
+        }
+
+        project_counts = {
+            bucket['key']: bucket['doc_count']
+            for bucket in status_agg.get('aggregations', {}).get('by_project', {}).get('buckets', [])
+        }
+
+        # Get total failures (sum of total_failures across all signatures)
+        total_result = es_client.search(
+            index="medic-claude-failures-*",
+            body={
+                "query": {"term": {"type": "claude_failure"}},
+                "size": 0,
+                "aggs": {
+                    "total_failures": {"sum": {"field": "total_failures"}},
+                    "total_clusters": {"sum": {"field": "cluster_count"}}
+                }
+            }
+        )
+
+        total_failures = int(total_result.get('aggregations', {}).get('total_failures', {}).get('value', 0))
+        total_clusters = int(total_result.get('aggregations', {}).get('total_clusters', {}).get('value', 0))
+
+        return jsonify({
+            'total_signatures': sum(status_counts.values()),
+            'total_failures': total_failures,
+            'total_clusters': total_clusters,
+            'by_status': status_counts,
+            'by_tool': tool_counts,
+            'by_error_type': error_type_counts,
+            'by_project': project_counts
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Failed to get Claude medic stats: {e}", exc_info=True)
+        return jsonify({
+            'total_signatures': 0,
+            'total_failures': 0,
+            'total_clusters': 0,
+            'by_status': {},
+            'by_tool': {},
+            'by_error_type': {},
+            'by_project': {}
+        }), 200
+
+
+@app.route('/api/medic/claude/projects', methods=['GET'])
+def get_claude_medic_projects():
+    """Get list of projects with Claude failure data"""
+    try:
+        result = es_client.search(
+            index="medic-claude-failures-*",
+            body={
+                "query": {"term": {"type": "claude_failure"}},
+                "size": 0,
+                "aggs": {
+                    "projects": {
+                        "terms": {"field": "project", "size": 100},
+                        "aggs": {
+                            "signature_count": {"value_count": {"field": "fingerprint_id"}},
+                            "total_failures": {"sum": {"field": "total_failures"}},
+                            "total_clusters": {"sum": {"field": "cluster_count"}},
+                            "last_seen": {"max": {"field": "last_seen"}}
+                        }
+                    }
+                }
+            }
+        )
+
+        projects = []
+        for bucket in result.get('aggregations', {}).get('projects', {}).get('buckets', []):
+            projects.append({
+                'project': bucket['key'],
+                'signature_count': bucket['doc_count'],
+                'total_failures': int(bucket['total_failures']['value']),
+                'total_clusters': int(bucket['total_clusters']['value']),
+                'last_seen': bucket['last_seen']['value_as_string']
+            })
+
+        return jsonify({'projects': projects}), 200
+
+    except Exception as e:
+        logger.error(f"Failed to get Claude medic projects: {e}", exc_info=True)
+        return jsonify({'projects': []}), 200
+
+
+@app.route('/api/medic/claude/projects/<project>/stats', methods=['GET'])
+def get_claude_project_stats(project):
+    """Get Claude Medic statistics for a specific project"""
+    try:
+        # Get signature counts by status for this project
+        result = es_client.search(
+            index="medic-claude-failures-*",
+            body={
+                "query": {
+                    "bool": {
+                        "must": [
+                            {"term": {"type": "claude_failure"}},
+                            {"term": {"project": project}}
+                        ]
+                    }
+                },
+                "size": 0,
+                "aggs": {
+                    "by_status": {"terms": {"field": "status"}},
+                    "by_tool": {"terms": {"field": "signature.tool_name", "size": 20}},
+                    "by_error_type": {"terms": {"field": "signature.error_type", "size": 20}},
+                    "total_failures": {"sum": {"field": "total_failures"}},
+                    "total_clusters": {"sum": {"field": "cluster_count"}}
+                }
+            }
+        )
+
+        aggs = result.get('aggregations', {})
+
+        status_counts = {
+            bucket['key']: bucket['doc_count']
+            for bucket in aggs.get('by_status', {}).get('buckets', [])
+        }
+
+        tool_counts = {
+            bucket['key']: bucket['doc_count']
+            for bucket in aggs.get('by_tool', {}).get('buckets', [])
+        }
+
+        error_type_counts = {
+            bucket['key']: bucket['doc_count']
+            for bucket in aggs.get('by_error_type', {}).get('buckets', [])
+        }
+
+        return jsonify({
+            'project': project,
+            'total_signatures': sum(status_counts.values()),
+            'total_failures': int(aggs.get('total_failures', {}).get('value', 0)),
+            'total_clusters': int(aggs.get('total_clusters', {}).get('value', 0)),
+            'by_status': status_counts,
+            'by_tool': tool_counts,
+            'by_error_type': error_type_counts
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Failed to get Claude project stats: {e}", exc_info=True)
+        return jsonify({
+            'project': project,
+            'total_signatures': 0,
+            'total_failures': 0,
+            'total_clusters': 0,
+            'by_status': {},
+            'by_tool': {},
+            'by_error_type': {}
+        }), 200
+
+
+# ============================================================================
+# Claude Investigation API Endpoints
+# ============================================================================
+
+@app.route('/api/medic/claude/investigations', methods=['GET'])
+def get_claude_investigations():
+    """
+    Get all Claude investigations with status and progress.
+
+    Query params:
+    - status: Filter by status (queued, in_progress, completed, failed, ignored)
+    - project: Filter by project
+    - limit: Max results (default 50)
+    - offset: Pagination offset (default 0)
+    """
+    try:
+        from services.medic.claude_report_manager import ClaudeReportManager
+
+        report_manager = ClaudeReportManager()
+        all_investigations = report_manager.list_all_investigations()
+
+        # Apply filters
+        status_filter = request.args.get('status')
+        project_filter = request.args.get('project')
+        limit = int(request.args.get('limit', 50))
+        offset = int(request.args.get('offset', 0))
+
+        filtered_investigations = []
+        for fingerprint_id in all_investigations:
+            summary = report_manager.get_investigation_summary(fingerprint_id)
+
+            # Apply status filter
+            if status_filter and summary.get('status') != status_filter:
+                continue
+
+            # Apply project filter
+            if project_filter and summary.get('project') != project_filter:
+                continue
+
+            filtered_investigations.append(summary)
+
+        # Sort by created_at desc
+        filtered_investigations.sort(
+            key=lambda x: x.get('created_at', ''),
+            reverse=True
+        )
+
+        # Apply pagination
+        paginated = filtered_investigations[offset:offset + limit]
+
+        return jsonify({
+            'investigations': paginated,
+            'total': len(filtered_investigations),
+            'limit': limit,
+            'offset': offset
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Failed to get Claude investigations: {e}", exc_info=True)
+        return jsonify({
+            'investigations': [],
+            'total': 0,
+            'limit': 50,
+            'offset': 0
+        }), 200
+
+
+@app.route('/api/medic/claude/investigations/<fingerprint_id>', methods=['POST'])
+def trigger_claude_investigation(fingerprint_id):
+    """Manually trigger a Claude investigation for a signature"""
+    try:
+        priority = request.json.get('priority', 'normal') if request.json else 'normal'
+
+        # Enqueue investigation via Redis
+        import redis
+        redis_client = redis.Redis(
+            host=os.getenv('REDIS_HOST', 'redis'),
+            port=int(os.getenv('REDIS_PORT', 6379)),
+            decode_responses=True
+        )
+
+        from services.medic.claude_investigation_queue import ClaudeInvestigationQueue
+        queue = ClaudeInvestigationQueue(redis_client)
+
+        enqueued = queue.enqueue(fingerprint_id, priority=priority)
+
+        if enqueued:
+            return jsonify({
+                'message': f'Investigation triggered for {fingerprint_id}',
+                'fingerprint_id': fingerprint_id,
+                'priority': priority
+            }), 200
+        else:
+            return jsonify({
+                'error': 'Investigation already queued or in progress',
+                'fingerprint_id': fingerprint_id
+            }), 409
+
+    except Exception as e:
+        logger.error(f"Failed to trigger Claude investigation: {e}", exc_info=True)
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/medic/claude/investigations/<fingerprint_id>/status', methods=['GET'])
+def get_claude_investigation_status(fingerprint_id):
+    """Get status and progress of a Claude investigation"""
+    try:
+        import redis
+        redis_client = redis.Redis(
+            host=os.getenv('REDIS_HOST', 'redis'),
+            port=int(os.getenv('REDIS_PORT', 6379)),
+            decode_responses=True
+        )
+
+        from services.medic.claude_investigation_queue import ClaudeInvestigationQueue
+        from services.medic.claude_report_manager import ClaudeReportManager
+
+        queue = ClaudeInvestigationQueue(redis_client)
+        report_manager = ClaudeReportManager()
+
+        # Get queue info
+        queue_info = queue.get_investigation_info(fingerprint_id)
+
+        # Get report info
+        report_summary = report_manager.get_investigation_summary(fingerprint_id)
+
+        # Merge information
+        status_info = {
+            'fingerprint_id': fingerprint_id,
+            'queue_status': queue_info.get('status'),
+            'report_status': report_summary.get('status'),
+            'started_at': queue_info.get('started_at'),
+            'last_heartbeat': queue_info.get('last_heartbeat'),
+            'completed_at': queue_info.get('completed_at'),
+            'result': queue_info.get('result'),
+            'progress_lines': queue_info.get('progress_lines', 0),
+            'duration_seconds': queue_info.get('duration_seconds'),
+            'has_diagnosis': report_summary.get('has_diagnosis', False),
+            'has_fix_plan': report_summary.get('has_fix_plan', False),
+            'has_ignored': report_summary.get('has_ignored', False),
+            'project': report_summary.get('project'),
+        }
+
+        return jsonify(status_info), 200
+
+    except Exception as e:
+        logger.error(f"Failed to get Claude investigation status: {e}", exc_info=True)
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/medic/claude/investigations/<fingerprint_id>/diagnosis', methods=['GET'])
+def get_claude_diagnosis(fingerprint_id):
+    """Get diagnosis.md content"""
+    try:
+        from services.medic.claude_report_manager import ClaudeReportManager
+
+        report_manager = ClaudeReportManager()
+        diagnosis = report_manager.read_diagnosis(fingerprint_id)
+
+        if not diagnosis:
+            return jsonify({'error': 'Diagnosis not found'}), 404
+
+        return jsonify({
+            'fingerprint_id': fingerprint_id,
+            'content': diagnosis
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Failed to get Claude diagnosis: {e}", exc_info=True)
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/medic/claude/investigations/<fingerprint_id>/fix-plan', methods=['GET'])
+def get_claude_fix_plan(fingerprint_id):
+    """Get fix_plan.md content"""
+    try:
+        from services.medic.claude_report_manager import ClaudeReportManager
+
+        report_manager = ClaudeReportManager()
+        fix_plan = report_manager.read_fix_plan(fingerprint_id)
+
+        if not fix_plan:
+            return jsonify({'error': 'Fix plan not found'}), 404
+
+        return jsonify({
+            'fingerprint_id': fingerprint_id,
+            'content': fix_plan
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Failed to get Claude fix plan: {e}", exc_info=True)
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/medic/claude/investigations/<fingerprint_id>/recommendations', methods=['GET'])
+def get_claude_recommendations(fingerprint_id):
+    """Get recommendations (alias for fix_plan.md)"""
+    try:
+        from services.medic.claude_report_manager import ClaudeReportManager
+
+        report_manager = ClaudeReportManager()
+        recommendations = report_manager.read_fix_plan(fingerprint_id)
+
+        if not recommendations:
+            return jsonify({'error': 'Recommendations not found'}), 404
+
+        # Get file modification timestamp
+        import os
+        from pathlib import Path
+        fix_plan_file = report_manager.get_report_dir(fingerprint_id) / "fix_plan.md"
+        created_at = None
+        if fix_plan_file.exists():
+            from datetime import datetime, timezone
+            created_at = datetime.fromtimestamp(
+                fix_plan_file.stat().st_mtime, tz=timezone.utc
+            ).isoformat()
+
+        return jsonify({
+            'fingerprint_id': fingerprint_id,
+            'content': recommendations,
+            'created_at': created_at
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Failed to get Claude recommendations: {e}", exc_info=True)
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/medic/claude/investigations/<fingerprint_id>/ignored', methods=['GET'])
+def get_claude_ignored(fingerprint_id):
+    """Get ignored.md content"""
+    try:
+        from services.medic.claude_report_manager import ClaudeReportManager
+
+        report_manager = ClaudeReportManager()
+        ignored = report_manager.read_ignored(fingerprint_id)
+
+        if not ignored:
+            return jsonify({'error': 'Ignored report not found'}), 404
+
+        return jsonify({
+            'fingerprint_id': fingerprint_id,
+            'content': ignored
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Failed to get Claude ignored report: {e}", exc_info=True)
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/medic/claude/investigations/<fingerprint_id>/log', methods=['GET'])
+def get_claude_investigation_log(fingerprint_id):
+    """Get investigation log (agent output)"""
+    try:
+        from services.medic.claude_report_manager import ClaudeReportManager
+
+        report_manager = ClaudeReportManager()
+
+        log_file = report_manager.get_report_dir(fingerprint_id) / "investigation_log.txt"
+        if not log_file.exists():
+            return jsonify({'error': 'Investigation log not found'}), 404
+
+        # Read log file
+        with open(log_file, 'r') as f:
+            content = f.read()
+
+        # Get line count
+        line_count = report_manager.count_log_lines(fingerprint_id)
+
+        return jsonify({
+            'fingerprint_id': fingerprint_id,
+            'content': content,
+            'line_count': line_count
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Failed to get Claude investigation log: {e}", exc_info=True)
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/medic/claude/clusters/<cluster_id>/failures', methods=['GET'])
+def get_cluster_failure_details(cluster_id):
+    """Get detailed failure events for a specific cluster"""
+    try:
+        # Parse cluster_id to extract session_id and timestamp
+        # Format: cluster_{project}_{session_id}_{timestamp}
+        # Session ID is a UUID format (8-4-4-4-12 hex digits separated by dashes)
+        # Timestamp is ISO format with 'T'
+
+        # Find the session ID pattern (UUID: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx)
+        import re
+        uuid_pattern = r'([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})'
+        match = re.search(uuid_pattern, cluster_id)
+
+        if not match:
+            return jsonify({"error": "Could not extract session_id from cluster_id"}), 400
+
+        session_id = match.group(1)
+
+        # Query Elasticsearch for tool_result events with failures in this session
+        result = es_client.search(
+            index="claude-streams-*",
+            body={
+                "query": {
+                    "bool": {
+                        "must": [
+                            {"term": {"raw_event.event.session_id.keyword": session_id}},
+                            {"term": {"event_category": "tool_result"}},
+                            {"term": {"success": False}}
+                        ]
+                    }
+                },
+                "sort": [{"timestamp": {"order": "asc"}}],
+                "size": 100
+            }
+        )
+
+        failures = []
+        for hit in result['hits']['hits']:
+            source = hit['_source']
+            failures.append({
+                "timestamp": source.get("timestamp"),
+                "tool_name": source.get("tool_name"),
+                "tool_params": source.get("tool_params", {}),
+                "success": source.get("success"),
+                "error_message": source.get("error_message", ""),
+                "raw_event": source.get("raw_event", {})
+            })
+
+        return jsonify({
+            "cluster_id": cluster_id,
+            "session_id": session_id,
+            "failures": failures,
+            "count": len(failures)
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Failed to get cluster failure details: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+
 def start_observability_server(host='0.0.0.0', port=5001):
     """Start the observability WebSocket server"""
     # Start Redis subscriber in background thread

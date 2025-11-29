@@ -1,0 +1,334 @@
+{
+  "fingerprint_id": "sha256:e59d7185876ea7c5545723fff16b46ba1bfb4eea283433c7e7f8a6b474ee671e",
+  "signature": {
+    "severity": "WARNING",
+    "first_seen": "2025-11-29T13:16:31.401791Z",
+    "occurrence_count": 20,
+    "last_seen": "2025-11-29T13:26:05.216265Z",
+    "signature": {
+      "error_type": "Unknown",
+      "error_pattern": "No result from GraphQL query for discussion D_kwDON0IZfM4AjD4P",
+      "container_pattern": "orchestrator",
+      "stack_signature": [],
+      "normalized_message": "No result from GraphQL query for discussion D_kwDON0IZfM4AjD4P"
+    },
+    "created_at": "2025-11-29T13:16:31.401791Z",
+    "impact_score": 0.0,
+    "tags": [
+      "Unknown",
+      "orchestrator"
+    ],
+    "updated_at": "2025-11-29T13:26:05.216265Z",
+    "fingerprint_id": "sha256:e59d7185876ea7c5545723fff16b46ba1bfb4eea283433c7e7f8a6b474ee671e",
+    "investigation_status": "not_started",
+    "occurrences_last_hour": 20,
+    "occurrences_last_day": 20,
+    "sample_log_entries": [
+      {
+        "container_name": "clauditoreum-orchestrator-1",
+        "raw_message": "No result from GraphQL query for discussion D_kwDON0IZfM4AjD4P",
+        "context": {
+          "level": "WARNING",
+          "logger": "services.human_feedback_loop"
+        },
+        "container_id": "d1897c5c73b35bec16be33306d47ee857421a5ae8d2846f8838c33de5890c992",
+        "timestamp": "2025-11-29T13:16:31.399Z"
+      },
+      {
+        "container_name": "clauditoreum-orchestrator-1",
+        "raw_message": "No result from GraphQL query for discussion D_kwDON0IZfM4AjD4P",
+        "context": {
+          "level": "WARNING",
+          "logger": "services.human_feedback_loop"
+        },
+        "container_id": "d1897c5c73b35bec16be33306d47ee857421a5ae8d2846f8838c33de5890c992",
+        "timestamp": "2025-11-29T13:17:01.623Z"
+      },
+      {
+        "container_name": "clauditoreum-orchestrator-1",
+        "raw_message": "No result from GraphQL query for discussion D_kwDON0IZfM4AjD4P",
+        "context": {
+          "level": "WARNING",
+          "logger": "services.human_feedback_loop"
+        },
+        "container_id": "d1897c5c73b35bec16be33306d47ee857421a5ae8d2846f8838c33de5890c992",
+        "timestamp": "2025-11-29T13:17:31.803Z"
+      },
+      {
+        "container_name": "clauditoreum-orchestrator-1",
+        "raw_message": "No result from GraphQL query for discussion D_kwDON0IZfM4AjD4P",
+        "context": {
+          "level": "WARNING",
+          "logger": "services.human_feedback_loop"
+        },
+        "container_id": "d1897c5c73b35bec16be33306d47ee857421a5ae8d2846f8838c33de5890c992",
+        "timestamp": "2025-11-29T13:18:01.977Z"
+      },
+      {
+        "container_name": "clauditoreum-orchestrator-1",
+        "raw_message": "No result from GraphQL query for discussion D_kwDON0IZfM4AjD4P",
+        "context": {
+          "level": "WARNING",
+          "logger": "services.human_feedback_loop"
+        },
+        "container_id": "d1897c5c73b35bec16be33306d47ee857421a5ae8d2846f8838c33de5890c992",
+        "timestamp": "2025-11-29T13:18:32.147Z"
+      },
+      {
+        "container_name": "clauditoreum-orchestrator-1",
+        "raw_message": "No result from GraphQL query for discussion D_kwDON0IZfM4AjD4P",
+        "context": {
+          "level": "WARNING",
+          "logger": "services.human_feedback_loop"
+        },
+        "container_id": "d1897c5c73b35bec16be33306d47ee857421a5ae8d2846f8838c33de5890c992",
+        "timestamp": "2025-11-29T13:19:02.504Z"
+      },
+      {
+        "container_name": "clauditoreum-orchestrator-1",
+        "raw_message": "No result from GraphQL query for discussion D_kwDON0IZfM4AjD4P",
+        "context": {
+          "level": "WARNING",
+          "logger": "services.human_feedback_loop"
+        },
+        "container_id": "d1897c5c73b35bec16be33306d47ee857421a5ae8d2846f8838c33de5890c992",
+        "timestamp": "2025-11-29T13:19:32.750Z"
+      },
+      {
+        "container_name": "clauditoreum-orchestrator-1",
+        "raw_message": "No result from GraphQL query for discussion D_kwDON0IZfM4AjD4P",
+        "context": {
+          "level": "WARNING",
+          "logger": "services.human_feedback_loop"
+        },
+        "container_id": "d1897c5c73b35bec16be33306d47ee857421a5ae8d2846f8838c33de5890c992",
+        "timestamp": "2025-11-29T13:20:02.919Z"
+      },
+      {
+        "container_name": "clauditoreum-orchestrator-1",
+        "raw_message": "No result from GraphQL query for discussion D_kwDON0IZfM4AjD4P",
+        "context": {
+          "level": "WARNING",
+          "logger": "services.human_feedback_loop"
+        },
+        "container_id": "d1897c5c73b35bec16be33306d47ee857421a5ae8d2846f8838c33de5890c992",
+        "timestamp": "2025-11-29T13:20:33.103Z"
+      },
+      {
+        "container_name": "clauditoreum-orchestrator-1",
+        "raw_message": "No result from GraphQL query for discussion D_kwDON0IZfM4AjD4P",
+        "context": {
+          "level": "WARNING",
+          "logger": "services.human_feedback_loop"
+        },
+        "container_id": "d1897c5c73b35bec16be33306d47ee857421a5ae8d2846f8838c33de5890c992",
+        "timestamp": "2025-11-29T13:21:03.272Z"
+      },
+      {
+        "container_name": "clauditoreum-orchestrator-1",
+        "raw_message": "No result from GraphQL query for discussion D_kwDON0IZfM4AjD4P",
+        "context": {
+          "level": "WARNING",
+          "logger": "services.human_feedback_loop"
+        },
+        "container_id": "d1897c5c73b35bec16be33306d47ee857421a5ae8d2846f8838c33de5890c992",
+        "timestamp": "2025-11-29T13:21:33.483Z"
+      },
+      {
+        "container_name": "clauditoreum-orchestrator-1",
+        "raw_message": "No result from GraphQL query for discussion D_kwDON0IZfM4AjD4P",
+        "context": {
+          "level": "WARNING",
+          "logger": "services.human_feedback_loop"
+        },
+        "container_id": "d1897c5c73b35bec16be33306d47ee857421a5ae8d2846f8838c33de5890c992",
+        "timestamp": "2025-11-29T13:22:03.672Z"
+      },
+      {
+        "container_name": "clauditoreum-orchestrator-1",
+        "raw_message": "No result from GraphQL query for discussion D_kwDON0IZfM4AjD4P",
+        "context": {
+          "level": "WARNING",
+          "logger": "services.human_feedback_loop"
+        },
+        "container_id": "d1897c5c73b35bec16be33306d47ee857421a5ae8d2846f8838c33de5890c992",
+        "timestamp": "2025-11-29T13:22:33.854Z"
+      },
+      {
+        "container_name": "clauditoreum-orchestrator-1",
+        "raw_message": "No result from GraphQL query for discussion D_kwDON0IZfM4AjD4P",
+        "context": {
+          "level": "WARNING",
+          "logger": "services.human_feedback_loop"
+        },
+        "container_id": "d1897c5c73b35bec16be33306d47ee857421a5ae8d2846f8838c33de5890c992",
+        "timestamp": "2025-11-29T13:23:04.038Z"
+      },
+      {
+        "container_name": "clauditoreum-orchestrator-1",
+        "raw_message": "No result from GraphQL query for discussion D_kwDON0IZfM4AjD4P",
+        "context": {
+          "level": "WARNING",
+          "logger": "services.human_feedback_loop"
+        },
+        "container_id": "d1897c5c73b35bec16be33306d47ee857421a5ae8d2846f8838c33de5890c992",
+        "timestamp": "2025-11-29T13:23:34.222Z"
+      },
+      {
+        "container_name": "clauditoreum-orchestrator-1",
+        "raw_message": "No result from GraphQL query for discussion D_kwDON0IZfM4AjD4P",
+        "context": {
+          "level": "WARNING",
+          "logger": "services.human_feedback_loop"
+        },
+        "container_id": "d1897c5c73b35bec16be33306d47ee857421a5ae8d2846f8838c33de5890c992",
+        "timestamp": "2025-11-29T13:24:04.426Z"
+      },
+      {
+        "container_name": "clauditoreum-orchestrator-1",
+        "raw_message": "No result from GraphQL query for discussion D_kwDON0IZfM4AjD4P",
+        "context": {
+          "level": "WARNING",
+          "logger": "services.human_feedback_loop"
+        },
+        "container_id": "d1897c5c73b35bec16be33306d47ee857421a5ae8d2846f8838c33de5890c992",
+        "timestamp": "2025-11-29T13:24:34.605Z"
+      },
+      {
+        "container_name": "clauditoreum-orchestrator-1",
+        "raw_message": "No result from GraphQL query for discussion D_kwDON0IZfM4AjD4P",
+        "context": {
+          "level": "WARNING",
+          "logger": "services.human_feedback_loop"
+        },
+        "container_id": "d1897c5c73b35bec16be33306d47ee857421a5ae8d2846f8838c33de5890c992",
+        "timestamp": "2025-11-29T13:25:04.794Z"
+      },
+      {
+        "container_name": "clauditoreum-orchestrator-1",
+        "raw_message": "No result from GraphQL query for discussion D_kwDON0IZfM4AjD4P",
+        "context": {
+          "level": "WARNING",
+          "logger": "services.human_feedback_loop"
+        },
+        "container_id": "d1897c5c73b35bec16be33306d47ee857421a5ae8d2846f8838c33de5890c992",
+        "timestamp": "2025-11-29T13:25:34.983Z"
+      },
+      {
+        "container_name": "clauditoreum-orchestrator-1",
+        "raw_message": "No result from GraphQL query for discussion D_kwDON0IZfM4AjD4P",
+        "context": {
+          "level": "WARNING",
+          "logger": "services.human_feedback_loop"
+        },
+        "container_id": "d1897c5c73b35bec16be33306d47ee857421a5ae8d2846f8838c33de5890c992",
+        "timestamp": "2025-11-29T13:26:05.207Z"
+      }
+    ],
+    "related_signatures": [],
+    "status": "recurring"
+  },
+  "sample_logs": [
+    {
+      "container_name": "clauditoreum-orchestrator-1",
+      "raw_message": "No result from GraphQL query for discussion D_kwDON0IZfM4AjD4P",
+      "context": {
+        "level": "WARNING",
+        "logger": "services.human_feedback_loop"
+      },
+      "container_id": "d1897c5c73b35bec16be33306d47ee857421a5ae8d2846f8838c33de5890c992",
+      "timestamp": "2025-11-29T13:16:31.399Z"
+    },
+    {
+      "container_name": "clauditoreum-orchestrator-1",
+      "raw_message": "No result from GraphQL query for discussion D_kwDON0IZfM4AjD4P",
+      "context": {
+        "level": "WARNING",
+        "logger": "services.human_feedback_loop"
+      },
+      "container_id": "d1897c5c73b35bec16be33306d47ee857421a5ae8d2846f8838c33de5890c992",
+      "timestamp": "2025-11-29T13:17:01.623Z"
+    },
+    {
+      "container_name": "clauditoreum-orchestrator-1",
+      "raw_message": "No result from GraphQL query for discussion D_kwDON0IZfM4AjD4P",
+      "context": {
+        "level": "WARNING",
+        "logger": "services.human_feedback_loop"
+      },
+      "container_id": "d1897c5c73b35bec16be33306d47ee857421a5ae8d2846f8838c33de5890c992",
+      "timestamp": "2025-11-29T13:17:31.803Z"
+    },
+    {
+      "container_name": "clauditoreum-orchestrator-1",
+      "raw_message": "No result from GraphQL query for discussion D_kwDON0IZfM4AjD4P",
+      "context": {
+        "level": "WARNING",
+        "logger": "services.human_feedback_loop"
+      },
+      "container_id": "d1897c5c73b35bec16be33306d47ee857421a5ae8d2846f8838c33de5890c992",
+      "timestamp": "2025-11-29T13:18:01.977Z"
+    },
+    {
+      "container_name": "clauditoreum-orchestrator-1",
+      "raw_message": "No result from GraphQL query for discussion D_kwDON0IZfM4AjD4P",
+      "context": {
+        "level": "WARNING",
+        "logger": "services.human_feedback_loop"
+      },
+      "container_id": "d1897c5c73b35bec16be33306d47ee857421a5ae8d2846f8838c33de5890c992",
+      "timestamp": "2025-11-29T13:18:32.147Z"
+    },
+    {
+      "container_name": "clauditoreum-orchestrator-1",
+      "raw_message": "No result from GraphQL query for discussion D_kwDON0IZfM4AjD4P",
+      "context": {
+        "level": "WARNING",
+        "logger": "services.human_feedback_loop"
+      },
+      "container_id": "d1897c5c73b35bec16be33306d47ee857421a5ae8d2846f8838c33de5890c992",
+      "timestamp": "2025-11-29T13:19:02.504Z"
+    },
+    {
+      "container_name": "clauditoreum-orchestrator-1",
+      "raw_message": "No result from GraphQL query for discussion D_kwDON0IZfM4AjD4P",
+      "context": {
+        "level": "WARNING",
+        "logger": "services.human_feedback_loop"
+      },
+      "container_id": "d1897c5c73b35bec16be33306d47ee857421a5ae8d2846f8838c33de5890c992",
+      "timestamp": "2025-11-29T13:19:32.750Z"
+    },
+    {
+      "container_name": "clauditoreum-orchestrator-1",
+      "raw_message": "No result from GraphQL query for discussion D_kwDON0IZfM4AjD4P",
+      "context": {
+        "level": "WARNING",
+        "logger": "services.human_feedback_loop"
+      },
+      "container_id": "d1897c5c73b35bec16be33306d47ee857421a5ae8d2846f8838c33de5890c992",
+      "timestamp": "2025-11-29T13:20:02.919Z"
+    },
+    {
+      "container_name": "clauditoreum-orchestrator-1",
+      "raw_message": "No result from GraphQL query for discussion D_kwDON0IZfM4AjD4P",
+      "context": {
+        "level": "WARNING",
+        "logger": "services.human_feedback_loop"
+      },
+      "container_id": "d1897c5c73b35bec16be33306d47ee857421a5ae8d2846f8838c33de5890c992",
+      "timestamp": "2025-11-29T13:20:33.103Z"
+    },
+    {
+      "container_name": "clauditoreum-orchestrator-1",
+      "raw_message": "No result from GraphQL query for discussion D_kwDON0IZfM4AjD4P",
+      "context": {
+        "level": "WARNING",
+        "logger": "services.human_feedback_loop"
+      },
+      "container_id": "d1897c5c73b35bec16be33306d47ee857421a5ae8d2846f8838c33de5890c992",
+      "timestamp": "2025-11-29T13:21:03.272Z"
+    }
+  ],
+  "created_at": "2025-11-29T13:26:09.522652+00:00"
+}
