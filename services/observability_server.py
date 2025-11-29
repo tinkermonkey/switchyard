@@ -2814,15 +2814,30 @@ def redis_subscriber_thread():
                             'feedback_detected',
                             'task_queued'
                         ]
-                        
+
+                        medic_event_types = [
+                            'medic_signature_created',
+                            'medic_signature_updated',
+                            'medic_signature_trending',
+                            'medic_signature_resolved',
+                            'medic_investigation_queued',
+                            'medic_investigation_started',
+                            'medic_investigation_completed',
+                            'medic_investigation_failed'
+                        ]
+
                         if event_type in decision_event_types:
                             # Decision event - route to decision_event handler
                             socketio.emit('decision_event', event_data)
                             logger.debug(f"Broadcasted decision event: {event_type}")
+                        elif event_type in medic_event_types:
+                            # Medic event - broadcast to specific medic channel
+                            socketio.emit(event_type, event_data)
+                            logger.info(f"Broadcasted medic event: {event_type} (fingerprint_id={event_data.get('data', {}).get('fingerprint_id', 'N/A')})")
                         else:
                             # Regular agent events (including lifecycle events)
                             socketio.emit('agent_event', event_data)
-                            
+
                             # Log agent lifecycle events at INFO level for visibility
                             if event_type in ['agent_initialized', 'agent_started', 'agent_completed', 'agent_failed']:
                                 logger.info(f"Broadcasted agent lifecycle event: {event_type} (agent={event_data.get('agent')}, task_id={event_data.get('task_id')})")

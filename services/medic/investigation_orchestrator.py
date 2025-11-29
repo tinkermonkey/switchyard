@@ -222,6 +222,8 @@ class InvestigationOrchestrator:
                 InvestigationQueue.RESULT_FAILED,
                 str(e),
             )
+            # Mark signature as failed to allow re-queueing
+            await self.failure_store.update_investigation_status(fingerprint_id, "failed")
 
     async def _heartbeat_monitor(self):
         """Monitor active investigations for progress and completion"""

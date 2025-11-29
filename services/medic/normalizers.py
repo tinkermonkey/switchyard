@@ -27,17 +27,16 @@ class TimestampNormalizer(BaseNormalizer):
     - "2025-11-28 12:45:23" -> "{timestamp}"
     - "2025-11-28T12:45:23.123456Z" -> "{timestamp}"
     - "1732800000" (unix timestamp) -> "{timestamp}"
+
+    NOTE: This should NOT normalize timestamps in structured log prefixes that have already
+    been parsed. It's for normalizing timestamps that appear in error messages themselves.
     """
 
     PATTERNS = [
-        # ISO 8601 timestamps
-        re.compile(r'\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?'),
-        # Unix timestamps (10-13 digits)
+        # ISO 8601 timestamps with timezone
+        re.compile(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})'),
+        # Unix timestamps (10-13 digits) - must be word boundary
         re.compile(r'\b\d{10,13}\b'),
-        # Date only
-        re.compile(r'\d{4}-\d{2}-\d{2}'),
-        # Time only
-        re.compile(r'\d{2}:\d{2}:\d{2}(?:\.\d+)?'),
     ]
 
     def normalize(self, message: str) -> str:

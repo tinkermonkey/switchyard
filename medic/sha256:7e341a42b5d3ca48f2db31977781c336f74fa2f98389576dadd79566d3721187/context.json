@@ -1,0 +1,54 @@
+{
+  "fingerprint_id": "sha256:7e341a42b5d3ca48f2db31977781c336f74fa2f98389576dadd79566d3721187",
+  "signature": {
+    "severity": "ERROR",
+    "first_seen": "2025-11-28T19:11:42.568180Z",
+    "occurrence_count": 1,
+    "last_seen": "2025-11-28T19:11:42.568180Z",
+    "signature": {
+      "error_type": "ServiceError",
+      "error_pattern": "ServiceError: STOPPING PROJECT MONITOR: Core functionality is broken",
+      "container_pattern": "orchestrator",
+      "stack_signature": [],
+      "normalized_message": "STOPPING PROJECT MONITOR: Core functionality is broken"
+    },
+    "created_at": "2025-11-28T19:11:42.568180Z",
+    "impact_score": 0.0,
+    "tags": [
+      "ServiceError",
+      "orchestrator"
+    ],
+    "updated_at": "2025-11-28T22:31:03.667808Z",
+    "fingerprint_id": "sha256:7e341a42b5d3ca48f2db31977781c336f74fa2f98389576dadd79566d3721187",
+    "investigation_status": "failed",
+    "occurrences_last_hour": 1,
+    "occurrences_last_day": 1,
+    "sample_log_entries": [
+      {
+        "container_name": "clauditoreum-orchestrator-1",
+        "raw_message": "2025-11-28 19:11:42,159 - services.project_monitor - ERROR - STOPPING PROJECT MONITOR: Core functionality is broken",
+        "context": {
+          "level": "ERROR",
+          "logger": ""
+        },
+        "container_id": "d1897c5c73b35bec16be33306d47ee857421a5ae8d2846f8838c33de5890c992",
+        "timestamp": "2025-11-28T19:11:42.566889Z"
+      }
+    ],
+    "related_signatures": [],
+    "status": "new"
+  },
+  "sample_logs": [
+    {
+      "container_name": "clauditoreum-orchestrator-1",
+      "raw_message": "2025-11-28 19:11:42,159 - services.project_monitor - ERROR - STOPPING PROJECT MONITOR: Core functionality is broken",
+      "context": {
+        "level": "ERROR",
+        "logger": ""
+      },
+      "container_id": "d1897c5c73b35bec16be33306d47ee857421a5ae8d2846f8838c33de5890c992",
+      "timestamp": "2025-11-28T19:11:42.566889Z"
+    }
+  ],
+  "created_at": "2025-11-28T22:37:22.178982+00:00"
+}

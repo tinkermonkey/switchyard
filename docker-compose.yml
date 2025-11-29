@@ -87,6 +87,7 @@ services:
       - ./:/app
       - ..:/workspace:ro  # Mount workspace read-only for git branch monitoring
       - /var/run/docker.sock:/var/run/docker.sock
+      - ./medic:/medic:ro  # Mount medic reports directory read-only
     environment:
       - REDIS_URL=redis://redis:6379
       - GITHUB_TOKEN=${GITHUB_TOKEN}
@@ -203,7 +204,10 @@ services:
       - ./:/app
       - ..:/workspace  # Access to orchestrator workspace for projects
       - /var/run/docker.sock:/var/run/docker.sock  # Docker CLI access for logs
-      - medic-reports:/medic  # Persistent volume for investigation reports
+      - ./medic:/medic  # Investigation reports directory (inside clauditoreum/)
+
+      # Mount Claude Code config directory for authentication (Linux: ~/.config/claude)
+      - ~/.config/claude:/home/orchestrator/.config/claude:ro
     environment:
       - REDIS_HOST=redis
       - REDIS_PORT=6379
@@ -211,6 +215,8 @@ services:
       - WORKSPACE_ROOT=/workspace/clauditoreum
       - MEDIC_DIR=/medic
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
     depends_on:
       redis:
         condition: service_started

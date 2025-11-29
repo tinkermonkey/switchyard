@@ -48,23 +48,23 @@ medic:
     # Automatically resolve signatures after N days without occurrence
     auto_resolve_days: 7
 
-# Phase 2 configuration (for future use)
-# auto_trigger:
-#   enabled: false  # Disabled in Phase 1
-#   check_interval_seconds: 300  # Check every 5 minutes
-#   thresholds:
-#     CRITICAL:
-#       total_occurrences: 3
-#       occurrences_per_hour: null  # Any CRITICAL triggers immediately
-#     ERROR:
-#       total_occurrences: 10
-#       occurrences_per_hour: 5
-#     WARNING:
-#       total_occurrences: 50
-#       occurrences_per_hour: 20
+# Phase 2 configuration
+auto_trigger:
+  enabled: true
+  check_interval_seconds: 300  # Check every 5 minutes
+  thresholds:
+    CRITICAL:
+      total_occurrences: 3
+      occurrences_per_hour: null  # Any CRITICAL triggers immediately
+    ERROR:
+      total_occurrences: 10
+      occurrences_per_hour: 5
+    WARNING:
+      total_occurrences: 50
+      occurrences_per_hour: 20
 
-# investigation:
-#   enabled: false  # Phase 2 feature
-#   max_concurrent: 3
-#   timeout_seconds: 14400  # 4 hours
-#   max_retries: 3
+investigation:
+  enabled: true
+  max_concurrent: 3
+  timeout_seconds: 14400  # 4 hours
+  max_retries: 3

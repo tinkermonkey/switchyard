@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { AlertCircle, Clock, Code, Play, FileText } from 'lucide-react'
 import InvestigationReport from './InvestigationReport'
+import { useSocket } from '../contexts'
 
 export default function FailureSignatureDetail({ fingerprintId }) {
   const [signature, setSignature] = useState(null)
@@ -9,11 +10,30 @@ export default function FailureSignatureDetail({ fingerprintId }) {
   const [error, setError] = useState(null)
   const [showDiagnosis, setShowDiagnosis] = useState(false)
   const [showFixPlan, setShowFixPlan] = useState(false)
+  const { medicEvents } = useSocket()
 
   useEffect(() => {
     fetchSignatureDetails()
     fetchOccurrences()
   }, [fingerprintId])
+
+  // Refresh when medic events occur for this signature
+  useEffect(() => {
+    if (medicEvents.length > 0) {
+      const latestEvent = medicEvents[0]
+      // Check if event is related to this signature
+      // Event can have fingerprint_id in data.fingerprint_id or task_id
+      const eventFingerprintId = latestEvent.data?.fingerprint_id || latestEvent.task_id
+      if (eventFingerprintId === fingerprintId) {
+        console.log('[FailureSignatureDetail] Refreshing due to event:', latestEvent.event_type)
+        fetchSignatureDetails()
+        // Also refresh occurrences if it's a new occurrence
+        if (latestEvent.event_type === 'signature_updated') {
+          fetchOccurrences()
+        }
+      }
+    }
+  }, [medicEvents, fingerprintId])
 
   const fetchSignatureDetails = async () => {
     try {
@@ -121,13 +141,13 @@ export default function FailureSignatureDetail({ fingerprintId }) {
             </p>
           </div>
           <div className="flex gap-2">
-            {signature.investigation_status === 'not_started' && (
+            {(signature.investigation_status === 'not_started' || signature.investigation_status === 'failed') && (
               <button
                 onClick={triggerInvestigation}
                 className="px-4 py-2 bg-gh-accent-emphasis text-white rounded hover:bg-gh-accent-primary transition-colors flex items-center gap-2"
               >
                 <Play className="w-4 h-4" />
-                Start Investigation
+                {signature.investigation_status === 'failed' ? 'Retry Investigation' : 'Start Investigation'}
               </button>
             )}
             <select

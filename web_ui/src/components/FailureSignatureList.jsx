@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { Link } from '@tanstack/react-router'
 import { AlertCircle, TrendingUp, Clock, Play } from 'lucide-react'
+import { useSocket } from '../contexts'
 
 export default function FailureSignatureList() {
   const [signatures, setSignatures] = useState([])
@@ -13,10 +14,18 @@ export default function FailureSignatureList() {
   })
   const [sortBy, setSortBy] = useState('last_seen')
   const [sortOrder, setSortOrder] = useState('desc')
+  const { medicEvents } = useSocket()
 
   useEffect(() => {
     fetchSignatures()
   }, [filters, sortBy, sortOrder])
+
+  // Refresh list when medic events occur
+  useEffect(() => {
+    if (medicEvents.length > 0) {
+      fetchSignatures()
+    }
+  }, [medicEvents])
 
   const fetchSignatures = async () => {
     try {
@@ -223,7 +232,7 @@ function FailureSignatureCard({ signature, onTriggerInvestigation }) {
 
   return (
     <Link
-      to={`/medic/${signature.fingerprint_id}`}
+      to={`/medic-detail/${signature.fingerprint_id}`}
       className="block bg-gh-canvas-subtle border border-gh-border rounded-lg p-4 hover:bg-gh-border-muted transition-colors"
     >
       <div className="flex items-start justify-between">
@@ -267,7 +276,7 @@ function FailureSignatureCard({ signature, onTriggerInvestigation }) {
           </div>
         </div>
 
-        {signature.investigation_status === 'not_started' && (
+        {(signature.investigation_status === 'not_started' || signature.investigation_status === 'failed') && (
           <button
             onClick={(e) => {
               e.preventDefault()
@@ -276,10 +285,10 @@ function FailureSignatureCard({ signature, onTriggerInvestigation }) {
             className="ml-4 px-3 py-1.5 bg-gh-accent-emphasis text-white rounded text-xs hover:bg-gh-accent-primary transition-colors flex items-center gap-1"
           >
             <Play className="w-3 h-3" />
-            Investigate
+            {signature.investigation_status === 'failed' ? 'Retry' : 'Investigate'}
           </button>
         )}
-        {signature.investigation_status !== 'not_started' && (
+        {signature.investigation_status !== 'not_started' && signature.investigation_status !== 'failed' && (
           <span className="ml-4 px-3 py-1.5 bg-blue-500/10 text-blue-500 rounded text-xs">
             {signature.investigation_status}
           </span>

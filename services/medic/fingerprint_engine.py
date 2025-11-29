@@ -127,6 +127,24 @@ class FingerprintEngine:
             if exception_match:
                 return exception_match.group(1)
 
+        # Check for common error keywords as a fallback
+        error_keywords = [
+            (r'\bFATAL\b', 'FatalError'),
+            (r'\bSTOPPING\b', 'ServiceError'),
+            (r'\bfailed to\b', 'OperationFailure'),
+            (r'\bcannot\b', 'OperationFailure'),
+            (r'\binvalid\b', 'ValidationError'),
+            (r'\bconnection (?:refused|failed|timeout)', 'ConnectionError'),
+            (r'\btimeout\b', 'TimeoutError'),
+            (r'\bpermission denied\b', 'PermissionError'),
+            (r'\bnot found\b', 'NotFoundError'),
+            (r'\bmissing\b', 'MissingDataError'),
+        ]
+
+        for pattern, error_type in error_keywords:
+            if re.search(pattern, message, re.IGNORECASE):
+                return error_type
+
         return None
 
     def _extract_error_message(self, log_entry: dict) -> str:

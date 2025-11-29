@@ -129,34 +129,42 @@ export function SocketProvider({ children }) {
 
     // Medic event listeners
     socketInstance.on('medic_signature_created', (event) => {
+      console.log('[SocketContext] Received medic_signature_created:', event)
       setMedicEvents(prev => [{ ...event, event_type: 'signature_created' }, ...prev].slice(0, 100))
     })
 
     socketInstance.on('medic_signature_updated', (event) => {
+      console.log('[SocketContext] Received medic_signature_updated:', event)
       setMedicEvents(prev => [{ ...event, event_type: 'signature_updated' }, ...prev].slice(0, 100))
     })
 
     socketInstance.on('medic_signature_trending', (event) => {
+      console.log('[SocketContext] Received medic_signature_trending:', event)
       setMedicEvents(prev => [{ ...event, event_type: 'signature_trending' }, ...prev].slice(0, 100))
     })
 
     socketInstance.on('medic_signature_resolved', (event) => {
+      console.log('[SocketContext] Received medic_signature_resolved:', event)
       setMedicEvents(prev => [{ ...event, event_type: 'signature_resolved' }, ...prev].slice(0, 100))
     })
 
     socketInstance.on('medic_investigation_queued', (event) => {
+      console.log('[SocketContext] Received medic_investigation_queued:', event)
       setMedicEvents(prev => [{ ...event, event_type: 'investigation_queued' }, ...prev].slice(0, 100))
     })
 
     socketInstance.on('medic_investigation_started', (event) => {
+      console.log('[SocketContext] Received medic_investigation_started:', event)
       setMedicEvents(prev => [{ ...event, event_type: 'investigation_started' }, ...prev].slice(0, 100))
     })
 
     socketInstance.on('medic_investigation_completed', (event) => {
+      console.log('[SocketContext] Received medic_investigation_completed:', event)
       setMedicEvents(prev => [{ ...event, event_type: 'investigation_completed' }, ...prev].slice(0, 100))
     })
 
     socketInstance.on('medic_investigation_failed', (event) => {
+      console.log('[SocketContext] Received medic_investigation_failed:', event)
       setMedicEvents(prev => [{ ...event, event_type: 'investigation_failed' }, ...prev].slice(0, 100))
     })
 

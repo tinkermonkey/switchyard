@@ -1,16 +1,25 @@
 import { useEffect, useState } from 'react'
 import { AlertCircle, TrendingUp, CheckCircle, XCircle } from 'lucide-react'
+import { useSocket } from '../contexts'
 
 export default function MedicDashboard() {
   const [stats, setStats] = useState(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
+  const { medicEvents } = useSocket()
 
   useEffect(() => {
     fetchStats()
     const interval = setInterval(fetchStats, 30000) // Refresh every 30 seconds
     return () => clearInterval(interval)
   }, [])
+
+  // Refresh stats when medic events occur
+  useEffect(() => {
+    if (medicEvents.length > 0) {
+      fetchStats()
+    }
+  }, [medicEvents])
 
   const fetchStats = async () => {
     try {

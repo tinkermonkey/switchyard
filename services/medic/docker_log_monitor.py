@@ -193,19 +193,27 @@ class DockerLogMonitor:
 
         # Try standard Python logging format
         # Format: "2025-11-28 12:45:23 - name - LEVEL - message"
+        # Also handle format with milliseconds: "2025-11-28 12:45:23,123 - name - LEVEL - message"
         match = re.match(
-            r"(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\s+-\s+(\S+)\s+-\s+(ERROR|WARNING|CRITICAL|FATAL|INFO|DEBUG)\s+-\s+(.+)",
+            r"(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}(?:,\d+)?)\s+-\s+(\S+)\s+-\s+(ERROR|WARNING|CRITICAL|FATAL|INFO|DEBUG)\s+-\s+(.+)",
             line,
         )
         if match:
             timestamp, name, level, message = match.groups()
+            # Convert timestamp to ISO format
+            # Handle both "2025-11-28 12:45:23" and "2025-11-28 12:45:23,123"
+            timestamp_clean = timestamp.replace(',', '.').replace(' ', 'T')
+            if '.' not in timestamp_clean:
+                timestamp_clean += '.000000'
+            timestamp_iso = timestamp_clean + 'Z'
+
             return {
-                "timestamp": timestamp,
+                "timestamp": timestamp_iso,
                 "level": level,
                 "message": message,
                 "name": name,
                 "traceback": None,
-                "context": {},
+                "context": {"logger": name},
             }
 
         # Try to extract log level from plain text
