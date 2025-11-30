@@ -1,7 +1,7 @@
 """
-Claude Investigation Queue Manager with Redis-based Locking
+Claude Fix Execution Queue Manager with Redis-based Locking
 
-Manages the queue of Claude failure investigations and process lifecycle tracking.
+Manages the queue of Claude fix executions and process lifecycle tracking.
 """
 
 import logging
@@ -13,61 +13,57 @@ import json
 logger = logging.getLogger(__name__)
 
 
-class ClaudeInvestigationQueue:
+class ClaudeFixExecutionQueue:
     """
-    Redis-based Claude investigation queue with distributed locking.
+    Redis-based Claude fix execution queue with distributed locking.
 
     Redis Keys:
-        medic:claude_investigation:{fingerprint_id}:pid              # Process ID
-        medic:claude_investigation:{fingerprint_id}:status           # Status
-        medic:claude_investigation:{fingerprint_id}:lock             # Lock with TTL
-        medic:claude_investigation:{fingerprint_id}:started_at       # ISO timestamp
-        medic:claude_investigation:{fingerprint_id}:last_heartbeat   # ISO timestamp
-        medic:claude_investigation:{fingerprint_id}:agent_output_lines  # Progress counter
-        medic:claude_investigation:{fingerprint_id}:result           # Outcome
-        medic:claude_investigation:{fingerprint_id}:completed_at     # ISO timestamp
-        medic:claude_investigation:queue                             # List (queue)
-        medic:claude_investigation:active                            # Set of active fingerprint IDs
+        medic:claude_fix:{fingerprint_id}:pid              # Process ID
+        medic:claude_fix:{fingerprint_id}:status           # Status
+        medic:claude_fix:{fingerprint_id}:lock             # Lock with TTL
+        medic:claude_fix:{fingerprint_id}:started_at       # ISO timestamp
+        medic:claude_fix:{fingerprint_id}:last_heartbeat   # ISO timestamp
+        medic:claude_fix:{fingerprint_id}:agent_output_lines  # Progress counter
+        medic:claude_fix:{fingerprint_id}:result           # Outcome
+        medic:claude_fix:{fingerprint_id}:completed_at     # ISO timestamp
+        medic:claude_fix:queue                             # List (queue)
+        medic:claude_fix:active                            # Set of active fingerprint IDs
     """
 
     # Status states
     STATUS_QUEUED = "queued"
     STATUS_STARTING = "starting"
     STATUS_IN_PROGRESS = "in_progress"
-    STATUS_STALLED = "stalled"
     STATUS_COMPLETED = "completed"
     STATUS_FAILED = "failed"
-    STATUS_IGNORED = "ignored"
-    STATUS_TIMEOUT = "timeout"
 
-    # Investigation results
-    RESULT_SUCCESS = "success"          # Successfully diagnosed and created fix plan
-    RESULT_IGNORED = "ignored"          # Marked as not actionable
-    RESULT_FAILED = "failed"            # Investigation failed/error
-    RESULT_TIMEOUT = "timeout"          # Exceeded 4 hour timeout
+    # Results
+    RESULT_SUCCESS = "success"
+    RESULT_FAILED = "failed"
+    RESULT_PARTIAL = "partial"  # e.g. code applied but restart skipped
 
     # Timeouts
-    LOCK_TTL = 4 * 3600  # 4 hours
+    LOCK_TTL = 2 * 3600  # 2 hours
     STALL_THRESHOLD = 10 * 60  # 10 minutes
-    HEARTBEAT_INTERVAL = 30  # 30 seconds
-    MAX_CONCURRENT = 3  # Maximum concurrent investigations
+    MAX_CONCURRENT = 2  # Conservative limit for fixes
 
     def __init__(self, redis_client: redis.Redis):
-        """Initialize Claude investigation queue with Redis client"""
+        """Initialize Claude fix execution queue with Redis client"""
         self.redis = redis_client
-        logger.info("ClaudeInvestigationQueue initialized")
+        logger.info("ClaudeFixExecutionQueue initialized")
 
     def _key(self, fingerprint_id: str, suffix: str) -> str:
-        """Generate Redis key for investigation data"""
-        return f"medic:claude_investigation:{fingerprint_id}:{suffix}"
+        """Generate Redis key for fix execution data"""
+        return f"medic:claude_fix:{fingerprint_id}:{suffix}"
 
-    def enqueue(self, fingerprint_id: str, priority: str = "normal") -> bool:
+    def enqueue(self, fingerprint_id: str, project: str = None, fix_plan_path: str = None) -> bool:
         """
-        Add investigation to queue if not already queued/in-progress.
+        Add fix execution to queue if not already queued/in-progress.
 
         Args:
             fingerprint_id: Failure signature ID
-            priority: "low", "normal", "high" (affects queue position)
+            project: Project name (optional)
+            fix_plan_path: Path to fix plan file (optional)
 
         Returns:
             True if enqueued, False if already exists
@@ -79,29 +75,53 @@ class ClaudeInvestigationQueue:
             self.STATUS_STARTING,
             self.STATUS_IN_PROGRESS,
         ]:
-            logger.info(f"Claude investigation {fingerprint_id} already {status}, not re-enqueuing")
+            logger.info(f"Claude fix {fingerprint_id} already {status}, not re-enqueuing")
             return False
+
+        # Store details if provided
+        if project:
+            self.redis.set(self._key(fingerprint_id, "project"), project)
+        if fix_plan_path:
+            self.redis.set(self._key(fingerprint_id, "fix_plan_path"), fix_plan_path)
 
         # Set initial status
         self.redis.set(self._key(fingerprint_id, "status"), self.STATUS_QUEUED)
 
-        # Add to queue based on priority
-        if priority == "high":
-            self.redis.lpush("medic:claude_investigation:queue", fingerprint_id)
-        else:
-            self.redis.rpush("medic:claude_investigation:queue", fingerprint_id)
+        # Add to queue
+        self.redis.rpush("medic:claude_fix:queue", fingerprint_id)
 
-        logger.info(f"Enqueued Claude investigation: {fingerprint_id} (priority: {priority})")
+        logger.info(f"Enqueued Claude fix execution: {fingerprint_id}")
         return True
+
+    def get_next_pending_fix(self) -> Optional[Dict]:
+        """
+        Get next pending fix from queue with details.
+        
+        Returns:
+            Dict with fix details or None if queue empty
+        """
+        fingerprint_id = self.dequeue()
+        if not fingerprint_id:
+            return None
+            
+        # Get details
+        project = self.redis.get(self._key(fingerprint_id, "project"))
+        fix_plan_path = self.redis.get(self._key(fingerprint_id, "fix_plan_path"))
+        
+        return {
+            "fingerprint_id": fingerprint_id,
+            "project": project,
+            "fix_plan_path": fix_plan_path
+        }
 
     def dequeue(self) -> Optional[str]:
         """
-        Get next investigation from queue (blocking with 5s timeout).
+        Get next fix execution from queue (blocking with 5s timeout).
 
         Returns:
             fingerprint_id or None if queue empty
         """
-        result = self.redis.blpop("medic:claude_investigation:queue", timeout=5)
+        result = self.redis.blpop("medic:claude_fix:queue", timeout=5)
         if result:
             _, fingerprint_id = result
             return fingerprint_id
@@ -109,7 +129,7 @@ class ClaudeInvestigationQueue:
 
     def acquire_lock(self, fingerprint_id: str) -> bool:
         """
-        Acquire distributed lock for investigation.
+        Acquire distributed lock for fix execution.
 
         Returns:
             True if lock acquired, False if already locked
@@ -119,9 +139,9 @@ class ClaudeInvestigationQueue:
         acquired = self.redis.set(lock_key, "locked", nx=True, ex=self.LOCK_TTL)
 
         if acquired:
-            logger.info(f"Acquired lock for Claude investigation {fingerprint_id}")
+            logger.info(f"Acquired lock for Claude fix {fingerprint_id}")
         else:
-            logger.warning(f"Failed to acquire lock for Claude investigation {fingerprint_id}")
+            logger.warning(f"Failed to acquire lock for Claude fix {fingerprint_id}")
 
         return bool(acquired)
 
@@ -129,36 +149,49 @@ class ClaudeInvestigationQueue:
         """Release distributed lock"""
         lock_key = self._key(fingerprint_id, "lock")
         self.redis.delete(lock_key)
-        logger.info(f"Released lock for Claude investigation {fingerprint_id}")
+        logger.info(f"Released lock for Claude fix {fingerprint_id}")
 
-    def update_status(self, fingerprint_id: str, status: str):
-        """Update investigation status"""
+    def update_status(self, fingerprint_id: str, status: str, **kwargs):
+        """
+        Update fix status and optional metadata.
+        
+        Args:
+            fingerprint_id: Failure signature ID
+            status: New status
+            **kwargs: Additional fields to update (e.g. error, log_file)
+        """
         self.redis.set(self._key(fingerprint_id, "status"), status)
-        logger.debug(f"Updated status for Claude investigation {fingerprint_id}: {status}")
+        
+        # Store additional fields
+        for key, value in kwargs.items():
+            if value is not None:
+                self.redis.set(self._key(fingerprint_id, key), str(value))
+                
+        logger.debug(f"Updated status for Claude fix {fingerprint_id}: {status}")
 
     def get_status(self, fingerprint_id: str) -> Optional[str]:
-        """Get current investigation status"""
+        """Get current fix status"""
         status = self.redis.get(self._key(fingerprint_id, "status"))
         return status if status else None
 
     def set_pid(self, fingerprint_id: str, pid: int):
-        """Set process ID for investigation"""
+        """Set process ID for fix execution"""
         self.redis.set(self._key(fingerprint_id, "pid"), str(pid))
-        self.redis.sadd("medic:claude_investigation:active", fingerprint_id)
-        logger.info(f"Set PID {pid} for Claude investigation {fingerprint_id}")
+        self.redis.sadd("medic:claude_fix:active", fingerprint_id)
+        logger.info(f"Set PID {pid} for Claude fix {fingerprint_id}")
 
     def get_pid(self, fingerprint_id: str) -> Optional[int]:
-        """Get process ID for investigation"""
+        """Get process ID for fix execution"""
         pid = self.redis.get(self._key(fingerprint_id, "pid"))
         return int(pid) if pid else None
 
     def remove_from_active(self, fingerprint_id: str):
         """Remove from active set"""
-        self.redis.srem("medic:claude_investigation:active", fingerprint_id)
+        self.redis.srem("medic:claude_fix:active", fingerprint_id)
 
     def get_active(self) -> List[str]:
-        """Get list of active investigation fingerprint IDs"""
-        active = self.redis.smembers("medic:claude_investigation:active")
+        """Get list of active fix fingerprint IDs"""
+        active = self.redis.smembers("medic:claude_fix:active")
         return list(active)
 
     def record_heartbeat(self, fingerprint_id: str):
@@ -174,36 +207,36 @@ class ClaudeInvestigationQueue:
         return None
 
     def set_started_at(self, fingerprint_id: str):
-        """Record investigation start time"""
+        """Record fix start time"""
         now = datetime.now(timezone.utc).isoformat()
         self.redis.set(self._key(fingerprint_id, "started_at"), now)
 
     def get_started_at(self, fingerprint_id: str) -> Optional[datetime]:
-        """Get investigation start time"""
+        """Get fix start time"""
         started = self.redis.get(self._key(fingerprint_id, "started_at"))
         if started:
             return datetime.fromisoformat(started)
         return None
 
     def set_completed_at(self, fingerprint_id: str):
-        """Record investigation completion time"""
+        """Record fix completion time"""
         now = datetime.now(timezone.utc).isoformat()
         self.redis.set(self._key(fingerprint_id, "completed_at"), now)
 
     def get_completed_at(self, fingerprint_id: str) -> Optional[datetime]:
-        """Get investigation completion time"""
+        """Get fix completion time"""
         completed = self.redis.get(self._key(fingerprint_id, "completed_at"))
         if completed:
             return datetime.fromisoformat(completed)
         return None
 
     def set_result(self, fingerprint_id: str, result: str):
-        """Set investigation result"""
+        """Set fix result"""
         self.redis.set(self._key(fingerprint_id, "result"), result)
-        logger.info(f"Set result for Claude investigation {fingerprint_id}: {result}")
+        logger.info(f"Set result for Claude fix {fingerprint_id}: {result}")
 
     def get_result(self, fingerprint_id: str) -> Optional[str]:
-        """Get investigation result"""
+        """Get fix result"""
         result = self.redis.get(self._key(fingerprint_id, "result"))
         return result if result else None
 
@@ -216,38 +249,20 @@ class ClaudeInvestigationQueue:
         lines = self.redis.get(self._key(fingerprint_id, "agent_output_lines"))
         return int(lines) if lines else 0
 
-    def is_stalled(self, fingerprint_id: str) -> bool:
-        """
-        Check if investigation has stalled (no heartbeat for 10+ minutes).
-
-        Returns:
-            True if stalled, False otherwise
-        """
-        last_hb = self.get_last_heartbeat(fingerprint_id)
-        if not last_hb:
-            return False
-
-        elapsed = (datetime.now(timezone.utc) - last_hb).total_seconds()
-        return elapsed > self.STALL_THRESHOLD
-
     def get_active_count(self) -> int:
-        """Get count of active investigations"""
-        return self.redis.scard("medic:claude_investigation:active")
+        """Get count of active fixes"""
+        return self.redis.scard("medic:claude_fix:active")
 
     def can_start_new(self) -> bool:
-        """Check if we can start a new investigation (under MAX_CONCURRENT)"""
+        """Check if we can start a new fix (under MAX_CONCURRENT)"""
         return self.get_active_count() < self.MAX_CONCURRENT
 
-    def get_queue_length(self) -> int:
-        """Get number of queued investigations"""
-        return self.redis.llen("medic:claude_investigation:queue")
-
-    def get_investigation_info(self, fingerprint_id: str) -> Dict:
+    def get_fix_info(self, fingerprint_id: str) -> Dict:
         """
-        Get complete investigation information.
+        Get complete fix execution information.
 
         Returns:
-            Dictionary with all investigation data
+            Dictionary with all fix data
         """
         status = self.get_status(fingerprint_id)
         if not status:
@@ -277,10 +292,10 @@ class ClaudeInvestigationQueue:
 
     def cleanup_completed(self, older_than_hours: int = 24):
         """
-        Clean up Redis data for completed investigations older than specified hours.
+        Clean up Redis data for completed fixes older than specified hours.
 
         Args:
-            older_than_hours: Remove data for investigations completed this many hours ago
+            older_than_hours: Remove data for fixes completed this many hours ago
         """
         cutoff = datetime.now(timezone.utc) - timedelta(hours=older_than_hours)
 
@@ -291,7 +306,7 @@ class ClaudeInvestigationQueue:
         for fingerprint_id in all_active:
             completed_at = self.get_completed_at(fingerprint_id)
             if completed_at and completed_at < cutoff:
-                # Remove all keys for this investigation
+                # Remove all keys for this fix
                 keys_to_delete = [
                     self._key(fingerprint_id, "pid"),
                     self._key(fingerprint_id, "status"),
@@ -307,10 +322,10 @@ class ClaudeInvestigationQueue:
                 cleaned += 1
 
         if cleaned > 0:
-            logger.info(f"Cleaned up {cleaned} completed Claude investigations older than {older_than_hours}h")
+            logger.info(f"Cleaned up {cleaned} completed Claude fixes older than {older_than_hours}h")
 
         return cleaned
 
 
 # Export
-__all__ = ['ClaudeInvestigationQueue']
+__all__ = ['ClaudeFixExecutionQueue']

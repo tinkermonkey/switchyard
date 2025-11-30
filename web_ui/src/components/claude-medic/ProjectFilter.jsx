@@ -1,5 +1,4 @@
 import { useEffect, useState } from 'react'
-import { FolderGit2 } from 'lucide-react'
 
 export default function ProjectFilter({ selectedProject, onProjectChange }) {
   const [projects, setProjects] = useState([])
@@ -23,19 +22,17 @@ export default function ProjectFilter({ selectedProject, onProjectChange }) {
   }
 
   return (
-    <div className="flex items-center gap-2">
-      <FolderGit2 className="w-4 h-4 text-gh-fg-muted" />
-      <label className="text-sm text-gh-fg-muted">Project:</label>
+        <div className="w-48">
+      <label className="block text-xs text-gh-fg-muted mb-1">Project</label>
       <select
-        value={selectedProject}
-        onChange={(e) => onProjectChange(e.target.value)}
-        className="px-3 py-1.5 bg-gh-canvas border border-gh-border rounded text-sm min-w-[200px]"
-        disabled={loading}
+        value={selectedProject || ''}
+        onChange={(e) => onProjectChange(e.target.value || null)}
+        className="w-full h-8 text-sm bg-gh-bg-secondary border border-gh-border rounded px-2 text-gh-fg-default focus:border-gh-blue focus:ring-1 focus:ring-gh-blue"
       >
         <option value="">All Projects</option>
         {projects.map((project) => (
-          <option key={project.name} value={project.name}>
-            {project.name} ({project.failure_count})
+          <option key={project.project} value={project.project}>
+            {project.project} ({project.total_failures})
           </option>
         ))}
       </select>

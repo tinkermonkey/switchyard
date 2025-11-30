@@ -651,6 +651,11 @@ class HumanFeedbackLoopExecutor:
                         continue
 
                     if not is_bot_user(author) and created_at > last_agent_time:
+                        # Check for agent signature (handles PAT users)
+                        if "_Processed by the " in comment.get('body', ''):
+                             logger.debug(f"Skipping comment from {author} as it contains agent signature")
+                             continue
+
                         logger.info(f"Found human feedback in issue comment from {author}")
                         return {
                             'author': author,
@@ -768,6 +773,11 @@ class HumanFeedbackLoopExecutor:
                         continue
 
                     if not is_bot_user(author) and created_at > last_agent_time:
+                        # Check for agent signature (handles PAT users)
+                        if "_Processed by the " in comment.get('body', ''):
+                             logger.debug(f"Skipping comment from {author} as it contains agent signature")
+                             continue
+
                         logger.info(f"Found human feedback in top-level comment from {author}")
                         return {
                             'author': author,
@@ -799,6 +809,11 @@ class HumanFeedbackLoopExecutor:
 
                     # Check if human comment after last agent output
                     if not is_bot_user(author) and created_at > last_agent_time:
+                        # Check for agent signature (handles PAT users)
+                        if "_Processed by the " in reply.get('body', ''):
+                             logger.debug(f"Skipping reply from {author} as it contains agent signature")
+                             continue
+
                         # FIX: Check if parent comment belongs to this agent
                         parent_body = comment.get('body', '')
                         agent_signature = f"_Processed by the {state.agent} agent_"
@@ -871,9 +886,13 @@ class HumanFeedbackLoopExecutor:
             bot_comments = []
 
             for comment in comments:
-                if is_bot_user(comment.get('author', {}).get('login', '')):
+                body = comment.get('body', '')
+                # Check for bot user OR agent signature (handles PAT users)
+                is_agent_output = '_Processed by the ' in body and ' agent_' in body
+                
+                if is_bot_user(comment.get('author', {}).get('login', '')) or is_agent_output:
                     bot_comments.append({
-                        'body': comment.get('body', ''),
+                        'body': body,
                         'timestamp': comment.get('createdAt')
                     })
 
@@ -944,17 +963,23 @@ class HumanFeedbackLoopExecutor:
 
             for comment in comments:
                 # Check top-level comment
-                if is_bot_user(comment.get('author', {}).get('login', '')):
+                body = comment.get('body', '')
+                is_agent_output = '_Processed by the ' in body and ' agent_' in body
+                
+                if is_bot_user(comment.get('author', {}).get('login', '')) or is_agent_output:
                     bot_comments.append({
-                        'body': comment.get('body', ''),
+                        'body': body,
                         'timestamp': comment.get('createdAt')
                     })
 
                 # Check replies
                 for reply in comment.get('replies', {}).get('nodes', []):
-                    if is_bot_user(reply.get('author', {}).get('login', '')):
+                    reply_body = reply.get('body', '')
+                    is_reply_agent_output = '_Processed by the ' in reply_body and ' agent_' in reply_body
+                    
+                    if is_bot_user(reply.get('author', {}).get('login', '')) or is_reply_agent_output:
                         bot_comments.append({
-                            'body': reply.get('body', ''),
+                            'body': reply_body,
                             'timestamp': reply.get('createdAt')
                         })
 

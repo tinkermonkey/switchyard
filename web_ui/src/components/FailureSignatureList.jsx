@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { Link } from '@tanstack/react-router'
-import { AlertCircle, TrendingUp, Clock, Play } from 'lucide-react'
+import { AlertCircle, TrendingUp, Clock, Play, Wrench } from 'lucide-react'
 import { useSocket } from '../contexts'
 
 export default function FailureSignatureList() {
@@ -85,6 +85,19 @@ export default function FailureSignatureList() {
         body: JSON.stringify({ priority: 'high' })
       })
       if (!response.ok) throw new Error('Failed to trigger investigation')
+      fetchSignatures() // Refresh list
+    } catch (err) {
+      alert(`Error: ${err.message}`)
+    }
+  }
+
+  const triggerFix = async (fingerprintId) => {
+    try {
+      const response = await fetch(`/api/medic/claude/fixes/${fingerprintId}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' }
+      })
+      if (!response.ok) throw new Error('Failed to trigger fix')
       fetchSignatures() // Refresh list
     } catch (err) {
       alert(`Error: ${err.message}`)
@@ -188,6 +201,7 @@ export default function FailureSignatureList() {
               key={sig.fingerprint_id}
               signature={sig}
               onTriggerInvestigation={triggerInvestigation}
+              onTriggerFix={triggerFix}
             />
           ))}
         </div>
@@ -196,7 +210,7 @@ export default function FailureSignatureList() {
   )
 }
 
-function FailureSignatureCard({ signature, onTriggerInvestigation }) {
+function FailureSignatureCard({ signature, onTriggerInvestigation, onTriggerFix }) {
   const getSeverityColor = (severity) => {
     switch (severity) {
       case 'CRITICAL': return 'text-red-500 bg-red-500/10 border-red-500/20'
@@ -288,7 +302,21 @@ function FailureSignatureCard({ signature, onTriggerInvestigation }) {
             {signature.investigation_status === 'failed' ? 'Retry' : 'Investigate'}
           </button>
         )}
-        {signature.investigation_status !== 'not_started' && signature.investigation_status !== 'failed' && (
+        
+        {(signature.investigation_status === 'diagnosed' || signature.investigation_status === 'completed') && (
+          <button
+            onClick={(e) => {
+              e.preventDefault()
+              onTriggerFix(signature.fingerprint_id)
+            }}
+            className="ml-4 px-3 py-1.5 bg-green-600 text-white rounded text-xs hover:bg-green-700 transition-colors flex items-center gap-1"
+          >
+            <Wrench className="w-3 h-3" />
+            Fix
+          </button>
+        )}
+
+        {signature.investigation_status !== 'not_started' && signature.investigation_status !== 'failed' && signature.investigation_status !== 'diagnosed' && signature.investigation_status !== 'completed' && (
           <span className="ml-4 px-3 py-1.5 bg-blue-500/10 text-blue-500 rounded text-xs">
             {signature.investigation_status}
           </span>

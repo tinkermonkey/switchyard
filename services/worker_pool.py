@@ -72,57 +72,75 @@ class TaskWorker:
 
                     # Execute task
                     start_time = time.time()
+                    max_retries = 3
+                    attempt = 0
+                    
                     try:
-                        result = await process_task_integrated(
-                            task, self.state_manager, self.logger
-                        )
-                        duration = time.time() - start_time
+                        while True:
+                            attempt += 1
+                            try:
+                                result = await process_task_integrated(
+                                    task, self.state_manager, self.logger
+                                )
+                                duration = time.time() - start_time
 
-                        # Log completion
-                        self.logger.log_agent_complete(
-                            task.agent,
-                            task.id,
-                            duration,
-                            result
-                        )
+                                # Log completion
+                                self.logger.log_agent_complete(
+                                    task.agent,
+                                    task.id,
+                                    duration,
+                                    result
+                                )
 
-                        # Record metrics
-                        self.metrics.record_task_complete(
-                            task.agent,
-                            duration,
-                            success=True
-                        )
+                                # Record metrics
+                                self.metrics.record_task_complete(
+                                    task.agent,
+                                    duration,
+                                    success=True
+                                )
 
-                        # Record quality metrics if present
-                        if hasattr(result, 'get') and result.get('quality_metrics'):
-                            quality_scores = result['quality_metrics']
-                            for metric_name, score in quality_scores.items():
-                                if hasattr(self.metrics, 'record_quality_metric'):
-                                    self.metrics.record_quality_metric(
-                                        task.agent, metric_name, score
+                                # Record quality metrics if present
+                                if hasattr(result, 'get') and result.get('quality_metrics'):
+                                    quality_scores = result['quality_metrics']
+                                    for metric_name, score in quality_scores.items():
+                                        if hasattr(self.metrics, 'record_quality_metric'):
+                                            self.metrics.record_quality_metric(
+                                                task.agent, metric_name, score
+                                            )
+
+                                self.tasks_processed += 1
+                                logger.info(
+                                    f"[Worker {self.worker_id}] Completed task {task.id} "
+                                    f"in {duration:.1f}s"
+                                )
+                                break # Success, exit retry loop
+
+                            except Exception as e:
+                                # Check if we should retry
+                                if attempt <= max_retries:
+                                    logger.warning(
+                                        f"[Worker {self.worker_id}] Task {task.id} failed (attempt {attempt}/{max_retries}): {e}. "
+                                        f"Retrying in 5 seconds..."
                                     )
+                                    await asyncio.sleep(5)
+                                    continue
+                                
+                                # Final failure handling
+                                duration = time.time() - start_time
+                                self.logger.log_error(f"[Worker {self.worker_id}] Task {task.id} failed: {e}")
 
-                        self.tasks_processed += 1
-                        logger.info(
-                            f"[Worker {self.worker_id}] Completed task {task.id} "
-                            f"in {duration:.1f}s"
-                        )
+                                # Record failure metrics
+                                self.metrics.record_task_complete(
+                                    task.agent,
+                                    duration,
+                                    success=False
+                                )
 
-                    except Exception as e:
-                        duration = time.time() - start_time
-                        self.logger.log_error(f"[Worker {self.worker_id}] Task {task.id} failed: {e}")
-
-                        # Record failure metrics
-                        self.metrics.record_task_complete(
-                            task.agent,
-                            duration,
-                            success=False
-                        )
-
-                        self.tasks_failed += 1
-                        logger.error(
-                            f"[Worker {self.worker_id}] Task {task.id} failed after {duration:.1f}s: {e}"
-                        )
+                                self.tasks_failed += 1
+                                logger.error(
+                                    f"[Worker {self.worker_id}] Task {task.id} failed after {duration:.1f}s: {e}"
+                                )
+                                break # Failure, exit retry loop
 
                     finally:
                         self.current_task = None

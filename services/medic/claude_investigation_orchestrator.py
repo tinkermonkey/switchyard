@@ -187,18 +187,28 @@ class ClaudeInvestigationOrchestrator:
             self.queue.update_status(fingerprint_id, self.queue.STATUS_IN_PROGRESS)
             self.queue.record_heartbeat(fingerprint_id)
 
+            # Add to active set (since we're not using set_pid anymore with async tasks)
+            from services.medic.claude_investigation_queue import ClaudeInvestigationQueue
+            self.queue.redis.sadd("medic:claude_investigation:active", fingerprint_id)
+
             # Set up completion callback
-            investigation_info['task'].add_done_callback(
-                lambda task: asyncio.create_task(self._investigation_completed(fingerprint_id, task))
-            )
+            def done_callback(task):
+                """Schedule completion handler in the event loop"""
+                try:
+                    loop = asyncio.get_event_loop()
+                    loop.create_task(self._investigation_completed(fingerprint_id, task))
+                except Exception as e:
+                    logger.error(f"Error scheduling investigation completion for {fingerprint_id}: {e}", exc_info=True)
+
+            investigation_info['task'].add_done_callback(done_callback)
 
             logger.info(f"Claude investigation started for {fingerprint_id} (project: {project})")
 
-            # Emit event
-            self.observability.emit_event(EventType.MEDIC_CLAUDE_INVESTIGATION_STARTED, {
-                "fingerprint_id": fingerprint_id,
-                "project": project
-            })
+            # TODO: Emit event for medic investigation started
+            # self.observability.emit_event(EventType.MEDIC_CLAUDE_INVESTIGATION_STARTED, {
+            #     "fingerprint_id": fingerprint_id,
+            #     "project": project
+            # })
 
         except Exception as e:
             logger.error(f"Failed to start investigation for {fingerprint_id}: {e}", exc_info=True)
@@ -235,11 +245,11 @@ class ClaudeInvestigationOrchestrator:
                         "completed"
                     )
 
-                    # Emit event
-                    self.observability.emit_event(EventType.MEDIC_CLAUDE_INVESTIGATION_COMPLETED, {
-                        "fingerprint_id": fingerprint_id,
-                        "result": "success"
-                    })
+                    # TODO: Emit event for medic investigation completed
+                    # self.observability.emit_event(EventType.MEDIC_CLAUDE_INVESTIGATION_COMPLETED, {
+                    #     "fingerprint_id": fingerprint_id,
+                    #     "result": "success"
+                    # })
 
                 elif report_status == "ignored":
                     self.queue.set_result(fingerprint_id, self.queue.RESULT_IGNORED)
@@ -251,11 +261,11 @@ class ClaudeInvestigationOrchestrator:
                         "ignored"
                     )
 
-                    # Emit event
-                    self.observability.emit_event(EventType.MEDIC_CLAUDE_INVESTIGATION_COMPLETED, {
-                        "fingerprint_id": fingerprint_id,
-                        "result": "ignored"
-                    })
+                    # TODO: Emit event for medic investigation completed
+                    # self.observability.emit_event(EventType.MEDIC_CLAUDE_INVESTIGATION_COMPLETED, {
+                    #     "fingerprint_id": fingerprint_id,
+                    #     "result": "ignored"
+                    # })
 
                 else:
                     # Investigation ran but didn't produce expected reports
@@ -298,10 +308,10 @@ class ClaudeInvestigationOrchestrator:
                             logger.warning(f"Claude investigation {fingerprint_id} appears stalled (no heartbeat)")
                             self.queue.update_status(fingerprint_id, self.queue.STATUS_STALLED)
 
-                            # Emit event
-                            self.observability.emit_event(EventType.MEDIC_CLAUDE_INVESTIGATION_STALLED, {
-                                "fingerprint_id": fingerprint_id
-                            })
+                            # TODO: Emit event for medic investigation stalled
+                            # self.observability.emit_event(EventType.MEDIC_CLAUDE_INVESTIGATION_STALLED, {
+                            #     "fingerprint_id": fingerprint_id
+                            # })
 
                     except Exception as e:
                         logger.error(f"Error monitoring investigation {fingerprint_id}: {e}")

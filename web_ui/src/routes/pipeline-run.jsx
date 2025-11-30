@@ -3,6 +3,7 @@ import { RefreshCw, Activity, CheckCircle, XCircle, AlertCircle, MessageSquare, 
 import Header from '../components/Header'
 import NavigationTabs from '../components/NavigationTabs'
 import CycleBoundingNode from '../components/CycleBoundingNode'
+import ConfirmationModal from '../components/ConfirmationModal'
 import { useState, useEffect, useCallback, useMemo } from 'react'
 import {
   ReactFlow,
@@ -221,6 +222,7 @@ function PipelineRunView() {
   const [legendOpen, setLegendOpen] = useState(true)
   const [reactFlowInstance, setReactFlowInstance] = useState(null)
   const [cycles, setCycles] = useState(new Map()) // Track cycle collapse state
+  const [showKillModal, setShowKillModal] = useState(false)
   const completedLimit = 10
   const { events: socketEvents } = useSocket()
   
@@ -343,6 +345,36 @@ function PipelineRunView() {
     }
   }, [])
   
+  // Kill pipeline run
+  const handleKillRun = useCallback(() => {
+    if (!selectedPipelineRun) return
+    setShowKillModal(true)
+  }, [selectedPipelineRun])
+
+  const confirmKillRun = useCallback(async () => {
+    if (!selectedPipelineRun) return
+    
+    try {
+      const response = await fetch(`/pipeline-runs/${selectedPipelineRun.id}/kill`, {
+        method: 'POST'
+      })
+      const data = await response.json()
+      
+      if (data.success) {
+        // Refresh lists
+        fetchActivePipelineRuns()
+        fetchCompletedPipelineRuns(0, false)
+        // Switch to completed tab since it's now completed/failed
+        setSelectedTab('completed')
+      } else {
+        alert(`Failed to kill run: ${data.error}`)
+      }
+    } catch (error) {
+      console.error('Error killing pipeline run:', error)
+      alert('Error killing pipeline run')
+    }
+  }, [selectedPipelineRun, fetchActivePipelineRuns, fetchCompletedPipelineRuns])
+
   // Handle cycle collapse/expand toggle
   const handleToggleCycle = useCallback((cycleId) => {
     setCycles(prevCycles => toggleCycleCollapsed(prevCycles, cycleId))
@@ -962,37 +994,50 @@ function PipelineRunView() {
                     </p>
                   </div>
                   
-                  {/* Debug: Download Data Button */}
-                  <button
-                    onClick={() => {
-                      const debugData = {
-                        pipelineRun: selectedPipelineRun,
-                        events: pipelineRunEvents,
-                        workflowConfig: workflowConfig,
-                        cycles: Array.from(cycles.entries()).map(([id, data]) => ({
-                          id,
-                          ...data,
-                          agentExecutions: data.agentExecutions?.map(e => ({
-                            agent: e.agent,
-                            taskId: e.execution?.taskId || e.taskId
-                          }))
-                        })),
-                        timestamp: new Date().toISOString()
-                      }
-                      const blob = new Blob([JSON.stringify(debugData, null, 2)], { type: 'application/json' })
-                      const url = URL.createObjectURL(blob)
-                      const a = document.createElement('a')
-                      a.href = url
-                      a.download = `pipeline-run-${selectedPipelineRun.id.substring(0, 8)}-debug.json`
-                      a.click()
-                      URL.revokeObjectURL(url)
-                      console.log('📥 Downloaded debug data')
-                    }}
-                    className="px-3 py-1 text-xs bg-gh-canvas-subtle border border-gh-border rounded hover:bg-gh-border-muted transition-colors whitespace-nowrap"
-                    title="Download debug data as JSON"
-                  >
-                    📥 Download Debug Data
-                  </button>
+                  <div className="flex gap-2">
+                    {selectedPipelineRun.status === 'active' && (
+                      <button
+                        onClick={handleKillRun}
+                        className="px-3 py-1 text-xs bg-red-900/20 border border-red-800 text-red-400 rounded hover:bg-red-900/40 transition-colors whitespace-nowrap flex items-center gap-1"
+                        title="Kill this pipeline run"
+                      >
+                        <XCircle className="w-3 h-3" />
+                        Kill Run
+                      </button>
+                    )}
+                    
+                    {/* Debug: Download Data Button */}
+                    <button
+                      onClick={() => {
+                        const debugData = {
+                          pipelineRun: selectedPipelineRun,
+                          events: pipelineRunEvents,
+                          workflowConfig: workflowConfig,
+                          cycles: Array.from(cycles.entries()).map(([id, data]) => ({
+                            id,
+                            ...data,
+                            agentExecutions: data.agentExecutions?.map(e => ({
+                              agent: e.agent,
+                              taskId: e.execution?.taskId || e.taskId
+                            }))
+                          })),
+                          timestamp: new Date().toISOString()
+                        }
+                        const blob = new Blob([JSON.stringify(debugData, null, 2)], { type: 'application/json' })
+                        const url = URL.createObjectURL(blob)
+                        const a = document.createElement('a')
+                        a.href = url
+                        a.download = `pipeline-run-${selectedPipelineRun.id.substring(0, 8)}-debug.json`
+                        a.click()
+                        URL.revokeObjectURL(url)
+                        console.log('📥 Downloaded debug data')
+                      }}
+                      className="px-3 py-1 text-xs bg-gh-canvas-subtle border border-gh-border rounded hover:bg-gh-border-muted transition-colors whitespace-nowrap"
+                      title="Download debug data as JSON"
+                    >
+                      📥 Download Debug Data
+                    </button>
+                  </div>
                 </div>
                 
                 {loadingEvents ? (
@@ -1153,6 +1198,16 @@ function PipelineRunView() {
           }
         }
       `}</style>
+
+      <ConfirmationModal
+        show={showKillModal}
+        onClose={() => setShowKillModal(false)}
+        onConfirm={confirmKillRun}
+        title="Kill Pipeline Run"
+        message={`Are you sure you want to kill the pipeline run for "${selectedPipelineRun?.issue_title}"? This will stop tracking and mark it as failed.`}
+        confirmText="Kill Run"
+        isDangerous={true}
+      />
     </div>
   )
 }

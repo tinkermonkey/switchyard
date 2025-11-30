@@ -910,6 +910,111 @@ def get_pipeline_run_events():
             'error': str(e)
         }), 500
 
+@app.route('/pipeline-runs/<pipeline_run_id>/kill', methods=['POST'])
+def kill_pipeline_run(pipeline_run_id):
+    """
+    Kill/Cancel an active pipeline run.
+    
+    This endpoint:
+    1. Ends the pipeline run in Redis/Elasticsearch
+    2. Marks any in-progress execution state as failed
+    3. Allows the system to start a fresh run for the issue
+    """
+    try:
+        from services.pipeline_run import get_pipeline_run_manager
+        from services.work_execution_state import work_execution_tracker
+        
+        logger.info(f"Received request to kill pipeline run: {pipeline_run_id}")
+        
+        pipeline_run_manager = get_pipeline_run_manager()
+        
+        # Get the run details first
+        pipeline_run = pipeline_run_manager.get_pipeline_run_by_id(pipeline_run_id)
+        
+        if not pipeline_run:
+            return jsonify({
+                'success': False,
+                'error': f'Pipeline run {pipeline_run_id} not found'
+            }), 404
+            
+        project = pipeline_run.project
+        issue_number = pipeline_run.issue_number
+        
+        # 1. End the pipeline run
+        success = pipeline_run_manager.end_pipeline_run(
+            project=project,
+            issue_number=issue_number,
+            reason="Killed by user via Web UI"
+        )
+        
+        if not success:
+            # It might have been already ended, but we should still clean up execution state
+            logger.warning(f"Pipeline run {pipeline_run_id} was not active in Redis, forcing update in Elasticsearch")
+            
+            # Force update in Elasticsearch using the run details we fetched earlier
+            # This handles "zombie" runs that exist in ES but not in Redis
+            try:
+                pipeline_run_manager._end_run_in_elasticsearch(
+                    pipeline_run.to_dict(),
+                    "Killed by user via Web UI (forced update)"
+                )
+                success = True # Mark as success since we updated ES
+            except Exception as e:
+                logger.error(f"Failed to force update pipeline run in ES: {e}")
+            
+        # 2. Force fail any in-progress execution state to release locks
+        # We need to find if there's an in-progress state
+        execution_history = work_execution_tracker.get_execution_history(project, issue_number)
+        
+        cleaned_up_execution = False
+        for execution in reversed(execution_history):
+            if execution.get('outcome') == 'in_progress':
+                agent = execution.get('agent')
+                column = execution.get('column')
+                
+                logger.info(f"Force-failing in-progress execution for {project}/#{issue_number} ({agent})")
+                
+                work_execution_tracker.record_execution_outcome(
+                    issue_number=issue_number,
+                    column=column,
+                    agent=agent,
+                    outcome='failure',
+                    project_name=project,
+                    error='Pipeline run killed by user'
+                )
+                cleaned_up_execution = True
+                
+        # 3. Attempt to kill any running containers associated with this run
+        # This is a best-effort cleanup
+        try:
+            import subprocess
+            # Find containers for this project/issue
+            # We look for agent containers and repair cycle containers
+            
+            # Agent containers: claude-agent-{project}-{task_id}
+            # We can't easily match task_id to run_id without more queries, 
+            # but we can check active agents endpoint logic
+            
+            # For now, let's just rely on the state cleanup. 
+            # The zombie reaper or next health check might clean up orphaned containers,
+            # or the user can use the specific "Kill Agent" button if they see a stuck container.
+            pass
+        except Exception as e:
+            logger.warning(f"Error cleaning up containers for killed run: {e}")
+
+        return jsonify({
+            'success': True,
+            'message': f'Pipeline run {pipeline_run_id} killed',
+            'cleaned_execution_state': cleaned_up_execution
+        })
+        
+    except Exception as e:
+        logger.error(f"Error killing pipeline run: {e}", exc_info=True)
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
 @app.route('/active-pipeline-runs')
 def get_active_pipeline_runs():
     """Get all currently active pipeline runs"""
@@ -3526,10 +3631,15 @@ def get_claude_medic_stats():
         total_failures = int(total_result.get('aggregations', {}).get('total_failures', {}).get('value', 0))
         total_clusters = int(total_result.get('aggregations', {}).get('total_clusters', {}).get('value', 0))
 
+        # Get under investigation count from Redis active set
+        redis_client = redis.Redis(host='redis', port=6379, decode_responses=True)
+        under_investigation = redis_client.scard("medic:claude_investigation:active")
+
         return jsonify({
             'total_signatures': sum(status_counts.values()),
             'total_failures': total_failures,
             'total_clusters': total_clusters,
+            'under_investigation': under_investigation,
             'by_status': status_counts,
             'by_tool': tool_counts,
             'by_error_type': error_type_counts,
@@ -3738,11 +3848,17 @@ def trigger_claude_investigation(fingerprint_id):
         )
 
         from services.medic.claude_investigation_queue import ClaudeInvestigationQueue
+        from services.medic.claude_failure_signature_store import ClaudeFailureSignatureStore
+
         queue = ClaudeInvestigationQueue(redis_client)
 
         enqueued = queue.enqueue(fingerprint_id, priority=priority)
 
         if enqueued:
+            # Update Elasticsearch signature document
+            signature_store = ClaudeFailureSignatureStore(es_client)
+            signature_store.update_investigation_status(fingerprint_id, 'queued')
+
             return jsonify({
                 'message': f'Investigation triggered for {fingerprint_id}',
                 'fingerprint_id': fingerprint_id,
@@ -3995,6 +4111,280 @@ def get_cluster_failure_details(cluster_id):
     except Exception as e:
         logger.error(f"Failed to get cluster failure details: {e}", exc_info=True)
         return jsonify({"error": str(e)}), 500
+
+
+# ============================================================================
+# Claude Fix Execution API Endpoints
+# ============================================================================
+
+@app.route('/api/medic/claude/fixes/<fingerprint_id>', methods=['POST'])
+def trigger_claude_fix(fingerprint_id):
+    """
+    Trigger a fix execution for a failure signature.
+    Requires a fix_plan.md to exist.
+    """
+    try:
+        from services.medic.fix_execution_queue import ClaudeFixExecutionQueue
+        from services.medic.claude_report_manager import ClaudeReportManager
+        import redis
+        
+        # Check if fix plan exists
+        report_manager = ClaudeReportManager()
+        fix_plan = report_manager.read_fix_plan(fingerprint_id)
+        
+        if not fix_plan:
+            return jsonify({
+                'error': 'Fix plan not found. Please run an investigation first.',
+                'fingerprint_id': fingerprint_id
+            }), 400
+            
+        # Get project from report summary
+        summary = report_manager.get_investigation_summary(fingerprint_id)
+        project = summary.get('project', 'unknown')
+        
+        # Enqueue fix
+        redis_client = redis.Redis(
+            host=os.getenv('REDIS_HOST', 'redis'),
+            port=int(os.getenv('REDIS_PORT', 6379)),
+            decode_responses=True
+        )
+        
+        queue = ClaudeFixExecutionQueue(redis_client)
+        fix_plan_path = str(report_manager.get_report_dir(fingerprint_id) / "fix_plan.md")
+        
+        enqueued = queue.enqueue(
+            fingerprint_id=fingerprint_id,
+            project=project,
+            fix_plan_path=fix_plan_path
+        )
+        
+        if enqueued:
+            return jsonify({
+                'message': f'Fix execution triggered for {fingerprint_id}',
+                'fingerprint_id': fingerprint_id,
+                'status': 'queued'
+            }), 200
+        else:
+            return jsonify({
+                'error': 'Fix execution already queued or in progress',
+                'fingerprint_id': fingerprint_id,
+                'status': queue.get_status(fingerprint_id)
+            }), 409
+            
+    except Exception as e:
+        logger.error(f"Failed to trigger Claude fix: {e}", exc_info=True)
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/medic/claude/fixes/<fingerprint_id>/status', methods=['GET'])
+def get_claude_fix_status(fingerprint_id):
+    """Get status of a fix execution"""
+    try:
+        from services.medic.fix_execution_queue import ClaudeFixExecutionQueue
+        import redis
+        
+        redis_client = redis.Redis(
+            host=os.getenv('REDIS_HOST', 'redis'),
+            port=int(os.getenv('REDIS_PORT', 6379)),
+            decode_responses=True
+        )
+        
+        queue = ClaudeFixExecutionQueue(redis_client)
+        status_info = queue.get_fix_info(fingerprint_id)
+        
+        return jsonify(status_info), 200
+        
+    except Exception as e:
+        logger.error(f"Failed to get Claude fix status: {e}", exc_info=True)
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/medic/claude/fixes/<fingerprint_id>/log', methods=['GET'])
+def get_claude_fix_log(fingerprint_id):
+    """Get fix execution log"""
+    try:
+        from services.medic.fix_execution_queue import ClaudeFixExecutionQueue
+        import redis
+        import json
+        
+        redis_client = redis.Redis(
+            host=os.getenv('REDIS_HOST', 'redis'),
+            port=int(os.getenv('REDIS_PORT', 6379)),
+            decode_responses=True
+        )
+        
+        queue = ClaudeFixExecutionQueue(redis_client)
+        info = queue.get_fix_info(fingerprint_id)
+        
+        log_file_path = info.get('log_file')
+        
+        if not log_file_path or not os.path.exists(log_file_path):
+            return jsonify({'error': 'Log file not found'}), 404
+            
+        # Read log file (JSONL format)
+        logs = []
+        with open(log_file_path, 'r') as f:
+            for line in f:
+                try:
+                    if line.strip():
+                        logs.append(json.loads(line))
+                except:
+                    pass
+                    
+        return jsonify({
+            'fingerprint_id': fingerprint_id,
+            'logs': logs,
+            'count': len(logs)
+        }), 200
+        
+    except Exception as e:
+        logger.error(f"Failed to get Claude fix log: {e}", exc_info=True)
+        return jsonify({'error': str(e)}), 500
+
+
+# ============================================================================
+# Claude Advisor API Endpoints
+# ============================================================================
+
+# Track active advisor runs in memory
+# Format: {project_name: {started_at: iso_timestamp, status: 'running'}}
+active_advisor_runs = {}
+
+@app.route('/api/medic/claude/advisor/active', methods=['GET'])
+def get_active_advisor_runs():
+    """Get list of currently running advisor sessions"""
+    return jsonify({
+        'runs': [
+            {'project': k, **v} 
+            for k, v in active_advisor_runs.items()
+        ]
+    }), 200
+
+@app.route('/api/medic/claude/advisor/reports', methods=['GET'])
+def get_all_advisor_reports():
+    """List recent advisor reports across all projects"""
+    try:
+        base_dir = Path("/workspace/orchestrator_data/medic/advisor_reports")
+        if not base_dir.exists():
+            return jsonify({'reports': []}), 200
+            
+        reports = []
+        # Walk through all project directories
+        for project_dir in base_dir.iterdir():
+            if project_dir.is_dir():
+                project_name = project_dir.name
+                for f in project_dir.glob("advisor_report_*.md"):
+                    stats = f.stat()
+                    reports.append({
+                        'project': project_name,
+                        'filename': f.name,
+                        'path': str(f),
+                        'created_at': datetime.fromtimestamp(stats.st_mtime).isoformat(),
+                        'size': stats.st_size
+                    })
+        
+        # Sort by date desc
+        reports.sort(key=lambda x: x['created_at'], reverse=True)
+        
+        # Limit to recent 50
+        return jsonify({'reports': reports[:50]}), 200
+        
+    except Exception as e:
+        logger.error(f"Failed to list all advisor reports: {e}", exc_info=True)
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/medic/claude/advisor/projects/<project>/run', methods=['POST'])
+def run_claude_advisor(project):
+    """Trigger Claude Advisor for a project"""
+    try:
+        if project in active_advisor_runs:
+             return jsonify({
+                'message': f'Advisor already running for {project}',
+                'status': 'running'
+            }), 409
+
+        # Run in background thread to not block
+        def run_advisor_bg():
+            try:
+                import asyncio
+                from services.medic.claude_advisor_orchestrator import ClaudeAdvisorOrchestrator
+                
+                orchestrator = ClaudeAdvisorOrchestrator()
+                asyncio.run(orchestrator.run_for_project(project))
+            except Exception as e:
+                logger.error(f"Advisor run failed for {project}: {e}", exc_info=True)
+            finally:
+                # Remove from active runs when done
+                if project in active_advisor_runs:
+                    del active_advisor_runs[project]
+            
+        # Mark as active
+        active_advisor_runs[project] = {
+            'started_at': datetime.utcnow().isoformat() + 'Z',
+            'status': 'running'
+        }
+
+        thread = threading.Thread(target=run_advisor_bg)
+        thread.start()
+        
+        return jsonify({
+            'message': f'Claude Advisor triggered for project {project}',
+            'status': 'started'
+        }), 200
+        
+    except Exception as e:
+        logger.error(f"Failed to trigger Claude Advisor: {e}", exc_info=True)
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/medic/claude/advisor/projects/<project>/reports', methods=['GET'])
+def get_claude_advisor_reports(project):
+    """List advisor reports for a project"""
+    try:
+        reports_dir = Path("/workspace/orchestrator_data/medic/advisor_reports") / project
+        
+        if not reports_dir.exists():
+            return jsonify({'reports': []}), 200
+            
+        reports = []
+        for f in reports_dir.glob("advisor_report_*.md"):
+            stats = f.stat()
+            reports.append({
+                'filename': f.name,
+                'path': str(f),
+                'created_at': datetime.fromtimestamp(stats.st_mtime).isoformat(),
+                'size': stats.st_size
+            })
+            
+        # Sort by date desc
+        reports.sort(key=lambda x: x['created_at'], reverse=True)
+        
+        return jsonify({'reports': reports}), 200
+        
+    except Exception as e:
+        logger.error(f"Failed to list advisor reports: {e}", exc_info=True)
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/medic/claude/advisor/projects/<project>/reports/<filename>', methods=['GET'])
+def get_claude_advisor_report_content(project, filename):
+    """Get content of a specific report"""
+    try:
+        reports_dir = Path("/workspace/orchestrator_data/medic/advisor_reports") / project
+        file_path = reports_dir / filename
+        
+        if not file_path.exists():
+            return jsonify({'error': 'Report not found'}), 404
+            
+        with open(file_path, 'r') as f:
+            content = f.read()
+            
+        return jsonify({
+            'content': content,
+            'filename': filename
+        }), 200
+        
+    except Exception as e:
+        logger.error(f"Failed to get advisor report content: {e}", exc_info=True)
+        return jsonify({'error': str(e)}), 500
 
 
 def start_observability_server(host='0.0.0.0', port=5001):

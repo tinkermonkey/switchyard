@@ -1,8 +1,9 @@
 import { createFileRoute, Link } from '@tanstack/react-router'
-import { RefreshCw, Activity, CheckCircle, ArrowRight } from 'lucide-react'
+import { RefreshCw, Activity, CheckCircle, ArrowRight, XCircle } from 'lucide-react'
 import Header from '../components/Header'
 import NavigationTabs from '../components/NavigationTabs'
 import PipelineRunEventLog from '../components/PipelineRunEventLog'
+import ConfirmationModal from '../components/ConfirmationModal'
 import { useState, useEffect, useCallback, useMemo, useRef, useLayoutEffect, memo } from 'react'
 import { useSocket } from '../contexts/SocketContext'
 import { formatDuration } from '../utils/stateHelpers'
@@ -62,6 +63,7 @@ function PipelineRunDebugView() {
   const [selectedTab, setSelectedTab] = useState('active')
   const [completedOffset, setCompletedOffset] = useState(0)
   const [hasMoreCompleted, setHasMoreCompleted] = useState(true)
+  const [showKillModal, setShowKillModal] = useState(false)
   const completedLimit = 10
   const { events: socketEvents } = useSocket()
 
@@ -445,6 +447,36 @@ function PipelineRunDebugView() {
     return filtered
   }, [pipelineRunEvents, socketEvents, selectedPipelineRun])
 
+  // Kill pipeline run
+  const handleKillRun = useCallback(() => {
+    if (!selectedPipelineRun) return
+    setShowKillModal(true)
+  }, [selectedPipelineRun])
+
+  const confirmKillRun = useCallback(async () => {
+    if (!selectedPipelineRun) return
+    
+    try {
+      const response = await fetch(`/pipeline-runs/${selectedPipelineRun.id}/kill`, {
+        method: 'POST'
+      })
+      const data = await response.json()
+      
+      if (data.success) {
+        // Refresh lists
+        fetchActivePipelineRuns()
+        fetchCompletedPipelineRuns(0, false)
+        // Switch to completed tab since it's now completed/failed
+        setSelectedTab('completed')
+      } else {
+        alert(`Failed to kill run: ${data.error}`)
+      }
+    } catch (error) {
+      console.error('Error killing pipeline run:', error)
+      alert('Error killing pipeline run')
+    }
+  }, [selectedPipelineRun, fetchActivePipelineRuns, fetchCompletedPipelineRuns])
+
   // Find the most recent agent execution for the selected pipeline run
   const latestAgentExecutionId = useMemo(() => {
     if (!mergedEvents || mergedEvents.length === 0) return null
@@ -585,17 +617,30 @@ function PipelineRunDebugView() {
         
         {/* Pipeline Run Event Log */}
         <div className="flex-1">
-          {/* Link to latest agent execution */}
-          {selectedPipelineRun && latestAgentExecutionId && (
-            <div className="mb-3">
-              <Link
-                to="/agent-execution/$executionId"
-                params={{ executionId: latestAgentExecutionId }}
-                className="inline-flex items-center gap-2 px-4 py-2 bg-gh-canvas border border-gh-border rounded-md hover:bg-gh-border-muted transition-colors text-sm"
-              >
-                <span>View Latest Agent Execution</span>
-                <ArrowRight className="w-4 h-4" />
-              </Link>
+          {/* Actions Bar */}
+          {selectedPipelineRun && (
+            <div className="mb-3 flex gap-2">
+              {latestAgentExecutionId && (
+                <Link
+                  to="/agent-execution/$executionId"
+                  params={{ executionId: latestAgentExecutionId }}
+                  className="inline-flex items-center gap-2 px-4 py-2 bg-gh-canvas border border-gh-border rounded-md hover:bg-gh-border-muted transition-colors text-sm"
+                >
+                  <span>View Latest Agent Execution</span>
+                  <ArrowRight className="w-4 h-4" />
+                </Link>
+              )}
+              
+              {selectedPipelineRun.status === 'active' && (
+                <button
+                  onClick={handleKillRun}
+                  className="px-3 py-2 text-sm bg-red-900/20 border border-red-800 text-red-400 rounded hover:bg-red-900/40 transition-colors whitespace-nowrap flex items-center gap-1"
+                  title="Kill this pipeline run"
+                >
+                  <XCircle className="w-4 h-4" />
+                  Kill Run
+                </button>
+              )}
             </div>
           )}
 
@@ -612,6 +657,16 @@ function PipelineRunDebugView() {
           )}
         </div>
       </div>
+
+      <ConfirmationModal
+        show={showKillModal}
+        onClose={() => setShowKillModal(false)}
+        onConfirm={confirmKillRun}
+        title="Kill Pipeline Run"
+        message={`Are you sure you want to kill the pipeline run for "${selectedPipelineRun?.issue_title}"? This will stop tracking and mark it as failed.`}
+        confirmText="Kill Run"
+        isDangerous={true}
+      />
     </div>
   )
 }

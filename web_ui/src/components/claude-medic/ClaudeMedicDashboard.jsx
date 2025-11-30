@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { AlertCircle, TrendingUp, CheckCircle, FolderGit2, Wrench, Code2 } from 'lucide-react'
 import { useSocket } from '../../contexts'
+import ClaudeAdvisorPanel from './ClaudeAdvisorPanel'
 
 export default function ClaudeMedicDashboard() {
   const [stats, setStats] = useState(null)
@@ -103,23 +104,33 @@ export default function ClaudeMedicDashboard() {
         </div>
       )}
 
-      {/* By Tool Type */}
-      {stats?.by_tool && Object.keys(stats.by_tool).length > 0 && (
-        <div className="bg-gh-canvas-subtle border border-gh-border rounded-lg p-4">
+      {/* Bottom Section: Tools and Advisor */}
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+        {/* By Tool Type */}
+        <div className="lg:col-span-2 bg-gh-canvas-subtle border border-gh-border rounded-lg p-4">
           <h4 className="text-sm font-semibold text-gh-fg mb-3 flex items-center gap-2">
             <Code2 className="w-4 h-4" />
             Failures by Tool
           </h4>
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-            {Object.entries(stats.by_tool).map(([tool, count]) => (
-              <div key={tool} className="bg-gh-canvas border border-gh-border rounded p-2">
-                <p className="text-xs text-gh-fg-muted">{tool}</p>
-                <p className="text-lg font-bold text-gh-fg">{count}</p>
-              </div>
-            ))}
-          </div>
+          {stats?.by_tool && Object.keys(stats.by_tool).length > 0 ? (
+            <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
+              {Object.entries(stats.by_tool).map(([tool, count]) => (
+                <div key={tool} className="bg-gh-canvas border border-gh-border rounded p-2">
+                  <p className="text-xs text-gh-fg-muted">{tool}</p>
+                  <p className="text-lg font-bold text-gh-fg">{count}</p>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <p className="text-sm text-gh-fg-muted italic">No tool failure data available.</p>
+          )}
         </div>
-      )}
+
+        {/* Advisor Panel */}
+        <div className="lg:col-span-1">
+          <ClaudeAdvisorPanel />
+        </div>
+      </div>
     </div>
   )
 }

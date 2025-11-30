@@ -1,8 +1,11 @@
 import { useEffect, useState } from 'react'
 import { Link } from '@tanstack/react-router'
-import { AlertCircle, TrendingUp, Clock, Play, Code2, FolderGit2 } from 'lucide-react'
+import { AlertCircle, TrendingUp, Clock, Play, Code2, FolderGit2, Brain } from 'lucide-react'
+import ReactMarkdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
 import { useSocket } from '../../contexts'
 import ProjectFilter from './ProjectFilter'
+import Modal from '../Modal'
 
 export default function ClaudeFailureSignatureList() {
   const [signatures, setSignatures] = useState([])
@@ -16,6 +19,14 @@ export default function ClaudeFailureSignatureList() {
   })
   const [sortBy, setSortBy] = useState('last_seen')
   const [sortOrder, setSortOrder] = useState('desc')
+  
+  // Advisor State
+  const [showAdvisor, setShowAdvisor] = useState(false)
+  const [advisorReports, setAdvisorReports] = useState([])
+  const [selectedReport, setSelectedReport] = useState(null)
+  const [selectedReportContent, setSelectedReportContent] = useState(null)
+  const [advisorLoading, setAdvisorLoading] = useState(false)
+
   const { medicEvents } = useSocket()
 
   useEffect(() => {
@@ -32,6 +43,13 @@ export default function ClaudeFailureSignatureList() {
       }
     }
   }, [medicEvents])
+
+  // Fetch advisor reports when modal opens
+  useEffect(() => {
+    if (showAdvisor && filters.project) {
+      fetchAdvisorReports()
+    }
+  }, [showAdvisor, filters.project])
 
   const fetchSignatures = async () => {
     try {
@@ -55,6 +73,60 @@ export default function ClaudeFailureSignatureList() {
       setError(err.message)
     } finally {
       setLoading(false)
+    }
+  }
+
+  const fetchAdvisorReports = async () => {
+    try {
+      const response = await fetch(`/api/medic/claude/advisor/projects/${filters.project}/reports`)
+      if (!response.ok) throw new Error('Failed to fetch reports')
+      const data = await response.json()
+      setAdvisorReports(data.reports || [])
+      
+      // If reports exist and none selected, select the first one (most recent usually)
+      if (data.reports && data.reports.length > 0 && !selectedReport) {
+        viewReport(data.reports[0])
+      }
+    } catch (err) {
+      console.error('Error fetching advisor reports:', err)
+    }
+  }
+
+  const runAdvisor = async () => {
+    if (!filters.project) return
+    
+    try {
+      setAdvisorLoading(true)
+      const response = await fetch(`/api/medic/claude/advisor/projects/${filters.project}/run`, {
+        method: 'POST'
+      })
+      
+      if (!response.ok) throw new Error('Failed to start advisor')
+      
+      // Poll for new report or just wait a bit and refresh list
+      // Since it's async, we just tell the user it started
+      alert('Advisor analysis started. This may take a few minutes.')
+      
+      // Refresh reports list after a delay to see if a new one appeared (unlikely to be instant)
+      setTimeout(fetchAdvisorReports, 2000)
+      
+    } catch (err) {
+      alert(`Error starting advisor: ${err.message}`)
+    } finally {
+      setAdvisorLoading(false)
+    }
+  }
+
+  const viewReport = async (filename) => {
+    try {
+      setSelectedReport(filename)
+      const response = await fetch(`/api/medic/claude/advisor/projects/${filters.project}/reports/${filename}`)
+      if (!response.ok) throw new Error('Failed to fetch report content')
+      const data = await response.json()
+      setSelectedReportContent(data.content)
+    } catch (err) {
+      console.error('Error fetching report content:', err)
+      setSelectedReportContent('Error loading report content.')
     }
   }
 
@@ -106,6 +178,21 @@ export default function ClaudeFailureSignatureList() {
             selectedProject={filters.project}
             onProjectChange={(project) => setFilters({...filters, project})}
           />
+
+          {/* Advisor Button */}
+          <button
+            onClick={() => setShowAdvisor(true)}
+            disabled={!filters.project}
+            className={`px-3 py-1.5 rounded text-sm flex items-center gap-2 border transition-colors ${
+              filters.project
+                ? 'bg-gh-canvas hover:bg-gh-canvas-subtle border-gh-border text-gh-fg'
+                : 'bg-gh-canvas-subtle border-gh-border text-gh-fg-muted cursor-not-allowed'
+            }`}
+            title={!filters.project ? "Select a project to use Advisor" : "Open Project Advisor"}
+          >
+            <Brain className="w-4 h-4" />
+            Advisor
+          </button>
 
           <div>
             <label className="block text-xs text-gh-fg-muted mb-1">Status</label>
@@ -169,14 +256,14 @@ export default function ClaudeFailureSignatureList() {
           </div>
 
           <div>
-            <label className="block text-xs text-gh-fg-muted mb-1">Order</label>
+            <label className="block text-xs text-gh-fg-muted mb-1">Order by</label>
             <select
               value={sortOrder}
               onChange={(e) => setSortOrder(e.target.value)}
               className="px-3 py-1.5 bg-gh-canvas border border-gh-border rounded text-sm"
             >
-              <option value="desc">Descending</option>
-              <option value="asc">Ascending</option>
+              <option value="desc">Age (desc)</option>
+              <option value="asc">Age (asc)</option>
             </select>
           </div>
         </div>
@@ -205,6 +292,78 @@ export default function ClaudeFailureSignatureList() {
             />
           ))}
         </div>
+      )}
+
+      {/* Advisor Modal */}
+      {showAdvisor && (
+        <Modal
+          title={`Claude Advisor: ${filters.project}`}
+          onClose={() => setShowAdvisor(false)}
+        >
+          <div className="space-y-6">
+            <div className="flex justify-between items-center">
+              <h4 className="text-lg font-semibold text-gh-fg">Analysis Reports</h4>
+              <button
+                onClick={runAdvisor}
+                disabled={advisorLoading}
+                className="px-4 py-2 bg-gh-accent-emphasis text-white rounded hover:bg-gh-accent-primary disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
+              >
+                {advisorLoading ? (
+                  <>
+                    <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-white"></div>
+                    Running Analysis...
+                  </>
+                ) : (
+                  <>
+                    <Brain className="w-4 h-4" />
+                    Run New Analysis
+                  </>
+                )}
+              </button>
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-4 gap-6 h-[calc(100vh-300px)]">
+              {/* Report List */}
+              <div className="lg:col-span-1 border-r border-gh-border pr-4 overflow-y-auto">
+                {advisorReports.length === 0 ? (
+                  <p className="text-gh-fg-muted text-sm">No reports found.</p>
+                ) : (
+                  <div className="space-y-2">
+                    {advisorReports.map((report) => (
+                      <button
+                        key={report}
+                        onClick={() => viewReport(report)}
+                        className={`w-full text-left px-3 py-2 rounded text-sm truncate transition-colors ${
+                          selectedReport === report
+                            ? 'bg-gh-accent-emphasis text-white'
+                            : 'hover:bg-gh-canvas-subtle text-gh-fg'
+                        }`}
+                      >
+                        {report.replace('advisor_report_', '').replace('.md', '').replace(/_/g, ' ')}
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              {/* Report Content */}
+              <div className="lg:col-span-3 overflow-y-auto bg-gh-canvas p-6 rounded border border-gh-border">
+                {selectedReportContent ? (
+                  <div className="prose prose-invert max-w-none">
+                    <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                      {selectedReportContent}
+                    </ReactMarkdown>
+                  </div>
+                ) : (
+                  <div className="flex flex-col items-center justify-center h-full text-gh-fg-muted">
+                    <Brain className="w-12 h-12 mb-4 opacity-20" />
+                    <p>Select a report to view details</p>
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        </Modal>
       )}
     </div>
   )

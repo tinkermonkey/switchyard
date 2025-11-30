@@ -1,10 +1,11 @@
 import { useEffect, useState } from 'react'
 import { useParams, Link } from '@tanstack/react-router'
-import { ArrowLeft, Play, FileText, TrendingUp, Clock, AlertCircle, Code2, FolderGit2 } from 'lucide-react'
+import { ArrowLeft, Play, FileText, TrendingUp, Clock, AlertCircle, Code2, FolderGit2, Wrench, Loader2 } from 'lucide-react'
 import Header from '../Header'
 import NavigationTabs from '../NavigationTabs'
 import ClaudeClusterView from './ClaudeClusterView'
 import ClaudeRecommendations from './ClaudeRecommendations'
+import ClaudeDiagnosis from './ClaudeDiagnosis'
 
 export default function ClaudeSignatureDetail() {
   const { fingerprintId } = useParams({ from: '/claude-medic-detail/$fingerprintId' })
@@ -14,13 +15,35 @@ export default function ClaudeSignatureDetail() {
   const [error, setError] = useState(null)
   const [showRecommendations, setShowRecommendations] = useState(false)
   const [showDiagnosis, setShowDiagnosis] = useState(false)
+  const [investigationStatus, setInvestigationStatus] = useState(null)
+  const [fixStatus, setFixStatus] = useState(null)
 
   useEffect(() => {
     if (fingerprintId) {
       fetchSignature()
       fetchClusters()
+      fetchInvestigationStatus()
+      fetchFixStatus()
     }
   }, [fingerprintId])
+
+  // Poll investigation status if queued or in progress
+  useEffect(() => {
+    let interval
+    if (investigationStatus && (investigationStatus.queue_status === 'queued' || investigationStatus.queue_status === 'starting' || investigationStatus.queue_status === 'in_progress')) {
+      interval = setInterval(fetchInvestigationStatus, 2000)
+    }
+    return () => clearInterval(interval)
+  }, [investigationStatus])
+
+  // Poll fix status if in progress
+  useEffect(() => {
+    let interval
+    if (fixStatus && (fixStatus.status === 'queued' || fixStatus.status === 'in_progress')) {
+      interval = setInterval(fetchFixStatus, 2000)
+    }
+    return () => clearInterval(interval)
+  }, [fixStatus])
 
   const fetchSignature = async () => {
     try {
@@ -33,6 +56,30 @@ export default function ClaudeSignatureDetail() {
       setError(err.message)
     } finally {
       setLoading(false)
+    }
+  }
+
+  const fetchInvestigationStatus = async () => {
+    try {
+      const response = await fetch(`/api/medic/claude/investigations/${fingerprintId}/status`)
+      if (response.ok) {
+        const data = await response.json()
+        setInvestigationStatus(data)
+      }
+    } catch (err) {
+      console.error('Error fetching investigation status:', err)
+    }
+  }
+
+  const fetchFixStatus = async () => {
+    try {
+      const response = await fetch(`/api/medic/claude/fixes/${fingerprintId}/status`)
+      if (response.ok) {
+        const data = await response.json()
+        setFixStatus(data)
+      }
+    } catch (err) {
+      console.error('Error fetching fix status:', err)
     }
   }
 
@@ -56,6 +103,20 @@ export default function ClaudeSignatureDetail() {
       })
       if (!response.ok) throw new Error('Failed to trigger investigation')
       fetchSignature() // Refresh to update investigation status
+      fetchInvestigationStatus()
+    } catch (err) {
+      alert(`Error: ${err.message}`)
+    }
+  }
+
+  const triggerFix = async () => {
+    try {
+      const response = await fetch(`/api/medic/claude/fixes/${fingerprintId}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' }
+      })
+      if (!response.ok) throw new Error('Failed to trigger fix')
+      fetchFixStatus()
     } catch (err) {
       alert(`Error: ${err.message}`)
     }
@@ -187,15 +248,27 @@ export default function ClaudeSignatureDetail() {
         </div>
 
         {/* Investigation Status */}
-        {signature.investigation_status && signature.investigation_status !== 'not_started' && (
+        {investigationStatus && investigationStatus.queue_status && investigationStatus.queue_status !== 'not_started' && (
           <div className="bg-gh-canvas-subtle border border-gh-border rounded-lg p-4">
             <h3 className="text-sm font-semibold text-gh-fg mb-3 flex items-center gap-2">
               <FileText className="w-4 h-4" />
-              Investigation Status: {signature.investigation_status}
+              Investigation Status: {investigationStatus.report_status || investigationStatus.queue_status}
+              {(investigationStatus.queue_status === 'queued' || investigationStatus.queue_status === 'starting' || investigationStatus.queue_status === 'in_progress') && (
+                <Loader2 className="w-4 h-4 ml-2 animate-spin text-blue-500" />
+              )}
             </h3>
 
-            {signature.investigation_status === 'completed' && (
-              <div className="flex gap-3">
+            {/* Show progress message for queued/in-progress investigations */}
+            {(investigationStatus.queue_status === 'queued' || investigationStatus.queue_status === 'starting' || investigationStatus.queue_status === 'in_progress') && (
+              <p className="text-sm text-gh-fg-muted">
+                {investigationStatus.queue_status === 'queued' && 'Investigation queued. Waiting for investigator to start...'}
+                {investigationStatus.queue_status === 'starting' && 'Investigation starting...'}
+                {investigationStatus.queue_status === 'in_progress' && `Investigation in progress... (${investigationStatus.progress_lines || 0} log lines written)`}
+              </p>
+            )}
+
+            {(investigationStatus.queue_status === 'completed' || investigationStatus.report_status === 'diagnosed') && (
+              <div className="flex flex-wrap gap-3 items-center">
                 <button
                   onClick={() => {
                     setShowDiagnosis(true)
@@ -222,30 +295,52 @@ export default function ClaudeSignatureDetail() {
                 >
                   View Recommendations
                 </button>
+
+                {/* Fix Button */}
+                {investigationStatus?.has_fix_plan && (
+                  <div className="flex items-center gap-2 ml-auto">
+                    {fixStatus && (fixStatus.status === 'queued' || fixStatus.status === 'in_progress') ? (
+                      <div className="flex items-center gap-2 px-4 py-2 bg-blue-500/10 border border-blue-500/20 rounded text-blue-500 text-sm">
+                        <Loader2 className="w-4 h-4 animate-spin" />
+                        <span>Fixing... {fixStatus.status}</span>
+                      </div>
+                    ) : fixStatus && fixStatus.status === 'completed' ? (
+                      <div className="flex items-center gap-2 px-4 py-2 bg-green-500/10 border border-green-500/20 rounded text-green-500 text-sm">
+                        <Wrench className="w-4 h-4" />
+                        <span>Fix Applied</span>
+                      </div>
+                    ) : (
+                      <button
+                        onClick={triggerFix}
+                        className="px-4 py-2 bg-green-600 text-white rounded hover:bg-green-700 transition-colors flex items-center gap-2 text-sm font-medium"
+                      >
+                        <Wrench className="w-4 h-4" />
+                        Apply Fix
+                      </button>
+                    )}
+                  </div>
+                )}
               </div>
             )}
 
-            {signature.investigation_status === 'in_progress' && (
-              <p className="text-sm text-blue-500">Investigation in progress...</p>
-            )}
-
-            {signature.investigation_status === 'queued' && (
-              <p className="text-sm text-yellow-500">Investigation queued</p>
+            {/* Fix Status Details */}
+            {fixStatus && fixStatus.status === 'failed' && (
+              <div className="mt-3 p-3 bg-red-500/10 border border-red-500/20 rounded text-sm text-red-500">
+                <p className="font-semibold">Fix Failed:</p>
+                <p>{fixStatus.error || 'Unknown error'}</p>
+              </div>
             )}
           </div>
         )}
 
         {/* Recommendations */}
-        {showRecommendations && signature.investigation_status === 'completed' && (
+        {showRecommendations && investigationStatus?.report_status === 'diagnosed' && (
           <ClaudeRecommendations fingerprintId={fingerprintId} />
         )}
 
-        {/* Diagnosis (placeholder for now) */}
-        {showDiagnosis && signature.investigation_status === 'completed' && (
-          <div className="bg-gh-canvas-subtle border border-gh-border rounded-lg p-6">
-            <h3 className="text-lg font-semibold text-gh-fg mb-3">Diagnosis</h3>
-            <p className="text-sm text-gh-fg-muted">Diagnosis view - to be implemented (similar to recommendations)</p>
-          </div>
+        {/* Diagnosis */}
+        {showDiagnosis && investigationStatus?.report_status === 'diagnosed' && (
+          <ClaudeDiagnosis fingerprintId={fingerprintId} />
         )}
 
         {/* Clusters */}

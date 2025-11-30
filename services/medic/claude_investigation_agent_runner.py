@@ -82,7 +82,12 @@ class ClaudeInvestigationAgentRunner:
             prompt = self._build_investigation_prompt(fingerprint_id, context_file, project)
 
             # Build context for run_claude_code
-            from claude.claude_integration import run_claude_code
+            try:
+                from claude.claude_integration import run_claude_code
+                logger.info(f"Successfully imported run_claude_code for {fingerprint_id}")
+            except Exception as e:
+                logger.error(f"Failed to import run_claude_code: {e}", exc_info=True)
+                return None
 
             context = {
                 'agent': 'claude-medic-investigator',
@@ -112,7 +117,9 @@ class ClaudeInvestigationAgentRunner:
 
             # Launch investigation as async task
             async def run_investigation():
+                logger.info(f"run_investigation() started for {fingerprint_id}")
                 try:
+                    logger.info(f"Calling run_claude_code for {fingerprint_id}")
                     result = await run_claude_code(prompt, context)
                     logger.info(f"Claude investigation {fingerprint_id} completed, result length: {len(result)}")
                     return result
@@ -124,6 +131,9 @@ class ClaudeInvestigationAgentRunner:
 
             # Start the task but don't await it (caller will monitor it)
             task = asyncio.create_task(run_investigation())
+
+            # Yield control to event loop to allow task to start
+            await asyncio.sleep(0)
 
             result = {
                 'task': task,

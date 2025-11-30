@@ -187,75 +187,90 @@ class DockerAgentRunner:
         """
         import subprocess
         import time
+        import uuid
+        import asyncio
 
-        # Create a unique test container name
-        test_container_name = f"write-test-{agent}-{int(time.time())}"
+        # Retry configuration
+        max_retries = 3
+        retry_delay = 2
 
-        # docker_cmd ends with the image name - remove it and everything after
-        # docker_cmd structure: ['docker', 'run', '--rm', '--name', 'name', ..., 'image']
-        test_cmd = docker_cmd[:-1]  # Remove the image name
+        for attempt in range(1, max_retries + 1):
+            # Create a unique test filename to avoid race conditions
+            unique_id = str(uuid.uuid4())[:8]
+            test_filename = f".write-verify-{unique_id}"
+            test_container_name = f"write-test-{agent}-{unique_id}"
 
-        # Remove all -e environment variables to avoid gh auth warnings in write test
-        filtered_cmd = []
-        skip_next = False
-        for i, arg in enumerate(test_cmd):
-            if skip_next:
-                skip_next = False
-                continue
-            if arg == '-e':
-                skip_next = True  # Skip the next argument (the env var value)
-                continue
-            filtered_cmd.append(arg)
-        test_cmd = filtered_cmd
+            # docker_cmd ends with the image name - remove it and everything after
+            # docker_cmd structure: ['docker', 'run', '--rm', '--name', 'name', ..., 'image']
+            test_cmd = docker_cmd[:-1]  # Remove the image name
 
-        # Replace the container name if it exists
-        if '--name' in test_cmd:
-            name_index = test_cmd.index('--name')
-            test_cmd[name_index + 1] = test_container_name
-        else:
-            # Add --name after --rm if it doesn't exist
+            # Remove all -e environment variables to avoid gh auth warnings in write test
+            filtered_cmd = []
+            skip_next = False
             for i, arg in enumerate(test_cmd):
-                if arg == '--rm':
-                    test_cmd.insert(i + 1, '--name')
-                    test_cmd.insert(i + 2, test_container_name)
-                    break
+                if skip_next:
+                    skip_next = False
+                    continue
+                if arg == '-e':
+                    skip_next = True  # Skip the next argument (the env var value)
+                    continue
+                filtered_cmd.append(arg)
+            test_cmd = filtered_cmd
 
-        # Add the image and simple test command
-        # Test writes to /workspace (the project directory), NOT to /home/orchestrator/.ssh (which is read-only)
-        test_cmd.extend([
-            'clauditoreum-orchestrator:latest',  # Use simple base image for quick test
-            'sh', '-c',
-            'echo "test" > /workspace/.write-verify && cat /workspace/.write-verify && rm /workspace/.write-verify && echo "SUCCESS"'
-        ])
-
-        logger.info(f"   Running container write test with container: {test_container_name}")
-
-        try:
-            result = subprocess.run(
-                test_cmd,
-                capture_output=True,
-                text=True,
-                timeout=10  # Quick test, should be fast
-            )
-
-            if result.returncode == 0 and 'SUCCESS' in result.stdout:
-                logger.info(f"   ✓ Container write test PASSED")
-                return True
+            # Replace the container name if it exists
+            if '--name' in test_cmd:
+                name_index = test_cmd.index('--name')
+                test_cmd[name_index + 1] = test_container_name
             else:
-                logger.error(f"   ✗ Container write test FAILED")
-                logger.error(f"   Return code: {result.returncode}")
-                logger.error(f"   Stdout: {result.stdout}")
-                logger.error(f"   Stderr: {result.stderr}")
-                return False
+                # Add --name after --rm if it doesn't exist
+                for i, arg in enumerate(test_cmd):
+                    if arg == '--rm':
+                        test_cmd.insert(i + 1, '--name')
+                        test_cmd.insert(i + 2, test_container_name)
+                        break
 
-        except subprocess.TimeoutExpired:
-            logger.error(f"   ✗ Container write test TIMED OUT")
-            # Try to clean up
-            subprocess.run(['docker', 'rm', '-f', test_container_name], capture_output=True)
-            return False
-        except Exception as e:
-            logger.error(f"   ✗ Container write test ERROR: {e}")
-            return False
+            # Add the image and simple test command
+            # Test writes to /workspace (the project directory), NOT to /home/orchestrator/.ssh (which is read-only)
+            # Use unique filename to prevent race conditions between concurrent agents
+            test_cmd.extend([
+                'clauditoreum-orchestrator:latest',  # Use simple base image for quick test
+                'sh', '-c',
+                f'echo "test" > /workspace/{test_filename} && cat /workspace/{test_filename} && rm /workspace/{test_filename} && echo "SUCCESS"'
+            ])
+
+            logger.info(f"   Running container write test (attempt {attempt}/{max_retries}) with container: {test_container_name}")
+
+            try:
+                result = subprocess.run(
+                    test_cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=30  # Increased from 10s to 30s for reliability
+                )
+
+                if result.returncode == 0 and 'SUCCESS' in result.stdout:
+                    logger.info(f"   ✓ Container write test PASSED")
+                    return True
+                else:
+                    logger.warning(f"   ✗ Container write test FAILED (attempt {attempt}/{max_retries})")
+                    logger.warning(f"   Return code: {result.returncode}")
+                    logger.warning(f"   Stdout: {result.stdout}")
+                    logger.warning(f"   Stderr: {result.stderr}")
+                    
+            except subprocess.TimeoutExpired:
+                logger.warning(f"   ✗ Container write test TIMED OUT (attempt {attempt}/{max_retries})")
+                # Try to clean up
+                subprocess.run(['docker', 'rm', '-f', test_container_name], capture_output=True)
+                
+            except Exception as e:
+                logger.warning(f"   ✗ Container write test ERROR (attempt {attempt}/{max_retries}): {e}")
+
+            # Wait before retry if not last attempt
+            if attempt < max_retries:
+                await asyncio.sleep(retry_delay)
+
+        logger.error(f"   ✗ Container write test FAILED after {max_retries} attempts")
+        return False
 
     async def run_agent_in_container(
         self,

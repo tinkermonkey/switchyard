@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { AlertCircle, Clock, Code, Play, FileText } from 'lucide-react'
+import { AlertCircle, Clock, Code, Play, FileText, Wrench } from 'lucide-react'
 import InvestigationReport from './InvestigationReport'
 import { useSocket } from '../contexts'
 
@@ -69,6 +69,19 @@ export default function FailureSignatureDetail({ fingerprintId }) {
       })
       if (!response.ok) throw new Error('Failed to trigger investigation')
       fetchSignatureDetails() // Refresh to update investigation status
+    } catch (err) {
+      alert(`Error: ${err.message}`)
+    }
+  }
+
+  const triggerFix = async () => {
+    try {
+      const response = await fetch(`/api/medic/claude/fixes/${fingerprintId}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' }
+      })
+      if (!response.ok) throw new Error('Failed to trigger fix')
+      fetchSignatureDetails() // Refresh
     } catch (err) {
       alert(`Error: ${err.message}`)
     }
@@ -148,6 +161,15 @@ export default function FailureSignatureDetail({ fingerprintId }) {
               >
                 <Play className="w-4 h-4" />
                 {signature.investigation_status === 'failed' ? 'Retry Investigation' : 'Start Investigation'}
+              </button>
+            )}
+            {(signature.investigation_status === 'diagnosed' || signature.investigation_status === 'completed') && (
+              <button
+                onClick={triggerFix}
+                className="px-4 py-2 bg-green-600 text-white rounded hover:bg-green-700 transition-colors flex items-center gap-2"
+              >
+                <Wrench className="w-4 h-4" />
+                Launch Fix
               </button>
             )}
             <select

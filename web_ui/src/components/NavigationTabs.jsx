@@ -29,18 +29,6 @@ export default function NavigationTabs() {
         Pipeline Run Debug
       </Link>
       <Link
-        to="/repair-cycles"
-        activeProps={{
-          className: "px-4 py-2 bg-gh-accent-emphasis border border-gh-accent-primary rounded-md hover:bg-gh-accent-primary transition-colors text-sm text-white"
-        }}
-        inactiveProps={{
-          className: "px-4 py-2 bg-gh-canvas-subtle border border-gh-border rounded-md hover:bg-gh-border-muted transition-colors text-sm"
-        }}
-      >
-        <Wrench className="inline w-4 h-4 mr-2" />
-        Repair Cycles
-      </Link>
-      <Link
         to="/medic"
         activeProps={{
           className: "px-4 py-2 bg-gh-accent-emphasis border border-gh-accent-primary rounded-md hover:bg-gh-accent-primary transition-colors text-sm text-white"
@@ -79,6 +67,18 @@ export default function NavigationTabs() {
 
         <div> | </div>
 
+      <Link
+        to="/repair-cycles"
+        activeProps={{
+          className: "px-4 py-2 bg-gh-accent-emphasis border border-gh-accent-primary rounded-md hover:bg-gh-accent-primary transition-colors text-sm text-white"
+        }}
+        inactiveProps={{
+          className: "px-4 py-2 bg-gh-canvas-subtle border border-gh-border rounded-md hover:bg-gh-border-muted transition-colors text-sm"
+        }}
+      >
+        <Wrench className="inline w-4 h-4 mr-2" />
+        Repair Cycles
+      </Link>
       <Link
         to="/pipeline-run"
         activeProps={{

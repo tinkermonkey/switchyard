@@ -205,6 +205,44 @@ class ClaudeFailureSignatureStore:
             self.logger.error(f"Failed to get signature {fingerprint_id}: {e}")
             return None
 
+    def get_signatures_by_project(self, project: str, status: Optional[str] = None) -> List[Dict]:
+        """
+        Get all failure signatures for a project.
+        
+        Args:
+            project: Project name
+            status: Optional status filter (e.g., 'new', 'recurring')
+            
+        Returns:
+            List of signature documents
+        """
+        try:
+            query = {
+                "bool": {
+                    "must": [
+                        {"term": {"project": project}}
+                    ]
+                }
+            }
+            
+            if status:
+                query["bool"]["must"].append({"term": {"status": status}})
+                
+            result = self.es.search(
+                index=f"{self.INDEX_PREFIX}-*",
+                body={
+                    "query": query,
+                    "size": 100,
+                    "sort": [{"total_failures": "desc"}]
+                }
+            )
+            
+            return [hit['_source'] for hit in result.get('hits', {}).get('hits', [])]
+            
+        except Exception as e:
+            self.logger.error(f"Failed to get signatures for project {project}: {e}")
+            return []
+
     def _cluster_to_sample(self, cluster: FailureCluster) -> Dict:
         """Convert cluster to sample entry"""
         return {

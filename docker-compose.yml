@@ -85,7 +85,7 @@ services:
     build: .
     volumes:
       - ./:/app
-      - ..:/workspace:ro  # Mount workspace read-only for git branch monitoring
+      - ..:/workspace  # Mount workspace read-write for Advisor agent execution
       - /var/run/docker.sock:/var/run/docker.sock
       - ./medic:/medic:ro  # Mount medic reports directory read-only
     environment:
@@ -94,6 +94,8 @@ services:
       - GITHUB_APP_ID=${GITHUB_APP_ID}
       - GITHUB_APP_INSTALLATION_ID=${GITHUB_APP_INSTALLATION_ID}
       - GITHUB_APP_PRIVATE_KEY_PATH=${GITHUB_APP_PRIVATE_KEY_PATH}
+      - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
     depends_on:
       redis:
         condition: service_started
@@ -282,6 +284,38 @@ services:
       - orchestrator-net
     working_dir: /app
     command: ["python", "-m", "services.medic.claude_investigation_orchestrator"]
+    restart: unless-stopped
+
+  claude-fix-orchestrator:
+    build: .
+    volumes:
+      - ./:/app
+      - ..:/workspace  # Access to orchestrator workspace for projects
+      - /var/run/docker.sock:/var/run/docker.sock  # Docker CLI access
+      - ./medic:/medic  # Investigation reports directory (inside clauditoreum/)
+
+      # Mount Claude Code config directory for authentication (Linux: ~/.config/claude)
+      - ~/.config/claude:/home/orchestrator/.config/claude:ro
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+      - WORKSPACE_ROOT=/workspace/clauditoreum
+      - MEDIC_DIR=/medic
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+    depends_on:
+      redis:
+        condition: service_started
+      elasticsearch:
+        condition: service_healthy
+      claude-investigation-orchestrator:
+        condition: service_started
+    networks:
+      - orchestrator-net
+    working_dir: /app
+    command: ["python", "-m", "services.medic.claude_fix_orchestrator"]
     restart: unless-stopped
 
 #  pattern-ingestion:

@@ -13,14 +13,14 @@ echo "=========================================="
 cd "$ORCHESTRATOR_ROOT"
 
 echo ""
-echo "Step 1: Stopping web-ui container via docker-compose..."
-docker compose stop web-ui
-echo "✓ Container stopped"
-
-echo ""
-echo "Step 2: Rebuilding Docker image..."
+echo "Step 1: Rebuilding Docker image..."
 docker compose build --no-cache web-ui
 echo "✓ Image rebuilt"
+
+echo ""
+echo "Step 2: Stopping web-ui container via docker-compose..."
+docker compose stop web-ui
+echo "✓ Container stopped"
 
 echo ""
 echo "Step 3: Starting web-ui container..."

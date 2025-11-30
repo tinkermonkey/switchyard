@@ -516,8 +516,16 @@ class PipelineRunManager:
             return
 
         try:
-            # Use date-based index name
+            # Use date-based index name derived from started_at to ensure updates go to the same index
             index_name = self._get_es_index_name()
+            try:
+                if pipeline_run.started_at:
+                    # Parse started_at (format: "2025-11-29T18:29:17.250Z" or similar)
+                    started_at_str = pipeline_run.started_at.replace('Z', '+00:00')
+                    started_date = datetime.fromisoformat(started_at_str)
+                    index_name = self._get_es_index_name(started_date)
+            except Exception as e:
+                logger.warning(f"Could not parse started_at '{pipeline_run.started_at}', using current date for index: {e}")
 
             self.es.index(
                 index=index_name,
@@ -1053,15 +1061,27 @@ class PipelineRunManager:
         Args:
             run_data: Pipeline run data from Elasticsearch
             reason: Reason for ending (for logging)
-            index: Optional index name where the document exists (if not provided, uses today's index)
+            index: Optional index name where the document exists (if not provided, uses started_at or today's index)
         """
         try:
             pipeline_run_id = run_data['id']
             run_data['ended_at'] = datetime.utcnow().isoformat() + 'Z'
             run_data['status'] = 'completed'
 
-            # Use the provided index (where the document was found) or fall back to today's index
-            target_index = index if index else self._get_es_index_name()
+            # Use the provided index (where the document was found) or derive from started_at
+            target_index = index
+            if not target_index:
+                try:
+                    started_at = run_data.get('started_at')
+                    if started_at:
+                        started_at_str = started_at.replace('Z', '+00:00')
+                        started_date = datetime.fromisoformat(started_at_str)
+                        target_index = self._get_es_index_name(started_date)
+                except Exception as e:
+                    logger.warning(f"Could not parse started_at '{run_data.get('started_at')}', using current date for index: {e}")
+            
+            if not target_index:
+                target_index = self._get_es_index_name()
 
             self.es.index(
                 index=target_index,
