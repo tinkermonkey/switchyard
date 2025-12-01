@@ -309,16 +309,21 @@ class ScheduledTasksService:
             logger.error(f"Fatal error in review learning cycle: {e}", exc_info=True)
 
     async def _cleanup_orphaned_containers(self):
-        """Cleanup orphaned agent container tracking keys in Redis"""
-        logger.info("Starting scheduled cleanup of orphaned agent container tracking keys")
+        """Cleanup orphaned agent container tracking keys in Redis and stuck execution states"""
+        logger.info("Starting scheduled cleanup of orphaned agent container tracking keys and stuck states")
 
         try:
             from claude.docker_runner import DockerAgentRunner
+            from services.work_execution_state import work_execution_tracker
             
-            # Run the cleanup (it's synchronous)
+            # Run the Redis key cleanup (it's synchronous)
             DockerAgentRunner.cleanup_orphaned_redis_keys()
             
-            logger.info("Orphaned container cleanup completed successfully")
+            # Run the execution state cleanup (it's synchronous)
+            # This ensures that if a container dies silently, the state is updated to 'failure'
+            work_execution_tracker.cleanup_stuck_in_progress_states()
+            
+            logger.info("Orphaned container and stuck state cleanup completed successfully")
 
         except Exception as e:
             logger.error(f"Error in orphaned container cleanup: {e}", exc_info=True)

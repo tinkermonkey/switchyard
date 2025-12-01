@@ -26,7 +26,7 @@ When a parent issue has multiple sub-issues (created by the work breakdown agent
 
 - **Type**: `MakerAgent` (produces GitHub issues as output)
 - **Name**: `pr_review_agent`
-- **Model**: `claude-opus-4-20250514` (for high-quality review analysis)
+- **Model**: `claude-opus-4-5-20251101` (for high-quality review analysis)
 - **Capabilities**: `code_review`, `pr_analysis`, `issue_creation`
 - **Docker Requirements**: `requires_docker: true`, `requires_dev_container: false`
 - **File Operations**: `makes_code_changes: false`, `filesystem_write_allowed: false`
@@ -421,7 +421,7 @@ class PRReviewStateManager:
 ```yaml
 pr_review_agent:
   description: "Automated PR review with scope-filtered recommendations"
-  model: "claude-opus-4-20250514"
+  model: "claude-opus-4-5-20251101"
   timeout: 600  # 10 minutes for review analysis
   retries: 2
   makes_code_changes: false

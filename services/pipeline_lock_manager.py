@@ -10,6 +10,7 @@ Only ONE issue can hold the pipeline lock at a time. Other issues wait in queue.
 import yaml
 import redis
 import logging
+import os
 from pathlib import Path
 from typing import Optional, Tuple
 from datetime import datetime, timezone, timedelta
@@ -51,15 +52,17 @@ class PipelineLockManager:
         self.redis_client = redis_client
         if self.redis_client is None:
             try:
+                redis_host = os.environ.get('REDIS_HOST', 'redis')
+                redis_port = int(os.environ.get('REDIS_PORT', 6379))
                 self.redis_client = redis.Redis(
-                    host='redis',
-                    port=6379,
+                    host=redis_host,
+                    port=redis_port,
                     decode_responses=True,
                     socket_connect_timeout=5,
                     socket_timeout=5
                 )
                 self.redis_client.ping()
-                logger.info("Connected to Redis for pipeline locks")
+                logger.info(f"Connected to Redis at {redis_host}:{redis_port} for pipeline locks")
             except Exception as e:
                 logger.warning(f"Redis connection failed for locks, using YAML only: {e}")
                 self.redis_client = None
@@ -132,6 +135,120 @@ class PipelineLockManager:
         Returns:
             (can_execute: bool, reason: str)
         """
+        # Try to acquire via Redis using atomic transaction (WATCH/MULTI)
+        if self.redis_client:
+            try:
+                lock_key = self._get_lock_key(project, board)
+                
+                # Use pipeline for optimistic locking
+                with self.redis_client.pipeline() as pipe:
+                    while True:
+                        try:
+                            # Watch the lock key for changes
+                            pipe.watch(lock_key)
+                            
+                            # Check if lock exists
+                            if pipe.exists(lock_key):
+                                # Lock exists - check who owns it
+                                # We must execute this read immediately (not in transaction)
+                                # But pipe is in watch mode, so commands are buffered? 
+                                # No, in redis-py pipeline, commands are buffered unless we call execute()
+                                # But we need to read the value to decide.
+                                # Standard pattern: pipe.watch(key); val = pipe.get(key); ...
+                                
+                                # We need a separate client or break out of pipeline to read?
+                                # No, the pipeline object acts as a client.
+                                # But in redis-py, calling methods on pipeline buffers them.
+                                # EXCEPT when using watch, we can read before multi().
+                                
+                                # Actually, let's just read it.
+                                # pipe.watch(lock_key) puts us in watch mode.
+                                # We can't read with 'pipe' and get result immediately?
+                                # Yes we can, before multi().
+                                
+                                # Wait, redis-py pipeline behavior:
+                                # "When using a pipeline, commands are buffered..."
+                                # But we need to read.
+                                # Correct pattern:
+                                # pipe.watch(key)
+                                # current_value = pipe.hgetall(key) # This might return the pipeline object, not result?
+                                # No, standard redis-py pipeline does not return results immediately.
+                                
+                                # We should use the callback form of transaction or just use the client for reading.
+                                # But we need to watch.
+                                pass
+                                
+                            # Let's use the transaction method which is cleaner in redis-py
+                            # self.redis_client.transaction(func, *keys)
+                            
+                            def acquire_lock_tx(pipe):
+                                lock_data = pipe.hgetall(lock_key)
+                                
+                                if lock_data and lock_data.get('lock_status') == 'locked':
+                                    # Lock exists
+                                    locked_by = int(lock_data.get('locked_by_issue', 0))
+                                    if locked_by == issue_number:
+                                        # Already held by us - refresh TTL
+                                        pipe.multi()
+                                        pipe.expire(lock_key, 7200)
+                                        return "already_holds_lock"
+                                    
+                                    # Check for stale lock
+                                    try:
+                                        lock_acquired_at = lock_data.get('lock_acquired_at')
+                                        if lock_acquired_at:
+                                            acquired_time = datetime.fromisoformat(lock_acquired_at)
+                                            lock_age = datetime.now(timezone.utc) - acquired_time
+                                            if lock_age > timedelta(hours=2):
+                                                # Stale - overwrite it
+                                                # Proceed to acquire logic below
+                                                pass
+                                            else:
+                                                # Locked by someone else
+                                                return f"locked_by_issue_{locked_by}"
+                                        else:
+                                            return f"locked_by_issue_{locked_by}"
+                                    except Exception:
+                                        return f"locked_by_issue_{locked_by}"
+                                
+                                # Not locked or stale - acquire it
+                                new_lock = PipelineLock(
+                                    project=project,
+                                    board=board,
+                                    locked_by_issue=issue_number,
+                                    lock_acquired_at=datetime.now(timezone.utc).isoformat(),
+                                    lock_status='locked'
+                                )
+                                
+                                pipe.multi()
+                                pipe.hset(lock_key, mapping=asdict(new_lock))
+                                pipe.expire(lock_key, 7200)
+                                return "lock_acquired"
+
+                            result = self.redis_client.transaction(acquire_lock_tx, lock_key, value_from_callable=True)
+                            
+                            # If we got here, transaction succeeded (or returned early)
+                            if result in ["lock_acquired", "already_holds_lock", "stale_lock_recovered"]:
+                                # We acquired/held the lock in Redis. Now sync to YAML.
+                                # Note: There is a small window where Redis has lock but YAML doesn't.
+                                # This is acceptable as Redis is primary.
+                                self._create_lock_yaml_only(project, board, issue_number)
+                                return True, result
+                            else:
+                                return False, result
+
+                        except redis.WatchError:
+                            # Lock changed while we were watching - retry loop
+                            continue
+                            
+            except Exception as e:
+                logger.warning(f"Redis lock acquisition failed, falling back to YAML: {e}")
+                # Fall through to YAML fallback
+
+        # Fallback to YAML (original logic, but only if Redis failed or not available)
+        # Note: If Redis is available but we failed to acquire (locked by other), we returned False above.
+        # We only reach here if self.redis_client is None or Redis threw an exception (connection error).
+        
         lock = self.get_lock(project, board)
 
         # Case 1: No existing lock - acquire immediately
@@ -173,8 +290,19 @@ class PipelineLockManager:
         )
         return False, f"locked_by_issue_{lock.locked_by_issue}"
 
+    def _create_lock_yaml_only(self, project: str, board: str, issue_number: int):
+        """Create lock in YAML only (helper for Redis sync)"""
+        lock = PipelineLock(
+            project=project,
+            board=board,
+            locked_by_issue=issue_number,
+            lock_acquired_at=datetime.now(timezone.utc).isoformat(),
+            lock_status='locked'
+        )
+        self._save_lock_to_yaml(lock)
+
     def _create_lock(self, project: str, board: str, issue_number: int):
-        """Create a new lock"""
+        """Create a new lock (Legacy/Fallback method)"""
         lock = PipelineLock(
             project=project,
             board=board,
@@ -203,7 +331,7 @@ class PipelineLockManager:
 
     def release_lock(self, project: str, board: str, issue_number: int) -> bool:
         """
-        Release pipeline lock.
+        Release pipeline lock safely.
 
         Args:
             project: Project name
@@ -213,25 +341,65 @@ class PipelineLockManager:
         Returns:
             True if lock was released, False if not held by this issue
         """
-        lock = self.get_lock(project, board)
-
-        # Safety check: Verify this issue actually holds the lock
-        if lock and lock.locked_by_issue != issue_number:
-            logger.warning(
-                f"Issue #{issue_number} attempted to release lock for {project}/{board} "
-                f"but lock is held by #{lock.locked_by_issue}"
-            )
-            return False
-
-        # Remove from Redis
+        # Atomic release via Redis
         if self.redis_client:
             try:
-                self.redis_client.delete(self._get_lock_key(project, board))
-                logger.debug(f"Deleted lock from Redis: {project}/{board}")
+                lock_key = self._get_lock_key(project, board)
+                
+                with self.redis_client.pipeline() as pipe:
+                    while True:
+                        try:
+                            pipe.watch(lock_key)
+                            
+                            # Check if lock exists and who owns it
+                            # We need to read inside the watch block
+                            # Since we can't easily read-and-branch in a pipeline without custom logic,
+                            # we'll use the transaction callback pattern again or just read.
+                            
+                            # Read directly (watched)
+                            # Note: In redis-py, if we watch a key, we can read it with the client (not pipe)
+                            # or use the transaction callback.
+                            
+                            def release_lock_tx(pipe):
+                                lock_data = pipe.hgetall(lock_key)
+                                if not lock_data:
+                                    # Lock doesn't exist - nothing to release
+                                    return "not_found"
+                                
+                                locked_by = int(lock_data.get('locked_by_issue', 0))
+                                if locked_by != issue_number:
+                                    # Held by someone else
+                                    return "held_by_other"
+                                
+                                # Held by us - delete it
+                                pipe.multi()
+                                pipe.delete(lock_key)
+                                return "released"
+
+                            result = self.redis_client.transaction(release_lock_tx, lock_key, value_from_callable=True)
+                            
+                            if result == "held_by_other":
+                                logger.warning(
+                                    f"Issue #{issue_number} attempted to release lock for {project}/{board} "
+                                    f"but it is held by another issue"
+                                )
+                                return False
+                            elif result == "not_found":
+                                # Already gone, consider it success (idempotent)
+                                logger.debug(f"Lock for {project}/{board} already gone during release by #{issue_number}")
+                                # Fall through to clean up YAML just in case
+                                break
+                            else:
+                                logger.debug(f"Deleted lock from Redis: {project}/{board}")
+                                break
+                                
+                        except redis.WatchError:
+                            continue
+                            
             except Exception as e:
                 logger.error(f"Failed to delete lock from Redis: {e}")
 
-        # Update YAML to unlocked state
+        # Update YAML to unlocked state (Fallback/Sync)
         from utils.file_lock import file_lock
 
         state_file = self._get_state_file(project, board)
@@ -241,8 +409,27 @@ class PipelineLockManager:
                 lock_file = state_file.with_suffix(state_file.suffix + '.lock')
                 with file_lock(lock_file):
                     if state_file.exists():  # Check again inside lock
-                        state_file.unlink()
-                        logger.debug(f"Deleted lock YAML file: {state_file}")
+                        # Double check ownership in YAML if we didn't check Redis (e.g. Redis down)
+                        # If Redis was up, we already validated ownership or deleted it.
+                        # If Redis was down, we must validate against YAML.
+                        
+                        should_delete = True
+                        if not self.redis_client: # Only check YAML content if Redis wasn't used
+                            try:
+                                with open(state_file, 'r') as f:
+                                    lock_data = yaml.safe_load(f)
+                                    if lock_data and int(lock_data.get('locked_by_issue', 0)) != issue_number:
+                                        should_delete = False
+                                        logger.warning(f"YAML lock held by {lock_data.get('locked_by_issue')} != {issue_number}")
+                            except Exception:
+                                pass # If read fails, assume safe to delete or let it be?
+                        
+                        if should_delete:
+                            state_file.unlink()
+                            logger.debug(f"Deleted lock YAML file: {state_file}")
+                        else:
+                            return False
+                            
             except Exception as e:
                 logger.error(f"Failed to delete lock YAML: {e}")
 

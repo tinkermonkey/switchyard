@@ -409,6 +409,43 @@ class ReviewCycleExecutor:
             try:
                 if cycle_state.status == 'initialized':
                     # Cycle is initialized - check if there's pending work to continue
+
+                    # Check if we have maker output but no corresponding review (or just starting)
+                    # For iteration 0, we always have maker output (from previous stage), and we want to start iteration 1
+                    is_start = cycle_state.current_iteration == 0 and len(cycle_state.maker_outputs) > 0
+                    
+                    # Check if we have completed maker work for the current iteration that needs review
+                    # (This happens if maker finished, we crashed, resumed, and _continue_cycle_from_maker set status to initialized)
+                    has_maker_output = cycle_state.maker_outputs and any(m['iteration'] == cycle_state.current_iteration for m in cycle_state.maker_outputs)
+                    
+                    if is_start or (has_maker_output and cycle_state.current_iteration < cycle_state.max_iterations):
+                        logger.info(f"Cycle in initialized state with pending maker output - starting/resuming review loop")
+                        
+                        # Fetch necessary context to run the loop
+                        try:
+                            from config.manager import config_manager
+                            workflow_template = config_manager.get_project_workflow(cycle_state.project_name, cycle_state.board_name)
+                            column = next((c for c in workflow_template.columns if c.agent == cycle_state.reviewer_agent), None)
+                            
+                            if column:
+                                github = self._get_github_integration(cycle_state)
+                                issue_data = await github.get_issue_details(cycle_state.issue_number, cycle_state.repository)
+                                
+                                # Execute the review loop
+                                # Note: _execute_review_loop will increment iteration at the start
+                                await self._execute_review_loop(
+                                    cycle_state,
+                                    column,
+                                    issue_data,
+                                    org
+                                )
+                            else:
+                                logger.error(f"Could not find column config for reviewer {cycle_state.reviewer_agent}")
+                        except Exception as e:
+                            logger.error(f"Failed to resume review loop: {e}", exc_info=True)
+                        
+                        continue
+
                     if cycle_state.review_outputs and len(cycle_state.review_outputs) > 0:
                         # Reviewer has completed at least one iteration
                         logger.info(f"Cycle in initialized state with pending review - continuing")
@@ -908,17 +945,18 @@ class ReviewCycleExecutor:
                     org
                 )
 
-                # Store maker output and increment iteration
+                # Store maker output
                 cycle_state.maker_outputs.append({
                     'iteration': cycle_state.current_iteration,
                     'output': maker_output,
                     'timestamp': datetime.now().isoformat()
                 })
-                cycle_state.current_iteration += 1
+                # Do not increment iteration here - let the review loop handle it
+                # cycle_state.current_iteration += 1
                 cycle_state.status = 'initialized'
                 self._save_cycle_state(cycle_state)
 
-                logger.info(f"Maker completed revision, incremented to iteration {cycle_state.current_iteration}")
+                logger.info(f"Maker completed revision, ready for iteration {cycle_state.current_iteration + 1}")
 
             elif review_result.status == ReviewStatus.BLOCKED:
                 logger.info(f"Review blocked, escalating")
@@ -1114,12 +1152,12 @@ class ReviewCycleExecutor:
                     'timestamp': datetime.now().isoformat()
                 })
 
-                # Increment iteration
-                cycle_state.current_iteration += 1
+                # Do not increment iteration here - let the review loop handle it
+                # cycle_state.current_iteration += 1
                 cycle_state.status = 'initialized'  # Ready for next review iteration
                 self._save_cycle_state(cycle_state)
 
-                logger.info(f"Maker completed revision, cycle ready for next iteration (now {cycle_state.current_iteration})")
+                logger.info(f"Maker completed revision, cycle ready for next iteration (now {cycle_state.current_iteration + 1})")
 
                 # The cycle is now ready for the next review iteration
                 # Project monitor will pick it up in the next polling cycle

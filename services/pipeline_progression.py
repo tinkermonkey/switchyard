@@ -16,6 +16,9 @@ from config.state_manager import state_manager
 from task_queue.task_manager import TaskQueue, Task, TaskPriority
 from datetime import datetime
 import time
+from services.pipeline_lock_manager import get_pipeline_lock_manager
+from services.pipeline_queue_manager import get_pipeline_queue_manager
+from services.pipeline_run import get_pipeline_run_manager
 
 logger = logging.getLogger(__name__)
 
@@ -314,6 +317,121 @@ class PipelineProgression:
             
             return False
 
+    def _get_issue_details(self, repository: str, issue_number: int, org: str) -> Dict[str, Any]:
+        """Fetch full issue details from GitHub"""
+        try:
+            result = subprocess.run(
+                ['gh', 'issue', 'view', str(issue_number), '--repo', f"{org}/{repository}", '--json', 'title,body,labels,state,author,createdAt,updatedAt,url'],
+                capture_output=True, text=True, check=True
+            )
+            return json.loads(result.stdout)
+        except Exception as e:
+            logger.error(f"Error fetching issue #{issue_number} details: {e}")
+            return {'title': f'Issue #{issue_number}', 'body': '', 'labels': []}
+
+    def _release_lock_and_process_next(self, project_name: str, board_name: str, issue_number: int, 
+                                      exit_column: str, repository: str):
+        """Release pipeline lock and process next waiting issue"""
+        try:
+            lock_manager = get_pipeline_lock_manager()
+            pipeline_queue = get_pipeline_queue_manager(project_name, board_name)
+            pipeline_run_manager = get_pipeline_run_manager()
+
+            # Release lock
+            lock_manager.release_lock(project_name, board_name, issue_number)
+            logger.info(f"Released pipeline lock for {project_name}/{board_name} (issue #{issue_number} reached '{exit_column}')")
+            
+            # Remove from queue
+            if pipeline_queue.is_issue_in_queue(issue_number):
+                pipeline_queue.remove_issue_from_queue(issue_number)
+                
+            # End pipeline run
+            pipeline_run_manager.end_pipeline_run(
+                project=project_name,
+                issue_number=issue_number,
+                reason=f"Issue reached exit column '{exit_column}'"
+            )
+            
+            # Process next waiting issue
+            next_issue = pipeline_queue.get_next_waiting_issue()
+            if next_issue:
+                logger.info(f"Processing next queued issue #{next_issue['issue_number']} for {project_name}/{board_name}")
+                
+                # Acquire lock
+                acquired, reason = lock_manager.try_acquire_lock(
+                    project=project_name,
+                    board=board_name,
+                    issue_number=next_issue['issue_number']
+                )
+                
+                if acquired:
+                    pipeline_queue.mark_issue_active(next_issue['issue_number'])
+                    
+                    # Get current column for next issue
+                    current_column = next_issue.get('column')
+                    
+                    # Get agent for this column
+                    project_config = config_manager.get_project_config(project_name)
+                    pipeline_config = next(p for p in project_config.pipelines if p.board_name == board_name)
+                    workflow_template = config_manager.get_workflow_template(pipeline_config.workflow)
+                    
+                    agent = None
+                    for col in workflow_template.columns:
+                        if col.name == current_column:
+                            agent = col.agent
+                            break
+                            
+                    if agent and agent != 'null':
+                        # Fetch issue details
+                        issue_data = self._get_issue_details(repository, next_issue['issue_number'], project_config.github['org'])
+                        
+                        # Create task
+                        task_context = {
+                            'project': project_name,
+                            'board': board_name,
+                            'pipeline': pipeline_config.name,
+                            'repository': repository,
+                            'issue_number': next_issue['issue_number'],
+                            'issue': issue_data,
+                            'column': current_column,
+                            'trigger': 'pipeline_progression', # Triggered by previous issue exiting
+                            'timestamp': datetime.now().isoformat()
+                        }
+
+                        task = Task(
+                            id=f"{agent}_{project_name}_{board_name}_{next_issue['issue_number']}_{int(time.time())}",
+                            agent=agent,
+                            project=project_name,
+                            priority=TaskPriority.MEDIUM,
+                            context=task_context,
+                            created_at=datetime.now().isoformat()
+                        )
+
+                        self.task_queue.enqueue(task)
+                        
+                        # Record execution start
+                        from services.work_execution_state import work_execution_tracker
+                        work_execution_tracker.record_execution_start(
+                            issue_number=next_issue['issue_number'],
+                            column=current_column,
+                            agent=agent,
+                            trigger_source='pipeline_progression',
+                            project_name=project_name
+                        )
+                        
+                        logger.info(f"Triggered agent {agent} for next waiting issue #{next_issue['issue_number']}")
+                    else:
+                        logger.warning(f"Next issue #{next_issue['issue_number']} is in column '{current_column}' which has no agent")
+                else:
+                    logger.error(f"Failed to acquire lock for next issue #{next_issue['issue_number']}: {reason}")
+            else:
+                logger.info(f"No waiting issues in pipeline queue for {project_name}/{board_name}")
+                
+        except Exception as e:
+            logger.error(f"Error releasing lock and processing next: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+
     def progress_to_next_stage(self, project_name: str, board_name: str, issue_number: int,
                                current_column: str, repository: str, issue_data: Dict[str, Any]) -> bool:
         """
@@ -351,6 +469,17 @@ class PipelineProgression:
                     break
 
             workflow_template = config_manager.get_workflow_template(pipeline_config.workflow)
+            
+            # Check if this is an exit column
+            is_exit_column = False
+            if hasattr(workflow_template, 'pipeline_exit_columns') and workflow_template.pipeline_exit_columns:
+                is_exit_column = next_column in workflow_template.pipeline_exit_columns
+
+            if is_exit_column:
+                logger.info(f"Issue #{issue_number} moved to exit column '{next_column}'. Releasing pipeline lock.")
+                self._release_lock_and_process_next(project_name, board_name, issue_number, next_column, repository)
+                return True
+
             next_agent = None
             for column in workflow_template.columns:
                 if column.name == next_column:

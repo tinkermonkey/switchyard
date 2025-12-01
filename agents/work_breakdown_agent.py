@@ -68,6 +68,8 @@ class WorkBreakdownAgent(AnalysisAgent):
 
 - Break work into logical phases based on the architecture design
 - Each sub-issue should be a cohesive unit of work for a developer
+- **CRITICAL**: Include DETAILED technical design in each sub-issue. The developer should not need to look up the original architecture document.
+- Copy relevant API signatures, data models, and component interactions directly into the sub-issue.
 - Include all specific requirements, design guidance, and acceptance criteria in each sub-issue
 - Order sub-issues by dependencies (earlier phases first)
 - Keep phase titles concise: "Phase 1: Infrastructure setup"
@@ -195,8 +197,8 @@ class WorkBreakdownAgent(AnalysisAgent):
                         logger.warning(f"No discussion_issue_links in GitHub state for project {project}")
 
                     # Get discussion number from GitHub using the discussion_id
-                    from services.discussions_integration import DiscussionsIntegration
-                    discussions = DiscussionsIntegration()
+                    from services.github_discussions import GitHubDiscussions
+                    discussions = GitHubDiscussions()
                     discussion_details = discussions.get_discussion(discussion_id)
                     if discussion_details:
                         discussion_number = discussion_details.get('number', 'unknown')
@@ -221,8 +223,8 @@ class WorkBreakdownAgent(AnalysisAgent):
                     disc_id = github_state.issue_discussion_links.get(int(issue_number))
                     if disc_id:
                         # Get discussion number for this issue
-                        from services.discussions_integration import DiscussionsIntegration
-                        discussions = DiscussionsIntegration()
+                        from services.github_discussions import GitHubDiscussions
+                        discussions = GitHubDiscussions()
                         discussion_details = discussions.get_discussion(disc_id)
                         if discussion_details:
                             discussion_number = discussion_details.get('number', 'unknown')
@@ -262,6 +264,10 @@ Brief overview of this phase's goals.
 **Design Guidance**:
 - [Specific architecture/design direction]
 - [Technical constraints or patterns to follow]
+- [Relevant API endpoints or signatures]
+- [Data model details for this phase]
+- [Component interaction details]
+- [All relevant technical details, guidance, and context from the architecture design]
 
 **Acceptance Criteria**:
 - [ ] [Testable criterion from test plan]
@@ -285,9 +291,10 @@ Each sub-issue will be created as a sub-task of issue #{parent_issue_number} and
 Make sure to:
 1. Extract phases from the software architect's design (or create logical phases if not explicit)
 2. Break work into smaller chunks if phases are too large
-3. Pull specific requirements from the business analyst's work and specific design guidance from the software architect
-4. Order phases by dependencies (foundational work first)
-5. Keep titles concise and descriptive
+3. **CRITICAL**: Pull specific requirements from the business analyst's work and specific design guidance from the software architect.
+4. **CRITICAL**: Include detailed technical specifications (API signatures, data models, component interactions) in the Design Guidance section. The sub-issue must be self-contained.
+5. Order phases by dependencies (foundational work first)
+6. Keep titles concise and descriptive
 """
 
         return base_prompt + sub_issue_instructions
@@ -325,12 +332,12 @@ Make sure to:
             phase_title = phase_match.group(1).strip()
             phase_content = phase_match.group(2).strip()
 
-            # Extract fields
+            # Extract fields - capture full content including formatting
             title = self._extract_field(phase_content, 'Title', default=phase_title)
             description = self._extract_field(phase_content, 'Description')
-            requirements = self._extract_list_field(phase_content, 'Requirements')
-            design_guidance = self._extract_list_field(phase_content, 'Design Guidance')
-            acceptance_criteria = self._extract_checklist_field(phase_content, 'Acceptance Criteria')
+            requirements = self._extract_field(phase_content, 'Requirements')
+            design_guidance = self._extract_field(phase_content, 'Design Guidance')
+            acceptance_criteria = self._extract_field(phase_content, 'Acceptance Criteria')
             dependencies = self._extract_field(phase_content, 'Dependencies', default='None')
             parent_issue = self._extract_field(phase_content, 'Parent Issue')
             discussion_link = self._extract_field(phase_content, 'Discussion')
@@ -344,20 +351,17 @@ Make sure to:
 
             if requirements:
                 body_parts.append("## Requirements")
-                for req in requirements:
-                    body_parts.append(f"- {req}")
+                body_parts.append(requirements)
                 body_parts.append("")
 
             if design_guidance:
                 body_parts.append("## Design Guidance")
-                for guide in design_guidance:
-                    body_parts.append(f"- {guide}")
+                body_parts.append(design_guidance)
                 body_parts.append("")
 
             if acceptance_criteria:
                 body_parts.append("## Acceptance Criteria")
-                for criterion in acceptance_criteria:
-                    body_parts.append(f"- [ ] {criterion}")
+                body_parts.append(acceptance_criteria)
                 body_parts.append("")
 
             if dependencies and dependencies.lower() != 'none':
@@ -386,60 +390,18 @@ Make sure to:
         return sub_issues
 
     def _extract_field(self, content: str, field_name: str, default: str = '') -> str:
-        """Extract a single field value from markdown content"""
-        pattern = rf'\*\*{re.escape(field_name)}\*\*:\s*(.+?)(?=\n\*\*|\n\n|\Z)'
+        """
+        Extract a single field value from markdown content.
+        Captures everything until the next field marker or end of section.
+        Preserves all formatting (newlines, code blocks, lists).
+        """
+        # Look for **Field**: Value
+        # Stop at next **Field**: (start of line) or end of string
+        pattern = rf'\*\*{re.escape(field_name)}\*\*:\s*(.+?)(?=\n\*\*.+?\*\*[:]|\Z)'
         match = re.search(pattern, content, re.DOTALL)
         if match:
             return match.group(1).strip()
         return default
-
-    def _extract_list_field(self, content: str, field_name: str) -> List[str]:
-        """Extract a bulleted list field from markdown content"""
-        # Find the field header and capture until the next field or end
-        pattern = rf'\*\*{re.escape(field_name)}\*\*:\s*\n(.*?)(?=\n\*\*[A-Z]|\Z)'
-        match = re.search(pattern, content, re.DOTALL)
-        if match:
-            list_content = match.group(1).strip()
-            # Extract all list items (handles multi-line items)
-            items = []
-            current_item = None
-            for line in list_content.split('\n'):
-                if line.strip().startswith('- '):
-                    # New list item
-                    if current_item:
-                        items.append(current_item)
-                    current_item = line.strip()[2:]  # Remove '- ' prefix
-                elif line.strip() and current_item is not None:
-                    # Continuation of current item
-                    current_item += ' ' + line.strip()
-            if current_item:
-                items.append(current_item)
-            return items
-        return []
-
-    def _extract_checklist_field(self, content: str, field_name: str) -> List[str]:
-        """Extract a checklist field from markdown content"""
-        # Find the field header and capture until the next field or end
-        pattern = rf'\*\*{re.escape(field_name)}\*\*:\s*\n(.*?)(?=\n\*\*[A-Z]|\Z)'
-        match = re.search(pattern, content, re.DOTALL)
-        if match:
-            list_content = match.group(1).strip()
-            # Extract all checklist items (handles multi-line items)
-            items = []
-            current_item = None
-            for line in list_content.split('\n'):
-                if line.strip().startswith('- [ ] ') or line.strip().startswith('- [x] '):
-                    # New checklist item
-                    if current_item:
-                        items.append(current_item)
-                    current_item = line.strip()[6:]  # Remove '- [ ] ' or '- [x] ' prefix
-                elif line.strip() and current_item is not None:
-                    # Continuation of current item
-                    current_item += ' ' + line.strip()
-            if current_item:
-                items.append(current_item)
-            return items
-        return []
 
     async def _create_sub_issues(
         self,

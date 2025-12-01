@@ -358,7 +358,7 @@ class PipelineRunManager:
                     "query": {
                         "bool": {
                             "must": [
-                                {"term": {"project.keyword": project}},
+                                {"term": {"project": project}},
                                 {"term": {"issue_number": issue_number}},
                                 {"term": {"status": "active"}}
                             ]
@@ -885,7 +885,7 @@ class PipelineRunManager:
                         "query": {
                             "bool": {
                                 "must": [
-                                    {"term": {"project.keyword": project}},
+                                    {"term": {"project": project}},
                                     {"term": {"issue_number": issue_number}},
                                     {"range": {"timestamp": {"gte": ten_minutes_ago}}}
                                 ]

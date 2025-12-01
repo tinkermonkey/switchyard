@@ -3082,6 +3082,43 @@ def get_failure_signature(fingerprint_id):
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/api/medic/failure-signatures/<fingerprint_id>', methods=['DELETE'])
+def delete_failure_signature(fingerprint_id):
+    """
+    Delete a failure signature and its associated investigation assets.
+    """
+    try:
+        # 1. Delete from Elasticsearch
+        result = es_client.delete_by_query(
+            index="medic-failure-signatures-*",
+            body={
+                "query": {
+                    "term": {"fingerprint_id": fingerprint_id}
+                }
+            }
+        )
+        
+        deleted_count = result.get('deleted', 0)
+        
+        # 2. Delete investigation assets
+        report_manager = get_report_manager()
+        assets_deleted = report_manager.cleanup_investigation(fingerprint_id)
+        
+        if deleted_count == 0 and not assets_deleted:
+             return jsonify({'error': 'Signature not found'}), 404
+             
+        return jsonify({
+            'fingerprint_id': fingerprint_id,
+            'deleted_from_es': deleted_count > 0,
+            'assets_deleted': assets_deleted,
+            'message': f'Successfully deleted signature {fingerprint_id}'
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Failed to delete signature {fingerprint_id}: {e}", exc_info=True)
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/api/medic/failure-signatures/<fingerprint_id>/occurrences', methods=['GET'])
 def get_signature_occurrences(fingerprint_id):
     """
@@ -4126,11 +4163,23 @@ def trigger_claude_fix(fingerprint_id):
     try:
         from services.medic.fix_execution_queue import ClaudeFixExecutionQueue
         from services.medic.claude_report_manager import ClaudeReportManager
+        from services.medic.report_manager import ReportManager
         import redis
         
-        # Check if fix plan exists
-        report_manager = ClaudeReportManager()
-        fix_plan = report_manager.read_fix_plan(fingerprint_id)
+        # Check if fix plan exists in Claude reports
+        claude_report_manager = ClaudeReportManager()
+        fix_plan = claude_report_manager.read_fix_plan(fingerprint_id)
+        
+        report_manager = claude_report_manager
+        is_claude_report = True
+        
+        if not fix_plan:
+            # Check standard reports
+            std_report_manager = ReportManager()
+            fix_plan = std_report_manager.read_fix_plan(fingerprint_id)
+            if fix_plan:
+                report_manager = std_report_manager
+                is_claude_report = False
         
         if not fix_plan:
             return jsonify({
@@ -4139,8 +4188,24 @@ def trigger_claude_fix(fingerprint_id):
             }), 400
             
         # Get project from report summary
-        summary = report_manager.get_investigation_summary(fingerprint_id)
-        project = summary.get('project', 'unknown')
+        if is_claude_report:
+            summary = report_manager.get_investigation_summary(fingerprint_id)
+            project = summary.get('project', 'unknown')
+        else:
+            # For standard reports, we need to get project from context
+            context = report_manager.read_context(fingerprint_id)
+            # Try to extract project from signature or sample logs if not explicit
+            project = 'unknown'
+            if context:
+                # Try to find project in sample logs
+                sample_logs = context.get('sample_logs', [])
+                if sample_logs and len(sample_logs) > 0:
+                    # Check first log for project context
+                    first_log = sample_logs[0]
+                    if isinstance(first_log, dict):
+                        context_data = first_log.get('context', {})
+                        if isinstance(context_data, dict):
+                            project = context_data.get('project', 'unknown')
         
         # Enqueue fix
         redis_client = redis.Redis(

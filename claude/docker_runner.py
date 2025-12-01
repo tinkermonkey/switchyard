@@ -344,6 +344,7 @@ class DockerAgentRunner:
                 container_name=container_name,
                 stream_callback=stream_callback,
                 context=context,
+                project_dir=project_dir,
                 mcp_config_path=mcp_config_path
             )
 
@@ -626,6 +627,7 @@ class DockerAgentRunner:
         container_name: str,
         stream_callback: Optional[Callable],
         context: Dict[str, Any],
+        project_dir: Path,
         mcp_config_path: Optional[str] = None
     ) -> str:
         """Execute Claude Code inside the container"""
@@ -636,6 +638,7 @@ class DockerAgentRunner:
 
         # Get agent info for safety check
         agent = context.get('agent', 'unknown')
+        task_id = context.get('task_id', 'unknown')
         from config.manager import config_manager
         agent_config = config_manager.get_project_agent_config(context.get('project', 'unknown'), agent)
         filesystem_write_allowed = getattr(agent_config, 'filesystem_write_allowed', True)
@@ -654,10 +657,35 @@ class DockerAgentRunner:
             logger.info("✓ Pre-launch verification passed: Container has write access")
 
         # Build the Claude command to run inside container
-        # We always use stdin to pass the prompt (no temp files or command-line args)
+        # We use file-based input/output to support detached execution and orchestrator restarts
+        
+        # Sanitize task_id for filename (replace spaces and special chars)
+        safe_task_id = re.sub(r'[^a-zA-Z0-9_-]', '_', str(task_id))
+        
+        # Write prompt to file in project directory (mounted in container)
+        prompt_filename = f".claude_prompt_{safe_task_id}.txt"
+        prompt_path = project_dir / prompt_filename
+        try:
+            with open(prompt_path, 'w') as f:
+                f.write(prompt)
+            logger.info(f"Wrote prompt to {prompt_path} ({len(prompt)} chars)")
+        except Exception as e:
+            logger.error(f"Failed to write prompt file: {e}")
+            raise
 
         # Check for existing session to resume
         existing_session_id = context.get('claude_session_id')
+
+        # DEBUG: Verify file existence
+        try:
+            if os.path.exists(prompt_path):
+                logger.info(f"DEBUG: Prompt file exists at {prompt_path}")
+                stat = os.stat(prompt_path)
+                logger.info(f"DEBUG: File size: {stat.st_size}, permissions: {oct(stat.st_mode)}")
+            else:
+                logger.error(f"DEBUG: Prompt file DOES NOT EXIST at {prompt_path}")
+        except Exception as e:
+            logger.error(f"DEBUG: Error checking prompt file: {e}")
 
         claude_cmd = [
             'claude',
@@ -674,24 +702,27 @@ class DockerAgentRunner:
             logger.info("Using MCP config: /home/orchestrator/.mcp_config.json")
 
         # Use bypassPermissions for all agents in containerized environment
-        # The container provides isolation, so we can safely bypass permission checks
         claude_cmd.extend(['--permission-mode', 'bypassPermissions'])
-        logger.info("Using --permission-mode bypassPermissions (safe in isolated container)")
 
         # Add --resume flag if continuing an existing session
         if existing_session_id:
             claude_cmd.extend(['--resume', existing_session_id])
             logger.info(f"Resuming Claude Code session: {existing_session_id}")
 
-        # Always pass prompt via stdin (use '-' to tell claude to read from stdin)
-        claude_cmd.append('-')
-
-        # Prepare the command - if we have GITHUB_TOKEN, wrap with gh auth setup
+        # Read prompt from the mounted file
+        # We use 'cat file | claude -' pattern
+        claude_exec_cmd = ' '.join(claude_cmd) + ' -'
+        
+        # Prepare the shell command
+        # 1. Setup gh auth if needed
+        # 2. Cat prompt file into claude
+        # 3. Redirect output to stdout (captured by docker logs)
+        
+        # Quote the filename to handle any remaining special characters
+        quoted_prompt_path = f"'/workspace/{prompt_filename}'"
+        
         github_token = os.environ.get('GITHUB_TOKEN')
-        logger.info(f"DEBUG: Checking for GITHUB_TOKEN, got: {'***' if github_token else 'None'}")
         if github_token:
-            # Create a wrapper that sets up gh with token, then runs claude
-            # Use printf for reliable YAML generation
             yaml_content = (
                 'version: 1\\n'
                 'auth:\\n'
@@ -699,30 +730,27 @@ class DockerAgentRunner:
                 '    oauth_token: $GITHUB_TOKEN\\n'
                 '    git_protocol: https\\n'
             )
-            setup_and_run = (
+            shell_cmd = (
                 'mkdir -p ~/.config/gh && '
                 f'printf \'{yaml_content}\' > ~/.config/gh/hosts.yml && '
-                'exec ' + ' '.join(claude_cmd)
+                f'ls -la /workspace >&2 && '
+                f'cat {quoted_prompt_path} | {claude_exec_cmd}'
             )
-            docker_cmd_with_entrypoint = docker_cmd + ['sh', '-c', setup_and_run]
-            logger.info("Added gh configuration setup before claude execution")
-            full_cmd = docker_cmd_with_entrypoint
         else:
-            # Combine docker command with claude command directly
-            full_cmd = docker_cmd + claude_cmd
+            shell_cmd = f'ls -la /workspace >&2 && cat {quoted_prompt_path} | {claude_exec_cmd}'
 
-        logger.info(f"Executing: docker run ... claude ...")
-        # Log the complete docker command (sanitize tokens)
-        sanitized_cmd = []
-        for i, part in enumerate(full_cmd):
-            if i > 0 and full_cmd[i-1] in ['-e'] and any(x in part for x in ['TOKEN', 'KEY']):
-                # Sanitize tokens
-                key_name = part.split('=')[0]
-                sanitized_cmd.append(f"{key_name}=***")
-            else:
-                sanitized_cmd.append(part)
-        logger.info(f"Full Docker command: {' '.join(sanitized_cmd)}")
+        # Add -d for detached mode
+        docker_cmd.insert(2, '-d')
+        
+        # Remove -i if present (we don't need interactive stdin anymore)
+        if '-i' in docker_cmd:
+            docker_cmd.remove('-i')
 
+        # Construct final command
+        full_cmd = docker_cmd + ['sh', '-c', shell_cmd]
+
+        logger.info(f"Executing detached: docker run -d ...")
+        
         obs = context.get('observability')
         agent = context.get('agent', 'unknown')
         task_id = context.get('task_id', 'unknown')
@@ -738,15 +766,29 @@ class DockerAgentRunner:
             obs.emit_claude_call_started(agent, task_id, project, claude_model)
 
         try:
-            # Always use stdin to pass the prompt
-            logger.info(f"Passing prompt via stdin ({len(prompt)} chars)")
-
-            # Run the container with stdin enabled
-            process = subprocess.Popen(
+            # Launch detached container
+            launch_result = subprocess.run(
                 full_cmd,
+                capture_output=True,
+                text=True
+            )
+            
+            if launch_result.returncode != 0:
+                raise Exception(f"Failed to launch container: {launch_result.stderr}")
+            
+            container_id = launch_result.stdout.strip()
+            logger.info(f"Launched detached container: {container_id[:12]}")
+
+            # Stream logs from the detached container
+            # This allows the orchestrator to restart without killing the container
+            # On restart, we can re-attach to the logs (logic to be added to recovery service)
+            
+            log_cmd = ['docker', 'logs', '-f', container_name]
+            
+            process = subprocess.Popen(
+                log_cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                stdin=subprocess.PIPE,
                 text=True
             )
 
@@ -755,129 +797,98 @@ class DockerAgentRunner:
             stderr_parts = []
             input_tokens = 0
             output_tokens = 0
-            session_id = None  # Track session ID for continuity
+            session_id = None
 
-            # Read both stdout and stderr using threads to avoid deadlock
+            # Read both stdout and stderr using threads
             import threading
 
-            def read_stderr():
-                for line in iter(process.stderr.readline, ''):
-                    if line:
-                        stderr_parts.append(line)
-                        logger.error(f"Container stderr: {line.strip()}")
+            def read_stream(stream, is_stderr):
+                nonlocal session_id, input_tokens, output_tokens
+                for line in iter(stream.readline, ''):
+                    if not line:
+                        break
+                    
+                    line = line.strip()
+                    if not line:
+                        continue
 
-            def write_stdin():
-                """Write prompt to stdin in a separate thread"""
-                try:
-                    logger.debug(f"Writing {len(prompt)} chars to stdin")
-                    process.stdin.write(prompt)
-                    process.stdin.flush()
-                    logger.debug("Stdin write completed, closing stdin")
-                    process.stdin.close()
-                    logger.debug("Stdin closed successfully")
-                except BrokenPipeError:
-                    logger.warning("Broken pipe while writing to stdin (process may have exited early)")
-                except Exception as e:
-                    logger.error(f"Error writing to stdin: {e}")
+                    # Check for token limits in both stdout and stderr
+                    breaker = get_breaker()
+                    if breaker:
+                        is_limit, reset_time = breaker.detect_session_limit(line)
+                        if is_limit:
+                            breaker.trip(reset_time)
+                            logger.error(f"🔴 TRIPPED BREAKER: Token limit detected in output: {line}")
 
-            # Start stderr reader thread
-            stderr_thread = threading.Thread(target=read_stderr, daemon=True)
+                    if is_stderr:
+                        stderr_parts.append(line + '\n')
+                        logger.error(f"Container stderr: {line}")
+                        continue
+
+                    # Parse stdout (Claude JSON events)
+                    try:
+                        event = json.loads(line)
+                        event_type = event.get('type', 'unknown')
+
+                        if 'session_id' in event and not session_id:
+                            session_id = event['session_id']
+                            logger.info(f"Captured Claude Code session_id: {session_id}")
+
+                        if stream_callback:
+                            stream_callback(event)
+
+                        if 'usage' in event:
+                            input_tokens = event['usage'].get('input_tokens', input_tokens)
+                            output_tokens = event['usage'].get('output_tokens', output_tokens)
+
+                        if event_type in ('error', 'error_detail', 'error_event'):
+                            error_msg = event.get('message') or event.get('error') or str(event)
+                            logger.error(f"🔴 Captured Claude Code error event: {error_msg}")
+                            stderr_parts.append(f"CLAUDE_CODE_ERROR: {error_msg}\n")
+
+                        if event_type == 'assistant':
+                            message = event.get('message', {})
+                            content = message.get('content', [])
+                            for item in content:
+                                if isinstance(item, dict) and item.get('type') == 'text':
+                                    text = item.get('text', '')
+                                    if text:
+                                        result_parts.append(text)
+
+                    except json.JSONDecodeError:
+                        # Non-JSON output might be error messages or raw text
+                        # In docker logs, stdout and stderr might be mixed if tty is enabled, 
+                        # but we didn't use -t. 
+                        # However, docker logs combines streams if we don't separate them carefully.
+                        # Here we are reading process.stdout which corresponds to container stdout.
+                        logger.warning(f"Non-JSON stdout: {line}")
+                        stderr_parts.append(f"STDOUT: {line}\n")
+
+            # Start reader threads
+            stdout_thread = threading.Thread(target=read_stream, args=(process.stdout, False), daemon=True)
+            stderr_thread = threading.Thread(target=read_stream, args=(process.stderr, True), daemon=True)
+            
+            stdout_thread.start()
             stderr_thread.start()
 
-            # Start stdin writer thread
-            stdin_thread = threading.Thread(target=write_stdin, daemon=True)
-            stdin_thread.start()
-
-            # Stream stdout
-            for line in iter(process.stdout.readline, ''):
-                if not line:
-                    break
-
-                line = line.strip()
-                if not line:
-                    continue
-
-                try:
-                    event = json.loads(line)
-                    event_type = event.get('type', 'unknown')
-
-                    # Capture session_id for session continuity
-                    if 'session_id' in event and not session_id:
-                        session_id = event['session_id']
-                        logger.info(f"Captured Claude Code session_id: {session_id}")
-
-                    # Stream to callback if provided
-                    if stream_callback:
-                        stream_callback(event)
-
-                    # Track token usage
-                    if 'usage' in event:
-                        input_tokens = event['usage'].get('input_tokens', input_tokens)
-                        output_tokens = event['usage'].get('output_tokens', output_tokens)
-
-                    # CRITICAL: Capture error events (including session limit errors)
-                    # These come on stdout as JSON, not stderr!
-                    if event_type in ('error', 'error_detail', 'error_event'):
-                        error_msg = event.get('message') or event.get('error') or str(event)
-                        error_text = f"CLAUDE_CODE_ERROR ({event_type}): {error_msg}"
-                        logger.error(f"🔴 Captured Claude Code error event: {error_text}")
-                        stderr_parts.append(f"{error_text}\n")
-
-                        # Also check if this error is a token/rate limit (less strict for actual errors)
-                        error_msg_lower = str(error_msg).lower()
-                        # For error events, simpler patterns are OK since they're already errors
-                        limit_error_patterns = [
-                            r'session\s+limit',
-                            r'token\s+limit',
-                            r'rate\s+limit',
-                            r'usage\s+limit',
-                            r'request\s+limit',
-                            r'quota',
-                            r'overloaded'
-                        ]
-                        if any(re.search(pattern, error_msg_lower) for pattern in limit_error_patterns):
-                            logger.error(f"🔴 Detected limit in error event: {error_msg}")
-                            stderr_parts.append(f"SESSION_LIMIT_IN_ERROR: {error_msg}\n")
-
-                    # Collect result text from assistant messages only
-                    # Note: Do not collect from 'result' events as they duplicate the assistant content
-                    if event_type == 'assistant':
-                        message = event.get('message', {})
-                        content = message.get('content', [])
-                        for item in content:
-                            if isinstance(item, dict) and item.get('type') == 'text':
-                                text = item.get('text', '')
-                                if text:
-                                    # CRITICAL: Check for session/token/rate limit in assistant response text!
-                                    # Claude returns "Session limit reached ∙ resets 12am" as assistant text
-                                    # Use regex to avoid false positives from documentation (e.g., "rate limiting features")
-                                    text_lower = text.lower()
-                                    # Only flag if it looks like an actual error (has action verbs or error indicators)
-                                    limit_error_patterns = [
-                                        r'session\s+limit\s+(?:reached|exceeded|hit|met)',
-                                        r'token\s+limit\s+(?:reached|exceeded|hit|met)',
-                                        r'rate\s+limit\s+(?:reached|exceeded|hit|met)',
-                                        r'usage\s+limit\s+(?:reached|exceeded|hit|met)',
-                                        r'request\s+limit\s+(?:reached|exceeded|hit|met)',
-                                        r'quota\s+(?:reached|exceeded|hit|met)',
-                                        r'(?:reached|exceeded|hit)\s+.*?(?:session|token|rate|usage|request)\s+(?:limit|quota)',
-                                    ]
-                                    if any(re.search(pattern, text_lower) for pattern in limit_error_patterns):
-                                        logger.error(f"🔴 Detected limit in assistant response: {text}")
-                                        stderr_parts.append(f"SESSION_LIMIT_IN_RESPONSE: {text}\n")
-
-                                    result_parts.append(text)
-
-                except json.JSONDecodeError:
-                    # Non-JSON output might be error messages
-                    logger.warning(f"Non-JSON stdout: {line}")
-                    stderr_parts.append(f"STDOUT: {line}\n")
-
-            # Wait for completion
-            process.wait(timeout=600)
-
-            # Wait for stderr thread to finish
+            # Wait for container to finish
+            # We use 'docker wait' instead of process.wait() because 'docker logs -f' might hang
+            # or we might want to stop following if the container dies.
+            
+            wait_result = subprocess.run(['docker', 'wait', container_name], capture_output=True, text=True)
+            exit_code = int(wait_result.stdout.strip())
+            
+            # Terminate log streamer
+            process.terminate()
+            stdout_thread.join(timeout=1)
             stderr_thread.join(timeout=1)
+
+            # Cleanup prompt file
+            try:
+                if os.path.exists(prompt_path):
+                    os.remove(prompt_path)
+            except Exception as e:
+                logger.warning(f"Failed to remove prompt file: {e}")
 
             # Emit completion
             if obs:
@@ -886,75 +897,27 @@ class DockerAgentRunner:
                 obs.emit_claude_call_completed(agent, task_id, project, api_duration_ms,
                                                input_tokens, output_tokens)
 
-            if process.returncode == 0:
+            if exit_code == 0:
                 result_text = ''.join(result_parts)
-                logger.info(f"Agent completed successfully in container, result length: {len(result_text)}, session_id: {session_id}")
-
-                # CRITICAL: Check for session limit even on success
-                # Claude Code can return session limit in response but still exit with code 0
-                # Check both stderr_parts (which includes captured session limit messages) and result_text
-                stderr_text = ''.join(stderr_parts) if stderr_parts else ""
-                combined_output = stderr_text + "\n" + result_text
-
-                breaker = get_breaker()
-                if breaker:
-                    is_session_limited, reset_time = breaker.detect_session_limit(combined_output)
-                    if is_session_limited:
-                        breaker.trip(reset_time)
-                        logger.error("🔴 Claude Code token limit detected in successful response - circuit breaker OPEN")
-
-                        # Mark all in-progress executions as failed
-                        from services.claude_code_failure_handler import mark_in_progress_executions_as_failed
-                        mark_in_progress_executions_as_failed("Claude Code session limit reached")
-
-                        # Raise exception to prevent further execution
-                        raise Exception(f"Claude Code session limit reached. Resets at: {reset_time}")
-
-                # Store session_id in context for session continuity
+                logger.info(f"Agent completed successfully in container, result length: {len(result_text)}")
+                
                 if session_id:
                     context['claude_session_id'] = session_id
 
-                # Return just the result text (callers expect string, not dict)
                 return result_text
             else:
-                # Collect error information
-                stderr_text = ''.join(stderr_parts) if stderr_parts else ""
-                
-                # If no stderr captured, try to get container logs
+                stderr_text = ''.join(stderr_parts)
                 if not stderr_text:
-                    try:
-                        logger.warning(f"No stderr captured, attempting to fetch container logs for {container_name}")
-                        logs_result = subprocess.run(
-                            ['docker', 'logs', '--tail', '100', container_name],
-                            capture_output=True,
-                            text=True,
-                            timeout=5
-                        )
-                        if logs_result.stdout or logs_result.stderr:
-                            stderr_text = f"Container logs (last 100 lines):\n{logs_result.stdout}\n{logs_result.stderr}"
-                            logger.info(f"Captured container logs: {len(stderr_text)} chars")
-                    except Exception as log_err:
-                        logger.warning(f"Failed to fetch container logs: {log_err}")
+                    stderr_text = f"Container exited with code {exit_code} but no error output captured."
                 
-                # Final fallback
-                if not stderr_text:
-                    stderr_text = "No error output captured. Container may have crashed or been killed."
-                
-                logger.error(f"Agent failed in container (returncode={process.returncode}): {stderr_text}")
-                
-                # Check for Claude Code session limit error and trip breaker if detected
-                breaker = get_breaker()
-                if breaker:
-                    is_session_limited, reset_time = breaker.detect_session_limit(stderr_text)
-                    if is_session_limited:
-                        breaker.trip(reset_time)
-                        logger.error("🔴 Claude Code token limit detected - circuit breaker OPEN")
-                        
-                        # Mark all in-progress executions as failed
-                        from services.claude_code_failure_handler import mark_in_progress_executions_as_failed
-                        mark_in_progress_executions_as_failed("Claude Code session limit reached")
-                
-                raise Exception(f"Agent execution failed (returncode={process.returncode}): {stderr_text}")
+                logger.error(f"Agent failed in container (exit_code={exit_code}): {stderr_text}")
+                raise Exception(f"Agent execution failed (exit_code={exit_code}): {stderr_text}")
+
+        except Exception as e:
+            logger.error(f"Agent execution error: {e}")
+            # Try to kill container if it's still running
+            self._cleanup_container(container_name)
+            raise
 
         except subprocess.TimeoutExpired:
             logger.error("Agent execution timed out")

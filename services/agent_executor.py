@@ -11,6 +11,7 @@ All agent executions MUST go through this service to ensure:
 import logging
 import time
 import json
+import asyncio
 from typing import Dict, Any, Optional
 from datetime import datetime, timezone
 from pathlib import Path
@@ -168,8 +169,41 @@ class AgentExecutor:
 
         # Execute agent
         start_time = time.time()
+        
+        # Get retry configuration
+        agent_config = agent_stage.agent_config or {}
+        if isinstance(agent_config, dict):
+            retries = agent_config.get('retries', 2)
+        else:
+            retries = getattr(agent_config, 'retries', 2)
+            
+        max_attempts = 1 + retries
+        attempt = 0
+        
         try:
-            result = await agent_stage.execute(execution_context)
+            while attempt < max_attempts:
+                attempt += 1
+                try:
+                    if attempt > 1:
+                        logger.info(f"Retry attempt {attempt}/{max_attempts} for agent {agent_name}")
+                        
+                    # Use run_with_circuit_breaker instead of direct execute
+                    result = await agent_stage.run_with_circuit_breaker(execution_context)
+                    
+                    # If successful, break the retry loop
+                    break
+                    
+                except Exception as e:
+                    # Check if we should retry
+                    if attempt < max_attempts:
+                        logger.warning(f"Agent execution failed (attempt {attempt}/{max_attempts}): {e}")
+                        # Wait before retry (exponential backoff: 2s, 4s, 8s...)
+                        wait_time = 2 ** attempt
+                        logger.info(f"Waiting {wait_time}s before retry...")
+                        await asyncio.sleep(wait_time)
+                    else:
+                        # Out of retries, re-raise to be caught by outer block
+                        raise e
 
             # Extract output from result for event emission
             output_text = None
@@ -512,6 +546,22 @@ class AgentExecutor:
 
             task_queue = TaskQueue(use_redis=True)
 
+            # Try to find the column for dev_environment_verifier
+            verifier_column = 'Verification'  # Default
+            try:
+                project_config = config_manager.get_project_config(project_name)
+                board_name = task_context.get('board')
+                if board_name and board_name != 'system':
+                    pipeline = next((p for p in project_config.pipelines if p.board_name == board_name), None)
+                    if pipeline:
+                        workflow = config_manager.get_workflow_template(pipeline.workflow)
+                        for col in workflow.columns:
+                            if col.agent == 'dev_environment_verifier':
+                                verifier_column = col.name
+                                break
+            except Exception:
+                pass
+
             # Create verifier task with reference to setup output
             task = Task(
                 id=f"auto_dev_env_verify_{project_name}_{int(utc_now().timestamp())}",
@@ -526,6 +576,7 @@ class AgentExecutor:
                     }),
                     'issue_number': task_context.get('issue_number', 0),
                     'board': task_context.get('board', 'system'),
+                    'column': verifier_column,  # Pass the column so auto-advance works
                     'repository': project_name,
                     'automated_setup': True,
                     'auto_triggered': True,

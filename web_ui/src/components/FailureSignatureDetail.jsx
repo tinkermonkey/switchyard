@@ -1,6 +1,8 @@
 import { useEffect, useState } from 'react'
-import { AlertCircle, Clock, Code, Play, FileText, Wrench } from 'lucide-react'
+import { AlertCircle, Clock, Code, Play, FileText, Wrench, Trash2 } from 'lucide-react'
+import { useNavigate } from '@tanstack/react-router'
 import InvestigationReport from './InvestigationReport'
+import ConfirmationModal from './ConfirmationModal'
 import { useSocket } from '../contexts'
 
 export default function FailureSignatureDetail({ fingerprintId }) {
@@ -10,7 +12,10 @@ export default function FailureSignatureDetail({ fingerprintId }) {
   const [error, setError] = useState(null)
   const [showDiagnosis, setShowDiagnosis] = useState(false)
   const [showFixPlan, setShowFixPlan] = useState(false)
+  const [showDeleteModal, setShowDeleteModal] = useState(false)
+  const [modalConfig, setModalConfig] = useState({ show: false, title: '', message: '', isDangerous: false })
   const { medicEvents } = useSocket()
+  const navigate = useNavigate()
 
   useEffect(() => {
     fetchSignatureDetails()
@@ -67,10 +72,21 @@ export default function FailureSignatureDetail({ fingerprintId }) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ priority: 'high' })
       })
-      if (!response.ok) throw new Error('Failed to trigger investigation')
+      if (!response.ok) {
+        const data = await response.json().catch(() => ({}))
+        throw new Error(data.error || 'Failed to trigger investigation')
+      }
       fetchSignatureDetails() // Refresh to update investigation status
     } catch (err) {
-      alert(`Error: ${err.message}`)
+      setModalConfig({
+        show: true,
+        title: 'Investigation Failed',
+        message: err.message,
+        isDangerous: true,
+        onConfirm: () => setModalConfig(prev => ({ ...prev, show: false })),
+        confirmText: 'Close',
+        cancelText: null
+      })
     }
   }
 
@@ -80,10 +96,21 @@ export default function FailureSignatureDetail({ fingerprintId }) {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' }
       })
-      if (!response.ok) throw new Error('Failed to trigger fix')
+      if (!response.ok) {
+        const data = await response.json().catch(() => ({}))
+        throw new Error(data.error || 'Failed to trigger fix')
+      }
       fetchSignatureDetails() // Refresh
     } catch (err) {
-      alert(`Error: ${err.message}`)
+      setModalConfig({
+        show: true,
+        title: 'Fix Failed',
+        message: err.message,
+        isDangerous: true,
+        onConfirm: () => setModalConfig(prev => ({ ...prev, show: false })),
+        confirmText: 'Close',
+        cancelText: null
+      })
     }
   }
 
@@ -94,10 +121,44 @@ export default function FailureSignatureDetail({ fingerprintId }) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ status: newStatus })
       })
-      if (!response.ok) throw new Error('Failed to update status')
+      if (!response.ok) {
+        const data = await response.json().catch(() => ({}))
+        throw new Error(data.error || 'Failed to update status')
+      }
       fetchSignatureDetails()
     } catch (err) {
-      alert(`Error: ${err.message}`)
+      setModalConfig({
+        show: true,
+        title: 'Update Failed',
+        message: err.message,
+        isDangerous: true,
+        onConfirm: () => setModalConfig(prev => ({ ...prev, show: false })),
+        confirmText: 'Close',
+        cancelText: null
+      })
+    }
+  }
+
+  const deleteSignature = async () => {
+    try {
+      const response = await fetch(`/api/medic/failure-signatures/${fingerprintId}`, {
+        method: 'DELETE'
+      })
+      if (!response.ok) {
+        const data = await response.json().catch(() => ({}))
+        throw new Error(data.error || 'Failed to delete signature')
+      }
+      navigate({ to: '/medic' })
+    } catch (err) {
+      setModalConfig({
+        show: true,
+        title: 'Delete Failed',
+        message: err.message,
+        isDangerous: true,
+        onConfirm: () => setModalConfig(prev => ({ ...prev, show: false })),
+        confirmText: 'Close',
+        cancelText: null
+      })
     }
   }
 
@@ -149,6 +210,9 @@ export default function FailureSignatureDetail({ fingerprintId }) {
             <h2 className="text-xl font-semibold text-gh-fg">
               {signature.signature?.error_type}: {signature.signature?.normalized_message}
             </h2>
+            <p className="text-xs text-gh-fg-muted mt-1 font-mono select-all">
+              ID: {fingerprintId}
+            </p>
             <p className="text-sm text-gh-fg-muted mt-2 font-mono">
               {signature.signature?.error_pattern}
             </p>
@@ -183,6 +247,13 @@ export default function FailureSignatureDetail({ fingerprintId }) {
               <option value="resolved">Resolved</option>
               <option value="ignored">Ignored</option>
             </select>
+            <button
+              onClick={() => setShowDeleteModal(true)}
+              className="px-3 py-2 bg-red-600/10 text-red-600 border border-red-600/20 rounded hover:bg-red-600/20 transition-colors"
+              title="Delete Signature"
+            >
+              <Trash2 className="w-4 h-4" />
+            </button>
           </div>
         </div>
 
@@ -223,19 +294,25 @@ export default function FailureSignatureDetail({ fingerprintId }) {
         </div>
       </div>
 
-      {/* Stack Signature */}
-      {signature.signature?.stack_signature && (
+      {/* Stack / Context Signature */}
+      {(signature.signature?.stack_signature?.length > 0 || signature.signature?.context_signature) && (
         <div className="bg-gh-canvas-subtle border border-gh-border rounded-lg p-4">
           <h3 className="text-sm font-semibold text-gh-fg mb-3 flex items-center gap-2">
             <Code className="w-4 h-4" />
-            Stack Signature
+            {signature.signature?.context_signature ? 'Context Signature' : 'Stack Signature'}
           </h3>
-          <div className="bg-gh-canvas border border-gh-border rounded p-3 font-mono text-xs">
-            {signature.signature.stack_signature.map((frame, idx) => (
-              <div key={idx} className="text-gh-fg-muted">
-                {frame}
+          <div className="bg-gh-canvas border border-gh-border rounded p-3 font-mono text-xs overflow-x-auto">
+            {signature.signature?.stack_signature?.length > 0 ? (
+              signature.signature.stack_signature.map((frame, idx) => (
+                <div key={idx} className="text-gh-fg-muted whitespace-pre">
+                  {frame}
+                </div>
+              ))
+            ) : (
+              <div className="text-gh-fg-muted whitespace-pre">
+                {signature.signature?.context_signature}
               </div>
-            ))}
+            )}
           </div>
         </div>
       )}
@@ -325,6 +402,27 @@ export default function FailureSignatureDetail({ fingerprintId }) {
         <h3 className="text-sm font-semibold text-gh-fg mb-3">Occurrence Timeline</h3>
         <OccurrenceTimeline occurrences={occurrences} />
       </div>
+
+      <ConfirmationModal
+        show={showDeleteModal}
+        onClose={() => setShowDeleteModal(false)}
+        onConfirm={deleteSignature}
+        title="Delete Failure Signature"
+        message="Are you sure you want to delete this failure signature? This will also delete all associated investigation reports and assets. This action cannot be undone."
+        confirmText="Delete"
+        isDangerous={true}
+      />
+
+      <ConfirmationModal
+        show={modalConfig.show}
+        onClose={() => setModalConfig(prev => ({ ...prev, show: false }))}
+        onConfirm={modalConfig.onConfirm}
+        title={modalConfig.title}
+        message={modalConfig.message}
+        confirmText={modalConfig.confirmText}
+        cancelText={modalConfig.cancelText}
+        isDangerous={modalConfig.isDangerous}
+      />
     </div>
   )
 }

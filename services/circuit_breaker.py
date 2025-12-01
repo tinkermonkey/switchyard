@@ -9,6 +9,7 @@ import asyncio
 import logging
 import redis
 import json
+import os
 from enum import Enum
 from datetime import datetime, timedelta
 from typing import Callable, Any, Optional
@@ -27,7 +28,7 @@ class CircuitState(Enum):
 @dataclass
 class CircuitBreakerConfig:
     """Circuit breaker configuration"""
-    failure_threshold: int = 5        # Failures before opening circuit
+    failure_threshold: int = 3        # Failures before opening circuit
     recovery_timeout: int = 30        # Seconds to wait before testing recovery
     success_threshold: int = 2        # Successes in half-open before closing
     expected_exception: type = Exception
@@ -57,7 +58,7 @@ class CircuitBreaker:
     def __init__(
         self,
         name: str,
-        failure_threshold: int = 5,
+        failure_threshold: int = 3,
         recovery_timeout: int = 30,
         success_threshold: int = 2,
         expected_exception: type = Exception
@@ -78,22 +79,30 @@ class CircuitBreaker:
         self.success_threshold = success_threshold
         self.expected_exception = expected_exception
 
-        # Redis client for state persistence - try multiple hosts
+        # Redis client for state persistence
         self.redis_client = None
-        for host in ['redis', 'localhost', '127.0.0.1']:
+        
+        # Try configured host first, then fallbacks
+        redis_host = os.environ.get('REDIS_HOST')
+        redis_port = int(os.environ.get('REDIS_PORT', 6379))
+        
+        hosts_to_try = [redis_host] if redis_host else ['redis', 'localhost', '127.0.0.1']
+        
+        for host in hosts_to_try:
             try:
                 self.redis_client = redis.Redis(
                     host=host,
-                    port=6379,
+                    port=redis_port,
                     decode_responses=True,
                     socket_connect_timeout=2,
                     socket_timeout=2
                 )
                 self.redis_client.ping()
-                logger.debug(f"Circuit breaker '{name}' connected to Redis at {host}")
+                logger.debug(f"Circuit breaker '{name}' connected to Redis at {host}:{redis_port}")
                 break
             except Exception as e:
-                logger.debug(f"Could not connect to Redis at {host}: {e}")
+                logger.debug(f"Could not connect to Redis at {host}:{redis_port}: {e}")
+                self.redis_client = None
                 continue
 
         if not self.redis_client:

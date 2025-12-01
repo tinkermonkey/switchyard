@@ -27,7 +27,7 @@ agents:
 
   dev_environment_verifier:
     description: "Verifies dev environment setup succeeded and marks container as verified"
-    model: "claude-opus-4-20250514"
+    model: "claude-opus-4-5-20251101"
     timeout: 300
     retries: 2
     makes_code_changes: false  # Only verifies and updates state
@@ -48,7 +48,7 @@ agents:
 
   idea_researcher:
     description: "Market research and idea validation"
-    model: "claude-opus-4-20250514"
+    model: "claude-opus-4-5-20251101"
     timeout: 300
     retries: 2
     makes_code_changes: false  # Posts research to GitHub discussions, doesn't create files
@@ -152,7 +152,7 @@ agents:
 
   code_reviewer:
     description: "Code quality review and validation"
-    model: "claude-opus-4-20250514"
+    model: "claude-opus-4-5-20251101"
     timeout: 300
     retries: 2
     makes_code_changes: false  # Review only, no changes
@@ -224,6 +224,26 @@ agents:
       - file_operations
       - git_integration
     mcp_servers: []  # No MCP servers needed for basic testing
+
+  claude_advisor:
+    description: "Analyzes project failures and recommends improvements"
+    model: "claude-sonnet-4-5-20250929"
+    timeout: 600
+    retries: 1
+    makes_code_changes: false
+    filesystem_write_allowed: true  # Allow running tests/scripts that might write temp files
+    requires_dev_container: true  # Needs project dependencies to analyze/run code
+    requires_docker: true
+    capabilities:
+      - failure_analysis
+      - code_analysis
+      - recommendation_generation
+    tools_enabled:
+      - file_operations
+      - git_integration
+      - web_search
+    mcp_servers:
+      - context7
 
 # Default agent configuration applied to all agents
 default_config:

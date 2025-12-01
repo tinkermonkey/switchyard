@@ -1,7 +1,8 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useState, useRef } from 'react'
 import { Link } from '@tanstack/react-router'
-import { AlertCircle, TrendingUp, Clock, Play, Wrench } from 'lucide-react'
+import { AlertCircle, TrendingUp, Clock, Play, Wrench, Loader2 } from 'lucide-react'
 import { useSocket } from '../contexts'
+import ConfirmationModal from './ConfirmationModal'
 
 export default function FailureSignatureList() {
   const [signatures, setSignatures] = useState([])
@@ -15,17 +16,75 @@ export default function FailureSignatureList() {
   const [sortBy, setSortBy] = useState('last_seen')
   const [sortOrder, setSortOrder] = useState('desc')
   const { medicEvents } = useSocket()
+  
+  const [processingIds, setProcessingIds] = useState(new Set())
+  const [modalConfig, setModalConfig] = useState({ show: false, title: '', message: '', isDangerous: false })
+  const lastProcessedEventRef = useRef(null)
 
   useEffect(() => {
     fetchSignatures()
   }, [filters, sortBy, sortOrder])
 
-  // Refresh list when medic events occur
+  // Handle real-time updates
   useEffect(() => {
-    if (medicEvents.length > 0) {
-      fetchSignatures()
-    }
+    if (medicEvents.length === 0) return
+
+    const latestEvent = medicEvents[0]
+    if (lastProcessedEventRef.current === latestEvent) return
+    lastProcessedEventRef.current = latestEvent
+
+    handleMedicEvent(latestEvent)
   }, [medicEvents])
+
+  const handleMedicEvent = (event) => {
+    setSignatures(prev => {
+      const index = prev.findIndex(s => s.fingerprint_id === event.fingerprint_id)
+      
+      if (index === -1) {
+        // If it's a new signature, we might want to fetch fresh data or add it if we have enough info
+        // For now, we'll skip adding new ones to avoid complex sorting/filtering logic on the client
+        // unless we want to just prepend it.
+        if (event.event_type === 'signature_created' || event.event_type === 'claude_signature_created') {
+           // Optional: fetchSignatures() if we want to see new ones immediately
+        }
+        return prev
+      }
+
+      const newSignatures = [...prev]
+      const sig = newSignatures[index]
+      
+      // Merge updates based on event type
+      switch (event.event_type) {
+        case 'signature_updated':
+        case 'claude_signature_updated':
+        case 'signature_trending':
+        case 'claude_signature_trending':
+          // Merge available fields. Note: event might not have all fields, so be careful.
+          // Assuming event contains the updated fields.
+          newSignatures[index] = { ...sig, ...event }
+          break
+          
+        case 'investigation_queued':
+          newSignatures[index] = { ...sig, investigation_status: 'queued' }
+          break
+        case 'investigation_started':
+          newSignatures[index] = { ...sig, investigation_status: 'in_progress' }
+          break
+        case 'investigation_completed':
+        case 'claude_investigation_completed':
+          newSignatures[index] = { ...sig, investigation_status: 'completed' }
+          break
+        case 'investigation_failed':
+          newSignatures[index] = { ...sig, investigation_status: 'failed' }
+          break
+        case 'signature_resolved':
+          newSignatures[index] = { ...sig, status: 'resolved' }
+          break
+      }
+      
+      return newSignatures
+    })
+  }
 
   const fetchSignatures = async () => {
     try {
@@ -78,29 +137,70 @@ export default function FailureSignatureList() {
   }
 
   const triggerInvestigation = async (fingerprintId) => {
+    setProcessingIds(prev => new Set(prev).add(fingerprintId))
     try {
       const response = await fetch(`/api/medic/investigations/${fingerprintId}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ priority: 'high' })
       })
-      if (!response.ok) throw new Error('Failed to trigger investigation')
-      fetchSignatures() // Refresh list
+      if (!response.ok) {
+        const data = await response.json().catch(() => ({}))
+        throw new Error(data.error || 'Failed to trigger investigation')
+      }
+      // Optimistic update
+      setSignatures(prev => prev.map(s => 
+        s.fingerprint_id === fingerprintId 
+          ? { ...s, investigation_status: 'queued' } 
+          : s
+      ))
     } catch (err) {
-      alert(`Error: ${err.message}`)
+      setModalConfig({
+        show: true,
+        title: 'Investigation Failed',
+        message: err.message,
+        isDangerous: true,
+        onConfirm: () => setModalConfig(prev => ({ ...prev, show: false })),
+        confirmText: 'Close',
+        cancelText: null
+      })
+    } finally {
+      setProcessingIds(prev => {
+        const next = new Set(prev)
+        next.delete(fingerprintId)
+        return next
+      })
     }
   }
 
   const triggerFix = async (fingerprintId) => {
+    setProcessingIds(prev => new Set(prev).add(fingerprintId))
     try {
       const response = await fetch(`/api/medic/claude/fixes/${fingerprintId}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' }
       })
-      if (!response.ok) throw new Error('Failed to trigger fix')
-      fetchSignatures() // Refresh list
+      if (!response.ok) {
+        const data = await response.json().catch(() => ({}))
+        throw new Error(data.error || 'Failed to trigger fix')
+      }
+      // Optimistic update not strictly needed as socket will update, but good for feedback
     } catch (err) {
-      alert(`Error: ${err.message}`)
+      setModalConfig({
+        show: true,
+        title: 'Fix Failed',
+        message: err.message,
+        isDangerous: true,
+        onConfirm: () => setModalConfig(prev => ({ ...prev, show: false })),
+        confirmText: 'Close',
+        cancelText: null
+      })
+    } finally {
+      setProcessingIds(prev => {
+        const next = new Set(prev)
+        next.delete(fingerprintId)
+        return next
+      })
     }
   }
 
@@ -202,15 +302,27 @@ export default function FailureSignatureList() {
               signature={sig}
               onTriggerInvestigation={triggerInvestigation}
               onTriggerFix={triggerFix}
+              isProcessing={processingIds.has(sig.fingerprint_id)}
             />
           ))}
         </div>
       )}
+
+      <ConfirmationModal
+        show={modalConfig.show}
+        onClose={() => setModalConfig(prev => ({ ...prev, show: false }))}
+        onConfirm={modalConfig.onConfirm}
+        title={modalConfig.title}
+        message={modalConfig.message}
+        confirmText={modalConfig.confirmText}
+        cancelText={modalConfig.cancelText}
+        isDangerous={modalConfig.isDangerous}
+      />
     </div>
   )
 }
 
-function FailureSignatureCard({ signature, onTriggerInvestigation, onTriggerFix }) {
+function FailureSignatureCard({ signature, onTriggerInvestigation, onTriggerFix, isProcessing }) {
   const getSeverityColor = (severity) => {
     switch (severity) {
       case 'CRITICAL': return 'text-red-500 bg-red-500/10 border-red-500/20'
@@ -296,9 +408,10 @@ function FailureSignatureCard({ signature, onTriggerInvestigation, onTriggerFix 
               e.preventDefault()
               onTriggerInvestigation(signature.fingerprint_id)
             }}
-            className="ml-4 px-3 py-1.5 bg-gh-accent-emphasis text-white rounded text-xs hover:bg-gh-accent-primary transition-colors flex items-center gap-1"
+            disabled={isProcessing}
+            className={`ml-4 px-3 py-1.5 bg-gh-accent-emphasis text-white rounded text-xs hover:bg-gh-accent-primary transition-colors flex items-center gap-1 ${isProcessing ? 'opacity-50 cursor-not-allowed' : ''}`}
           >
-            <Play className="w-3 h-3" />
+            {isProcessing ? <Loader2 className="w-3 h-3 animate-spin" /> : <Play className="w-3 h-3" />}
             {signature.investigation_status === 'failed' ? 'Retry' : 'Investigate'}
           </button>
         )}
@@ -309,9 +422,10 @@ function FailureSignatureCard({ signature, onTriggerInvestigation, onTriggerFix 
               e.preventDefault()
               onTriggerFix(signature.fingerprint_id)
             }}
-            className="ml-4 px-3 py-1.5 bg-green-600 text-white rounded text-xs hover:bg-green-700 transition-colors flex items-center gap-1"
+            disabled={isProcessing}
+            className={`ml-4 px-3 py-1.5 bg-green-600 text-white rounded text-xs hover:bg-green-700 transition-colors flex items-center gap-1 ${isProcessing ? 'opacity-50 cursor-not-allowed' : ''}`}
           >
-            <Wrench className="w-3 h-3" />
+            {isProcessing ? <Loader2 className="w-3 h-3 animate-spin" /> : <Wrench className="w-3 h-3" />}
             Fix
           </button>
         )}

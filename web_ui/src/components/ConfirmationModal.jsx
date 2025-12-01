@@ -58,12 +58,14 @@ export default function ConfirmationModal({
             >
               {confirmText}
             </button>
-            <button
-              onClick={onClose}
-              className="px-4 py-2 text-sm font-medium text-gh-fg bg-gh-canvas-subtle border border-gh-border rounded-md hover:bg-gh-border-muted transition-colors"
-            >
-              {cancelText}
-            </button>
+            {cancelText && (
+              <button
+                onClick={onClose}
+                className="px-4 py-2 text-sm font-medium text-gh-fg bg-gh-canvas-subtle border border-gh-border rounded-md hover:bg-gh-border-muted transition-colors"
+              >
+                {cancelText}
+              </button>
+            )}
           </div>
         </div>
       </div>

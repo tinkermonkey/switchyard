@@ -183,7 +183,7 @@ workflow_templates:
         stage_mapping: "implementation_review"
         agent: "code_reviewer"
         maker_agent: "senior_software_engineer"
-        max_iterations: 3
+        max_iterations: 5
         auto_advance_on_approval: true
         escalate_on_blocked: true
         description: "Code quality validation"

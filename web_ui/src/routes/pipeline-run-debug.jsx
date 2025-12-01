@@ -1,5 +1,5 @@
 import { createFileRoute, Link } from '@tanstack/react-router'
-import { RefreshCw, Activity, CheckCircle, ArrowRight, XCircle } from 'lucide-react'
+import { RefreshCw, Activity, CheckCircle, ArrowRight, XCircle, MessageSquare } from 'lucide-react'
 import Header from '../components/Header'
 import NavigationTabs from '../components/NavigationTabs'
 import PipelineRunEventLog from '../components/PipelineRunEventLog'
@@ -491,6 +491,28 @@ function PipelineRunDebugView() {
     return latestEvent.agent_execution_id || null
   }, [mergedEvents])
 
+  // Determine if currently in conversational loop
+  const isConversational = useMemo(() => {
+    if (!mergedEvents || mergedEvents.length === 0) return false
+    
+    // Sort events by timestamp descending (newest first) to find latest status
+    const sortedEvents = [...mergedEvents].sort((a, b) => {
+      const tA = new Date(a.timestamp).getTime()
+      const tB = new Date(b.timestamp).getTime()
+      return tB - tA
+    })
+
+    for (const event of sortedEvents) {
+      if (['conversational_loop_started', 'feedback_listening_started', 'conversational_loop_resumed'].includes(event.event_type)) {
+        return true
+      }
+      if (['feedback_listening_stopped', 'conversational_loop_paused', 'pipeline_stage_transition', 'agent_completed'].includes(event.event_type)) {
+        return false
+      }
+    }
+    return false
+  }, [mergedEvents])
+
   return (
     <div className="min-h-screen p-5 bg-gh-canvas text-gh-fg">
       <Header />
@@ -619,28 +641,41 @@ function PipelineRunDebugView() {
         <div className="flex-1">
           {/* Actions Bar */}
           {selectedPipelineRun && (
-            <div className="mb-3 flex gap-2">
-              {latestAgentExecutionId && (
-                <Link
-                  to="/agent-execution/$executionId"
-                  params={{ executionId: latestAgentExecutionId }}
-                  className="inline-flex items-center gap-2 px-4 py-2 bg-gh-canvas border border-gh-border rounded-md hover:bg-gh-border-muted transition-colors text-sm"
-                >
-                  <span>View Latest Agent Execution</span>
-                  <ArrowRight className="w-4 h-4" />
-                </Link>
+            <div className="mb-3 flex flex-col gap-2">
+              {/* Conversational Loop Indicator */}
+              {isConversational && (
+                <div className="bg-blue-900/20 border border-blue-800 text-blue-400 px-4 py-3 rounded-md flex items-center gap-3 mb-2">
+                  <MessageSquare className="w-5 h-5 animate-pulse" />
+                  <div>
+                    <div className="font-semibold">Conversational Loop Active</div>
+                    <div className="text-xs opacity-80">Waiting for human feedback on GitHub...</div>
+                  </div>
+                </div>
               )}
-              
-              {selectedPipelineRun.status === 'active' && (
-                <button
-                  onClick={handleKillRun}
-                  className="px-3 py-2 text-sm bg-red-900/20 border border-red-800 text-red-400 rounded hover:bg-red-900/40 transition-colors whitespace-nowrap flex items-center gap-1"
-                  title="Kill this pipeline run"
-                >
-                  <XCircle className="w-4 h-4" />
-                  Kill Run
-                </button>
-              )}
+
+              <div className="flex gap-2">
+                {latestAgentExecutionId && (
+                  <Link
+                    to="/agent-execution/$executionId"
+                    params={{ executionId: latestAgentExecutionId }}
+                    className="inline-flex items-center gap-2 px-4 py-2 bg-gh-canvas border border-gh-border rounded-md hover:bg-gh-border-muted transition-colors text-sm"
+                  >
+                    <span>View Latest Agent Execution</span>
+                    <ArrowRight className="w-4 h-4" />
+                  </Link>
+                )}
+                
+                {selectedPipelineRun.status === 'active' && (
+                  <button
+                    onClick={handleKillRun}
+                    className="px-3 py-2 text-sm bg-red-900/20 border border-red-800 text-red-400 rounded hover:bg-red-900/40 transition-colors whitespace-nowrap flex items-center gap-1"
+                    title="Kill this pipeline run"
+                  >
+                    <XCircle className="w-4 h-4" />
+                    Kill Run
+                  </button>
+                )}
+              </div>
             </div>
           )}
 

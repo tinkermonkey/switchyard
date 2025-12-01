@@ -468,11 +468,9 @@ class ProjectMonitor:
                     if not content:  # Skip draft items
                         continue
 
-                    # Skip closed issues - they should not trigger any agents
+                    # Include closed issues so we can detect moves to Done/Exit columns and release locks
+                    # trigger_agent_for_status will handle skipping agent execution for closed issues
                     issue_state = content.get('state', '').upper()
-                    if issue_state == 'CLOSED':
-                        logger.debug(f"Skipping closed issue #{content['number']} in project query")
-                        continue
 
                     # Find status field
                     status = "No Status"
@@ -768,9 +766,31 @@ class ProjectMonitor:
                     
                     if parent_issue_number:
                         logger.info(f"Found parent issue #{parent_issue_number}, checking for agent outputs")
-                        parent_outputs = self._get_agent_outputs_from_issue(
-                            repository, parent_issue_number, org, current_stage_config.inputs_from
-                        )
+                        
+                        # Check if parent issue has a discussion associated with it
+                        parent_discussion_id = None
+                        try:
+                            from config.state_manager import GitHubStateManager
+                            state_manager = GitHubStateManager()
+                            github_state = state_manager.load_project_state(project_name)
+                            if github_state and github_state.issue_discussion_links:
+                                parent_discussion_id = github_state.issue_discussion_links.get(parent_issue_number)
+                        except Exception as e:
+                            logger.warning(f"Error looking up discussion for parent issue #{parent_issue_number}: {e}")
+
+                        parent_outputs = None
+                        if parent_discussion_id:
+                            logger.info(f"Found discussion {parent_discussion_id} for parent issue #{parent_issue_number}, checking for agent outputs")
+                            parent_outputs = self._get_agent_outputs_from_discussion(
+                                parent_discussion_id, current_stage_config.inputs_from
+                            )
+                        
+                        # If no outputs found in discussion (or no discussion), check issue comments
+                        if not parent_outputs:
+                            logger.info(f"Checking parent issue #{parent_issue_number} comments for agent outputs")
+                            parent_outputs = self._get_agent_outputs_from_issue(
+                                repository, parent_issue_number, org, current_stage_config.inputs_from
+                            )
                         
                         if parent_outputs:
                             logger.info(f"Found agent outputs in parent issue #{parent_issue_number}")
@@ -838,24 +858,32 @@ class ProjectMonitor:
             agent_comments = []
             for comment in data.get('comments', []):
                 body = comment.get('body', '')
+                
                 # Match agent signature pattern
+                agent_name = None
                 if '_Processed by the ' in body and ' agent_' in body:
-                    # Extract agent name from signature
                     import re
                     match = re.search(r'_Processed by the (.+?) agent_', body)
                     if match:
                         agent_name = match.group(1)
-                        timestamp = comment.get('createdAt')
-                        parsed_time = date_parser.parse(timestamp)
-                        if parsed_time.tzinfo is None:
-                            parsed_time = parsed_time.replace(tzinfo=timezone.utc)
+                elif 'Processed by the ' in body and ' agent' in body:
+                    import re
+                    match = re.search(r'Processed by the (.+?) agent', body)
+                    if match:
+                        agent_name = match.group(1)
 
-                        agent_comments.append({
-                            'agent': agent_name,
-                            'body': body,
-                            'timestamp': parsed_time,
-                            'raw_timestamp': timestamp
-                        })
+                if agent_name:
+                    timestamp = comment.get('createdAt')
+                    parsed_time = date_parser.parse(timestamp)
+                    if parsed_time.tzinfo is None:
+                        parsed_time = parsed_time.replace(tzinfo=timezone.utc)
+
+                    agent_comments.append({
+                        'agent': agent_name,
+                        'body': body,
+                        'timestamp': parsed_time,
+                        'raw_timestamp': timestamp
+                    })
 
             if not agent_comments:
                 return ""  # No agent comments yet
@@ -1097,6 +1125,7 @@ class ProjectMonitor:
 
             for agent_name in agent_names:
                 agent_signature = f"_Processed by the {agent_name} agent_"
+                alt_signature = f"Processed by the {agent_name} agent"
 
                 # Find agent's FINAL output (could be in top-level OR threaded reply)
                 final_output = None
@@ -1106,7 +1135,8 @@ class ProjectMonitor:
                 # Check threaded replies first (most recent refinements)
                 for comment in all_comments:
                     for reply in comment.get('replies', {}).get('nodes', []):
-                        if agent_signature in reply.get('body', ''):
+                        body = reply.get('body', '')
+                        if agent_signature in body or alt_signature in body:
                             reply_time = date_parser.parse(reply.get('createdAt'))
                             if final_timestamp is None or reply_time > final_timestamp:
                                 final_output = reply
@@ -1115,7 +1145,8 @@ class ProjectMonitor:
 
                 # Check top-level comments (initial outputs)
                 for comment in all_comments:
-                    if agent_signature in comment.get('body', ''):
+                    body = comment.get('body', '')
+                    if agent_signature in body or alt_signature in body:
                         comment_time = date_parser.parse(comment.get('createdAt'))
                         if final_timestamp is None or comment_time > final_timestamp:
                             final_output = comment
@@ -1200,13 +1231,15 @@ class ProjectMonitor:
 
             for agent_name in agent_names:
                 agent_signature = f"_Processed by the {agent_name} agent_"
+                alt_signature = f"Processed by the {agent_name} agent"
 
                 # Find agent's most recent output
                 final_output = None
                 final_timestamp = None
 
                 for comment in all_comments:
-                    if agent_signature in comment.get('body', ''):
+                    body = comment.get('body', '')
+                    if agent_signature in body or alt_signature in body:
                         comment_time = date_parser.parse(comment.get('createdAt'))
                         if final_timestamp is None or comment_time > final_timestamp:
                             final_output = comment
@@ -1251,14 +1284,6 @@ class ProjectMonitor:
             # Get workflow template for this board
             project_config = self.config_manager.get_project_config(project_name)
 
-            # DEFENSIVE: Check if issue is open before triggering any agents
-            issue_data = self.get_issue_details(repository, issue_number, project_config.github['org'])
-            issue_state = issue_data.get('state', '').upper()
-
-            if issue_state == 'CLOSED':
-                logger.info(f"Skipping agent trigger for issue #{issue_number}: issue is CLOSED")
-                return None
-
             # Find the pipeline config for this board
             pipeline_config = None
             for pipeline in project_config.pipelines:
@@ -1272,6 +1297,27 @@ class ProjectMonitor:
 
             # Get workflow template
             workflow_template = self.config_manager.get_workflow_template(pipeline_config.workflow)
+
+            # DEFENSIVE: Check if issue is open before triggering any agents
+            issue_data = self.get_issue_details(repository, issue_number, project_config.github['org'])
+            issue_state = issue_data.get('state', '').upper()
+
+            if issue_state == 'CLOSED':
+                logger.info(f"Issue #{issue_number} is CLOSED - checking if lock needs release")
+                
+                # Check if lock is held and release it
+                from services.pipeline_lock_manager import get_pipeline_lock_manager
+                lock_manager = get_pipeline_lock_manager()
+                lock = lock_manager.get_lock(project_name, board_name)
+                
+                if lock and lock.locked_by_issue == issue_number:
+                    logger.info(f"Releasing pipeline lock for closed issue #{issue_number}")
+                    self._release_pipeline_lock_and_process_next(
+                        project_name, board_name, issue_number, status,
+                        repository, workflow_template
+                    )
+                
+                return None
 
             # Find the column that matches this status
             agent = None
