@@ -4,7 +4,7 @@
 agents:
   dev_environment_setup:
     description: "Development environment configuration, Dockerfile generation, and validation with automated troubleshooting"
-    model: "claude-sonnet-4-5-20250929"
+    model: "claude-opus-4-5-20251101"
     timeout: 1800  # 30 minutes for Docker builds and validation
     retries: 2
     makes_code_changes: true  # Modifies dependency files (requirements.txt, etc.)
@@ -89,7 +89,7 @@ agents:
 
   software_architect:
     description: "System architecture and technical design"
-    model: "claude-sonnet-4-5-20250929"
+    model: "claude-opus-4-5-20251101"
     timeout: 600
     retries: 3
     makes_code_changes: false  # Creates architecture documents and diagrams
@@ -110,7 +110,7 @@ agents:
 
   work_breakdown_agent:
     description: "Break approved designs into phase-based sub-issues for implementation"
-    model: "claude-sonnet-4-5-20250929"
+    model: "claude-opus-4-5-20251101"
     timeout: 300
     retries: 2
     makes_code_changes: false  # Creates GitHub issues, not files
@@ -130,7 +130,7 @@ agents:
 
   senior_software_engineer:
     description: "Software development and implementation"
-    model: "claude-sonnet-4-5-20250929"
+    model: "claude-opus-4-5-20251101"
     timeout: 900
     retries: 3
     makes_code_changes: true  # Writes actual code

@@ -141,7 +141,8 @@ class DecisionEventEmitter:
         target_agent: Optional[str],
         action_taken: str,
         workspace_type: str = "issues",
-        discussion_id: Optional[str] = None
+        discussion_id: Optional[str] = None,
+        pipeline_run_id: Optional[str] = None
     ):
         """
         Emit event when orchestrator detects feedback on an issue
@@ -156,6 +157,7 @@ class DecisionEventEmitter:
             action_taken: What action was taken ("queue_agent_task", "ignore", "escalate", etc.)
             workspace_type: "issues" or "discussions"
             discussion_id: Discussion ID if applicable
+            pipeline_run_id: Pipeline run ID for traceability
         """
         task_id = f"feedback_{project}_{issue_number}_{datetime.now().timestamp()}"
         
@@ -185,7 +187,8 @@ class DecisionEventEmitter:
                     'target_agent': target_agent
                 },
                 'reason': f"Detected feedback from {feedback_source}, {action_taken}"
-            }
+            },
+            pipeline_run_id=pipeline_run_id
         )
     
     def emit_feedback_listening_started(
@@ -195,7 +198,8 @@ class DecisionEventEmitter:
         board: str,
         agent: str,
         monitoring_for: List[str],
-        workspace_type: str = "issues"
+        workspace_type: str = "issues",
+        pipeline_run_id: Optional[str] = None
     ):
         """
         Emit event when orchestrator starts listening for feedback
@@ -207,6 +211,7 @@ class DecisionEventEmitter:
             agent: Agent that's waiting for feedback
             monitoring_for: What types of feedback we're monitoring for
             workspace_type: "issues" or "discussions"
+            pipeline_run_id: Pipeline run ID for traceability
         """
         task_id = f"feedback_listen_{project}_{issue_number}"
         
@@ -223,7 +228,8 @@ class DecisionEventEmitter:
                 'monitoring_agent': agent,
                 'monitoring_for': monitoring_for,
                 'reason': f"Starting feedback monitoring for {agent}"
-            }
+            },
+            pipeline_run_id=pipeline_run_id
         )
     
     def emit_feedback_listening_stopped(
@@ -233,7 +239,8 @@ class DecisionEventEmitter:
         board: str,
         agent: str,
         reason: str,
-        feedback_received: bool = False
+        feedback_received: bool = False,
+        pipeline_run_id: Optional[str] = None
     ):
         """
         Emit event when orchestrator stops listening for feedback
@@ -245,6 +252,7 @@ class DecisionEventEmitter:
             agent: Agent that was waiting
             reason: Why monitoring stopped
             feedback_received: Whether feedback was received
+            pipeline_run_id: Pipeline run ID for traceability
         """
         task_id = f"feedback_listen_{project}_{issue_number}"
         
@@ -260,7 +268,8 @@ class DecisionEventEmitter:
                 'monitoring_agent': agent,
                 'feedback_received': feedback_received,
                 'reason': reason
-            }
+            },
+            pipeline_run_id=pipeline_run_id
         )
     
     def emit_feedback_ignored(
@@ -467,7 +476,8 @@ class DecisionEventEmitter:
         board: str,
         agent: str,
         workspace_type: str = "issues",
-        discussion_id: Optional[str] = None
+        discussion_id: Optional[str] = None,
+        pipeline_run_id: Optional[str] = None
     ):
         """
         Emit event when conversational loop starts
@@ -479,6 +489,7 @@ class DecisionEventEmitter:
             agent: Agent handling conversations
             workspace_type: "issues" or "discussions"
             discussion_id: Discussion ID if applicable
+            pipeline_run_id: Pipeline run ID for traceability
         """
         task_id = f"conv_loop_{project}_{issue_number}"
         
@@ -495,7 +506,8 @@ class DecisionEventEmitter:
                 'discussion_id': discussion_id,
                 'agent': agent,
                 'reason': f"Starting conversational loop with {agent}"
-            }
+            },
+            pipeline_run_id=pipeline_run_id
         )
     
     def emit_conversational_question_routed(
@@ -505,7 +517,8 @@ class DecisionEventEmitter:
         board: str,
         question: str,
         target_agent: str,
-        reason: str
+        reason: str,
+        pipeline_run_id: Optional[str] = None
     ):
         """
         Emit event when question is routed to specific agent
@@ -517,6 +530,7 @@ class DecisionEventEmitter:
             question: The question (truncated)
             target_agent: Agent receiving the question
             reason: Why this agent was selected
+            pipeline_run_id: Pipeline run ID for traceability
         """
         task_id = f"conv_route_{project}_{issue_number}_{datetime.now().timestamp()}"
         
@@ -537,7 +551,8 @@ class DecisionEventEmitter:
                 'question': truncated_question,
                 'target_agent': target_agent,
                 'reason': reason
-            }
+            },
+            pipeline_run_id=pipeline_run_id
         )
     
     def emit_conversational_loop_paused(
@@ -547,7 +562,8 @@ class DecisionEventEmitter:
         board: str,
         reason: str,
         workspace_type: str = "issues",
-        discussion_id: Optional[str] = None
+        discussion_id: Optional[str] = None,
+        pipeline_run_id: Optional[str] = None
     ):
         """
         Emit event when conversational loop is paused
@@ -559,6 +575,7 @@ class DecisionEventEmitter:
             reason: Why the loop was paused
             workspace_type: "issues" or "discussions"
             discussion_id: Discussion ID if applicable
+            pipeline_run_id: Pipeline run ID for traceability
         """
         task_id = f"conv_loop_{project}_{issue_number}"
         
@@ -574,7 +591,8 @@ class DecisionEventEmitter:
                 'workspace_type': workspace_type,
                 'discussion_id': discussion_id,
                 'reason': reason
-            }
+            },
+            pipeline_run_id=pipeline_run_id
         )
     
     def emit_conversational_loop_resumed(
@@ -584,7 +602,8 @@ class DecisionEventEmitter:
         board: str,
         reason: str,
         workspace_type: str = "issues",
-        discussion_id: Optional[str] = None
+        discussion_id: Optional[str] = None,
+        pipeline_run_id: Optional[str] = None
     ):
         """
         Emit event when conversational loop resumes
@@ -596,6 +615,7 @@ class DecisionEventEmitter:
             reason: Why the loop resumed
             workspace_type: "issues" or "discussions"
             discussion_id: Discussion ID if applicable
+            pipeline_run_id: Pipeline run ID for traceability
         """
         task_id = f"conv_loop_{project}_{issue_number}"
         
@@ -611,7 +631,8 @@ class DecisionEventEmitter:
                 'workspace_type': workspace_type,
                 'discussion_id': discussion_id,
                 'reason': reason
-            }
+            },
+            pipeline_run_id=pipeline_run_id
         )
     
     def emit_error_decision(

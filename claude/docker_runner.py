@@ -414,23 +414,61 @@ class DockerAgentRunner:
         import tempfile
         import time
 
-        # Create a temp file in /app/tmp (accessible from Docker-in-Docker)
-        # /app is mounted from the host, so files here are accessible to child containers
-        temp_dir = "/app/tmp" if os.path.exists("/app") else "/tmp"
-        os.makedirs(temp_dir, exist_ok=True)
-
         timestamp = int(time.time())
         mcp_config_filename = f"mcp_config_{agent}_{task_id}_{timestamp}.json"
-        mcp_config_path = os.path.join(temp_dir, mcp_config_filename)
+
+        # Try to find a writable directory
+        # Priority 1: /workspace/.orchestrator/tmp (Shared volume, preferred)
+        # Priority 2: /app/tmp (Legacy, might be read-only)
+        # Priority 3: Local tmp (Fallback)
+        
+        candidate_dirs = []
+        if os.path.exists("/workspace"):
+            candidate_dirs.append("/workspace/.orchestrator/tmp")
+        if os.path.exists("/app"):
+            candidate_dirs.append("/app/tmp")
+        
+        # Fallbacks
+        candidate_dirs.append(os.path.join(os.getcwd(), "tmp"))
+        candidate_dirs.append("/tmp")
+
+        selected_path = None
+
+        for temp_dir in candidate_dirs:
+            try:
+                os.makedirs(temp_dir, exist_ok=True)
+                test_path = os.path.join(temp_dir, f".write_test_{timestamp}")
+                
+                # Verify write access
+                with open(test_path, 'w') as f:
+                    f.write("test")
+                os.remove(test_path)
+                
+                # If successful, use this directory
+                selected_path = os.path.join(temp_dir, mcp_config_filename)
+                logger.info(f"Using temporary directory for MCP config: {temp_dir}")
+                break
+            except Exception as e:
+                logger.debug(f"Skipping temporary directory {temp_dir}: {e}")
+                continue
+
+        if not selected_path:
+            # Last resort fallback
+            selected_path = os.path.join("/tmp", mcp_config_filename)
+            logger.warning(f"Could not verify write access to any temp dir, falling back to {selected_path}")
 
         # Write the config
-        with open(mcp_config_path, 'w') as f:
-            json.dump(mcp_config, f, indent=2)
+        try:
+            with open(selected_path, 'w') as f:
+                json.dump(mcp_config, f, indent=2)
+        except Exception as e:
+            logger.error(f"Failed to write MCP config to {selected_path}: {e}")
+            raise
 
-        logger.info(f"Wrote MCP config to {mcp_config_path}")
+        logger.info(f"Wrote MCP config to {selected_path}")
         logger.debug(f"MCP config contents: {json.dumps(mcp_config, indent=2)}")
 
-        return mcp_config_path
+        return selected_path
 
     def _build_docker_command(
         self,
@@ -513,19 +551,24 @@ class DockerAgentRunner:
         ])
 
         # Mount MCP config file if provided
-        # The MCP config is written to /app/tmp which is accessible from host
+        # The MCP config is written to a temp location accessible from host
         # We need to convert container path to host path for Docker-in-Docker mounting
         if mcp_config_path:
-            # If running in orchestrator container, /app maps to host directory
-            # Convert /app/tmp/file.json -> host_path/tmp/file.json
+            host_mcp_path = mcp_config_path
+
             if mcp_config_path.startswith('/app/'):
                 # Running in orchestrator - /app is mounted from host
-                # Get the relative path from /app and prepend host workspace
+                # Convert /app/tmp/file.json -> host_workspace/clauditoreum/tmp/file.json
                 relative_from_app = mcp_config_path.replace('/app/', '')
                 host_mcp_path = f'{host_workspace}/clauditoreum/{relative_from_app}'
-            else:
-                # Running locally - use as-is
-                host_mcp_path = mcp_config_path
+            
+            elif mcp_config_path.startswith('/workspace/'):
+                # Running in orchestrator - /workspace is mounted from host
+                # Convert /workspace/.orchestrator/tmp/file.json -> host_workspace/.orchestrator/tmp/file.json
+                relative_from_workspace = mcp_config_path.replace('/workspace/', '')
+                host_mcp_path = f'{host_workspace}/{relative_from_workspace}'
+            
+            # Else: Running locally or absolute path - use as-is (assuming shared filesystem or local docker)
 
             # Mount to /home/orchestrator/.mcp_config.json to ensure parent dir exists
             cmd.extend(['-v', f'{host_mcp_path}:/home/orchestrator/.mcp_config.json:ro'])
@@ -538,6 +581,7 @@ class DockerAgentRunner:
             # Environment variables
             '-e', f'GITHUB_TOKEN={os.environ.get("GITHUB_TOKEN", "")}',
             '-e', 'GH_AUTH_SETUP_REQUIRED=true',
+            '-e', 'PYTHONDONTWRITEBYTECODE=1',
         ])
         
         # Pass PIPELINE_RUN_ID if available in context (for event tracking)

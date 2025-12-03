@@ -109,7 +109,8 @@ class HumanFeedbackLoopExecutor:
             board=board_name,
             agent=column.agent,
             workspace_type=workspace_type,
-            discussion_id=discussion_id
+            discussion_id=discussion_id,
+            pipeline_run_id=pipeline_run_id
         )
 
         # FIX #1: Check if loop already active (in-memory duplicate prevention)
@@ -193,15 +194,30 @@ class HumanFeedbackLoopExecutor:
         self.workflow_columns = workflow_columns
 
         try:
-            # Step 1: Execute the agent (initial output)
-            await self._execute_agent(
-                state,
-                column,
-                issue_data,
-                previous_stage_output,
-                org,
-                is_initial=True
-            )
+            # Check for existing user comments to reply to (instead of posting new top-level)
+            initial_feedback = await self._get_initial_user_request(state, org)
+            
+            if initial_feedback:
+                logger.info(f"Found initial user request from {initial_feedback['author']}, replying to it")
+                await self._execute_agent(
+                    state,
+                    column,
+                    issue_data,
+                    previous_stage_output,
+                    org,
+                    is_initial=True,
+                    human_feedback=initial_feedback
+                )
+            else:
+                # Step 1: Execute the agent (initial output)
+                await self._execute_agent(
+                    state,
+                    column,
+                    issue_data,
+                    previous_stage_output,
+                    org,
+                    is_initial=True
+                )
 
             # Step 2: Monitor for human feedback
             result = await self._conversational_loop(state, column, issue_data, org)
@@ -261,7 +277,8 @@ class HumanFeedbackLoopExecutor:
             board=state.board_name,
             agent=state.agent,
             monitoring_for=['discussion_replies', 'issue_comments'],
-            workspace_type=state.workspace_type
+            workspace_type=state.workspace_type,
+            pipeline_run_id=state.pipeline_run_id
         )
 
         # Safety check: Verify we have valid state
@@ -323,7 +340,8 @@ class HumanFeedbackLoopExecutor:
                     target_agent=state.agent,
                     action_taken=action_description,
                     workspace_type=state.workspace_type,
-                    discussion_id=state.discussion_id
+                    discussion_id=state.discussion_id,
+                    pipeline_run_id=state.pipeline_run_id
                 )
 
                 # Execute agent with human feedback (pass full dict with author)
@@ -379,7 +397,8 @@ class HumanFeedbackLoopExecutor:
                         board=state.board_name,
                         agent=state.agent,
                         reason=f"Card moved from '{column.name}' to '{current_column}'",
-                        feedback_received=state.current_iteration > 0
+                        feedback_received=state.current_iteration > 0,
+                        pipeline_run_id=state.pipeline_run_id
                     )
 
                     return (None, True)  # Exit the loop
@@ -398,7 +417,8 @@ class HumanFeedbackLoopExecutor:
                         board=state.board_name,
                         agent=state.agent,
                         reason="Card moved to Backlog",
-                        feedback_received=state.current_iteration > 0
+                        feedback_received=state.current_iteration > 0,
+                        pipeline_run_id=state.pipeline_run_id
                     )
 
                     return (None, True)  # Exit the loop
@@ -567,6 +587,157 @@ class HumanFeedbackLoopExecutor:
         })
 
         logger.info(f"Agent {state.agent} completed successfully")
+
+    async def _get_initial_user_request(
+        self,
+        state: HumanFeedbackState,
+        org: str
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Check for an initial user request/comment to reply to.
+        Used when starting the loop to determine if we should reply to an existing comment
+        instead of posting a new top-level comment.
+        """
+        # For issues workspace, use issue comment API
+        if state.workspace_type == 'issues' or state.discussion_id is None:
+            # For issues, we check comments on the issue
+            return await self._get_initial_user_request_from_issue(state, org)
+
+        # For discussions workspace, use discussion API
+        from services.github_app import github_app
+        from dateutil import parser as date_parser
+
+        try:
+            logger.debug(f"Checking discussion {state.discussion_id} for initial user request")
+
+            query = """
+            query($discussionId: ID!) {
+              node(id: $discussionId) {
+                ... on Discussion {
+                  comments(last: 20) {
+                    nodes {
+                      id
+                      author { login }
+                      body
+                      createdAt
+                    }
+                  }
+                }
+              }
+            }
+            """
+
+            result = github_app.graphql_request(query, {'discussionId': state.discussion_id})
+
+            if not result or 'node' not in result or not result['node']:
+                return None
+
+            comments = result['node']['comments']['nodes']
+            
+            # Look for the most recent user comment that isn't from a bot
+            # We prefer comments that mention the agent, but will take any recent user comment
+            # if it looks like a request.
+            
+            most_recent_comment = None
+            most_recent_time = None
+            
+            for comment in comments:
+                # Check top-level comment
+                if 'author' in comment and 'createdAt' in comment:
+                    author = comment['author']['login']
+                    created_at = date_parser.parse(comment['createdAt'])
+                    comment_id = comment.get('id')
+                    
+                    if not is_bot_user(author):
+                        # Check for agent signature (skip if it's an agent output)
+                        if "_Processed by the " in comment.get('body', ''):
+                             continue
+                             
+                        if most_recent_time is None or created_at > most_recent_time:
+                            most_recent_time = created_at
+                            most_recent_comment = {
+                                'author': author,
+                                'body': comment.get('body', ''),
+                                'created_at': created_at.isoformat(),
+                                'comment_id': comment_id,
+                                'parent_comment': None  # Top-level
+                            }
+            
+            return most_recent_comment
+
+        except Exception as e:
+            logger.error(f"Error checking for initial user request: {e}")
+            return None
+
+    async def _get_initial_user_request_from_issue(
+        self,
+        state: HumanFeedbackState,
+        org: str
+    ) -> Optional[Dict[str, Any]]:
+        """Check for initial user request in issue comments"""
+        from services.github_app import github_app
+        from dateutil import parser as date_parser
+
+        try:
+            query = """
+            query($org: String!, $repo: String!, $number: Int!) {
+              repository(owner: $org, name: $repo) {
+                issue(number: $number) {
+                  comments(last: 20) {
+                    nodes {
+                      id
+                      author { login }
+                      body
+                      createdAt
+                    }
+                  }
+                }
+              }
+            }
+            """
+
+            if not github_app.enabled:
+                return None
+
+            result = github_app.graphql_request(query, {
+                'org': org,
+                'repo': state.repository,
+                'number': state.issue_number
+            })
+
+            if not result or 'repository' not in result or not result['repository']:
+                return None
+
+            comments = result['repository']['issue']['comments']['nodes']
+            
+            most_recent_comment = None
+            most_recent_time = None
+            
+            for comment in comments:
+                if 'author' in comment and 'createdAt' in comment:
+                    author = comment['author']['login']
+                    created_at = date_parser.parse(comment['createdAt'])
+                    comment_id = comment.get('id')
+                    
+                    if not is_bot_user(author):
+                        if "_Processed by the " in comment.get('body', ''):
+                             continue
+                             
+                        if most_recent_time is None or created_at > most_recent_time:
+                            most_recent_time = created_at
+                            most_recent_comment = {
+                                'author': author,
+                                'body': comment.get('body', ''),
+                                'created_at': created_at.isoformat(),
+                                'comment_id': comment_id,
+                                'parent_comment': None
+                            }
+            
+            return most_recent_comment
+
+        except Exception as e:
+            logger.error(f"Error checking for initial user request from issue: {e}")
+            return None
 
     async def _get_human_feedback_from_issue(
         self,
@@ -814,12 +985,20 @@ class HumanFeedbackLoopExecutor:
                              logger.debug(f"Skipping reply from {author} as it contains agent signature")
                              continue
 
-                        # FIX: Check if parent comment belongs to this agent
+                        # FIX: Check if parent comment belongs to this agent OR if agent has participated in this thread
                         parent_body = comment.get('body', '')
                         agent_signature = f"_Processed by the {state.agent} agent_"
                         
-                        if agent_signature not in parent_body:
-                            logger.debug(f"Skipping reply to comment {comment.get('id')} - not processed by {state.agent}")
+                        agent_participated = agent_signature in parent_body
+                        if not agent_participated:
+                             # Check if agent has any replies in this thread
+                             for r in replies:
+                                 if agent_signature in r.get('body', ''):
+                                     agent_participated = True
+                                     break
+                        
+                        if not agent_participated:
+                            logger.debug(f"Skipping reply to comment {comment.get('id')} - thread not touched by {state.agent}")
                             continue
 
                         logger.info(f"Found human feedback in reply from {author} to comment {comment.get('id')}")

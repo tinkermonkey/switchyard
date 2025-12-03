@@ -1874,12 +1874,11 @@ class ReviewCycleExecutor:
                     try:
                         project_dir = workspace_manager.get_project_dir(cycle_state.project_name)
                         # Use FeatureBranchManager which handles parent/sub-issue detection
-                        branch_name = await feature_branch_manager.ensure_and_prepare_branch(
+                        branch_name = await feature_branch_manager.prepare_feature_branch(
                             project=cycle_state.project_name,
-                            project_dir=str(project_dir),
                             issue_number=cycle_state.issue_number,
-                            issue_title=cycle_state.issue_title or f"Issue {cycle_state.issue_number}",
-                            github_integration=github_integration
+                            github_integration=github_integration,
+                            issue_title=issue_data.get('title') or f"Issue {cycle_state.issue_number}"
                         )
                         
                         # Track the branch for git workflow (this will be done by feature_branch_manager too, but ensure it)

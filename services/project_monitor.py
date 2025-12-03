@@ -1888,6 +1888,8 @@ class ProjectMonitor:
 
         except Exception as e:
             logger.error(f"Error triggering agent for status: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             return None
 
     def _release_pipeline_lock_and_process_next(

@@ -286,6 +286,13 @@ Brief overview of this phase's goals.
 [... same structure ...]
 ```
 
+**IMPORTANT FORMATTING RULES**:
+1. Use `### Phase N: [Title]` for each phase header
+2. Use `**Field**: Value` for metadata fields
+3. Separate phases with `---`
+4. Ensure the section starts with `## Sub-Issues to Create`
+
+
 Each sub-issue will be created as a sub-task of issue #{parent_issue_number} and placed in the SDLC board's Backlog column, ordered by dependency.
 
 Make sure to:
@@ -324,9 +331,11 @@ Make sure to:
 
         section_content = section_match.group(1)
 
-        # Split by phase markers (### Phase N:)
-        phase_pattern = r'### (Phase \d+: .+?)\n(.*?)(?=\n### Phase \d+:|\Z)'
-        phase_matches = re.finditer(phase_pattern, section_content, re.DOTALL)
+        # Split by phase markers (### Phase N...)
+        # Relaxed pattern: Allow optional colon, hyphen, or just space
+        # Also handle the lookahead for the next phase more flexibly
+        phase_pattern = r'### (Phase \d+.*?)\n(.*?)(?=\n### Phase \d+|\Z)'
+        phase_matches = re.finditer(phase_pattern, section_content, re.DOTALL | re.IGNORECASE)
 
         for phase_match in phase_matches:
             phase_title = phase_match.group(1).strip()
