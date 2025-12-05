@@ -666,7 +666,7 @@ function AgentExecutionView() {
               {inputPrompt && lastTextMessage && (
                 <div className="flex gap-4">
                   {/* Input Prompt - 50% width */}
-                  <div className="flex-1 bg-gh-canvas rounded-md border border-gh-border p-3">
+                  <div className="flex-1 min-w-0 bg-gh-canvas rounded-md border border-gh-border p-3">
                     <div className="flex items-center justify-between mb-2">
                       <div className="flex items-center gap-2">
                         <h3 className="text-sm font-semibold text-gh-fg">Input Prompt</h3>
@@ -704,7 +704,7 @@ function AgentExecutionView() {
                   </div>
 
                   {/* Latest Message - 50% width */}
-                  <div className="flex-1 bg-gh-canvas rounded-md border border-gh-border p-3">
+                  <div className="flex-1 min-w-0 bg-gh-canvas rounded-md border border-gh-border p-3">
                     <div className="flex items-center justify-between mb-2">
                       <div className="flex items-center gap-2">
                         <h3 className="text-sm font-semibold text-gh-fg">Latest Message</h3>
@@ -746,7 +746,7 @@ function AgentExecutionView() {
               {/* Second row: Tool calls/results (left 70%) and Current Tasks (right 30%) */}
               <div className="flex gap-4">
                 {/* Left side - Tool calls and results */}
-                <div className="flex-[7] space-y-4">
+                <div className="flex-[7] min-w-0 space-y-4">
                   {lastToolCall && (
                     <div className="bg-gh-canvas rounded-md border border-gh-border p-3">
                       <div className="flex items-center gap-2 mb-2">
@@ -756,10 +756,10 @@ function AgentExecutionView() {
                         </span>
                       </div>
                       <div className="flex items-center gap-2">
-                        <span className="px-2 py-1 bg-gh-warning rounded text-xs font-semibold text-white">
+                        <span className="px-2 py-1 bg-gh-warning rounded text-xs font-semibold text-white shrink-0">
                           {lastToolCall.name}
                         </span>
-                        <span className="text-sm text-gh-fg font-mono">
+                        <span className="text-sm text-gh-fg font-mono break-all whitespace-pre-wrap">
                           {formatToolCall(lastToolCall)}
                         </span>
                       </div>
@@ -775,10 +775,10 @@ function AgentExecutionView() {
                         </span>
                       </div>
                       <div className="flex items-center gap-2">
-                        <span className="px-2 py-1 bg-gh-warning rounded text-xs font-semibold text-white">
+                        <span className="px-2 py-1 bg-gh-warning rounded text-xs font-semibold text-white shrink-0">
                           {previousToolCall.name}
                         </span>
-                        <span className="text-sm text-gh-fg font-mono">
+                        <span className="text-sm text-gh-fg font-mono break-all whitespace-pre-wrap">
                           {formatToolCall(previousToolCall)}
                         </span>
                       </div>
@@ -830,7 +830,7 @@ function AgentExecutionView() {
                 </div>
 
                 {/* Right side - Current Tasks */}
-                <div className="flex-[3]">
+                <div className="flex-[3] min-w-0">
                   <RepairCycleStatus events={mergedPipelineEvents} />
                   <div className="bg-gh-canvas rounded-md border border-gh-border p-3">
                     <div className="mb-3">
@@ -898,7 +898,7 @@ function AgentExecutionView() {
             /* When not completed, use original layout */
             <div className="flex gap-4">
               {/* Left column - 70% width */}
-              <div className="flex-[7] space-y-4">
+              <div className="flex-[7] min-w-0 space-y-4">
                 {inputPrompt && (
                   <div className="bg-gh-canvas rounded-md border border-gh-border p-3">
                     <div className="flex items-center justify-between mb-2">
@@ -986,10 +986,10 @@ function AgentExecutionView() {
                       </span>
                     </div>
                     <div className="flex items-center gap-2">
-                      <span className="px-2 py-1 bg-gh-warning rounded text-xs font-semibold text-white">
+                      <span className="px-2 py-1 bg-gh-warning rounded text-xs font-semibold text-white shrink-0">
                         {lastToolCall.name}
                       </span>
-                      <span className="text-sm text-gh-fg font-mono">
+                      <span className="text-sm text-gh-fg font-mono break-all whitespace-pre-wrap">
                         {formatToolCall(lastToolCall)}
                       </span>
                     </div>
@@ -1005,10 +1005,10 @@ function AgentExecutionView() {
                       </span>
                     </div>
                     <div className="flex items-center gap-2">
-                      <span className="px-2 py-1 bg-gh-warning rounded text-xs font-semibold text-white">
+                      <span className="px-2 py-1 bg-gh-warning rounded text-xs font-semibold text-white shrink-0">
                         {previousToolCall.name}
                       </span>
-                      <span className="text-sm text-gh-fg font-mono">
+                      <span className="text-sm text-gh-fg font-mono break-all whitespace-pre-wrap">
                         {formatToolCall(previousToolCall)}
                       </span>
                     </div>
@@ -1060,7 +1060,7 @@ function AgentExecutionView() {
               </div>
 
               {/* Right column - 30% width */}
-              <div className="flex-[3]">
+              <div className="flex-[3] min-w-0">
                 <RepairCycleStatus events={mergedPipelineEvents} />
                 <div className="bg-gh-canvas rounded-md border border-gh-border p-3">
                   <div className="mb-3">

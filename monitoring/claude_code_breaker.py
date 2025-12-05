@@ -42,16 +42,23 @@ class ClaudeCodeBreaker:
     # - "session limit exceeded. Reset at 1:30pm"
     # - "SESSION_LIMIT_IN_RESPONSE: ..."
     # - "token limit reached/exceeded" (with action verb)
-    # - "Session limit reached" (without reset time)
+    # - "Limit reached resets 7pm (UTC)" (specific format seen in logs)
     #
     # IMPORTANT: Must be specific to avoid false positives!
     # Only match specific limit types (session/token/rate/request/usage) with action verbs
     # Don't match generic "limit reached" which appears in documentation
     SESSION_LIMIT_PATTERN = re.compile(
         r'(?:SESSION_LIMIT_IN_RESPONSE:\s+)?(?:'
-        r'(?:session|token|request|rate|usage)\s+(?:limit|quota)\s+(?:reached|exceeded|hit|met|violated)'
-        r'|(?:reached|exceeded|hit|met|violated)\s+(?:session|token|request|rate|usage)\s+(?:limit|quota)'
-        r')(?:.*?(?:resets?|reset)(?:\s+at)?\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)?)?',
+        # Group 1: Explicit type (session/token/etc)
+        r'(?:'
+            r'(?:(?:session|token|request|rate|usage)\s+(?:limit|quota)\s+(?:reached|exceeded|hit|met|violated)'
+            r'|(?:reached|exceeded|hit|met|violated)\s+(?:session|token|request|rate|usage)\s+(?:limit|quota))'
+            r'(?:.*?(?:resets?|reset)(?:\s+at)?\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)?)?'
+        r')'
+        r'|'
+        # Group 2: "Limit reached" followed by "resets"
+        r'(?:limit\s+reached\s+.*?(?:resets?|reset)(?:\s+at)?\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)?)'
+        r')',
         re.IGNORECASE | re.DOTALL
     )
     
@@ -66,7 +73,10 @@ class ClaudeCodeBreaker:
         # Try to initialize Redis client
         try:
             import redis
-            self.redis_client = redis.Redis(host='redis', port=6379, decode_responses=True)
+            import os
+            redis_host = os.environ.get('REDIS_HOST', 'redis')
+            redis_port = int(os.environ.get('REDIS_PORT', 6379))
+            self.redis_client = redis.Redis(host=redis_host, port=redis_port, decode_responses=True)
             self.redis_client.ping()
             # Load persisted state from Redis
             self._load_from_redis()
@@ -148,8 +158,8 @@ class ClaudeCodeBreaker:
             return False, None
         
         try:
-            # group(1) is the reset time (if present)
-            reset_time_str = match.group(1) if match.lastindex and match.lastindex >= 1 else None
+            # Find the first non-None group which should be the reset time
+            reset_time_str = next((g for g in match.groups() if g), None)
             
             if reset_time_str:
                 reset_time = self._parse_reset_time(reset_time_str.strip())
@@ -275,6 +285,11 @@ class ClaudeCodeBreaker:
     def is_open(self) -> bool:
         """Check if breaker is open (agents cannot run).
         Also checks Redis to detect external resets."""
+        
+        # Sync from Redis to detect if another worker tripped it
+        if self.state == self.CLOSED:
+            self._load_from_redis()
+
         # Check Redis for external reset before checking state
         if self.state == self.OPEN:
             self.check_and_close()  # Will detect and apply external reset

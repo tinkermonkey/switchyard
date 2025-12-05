@@ -271,10 +271,21 @@ class PipelineProgression:
                 }}
             '''
 
-            result = subprocess.run(
-                ['gh', 'api', 'graphql', '-f', f'query={mutation}'],
-                capture_output=True, text=True, check=True, timeout=30
-            )
+            # Retry logic for mutation
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    result = subprocess.run(
+                        ['gh', 'api', 'graphql', '-f', f'query={mutation}'],
+                        capture_output=True, text=True, check=True, timeout=30
+                    )
+                    break # Success
+                except subprocess.CalledProcessError as e:
+                    if attempt < max_retries - 1:
+                        logger.warning(f"Failed to move issue (attempt {attempt+1}/{max_retries}): {e.stderr}. Retrying...")
+                        time.sleep(2 * (attempt + 1)) # Exponential backoff
+                    else:
+                        raise # Re-raise on last attempt
 
             # Record status change with trigger (from pipeline progression)
             from services.work_execution_state import work_execution_tracker

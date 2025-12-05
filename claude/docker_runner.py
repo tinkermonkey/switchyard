@@ -922,8 +922,15 @@ class DockerAgentRunner:
             wait_result = subprocess.run(['docker', 'wait', container_name], capture_output=True, text=True)
             exit_code = int(wait_result.stdout.strip())
             
-            # Terminate log streamer
-            process.terminate()
+            # Allow log streamer to finish naturally
+            # 'docker logs -f' should exit when the container stops, but we give it a timeout
+            # to ensure we capture the final output (like session limit messages)
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                logger.warning(f"Log streamer for {container_name} timed out, terminating...")
+                process.terminate()
+            
             stdout_thread.join(timeout=1)
             stderr_thread.join(timeout=1)
 

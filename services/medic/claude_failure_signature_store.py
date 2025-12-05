@@ -205,6 +205,102 @@ class ClaudeFailureSignatureStore:
             self.logger.error(f"Failed to get signature {fingerprint_id}: {e}")
             return None
 
+    def get_unresolved_signatures(self) -> List[Dict]:
+        """Get all unresolved failure signatures."""
+        try:
+            result = self.es.search(
+                index=f"{self.INDEX_PREFIX}-*",
+                body={
+                    "query": {
+                        "bool": {
+                            "must_not": [
+                                {"term": {"status": "resolved"}},
+                                {"term": {"status": "ignored"}}
+                            ]
+                        }
+                    },
+                    "size": 1000  # Limit to 1000 for now
+                }
+            )
+            return [hit['_source'] for hit in result.get('hits', {}).get('hits', [])]
+        except Exception as e:
+            self.logger.error(f"Failed to get unresolved signatures: {e}")
+            return []
+
+    def delete_signature(self, fingerprint_id: str):
+        """Delete a signature by ID."""
+        try:
+            self.es.delete_by_query(
+                index=f"{self.INDEX_PREFIX}-*",
+                body={"query": {"term": {"fingerprint_id": fingerprint_id}}}
+            )
+            self.logger.info(f"Deleted signature {fingerprint_id}")
+        except Exception as e:
+            self.logger.error(f"Failed to delete signature {fingerprint_id}: {e}")
+
+    def merge_signatures(self, primary_id: str, secondary_ids: List[str]):
+        """Merge secondary signatures into primary signature."""
+        primary = self.get_signature(primary_id)
+        if not primary:
+            self.logger.error(f"Primary signature {primary_id} not found")
+            return
+
+        total_failures = primary['total_failures']
+        cluster_count = primary['cluster_count']
+        sample_clusters = primary.get('sample_clusters', [])
+        
+        # Parse timestamps for min/max calculation
+        first_seen = self._parse_timestamp(primary['first_seen'])
+        last_seen = self._parse_timestamp(primary['last_seen'])
+
+        for sec_id in secondary_ids:
+            secondary = self.get_signature(sec_id)
+            if not secondary:
+                continue
+            
+            total_failures += secondary['total_failures']
+            cluster_count += secondary['cluster_count']
+            sample_clusters.extend(secondary.get('sample_clusters', []))
+            
+            sec_first = self._parse_timestamp(secondary['first_seen'])
+            sec_last = self._parse_timestamp(secondary['last_seen'])
+            
+            if sec_first < first_seen:
+                first_seen = sec_first
+            if sec_last > last_seen:
+                last_seen = sec_last
+            
+            # Delete secondary
+            self.delete_signature(sec_id)
+
+        # Sort samples and keep top 20
+        sample_clusters.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
+        sample_clusters = sample_clusters[:20]
+        
+        # Update primary
+        now = datetime.utcnow().isoformat() + 'Z'
+        update_body = {
+            "doc": {
+                "updated_at": now,
+                "total_failures": total_failures,
+                "cluster_count": cluster_count,
+                "sample_clusters": sample_clusters,
+                "first_seen": first_seen.isoformat() + 'Z',
+                "last_seen": last_seen.isoformat() + 'Z',
+                "signature.cluster_size_avg": total_failures / cluster_count if cluster_count > 0 else 0
+            }
+        }
+        
+        try:
+            self.es.update(
+                index=f"{self.INDEX_PREFIX}-*",
+                id=primary_id,
+                body=update_body
+            )
+            self.logger.info(f"Merged {len(secondary_ids)} signatures into {primary_id}")
+        except Exception as e:
+            self.logger.error(f"Failed to update primary signature {primary_id}: {e}")
+
     def get_signatures_by_project(self, project: str, status: Optional[str] = None) -> List[Dict]:
         """
         Get all failure signatures for a project.

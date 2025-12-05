@@ -2624,14 +2624,23 @@ _Review cycle initiated by Claude Code Orchestrator_
                         
                         from services.pipeline_progression import PipelineProgression
                         progression_service = PipelineProgression(self.task_queue)
-                        progression_service.move_issue_to_column(
+                        moved = progression_service.move_issue_to_column(
                             project_name=project_name,
                             board_name=board_name,
                             issue_number=issue_number,
                             target_column=next_column.name,
                             trigger='repair_cycle_completion'
                         )
-                        logger.info(f"Successfully moved issue #{issue_number} to {next_column.name}")
+                        
+                        if moved:
+                            logger.info(f"Successfully moved issue #{issue_number} to {next_column.name}")
+                        else:
+                            logger.error(f"Failed to move issue #{issue_number} to {next_column.name}")
+                            # Don't end pipeline run if move failed, so it can be retried or noticed
+                            # But we already committed code... this is a tricky state.
+                            # For now, we'll log error but still end run to avoid infinite loop of repair cycles
+                            # (since repair cycle itself succeeded)
+                            # Ideally we should have a "Move Failed" state or alert.
 
                 # End pipeline run on success
                 if pipeline_run_id:
