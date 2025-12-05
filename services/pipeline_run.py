@@ -340,74 +340,97 @@ class PipelineRunManager:
         Returns:
             PipelineRun instance (existing or new)
         """
-        # Check for existing active run in Redis
-        existing = self.get_active_pipeline_run(project, issue_number)
+        # Use a lock to prevent race conditions when creating runs
+        lock_key = f"{self.redis_prefix}:lock:{project}:{issue_number}"
         
-        if existing:
-            logger.debug(
-                f"Using existing pipeline run {existing.id} for "
-                f"{project} issue #{issue_number}"
-            )
-            return existing
-        
-        # Redis doesn't have an active run, but Elasticsearch might have old ones
-        # Query Elasticsearch for any active runs for this issue
-        if self.es:
-            try:
-                query = {
-                    "query": {
-                        "bool": {
-                            "must": [
-                                {"term": {"project": project}},
-                                {"term": {"issue_number": issue_number}},
-                                {"term": {"status": "active"}}
-                            ]
-                        }
-                    },
-                    "size": 100  # Get all active runs for this issue
-                }
+        try:
+            # Try to acquire lock (wait up to 5 seconds)
+            with self.redis.lock(lock_key, timeout=5, blocking_timeout=5):
+                # Check for existing active run in Redis
+                existing = self.get_active_pipeline_run(project, issue_number)
                 
-                result = self.es.search(index="pipeline-runs-*", body=query)
-                
-                if result['hits']['total']['value'] > 0:
-                    logger.warning(
-                        f"Found {result['hits']['total']['value']} orphaned active pipeline runs "
-                        f"in Elasticsearch for {project} issue #{issue_number}. Ending them."
+                if existing:
+                    logger.debug(
+                        f"Using existing pipeline run {existing.id} for "
+                        f"{project} issue #{issue_number}"
                     )
-                    
-                    # End all old active runs
-                    for hit in result['hits']['hits']:
-                        old_run_data = hit['_source']
-                        old_run_id = old_run_data['id']
+                    return existing
+                
+                # Redis doesn't have an active run, but Elasticsearch might have old ones
+                # Query Elasticsearch for any active runs for this issue
+                if self.es:
+                    try:
+                        query = {
+                            "query": {
+                                "bool": {
+                                    "must": [
+                                        {"term": {"project": project}},
+                                        {"term": {"issue_number": issue_number}},
+                                        {"term": {"status": "active"}}
+                                    ]
+                                }
+                            },
+                            "size": 100  # Get all active runs for this issue
+                        }
                         
-                        # Update the run in Elasticsearch to mark it as completed
-                        old_run_data['ended_at'] = datetime.utcnow().isoformat() + 'Z'
-                        old_run_data['status'] = 'completed'
+                        result = self.es.search(index="pipeline-runs-*", body=query)
                         
-                        # Update in the same index where it was found
-                        # Extract the index from the hit's _index field
-                        old_index = hit['_index']
-                        self.es.index(
-                            index=old_index,
-                            id=old_run_id,
-                            document=old_run_data
-                        )
-                        
-                        logger.info(
-                            f"Ended orphaned pipeline run {old_run_id} for "
-                            f"{project} issue #{issue_number}"
-                        )
-            except Exception as e:
-                logger.error(f"Error checking/ending old pipeline runs in Elasticsearch: {e}")
-        
-        # Create new run
-        return self.create_pipeline_run(
-            issue_number=issue_number,
-            issue_title=issue_title,
-            issue_url=issue_url,
-            project=project,
-            board=board
-        )
+                        if result['hits']['total']['value'] > 0:
+                            logger.warning(
+                                f"Found {result['hits']['total']['value']} orphaned active pipeline runs "
+                                f"in Elasticsearch for {project} issue #{issue_number}. Ending them."
+                            )
+                            
+                            # End all old active runs
+                            for hit in result['hits']['hits']:
+                                old_run_data = hit['_source']
+                                old_run_id = old_run_data['id']
+                                
+                                # Update the run in Elasticsearch to mark it as completed
+                                old_run_data['ended_at'] = datetime.utcnow().isoformat() + 'Z'
+                                old_run_data['status'] = 'completed'
+                                
+                                # Update in the same index where it was found
+                                # Extract the index from the hit's _index field
+                                old_index = hit['_index']
+                                self.es.index(
+                                    index=old_index,
+                                    id=old_run_id,
+                                    document=old_run_data
+                                )
+                                
+                                logger.info(
+                                    f"Ended orphaned pipeline run {old_run_id} for "
+                                    f"{project} issue #{issue_number}"
+                                )
+                    except Exception as e:
+                        logger.error(f"Error checking/ending old pipeline runs in Elasticsearch: {e}")
+                
+                # Create new run
+                return self.create_pipeline_run(
+                    issue_number=issue_number,
+                    issue_title=issue_title,
+                    issue_url=issue_url,
+                    project=project,
+                    board=board
+                )
+        except redis.exceptions.LockError:
+            logger.warning(f"Could not acquire lock for pipeline run creation: {project} #{issue_number}")
+            # Fallback: try to get existing one last time
+            existing = self.get_active_pipeline_run(project, issue_number)
+            if existing:
+                return existing
+            
+            # If we can't get lock and no existing run, proceed with creation anyway
+            # This is a best-effort fallback
+            logger.warning("Proceeding with pipeline run creation without lock")
+            return self.create_pipeline_run(
+                issue_number=issue_number,
+                issue_title=issue_title,
+                issue_url=issue_url,
+                project=project,
+                board=board
+            )
     
     def end_pipeline_run(
         self,

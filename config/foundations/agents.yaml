@@ -133,6 +133,8 @@ agents:
     model: "claude-opus-4-5-20251101"
     timeout: 900
     retries: 3
+    circuit_breaker:
+      failure_threshold: 6
     makes_code_changes: true  # Writes actual code
     filesystem_write_allowed: true  # CRITICAL: Must write to /workspace for implementation
     requires_dev_container: true  # NEEDS project dependencies to run/test code

@@ -159,6 +159,45 @@ class AgentContainerRecovery:
         if not container_name.startswith('claude-agent-'):
             return None
 
+        # Try to match against known projects first for reliability
+        # This handles cases where project names contain hyphens, which breaks simple splitting
+        try:
+            from config.manager import config_manager
+            projects = config_manager.list_projects()
+            
+            # Sort by length descending to match longest project name first 
+            # (e.g. match 'my-project-v2' before 'my-project')
+            projects.sort(key=len, reverse=True)
+            
+            for project in projects:
+                prefix = f"claude-agent-{project}-"
+                if container_name.startswith(prefix):
+                    # Found matching project!
+                    task_id = container_name[len(prefix):]
+                    
+                    # Validate task_id format: should have at least 2 underscores and end with numeric timestamp
+                    task_parts = task_id.split('_')
+                    
+                    # Note: task_id might contain hyphens if project/board names have hyphens
+                    # But it must use underscores as primary separators
+                    
+                    if len(task_parts) >= 3 and task_parts[-1].isdigit():
+                        timestamp = task_parts[-1]
+                        # The agent is typically the last word(s) before timestamp
+                        agent = '_'.join(task_parts[:-1])
+                        
+                        logger.debug(f"Parsed container {container_name} using known project '{project}'")
+                        return {
+                            'agent': agent,
+                            'project': project,
+                            'task_id': task_id,
+                            'timestamp': timestamp,
+                            'container_name': container_name
+                        }
+        except Exception as e:
+            logger.warning(f"Error matching container against known projects: {e}")
+
+        # Fallback to heuristic splitting if project matching failed
         # Remove prefix: claude-agent-
         remainder = container_name.replace('claude-agent-', '', 1)
 

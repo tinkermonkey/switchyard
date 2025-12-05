@@ -11,6 +11,7 @@ from pipeline.base import PipelineStage
 from pipeline.orchestrator import SequentialPipeline
 from state_management.manager import StateManager
 from agents import AGENT_REGISTRY, get_agent_class
+from services.circuit_breaker import CircuitBreaker
 
 
 async def validate_task_can_run(task, logger) -> Dict[str, Any]:
@@ -104,7 +105,21 @@ class AgentStage(PipelineStage):
     """Generic pipeline stage that wraps any agent"""
 
     def __init__(self, agent_name: str, agent_config: Dict[str, Any] = None):
-        super().__init__(agent_name, agent_config=agent_config)
+        # Check for custom circuit breaker config
+        circuit_breaker = None
+        if agent_config and 'agent_config' in agent_config:
+            # agent_config['agent_config'] is the AgentConfig object from ConfigManager
+            real_config = agent_config['agent_config']
+            if hasattr(real_config, 'circuit_breaker_config') and real_config.circuit_breaker_config:
+                cb_config = real_config.circuit_breaker_config
+                circuit_breaker = CircuitBreaker(
+                    name=agent_name,
+                    failure_threshold=cb_config.get('failure_threshold', 3),
+                    recovery_timeout=cb_config.get('recovery_timeout', 30),
+                    success_threshold=cb_config.get('success_threshold', 2)
+                )
+
+        super().__init__(agent_name, circuit_breaker=circuit_breaker, agent_config=agent_config)
         self.agent_class = get_agent_class(agent_name)
         if not self.agent_class:
             raise ValueError(f"Unknown agent: {agent_name}")

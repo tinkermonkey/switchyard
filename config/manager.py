@@ -35,6 +35,7 @@ class AgentConfig:
     requires_dev_container: bool = False
     requires_docker: bool = True  # CRITICAL: Default to True for security, only dev_environment_setup should be False
     filesystem_write_allowed: bool = True  # Default to True for backward compatibility
+    circuit_breaker_config: Optional[Dict[str, Any]] = None  # Custom circuit breaker settings
 
 
 @dataclass
@@ -227,7 +228,8 @@ class ConfigManager:
                 makes_code_changes=config.get('makes_code_changes', False),
                 requires_dev_container=config.get('requires_dev_container', False),
                 requires_docker=config.get('requires_docker', True),  # Default True for security
-                filesystem_write_allowed=config.get('filesystem_write_allowed', True)
+                filesystem_write_allowed=config.get('filesystem_write_allowed', True),
+                circuit_breaker_config=config.get('circuit_breaker', None)
             )
 
         return agents
@@ -434,7 +436,8 @@ class ConfigManager:
             makes_code_changes=base_agent.makes_code_changes,
             requires_dev_container=base_agent.requires_dev_container,
             requires_docker=base_agent.requires_docker,
-            filesystem_write_allowed=base_agent.filesystem_write_allowed
+            filesystem_write_allowed=base_agent.filesystem_write_allowed,
+            circuit_breaker_config=base_agent.circuit_breaker_config
         )
 
     def get_project_pipelines(self, project_name: str) -> List[ProjectPipeline]:

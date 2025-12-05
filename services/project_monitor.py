@@ -3166,6 +3166,80 @@ _Repair cycle initiated by Claude Code Orchestrator_
             logger.error(traceback.format_exc())
             return None
 
+    def _reconcile_active_runs(self):
+        """
+        Reconcile active pipeline runs with current board state.
+        
+        If an issue has an active pipeline run but is in an exit column (or a column with no agent),
+        we should end the pipeline run.
+        """
+        logger.info("Reconciling active pipeline runs with board state...")
+        
+        try:
+            for project_name in self.config_manager.list_visible_projects():
+                project_config = self.config_manager.get_project_config(project_name)
+                
+                for pipeline in project_config.pipelines:
+                    if not pipeline.active:
+                        continue
+                        
+                    board_key = f"{project_name}_{pipeline.board_name}"
+                    if board_key not in self.last_state:
+                        continue
+                        
+                    current_items = self.last_state[board_key].values()
+                    workflow_template = self.config_manager.get_workflow_template(pipeline.workflow)
+                    
+                    for item in current_items:
+                        # Check if there is an active run
+                        pipeline_run = self.pipeline_run_manager.get_active_pipeline_run(
+                            project_name, item.issue_number
+                        )
+                        
+                        if pipeline_run:
+                            # Check if current column is an exit column or has no agent
+                            column_config = next(
+                                (c for c in workflow_template.columns if c.name == item.status),
+                                None
+                            )
+                            
+                            should_end = False
+                            reason = ""
+                            
+                            if not column_config:
+                                should_end = True
+                                reason = f"Column '{item.status}' not found in workflow"
+                            elif not column_config.agent or column_config.agent == 'null':
+                                should_end = True
+                                reason = f"Column '{item.status}' has no agent"
+                            elif hasattr(workflow_template, 'pipeline_exit_columns') and \
+                                 workflow_template.pipeline_exit_columns and \
+                                 item.status in workflow_template.pipeline_exit_columns:
+                                should_end = True
+                                reason = f"Column '{item.status}' is an exit column"
+                                
+                            if should_end:
+                                logger.info(
+                                    f"Found active run {pipeline_run.id} for issue #{item.issue_number} "
+                                    f"in exit/no-agent column '{item.status}'. Ending run."
+                                )
+                                self.pipeline_run_manager.end_pipeline_run(
+                                    project_name, item.issue_number, reason
+                                )
+                                
+                                # Also release lock if held
+                                from services.pipeline_lock_manager import get_pipeline_lock_manager
+                                lock_manager = get_pipeline_lock_manager()
+                                lock = lock_manager.get_lock(project_name, pipeline.board_name)
+                                if lock and lock.locked_by_issue == item.issue_number:
+                                    lock_manager.release_lock(project_name, pipeline.board_name, item.issue_number)
+                                    logger.info(f"Released lock for issue #{item.issue_number}")
+
+        except Exception as e:
+            logger.error(f"Error reconciling active runs: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+
     def _rescan_boards_for_stalled_items(self):
         """
         Rescan all boards after startup to dispatch agents for items already in action-required columns.
@@ -3510,8 +3584,9 @@ _Repair cycle initiated by Claude Code Orchestrator_
         
         logger.info("Project state initialization complete, starting main monitoring loop...")
 
-        # After cleanup and state initialization, rescan boards for items needing action
-        logger.info("Rescanning boards for items that need action after startup...")
+        # After cleanup and state initialization, reconcile active runs and rescan boards
+        logger.info("Reconciling active runs and rescanning boards after startup...")
+        self._reconcile_active_runs()
         self._rescan_boards_for_stalled_items()
         logger.info("Board rescan complete")
 
