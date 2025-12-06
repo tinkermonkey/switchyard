@@ -1,4 +1,4 @@
-import { CheckCircle, XCircle, GitBranch, FilePlus, FileMinus, GitCommit } from 'lucide-react'
+import { CheckCircle, XCircle, GitBranch, FilePlus, FileMinus, GitCommit, Archive } from 'lucide-react'
 
 export default function WorkspaceStatus({ workspace }) {
   const formatTimestamp = (timestamp) => {
@@ -138,6 +138,46 @@ export default function WorkspaceStatus({ workspace }) {
             {workspace.git_branches.branches.length === 0 && (
               <p className="text-xs text-gh-fg-muted">No branches found</p>
             )}
+          </div>
+        </div>
+      )}
+
+      {/* Git Stashes */}
+      {workspace?.git_branches?.stashes && workspace.git_branches.stashes.length > 0 && (
+        <div className="mt-3 border-t border-gh-border pt-3">
+          <div className="flex items-center justify-between mb-2">
+            <span className="text-xs font-medium text-gh-fg-muted">
+              Stashes
+            </span>
+            <span className="text-xs text-gh-fg-muted">
+              {workspace.git_branches.stashes.length} stash{workspace.git_branches.stashes.length !== 1 ? 'es' : ''}
+            </span>
+          </div>
+
+          <div className="space-y-2">
+            {workspace.git_branches.stashes.map((stash) => (
+              <div
+                key={stash.id}
+                className="border border-gh-border bg-gh-canvas rounded-md p-2"
+              >
+                <div className="flex items-start gap-2">
+                  <Archive className="w-3 h-3 text-gh-fg-muted mt-0.5" />
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-2">
+                      <span className="text-xs font-mono font-medium text-gh-fg">
+                        {stash.id}
+                      </span>
+                      <span className="text-[10px] text-gh-fg-muted truncate">
+                        {stash.branch}
+                      </span>
+                    </div>
+                    <div className="text-xs text-gh-fg-muted truncate mt-0.5" title={stash.message}>
+                      {stash.message}
+                    </div>
+                  </div>
+                </div>
+              </div>
+            ))}
           </div>
         </div>
       )}

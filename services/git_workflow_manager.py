@@ -452,6 +452,25 @@ class GitWorkflowManager:
 
             if result.returncode == 0:
                 logger.info(f"Checked out branch {branch_name}")
+                
+                if has_changes:
+                    logger.info("Restoring stashed changes...")
+                    try:
+                        pop_result = subprocess.run(
+                            ['git', 'stash', 'pop'],
+                            cwd=project_dir,
+                            capture_output=True,
+                            text=True,
+                            timeout=30
+                        )
+                        
+                        if pop_result.returncode != 0:
+                            logger.warning(f"Failed to pop stash (changes are saved in stash list): {pop_result.stderr}")
+                        else:
+                            logger.info("Successfully restored stashed changes")
+                    except Exception as e:
+                        logger.warning(f"Exception while popping stash: {e}")
+
                 return True
             else:
                 logger.error(f"Failed to checkout branch {branch_name}: {result.stderr}")

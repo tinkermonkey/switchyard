@@ -1965,6 +1965,7 @@ def collect_git_branch_data(project_name, workspace_path):
         branch_data = {
             'current_branch': None,
             'branches': [],
+            'stashes': [],
             'collected_at': datetime.now().isoformat()
         }
 
@@ -1984,6 +1985,37 @@ def collect_git_branch_data(project_name, workspace_path):
         )
         if result.returncode == 0:
             branch_data['current_branch'] = result.stdout.strip()
+
+        # Get stashes
+        stash_result = subprocess.run(
+            ['git', '-C', str(workspace_path), 'stash', 'list'],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        if stash_result.returncode == 0:
+            for line in stash_result.stdout.strip().split('\n'):
+                if not line.strip():
+                    continue
+                # Format: stash@{0}: On branch-name: message
+                parts = line.split(':', 2)
+                if len(parts) >= 3:
+                    stash_id = parts[0].strip()
+                    branch_info = parts[1].strip()
+                    message = parts[2].strip()
+                    branch_data['stashes'].append({
+                        'id': stash_id,
+                        'branch': branch_info,
+                        'message': message,
+                        'raw': line.strip()
+                    })
+                else:
+                    branch_data['stashes'].append({
+                        'id': line.split(':')[0] if ':' in line else 'unknown',
+                        'branch': 'unknown',
+                        'message': line,
+                        'raw': line.strip()
+                    })
 
         # Get all local branches with their tracking info
         result = subprocess.run(
