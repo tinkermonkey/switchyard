@@ -3309,6 +3309,15 @@ _Repair cycle initiated by Claude Code Orchestrator_
                         if not column_config:
                             continue
 
+                        # Check for missing discussions (e.g. Backlog items added while offline)
+                        self._check_and_create_discussion(
+                            project_name,
+                            pipeline.board_name,
+                            item.issue_number,
+                            item.repository,
+                            item.status
+                        )
+
                         # Check if column requires agent action
                         has_agent = column_config.agent and column_config.agent != 'null'
 

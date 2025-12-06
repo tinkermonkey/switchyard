@@ -9,6 +9,7 @@ import logging
 from typing import Dict, Any, List, Optional
 from datetime import datetime
 from services.github_app import github_app
+from services.github_api_client import get_github_client
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +20,20 @@ class GitHubDiscussions:
     def __init__(self):
         """Initialize discussions client"""
         self.app = github_app
+        self.client = get_github_client()
+
+    def _execute_graphql(self, query: str, variables: Dict[str, Any] = None) -> Optional[Dict]:
+        """Execute GraphQL query using App or Client fallback"""
+        if self.app.enabled:
+            return self.app.graphql_request(query, variables)
+        
+        # Fallback to client (PAT)
+        success, result = self.client.graphql(query, variables)
+        if success:
+            return result
+        
+        logger.error(f"GraphQL execution failed: {result}")
+        return None
 
     def get_repository_id(self, owner: str, repo: str) -> Optional[str]:
         """Get repository ID (node ID) for GraphQL operations"""
@@ -30,7 +45,7 @@ class GitHubDiscussions:
         }
         """
 
-        result = self.app.graphql_request(query, {
+        result = self._execute_graphql(query, {
             'owner': owner,
             'repo': repo
         })
@@ -82,7 +97,7 @@ class GitHubDiscussions:
         }
         """
 
-        result = self.app.graphql_request(mutation, {
+        result = self._execute_graphql(mutation, {
             'repositoryId': repo_id,
             'categoryId': category_id,
             'title': title,
@@ -126,7 +141,7 @@ class GitHubDiscussions:
         }
         """
 
-        result = self.app.graphql_request(mutation, {
+        result = self._execute_graphql(mutation, {
             'discussionId': discussion_id,
             'body': body,
             'replyToId': reply_to_id
@@ -165,7 +180,7 @@ class GitHubDiscussions:
         }
         """
 
-        result = self.app.graphql_request(query, {
+        result = self._execute_graphql(query, {
             'discussionId': discussion_id
         })
 
@@ -219,7 +234,7 @@ class GitHubDiscussions:
         }
         """
 
-        result = self.app.graphql_request(query, {
+        result = self._execute_graphql(query, {
             'owner': owner,
             'repo': repo,
             'number': number
@@ -272,7 +287,7 @@ class GitHubDiscussions:
         }
         """
 
-        result = self.app.graphql_request(query, {
+        result = self._execute_graphql(query, {
             'owner': owner,
             'repo': repo,
             'first': first,
@@ -302,7 +317,7 @@ class GitHubDiscussions:
         }
         """
 
-        result = self.app.graphql_request(query, {
+        result = self._execute_graphql(query, {
             'owner': owner,
             'repo': repo
         })
