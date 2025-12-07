@@ -743,19 +743,9 @@ class HumanFeedbackLoopExecutor:
             context['claude_session_id'] = state.claude_session_id
             logger.info(f"Resuming Claude Code session: {state.claude_session_id}")
 
-        # Determine what execution mode the agent will use based on context
-        # This matches the logic in base_maker_agent._determine_execution_mode()
-        if human_feedback and context.get('conversation_mode') == 'threaded' and len(context.get('thread_history', [])) > 0:
-            execution_mode = 'question'
-        elif human_feedback or context.get('trigger') == 'feedback_loop':
-            execution_mode = 'revision'
-        else:
-            execution_mode = 'initial'
-        
-        logger.info(f"Agent will execute in {execution_mode.upper()} mode (iteration {state.current_iteration}, is_initial={is_initial})")
-
         # Execute agent via centralized executor (ensures observability)
-        logger.info(f"Executing {state.agent} (iteration {state.current_iteration})")
+        # Mode detection happens in base_maker_agent._determine_execution_mode()
+        logger.info(f"Executing {state.agent} (iteration {state.current_iteration}, is_initial={is_initial})")
 
         from services.agent_executor import get_agent_executor
 
@@ -939,15 +929,24 @@ class HumanFeedbackLoopExecutor:
                         continue
                     
                     # This is a valid user reply
+                    # CRITICAL: Only consider this reply if it's to THIS agent's comment
+                    # This prevents agent A from replying in-thread to conversations with agent B
+                    comment_body = comment.get('body', '')
+                    agent_signature = f"_Processed by the {state.agent} agent_"
+                    
+                    if agent_signature not in comment_body:
+                        logger.info(f"DEBUG:   Skipping reply - parent comment not from {state.agent}")
+                        continue
+                    
                     if most_recent_time is None or reply_created_at > most_recent_time:
-                        logger.info(f"DEBUG:   ✅ New most recent comment: {reply_author} at {reply_created_at} (reply to {author})")
+                        logger.info(f"DEBUG:   ✅ New most recent comment: {reply_author} at {reply_created_at} (reply to {author} [{state.agent}])")
                         most_recent_time = reply_created_at
                         
                         # Build parent comment info (the top-level comment being replied to)
                         parent_comment = {
                             'id': comment_id,
                             'author': author,
-                            'body': comment.get('body', '')
+                            'body': comment_body
                         }
                         
                         most_recent_comment = {
@@ -1020,16 +1019,33 @@ class HumanFeedbackLoopExecutor:
                     author = comment['author']['login']
                     created_at = date_parser.parse(comment['createdAt'])
                     comment_id = comment.get('id')
+                    body = comment.get('body', '')
+                    
+                    # Skip if already processed
+                    if comment_id in state.processed_comment_ids:
+                        logger.debug(f"Skipping already-processed comment {comment_id}")
+                        continue
                     
                     if not is_bot_user(author):
-                        if "_Processed by the " in comment.get('body', ''):
-                             continue
+                        # Check for agent signatures
+                        has_signature = "_Processed by the " in body
+                        agent_signature = f"_Processed by the {state.agent} agent_"
+                        
+                        # Skip if this is an agent output (not from this agent)
+                        if has_signature and agent_signature not in body:
+                            logger.debug(f"Skipping comment discussing different agent's work")
+                            continue
+                        
+                        # Skip if this is our own agent output
+                        if agent_signature in body:
+                            logger.debug(f"Skipping our own agent output")
+                            continue
                              
                         if most_recent_time is None or created_at > most_recent_time:
                             most_recent_time = created_at
                             most_recent_comment = {
                                 'author': author,
-                                'body': comment.get('body', ''),
+                                'body': body,
                                 'created_at': created_at.isoformat(),
                                 'comment_id': comment_id,
                                 'parent_comment': None
@@ -1124,17 +1140,29 @@ class HumanFeedbackLoopExecutor:
                         continue
 
                     if not is_bot_user(author) and created_at > last_agent_time:
-                        # Check for agent signature (handles PAT users)
-                        if "_Processed by the " in comment.get('body', ''):
-                             logger.debug(f"Skipping comment from {author} as it contains agent signature")
-                             continue
+                        body = comment.get('body', '')
+                        
+                        # Check for agent signatures
+                        has_signature = "_Processed by the " in body
+                        agent_signature = f"_Processed by the {state.agent} agent_"
+                        
+                        # Skip if this is an agent output (not from this agent)
+                        if has_signature and agent_signature not in body:
+                            logger.debug(f"Skipping comment discussing different agent's work")
+                            continue
+                        
+                        # Skip if this is our own agent output
+                        if agent_signature in body:
+                            logger.debug(f"Skipping our own agent output")
+                            continue
 
                         logger.info(f"Found human feedback in issue comment from {author}")
                         return {
                             'author': author,
-                            'body': comment.get('body', ''),
+                            'body': body,
                             'created_at': created_at.isoformat(),
-                            'comment_id': comment_id
+                            'comment_id': comment_id,
+                            'parent_comment': None
                         }
 
             return None
