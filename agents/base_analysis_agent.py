@@ -59,13 +59,23 @@ class AnalysisAgent(MakerAgent):
                     inner_config.setdefault('makes_code_changes', False)
                     inner_config.setdefault('filesystem_write_allowed', False)
 
-    def _get_output_instructions(self) -> str:
+    def _get_output_instructions(self, mode: str = 'initial') -> str:
         """
         Override output instructions to be specific to analysis agents.
         
         Analysis agents always output markdown for GitHub comments and never write files.
         This method is called by the base MakerAgent's prompt builders.
         """
+        if mode == 'question':
+            return """
+**IMPORTANT - OUTPUT FORMAT**:
+- **PROJECT-SPECIFIC CONVENTIONS OVERRIDE**: Read `/workspace/CLAUDE.md` first.
+- Output your answer as markdown text directly
+- DO NOT create any files
+- Use proper markdown formatting (headers, lists, code blocks)
+- **NO INTERNAL DIALOG**: Do not include planning statements like "Let me research...", "I'll examine...". Just provide the answer.
+"""
+
         return """
 
 **IMPORTANT - OUTPUT FORMAT FOR ANALYSIS**:

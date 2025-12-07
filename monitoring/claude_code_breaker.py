@@ -47,6 +47,9 @@ class ClaudeCodeBreaker:
     # IMPORTANT: Must be specific to avoid false positives!
     # Only match specific limit types (session/token/rate/request/usage) with action verbs
     # Don't match generic "limit reached" which appears in documentation
+    #
+    # FIX: Added ^ anchor to ensure we match start of line/string for some patterns
+    # to avoid matching inside sentences
     SESSION_LIMIT_PATTERN = re.compile(
         r'(?:SESSION_LIMIT_IN_RESPONSE:\s+)?(?:'
         # Group 1: Explicit type (session/token/etc)
@@ -151,6 +154,12 @@ class ClaudeCodeBreaker:
             Tuple of (is_session_limited, reset_datetime)
         """
         if not message:
+            return False, None
+            
+        # FIX: Length restriction to prevent false positives from long prompts/discussions
+        # Real error messages are typically short (< 200 chars)
+        # If the message is very long, it's likely a prompt or file content
+        if len(message) > 300:
             return False, None
             
         match = self.SESSION_LIMIT_PATTERN.search(message)

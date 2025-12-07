@@ -125,7 +125,8 @@ class AgentContainerRecovery:
                             'id': container_data.get('ID', ''),
                             'status': container_data.get('Status', ''),
                             'created_at': container_data.get('CreatedAt', ''),
-                            'image': container_data.get('Image', '')
+                            'image': container_data.get('Image', ''),
+                            'labels': container_data.get('Labels', '')
                         })
                     except json.JSONDecodeError as e:
                         logger.warning(f"Failed to parse container JSON: {e}")
@@ -343,6 +344,7 @@ class AgentContainerRecovery:
         for container in running_containers:
             container_name = container['name']
             container_id = container['id']
+            labels_str = container.get('labels', '')
 
             try:
                 # Skip agent containers that are part of repair cycles
@@ -353,10 +355,36 @@ class AgentContainerRecovery:
                     )
                     continue
 
-                # Parse container name
-                metadata = self.parse_container_name(container_name)
+                # Parse labels to get metadata
+                labels = {}
+                if labels_str:
+                    for part in labels_str.split(','):
+                        if '=' in part:
+                            k, v = part.split('=', 1)
+                            labels[k.strip()] = v.strip()
+
+                # Try to get metadata from labels first
+                project = labels.get('org.clauditoreum.project')
+                agent = labels.get('org.clauditoreum.agent')
+                task_id = labels.get('org.clauditoreum.task_id')
+                issue_number_label = labels.get('org.clauditoreum.issue_number')
+                
+                metadata = None
+                if project and agent and task_id:
+                    metadata = {
+                        'project': project,
+                        'agent': agent,
+                        'task_id': task_id,
+                        'container_name': container_name
+                    }
+                    logger.info(f"Recovered metadata from labels for {container_name}")
+                
                 if not metadata:
-                    logger.warning(f"Could not parse container name: {container_name}, killing it")
+                    # Fallback to name parsing
+                    metadata = self.parse_container_name(container_name)
+
+                if not metadata:
+                    logger.warning(f"Could not parse container name or labels: {container_name}, killing it")
                     self.kill_container(container_name, container_id)
                     killed += 1
                     continue
@@ -368,23 +396,32 @@ class AgentContainerRecovery:
                 # Try to get additional metadata from Redis (if still available after restart)
                 redis_key = f'agent:container:{container_name}'
                 issue_number = None
+                
+                # Use label if available
+                if issue_number_label:
+                    try:
+                        issue_number = int(issue_number_label)
+                        logger.info(f"Found issue number {issue_number} in labels for {container_name}")
+                    except ValueError:
+                        logger.warning(f"Invalid issue number in label: {issue_number_label}")
 
-                try:
-                    redis_data = self.redis.hgetall(redis_key)
-                    if redis_data:
-                        # Use project from Redis if available (more reliable than parsing container name)
-                        if 'project' in redis_data and redis_data['project']:
-                            project = redis_data['project']
-                            logger.debug(f"Using project '{project}' from Redis for container {container_name}")
+                if not issue_number:
+                    try:
+                        redis_data = self.redis.hgetall(redis_key)
+                        if redis_data:
+                            # Use project from Redis if available (more reliable than parsing container name)
+                            if 'project' in redis_data and redis_data['project']:
+                                project = redis_data['project']
+                                logger.debug(f"Using project '{project}' from Redis for container {container_name}")
 
-                        # Get issue number
-                        if 'issue_number' in redis_data:
-                            issue_number_str = redis_data.get('issue_number', '')
-                            if issue_number_str and issue_number_str != 'unknown':
-                                issue_number = int(issue_number_str)
-                                logger.info(f"Found issue number {issue_number} in Redis for container {container_name}")
-                except Exception as e:
-                    logger.debug(f"Could not get Redis data for container: {e}")
+                            # Get issue number
+                            if 'issue_number' in redis_data:
+                                issue_number_str = redis_data.get('issue_number', '')
+                                if issue_number_str and issue_number_str != 'unknown':
+                                    issue_number = int(issue_number_str)
+                                    logger.info(f"Found issue number {issue_number} in Redis for container {container_name}")
+                    except Exception as e:
+                        logger.debug(f"Could not get Redis data for container: {e}")
 
                 # If we have issue_number, validate against execution history
                 if issue_number:

@@ -460,6 +460,11 @@ class AgentExecutor:
             
             # Get reply_to_id for threaded conversations
             reply_to_id = task_context.get('reply_to_comment_id')
+            
+            if reply_to_id:
+                logger.info(f"Posting threaded reply to comment {reply_to_id}")
+            else:
+                logger.info("Posting top-level comment (no reply_to_comment_id found)")
 
             # Post to GitHub (workspace-aware: issues or discussions)
             post_result = await github.post_agent_output(

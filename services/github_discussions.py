@@ -35,6 +35,54 @@ class GitHubDiscussions:
         logger.error(f"GraphQL execution failed: {result}")
         return None
 
+    def get_discussion_comments(self, owner: str, repo: str, discussion_id: str) -> List[Dict]:
+        """
+        Get comments for a discussion by node ID
+        
+        Args:
+            owner: Repository owner
+            repo: Repository name
+            discussion_id: Discussion node ID (e.g. D_kwD...)
+            
+        Returns: List of comment objects
+        """
+        query = """
+        query($discussionId: ID!) {
+          node(id: $discussionId) {
+            ... on Discussion {
+              comments(first: 100) {
+                nodes {
+                  id
+                  body
+                  createdAt
+                  author {
+                    login
+                  }
+                  replies(first: 50) {
+                    nodes {
+                      id
+                      body
+                      createdAt
+                      author {
+                        login
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+        """
+        
+        result = self._execute_graphql(query, {'discussionId': discussion_id})
+        
+        if result and 'node' in result and 'comments' in result['node']:
+            return result['node']['comments']['nodes']
+            
+        logger.error(f"Failed to get comments for discussion {discussion_id}")
+        return []
+
     def get_repository_id(self, owner: str, repo: str) -> Optional[str]:
         """Get repository ID (node ID) for GraphQL operations"""
         query = """
@@ -149,10 +197,10 @@ class GitHubDiscussions:
 
         if result and 'addDiscussionComment' in result:
             comment_id = result['addDiscussionComment']['comment']['id']
-            logger.info(f"Added comment to discussion {discussion_id}")
+            logger.info(f"Added comment to discussion {discussion_id} (reply_to: {reply_to_id})")
             return comment_id
 
-        logger.error(f"Failed to add comment to discussion {discussion_id}")
+        logger.error(f"Failed to add comment to discussion {discussion_id}. Result: {result}")
         return None
 
     def get_discussion(self, discussion_id: str) -> Optional[Dict]:

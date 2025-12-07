@@ -10,6 +10,7 @@ For automated maker-checker review workflows, see review_cycle.py instead.
 import asyncio
 import logging
 import re
+import subprocess
 from typing import Dict, Any, Optional, Tuple
 from datetime import datetime
 from config.manager import WorkflowColumn
@@ -69,6 +70,127 @@ class HumanFeedbackLoopExecutor:
         self.review_parser = ReviewParser()
         # Don't initialize GitHubIntegration here - create it per-loop with proper repo context
         self.active_loops = {}  # Track active loops by issue number
+        self._initialized = False
+
+    async def initialize(self):
+        """Initialize executor and clean up stale locks from previous orchestrator runs"""
+        if self._initialized:
+            return
+
+        logger.info("Initializing HumanFeedbackLoopExecutor and cleaning up stale locks...")
+
+        # Clear in-memory state (always stale after restart)
+        if self.active_loops:
+            logger.warning(
+                f"Clearing {len(self.active_loops)} stale in-memory loop states from previous run"
+            )
+            self.active_loops.clear()
+
+        # Clean up stale Redis locks that don't have corresponding running containers
+        await self._cleanup_stale_redis_locks()
+
+        self._initialized = True
+        logger.info("HumanFeedbackLoopExecutor initialization complete")
+
+    async def _cleanup_stale_redis_locks(self):
+        """
+        Clean up Redis locks that don't have corresponding running agent containers.
+
+        SAFETY: Only clears locks when:
+        1. No Docker container exists with matching name pattern
+        2. No Redis container tracking key exists
+        3. Container exists but is not running (exited/stopped)
+
+        This is safe across orchestrator restarts because:
+        - Running agents have both: active container + Redis tracking key
+        - Stale locks from crashes/forced stops have neither
+        """
+        try:
+            import redis
+            redis_client = redis.Redis(host='redis', port=6379, decode_responses=True)
+
+            # Find all conversational loop locks
+            lock_pattern = "orchestrator:conversational_loop:*"
+            lock_keys = redis_client.keys(lock_pattern)
+
+            if not lock_keys:
+                logger.info("No conversational loop locks found in Redis")
+                return
+
+            logger.info(f"Checking {len(lock_keys)} conversational loop locks for stale entries...")
+
+            cleaned_count = 0
+            for lock_key in lock_keys:
+                try:
+                    # Parse lock key: orchestrator:conversational_loop:{project}:{issue_number}
+                    parts = lock_key.split(':')
+                    if len(parts) != 4:
+                        logger.warning(f"Malformed lock key: {lock_key}")
+                        continue
+
+                    project = parts[2]
+                    issue_number = parts[3]
+                    agent = redis_client.get(lock_key)  # Lock value = agent name
+
+                    # Check if container exists for this lock
+                    # Container naming: claude-agent-{project}-{task_id}
+                    # We need to check all containers for this project
+                    container_pattern = f"claude-agent-{project}-*"
+
+                    result = subprocess.run(
+                        ['docker', 'ps', '--filter', f'name={container_pattern}', '--format', '{{.Names}}'],
+                        capture_output=True,
+                        text=True,
+                        timeout=5
+                    )
+
+                    running_containers = []
+                    if result.returncode == 0 and result.stdout.strip():
+                        running_containers = [line.strip() for line in result.stdout.strip().split('\n') if line.strip()]
+
+                    # Check if any running container is associated with this issue
+                    has_active_container = False
+                    for container_name in running_containers:
+                        # Check Redis tracking for this container
+                        tracking_key = f'agent:container:{container_name}'
+                        container_info = redis_client.hgetall(tracking_key)
+
+                        if container_info:
+                            tracked_issue = container_info.get('issue_number', '')
+                            tracked_agent = container_info.get('agent', '')
+
+                            # Match by issue number AND agent (must be exact match)
+                            if tracked_issue == issue_number and tracked_agent == agent:
+                                has_active_container = True
+                                logger.info(
+                                    f"✅ Lock {lock_key} is VALID: active container {container_name} "
+                                    f"for issue #{issue_number} (agent={agent})"
+                                )
+                                break
+
+                    # If no active container found, this is a stale lock
+                    if not has_active_container:
+                        redis_client.delete(lock_key)
+                        cleaned_count += 1
+                        logger.warning(
+                            f"🧹 Cleaned up STALE lock: {lock_key} "
+                            f"(issue #{issue_number}, agent={agent}, no active container found)"
+                        )
+
+                except subprocess.TimeoutExpired:
+                    logger.warning(f"Timeout checking containers for lock {lock_key}")
+                except Exception as e:
+                    logger.warning(f"Error checking lock {lock_key}: {e}")
+
+            if cleaned_count > 0:
+                logger.info(f"Cleaned up {cleaned_count} stale conversational loop locks")
+            else:
+                logger.info("No stale conversational loop locks found")
+
+        except Exception as e:
+            logger.error(f"Error during stale lock cleanup: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
 
     async def start_loop(
         self,
@@ -91,6 +213,9 @@ class HumanFeedbackLoopExecutor:
         Returns:
             Tuple of (next_column_name, success)
         """
+        # Ensure executor is initialized (cleans up stale locks on first call)
+        await self.initialize()
+
         logger.info(
             f"Starting human feedback loop for issue #{issue_number} "
             f"with agent {column.agent}"
@@ -194,18 +319,28 @@ class HumanFeedbackLoopExecutor:
         self.workflow_columns = workflow_columns
 
         try:
+            # CRITICAL FIX: Load previous agent outputs BEFORE checking for initial user request
+            # This ensures state.agent_outputs is populated so we can correctly detect threaded conversations
+            logger.info(f"Loading previous agent outputs for issue #{issue_number} from {workspace_type} workspace")
+            if workspace_type == 'discussions' and discussion_id:
+                await self._load_previous_outputs_from_discussion(state, org)
+            else:
+                await self._load_previous_outputs_from_issue(state, org)
+            
             # Check for existing user comments to reply to (instead of posting new top-level)
             initial_feedback = await self._get_initial_user_request(state, org)
             
             if initial_feedback:
-                logger.info(f"Found initial user request from {initial_feedback['author']}, replying to it")
+                # CRITICAL FIX: When replying to existing feedback, set is_initial=False
+                # This ensures the agent uses question/revision mode instead of initial mode
+                logger.info(f"Found initial user request from {initial_feedback['author']}, replying to it as feedback")
                 await self._execute_agent(
                     state,
                     column,
                     issue_data,
                     previous_stage_output,
                     org,
-                    is_initial=True,
+                    is_initial=False,  # FIX: False because we're responding to existing feedback
                     human_feedback=initial_feedback
                 )
             else:
@@ -295,9 +430,79 @@ class HumanFeedbackLoopExecutor:
                 f"Will only respond to feedback after {state.agent_outputs[-1]['timestamp']}"
             )
 
+        # CRITICAL FIX: Check for existing unprocessed feedback IMMEDIATELY before entering poll loop
+        # This handles cases where:
+        # 1. Orchestrator restarts and resumes monitoring (feedback may have arrived during downtime)
+        # 2. Human posted feedback while agent was executing
+        # 3. Race condition where feedback arrives between agent completion and monitoring start
+        logger.info("Checking for existing unprocessed feedback before starting poll loop...")
+        try:
+            initial_human_feedback = await self._get_human_feedback_since_last_agent(
+                state,
+                org
+            )
+            
+            if initial_human_feedback:
+                logger.info(
+                    f"Found existing unprocessed feedback from {initial_human_feedback['author']}, "
+                    f"processing immediately (before entering poll loop)"
+                )
+                state.current_iteration += 1
+
+                # Emit decision event for feedback detection
+                from monitoring.decision_events import DecisionEventEmitter
+                from monitoring.observability import get_observability_manager
+                
+                obs = get_observability_manager()
+                decision_events = DecisionEventEmitter(obs)
+                
+                has_parent_comment = 'parent_comment' in initial_human_feedback and initial_human_feedback['parent_comment'] is not None
+                predicted_mode = 'question' if has_parent_comment else 'revision'
+                action_description = f"route_to_agent_{state.agent}_in_{predicted_mode}_mode"
+                
+                decision_events.emit_feedback_detected(
+                    issue_number=state.issue_number,
+                    project=state.project_name,
+                    board=state.board_name,
+                    feedback_source='discussion_reply' if state.workspace_type == 'discussions' else 'issue_comment',
+                    feedback_content=initial_human_feedback.get('body', ''),
+                    target_agent=state.agent,
+                    action_taken=action_description,
+                    workspace_type=state.workspace_type,
+                    discussion_id=state.discussion_id,
+                    pipeline_run_id=state.pipeline_run_id
+                )
+
+                # Execute agent with feedback
+                await self._execute_agent(
+                    state,
+                    column,
+                    issue_data,
+                    None,
+                    org,
+                    is_initial=False,
+                    human_feedback=initial_human_feedback
+                )
+
+                # Mark comment as processed
+                comment_id = initial_human_feedback.get('comment_id')
+                if comment_id:
+                    state.processed_comment_ids.add(comment_id)
+                    logger.info(f"✅ Marked comment {comment_id} as processed")
+            else:
+                logger.info("No existing unprocessed feedback found, entering poll loop...")
+        except Exception as e:
+            logger.error(f"Error checking for initial feedback: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+
         while True:
             await asyncio.sleep(poll_interval)
             poll_count += 1
+
+            # DEBUG: Log that we are polling
+            if poll_count % 2 == 0:  # Log every minute
+                logger.debug(f"Polling for feedback on discussion {state.discussion_id} (iteration {poll_count})")
 
             # Check for human feedback
             try:
@@ -465,6 +670,8 @@ class HumanFeedbackLoopExecutor:
             feedback_author = human_feedback.get('author', 'human') if isinstance(human_feedback, dict) else 'human'
             comment_id = human_feedback.get('comment_id') if isinstance(human_feedback, dict) else None
             parent_comment = human_feedback.get('parent_comment') if isinstance(human_feedback, dict) else None
+            
+            logger.info(f"Processing feedback from {feedback_author}. Comment ID: {comment_id}, Parent: {parent_comment.get('id') if parent_comment else 'None'}")
 
             # Add feedback context
             context['feedback'] = {
@@ -484,6 +691,9 @@ class HumanFeedbackLoopExecutor:
                 # Top-level human comment, can reply directly
                 context['reply_to_comment_id'] = comment_id
                 logger.debug(f"Set reply_to_comment_id: {comment_id}")
+            else:
+                # Fallback: if no comment ID, we can't thread, but we should log it
+                logger.warning("No comment_id or parent_comment found in feedback - cannot thread reply")
 
             # Build thread history ONLY from the parent comment being replied to
             # This is deterministic - we know exactly which comment the human replied to
@@ -614,12 +824,20 @@ class HumanFeedbackLoopExecutor:
             query($discussionId: ID!) {
               node(id: $discussionId) {
                 ... on Discussion {
-                  comments(last: 20) {
+                  comments(last: 100) {
                     nodes {
                       id
                       author { login }
                       body
                       createdAt
+                      replies(last: 100) {
+                        nodes {
+                          id
+                          author { login }
+                          body
+                          createdAt
+                        }
+                      }
                     }
                   }
                 }
@@ -634,35 +852,119 @@ class HumanFeedbackLoopExecutor:
 
             comments = result['node']['comments']['nodes']
             
-            # Look for the most recent user comment that isn't from a bot
-            # We prefer comments that mention the agent, but will take any recent user comment
-            # if it looks like a request.
+            # GitHub discussions use nested structure: top-level comments with nested replies
+            # We need to check both top-level comments and their replies for user requests
+            
+            logger.info(f"DEBUG: Checking {len(comments)} comments for initial user request")
             
             most_recent_comment = None
             most_recent_time = None
             
             for comment in comments:
+                if 'author' not in comment or 'createdAt' not in comment:
+                    continue
+                
                 # Check top-level comment
-                if 'author' in comment and 'createdAt' in comment:
-                    author = comment['author']['login']
-                    created_at = date_parser.parse(comment['createdAt'])
-                    comment_id = comment.get('id')
+                author = comment['author']['login']
+                created_at = date_parser.parse(comment['createdAt'])
+                comment_id = comment.get('id')
+                
+                logger.info(f"DEBUG: Comment {comment_id} from {author} at {created_at}")
+                
+                # Skip bot comments
+                if not is_bot_user(author):
+                    # Check for agent signature (skip if it's an agent output)
+                    body = comment.get('body', '')
+                    has_signature = "_Processed by the " in body
+                    is_quote = False
                     
-                    if not is_bot_user(author):
-                        # Check for agent signature (skip if it's an agent output)
-                        if "_Processed by the " in comment.get('body', ''):
-                             continue
-                             
+                    if has_signature:
+                        # Check if signature line starts with > (quoted)
+                        for line in body.split('\n'):
+                            if "_Processed by the " in line and line.strip().startswith('>'):
+                                is_quote = True
+                                break
+                    
+                    if not has_signature or is_quote:
+                        # This is a valid user comment
                         if most_recent_time is None or created_at > most_recent_time:
+                            logger.info(f"DEBUG:   ✅ New most recent comment: {author} at {created_at}")
                             most_recent_time = created_at
                             most_recent_comment = {
                                 'author': author,
-                                'body': comment.get('body', ''),
+                                'body': body,
                                 'created_at': created_at.isoformat(),
                                 'comment_id': comment_id,
-                                'parent_comment': None  # Top-level
+                                'parent_comment': None
                             }
+                        else:
+                            logger.info(f"DEBUG:   Older than current most recent ({most_recent_time})")
+                    else:
+                        logger.info(f"DEBUG:   Skipping - has agent signature (not quoted)")
+                else:
+                    logger.info(f"DEBUG:   Skipping - bot user")
+                
+                # Check nested replies
+                replies = comment.get('replies', {}).get('nodes', [])
+                logger.info(f"DEBUG: Checking {len(replies)} replies to comment {comment_id}")
+                
+                for reply in replies:
+                    if 'author' not in reply or 'createdAt' not in reply:
+                        continue
+                    
+                    reply_author = reply['author']['login']
+                    reply_created_at = date_parser.parse(reply['createdAt'])
+                    reply_id = reply.get('id')
+                    
+                    logger.info(f"DEBUG: Reply {reply_id} from {reply_author} at {reply_created_at}")
+                    
+                    # Skip bot replies
+                    if is_bot_user(reply_author):
+                        logger.info(f"DEBUG:   Skipping - bot user")
+                        continue
+                    
+                    # Check for agent signature
+                    reply_body = reply.get('body', '')
+                    has_signature = "_Processed by the " in reply_body
+                    is_quote = False
+                    
+                    if has_signature:
+                        for line in reply_body.split('\n'):
+                            if "_Processed by the " in line and line.strip().startswith('>'):
+                                is_quote = True
+                                break
+                    
+                    if has_signature and not is_quote:
+                        logger.info(f"DEBUG:   Skipping - has agent signature (not quoted)")
+                        continue
+                    
+                    # This is a valid user reply
+                    if most_recent_time is None or reply_created_at > most_recent_time:
+                        logger.info(f"DEBUG:   ✅ New most recent comment: {reply_author} at {reply_created_at} (reply to {author})")
+                        most_recent_time = reply_created_at
+                        
+                        # Build parent comment info (the top-level comment being replied to)
+                        parent_comment = {
+                            'id': comment_id,
+                            'author': author,
+                            'body': comment.get('body', '')
+                        }
+                        
+                        most_recent_comment = {
+                            'author': reply_author,
+                            'body': reply_body,
+                            'created_at': reply_created_at.isoformat(),
+                            'comment_id': reply_id,
+                            'parent_comment': parent_comment
+                        }
+                    else:
+                        logger.info(f"DEBUG:   Older than current most recent ({most_recent_time})")
             
+            if most_recent_comment:
+                logger.info(f"Found initial user request from {most_recent_comment['author']} at {most_recent_comment['created_at']} (ID: {most_recent_comment['comment_id']})")
+            else:
+                logger.info("No initial user request found in discussion comments (checked last 100 comments/replies)")
+
             return most_recent_comment
 
         except Exception as e:
@@ -871,13 +1173,13 @@ class HumanFeedbackLoopExecutor:
             query($discussionId: ID!) {
               node(id: $discussionId) {
                 ... on Discussion {
-                  comments(last: 20) {
+                  comments(last: 100) {
                     nodes {
                       id
                       author { login }
                       body
                       createdAt
-                      replies(last: 20) {
+                      replies(last: 100) {
                         nodes {
                           id
                           author { login }
@@ -925,95 +1227,116 @@ class HumanFeedbackLoopExecutor:
                 if last_agent_time.tzinfo:
                     last_agent_time = last_agent_time.replace(tzinfo=None)
 
-            # Flatten comments and replies, look for human comments after last agent output
+            # GitHub discussions use nested structure: top-level comments with nested replies
             logger.debug(f"Checking {len(comments)} comments for feedback (last_agent_time: {last_agent_time})")
 
             for comment in comments:
+                if 'author' not in comment or 'createdAt' not in comment:
+                    continue
+                    
+                author = comment['author']['login']
+                created_at = date_parser.parse(comment['createdAt'])
+                comment_id = comment.get('id')
+
+                if created_at.tzinfo:
+                    created_at = created_at.replace(tzinfo=None)
+
+                # FIX #3: Skip if already processed
+                if comment_id in state.processed_comment_ids:
+                    logger.debug(f"Skipping already-processed comment {comment_id}")
+                    continue
+
                 # Check top-level comment
-                if 'author' in comment and 'createdAt' in comment:
-                    author = comment['author']['login']
-                    created_at = date_parser.parse(comment['createdAt'])
-                    comment_id = comment.get('id')
-
-                    if created_at.tzinfo:
-                        created_at = created_at.replace(tzinfo=None)
-
-                    # FIX #3: Skip if already processed
-                    if comment_id in state.processed_comment_ids:
-                        logger.debug(f"Skipping already-processed comment {comment_id}")
-                        continue
-
-                    if not is_bot_user(author) and created_at > last_agent_time:
-                        # Check for agent signature (handles PAT users)
-                        if "_Processed by the " in comment.get('body', ''):
-                             logger.debug(f"Skipping comment from {author} as it contains agent signature")
-                             continue
-
+                if not is_bot_user(author) and created_at > last_agent_time:
+                    # Check for agent signature (handles PAT users)
+                    body = comment.get('body', '')
+                    has_signature = "_Processed by the " in body
+                    is_quote = False
+                    
+                    if has_signature:
+                        # Check if signature line starts with > (quoted)
+                        for line in body.split('\n'):
+                            if "_Processed by the " in line and line.strip().startswith('>'):
+                                is_quote = True
+                                break
+                    
+                    if not has_signature or is_quote:
+                        # Top-level comment (not a reply)
                         logger.info(f"Found human feedback in top-level comment from {author}")
                         return {
                             'author': author,
-                            'body': comment.get('body', ''),
+                            'body': body,
                             'created_at': created_at.isoformat(),
                             'comment_id': comment_id,
-                            'parent_comment': None  # Top-level, no parent
+                            'parent_comment': None
                         }
+                    else:
+                        logger.debug(f"Skipping comment from {author} as it contains agent signature")
 
-                # Check replies - the parent comment is already known!
+                # Check nested replies
                 replies = comment.get('replies', {}).get('nodes', [])
-                logger.debug(f"Comment has {len(replies)} replies")
-
+                logger.debug(f"Checking {len(replies)} replies to comment {comment_id}")
+                
                 for reply in replies:
-                    author = reply['author']['login']
-                    created_at = date_parser.parse(reply['createdAt'])
+                    if 'author' not in reply or 'createdAt' not in reply:
+                        continue
+                    
+                    reply_author = reply['author']['login']
+                    reply_created_at = date_parser.parse(reply['createdAt'])
                     reply_id = reply.get('id')
 
-                    # Convert to naive datetime
-                    if created_at.tzinfo:
-                        created_at = created_at.replace(tzinfo=None)
-
-                    logger.debug(f"Reply from {author} at {created_at} (last_agent: {last_agent_time})")
+                    if reply_created_at.tzinfo:
+                        reply_created_at = reply_created_at.replace(tzinfo=None)
 
                     # FIX #3: Skip if already processed
                     if reply_id in state.processed_comment_ids:
                         logger.debug(f"Skipping already-processed reply {reply_id}")
                         continue
 
-                    # Check if human comment after last agent output
-                    if not is_bot_user(author) and created_at > last_agent_time:
-                        # Check for agent signature (handles PAT users)
-                        if "_Processed by the " in reply.get('body', ''):
-                             logger.debug(f"Skipping reply from {author} as it contains agent signature")
-                             continue
-
-                        # FIX: Check if parent comment belongs to this agent OR if agent has participated in this thread
-                        parent_body = comment.get('body', '')
-                        agent_signature = f"_Processed by the {state.agent} agent_"
+                    # Skip bot replies
+                    if is_bot_user(reply_author):
+                        continue
                         
-                        agent_participated = agent_signature in parent_body
-                        if not agent_participated:
-                             # Check if agent has any replies in this thread
-                             for r in replies:
-                                 if agent_signature in r.get('body', ''):
-                                     agent_participated = True
-                                     break
-                        
-                        if not agent_participated:
-                            logger.debug(f"Skipping reply to comment {comment.get('id')} - thread not touched by {state.agent}")
-                            continue
+                    # Only process replies after last agent output
+                    if reply_created_at <= last_agent_time:
+                        continue
 
-                        logger.info(f"Found human feedback in reply from {author} to comment {comment.get('id')}")
-                        # Return the parent comment info so we can build correct thread context
-                        return {
-                            'author': author,
-                            'body': reply['body'],
-                            'created_at': created_at.isoformat(),
-                            'comment_id': reply_id,
-                            'parent_comment': {
-                                'id': comment.get('id'),
-                                'body': comment.get('body', ''),
-                                'author': comment.get('author', {}).get('login', 'unknown')
-                            }
+                    # Check for agent signature
+                    reply_body = reply.get('body', '')
+                    has_signature = "_Processed by the " in reply_body
+                    is_quote = False
+                    
+                    if has_signature:
+                        for line in reply_body.split('\n'):
+                            if "_Processed by the " in line and line.strip().startswith('>'):
+                                is_quote = True
+                                break
+                    
+                    if has_signature and not is_quote:
+                        logger.debug(f"Skipping reply from {reply_author} as it contains agent signature")
+                        continue
+
+                    # Check if this reply is to our agent's comment
+                    comment_body = comment.get('body', '')
+                    agent_signature = f"_Processed by the {state.agent} agent_"
+                    
+                    if agent_signature not in comment_body:
+                        logger.debug(f"Skipping reply to comment {comment_id} - not from {state.agent}")
+                        continue
+                    
+                    # This is a reply to our agent's comment!
+                    logger.info(f"Found human feedback in reply from {reply_author} to agent comment {comment_id}")
+                    return {
+                        'author': reply_author,
+                        'body': reply_body,
+                        'created_at': reply_created_at.isoformat(),
+                        'comment_id': reply_id,
+                        'parent_comment': {
+                            'id': comment_id,
+                            'body': comment_body,
+                            'author': author
                         }
+                    }
 
             return None
 

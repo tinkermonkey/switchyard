@@ -114,7 +114,7 @@ class MakerAgent(PipelineStage, ABC):
     # OUTPUT INSTRUCTION BUILDER - Conditional based on agent capabilities
     # ==================================================================================
 
-    def _get_output_instructions(self) -> str:
+    def _get_output_instructions(self, mode: str = 'initial') -> str:
         """
         Build output instructions based on agent configuration.
 
@@ -137,6 +137,26 @@ class MakerAgent(PipelineStage, ABC):
                 agent_cfg = self.agent_config.get('agent_config', {})
                 makes_code_changes = agent_cfg.get('makes_code_changes', False)
                 filesystem_write_allowed = agent_cfg.get('filesystem_write_allowed', True)
+
+        # QUESTION MODE: Lighter instructions for conversational replies
+        if mode == 'question':
+            base_instructions = """
+**IMPORTANT - OUTPUT FORMAT**:
+- **PROJECT-SPECIFIC CONVENTIONS OVERRIDE**: Read `/workspace/CLAUDE.md` first.
+- Use proper markdown formatting (headers, lists, code blocks)
+- **NO INTERNAL DIALOG**: Do not include planning statements like "Let me research...", "I'll examine...". Just provide the answer.
+"""
+            if makes_code_changes or filesystem_write_allowed:
+                return base_instructions + """
+- You may create, edit, or modify files if requested
+- Your changes will be auto-committed to git
+- Provide a summary of your work/answer as the GitHub comment
+"""
+            else:
+                return base_instructions + """
+- Output your answer as markdown text directly
+- DO NOT create any files
+"""
 
         # Agents that modify files get permissive instructions
         if makes_code_changes or filesystem_write_allowed:
@@ -199,7 +219,7 @@ Build upon this previous analysis in your work.
 """ if quality_standards else ""
 
         # Build output instructions based on agent capabilities
-        output_instructions = self._get_output_instructions()
+        output_instructions = self._get_output_instructions(mode='initial')
 
         prompt = f"""
 You are a {self.agent_display_name}.
@@ -237,7 +257,7 @@ Provide a comprehensive analysis with the following sections:
         guidelines_section = f"\n{guidelines}" if guidelines else ""
 
         # Include output instructions so agent knows it can take action
-        output_instructions = self._get_output_instructions()
+        output_instructions = self._get_output_instructions(mode='question')
 
         prompt = f"""
 You are the {self.agent_display_name} continuing a conversation.
@@ -256,20 +276,22 @@ You are the {self.agent_display_name} continuing a conversation.
 
 ## Response Guidelines
 
-You are in **conversational mode**:
+You are in **conversational mode** (replying to a comment thread):
 
-1. **Take Action When Requested**: If the user is asking you to proceed, DO IT - don't ask for permission again
-2. **Be Direct & Concise**: 200-500 words unless the question needs more
-3. **Reference Prior Discussion**: Build on what's been said
-4. **Natural Tone**: Professional but approachable ("I", "you")
-5. **Stay Focused**: Answer the specific question
-6. **Clarify if Needed**: Ask follow-up questions if unclear
-7. **NO Internal Planning Dialog**: Do not include statements like "Let me research...", "I'll examine...", "Now let me check...". Just provide the findings directly.
+1. **REPLY ONLY TO THE LATEST QUESTION**: Do NOT regenerate your entire previous report.
+2. **Take Action When Requested**: If the user is asking you to proceed, DO IT - don't ask for permission again
+3. **Be Direct & Concise**: 200-500 words unless the question needs more
+4. **Reference Prior Discussion**: Build on what's been said
+5. **Natural Tone**: Professional but approachable ("I", "you")
+6. **Stay Focused**: Answer the specific question
+7. **Clarify if Needed**: Ask follow-up questions if unclear
+8. **NO Internal Planning Dialog**: Do not include statements like "Let me research...", "I'll examine...", "Now let me check...". Just provide the findings directly.
 
 **Response Format**:
 - Use markdown for clarity (bold, lists, code blocks)
 - Start directly with your answer (no formal headers)
 - End naturally (no signatures)
+- **DO NOT** include a "Summary" section or "Report" section unless explicitly asked. Just answer the question.
 
 **Common Scenarios**:
 - "Expand on X?" → 2-3 focused paragraphs on X

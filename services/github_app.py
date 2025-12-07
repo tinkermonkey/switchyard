@@ -90,15 +90,18 @@ class GitHubApp:
             return None
 
     def graphql_request(self, query: str, variables: Dict[str, Any] = None) -> Optional[Dict]:
-        """Execute a GraphQL request using GitHub App authentication"""
-        if not self.enabled:
-            logger.debug("GitHub App not configured, cannot execute GraphQL request")
-            return None
-
-        token = self.get_installation_token()
+        """Execute a GraphQL request using GitHub App authentication (with PAT fallback)"""
+        
+        token = None
+        if self.enabled:
+            token = self.get_installation_token()
+        
         if not token:
-            logger.debug("No installation token available for GraphQL request")
-            return None
+            # Fallback to PAT
+            token = os.environ.get('GITHUB_TOKEN')
+            if not token:
+                logger.debug("No installation token or PAT available for GraphQL request")
+                return None
 
         headers = {
             'Authorization': f'Bearer {token}',
@@ -136,20 +139,24 @@ class GitHubApp:
             return None
 
     def rest_request(self, method: str, path: str, data: Dict = None) -> Optional[Dict]:
-        """Execute a REST API request using GitHub App authentication"""
-        if not self.enabled:
-            logger.debug("GitHub App not configured, cannot execute REST request")
-            return None
-
-        token = self.get_installation_token()
+        """Execute a REST API request using GitHub App authentication (with PAT fallback)"""
+        
+        token = None
+        if self.enabled:
+            token = self.get_installation_token()
+        
         if not token:
-            logger.debug("No installation token available for REST request")
-            return None
+            # Fallback to PAT
+            token = os.environ.get('GITHUB_TOKEN')
+            if not token:
+                logger.debug("No installation token or PAT available for REST request")
+                return None
 
         headers = {
             'Authorization': f'Bearer {token}',
             'Accept': 'application/vnd.github.v3+json'
         }
+
 
         url = f'https://api.github.com{path}'
 

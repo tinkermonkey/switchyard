@@ -6,6 +6,7 @@ import subprocess
 import json
 import os
 import logging
+import requests
 from typing import Dict, Any, List, Optional
 
 from services.github_api_client import get_github_client
@@ -184,7 +185,11 @@ class GitHubIntegration:
             return False  # Default to not processed if we can't check
 
     async def has_agent_processed_discussion(self, discussion_id: str, agent_name: str) -> bool:
-        """Check if an agent has already processed this discussion by looking for its signature in comments and replies"""
+        """
+        Check if an agent has already processed this discussion.
+        Returns True if the agent has processed it AND there are no subsequent user comments.
+        Returns False if the agent hasn't processed it OR if there are new user comments.
+        """
         try:
             from services.github_app import github_app
 
@@ -201,6 +206,7 @@ class GitHubIntegration:
                       author {
                         login
                       }
+                      createdAt
                       replies(first: 50) {
                         nodes {
                           id
@@ -208,6 +214,7 @@ class GitHubIntegration:
                           author {
                             login
                           }
+                          createdAt
                         }
                       }
                     }
@@ -224,23 +231,46 @@ class GitHubIntegration:
                 return False
 
             comments = result['node']['comments']['nodes']
-
-            # Look for the agent processing signature in comments and replies
             signature = f"_Processed by the {agent_name} agent_"
 
+            # Collect all messages with timestamps
+            all_messages = []
             for comment in comments:
-                # Check top-level comment
-                if signature in comment.get('body', ''):
-                    logger.debug(f"Found agent signature for {agent_name} in discussion {discussion_id} (top-level comment)")
-                    return True
-
-                # Check replies
+                all_messages.append({
+                    'body': comment.get('body', ''),
+                    'author': comment.get('author', {}).get('login', ''),
+                    'createdAt': comment.get('createdAt', ''),
+                    'type': 'comment'
+                })
                 for reply in comment.get('replies', {}).get('nodes', []):
-                    if signature in reply.get('body', ''):
-                        logger.debug(f"Found agent signature for {agent_name} in discussion {discussion_id} (reply)")
-                        return True
+                    all_messages.append({
+                        'body': reply.get('body', ''),
+                        'author': reply.get('author', {}).get('login', ''),
+                        'createdAt': reply.get('createdAt', ''),
+                        'type': 'reply'
+                    })
+            
+            # Sort by createdAt
+            all_messages.sort(key=lambda x: x['createdAt'])
+            
+            last_agent_idx = -1
+            last_user_idx = -1
+            
+            for i, msg in enumerate(all_messages):
+                if signature in msg['body']:
+                    last_agent_idx = i
+                elif msg['author'] != 'orchestrator-bot' and '[bot]' not in msg['author']:
+                    last_user_idx = i
 
-            return False
+            if last_agent_idx == -1:
+                return False # Agent never processed it
+            
+            if last_user_idx > last_agent_idx:
+                logger.info(f"New user comment found after agent signature (User idx: {last_user_idx}, Agent idx: {last_agent_idx})")
+                return False # New user comment exists
+                
+            logger.debug(f"Found agent signature for {agent_name} and no new user comments")
+            return True
 
         except Exception as e:
             logger.error(f"Failed to check discussion comments: {e}")

@@ -530,6 +530,25 @@ class DockerAgentRunner:
         # Base docker command - build list dynamically to conditionally add -i flag
         cmd = ['docker', 'run', '--rm', '--name', container_name, '--network', self.network_name]
 
+        # Add labels for robust recovery
+        # These labels allow the recovery system to identify containers without parsing names
+        # and without relying on Redis state that might be lost during a crash.
+        cmd.extend([
+            '--label', f'org.clauditoreum.project={context.get("project", "unknown")}',
+            '--label', f'org.clauditoreum.agent={agent}',
+            '--label', f'org.clauditoreum.task_id={context.get("task_id", "unknown")}',
+            '--label', 'org.clauditoreum.managed=true'
+        ])
+
+        # Add optional labels if available
+        issue_number = context.get('issue_number')
+        if issue_number:
+            cmd.extend(['--label', f'org.clauditoreum.issue_number={issue_number}'])
+            
+        pipeline_run_id = context.get('pipeline_run_id')
+        if pipeline_run_id:
+            cmd.extend(['--label', f'org.clauditoreum.pipeline_run_id={pipeline_run_id}'])
+
         # Add -i (interactive) flag if we need stdin for large prompts
         if use_stdin:
             cmd.append('-i')

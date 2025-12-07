@@ -1267,13 +1267,17 @@ class ProjectMonitor:
             logger.error(traceback.format_exc())
             return ""
 
-    def _check_agent_processed_issue_sync(self, issue_number: int, agent: str, repository: str, org: str) -> bool:
+    def _check_agent_processed_issue_sync(self, issue_number: int, agent: str, repository: str, org: str, workspace_type: str = 'issues', discussion_id: Optional[str] = None) -> bool:
         """Synchronous wrapper for checking if agent has processed issue"""
         try:
             import asyncio
             from services.github_integration import GitHubIntegration
             github = GitHubIntegration(repo_owner=org, repo_name=repository)
-            return asyncio.run(github.has_agent_processed_issue(issue_number, agent, repository))
+            
+            if workspace_type == 'discussions' and discussion_id:
+                return asyncio.run(github.has_agent_processed_discussion(discussion_id, agent))
+            else:
+                return asyncio.run(github.has_agent_processed_issue(issue_number, agent, repository))
         except Exception as e:
             logger.warning(f"Could not check for prior agent work: {e}")
             return False
@@ -1503,9 +1507,22 @@ class ProjectMonitor:
                         github = GitHubIntegration(repo_owner=project_config.github['org'], repo_name=repository)
 
                         # For discussions, also check discussion comments (fallback)
-                        already_processed = loop.run_until_complete(
-                            github.has_agent_processed_discussion(discussion_id, agent)
-                        )
+                        # Use a separate thread to avoid "loop already running" errors if called from async context
+                        import concurrent.futures
+                        
+                        def run_check():
+                            new_loop = asyncio.new_event_loop()
+                            asyncio.set_event_loop(new_loop)
+                            try:
+                                return new_loop.run_until_complete(
+                                    github.has_agent_processed_discussion(discussion_id, agent)
+                                )
+                            finally:
+                                new_loop.close()
+
+                        with concurrent.futures.ThreadPoolExecutor() as executor:
+                            already_processed = executor.submit(run_check).result()
+
                         if already_processed:
                             logger.info(f"Agent {agent} has already processed discussion for issue #{issue_number} (comment signature found)")
 
@@ -1572,6 +1589,11 @@ class ProjectMonitor:
                                         try:
                                             loop = asyncio.new_event_loop()
                                             asyncio.set_event_loop(loop)
+
+                                            # Initialize executor (cleanup stale locks on first use)
+                                            loop.run_until_complete(
+                                                human_feedback_loop_executor.initialize()
+                                            )
 
                                             # Just start monitoring - no initial execution needed
                                             from services.human_feedback_loop import HumanFeedbackState
@@ -1647,11 +1669,14 @@ class ProjectMonitor:
                         elif column and column.type == 'conversational':
                             # Check if there's existing work to resume
                             # Only resume if there's evidence of prior agent activity
-                            has_prior_work = self._check_agent_processed_issue_sync(issue_number, agent, repository, project_config.github['org'])
+                            has_prior_work = self._check_agent_processed_issue_sync(
+                                issue_number, agent, repository, project_config.github['org'],
+                                workspace_type=workspace_type, discussion_id=discussion_id
+                            )
 
                             if has_prior_work:
                                 # Resume existing conversational feedback loop
-                                logger.info(f"Resuming conversational feedback loop for issue #{issue_number} in issues workspace")
+                                logger.info(f"Resuming conversational feedback loop for issue #{issue_number} (workspace: {workspace_type})")
                                 try:
                                     from services.human_feedback_loop import human_feedback_loop_executor
                                     import threading
@@ -1662,6 +1687,11 @@ class ProjectMonitor:
                                             loop_new = asyncio.new_event_loop()
                                             asyncio.set_event_loop(loop_new)
 
+                                            # Initialize executor (cleanup stale locks on first use)
+                                            loop_new.run_until_complete(
+                                                human_feedback_loop_executor.initialize()
+                                            )
+
                                             # Create state for this feedback loop
                                             from services.human_feedback_loop import HumanFeedbackState
 
@@ -1671,8 +1701,8 @@ class ProjectMonitor:
                                                 agent=agent,
                                                 project_name=project_name,
                                                 board_name=board_name,
-                                                workspace_type='issues',
-                                                discussion_id=None,  # Issues don't have discussion IDs
+                                                workspace_type=workspace_type,
+                                                discussion_id=discussion_id,
                                                 pipeline_run_id=pipeline_run.id
                                             )
 
@@ -1687,13 +1717,21 @@ class ProjectMonitor:
                                                 state.claude_session_id = persisted_session.session_id
                                                 logger.info(f"Restored Claude Code session for #{issue_number}: {state.claude_session_id}")
 
-                                            # Load previous outputs from issue to rebuild conversation history
-                                            loop_new.run_until_complete(
-                                                human_feedback_loop_executor._load_previous_outputs_from_issue(
-                                                    state,
-                                                    project_config.github['org']
+                                            # Load previous outputs to rebuild conversation history
+                                            if workspace_type == 'discussions':
+                                                loop_new.run_until_complete(
+                                                    human_feedback_loop_executor._load_previous_outputs_from_discussion(
+                                                        state,
+                                                        project_config.github['org']
+                                                    )
                                                 )
-                                            )
+                                            else:
+                                                loop_new.run_until_complete(
+                                                    human_feedback_loop_executor._load_previous_outputs_from_issue(
+                                                        state,
+                                                        project_config.github['org']
+                                                    )
+                                                )
 
                                             # Register and start monitoring
                                             human_feedback_loop_executor.active_loops[issue_number] = state
@@ -3339,20 +3377,26 @@ _Repair cycle initiated by Claude Code Orchestrator_
                             project_name, item.issue_number
                         )
 
-                        # CRITICAL: For repair cycles, check if container is actually running
+                        # CRITICAL: Check if container is actually running for ANY active run
                         # If container is missing, we need to restart even with active pipeline run
                         container_is_running = False
-                        if is_repair_cycle and has_active_run:
-                            # Check Redis for repair cycle container tracking
+                        if has_active_run:
+                            # Check Redis for container tracking
                             if self.task_queue.redis_client:
+                                # Try repair cycle key first
                                 redis_key = f"repair_cycle:container:{project_name}:{item.issue_number}"
                                 container_name = self.task_queue.redis_client.get(redis_key)
-
+                                
+                                # If not found, try agent key (from pipeline_run)
+                                if not container_name and hasattr(has_active_run, 'active_agent') and has_active_run.active_agent:
+                                    container_name = has_active_run.active_agent
+                                
                                 if container_name:
                                     # Check if container actually exists
                                     try:
+                                        c_name = container_name.decode() if isinstance(container_name, bytes) else container_name
                                         result = subprocess.run(
-                                            ['docker', 'inspect', container_name.decode() if isinstance(container_name, bytes) else container_name],
+                                            ['docker', 'inspect', c_name],
                                             capture_output=True,
                                             timeout=5
                                         )
@@ -3360,23 +3404,29 @@ _Repair cycle initiated by Claude Code Orchestrator_
 
                                         if not container_is_running:
                                             logger.warning(
-                                                f"Repair cycle for issue #{item.issue_number} has active pipeline run "
-                                                f"but container {container_name} is not running - will restart"
+                                                f"Issue #{item.issue_number} has active pipeline run "
+                                                f"but container {c_name} is not running - will restart"
                                             )
                                     except Exception as e:
                                         logger.warning(f"Error checking container status for issue #{item.issue_number}: {e}")
                                         container_is_running = False
                                 else:
+                                    # No container name found, but active run exists.
+                                    # For normal agents, this might mean it finished or hasn't started.
+                                    # But if it finished, the run should be closed?
+                                    # If it's a conversational agent, it might be waiting?
+                                    # Assume not running if we can't find a container.
                                     logger.warning(
-                                        f"Repair cycle for issue #{item.issue_number} has active pipeline run "
-                                        f"but no container tracking in Redis - will restart"
+                                        f"Issue #{item.issue_number} has active pipeline run "
+                                        f"but no container tracking found - assuming not running"
                                     )
+                                    container_is_running = False
 
-                        # Skip if active pipeline run exists AND (not repair cycle OR container is running)
-                        if has_active_run and (not is_repair_cycle or container_is_running):
+                        # Skip if active pipeline run exists AND container is running
+                        if has_active_run and container_is_running:
                             logger.debug(
                                 f"Issue #{item.issue_number} in {item.status} already has active pipeline run "
-                                f"{'with running container ' if container_is_running else ''}skipping"
+                                f"with running container - skipping"
                             )
                             continue
 
@@ -3424,17 +3474,31 @@ _Repair cycle initiated by Claude Code Orchestrator_
 
                                         # Look for agent output in discussion
                                         agent_name = column_config.agent
-                                        for comment in comments:
-                                            if comment.get('author', {}).get('login') in ['orchestrator-bot', 'github-actions[bot]']:
-                                                body = comment.get('body', '')
-                                                # Check if this comment is from the current agent
-                                                if f'_Processed by the {agent_name} agent_' in body:
-                                                    has_existing_output = True
-                                                    logger.info(
-                                                        f"Issue #{item.issue_number} in {item.status} already has output from "
-                                                        f"{agent_name} in discussion {discussion_id} - skipping"
-                                                    )
-                                                    break
+                                        last_agent_idx = -1
+                                        last_user_idx = -1
+                                        
+                                        for i, comment in enumerate(comments):
+                                            body = comment.get('body', '')
+                                            author = comment.get('author', {}).get('login')
+                                            
+                                            if author in ['orchestrator-bot', 'github-actions[bot]'] and f'_Processed by the {agent_name} agent_' in body:
+                                                last_agent_idx = i
+                                            elif author not in ['orchestrator-bot', 'github-actions[bot]']:
+                                                last_user_idx = i
+                                        
+                                        if last_agent_idx != -1:
+                                            if last_user_idx > last_agent_idx:
+                                                has_existing_output = False
+                                                logger.info(
+                                                    f"Issue #{item.issue_number} in {item.status} has new user feedback after "
+                                                    f"{agent_name} output in discussion {discussion_id} - triggering update"
+                                                )
+                                            else:
+                                                has_existing_output = True
+                                                logger.info(
+                                                    f"Issue #{item.issue_number} in {item.status} already has output from "
+                                                    f"{agent_name} in discussion {discussion_id} - skipping"
+                                                )
                                 else:
                                     # For issues workspace (default), check issue comments
                                     result = subprocess.run(
@@ -3446,18 +3510,31 @@ _Repair cycle initiated by Claude Code Orchestrator_
                                     comments = comments_data.get('comments', [])
                                     
                                     agent_name = column_config.agent
-                                    for comment in comments:
-                                        # Check for agent signature in comment body
-                                        # Note: Issue comments might be from the user who ran the agent if using PAT, 
-                                        # or bot if using App. We check the body content primarily.
+                                    last_agent_idx = -1
+                                    last_user_idx = -1
+                                    
+                                    for i, comment in enumerate(comments):
                                         body = comment.get('body', '')
+                                        author = comment.get('author', {}).get('login')
+                                        
                                         if f'_Processed by the {agent_name} agent_' in body:
+                                            last_agent_idx = i
+                                        elif author not in ['orchestrator-bot', 'github-actions[bot]']:
+                                            last_user_idx = i
+                                    
+                                    if last_agent_idx != -1:
+                                        if last_user_idx > last_agent_idx:
+                                            has_existing_output = False
+                                            logger.info(
+                                                f"Issue #{item.issue_number} in {item.status} has new user feedback after "
+                                                f"{agent_name} output in issue comments - triggering update"
+                                            )
+                                        else:
                                             has_existing_output = True
                                             logger.info(
                                                 f"Issue #{item.issue_number} in {item.status} already has output from "
                                                 f"{agent_name} in issue comments - skipping"
                                             )
-                                            break
 
                             except Exception as e:
                                 logger.warning(f"Error checking for existing output on issue #{item.issue_number}: {e}")

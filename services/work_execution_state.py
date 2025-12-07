@@ -546,7 +546,41 @@ class WorkExecutionStateTracker:
                             # 1. Docker ps (checks if container actually exists)
                             # 2. Redis tracking keys (checks orchestrator's view of active agents)
 
-                            # Method 1: Check Docker for RUNNING agent containers (not exited ones)
+                            # Check if this issue is in the pipeline queue
+                            # If it is, it's waiting to start, not stuck
+                            try:
+                                import redis
+                                import json
+                                redis_client = redis.Redis(host='redis', port=6379, decode_responses=True)
+                                
+                                # Scan for all board queues for this project
+                                queue_keys = redis_client.keys(f"orchestrator:pipeline_queue:{project_name}:*")
+                                is_in_queue = False
+                                
+                                for key in queue_keys:
+                                    # Get all items in the queue
+                                    items = redis_client.lrange(key, 0, -1)
+                                    for item_json in items:
+                                        try:
+                                            item = json.loads(item_json)
+                                            if str(item.get('issue_number')) == str(issue_number):
+                                                is_in_queue = True
+                                                break
+                                        except:
+                                            pass
+                                    if is_in_queue:
+                                        break
+                                
+                                if is_in_queue:
+                                    logger.info(
+                                        f"Issue {project_name}/#{issue_number} is in pipeline queue, "
+                                        f"skipping stuck state cleanup"
+                                    )
+                                    continue
+                            except Exception as e:
+                                logger.warning(f"Failed to check pipeline queue: {e}")
+
+                            # Method 1: Check if Docker container is running
                             # Use specific prefix pattern to avoid false positives from other projects
                             # Agent container naming: claude-agent-{project}-{task_id}
                             result = subprocess.run(

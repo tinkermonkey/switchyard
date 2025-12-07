@@ -706,7 +706,7 @@ class PipelineRunManager:
                     else:
                         # Column has an agent - now verify work is actually in progress
                         is_actually_active = self._verify_pipeline_run_is_active(
-                            pipeline_run_id, project, issue_number, current_column
+                            pipeline_run_id, project, issue_number, current_column, board
                         )
                         
                         if is_actually_active:
@@ -740,7 +740,7 @@ class PipelineRunManager:
             logger.error(f"Error during stale pipeline run cleanup: {e}")
     
     def _verify_pipeline_run_is_active(self, pipeline_run_id: str, project: str, 
-                                       issue_number: int, current_column: str) -> bool:
+                                       issue_number: int, current_column: str, board: str = None) -> bool:
         """
         Verify that a pipeline run actually has work in progress.
         
@@ -748,13 +748,15 @@ class PipelineRunManager:
         1. Are there any active agent containers running in Docker for this issue?
         2. Are there any active agents in Redis tracking for this issue?
         3. Are there any tasks in the queue for this issue?
-        4. Has there been any recent activity (agent events in last 10 minutes)?
+        4. Is the issue waiting in the pipeline queue?
+        5. Has there been any recent activity (agent events in last 10 minutes)?
         
         Args:
             pipeline_run_id: Pipeline run ID
             project: Project name
             issue_number: Issue number
             current_column: Current column name
+            board: Board name (optional, but required for pipeline queue check)
             
         Returns:
             True if work is actually in progress, False if stalled
@@ -899,7 +901,28 @@ class PipelineRunManager:
                     except Exception as e:
                         continue
             
-            # Check 4: Has there been recent activity? (agent events in last 10 minutes)
+            # Check 4: Is the issue waiting in the pipeline queue?
+            # This handles cases where the issue is queued but not yet processed into a task
+            if board:
+                try:
+                    pipeline_queue_key = f"orchestrator:pipeline_queue:{project}:{board}"
+                    pipeline_queue_items = redis_client.lrange(pipeline_queue_key, 0, -1)
+                    
+                    for item_json in pipeline_queue_items:
+                        try:
+                            import json
+                            item = json.loads(item_json)
+                            if item.get('issue_number') == issue_number:
+                                logger.info(
+                                    f"Pipeline run {pipeline_run_id} has issue #{issue_number} waiting in pipeline queue"
+                                )
+                                return True
+                        except Exception:
+                            continue
+                except Exception as e:
+                    logger.warning(f"Error checking pipeline queue: {e}")
+
+            # Check 5: Has there been recent activity? (agent events in last 10 minutes)
             if self.es:
                 try:
                     ten_minutes_ago = (datetime.utcnow() - timedelta(minutes=10)).isoformat() + 'Z'
