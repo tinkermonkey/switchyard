@@ -404,9 +404,18 @@ Make sure to:
         Captures everything until the next field marker or end of section.
         Preserves all formatting (newlines, code blocks, lists).
         """
-        # Look for **Field**: Value
-        # Stop at next **Field**: (start of line) or end of string
-        pattern = rf'\*\*{re.escape(field_name)}\*\*:\s*(.+?)(?=\n\*\*.+?\*\*[:]|\Z)'
+        # Define the known field markers to stop at
+        # This prevents stopping at random bold text in markdown tables/content
+        known_fields = [
+            'Title', 'Description', 'Requirements', 'Design Guidance',
+            'Acceptance Criteria', 'Dependencies', 'Parent Issue', 'Discussion'
+        ]
+        
+        # Build lookahead pattern that only matches known field markers at line start
+        # This ensures we capture ALL content between fields, including tables, code blocks, etc.
+        field_alternation = '|'.join(re.escape(f) for f in known_fields)
+        pattern = rf'\*\*{re.escape(field_name)}\*\*:\s*(.+?)(?=\n\*\*(?:{field_alternation})\*\*:|\Z)'
+        
         match = re.search(pattern, content, re.DOTALL)
         if match:
             return match.group(1).strip()
