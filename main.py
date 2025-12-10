@@ -192,6 +192,10 @@ async def main():
     lock_manager = get_pipeline_lock_manager()
     locks_recovered = 0
     locks_released = 0
+    
+    # Track issues that were re-triggered during lock recovery
+    # These should NOT be cleaned up during pipeline run cleanup
+    retriggered_issues = set()  # Set of (project, issue_number) tuples
 
     # Create a temporary ProjectMonitor instance for checking issue columns
     temp_monitor = ProjectMonitor(task_queue, config_manager)
@@ -316,6 +320,8 @@ async def main():
                                     status=lock_holder_column,
                                     repository=project_config.github['repo']
                                 )
+                                # Track this issue as re-triggered
+                                retriggered_issues.add((project_name, lock.locked_by_issue))
                             except Exception as trigger_error:
                                 logger.error(
                                     f"Failed to re-trigger agent for issue #{lock.locked_by_issue}: {trigger_error}"
@@ -330,7 +336,7 @@ async def main():
 
     logger.info(
         f"Pipeline lock recovery complete: {locks_recovered} locks kept, "
-        f"{locks_released} locks released"
+        f"{locks_released} locks released, {len(retriggered_issues)} issues re-triggered"
     )
 
     # NOTE: Stall detection moved to after startup rescan completes
@@ -441,7 +447,9 @@ async def main():
         logger.info("Cleaning up stale active pipeline runs")
         from services.pipeline_run import get_pipeline_run_manager
         pipeline_run_manager = get_pipeline_run_manager()
-        pipeline_run_manager.cleanup_stale_active_runs_on_startup()
+        pipeline_run_manager.cleanup_stale_active_runs_on_startup(
+            retriggered_issues=retriggered_issues
+        )
         logger.info("Pipeline run cleanup complete")
     else:
         logger.warning("Skipping pipeline run cleanup - Elasticsearch not available")

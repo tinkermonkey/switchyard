@@ -588,7 +588,7 @@ class PipelineRunManager:
         except Exception as e:
             logger.error(f"Error cleaning up pipeline run mappings: {e}")
     
-    def cleanup_stale_active_runs_on_startup(self):
+    def cleanup_stale_active_runs_on_startup(self, retriggered_issues: set = None):
         """
         Clean up stale 'active' pipeline runs on orchestrator startup.
         
@@ -602,10 +602,18 @@ class PipelineRunManager:
         - Orchestrator restarts
         - Issues manually moved to Done
         - Issues moved to Backlog
+        
+        Args:
+            retriggered_issues: Set of (project, issue_number) tuples for issues
+                that were just re-triggered during lock recovery. These should
+                NOT be cleaned up since they're about to start work.
         """
         if not self.es:
             logger.warning("Elasticsearch not available, skipping stale pipeline run cleanup")
             return
+        
+        if retriggered_issues is None:
+            retriggered_issues = set()
         
         try:
             from config.manager import config_manager
@@ -640,6 +648,16 @@ class PipelineRunManager:
                 board = run['board']
 
                 try:
+                    # CRITICAL: Skip issues that were just re-triggered during lock recovery
+                    # They have tasks queued but haven't started executing yet
+                    if (project, issue_number) in retriggered_issues:
+                        logger.info(
+                            f"Skipping cleanup for {project} issue #{issue_number} "
+                            f"(run {pipeline_run_id[:8]}...) - was just re-triggered during lock recovery"
+                        )
+                        kept_active_count += 1
+                        continue
+                    
                     # Get project config
                     project_config = config_manager.get_project_config(project)
                     if not project_config:
@@ -693,35 +711,50 @@ class PipelineRunManager:
                         ended_count += 1
                         continue
                     
+                    # CRITICAL: Determine if run should be active based on GitHub issue status
+                    # A pipeline run is active if and only if:
+                    # 1. Issue is NOT in an exit column (Done, Staged, etc.)
+                    # 2. Issue IS in a column with an agent assigned
+                    
+                    # Check if issue is in an exit column
+                    exit_columns = getattr(workflow_template, 'pipeline_exit_columns', [])
+                    is_in_exit_column = current_column in exit_columns
+                    
                     # Check if column has an agent
                     has_agent = column_config.agent and column_config.agent != 'null'
                     
-                    if not has_agent:
+                    if is_in_exit_column:
+                        # Issue reached completion - end the run
+                        logger.info(
+                            f"Issue #{issue_number} in exit column '{current_column}', "
+                            f"ending run {pipeline_run_id}"
+                        )
+                        self._end_run_in_elasticsearch(
+                            run, 
+                            f"Issue in exit column '{current_column}'", 
+                            original_index
+                        )
+                        ended_count += 1
+                    elif not has_agent:
+                        # Column has no agent (e.g., Backlog) - end the run
                         logger.info(
                             f"Issue #{issue_number} in column '{current_column}' with no agent, "
                             f"ending run {pipeline_run_id}"
                         )
-                        self._end_run_in_elasticsearch(run, f"Issue in column '{current_column}' with no agent", original_index)
+                        self._end_run_in_elasticsearch(
+                            run, 
+                            f"Issue in column '{current_column}' with no agent", 
+                            original_index
+                        )
                         ended_count += 1
                     else:
-                        # Column has an agent - now verify work is actually in progress
-                        is_actually_active = self._verify_pipeline_run_is_active(
-                            pipeline_run_id, project, issue_number, current_column, board
+                        # Issue is in a column with an agent - keep run active
+                        # The GitHub issue status is the source of truth
+                        logger.debug(
+                            f"Issue #{issue_number} in column '{current_column}' with agent {column_config.agent}, "
+                            f"keeping run {pipeline_run_id} active"
                         )
-                        
-                        if is_actually_active:
-                            logger.debug(
-                                f"Issue #{issue_number} in column '{current_column}' with agent {column_config.agent}, "
-                                f"keeping run {pipeline_run_id} active (work verified)"
-                            )
-                            kept_active_count += 1
-                        else:
-                            logger.info(
-                                f"Issue #{issue_number} in column '{current_column}' appears stalled "
-                                f"(no active agents, no queued tasks), ending run {pipeline_run_id}"
-                            )
-                            self._end_run_in_elasticsearch(run, "No work in progress detected", original_index)
-                            ended_count += 1
+                        kept_active_count += 1
                     
                 except Exception as e:
                     logger.error(
@@ -739,230 +772,16 @@ class PipelineRunManager:
         except Exception as e:
             logger.error(f"Error during stale pipeline run cleanup: {e}")
     
-    def _verify_pipeline_run_is_active(self, pipeline_run_id: str, project: str, 
-                                       issue_number: int, current_column: str, board: str = None) -> bool:
-        """
-        Verify that a pipeline run actually has work in progress.
-        
-        Checks:
-        1. Are there any active agent containers running in Docker for this issue?
-        2. Are there any active agents in Redis tracking for this issue?
-        3. Are there any tasks in the queue for this issue?
-        4. Is the issue waiting in the pipeline queue?
-        5. Has there been any recent activity (agent events in last 10 minutes)?
-        
-        Args:
-            pipeline_run_id: Pipeline run ID
-            project: Project name
-            issue_number: Issue number
-            current_column: Current column name
-            board: Board name (optional, but required for pipeline queue check)
-            
-        Returns:
-            True if work is actually in progress, False if stalled
-        """
-        try:
-            import redis
-            import subprocess
-            from datetime import datetime, timedelta
-            
-            # Check 0: CRITICAL - Check execution state FIRST before looking at containers
-            # If there's an in_progress execution, the run is definitely active
-            # This prevents race conditions during startup where containers might be
-            # in the process of being recovered
-            try:
-                from services.work_execution_state import work_execution_tracker
-                execution_history = work_execution_tracker.get_execution_history(project, issue_number)
-
-                # Check if there's any in_progress execution
-                for execution in reversed(execution_history):
-                    if execution.get('outcome') == 'in_progress':
-                        logger.info(
-                            f"Pipeline run {pipeline_run_id} has in_progress execution: "
-                            f"agent={execution.get('agent')}, column={execution.get('column')}"
-                        )
-                        return True
-            except Exception as e:
-                logger.warning(f"Error checking execution state: {e}")
-
-            # Check 1: Are there actual Docker containers running for this issue?
-            # CRITICAL FIX: Use proper container name parsing to handle projects with dashes
-            try:
-                # Get ALL agent containers and parse them properly
-                # We can't use precise Docker filters because project names can contain dashes
-                result = subprocess.run(
-                    ['docker', 'ps', '--filter', 'name=claude-agent-',
-                     '--format', '{{.Names}}'],
-                    capture_output=True,
-                    text=True,
-                    timeout=5
-                )
-
-                if result.returncode == 0 and result.stdout.strip():
-                    container_names = result.stdout.strip().split('\n')
-
-                    # Use the proper parsing logic from agent_container_recovery
-                    from services.agent_container_recovery import get_agent_container_recovery
-                    recovery_service = get_agent_container_recovery()
-
-                    for container_name in container_names:
-                        # Parse the container name properly
-                        metadata = recovery_service.parse_container_name(container_name)
-
-                        if metadata and metadata['project'] == project:
-                            # Check if this container is for our issue
-                            # The task_id or container name might contain the issue number
-                            issue_str = str(issue_number)
-                            if issue_str in container_name:
-                                logger.info(
-                                    f"Pipeline run {pipeline_run_id} has running agent container: {container_name} "
-                                    f"(project={metadata['project']}, task_id={metadata.get('task_id')})"
-                                )
-                                return True
-
-                # Check for repair cycle containers (format: repair-cycle-{project}-{issue}-{run_id})
-                # Get all repair cycle containers and parse them properly
-                result = subprocess.run(
-                    ['docker', 'ps', '--filter', 'name=repair-cycle-',
-                     '--format', '{{.Names}}'],
-                    capture_output=True,
-                    text=True,
-                    timeout=5
-                )
-
-                if result.returncode == 0 and result.stdout.strip():
-                    container_names = result.stdout.strip().split('\n')
-
-                    # Use the proper parsing logic from agent_container_recovery
-                    from services.agent_container_recovery import get_agent_container_recovery
-                    recovery_service = get_agent_container_recovery()
-
-                    for container_name in container_names:
-                        # Parse repair cycle container name properly
-                        metadata = recovery_service.parse_repair_cycle_container_name(container_name)
-
-                        if (metadata and
-                            metadata['project'] == project and
-                            int(metadata['issue_number']) == issue_number):
-                            
-                            # Verify run_id matches if available
-                            container_run_id = metadata.get('run_id')
-                            if container_run_id and not pipeline_run_id.startswith(container_run_id):
-                                logger.debug(
-                                    f"Skipping container {container_name} for run {pipeline_run_id}: "
-                                    f"run_id mismatch ({container_run_id})"
-                                )
-                                continue
-
-                            logger.info(
-                                f"Pipeline run {pipeline_run_id} has running repair cycle container: {container_name} "
-                                f"(project={metadata['project']}, issue={metadata['issue_number']})"
-                            )
-                            return True
-
-            except Exception as e:
-                logger.warning(f"Error checking Docker containers: {e}")
-            
-            # Check 2: Are there active agents in Redis tracking for this issue?
-            redis_client = redis.Redis(host='redis', port=6379, decode_responses=True)
-            agent_keys = redis_client.keys('agent:container:*')
-            
-            for key in agent_keys:
-                try:
-                    container_info = redis_client.hgetall(key)
-                    if (container_info.get('project') == project and 
-                        container_info.get('issue_number') == str(issue_number)):
-                        logger.info(
-                            f"Pipeline run {pipeline_run_id} has active agent in Redis: "
-                            f"{container_info.get('container_name')}"
-                        )
-                        return True
-                except Exception as e:
-                    logger.warning(f"Error checking agent key {key}: {e}")
-                    continue
-            
-            # Check 3: Are there queued tasks for this issue?
-            # Tasks in the queue have the project and issue_number in their context
-            queue_length = redis_client.llen('orchestrator:task_queue')
-            if queue_length > 0:
-                # Check up to 100 tasks in the queue
-                tasks = redis_client.lrange('orchestrator:task_queue', 0, min(100, queue_length - 1))
-                for task_json in tasks:
-                    try:
-                        import json
-                        task = json.loads(task_json)
-                        task_context = task.get('context', {})
-                        if (task_context.get('project') == project and 
-                            task_context.get('issue_number') == issue_number):
-                            logger.info(
-                                f"Pipeline run {pipeline_run_id} has queued task for issue #{issue_number}"
-                            )
-                            return True
-                    except Exception as e:
-                        continue
-            
-            # Check 4: Is the issue waiting in the pipeline queue?
-            # This handles cases where the issue is queued but not yet processed into a task
-            if board:
-                try:
-                    pipeline_queue_key = f"orchestrator:pipeline_queue:{project}:{board}"
-                    pipeline_queue_items = redis_client.lrange(pipeline_queue_key, 0, -1)
-                    
-                    for item_json in pipeline_queue_items:
-                        try:
-                            import json
-                            item = json.loads(item_json)
-                            if item.get('issue_number') == issue_number:
-                                logger.info(
-                                    f"Pipeline run {pipeline_run_id} has issue #{issue_number} waiting in pipeline queue"
-                                )
-                                return True
-                        except Exception:
-                            continue
-                except Exception as e:
-                    logger.warning(f"Error checking pipeline queue: {e}")
-
-            # Check 5: Has there been recent activity? (agent events in last 10 minutes)
-            if self.es:
-                try:
-                    ten_minutes_ago = (datetime.utcnow() - timedelta(minutes=10)).isoformat() + 'Z'
-                    
-                    activity_query = {
-                        "query": {
-                            "bool": {
-                                "must": [
-                                    {"term": {"project": project}},
-                                    {"term": {"issue_number": issue_number}},
-                                    {"range": {"timestamp": {"gte": ten_minutes_ago}}}
-                                ]
-                            }
-                        },
-                        "size": 1
-                    }
-                    
-                    result = self.es.search(index="agent-events-*", body=activity_query)
-                    
-                    if result['hits']['total']['value'] > 0:
-                        logger.info(
-                            f"Pipeline run {pipeline_run_id} has recent activity "
-                            f"(events in last 10 minutes)"
-                        )
-                        return True
-                        
-                except Exception as e:
-                    logger.warning(f"Error checking recent activity for {pipeline_run_id}: {e}")
-            
-            # No active work detected
-            logger.debug(
-                f"Pipeline run {pipeline_run_id} appears stalled: "
-                f"no active agents, no queued tasks, no recent activity"
-            )
-            return False
-            
-        except Exception as e:
-            logger.error(f"Error verifying pipeline run {pipeline_run_id}: {e}")
-            # Return True on error to be safe (don't end runs if we can't verify)
-            return True
+    # REMOVED: _verify_pipeline_run_is_active()
+    # The old approach tried to infer pipeline state from timing signals (recent activity,
+    # running containers, queued tasks). This was fundamentally flawed because:
+    # 1. Timing-based checks created race conditions during startup
+    # 2. The "10 minute activity window" was arbitrary and unreliable
+    # 3. Container/queue checks didn't account for legitimate pauses (waiting for human feedback)
+    #
+    # NEW APPROACH: Use GitHub issue status as the single source of truth
+    # A pipeline run is active if and only if the issue is in a column with an agent
+    # and NOT in an exit column. This is simple, deterministic, and testable.
     
     def _get_issue_column_from_github(self, project_config, pipeline_config, issue_number: int) -> Optional[str]:
         """
