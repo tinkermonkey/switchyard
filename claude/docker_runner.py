@@ -5,6 +5,7 @@ import os
 import re
 from typing import Dict, Any, Optional, Callable
 from pathlib import Path
+from datetime import datetime, timedelta, timezone
 
 logger = logging.getLogger(__name__)
 
@@ -805,10 +806,19 @@ class DockerAgentRunner:
                 'mkdir -p ~/.config/gh && '
                 f'printf \'{yaml_content}\' > ~/.config/gh/hosts.yml && '
                 f'ls -la /workspace >&2 && '
-                f'cat {quoted_prompt_path} | {claude_exec_cmd}'
+                f'echo "DEBUG: Checking prompt file..." >&2 && '
+                f'ls -la {quoted_prompt_path} >&2 && '
+                f'echo "DEBUG: Running Claude Code..." >&2 && '
+                f'cat {quoted_prompt_path} | {claude_exec_cmd} 2>&1'
             )
         else:
-            shell_cmd = f'ls -la /workspace >&2 && cat {quoted_prompt_path} | {claude_exec_cmd}'
+            shell_cmd = (
+                f'ls -la /workspace >&2 && '
+                f'echo "DEBUG: Checking prompt file..." >&2 && '
+                f'ls -la {quoted_prompt_path} >&2 && '
+                f'echo "DEBUG: Running Claude Code..." >&2 && '
+                f'cat {quoted_prompt_path} | {claude_exec_cmd} 2>&1'
+            )
 
         # Add -d for detached mode
         docker_cmd.insert(2, '-d')
@@ -985,11 +995,52 @@ class DockerAgentRunner:
                 return result_text
             else:
                 stderr_text = ''.join(stderr_parts)
+                
+                # Check if this might be a rate limit error
+                # Claude Code exits with code 1 when rate limited, but the "Limit reached" message
+                # is not always captured by docker logs (especially in detached mode)
+                # Detect this by checking if stderr only contains our debug output (ls, DEBUG messages)
+                # and no actual Claude Code error
+                breaker = get_breaker()
+                if exit_code == 1 and breaker:
+                    # Check if stderr only has debug/ls output (no real errors)
+                    has_real_error = any(
+                        keyword in stderr_text.lower() 
+                        for keyword in ['error:', 'exception:', 'traceback', 'failed to', 'cannot', 'invalid']
+                    )
+                    # Exclude our own debug messages and file listings from the check
+                    debug_only = all(
+                        line.startswith('STDOUT:') or  # Our debug marker
+                        line.startswith('drwx') or line.startswith('-rw') or  # ls output
+                        line.startswith('total ') or  # ls summary
+                        'DEBUG:' in line or  # Our debug messages
+                        line.strip() == '' or  # Empty lines
+                        '.gitconfig is a directory' in line  # Entrypoint warning
+                        for line in stderr_text.split('\n')
+                    )
+                    
+                    if debug_only and not has_real_error:
+                        logger.warning(
+                            f"🔴 Container exited with code 1 but stderr contains only debug output. "
+                            f"This indicates Claude Code failed without logging (likely rate limit)."
+                        )
+                        # If breaker is already open, we know it's a rate limit
+                        if breaker.state == breaker.OPEN:
+                            logger.error("🔴 Claude Code breaker is OPEN - rate limit confirmed")
+                            raise Exception("Claude Code rate limit reached. Please wait for reset.")
+                        # Otherwise, trip it with a default reset time
+                        else:
+                            logger.error("🔴 Tripping Claude Code breaker - suspicious exit 1 with no real error output")
+                            # Default to 1 hour, or parse from current time
+                            reset_time = datetime.now(timezone.utc) + timedelta(hours=1)
+                            breaker.trip(reset_time)
+                            raise Exception("Claude Code likely hit rate limit (exit 1, no error logged). Breaker tripped.")
+                
                 if not stderr_text:
                     stderr_text = f"Container exited with code {exit_code} but no error output captured."
                 
-                logger.error(f"Agent failed in container (exit_code={exit_code}): {stderr_text}")
-                raise Exception(f"Agent execution failed (exit_code={exit_code}): {stderr_text}")
+                logger.error(f"Agent failed in container (exit_code={exit_code}): {stderr_text[:500]}")
+                raise Exception(f"Agent execution failed (exit_code={exit_code}): {stderr_text[:500]}")
 
         except Exception as e:
             logger.error(f"Agent execution error: {e}")

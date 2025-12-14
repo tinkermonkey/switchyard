@@ -65,9 +65,9 @@ RUN if [ "${DOCKER_GID}" = "0" ]; then \
         groupadd -g ${DOCKER_GID} docker || true && \
         useradd -m -u 1000 -G docker orchestrator; \
     fi && \
-    mkdir -p /home/orchestrator/.ssh && \
-    chown orchestrator:orchestrator /home/orchestrator/.ssh && \
-    chmod 700 /home/orchestrator/.ssh && \
+    mkdir -p /home/orchestrator/.ssh /home/orchestrator/.config && \
+    chown -R orchestrator:orchestrator /home/orchestrator && \
+    chmod 700 /home/orchestrator/.ssh /home/orchestrator/.config && \
     rm -rf /home/orchestrator/.gitconfig /home/orchestrator/.orchestrator
 
 # Install Python dependencies
