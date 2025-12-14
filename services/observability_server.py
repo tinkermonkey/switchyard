@@ -1842,6 +1842,56 @@ def get_circuit_breakers():
         except Exception as e:
             logger.error(f"Could not get GitHub API breaker status: {e}", exc_info=True)
 
+        # Agent-specific circuit breakers from Redis
+        logger.info("=== Starting agent circuit breaker query ===")
+        try:
+            # Find all agent circuit breaker keys (reuse redis_client from top of function)
+            agent_breaker_keys = redis_client.keys('circuit_breaker:*:state')
+            logger.info(f"Found {len(agent_breaker_keys)} agent circuit breaker keys: {agent_breaker_keys}")
+            
+            for key in agent_breaker_keys:
+                try:
+                    # Extract agent name from key (format: circuit_breaker:agent_name:state)
+                    agent_name = key.replace('circuit_breaker:', '').replace(':state', '')
+                    logger.debug(f"Processing agent breaker: {agent_name}")
+                    
+                    # Get breaker state
+                    state_json = redis_client.get(key)
+                    if state_json:
+                        import json
+                        from datetime import datetime
+                        state = json.loads(state_json)
+                        logger.debug(f"Agent {agent_name} breaker state: {state}")
+                        
+                        # Calculate time until retry
+                        time_until_retry = None
+                        if state.get('state') == 'open' and state.get('last_failure_time'):
+                            from services.circuit_breaker import CircuitBreaker
+                            # Default recovery timeout is 30s
+                            recovery_timeout = 30
+                            last_failure = datetime.fromisoformat(state['last_failure_time'])
+                            elapsed = (datetime.now() - last_failure).total_seconds()
+                            time_until_retry = max(0, recovery_timeout - elapsed)
+                        
+                        circuit_breakers.append({
+                            'name': f'{agent_name} (Agent)',
+                            'service': 'agent_execution',
+                            'agent': agent_name,
+                            'state': state.get('state', 'unknown'),
+                            'is_open': state.get('state') == 'open',
+                            'failure_count': state.get('failure_count', 0),
+                            'total_failures': state.get('total_failures', 0),
+                            'total_successes': state.get('total_successes', 0),
+                            'last_failure_time': state.get('last_failure_time'),
+                            'time_until_retry': time_until_retry
+                        })
+                        logger.info(f"Added agent breaker: {agent_name}, state={state.get('state')}")
+                except Exception as e:
+                    logger.warning(f"Could not parse agent breaker {key}: {e}")
+                    
+        except Exception as e:
+            logger.error(f"Could not get agent circuit breakers: {e}", exc_info=True)
+
         # Calculate summary
         open_count = sum(1 for cb in circuit_breakers 
                         if cb.get('state') == 'open' or cb.get('is_open') == True)
@@ -1893,6 +1943,36 @@ def reset_claude_code_breaker():
 
     except Exception as e:
         logger.error(f"Error resetting Claude Code breaker: {e}", exc_info=True)
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+@app.route('/api/circuit-breakers/agent/<agent_name>/reset', methods=['POST'])
+def reset_agent_breaker(agent_name):
+    """Manually reset an agent-specific circuit breaker"""
+    try:
+        import redis
+        redis_client = redis.Redis(host='redis', port=6379, decode_responses=True)
+        
+        # Delete the breaker state from Redis
+        key = f'circuit_breaker:{agent_name}:state'
+        deleted = redis_client.delete(key)
+        
+        if deleted:
+            logger.info(f"🟢 Agent circuit breaker '{agent_name}' manually reset via API")
+            return jsonify({
+                'success': True,
+                'message': f'Agent circuit breaker \'{agent_name}\' has been reset'
+            })
+        else:
+            return jsonify({
+                'success': False,
+                'error': f'Circuit breaker for agent \'{agent_name}\' not found'
+            }), 404
+
+    except Exception as e:
+        logger.error(f"Error resetting agent breaker {agent_name}: {e}", exc_info=True)
         return jsonify({
             'success': False,
             'error': str(e)
