@@ -197,9 +197,11 @@ class AgentExecutor:
                     # Check if we should retry
                     if attempt < max_attempts:
                         logger.warning(f"Agent execution failed (attempt {attempt}/{max_attempts}): {e}")
-                        # Wait before retry (exponential backoff: 2s, 4s, 8s...)
-                        wait_time = 2 ** attempt
-                        logger.info(f"Waiting {wait_time}s before retry...")
+                        # Wait before retry (longer backoff to allow circuit breaker recovery: 15s, 30s, 60s)
+                        # Circuit breaker recovery timeout is 30s, so first retry happens after breaker opens,
+                        # second retry happens after breaker transitions to HALF_OPEN
+                        wait_time = 15 * attempt
+                        logger.info(f"Waiting {wait_time}s before retry (allows circuit breaker recovery)...")
                         await asyncio.sleep(wait_time)
                     else:
                         # Out of retries, re-raise to be caught by outer block
