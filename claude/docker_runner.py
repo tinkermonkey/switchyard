@@ -692,6 +692,54 @@ class DockerAgentRunner:
         # Default: use orchestrator image
         return 'clauditoreum-orchestrator:latest'
 
+    def _detect_rate_limit_reset_time(self, project_dir: Path) -> Optional[datetime]:
+        """
+        Detect Claude Code rate limit reset time by running a quick test.
+        
+        When Claude Code is rate limited, it outputs: "Limit reached · resets 3pm (UTC)"
+        This method captures that message and parses the reset time.
+        
+        Args:
+            project_dir: Project directory path
+            
+        Returns:
+            Datetime when rate limit resets, or None if detection failed
+        """
+        try:
+            # Run a minimal Claude Code command to trigger the rate limit message
+            test_cmd = [
+                'docker', 'run', '--rm',
+                '-e', f'CLAUDE_CODE_OAUTH_TOKEN={os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "")}',
+                '--user', 'orchestrator',
+                'clauditoreum-orchestrator:latest',
+                'sh', '-c', 'echo "test" | claude - 2>&1 | head -5'
+            ]
+            
+            result = subprocess.run(
+                test_cmd,
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+            
+            output = result.stdout + result.stderr
+            logger.debug(f"Rate limit detection output: {output[:200]}")
+            
+            # Look for the limit message
+            breaker = get_breaker()
+            if breaker:
+                is_limit, reset_time = breaker.detect_session_limit(output)
+                if is_limit and reset_time:
+                    logger.info(f"✓ Detected rate limit reset time from Claude Code output: {reset_time}")
+                    return reset_time
+            
+            logger.warning("Could not detect rate limit reset time from output")
+            return None
+            
+        except Exception as e:
+            logger.warning(f"Failed to detect rate limit reset time: {e}")
+            return None
+
     async def _execute_in_container(
         self,
         docker_cmd: list,
@@ -989,6 +1037,13 @@ class DockerAgentRunner:
                 result_text = ''.join(result_parts)
                 logger.info(f"Agent completed successfully in container, result length: {len(result_text)}")
                 
+                # Close Claude Code breaker if it was open/half-open
+                # This allows recovery after rate limit reset
+                breaker = get_breaker()
+                if breaker and (breaker.is_open() or breaker.is_half_open()):
+                    logger.info("🟢 Agent succeeded - closing Claude Code breaker")
+                    breaker.close()
+                
                 if session_id:
                     context['claude_session_id'] = session_id
 
@@ -1028,11 +1083,21 @@ class DockerAgentRunner:
                         if breaker.state == breaker.OPEN:
                             logger.error("🔴 Claude Code breaker is OPEN - rate limit confirmed")
                             raise Exception("Claude Code rate limit reached. Please wait for reset.")
-                        # Otherwise, trip it with a default reset time
+                        # Otherwise, trip it and try to detect actual reset time
                         else:
                             logger.error("🔴 Tripping Claude Code breaker - suspicious exit 1 with no real error output")
-                            # Default to 1 hour, or parse from current time
-                            reset_time = datetime.now(timezone.utc) + timedelta(hours=1)
+                            
+                            # Try to detect actual reset time by running a quick test
+                            # This captures the "Limit reached · resets 3pm (UTC)" message
+                            reset_time = self._detect_rate_limit_reset_time(project_dir)
+                            
+                            if not reset_time:
+                                # Fallback to 1 hour from now
+                                logger.warning("Could not detect reset time, using 1-hour default")
+                                reset_time = datetime.now(timezone.utc) + timedelta(hours=1)
+                            else:
+                                logger.info(f"Detected rate limit reset time: {reset_time.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+                            
                             breaker.trip(reset_time)
                             raise Exception("Claude Code likely hit rate limit (exit 1, no error logged). Breaker tripped.")
                 
