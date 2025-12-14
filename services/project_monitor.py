@@ -4229,7 +4229,7 @@ _Repair cycle initiated by Claude Code Orchestrator_
             discussion_body = self._format_discussion_from_issue(issue_data, issue_number)
 
             # Create discussion
-            discussion_id = self.discussions.create_discussion(
+            discussion_data = self.discussions.create_discussion(
                 owner=project_config.github['org'],
                 repo=repository,
                 repository_id=repo_id,
@@ -4238,13 +4238,14 @@ _Repair cycle initiated by Claude Code Orchestrator_
                 body=discussion_body
             )
 
-            if not discussion_id:
+            if not discussion_data:
                 logger.error(f"Failed to create discussion for issue #{issue_number}")
                 return
 
-            # Get discussion number for user-friendly reference
-            discussion_details = self.discussions.get_discussion(discussion_id)
-            discussion_number = discussion_details.get('number') if discussion_details else '?'
+            # Extract discussion details from response
+            discussion_id = discussion_data['id']
+            discussion_number = discussion_data['number']
+            discussion_url = discussion_data['url']
 
             logger.info(f"Created discussion #{discussion_number} (ID: {discussion_id}) for issue #{issue_number}")
 
@@ -4253,7 +4254,6 @@ _Repair cycle initiated by Claude Code Orchestrator_
             state_manager.link_issue_to_discussion(project_name, issue_number, discussion_id)
 
             # Add comment to issue linking to discussion
-            discussion_url = discussion_details.get('url', '') if discussion_details else ''
             comment_body = f"""📋 Requirements analysis moved to Discussion #{discussion_number}
 
 This issue will be updated with final requirements when ready for implementation.

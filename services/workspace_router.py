@@ -204,7 +204,7 @@ class WorkspaceRouter:
             if workspace_type == "discussions":
                 # Check if discussion already exists for this issue
                 # For now, create new discussion
-                discussion_id = self.discussions.create_discussion(
+                discussion_data = self.discussions.create_discussion(
                     owner=project_config.github['org'],
                     repo=project_config.github['repo'],
                     category_id=category_id,
@@ -212,10 +212,10 @@ class WorkspaceRouter:
                     body=issue_data.get('body', '')
                 )
 
-                if discussion_id:
+                if discussion_data:
                     return {
                         'workspace_type': 'discussions',
-                        'discussion_id': discussion_id,
+                        'discussion_id': discussion_data['id'],
                         'category_id': category_id
                     }
                 else:

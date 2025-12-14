@@ -105,7 +105,7 @@ class GitHubDiscussions:
         return None
 
     def create_discussion(self, owner: str, repo: str, category_id: str,
-                         title: str, body: str, repository_id: Optional[str] = None) -> Optional[str]:
+                         title: str, body: str, repository_id: Optional[str] = None) -> Optional[Dict]:
         """
         Create a new discussion
 
@@ -117,7 +117,7 @@ class GitHubDiscussions:
             body: Discussion body (markdown)
             repository_id: Optional repository node ID (fetched if not provided)
 
-        Returns: discussion ID if successful, None otherwise
+        Returns: Dict with 'id', 'number', and 'url' if successful, None otherwise
         """
         # Get repository ID if not provided
         if not repository_id:
@@ -153,10 +153,16 @@ class GitHubDiscussions:
         })
 
         if result and 'createDiscussion' in result:
-            discussion_id = result['createDiscussion']['discussion']['id']
-            discussion_number = result['createDiscussion']['discussion']['number']
+            discussion_data = result['createDiscussion']['discussion']
+            discussion_id = discussion_data['id']
+            discussion_number = discussion_data['number']
+            discussion_url = discussion_data['url']
             logger.info(f"Created discussion #{discussion_number}: {title}")
-            return discussion_id
+            return {
+                'id': discussion_id,
+                'number': discussion_number,
+                'url': discussion_url
+            }
 
         logger.error("Failed to create discussion")
         return None

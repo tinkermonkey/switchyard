@@ -215,7 +215,7 @@ class PatternGitHubIntegration:
         body = self._build_discussion_body(pattern)
 
         # Create discussion
-        discussion_id = self.discussions.create_discussion(
+        discussion_data = self.discussions.create_discussion(
             self.owner,
             self.repo,
             category_id,
@@ -223,31 +223,31 @@ class PatternGitHubIntegration:
             body
         )
 
-        if discussion_id:
-            # Get discussion number
-            discussion_data = self.discussions.get_discussion(discussion_id)
-            if discussion_data:
-                discussion_number = discussion_data.get('number')
-                discussion_url = discussion_data.get('url')
+        if discussion_data:
+            # Extract discussion details from response
+            discussion_id = discussion_data['id']
+            discussion_number = discussion_data['number']
+            discussion_url = discussion_data['url']
 
-                # Record in Elasticsearch
-                self._record_github_discussion(
-                    pattern['pattern_name'],
-                    discussion_id,
-                    discussion_number,
-                    discussion_url,
-                    pattern['occurrence_count'],
-                    pattern['first_seen'],
-                    pattern['last_seen'],
-                    pattern['affected_projects'],
-                    pattern['affected_agents']
-                )
+            # Record in Elasticsearch
+            self._record_github_discussion(
+                pattern['pattern_name'],
+                discussion_id,
+                discussion_number,
+                discussion_url,
+                pattern['occurrence_count'],
+                pattern['first_seen'],
+                pattern['last_seen'],
+                pattern['affected_projects'],
+                pattern['affected_agents']
+            )
 
-                logger.info(
-                    f"Created discussion #{discussion_number} for pattern '{pattern['pattern_name']}'"
-                )
+            logger.info(
+                f"Created discussion #{discussion_number} for pattern '{pattern['pattern_name']}'"
+            )
+            return discussion_id
 
-        return discussion_id
+        return None
 
     def _build_discussion_body(self, pattern: Dict[str, Any]) -> str:
         """Build formatted discussion body with pattern details"""

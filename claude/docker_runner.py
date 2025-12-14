@@ -569,7 +569,15 @@ class DockerAgentRunner:
             '-v', f'{host_home}/.gitconfig:/home/orchestrator/.gitconfig:ro',
         ])
 
-        # Mount MCP config file if provided
+        # Mount global Claude config directory (contains MCP server configurations)
+        # This gives agent containers access to Playwright MCP and other global MCP servers
+        claude_config_host_path = f'{host_workspace}/clauditoreum/.claude-config'
+        cmd.extend([
+            '-v', f'{claude_config_host_path}:/home/orchestrator/.config/claude:ro'
+        ])
+        logger.info(f"Mounting Claude config: {claude_config_host_path} -> /home/orchestrator/.config/claude")
+
+        # Mount MCP config file if provided (task-specific MCP servers)
         # The MCP config is written to a temp location accessible from host
         # We need to convert container path to host path for Docker-in-Docker mounting
         if mcp_config_path:

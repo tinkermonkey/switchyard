@@ -39,11 +39,9 @@ services:
       # Mount GitHub App private key directory (optional - accessible by orchestrator user)
       - ~/.orchestrator:/home/orchestrator/.orchestrator
 
-      # Mount Claude Code config directory for authentication (Linux: ~/.config/claude, macOS: ~/.claude)
-      # On macOS, config is in ~/.claude; on Linux it's in ~/.config/claude
-      # We mount both to support both platforms (one will be empty/missing on each platform)
-      #- ~/.claude:/home/orchestrator/.claude:ro
-      #- ~/.config/claude:/home/orchestrator/.config/claude:ro
+      # Mount Claude Code config directory with MCP server configuration
+      # We use a local .claude-config directory that contains MCP server settings
+      - ./.claude-config:/home/orchestrator/.config/claude:ro
 
       # Share Docker socket for nested containers (rootful Docker)
       - /var/run/docker.sock:/var/run/docker.sock
@@ -88,6 +86,7 @@ services:
       - ..:/workspace  # Mount workspace read-write for Advisor agent execution
       - /var/run/docker.sock:/var/run/docker.sock
       - ./medic:/medic:ro  # Mount medic reports directory read-only
+      - ./.claude-config:/home/orchestrator/.config/claude:ro  # MCP config
     environment:
       - REDIS_URL=redis://redis:6379
       - GITHUB_TOKEN=${GITHUB_TOKEN}
@@ -186,7 +185,7 @@ services:
       - ..:/workspace  # Access to orchestrator workspace for projects
       - /var/run/docker.sock:/var/run/docker.sock  # Docker CLI access
       - ./medic:/medic  # Investigation reports directory (inside clauditoreum/)
-      - ~/.config/claude:/home/orchestrator/.config/claude:ro
+      - ./.claude-config:/home/orchestrator/.config/claude:ro  # MCP config
     environment:
       - REDIS_HOST=redis
       - REDIS_PORT=6379

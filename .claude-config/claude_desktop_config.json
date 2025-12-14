@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "playwright": {
+      "command": "npx",
+      "args": ["-y", "github:b3nw/playwright-mcp-server", "--url", "ws://browserless:3000/playwright/chromium"]
+    }
+  }
+}

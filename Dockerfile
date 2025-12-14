@@ -15,7 +15,17 @@ RUN apt update -y && apt install curl git redis-tools gnupg2 procps -y \
     && tar -xzvf node.tar.gz && rm node.tar.gz \
     && cp -r node-$NODE_VERSION-linux-$NODE_ARCH/* /usr/local/ \
     && rm -rf node-$NODE_VERSION-linux-$NODE_ARCH \
-    && npm install -g @anthropic-ai/claude-code \
+    && npm install -g @anthropic-ai/claude-code @playwright/mcp \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Playwright dependencies for MCP server (minimal - we'll use Browserless instead of local browsers)
+RUN apt update -y && apt install -y \
+    libnss3 \
+    libatk-bridge2.0-0 \
+    libdrm2 \
+    libxkbcommon0 \
+    libgbm1 \
+    libasound2 \
     && rm -rf /var/lib/apt/lists/*
 
 # Install GitHub CLI
