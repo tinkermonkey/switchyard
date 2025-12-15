@@ -578,6 +578,20 @@ class DockerAgentRunner:
         ])
         logger.info(f"Mounting Claude config: {claude_config_host_path} -> /home/orchestrator/.config/claude")
 
+        # Mount shared agents directory (read-only)
+        # This makes specialist Claude Code agents available to all containers
+        shared_agents_host_path = f'{host_workspace}/clauditoreum/config/shared_agents'
+        shared_agents_container_path = '/shared_agents'
+
+        # Check if shared agents directory exists before mounting
+        if Path('/app/config/shared_agents/.claude/agents').exists():
+            cmd.extend([
+                '-v', f'{shared_agents_host_path}:{shared_agents_container_path}:ro'
+            ])
+            logger.info(f"Mounting shared agents: {shared_agents_host_path} -> {shared_agents_container_path}")
+        else:
+            logger.debug("No shared agents directory found, skipping mount")
+
         # Mount MCP config file if provided (task-specific MCP servers)
         # The MCP config is written to a temp location accessible from host
         # We need to convert container path to host path for Docker-in-Docker mounting
@@ -740,6 +754,44 @@ class DockerAgentRunner:
             logger.warning(f"Failed to detect rate limit reset time: {e}")
             return None
 
+    def _setup_shared_agents(self, project_dir: Path) -> None:
+        """
+        Copy shared agents into project's .claude/agents/ directory.
+        This creates a union of project-specific and shared agents.
+
+        Args:
+            project_dir: Project directory path inside container (e.g., /workspace/project-name)
+        """
+        shared_agents_source = Path('/shared_agents/.claude/agents')
+        project_agents_dir = project_dir / '.claude' / 'agents'
+
+        # Create project's .claude/agents directory if it doesn't exist
+        project_agents_dir.mkdir(parents=True, exist_ok=True)
+
+        # Copy shared agent definitions into project
+        if shared_agents_source.exists():
+            import shutil
+
+            copied_count = 0
+            skipped_count = 0
+
+            for agent_file in shared_agents_source.glob('*.md'):
+                dest_file = project_agents_dir / agent_file.name
+
+                # Only copy if not already present (project-specific agents take precedence)
+                if not dest_file.exists():
+                    shutil.copy2(agent_file, dest_file)
+                    copied_count += 1
+                    logger.debug(f"Copied shared agent: {agent_file.name}")
+                else:
+                    skipped_count += 1
+                    logger.debug(f"Skipping {agent_file.name} - project-specific version exists")
+
+            if copied_count > 0:
+                logger.info(f"Shared agents setup complete: copied {copied_count}, skipped {skipped_count} (project-specific)")
+        else:
+            logger.debug("Shared agents source directory not found, skipping setup")
+
     async def _execute_in_container(
         self,
         docker_cmd: list,
@@ -775,6 +827,13 @@ class DockerAgentRunner:
                 logger.error("FATAL: Container cannot write to workspace - aborting agent launch")
                 raise Exception("Container write access verification failed - agent would not be able to write files")
             logger.info("✓ Pre-launch verification passed: Container has write access")
+
+        # Setup shared agents - copy to project directory for Claude Code discovery
+        try:
+            self._setup_shared_agents(project_dir)
+        except Exception as e:
+            logger.warning(f"Failed to setup shared agents: {e}")
+            # Not critical - continue execution
 
         # Build the Claude command to run inside container
         # We use file-based input/output to support detached execution and orchestrator restarts
