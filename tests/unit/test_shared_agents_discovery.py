@@ -1,22 +1,40 @@
-"""Unit tests for shared agents discovery and setup"""
+"""Unit tests for shared Claude Code library discovery and setup"""
 
 import pytest
 from pathlib import Path
 from claude.docker_runner import docker_runner
 
 
-class TestSharedAgentsStructure:
-    """Test shared agents directory structure validation"""
+class TestSharedClaudeStructure:
+    """Test shared Claude Code library directory structure validation"""
 
-    def test_shared_agents_directory_exists(self):
-        """Test that shared agents directory exists"""
-        shared_agents_dir = Path('config/shared_agents/.claude/agents')
-        assert shared_agents_dir.exists(), "Shared agents directory should exist"
-        assert shared_agents_dir.is_dir(), "Shared agents path should be a directory"
+    def test_shared_claude_directory_exists(self):
+        """Test that shared Claude directory exists"""
+        shared_claude_dir = Path('config/shared_claude/.claude')
+        assert shared_claude_dir.exists(), "Shared Claude directory should exist"
+        assert shared_claude_dir.is_dir(), "Shared Claude path should be a directory"
+
+    def test_agents_directory_exists(self):
+        """Test that agents subdirectory exists"""
+        agents_dir = Path('config/shared_claude/.claude/agents')
+        assert agents_dir.exists(), "Agents directory should exist"
+        assert agents_dir.is_dir(), "Agents path should be a directory"
+
+    def test_commands_directory_exists(self):
+        """Test that commands subdirectory exists"""
+        commands_dir = Path('config/shared_claude/.claude/commands')
+        assert commands_dir.exists(), "Commands directory should exist"
+        assert commands_dir.is_dir(), "Commands path should be a directory"
+
+    def test_skills_directory_exists(self):
+        """Test that skills subdirectory exists"""
+        skills_dir = Path('config/shared_claude/.claude/skills')
+        assert skills_dir.exists(), "Skills directory should exist"
+        assert skills_dir.is_dir(), "Skills path should be a directory"
 
     def test_readme_exists(self):
         """Test that README.md exists in shared agents directory"""
-        readme_path = Path('config/shared_agents/.claude/agents/README.md')
+        readme_path = Path('config/shared_claude/.claude/agents/README.md')
         assert readme_path.exists(), "README.md should exist"
         assert readme_path.is_file(), "README path should be a file"
 
@@ -27,19 +45,19 @@ class TestSharedAgentsStructure:
 
     def test_playwright_expert_exists(self):
         """Test that playwright_expert.md exists"""
-        agent_path = Path('config/shared_agents/.claude/agents/playwright_expert.md')
+        agent_path = Path('config/shared_claude/.claude/agents/playwright_expert.md')
         assert agent_path.exists(), "playwright_expert.md should exist"
         assert agent_path.is_file(), "Playwright expert path should be a file"
 
     def test_database_expert_exists(self):
         """Test that database_expert.md exists"""
-        agent_path = Path('config/shared_agents/.claude/agents/database_expert.md')
+        agent_path = Path('config/shared_claude/.claude/agents/database_expert.md')
         assert agent_path.exists(), "database_expert.md should exist"
         assert agent_path.is_file(), "Database expert path should be a file"
 
     def test_flowbite_react_expert_exists(self):
         """Test that flowbite_react_expert.md exists"""
-        agent_path = Path('config/shared_agents/.claude/agents/flowbite_react_expert.md')
+        agent_path = Path('config/shared_claude/.claude/agents/flowbite_react_expert.md')
         assert agent_path.exists(), "flowbite_react_expert.md should exist"
         assert agent_path.is_file(), "Flowbite React expert path should be a file"
 
@@ -49,7 +67,7 @@ class TestSharedAgentsContent:
 
     def test_playwright_expert_has_proper_header(self):
         """Test that playwright_expert.md has proper header"""
-        agent_path = Path('config/shared_agents/.claude/agents/playwright_expert.md')
+        agent_path = Path('config/shared_claude/.claude/agents/playwright_expert.md')
         content = agent_path.read_text()
 
         assert "# Playwright Testing Expert" in content, "Should have agent title"
@@ -58,7 +76,7 @@ class TestSharedAgentsContent:
 
     def test_database_expert_has_proper_header(self):
         """Test that database_expert.md has proper header"""
-        agent_path = Path('config/shared_agents/.claude/agents/database_expert.md')
+        agent_path = Path('config/shared_claude/.claude/agents/database_expert.md')
         content = agent_path.read_text()
 
         assert "# Database Design Expert" in content, "Should have agent title"
@@ -67,7 +85,7 @@ class TestSharedAgentsContent:
 
     def test_flowbite_react_expert_has_proper_header(self):
         """Test that flowbite_react_expert.md has proper header"""
-        agent_path = Path('config/shared_agents/.claude/agents/flowbite_react_expert.md')
+        agent_path = Path('config/shared_claude/.claude/agents/flowbite_react_expert.md')
         content = agent_path.read_text()
 
         assert "# Flowbite-React UI Component Expert" in content, "Should have agent title"
@@ -83,7 +101,7 @@ class TestSharedAgentsContent:
         ]
 
         for agent_file in agent_files:
-            agent_path = Path(f'config/shared_agents/.claude/agents/{agent_file}')
+            agent_path = Path(f'config/shared_claude/.claude/agents/{agent_file}')
             content = agent_path.read_text()
 
             # Should have code blocks
@@ -91,23 +109,23 @@ class TestSharedAgentsContent:
 
 
 class TestSetupSharedAgents:
-    """Test _setup_shared_agents() function"""
+    """Test _setup_shared_claude() function"""
 
-    def test_setup_shared_agents_creates_directory(self, tmp_path):
-        """Test that _setup_shared_agents creates .claude/agents directory"""
+    def test_setup_shared_claude_creates_directory(self, tmp_path):
+        """Test that _setup_shared_claude creates .claude/ base directory"""
         project_dir = tmp_path / "test_project"
         project_dir.mkdir()
 
-        # Call setup (will fail gracefully if /shared_agents doesn't exist)
-        try:
-            docker_runner._setup_shared_agents(project_dir)
-        except:
-            pass  # Expected to fail in test environment
+        # Call setup - creates .claude/ even if /shared_claude doesn't exist
+        docker_runner._setup_shared_claude(project_dir)
 
-        # Directory should still be created
-        agents_dir = project_dir / '.claude' / 'agents'
-        assert agents_dir.exists(), ".claude/agents directory should be created"
-        assert agents_dir.is_dir(), ".claude/agents should be a directory"
+        # Base .claude directory should be created
+        claude_dir = project_dir / '.claude'
+        assert claude_dir.exists(), ".claude directory should be created"
+        assert claude_dir.is_dir(), ".claude should be a directory"
+
+        # Subdirectories (agents, commands, skills) are only created if shared resources exist
+        # Since /shared_claude doesn't exist in test environment, subdirectories won't be created
 
     def test_setup_shared_agents_with_mock_agents(self, tmp_path):
         """Test copying shared agents with mocked source"""
@@ -168,15 +186,15 @@ class TestSetupSharedAgents:
 
 
 class TestDockerRunnerMounts:
-    """Test that docker_runner adds shared agents mount"""
+    """Test that docker_runner adds shared claude mount"""
 
     def test_docker_runner_has_setup_method(self):
-        """Test that docker_runner has _setup_shared_agents method"""
-        assert hasattr(docker_runner, '_setup_shared_agents'), \
-            "docker_runner should have _setup_shared_agents method"
+        """Test that docker_runner has _setup_shared_claude method"""
+        assert hasattr(docker_runner, '_setup_shared_claude'), \
+            "docker_runner should have _setup_shared_claude method"
 
         # Verify method signature
         import inspect
-        sig = inspect.signature(docker_runner._setup_shared_agents)
+        sig = inspect.signature(docker_runner._setup_shared_claude)
         assert 'project_dir' in sig.parameters, \
-            "_setup_shared_agents should accept project_dir parameter"
+            "_setup_shared_claude should accept project_dir parameter"

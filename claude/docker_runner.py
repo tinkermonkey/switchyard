@@ -578,19 +578,19 @@ class DockerAgentRunner:
         ])
         logger.info(f"Mounting Claude config: {claude_config_host_path} -> /home/orchestrator/.config/claude")
 
-        # Mount shared agents directory (read-only)
-        # This makes specialist Claude Code agents available to all containers
-        shared_agents_host_path = f'{host_workspace}/clauditoreum/config/shared_agents'
-        shared_agents_container_path = '/shared_agents'
+        # Mount shared Claude Code library (read-only)
+        # This makes shared agents, commands, and skills available to all containers
+        shared_claude_host_path = f'{host_workspace}/clauditoreum/config/shared_claude'
+        shared_claude_container_path = '/shared_claude'
 
-        # Check if shared agents directory exists before mounting
-        if Path('/app/config/shared_agents/.claude/agents').exists():
+        # Check if shared Claude directory exists before mounting
+        if Path('/app/config/shared_claude/.claude').exists():
             cmd.extend([
-                '-v', f'{shared_agents_host_path}:{shared_agents_container_path}:ro'
+                '-v', f'{shared_claude_host_path}:{shared_claude_container_path}:ro'
             ])
-            logger.info(f"Mounting shared agents: {shared_agents_host_path} -> {shared_agents_container_path}")
+            logger.info(f"Mounting shared Claude library: {shared_claude_host_path} -> {shared_claude_container_path}")
         else:
-            logger.debug("No shared agents directory found, skipping mount")
+            logger.debug("No shared Claude directory found, skipping mount")
 
         # Mount MCP config file if provided (task-specific MCP servers)
         # The MCP config is written to a temp location accessible from host
@@ -754,43 +754,64 @@ class DockerAgentRunner:
             logger.warning(f"Failed to detect rate limit reset time: {e}")
             return None
 
-    def _setup_shared_agents(self, project_dir: Path) -> None:
+    def _setup_shared_claude(self, project_dir: Path) -> None:
         """
-        Copy shared agents into project's .claude/agents/ directory.
-        This creates a union of project-specific and shared agents.
+        Copy shared Claude Code resources (agents, commands, skills) into project's .claude/ directory.
+        This creates a union of project-specific and shared resources.
 
         Args:
             project_dir: Project directory path inside container (e.g., /workspace/project-name)
         """
-        shared_agents_source = Path('/shared_agents/.claude/agents')
-        project_agents_dir = project_dir / '.claude' / 'agents'
+        import shutil
 
-        # Create project's .claude/agents directory if it doesn't exist
-        project_agents_dir.mkdir(parents=True, exist_ok=True)
+        shared_claude_base = Path('/shared_claude/.claude')
+        project_claude_dir = project_dir / '.claude'
 
-        # Copy shared agent definitions into project
-        if shared_agents_source.exists():
-            import shutil
+        # Ensure project's .claude directory exists
+        project_claude_dir.mkdir(parents=True, exist_ok=True)
 
-            copied_count = 0
-            skipped_count = 0
+        total_copied = 0
+        total_skipped = 0
 
-            for agent_file in shared_agents_source.glob('*.md'):
-                dest_file = project_agents_dir / agent_file.name
+        # Copy agents, commands, and skills
+        for resource_type in ['agents', 'commands', 'skills']:
+            shared_resource_dir = shared_claude_base / resource_type
+            project_resource_dir = project_claude_dir / resource_type
 
-                # Only copy if not already present (project-specific agents take precedence)
-                if not dest_file.exists():
-                    shutil.copy2(agent_file, dest_file)
-                    copied_count += 1
-                    logger.debug(f"Copied shared agent: {agent_file.name}")
-                else:
-                    skipped_count += 1
-                    logger.debug(f"Skipping {agent_file.name} - project-specific version exists")
+            if not shared_resource_dir.exists():
+                continue
 
-            if copied_count > 0:
-                logger.info(f"Shared agents setup complete: copied {copied_count}, skipped {skipped_count} (project-specific)")
-        else:
-            logger.debug("Shared agents source directory not found, skipping setup")
+            # Create project's resource directory
+            project_resource_dir.mkdir(parents=True, exist_ok=True)
+
+            if resource_type == 'skills':
+                # Skills are directories, copy entire skill directories
+                for skill_dir in shared_resource_dir.iterdir():
+                    if skill_dir.is_dir():
+                        dest_skill_dir = project_resource_dir / skill_dir.name
+                        if not dest_skill_dir.exists():
+                            shutil.copytree(skill_dir, dest_skill_dir)
+                            total_copied += 1
+                            logger.debug(f"Copied shared {resource_type}: {skill_dir.name}")
+                        else:
+                            total_skipped += 1
+                            logger.debug(f"Skipping {skill_dir.name} - project-specific version exists")
+            else:
+                # Agents and commands are .md files
+                for resource_file in shared_resource_dir.glob('*.md'):
+                    dest_file = project_resource_dir / resource_file.name
+                    if not dest_file.exists():
+                        shutil.copy2(resource_file, dest_file)
+                        total_copied += 1
+                        logger.debug(f"Copied shared {resource_type}: {resource_file.name}")
+                    else:
+                        total_skipped += 1
+                        logger.debug(f"Skipping {resource_file.name} - project-specific version exists")
+
+        if total_copied > 0:
+            logger.info(f"Shared Claude setup complete: copied {total_copied} resources, skipped {total_skipped} (project-specific)")
+        elif shared_claude_base.exists():
+            logger.debug("All shared resources already present in project")
 
     async def _execute_in_container(
         self,
@@ -828,11 +849,11 @@ class DockerAgentRunner:
                 raise Exception("Container write access verification failed - agent would not be able to write files")
             logger.info("✓ Pre-launch verification passed: Container has write access")
 
-        # Setup shared agents - copy to project directory for Claude Code discovery
+        # Setup shared Claude resources - copy to project directory for Claude Code discovery
         try:
-            self._setup_shared_agents(project_dir)
+            self._setup_shared_claude(project_dir)
         except Exception as e:
-            logger.warning(f"Failed to setup shared agents: {e}")
+            logger.warning(f"Failed to setup shared Claude resources: {e}")
             # Not critical - continue execution
 
         # Build the Claude command to run inside container

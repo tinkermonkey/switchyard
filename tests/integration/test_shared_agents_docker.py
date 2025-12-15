@@ -9,17 +9,17 @@ class TestSharedAgentsDockerMount:
     """Test Docker volume mounting for shared agents"""
 
     @pytest.mark.integration
-    def test_shared_agents_directory_mountable(self):
+    def test_shared_claude_directory_mountable(self):
         """Test that shared agents directory exists and can be mounted"""
         # Verify source directory exists
-        shared_agents_dir = Path('/app/config/shared_agents/.claude/agents')
+        shared_claude_dir = Path('/app/config/shared_claude/.claude')
 
         # In container, this path should exist
-        if shared_agents_dir.exists():
-            assert shared_agents_dir.is_dir(), "Shared agents should be a directory"
+        if shared_claude_dir.exists():
+            assert shared_claude_dir.is_dir(), "Shared agents should be a directory"
 
             # Verify it has agent files
-            agent_files = list(shared_agents_dir.glob('*.md'))
+            agent_files = list(shared_claude_dir.glob('*.md'))
             assert len(agent_files) >= 3, "Should have at least 3 agent definitions"
 
     @pytest.mark.integration
@@ -31,35 +31,33 @@ class TestSharedAgentsDockerMount:
             "docker_runner should have _build_docker_command method"
 
     @pytest.mark.integration
-    def test_setup_shared_agents_integration(self, tmp_path):
-        """Integration test for _setup_shared_agents with real directory"""
+    def test_setup_shared_claude_integration(self, tmp_path):
+        """Integration test for _setup_shared_claude with real directory"""
         # Create a test project directory
         project_dir = tmp_path / "test_project"
         project_dir.mkdir()
 
         # Call the actual setup method
-        try:
-            docker_runner._setup_shared_agents(project_dir)
-        except Exception as e:
-            # May fail if not running in container with /shared_agents mounted
-            # That's okay for this test
-            pytest.skip(f"Not running in container environment: {e}")
+        docker_runner._setup_shared_claude(project_dir)
 
-        # Verify .claude/agents directory was created
-        agents_dir = project_dir / '.claude' / 'agents'
-        assert agents_dir.exists(), ".claude/agents should be created"
+        # Verify base .claude/ directory was created
+        claude_dir = project_dir / '.claude'
+        assert claude_dir.exists(), ".claude directory should be created"
+
+        # Subdirectories (agents, commands, skills) are only created if /shared_claude mount exists
+        # In test environment without mount, they won't be created
 
     @pytest.mark.integration
     @pytest.mark.skipif(
-        not Path('/shared_agents/.claude/agents').exists(),
-        reason="Requires /shared_agents mount (only available in agent containers)"
+        not Path('/shared_claude/.claude/agents').exists(),
+        reason="Requires /shared_claude mount (only available in agent containers)"
     )
-    def test_shared_agents_accessible_from_container(self):
-        """Test that shared agents are accessible from /shared_agents mount"""
-        shared_agents_dir = Path('/shared_agents/.claude/agents')
+    def test_shared_claude_accessible_from_container(self):
+        """Test that shared agents are accessible from /shared_claude mount"""
+        shared_claude_dir = Path('/shared_claude/.claude/agents')
 
-        assert shared_agents_dir.exists(), "/shared_agents mount should exist"
-        assert shared_agents_dir.is_dir(), "/shared_agents should be a directory"
+        assert shared_claude_dir.exists(), "/shared_claude mount should exist"
+        assert shared_claude_dir.is_dir(), "/shared_claude should be a directory"
 
         # Verify agent files are present
         expected_agents = [
@@ -69,7 +67,7 @@ class TestSharedAgentsDockerMount:
         ]
 
         for agent_file in expected_agents:
-            agent_path = shared_agents_dir / agent_file
+            agent_path = shared_claude_dir / agent_file
             assert agent_path.exists(), f"{agent_file} should exist in shared agents"
             assert agent_path.is_file(), f"{agent_file} should be a file"
 
@@ -79,15 +77,15 @@ class TestSharedAgentsDockerMount:
 
     @pytest.mark.integration
     @pytest.mark.skipif(
-        not Path('/shared_agents/.claude/agents').exists(),
-        reason="Requires /shared_agents mount"
+        not Path('/shared_claude/.claude/agents').exists(),
+        reason="Requires /shared_claude mount"
     )
-    def test_shared_agents_mount_is_read_only(self):
+    def test_shared_claude_mount_is_read_only(self):
         """Test that shared agents mount is read-only"""
-        shared_agents_dir = Path('/shared_agents/.claude/agents')
+        shared_claude_dir = Path('/shared_claude/.claude/agents')
 
-        if shared_agents_dir.exists():
-            test_file = shared_agents_dir / "test_write.txt"
+        if shared_claude_dir.exists():
+            test_file = shared_claude_dir / "test_write.txt"
 
             # Attempt to write should fail (read-only mount)
             try:
@@ -133,7 +131,7 @@ class TestSharedAgentsDockerMount:
         assert "Test Expert 1" in content1
 
     @pytest.mark.integration
-    def test_project_agents_override_shared_agents(self, tmp_path):
+    def test_project_agents_override_shared_claude(self, tmp_path):
         """Test that project-specific agents override shared agents"""
         # Create mock shared agents
         shared_source = tmp_path / "shared"
