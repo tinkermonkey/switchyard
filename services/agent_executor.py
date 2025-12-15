@@ -186,15 +186,55 @@ class AgentExecutor:
                 try:
                     if attempt > 1:
                         logger.info(f"Retry attempt {attempt}/{max_attempts} for agent {agent_name}")
-                        
+
+                    # Check Claude Code circuit breaker before attempting execution
+                    # If it's open, we should not attempt execution or count failures against the agent
+                    from monitoring.claude_code_breaker import get_breaker
+                    claude_breaker = get_breaker()
+                    if claude_breaker.is_open():
+                        reset_time = claude_breaker.reset_time
+                        if reset_time:
+                            from datetime import datetime, timezone
+                            time_until = (reset_time - datetime.now(timezone.utc)).total_seconds()
+                            logger.warning(
+                                f"⏸️  Claude Code circuit breaker is OPEN. Agent {agent_name} execution paused. "
+                                f"Tokens reset in {time_until:.0f}s at {reset_time.strftime('%I:%M %p')}"
+                            )
+                            # Raise a specific exception that indicates this is a systemic issue, not an agent failure
+                            raise Exception(
+                                f"Claude Code circuit breaker is OPEN. Resets at {reset_time.strftime('%I:%M %p')}. "
+                                f"This is a systemic token limit issue, not an agent failure."
+                            )
+                        else:
+                            logger.warning(f"⏸️  Claude Code circuit breaker is OPEN. Agent {agent_name} execution paused.")
+                            raise Exception(
+                                "Claude Code circuit breaker is OPEN. Awaiting token reset. "
+                                "This is a systemic token limit issue, not an agent failure."
+                            )
+
                     # Use run_with_circuit_breaker instead of direct execute
                     result = await agent_stage.run_with_circuit_breaker(execution_context)
-                    
+
                     # If successful, break the retry loop
                     break
-                    
+
                 except Exception as e:
-                    # Check if we should retry
+                    # Check if this is a Claude Code breaker failure (systemic issue)
+                    error_message = str(e)
+                    is_claude_breaker_failure = "Claude Code circuit breaker is OPEN" in error_message
+
+                    if is_claude_breaker_failure:
+                        # This is a systemic issue (token limits), not an agent failure
+                        # Don't retry - all agents will fail until breaker closes
+                        # Don't count against agent's circuit breaker
+                        logger.error(
+                            f"Agent {agent_name} blocked by Claude Code circuit breaker. "
+                            f"No retries will be attempted (all would fail until tokens reset)."
+                        )
+                        # Re-raise to be caught by outer block, which will emit agent_failed event
+                        raise e
+
+                    # Check if we should retry (for normal agent failures)
                     if attempt < max_attempts:
                         logger.warning(f"Agent execution failed (attempt {attempt}/{max_attempts}): {e}")
                         # Wait before retry (longer backoff to allow circuit breaker recovery: 15s, 30s, 60s)
@@ -281,39 +321,54 @@ class AgentExecutor:
 
         except Exception as e:
             duration_ms = (time.time() - start_time) * 1000
-            self.obs.emit_agent_completed(
-                agent_name, task_id, project_name, duration_ms, False, str(e), pipeline_run_id, None, agent_execution_id
-            )
+            error_message = str(e)
+            is_claude_breaker_failure = "Claude Code circuit breaker is OPEN" in error_message
 
-            # Record failed execution outcome
-            # CRITICAL: Always try to record outcome to prevent stuck "in_progress" states
-            if 'issue_number' in task_context:
-                from services.work_execution_state import work_execution_tracker
-                column = task_context.get('column', 'unknown')
+            if is_claude_breaker_failure:
+                # This is a systemic issue (token limits), not an agent failure
+                # Don't emit agent_failed - emit a paused/blocked event instead
+                logger.warning(
+                    f"Agent {agent_name} blocked by Claude Code circuit breaker after {duration_ms:.0f}ms. "
+                    f"Not counting as agent failure. Pipeline will resume when tokens reset."
+                )
+                # Don't record execution outcome - the execution was blocked, not failed
+                # The work remains in_progress and will be retried when the breaker closes
+            else:
+                # Normal agent failure - emit event and record outcome
+                self.obs.emit_agent_completed(
+                    agent_name, task_id, project_name, duration_ms, False, str(e), pipeline_run_id, None, agent_execution_id
+                )
 
-                # Warn if column is missing (shouldn't happen in normal flow)
-                if column == 'unknown':
+                # Record failed execution outcome
+                # CRITICAL: Always try to record outcome to prevent stuck "in_progress" states
+                if 'issue_number' in task_context:
+                    from services.work_execution_state import work_execution_tracker
+                    column = task_context.get('column', 'unknown')
+
+                    # Warn if column is missing (shouldn't happen in normal flow)
+                    if column == 'unknown':
+                        logger.warning(
+                            f"Recording execution outcome without column for issue #{task_context['issue_number']} "
+                            f"(agent={agent_name}, project={project_name}). This may indicate a bug in task creation."
+                        )
+
+                    work_execution_tracker.record_execution_outcome(
+                        issue_number=task_context['issue_number'],
+                        column=column,
+                        agent=agent_name,
+                        outcome='failure',
+                        project_name=project_name,
+                        error=str(e)
+                    )
+                else:
+                    # Log warning if we can't record outcome due to missing context
                     logger.warning(
-                        f"Recording execution outcome without column for issue #{task_context['issue_number']} "
-                        f"(agent={agent_name}, project={project_name}). This may indicate a bug in task creation."
+                        f"Cannot record execution outcome for {agent_name}: missing issue_number in task_context. "
+                        f"This execution will not be tracked in work execution state. task_id={task_id}, error={str(e)}"
                     )
 
-                work_execution_tracker.record_execution_outcome(
-                    issue_number=task_context['issue_number'],
-                    column=column,
-                    agent=agent_name,
-                    outcome='failure',
-                    project_name=project_name,
-                    error=str(e)
-                )
-            else:
-                # Log warning if we can't record outcome due to missing context
-                logger.warning(
-                    f"Cannot record execution outcome for {agent_name}: missing issue_number in task_context. "
-                    f"This execution will not be tracked in work execution state. task_id={task_id}, error={str(e)}"
-                )
+                logger.error(f"Agent {agent_name} failed after {duration_ms:.0f}ms: {e}")
 
-            logger.error(f"Agent {agent_name} failed after {duration_ms:.0f}ms: {e}")
             raise
 
     def _create_stream_callback(self, agent_name: str, task_id: str, project_name: str, pipeline_run_id: str = None):
