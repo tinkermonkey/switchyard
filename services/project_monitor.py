@@ -1922,6 +1922,14 @@ class ProjectMonitor:
                 pipeline_queue = get_pipeline_queue_manager(project_name, board_name)
                 pipeline_queue.reset_issue_to_waiting(issue_number)
 
+                # Clean up any active conversational loop state
+                from services.human_feedback_loop import human_feedback_loop_executor
+                human_feedback_loop_executor.cleanup_loop(
+                    project_name=project_name,
+                    issue_number=issue_number,
+                    reason=f"Issue moved to no-agent column '{status}'"
+                )
+
                 return None
 
         except Exception as e:

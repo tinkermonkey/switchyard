@@ -476,10 +476,162 @@ class WorkExecutionStateTracker:
                 return True
             
             return False
-            
+
         except Exception as e:
             logger.error(f"Error checking repair cycle Redis tracking: {e}")
             return False
+
+    def _should_retry_failed_execution(
+        self,
+        project_name: str,
+        issue_number: int,
+        agent: str,
+        column: str,
+        execution: dict
+    ) -> tuple:
+        """
+        Determine if a failed execution should be retried by watchdog.
+
+        Performs comprehensive eligibility checks:
+        - Retry limit not exceeded
+        - Issue still in same active column
+        - Column still requires agent
+        - Pipeline run still active
+        - Issue still open
+        - Circuit breakers not open
+
+        Args:
+            project_name: Project name
+            issue_number: Issue number
+            agent: Agent name
+            column: Column name
+            execution: Execution record dict
+
+        Returns:
+            (should_retry, reason) tuple
+        """
+        import os
+
+        # Check 1: Retry limit
+        max_retries = int(os.environ.get('WATCHDOG_MAX_RETRIES', '3'))
+        retry_count = execution.get('watchdog_retry_count', 0)
+
+        if retry_count >= max_retries:
+            return False, f"max_retries_exceeded (count={retry_count}, max={max_retries})"
+
+        # Check 2 & 3 & 5: Issue state and column (combined GitHub query)
+        try:
+            from config.manager import config_manager
+            from services.github_api_client import get_github_client
+
+            project_config = config_manager.get_project_config(project_name)
+            if not project_config:
+                return False, "project_config_not_found"
+
+            github_client = get_github_client()
+
+            # Get issue details (state and current column)
+            query = """
+            query($owner: String!, $repo: String!, $number: Int!) {
+              repository(owner: $owner, name: $repo) {
+                issue(number: $number) {
+                  state
+                  projectItems(first: 10) {
+                    nodes {
+                      fieldValueByName(name: "Status") {
+                        ... on ProjectV2ItemFieldSingleSelectValue {
+                          name
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+            """
+
+            success, data = github_client.graphql(query, {
+                'owner': project_config.github['org'],
+                'repo': project_config.github['repo'],
+                'number': issue_number
+            })
+
+            if not success:
+                logger.warning(f"Failed to query issue state for {project_name}/#{issue_number}: {data}")
+                return False, "github_query_failed"
+
+            issue_data = data.get('repository', {}).get('issue', {})
+
+            # Check 5: Issue state
+            if issue_data.get('state', '').upper() == 'CLOSED':
+                return False, "issue_closed"
+
+            # Check 2: Current column
+            current_column = None
+            for item in issue_data.get('projectItems', {}).get('nodes', []):
+                field_value = item.get('fieldValueByName')
+                if field_value:
+                    current_column = field_value.get('name')
+                    break
+
+            if current_column != column:
+                return False, f"issue_moved_to_different_column (was={column}, now={current_column})"
+
+        except Exception as e:
+            logger.error(f"Error checking issue state: {e}")
+            return False, f"error_checking_issue_state: {str(e)}"
+
+        # Check 3: Column requires agent
+        try:
+            workflow_template = config_manager.get_workflow_template_for_project(project_name)
+            if not workflow_template:
+                return False, "workflow_template_not_found"
+
+            column_config = None
+            for col in workflow_template.columns:
+                if col.name == column:
+                    column_config = col
+                    break
+
+            if not column_config or not column_config.agent or column_config.agent == 'null':
+                return False, "column_no_longer_requires_agent"
+
+        except Exception as e:
+            logger.error(f"Error checking workflow template: {e}")
+            return False, f"error_checking_workflow: {str(e)}"
+
+        # Check 4: Pipeline run active
+        try:
+            from services.pipeline_run import get_pipeline_run_manager
+
+            pipeline_run_mgr = get_pipeline_run_manager()
+            active_run = pipeline_run_mgr.get_active_pipeline_run(project_name, issue_number)
+
+            if not active_run:
+                return False, "no_active_pipeline_run"
+
+        except Exception as e:
+            logger.error(f"Error checking pipeline run: {e}")
+            return False, f"error_checking_pipeline_run: {str(e)}"
+
+        # Check 6: Claude Code circuit breaker
+        try:
+            from monitoring.claude_code_breaker import get_claude_code_breaker
+
+            claude_breaker = get_claude_code_breaker()
+            if claude_breaker.is_open():
+                return False, "claude_code_breaker_open"
+
+        except Exception as e:
+            logger.warning(f"Error checking Claude Code breaker: {e}")
+            # Continue - don't block on breaker check failure
+
+        # Check 7: Agent-specific circuit breaker
+        # Note: Agent circuit breakers are checked in agent_executor, not globally accessible
+        # Skip this check for now - agent_executor will handle it on retry
+
+        # All checks passed
+        return True, "eligible_for_retry"
 
     def cleanup_stuck_in_progress_states(self):
         """
@@ -667,6 +819,99 @@ class WorkExecutionStateTracker:
                                     f"Marked stuck execution as failed: {project_name}/#{issue_number} "
                                     f"{agent} in {column} (no container found, outcome not recorded)"
                                 )
+
+                                # NEW: Check if we should retry this failed execution
+                                should_retry, retry_reason = self._should_retry_failed_execution(
+                                    project_name, issue_number, agent, column, execution
+                                )
+
+                                # Emit decision event
+                                from monitoring.observability import get_observability_manager
+                                obs = get_observability_manager()
+                                obs.emit_decision_event(
+                                    decision_type="watchdog_retry_decision",
+                                    agent=agent,
+                                    project=project_name,
+                                    issue_number=issue_number,
+                                    context={
+                                        "should_retry": should_retry,
+                                        "reason": retry_reason,
+                                        "column": column,
+                                        "retry_count": execution.get('watchdog_retry_count', 0),
+                                        "execution_timestamp": execution['timestamp']
+                                    }
+                                )
+
+                                if should_retry:
+                                    # Trigger retry via ProjectMonitor
+                                    try:
+                                        # Import here to avoid circular dependency
+                                        from services.project_monitor import get_project_monitor
+
+                                        monitor = get_project_monitor()
+                                        if not monitor:
+                                            logger.error("ProjectMonitor not available for retry trigger")
+                                        else:
+                                            # Get repository from project config
+                                            from config.manager import config_manager
+                                            project_config = config_manager.get_project_config(project_name)
+
+                                            if not project_config:
+                                                logger.error(f"Cannot retry: project config not found for {project_name}")
+                                            else:
+                                                # Get board name from active pipeline run
+                                                from services.pipeline_run import get_pipeline_run_manager
+                                                pipeline_run_mgr = get_pipeline_run_manager()
+                                                active_run = pipeline_run_mgr.get_active_pipeline_run(project_name, issue_number)
+
+                                                if not active_run:
+                                                    logger.warning(f"Cannot retry: no active pipeline run for {project_name}/#{issue_number}")
+                                                else:
+                                                    logger.info(
+                                                        f"Triggering watchdog retry for {project_name}/#{issue_number} "
+                                                        f"in column '{column}' (attempt {execution.get('watchdog_retry_count', 0) + 1})"
+                                                    )
+
+                                                    # Increment retry counter
+                                                    execution['watchdog_retry_count'] = execution.get('watchdog_retry_count', 0) + 1
+                                                    execution['watchdog_last_retry_at'] = datetime.now(timezone.utc).isoformat()
+
+                                                    # Trigger agent (this will create new execution record)
+                                                    monitor.trigger_agent_for_status(
+                                                        project_name=project_name,
+                                                        board_name=active_run.board,
+                                                        issue_number=issue_number,
+                                                        status=column,
+                                                        repository=project_config.github['repo']
+                                                    )
+
+                                                    # Emit retry triggered event
+                                                    obs.emit_decision_event(
+                                                        decision_type="watchdog_retry_triggered",
+                                                        agent=agent,
+                                                        project=project_name,
+                                                        issue_number=issue_number,
+                                                        context={
+                                                            "column": column,
+                                                            "retry_count": execution['watchdog_retry_count'],
+                                                            "previous_failure": execution.get('error', 'Unknown')
+                                                        }
+                                                    )
+
+                                                    logger.info(
+                                                        f"Successfully triggered watchdog retry for {project_name}/#{issue_number}"
+                                                    )
+
+                                    except Exception as retry_error:
+                                        logger.error(
+                                            f"Failed to trigger watchdog retry for {project_name}/#{issue_number}: {retry_error}",
+                                            exc_info=True
+                                        )
+                                        # Don't re-raise - continue with cleanup
+                                else:
+                                    logger.info(
+                                        f"Not retrying {project_name}/#{issue_number}: {retry_reason}"
+                                    )
                             else:
                                 logger.info(
                                     f"Agent container still running for {project_name}/#{issue_number}, "

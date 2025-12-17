@@ -1843,11 +1843,11 @@ def get_circuit_breakers():
             logger.error(f"Could not get GitHub API breaker status: {e}", exc_info=True)
 
         # Agent-specific circuit breakers from Redis
-        logger.info("=== Starting agent circuit breaker query ===")
+        logger.debug("=== Starting agent circuit breaker query ===")
         try:
             # Find all agent circuit breaker keys (reuse redis_client from top of function)
             agent_breaker_keys = redis_client.keys('circuit_breaker:*:state')
-            logger.info(f"Found {len(agent_breaker_keys)} agent circuit breaker keys: {agent_breaker_keys}")
+            logger.debug(f"Found {len(agent_breaker_keys)} agent circuit breaker keys: {agent_breaker_keys}")
             
             for key in agent_breaker_keys:
                 try:

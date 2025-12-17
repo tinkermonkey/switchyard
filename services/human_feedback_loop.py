@@ -192,6 +192,65 @@ class HumanFeedbackLoopExecutor:
             import traceback
             logger.error(traceback.format_exc())
 
+    def cleanup_loop(self, project_name: str, issue_number: int, reason: str = "issue moved to non-agent column") -> bool:
+        """
+        Safely clean up in-memory state and Redis lock for a specific conversational loop.
+
+        This is called when an issue moves out of an agent column (e.g., moved to Backlog).
+
+        Args:
+            project_name: Project name (e.g., 'documentation_robotics')
+            issue_number: Issue number
+            reason: Human-readable reason for cleanup (for logging)
+
+        Returns:
+            True if cleanup was performed, False if loop wasn't active
+
+        Safety guarantees:
+        - Defensive: Only cleans up if loop exists in active_loops
+        - Non-blocking: Never raises exceptions (logs errors instead)
+        - Idempotent: Safe to call multiple times for same issue
+        """
+        try:
+            # Clean up in-memory state
+            if issue_number in self.active_loops:
+                state = self.active_loops[issue_number]
+                agent = state.agent
+                del self.active_loops[issue_number]
+                logger.info(
+                    f"🧹 Cleaned up conversational loop for {project_name}#{issue_number} "
+                    f"(agent={agent}, reason={reason})"
+                )
+
+                # Clean up Redis lock
+                try:
+                    from services.redis_client import get_redis_client
+                    redis_client = get_redis_client()
+                    lock_key = f"orchestrator:conversational_loop:{project_name}:{issue_number}"
+
+                    if redis_client.exists(lock_key):
+                        redis_client.delete(lock_key)
+                        logger.debug(f"Deleted Redis lock: {lock_key}")
+                except Exception as e:
+                    # Non-critical: Lock will eventually be cleaned up by stale lock cleanup
+                    logger.warning(f"Failed to delete Redis lock for {project_name}#{issue_number}: {e}")
+
+                return True
+            else:
+                logger.debug(
+                    f"No active conversational loop to clean up for {project_name}#{issue_number} "
+                    f"(reason={reason})"
+                )
+                return False
+
+        except Exception as e:
+            # Never raise - this is a cleanup operation that shouldn't break the caller
+            logger.error(
+                f"Error cleaning up conversational loop for {project_name}#{issue_number}: {e}",
+                exc_info=True
+            )
+            return False
+
     async def start_loop(
         self,
         issue_number: int,
