@@ -1,13 +1,7 @@
 #!/bin/sh
 set -e
 
-# Fix mount issues where .gitconfig or .orchestrator were created as directories
-# This can happen if Docker creates mount points before volumes are mounted
-if [ -d /home/orchestrator/.gitconfig ] && [ ! -f /home/orchestrator/.gitconfig ]; then
-    echo "Warning: .gitconfig is a directory, removing to allow file mount"
-    rm -rf /home/orchestrator/.gitconfig 2>/dev/null || true
-fi
-
+# Clean up empty .orchestrator directory if mount failed
 if [ -d /home/orchestrator/.orchestrator ] && [ -z "$(ls -A /home/orchestrator/.orchestrator 2>/dev/null)" ]; then
     echo "Warning: .orchestrator is an empty directory, removing to allow proper mount"
     rm -rf /home/orchestrator/.orchestrator 2>/dev/null || true
@@ -46,7 +40,7 @@ if [ -n "$GITHUB_TOKEN" ]; then
     # Ensure .config directory exists for gh to save config
     mkdir -p /home/orchestrator/.config
     chmod 700 /home/orchestrator/.config 2>/dev/null || true
-    
+
     # Authenticate gh CLI with token
     # Suppress all output (both stdout and stderr) since gh may fail if config is read-only
     # The token will still be available as GITHUB_TOKEN environment variable for API calls

@@ -34,14 +34,14 @@ services:
       # Note: We don't mount ~/.ssh/config or known_hosts to preserve container's SSH setup
 
       # Mount git config
-      - ~/.gitconfig:/home/orchestrator/.gitconfig:ro
+      - ~/.gitconfig:/home/orchestrator/.gitconfig
 
       # Mount GitHub App private key directory (optional - accessible by orchestrator user)
       - ~/.orchestrator:/home/orchestrator/.orchestrator
 
       # Mount Claude Code config directory with MCP server configuration
       # We use a local .claude-config directory that contains MCP server settings
-      - ./.claude-config:/home/orchestrator/.config/claude:ro
+      - ./.claude-config:/home/orchestrator/.config/claude
 
       # Share Docker socket for nested containers (rootful Docker)
       - /var/run/docker.sock:/var/run/docker.sock
@@ -59,6 +59,8 @@ services:
       - CONTEXT7_MCP_URL=https://mcp.context7.com/mcp
       - CONTEXT7_API_KEY=${CONTEXT7_API_KEY}
       - RECONCILIATION_FRESHNESS_HOURS=${RECONCILIATION_FRESHNESS_HOURS:-1}
+      # Watchdog retry configuration
+      - WATCHDOG_MAX_RETRIES=${WATCHDOG_MAX_RETRIES:-3}
       # Worker pool configuration
       # Set to 1 for single-threaded (default), 2-8 for multi-threaded parallel execution
       # Recommended: 2-3 workers for multi-project deployments

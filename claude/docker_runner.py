@@ -566,15 +566,15 @@ class DockerAgentRunner:
             # Mount SSH keys for git operations (read-only)
             '-v', f'{host_home}/.ssh:/home/orchestrator/.ssh:ro',
 
-            # Mount git config (read-only)
-            '-v', f'{host_home}/.gitconfig:/home/orchestrator/.gitconfig:ro',
+            # Mount git config
+            '-v', f'{host_home}/.gitconfig:/home/orchestrator/.gitconfig',
         ])
 
         # Mount global Claude config directory (contains MCP server configurations)
         # This gives agent containers access to Playwright MCP and other global MCP servers
         claude_config_host_path = f'{host_workspace}/clauditoreum/.claude-config'
         cmd.extend([
-            '-v', f'{claude_config_host_path}:/home/orchestrator/.config/claude:ro'
+            '-v', f'{claude_config_host_path}:/home/orchestrator/.config/claude'
         ])
         logger.info(f"Mounting Claude config: {claude_config_host_path} -> /home/orchestrator/.config/claude")
 
@@ -1031,7 +1031,16 @@ class DockerAgentRunner:
 
                     if is_stderr:
                         stderr_parts.append(line + '\n')
-                        logger.error(f"Container stderr: {line}")
+                        # Log debug output at DEBUG level, errors at ERROR level
+                        if line.startswith('DEBUG:') or line.startswith(('total ', 'drwx', '-rw', 'lrwx')):
+                            # Debug output from entrypoint script (ls -la, debug messages)
+                            logger.debug(f"Container debug: {line}")
+                        elif 'error' in line.lower() or 'exception' in line.lower() or 'failed' in line.lower():
+                            # Actual errors
+                            logger.error(f"Container stderr: {line}")
+                        else:
+                            # Other stderr (warnings, info)
+                            logger.info(f"Container stderr: {line}")
                         continue
 
                     # Parse stdout (Claude JSON events)
