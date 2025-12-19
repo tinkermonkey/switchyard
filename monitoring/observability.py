@@ -206,6 +206,11 @@ class EventType(Enum):
     MEDIC_CLAUDE_INVESTIGATION_COMPLETED = "medic_claude_investigation_completed"
     MEDIC_CLAUDE_INVESTIGATION_STALLED = "medic_claude_investigation_stalled"
 
+    # Medic Fix events
+    MEDIC_FIX_STARTED = "medic_fix_started"
+    MEDIC_FIX_COMPLETED = "medic_fix_completed"
+    MEDIC_FIX_FAILED = "medic_fix_failed"
+
 @dataclass
 class ObservabilityEvent:
     """Structured event for agent observability"""

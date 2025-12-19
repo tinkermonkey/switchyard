@@ -277,6 +277,7 @@ class ClaudeFixExecutionQueue:
             "completed_at": self.get_completed_at(fingerprint_id).isoformat() if self.get_completed_at(fingerprint_id) else None,
             "result": self.get_result(fingerprint_id),
             "progress_lines": self.get_progress(fingerprint_id),
+            "log_file": self.redis.get(self._key(fingerprint_id, "log_file")),
         }
 
         # Calculate duration if started

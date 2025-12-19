@@ -76,18 +76,17 @@ class ClaudeInvestigationOrchestrator:
         await self._recover_stalled_investigations()
 
         self.running = True
+        logger.info("Claude Investigation Orchestrator initialized and ready")
 
-        # Start background tasks
-        tasks = [
-            asyncio.create_task(self._queue_processor()),
-            asyncio.create_task(self._heartbeat_monitor()),
-        ]
-
+        # Background tasks will be started by main.py
+        # Keep this task alive with infinite wait
         try:
-            await asyncio.gather(*tasks)
-        except Exception as e:
-            logger.error(f"Claude orchestrator error: {e}", exc_info=True)
-            await self.stop()
+            while True:
+                await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            logger.info("Claude orchestrator cancelled")
+            self.running = False
+            raise
 
     async def stop(self):
         """Stop the orchestrator and cleanup"""
@@ -106,9 +105,9 @@ class ClaudeInvestigationOrchestrator:
         self.active_processes.clear()
         logger.info("Claude Investigation Orchestrator stopped")
 
-    async def _queue_processor(self):
+    async def queue_processor(self):
         """Process investigation queue continuously"""
-        logger.info("Queue processor started")
+        logger.info("Claude queue processor started")
 
         while self.running:
             try:
@@ -195,8 +194,9 @@ class ClaudeInvestigationOrchestrator:
             def done_callback(task):
                 """Schedule completion handler in the event loop"""
                 try:
-                    loop = asyncio.get_event_loop()
-                    loop.create_task(self._investigation_completed(fingerprint_id, task))
+                    # Use asyncio.create_task directly (requires Python 3.7+)
+                    # This properly schedules in the current running loop
+                    asyncio.create_task(self._investigation_completed(fingerprint_id, task))
                 except Exception as e:
                     logger.error(f"Error scheduling investigation completion for {fingerprint_id}: {e}", exc_info=True)
 
@@ -284,9 +284,9 @@ class ClaudeInvestigationOrchestrator:
         except Exception as e:
             logger.error(f"Error handling investigation completion for {fingerprint_id}: {e}", exc_info=True)
 
-    async def _heartbeat_monitor(self):
+    async def heartbeat_monitor(self):
         """Monitor active investigations for stalls and timeouts"""
-        logger.info("Heartbeat monitor started")
+        logger.info("Claude heartbeat monitor started")
 
         while self.running:
             try:
@@ -296,22 +296,32 @@ class ClaudeInvestigationOrchestrator:
 
                 for fingerprint_id in active_fps:
                     try:
-                        # Update heartbeat with progress
-                        self.queue.record_heartbeat(fingerprint_id)
-
                         # Update progress (log line count)
                         line_count = self.report_manager.count_log_lines(fingerprint_id)
                         self.queue.update_progress(fingerprint_id, line_count)
 
-                        # Check for stalls
+                        # Check for stalls (NOTE: Investigation process should record its own heartbeats)
                         if self.queue.is_stalled(fingerprint_id):
                             logger.warning(f"Claude investigation {fingerprint_id} appears stalled (no heartbeat)")
-                            self.queue.update_status(fingerprint_id, self.queue.STATUS_STALLED)
 
-                            # TODO: Emit event for medic investigation stalled
-                            # self.observability.emit_event(EventType.MEDIC_CLAUDE_INVESTIGATION_STALLED, {
-                            #     "fingerprint_id": fingerprint_id
-                            # })
+                            # Mark as failed and cleanup
+                            investigation_info = self.active_processes.get(fingerprint_id)
+                            if investigation_info:
+                                # Cancel the task
+                                task = investigation_info.get('task')
+                                if task and not task.done():
+                                    task.cancel()
+
+                                # Remove from active
+                                del self.active_processes[fingerprint_id]
+
+                            self.queue.update_status(fingerprint_id, self.queue.STATUS_FAILED)
+                            self.queue.set_result(fingerprint_id, self.queue.RESULT_FAILED)
+                            self.queue.set_completed_at(fingerprint_id)
+                            self.queue.remove_from_active(fingerprint_id)
+                            self.queue.release_lock(fingerprint_id)
+
+                            logger.info(f"Cleaned up stalled investigation {fingerprint_id}")
 
                     except Exception as e:
                         logger.error(f"Error monitoring investigation {fingerprint_id}: {e}")
@@ -355,6 +365,61 @@ class ClaudeInvestigationOrchestrator:
 
         except Exception as e:
             logger.error(f"Error in startup recovery: {e}", exc_info=True)
+
+    async def auto_trigger_checker(self):
+        """Periodically check for signatures that should auto-trigger investigation"""
+        logger.info("Claude auto-trigger checker started")
+
+        while self.running:
+            try:
+                # Run every 5 minutes
+                await asyncio.sleep(300)
+
+                logger.debug("Checking for Claude auto-trigger conditions...")
+
+                # Get unresolved signatures with investigation_status = "not_started"
+                try:
+                    from elasticsearch.helpers import scan
+                    query = {
+                        "query": {
+                            "bool": {
+                                "must": [
+                                    {"term": {"investigation_status": "not_started"}},
+                                    {"bool": {
+                                        "must_not": [
+                                            {"term": {"status": "resolved"}},
+                                            {"term": {"status": "ignored"}}
+                                        ]
+                                    }}
+                                ]
+                            }
+                        },
+                        "_source": ["fingerprint_id"]
+                    }
+
+                    results = self.failure_store.es.search(
+                        index="medic-claude-failures-*",
+                        body=query,
+                        size=100
+                    )
+
+                    triggered = [hit['_source']['fingerprint_id'] for hit in results['hits']['hits']]
+
+                    for fingerprint_id in triggered:
+                        logger.info(f"Auto-triggering Claude investigation for {fingerprint_id}")
+                        # Update investigation status to queued
+                        self.failure_store.update_investigation_status(fingerprint_id, "queued")
+                        # Enqueue investigation
+                        self.queue.enqueue(fingerprint_id, priority="normal")
+
+                    if triggered:
+                        logger.info(f"Auto-triggered {len(triggered)} Claude investigations")
+
+                except Exception as e:
+                    logger.error(f"Error querying signatures for auto-trigger: {e}", exc_info=True)
+
+            except Exception as e:
+                logger.error(f"Claude auto-trigger checker error: {e}", exc_info=True)
 
     def trigger_investigation(self, fingerprint_id: str, priority: str = "normal") -> bool:
         """

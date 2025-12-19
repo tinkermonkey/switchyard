@@ -220,7 +220,8 @@ class WorkBreakdownAgent(AnalysisAgent):
             try:
                 github_state = self.state_manager.load_project_state(project)
                 if github_state and github_state.issue_discussion_links:
-                    disc_id = github_state.issue_discussion_links.get(int(issue_number))
+                    # Convert to string - YAML keys are strings even for numeric values
+                    disc_id = github_state.issue_discussion_links.get(str(issue_number))
                     if disc_id:
                         # Get discussion number for this issue
                         from services.github_discussions import GitHubDiscussions

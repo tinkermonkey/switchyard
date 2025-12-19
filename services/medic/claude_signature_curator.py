@@ -19,6 +19,7 @@ from apscheduler.triggers.cron import CronTrigger
 
 from services.medic.claude_failure_signature_store import ClaudeFailureSignatureStore
 from services.medic.claude_investigation_queue import ClaudeInvestigationQueue
+from services.medic.claude_report_manager import ClaudeReportManager
 from monitoring.observability import get_observability_manager
 from monitoring.claude_code_breaker import ClaudeCodeBreaker
 
@@ -36,6 +37,7 @@ class ClaudeSignatureCurator:
         )
         self.store = ClaudeFailureSignatureStore(self.es_client)
         self.queue = ClaudeInvestigationQueue(self.redis_client)
+        self.report_manager = ClaudeReportManager()
         self.observability = get_observability_manager()
         self.breaker = ClaudeCodeBreaker()
         self.scheduler = AsyncIOScheduler()
@@ -84,11 +86,37 @@ class ClaudeSignatureCurator:
 
     async def run_curation_cycle(self):
         logger.info("Starting signature curation cycle")
-        
+
         if self.breaker.is_open():
             logger.warning(f"Circuit breaker is OPEN (resets at {self.breaker.reset_time}). Skipping curation cycle.")
             return
-        
+
+        # 0. Cleanup stale signatures (signatures not seen in retention period)
+        try:
+            retention_days = int(os.getenv('MEDIC_SIGNATURE_RETENTION_DAYS', '7'))
+            logger.info(f"Cleaning up signatures not seen in {retention_days} days...")
+
+            # Delete from Elasticsearch (returns count and list of deleted IDs)
+            deleted_count, deleted_fp_ids = self.store.cleanup_stale_signatures(retention_days)
+
+            # Cleanup associated resources
+            if deleted_fp_ids:
+                # Delete investigation report directories
+                reports_deleted = self.report_manager.cleanup_investigation_reports(deleted_fp_ids)
+
+                # Delete Redis keys
+                redis_cleaned = self.queue.cleanup_orphaned_keys(deleted_fp_ids)
+
+                logger.info(f"Cleanup complete: {deleted_count} signatures removed, "
+                           f"{reports_deleted} report directories deleted, "
+                           f"{redis_cleaned} Redis keys cleaned")
+            else:
+                logger.info("No stale signatures to clean up")
+
+        except Exception as e:
+            logger.error(f"Stale signature cleanup failed: {e}", exc_info=True)
+            # Continue with curation even if cleanup fails
+
         # 1. Get unresolved signatures
         signatures = self.store.get_unresolved_signatures()
         if not signatures:

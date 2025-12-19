@@ -63,7 +63,7 @@ class InvestigationOrchestrator:
         logger.info("InvestigationOrchestrator initialized")
 
     async def start(self):
-        """Start the investigation orchestrator"""
+        """Start the investigation orchestrator - initialization only"""
         logger.info("Starting Investigation Orchestrator...")
 
         # Check Claude Code CLI availability
@@ -77,19 +77,17 @@ class InvestigationOrchestrator:
         logger.info(f"Recovery complete: {recovery_stats}")
 
         self.running = True
+        logger.info("Investigation Orchestrator initialized and ready")
 
-        # Start background tasks
-        tasks = [
-            asyncio.create_task(self._queue_processor()),
-            asyncio.create_task(self._heartbeat_monitor()),
-            asyncio.create_task(self._auto_trigger_checker()),
-        ]
-
+        # Background tasks will be started by main.py
+        # Keep this task alive with infinite wait
         try:
-            await asyncio.gather(*tasks)
-        except Exception as e:
-            logger.error(f"Orchestrator error: {e}", exc_info=True)
-            await self.stop()
+            while True:
+                await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            logger.info("Orchestrator cancelled")
+            self.running = False
+            raise
 
     async def stop(self):
         """Stop the orchestrator and cleanup"""
@@ -111,14 +109,17 @@ class InvestigationOrchestrator:
 
         logger.info("Investigation Orchestrator stopped")
 
-    async def _queue_processor(self):
+    async def queue_processor(self):
         """Process investigation queue (main loop)"""
         logger.info("Queue processor started")
+        logger.info(f"DEBUG: self.running = {self.running}")
 
         while self.running:
             try:
                 # Check concurrent limit
                 active_count = len(self.queue.get_all_active())
+                logger.info(f"DEBUG: Queue processor loop - active_count={active_count}, max={InvestigationQueue.MAX_CONCURRENT}")
+
                 if active_count >= InvestigationQueue.MAX_CONCURRENT:
                     logger.debug(
                         f"Max concurrent investigations reached ({active_count}), waiting..."
@@ -126,17 +127,20 @@ class InvestigationOrchestrator:
                     await asyncio.sleep(10)
                     continue
 
-                # Get next investigation from queue (blocking with timeout)
-                fingerprint_id = await asyncio.get_event_loop().run_in_executor(
-                    None, self.queue.dequeue
-                )
+                # Get next investigation from queue (non-blocking check)
+                logger.info("DEBUG: About to dequeue from queue")
+                # Use non-blocking pop instead of blocking blpop
+                fingerprint_id = self.queue.redis.lpop("medic:investigation:queue")
+                logger.info(f"DEBUG: Dequeued fingerprint_id: {fingerprint_id}")
 
                 if not fingerprint_id:
                     # Queue empty, wait a bit
+                    logger.info("DEBUG: Queue empty, sleeping 1 second")
                     await asyncio.sleep(1)
                     continue
 
                 # Start investigation
+                logger.info(f"DEBUG: About to start investigation for {fingerprint_id}")
                 await self._start_investigation(fingerprint_id)
 
             except Exception as e:
@@ -225,7 +229,7 @@ class InvestigationOrchestrator:
             # Mark signature as failed to allow re-queueing
             await self.failure_store.update_investigation_status(fingerprint_id, "failed")
 
-    async def _heartbeat_monitor(self):
+    async def heartbeat_monitor(self):
         """Monitor active investigations for progress and completion"""
         logger.info("Heartbeat monitor started")
 
@@ -391,7 +395,7 @@ class InvestigationOrchestrator:
                 f"Error handling completion for {fingerprint_id}: {e}", exc_info=True
             )
 
-    async def _auto_trigger_checker(self):
+    async def auto_trigger_checker(self):
         """Periodically check for signatures that should auto-trigger investigation"""
         logger.info("Auto-trigger checker started")
 

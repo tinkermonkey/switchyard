@@ -1,8 +1,12 @@
 import { useEffect, useState } from 'react'
-import { AlertCircle, Clock, Code, Play, FileText, Wrench, Trash2 } from 'lucide-react'
+import { AlertCircle, Clock, Code, Play, FileText, Wrench, Trash2, ChevronDown } from 'lucide-react'
 import { useNavigate } from '@tanstack/react-router'
+import ReactMarkdown from 'react-markdown'
+import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter'
+import { vscDarkPlus } from 'react-syntax-highlighter/dist/esm/styles/prism'
 import InvestigationReport from './InvestigationReport'
 import ConfirmationModal from './ConfirmationModal'
+import Toast from './Toast'
 import { useSocket } from '../contexts'
 
 export default function FailureSignatureDetail({ fingerprintId }) {
@@ -12,14 +16,19 @@ export default function FailureSignatureDetail({ fingerprintId }) {
   const [error, setError] = useState(null)
   const [showDiagnosis, setShowDiagnosis] = useState(false)
   const [showFixPlan, setShowFixPlan] = useState(false)
+  const [showFixResults, setShowFixResults] = useState(false)
   const [showDeleteModal, setShowDeleteModal] = useState(false)
   const [modalConfig, setModalConfig] = useState({ show: false, title: '', message: '', isDangerous: false })
+  const [fixStatus, setFixStatus] = useState(null)
+  const [fixLog, setFixLog] = useState(null)
+  const [toast, setToast] = useState({ show: false, message: '', type: 'info' })
   const { medicEvents } = useSocket()
   const navigate = useNavigate()
 
   useEffect(() => {
     fetchSignatureDetails()
     fetchOccurrences()
+    fetchFixStatus()
   }, [fingerprintId])
 
   // Refresh when medic events occur for this signature
@@ -32,6 +41,7 @@ export default function FailureSignatureDetail({ fingerprintId }) {
       if (eventFingerprintId === fingerprintId) {
         console.log('[FailureSignatureDetail] Refreshing due to event:', latestEvent.event_type)
         fetchSignatureDetails()
+        fetchFixStatus()
         // Also refresh occurrences if it's a new occurrence
         if (latestEvent.event_type === 'signature_updated') {
           fetchOccurrences()
@@ -62,6 +72,37 @@ export default function FailureSignatureDetail({ fingerprintId }) {
       setOccurrences(data.occurrences || [])
     } catch (err) {
       console.error('Error fetching occurrences:', err)
+    }
+  }
+
+  const fetchFixStatus = async () => {
+    try {
+      const response = await fetch(`/api/medic/claude/fixes/${fingerprintId}/status`)
+      if (response.ok) {
+        const data = await response.json()
+        setFixStatus(data.status || null)
+        // If fix is completed, also fetch the log
+        if (data.status === 'completed' && !fixLog) {
+          fetchFixLog()
+        }
+      } else {
+        setFixStatus(null)
+      }
+    } catch (err) {
+      console.error('Error fetching fix status:', err)
+      setFixStatus(null)
+    }
+  }
+
+  const fetchFixLog = async () => {
+    try {
+      const response = await fetch(`/api/medic/claude/fixes/${fingerprintId}/log`)
+      if (response.ok) {
+        const data = await response.json()
+        setFixLog(data)
+      }
+    } catch (err) {
+      console.error('Error fetching fix log:', err)
     }
   }
 
@@ -100,7 +141,15 @@ export default function FailureSignatureDetail({ fingerprintId }) {
         const data = await response.json().catch(() => ({}))
         throw new Error(data.error || 'Failed to trigger fix')
       }
-      fetchSignatureDetails() // Refresh
+      // Show success toast
+      setToast({
+        show: true,
+        message: 'Fix has been queued successfully and will be executed shortly.',
+        type: 'success'
+      })
+      // Refresh data
+      fetchSignatureDetails()
+      fetchFixStatus()
     } catch (err) {
       setModalConfig({
         show: true,
@@ -228,13 +277,47 @@ export default function FailureSignatureDetail({ fingerprintId }) {
               </button>
             )}
             {(signature.investigation_status === 'diagnosed' || signature.investigation_status === 'completed') && (
-              <button
-                onClick={triggerFix}
-                className="px-4 py-2 bg-green-600 text-white rounded hover:bg-green-700 transition-colors flex items-center gap-2"
-              >
-                <Wrench className="w-4 h-4" />
-                Launch Fix
-              </button>
+              <>
+                {fixStatus === 'queued' || fixStatus === 'starting' || fixStatus === 'in_progress' ? (
+                  <button
+                    disabled
+                    className="px-4 py-2 bg-gray-500 text-white rounded cursor-not-allowed opacity-50 flex items-center gap-2"
+                    title={
+                      fixStatus === 'queued' ? 'Fix is queued for execution' :
+                      fixStatus === 'starting' ? 'Fix is starting' :
+                      'Fix is in progress'
+                    }
+                  >
+                    <Wrench className="w-4 h-4" />
+                    {fixStatus === 'queued' && 'Fix Queued'}
+                    {fixStatus === 'starting' && 'Fix Starting...'}
+                    {fixStatus === 'in_progress' && 'Fix In Progress...'}
+                  </button>
+                ) : fixStatus === 'completed' ? (
+                  <span className="px-4 py-2 bg-green-500/10 text-green-500 rounded flex items-center gap-2 font-medium">
+                    <Wrench className="w-4 h-4" />
+                    Fixed ✓
+                  </span>
+                ) : fixStatus === 'failed' ? (
+                  <button
+                    onClick={triggerFix}
+                    className="px-4 py-2 bg-orange-600 text-white rounded hover:bg-orange-700 transition-colors flex items-center gap-2"
+                    title="Previous fix failed - click to retry"
+                  >
+                    <Wrench className="w-4 h-4" />
+                    Retry Fix
+                  </button>
+                ) : (
+                  <button
+                    onClick={triggerFix}
+                    className="px-4 py-2 bg-green-600 text-white rounded hover:bg-green-700 transition-colors flex items-center gap-2"
+                    title="Launch fix for this failure"
+                  >
+                    <Wrench className="w-4 h-4" />
+                    Launch Fix
+                  </button>
+                )}
+              </>
             )}
             <select
               value={signature.status}
@@ -320,42 +403,207 @@ export default function FailureSignatureDetail({ fingerprintId }) {
       {/* Investigation Reports */}
       {signature.investigation_status === 'completed' && (
         <div className="space-y-4">
-          <button
-            onClick={() => setShowDiagnosis(!showDiagnosis)}
-            className="w-full bg-gh-canvas-subtle border border-gh-border rounded-lg p-4 hover:bg-gh-border-muted transition-colors text-left flex items-center justify-between"
-          >
-            <div className="flex items-center gap-2">
-              <FileText className="w-4 h-4" />
-              <span className="font-semibold">Root Cause Diagnosis</span>
+          {/* Root Cause Diagnosis */}
+          <div className="bg-gh-canvas-subtle border border-gh-border rounded-lg overflow-hidden">
+            <button
+              onClick={() => setShowDiagnosis(!showDiagnosis)}
+              className="w-full p-4 hover:bg-gh-border-muted transition-colors text-left flex items-center justify-between"
+            >
+              <div className="flex items-center gap-2">
+                <FileText className="w-4 h-4" />
+                <span className="font-semibold">Root Cause Diagnosis</span>
+              </div>
+              <ChevronDown
+                className={`w-5 h-5 text-gh-fg-muted transition-transform duration-200 ${
+                  showDiagnosis ? 'transform rotate-180' : ''
+                }`}
+              />
+            </button>
+            {showDiagnosis && (
+              <div className="border-t border-gh-border p-4">
+                <InvestigationReport
+                  fingerprintId={fingerprintId}
+                  reportType="diagnosis"
+                />
+              </div>
+            )}
+          </div>
+
+          {/* Fix Plan */}
+          <div className="bg-gh-canvas-subtle border border-gh-border rounded-lg overflow-hidden">
+            <button
+              onClick={() => setShowFixPlan(!showFixPlan)}
+              className="w-full p-4 hover:bg-gh-border-muted transition-colors text-left flex items-center justify-between"
+            >
+              <div className="flex items-center gap-2">
+                <FileText className="w-4 h-4" />
+                <span className="font-semibold">Fix Plan</span>
+              </div>
+              <ChevronDown
+                className={`w-5 h-5 text-gh-fg-muted transition-transform duration-200 ${
+                  showFixPlan ? 'transform rotate-180' : ''
+                }`}
+              />
+            </button>
+            {showFixPlan && (
+              <div className="border-t border-gh-border p-4">
+                <InvestigationReport
+                  fingerprintId={fingerprintId}
+                  reportType="fix-plan"
+                />
+              </div>
+            )}
+          </div>
+
+          {/* Fix Results (only show if fix is completed) */}
+          {fixStatus === 'completed' && (
+            <div className="bg-gh-canvas-subtle border border-gh-border rounded-lg overflow-hidden">
+              <button
+                onClick={() => {
+                  setShowFixResults(!showFixResults)
+                  if (!showFixResults && !fixLog) {
+                    fetchFixLog()
+                  }
+                }}
+                className="w-full p-4 hover:bg-gh-border-muted transition-colors text-left flex items-center justify-between"
+              >
+                <div className="flex items-center gap-2">
+                  <Wrench className="w-4 h-4 text-green-500" />
+                  <span className="font-semibold">Fix Results</span>
+                  <span className="ml-2 px-2 py-0.5 bg-green-500/10 text-green-500 rounded text-xs">
+                    Completed ✓
+                  </span>
+                </div>
+                <ChevronDown
+                  className={`w-5 h-5 text-gh-fg-muted transition-transform duration-200 ${
+                    showFixResults ? 'transform rotate-180' : ''
+                  }`}
+                />
+              </button>
+              {showFixResults && (
+                <div className="border-t border-gh-border p-4">
+                  {fixLog && fixLog.logs && fixLog.logs.length > 0 ? (
+                    <div className="space-y-4">
+                      {/* Extract summary from last message */}
+                      {(() => {
+                        const lastMessage = fixLog.logs.filter(log => log.type === 'assistant').pop()
+                        const summaryMessage = lastMessage?.message?.content?.find(c => c.type === 'text')?.text
+                        if (summaryMessage) {
+                          return (
+                            <div className="bg-gh-canvas border border-gh-border rounded p-4">
+                              <h4 className="text-sm font-semibold text-gh-fg mb-3">Summary</h4>
+                              <div className="prose prose-invert prose-sm max-w-none">
+                                <ReactMarkdown
+                                  components={{
+                                    code({ node, inline, className, children, ...props }) {
+                                      const match = /language-(\w+)/.exec(className || '')
+                                      return !inline && match ? (
+                                        <SyntaxHighlighter
+                                          style={vscDarkPlus}
+                                          language={match[1]}
+                                          PreTag="div"
+                                          {...props}
+                                        >
+                                          {String(children).replace(/\n$/, '')}
+                                        </SyntaxHighlighter>
+                                      ) : (
+                                        <code className="bg-gh-canvas px-1.5 py-0.5 rounded text-gh-accent-fg font-mono text-xs" {...props}>
+                                          {children}
+                                        </code>
+                                      )
+                                    },
+                                    h1: ({ children }) => (
+                                      <h1 className="text-xl font-bold text-gh-fg mt-4 mb-3 pb-2 border-b border-gh-border">
+                                        {children}
+                                      </h1>
+                                    ),
+                                    h2: ({ children }) => (
+                                      <h2 className="text-lg font-bold text-gh-fg mt-3 mb-2">
+                                        {children}
+                                      </h2>
+                                    ),
+                                    h3: ({ children }) => (
+                                      <h3 className="text-base font-semibold text-gh-fg mt-3 mb-2">
+                                        {children}
+                                      </h3>
+                                    ),
+                                    p: ({ children }) => (
+                                      <p className="text-sm text-gh-fg mb-3 leading-relaxed">
+                                        {children}
+                                      </p>
+                                    ),
+                                    ul: ({ children }) => (
+                                      <ul className="list-disc list-inside text-sm text-gh-fg mb-3 space-y-1">
+                                        {children}
+                                      </ul>
+                                    ),
+                                    ol: ({ children }) => (
+                                      <ol className="list-decimal list-inside text-sm text-gh-fg mb-3 space-y-1">
+                                        {children}
+                                      </ol>
+                                    ),
+                                    li: ({ children }) => (
+                                      <li className="text-gh-fg">
+                                        {children}
+                                      </li>
+                                    ),
+                                    a: ({ children, href }) => (
+                                      <a
+                                        href={href}
+                                        className="text-gh-accent-fg hover:underline"
+                                        target="_blank"
+                                        rel="noopener noreferrer"
+                                      >
+                                        {children}
+                                      </a>
+                                    ),
+                                    blockquote: ({ children }) => (
+                                      <blockquote className="border-l-4 border-gh-accent-emphasis pl-4 italic text-gh-fg-muted mb-3">
+                                        {children}
+                                      </blockquote>
+                                    ),
+                                  }}
+                                >
+                                  {summaryMessage}
+                                </ReactMarkdown>
+                              </div>
+                            </div>
+                          )
+                        }
+                        return null
+                      })()}
+
+                      {/* Full execution log (collapsed by default) */}
+                      <details className="bg-gh-canvas border border-gh-border rounded">
+                        <summary className="p-3 cursor-pointer hover:bg-gh-canvas-subtle text-sm font-medium">
+                          View Full Execution Log ({fixLog.logs.length} entries)
+                        </summary>
+                        <div className="border-t border-gh-border p-3 max-h-96 overflow-y-auto">
+                          <pre className="text-xs text-gh-fg font-mono whitespace-pre-wrap">
+                            {JSON.stringify(fixLog.logs, null, 2)}
+                          </pre>
+                        </div>
+                      </details>
+                    </div>
+                  ) : (
+                    <p className="text-sm text-gh-fg-muted">Loading fix results...</p>
+                  )}
+                </div>
+              )}
             </div>
-            <span className="text-xs text-gh-fg-muted">
-              {showDiagnosis ? 'Hide' : 'Show'}
-            </span>
-          </button>
-          {showDiagnosis && (
-            <InvestigationReport
-              fingerprintId={fingerprintId}
-              reportType="diagnosis"
-            />
           )}
 
-          <button
-            onClick={() => setShowFixPlan(!showFixPlan)}
-            className="w-full bg-gh-canvas-subtle border border-gh-border rounded-lg p-4 hover:bg-gh-border-muted transition-colors text-left flex items-center justify-between"
-          >
-            <div className="flex items-center gap-2">
-              <FileText className="w-4 h-4" />
-              <span className="font-semibold">Fix Plan</span>
+          {/* Fix Failed Status */}
+          {fixStatus === 'failed' && (
+            <div className="bg-red-500/10 border border-red-500/20 rounded-lg p-4">
+              <div className="flex items-center gap-2 text-red-500">
+                <AlertCircle className="w-4 h-4" />
+                <span className="font-semibold">Fix execution failed</span>
+              </div>
+              <p className="text-sm text-gh-fg-muted mt-2">
+                The automated fix failed to complete. You can retry the fix or investigate manually.
+              </p>
             </div>
-            <span className="text-xs text-gh-fg-muted">
-              {showFixPlan ? 'Hide' : 'Show'}
-            </span>
-          </button>
-          {showFixPlan && (
-            <InvestigationReport
-              fingerprintId={fingerprintId}
-              reportType="fix-plan"
-            />
           )}
         </div>
       )}
@@ -422,6 +670,13 @@ export default function FailureSignatureDetail({ fingerprintId }) {
         confirmText={modalConfig.confirmText}
         cancelText={modalConfig.cancelText}
         isDangerous={modalConfig.isDangerous}
+      />
+
+      <Toast
+        show={toast.show}
+        onClose={() => setToast(prev => ({ ...prev, show: false }))}
+        message={toast.message}
+        type={toast.type}
       />
     </div>
   )

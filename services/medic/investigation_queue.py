@@ -104,7 +104,8 @@ class InvestigationQueue:
         result = self.redis.blpop("medic:investigation:queue", timeout=5)
         if result:
             _, fingerprint_id = result
-            return fingerprint_id.decode("utf-8")
+            # Already decoded since redis client has decode_responses=True
+            return fingerprint_id
         return None
 
     def acquire_lock(self, fingerprint_id: str) -> bool:

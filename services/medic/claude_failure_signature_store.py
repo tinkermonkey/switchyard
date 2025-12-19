@@ -496,3 +496,57 @@ class ClaudeFailureSignatureStore:
             self.logger.info(f"Updated investigation status for {fingerprint_id}: {investigation_status}")
         except Exception as e:
             self.logger.error(f"Failed to update investigation status for {fingerprint_id}: {e}")
+
+    def cleanup_stale_signatures(self, days: int = 7) -> tuple:
+        """
+        Delete signatures that haven't been seen in the specified number of days.
+
+        Args:
+            days: Number of days of inactivity before deletion (default: 7)
+
+        Returns:
+            Tuple of (number of signatures deleted, list of deleted fingerprint IDs)
+        """
+        cutoff_date = datetime.utcnow() - timedelta(days=days)
+        cutoff_iso = cutoff_date.isoformat() + 'Z'
+
+        try:
+            # First, get the list of signatures to be deleted (for cleanup coordination)
+            query = {
+                "query": {
+                    "range": {
+                        "last_seen": {
+                            "lt": cutoff_iso
+                        }
+                    }
+                },
+                "_source": ["fingerprint_id"],
+                "size": 10000  # Max signatures to clean in one pass
+            }
+
+            search_result = self.es.search(
+                index=f"{self.INDEX_PREFIX}-*",
+                body=query
+            )
+
+            fingerprint_ids = [hit['_source']['fingerprint_id'] for hit in search_result['hits']['hits']]
+
+            if not fingerprint_ids:
+                self.logger.info("No stale Claude signatures to clean up")
+                return 0, []
+
+            # Use delete_by_query for efficient bulk deletion
+            delete_result = self.es.delete_by_query(
+                index=f"{self.INDEX_PREFIX}-*",
+                body=query,
+                refresh=True
+            )
+
+            deleted_count = delete_result.get('deleted', 0)
+
+            self.logger.info(f"Cleaned up {deleted_count} stale Claude signatures older than {days} days (cutoff: {cutoff_iso})")
+            return deleted_count, fingerprint_ids
+
+        except Exception as e:
+            self.logger.error(f"Failed to cleanup stale signatures: {e}", exc_info=True)
+            return 0, []

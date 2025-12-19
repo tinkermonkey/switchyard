@@ -4273,7 +4273,7 @@ def trigger_claude_fix(fingerprint_id):
     Requires a fix_plan.md to exist.
     """
     try:
-        from services.medic.fix_execution_queue import ClaudeFixExecutionQueue
+        from services.fix_orchestrator.fix_execution_queue import ClaudeFixExecutionQueue
         from services.medic.claude_report_manager import ClaudeReportManager
         from services.medic.report_manager import ReportManager
         import redis
@@ -4357,7 +4357,7 @@ def trigger_claude_fix(fingerprint_id):
 def get_claude_fix_status(fingerprint_id):
     """Get status of a fix execution"""
     try:
-        from services.medic.fix_execution_queue import ClaudeFixExecutionQueue
+        from services.fix_orchestrator.fix_execution_queue import ClaudeFixExecutionQueue
         import redis
         
         redis_client = redis.Redis(
@@ -4380,7 +4380,7 @@ def get_claude_fix_status(fingerprint_id):
 def get_claude_fix_log(fingerprint_id):
     """Get fix execution log"""
     try:
-        from services.medic.fix_execution_queue import ClaudeFixExecutionQueue
+        from services.fix_orchestrator.fix_execution_queue import ClaudeFixExecutionQueue
         import redis
         import json
         
@@ -4417,6 +4417,123 @@ def get_claude_fix_log(fingerprint_id):
     except Exception as e:
         logger.error(f"Failed to get Claude fix log: {e}", exc_info=True)
         return jsonify({'error': str(e)}), 500
+
+
+# ============================================================================
+# Fix Orchestrator Control API Endpoints
+# ============================================================================
+
+@app.route('/fix-orchestrator/active', methods=['GET'])
+def get_active_fixes():
+    """Get all currently active fixes."""
+    try:
+        import redis
+        redis_client = redis.Redis(
+            host=os.getenv('REDIS_HOST', 'redis'),
+            port=int(os.getenv('REDIS_PORT', 6379)),
+            decode_responses=True
+        )
+        keys = redis_client.keys("fix:active:*")
+
+        active_fixes = []
+        for key in keys:
+            fix_data = redis_client.hgetall(key)
+            active_fixes.append({
+                "fingerprint_id": fix_data.get("fingerprint_id"),
+                "status": fix_data.get("status"),
+                "started_at": fix_data.get("started_at"),
+                "log_file": fix_data.get("log_file"),
+                "container_name": fix_data.get("container_name"),
+                "project": fix_data.get("project")
+            })
+
+        redis_client.close()
+        return jsonify(active_fixes), 200
+    except Exception as e:
+        logger.error(f"Failed to get active fixes: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/fix-orchestrator/status/<fingerprint_id>', methods=['GET'])
+def get_fix_status(fingerprint_id):
+    """Get detailed status for a specific fix."""
+    try:
+        import redis
+        redis_client = redis.Redis(
+            host=os.getenv('REDIS_HOST', 'redis'),
+            port=int(os.getenv('REDIS_PORT', 6379)),
+            decode_responses=True
+        )
+
+        # Check active state
+        active_data = redis_client.hgetall(f"fix:active:{fingerprint_id}")
+
+        # Check final status
+        status_data = redis_client.hgetall(f"medic:fix:execution:status:{fingerprint_id}")
+
+        redis_client.close()
+
+        return jsonify({
+            "fingerprint_id": fingerprint_id,
+            "active": bool(active_data),
+            "active_data": active_data or None,
+            "status_data": status_data or None
+        }), 200
+    except Exception as e:
+        logger.error(f"Failed to get fix status: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/fix-orchestrator/kill/<fingerprint_id>', methods=['POST'])
+def kill_fix(fingerprint_id):
+    """Force-kill a running fix execution."""
+    try:
+        import redis
+        redis_client = redis.Redis(
+            host=os.getenv('REDIS_HOST', 'redis'),
+            port=int(os.getenv('REDIS_PORT', 6379)),
+            decode_responses=True
+        )
+
+        # Signal fix orchestrator to kill this fix
+        redis_client.setex(f"fix:kill:{fingerprint_id}", 60, "kill_requested")
+
+        redis_client.close()
+
+        return jsonify({
+            "success": True,
+            "message": f"Kill signal sent for {fingerprint_id}"
+        }), 200
+    except Exception as e:
+        logger.error(f"Failed to send kill signal: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/fix-orchestrator/health', methods=['GET'])
+def fix_orchestrator_health():
+    """Check fix orchestrator service health."""
+    try:
+        import redis
+        redis_client = redis.Redis(
+            host=os.getenv('REDIS_HOST', 'redis'),
+            port=int(os.getenv('REDIS_PORT', 6379)),
+            decode_responses=True
+        )
+
+        keys = redis_client.keys("fix:active:*")
+        queue_length = redis_client.llen("medic:fix:execution:queue")
+
+        redis_client.close()
+
+        return jsonify({
+            "healthy": True,
+            "service": "fix-orchestrator",
+            "active_fixes": len(keys),
+            "queue_length": queue_length
+        }), 200
+    except Exception as e:
+        logger.error(f"Fix orchestrator health check failed: {e}", exc_info=True)
+        return jsonify({"healthy": False, "error": str(e)}), 500
 
 
 # ============================================================================

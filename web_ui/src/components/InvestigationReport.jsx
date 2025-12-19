@@ -49,7 +49,7 @@ export default function InvestigationReport({ fingerprintId, reportType }) {
   }
 
   return (
-    <div className="bg-gh-canvas-subtle border border-gh-border rounded-lg p-6">
+    <div className="bg-gh-canvas border border-gh-border rounded p-4">
       <div className="prose prose-invert prose-sm max-w-none">
         <ReactMarkdown
           components={{

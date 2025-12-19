@@ -115,13 +115,36 @@ class ClaudeInvestigationAgentRunner:
 
             context['stream_callback'] = stream_to_file
 
+            # Get investigation queue for heartbeat recording (if available)
+            investigation_queue = None
+            try:
+                from services.medic.claude_investigation_queue import ClaudeInvestigationQueue
+                import redis
+                redis_client = redis.Redis(
+                    host=os.environ.get('REDIS_HOST', 'redis'),
+                    port=int(os.environ.get('REDIS_PORT', 6379)),
+                    decode_responses=True
+                )
+                investigation_queue = ClaudeInvestigationQueue(redis_client)
+            except Exception as e:
+                logger.warning(f"Could not initialize investigation queue for heartbeats: {e}")
+
             # Launch investigation as async task
             async def run_investigation():
                 logger.info(f"run_investigation() started for {fingerprint_id}")
                 try:
+                    # Record initial heartbeat
+                    if investigation_queue:
+                        investigation_queue.record_heartbeat(fingerprint_id)
+
                     logger.info(f"Calling run_claude_code for {fingerprint_id}")
                     result = await run_claude_code(prompt, context)
                     logger.info(f"Claude investigation {fingerprint_id} completed, result length: {len(result)}")
+
+                    # Record final heartbeat
+                    if investigation_queue:
+                        investigation_queue.record_heartbeat(fingerprint_id)
+
                     return result
                 except Exception as e:
                     logger.error(f"Claude investigation {fingerprint_id} failed: {e}", exc_info=True)

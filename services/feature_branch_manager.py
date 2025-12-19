@@ -500,7 +500,13 @@ class FeatureBranchManager:
             if "conflict" in str(e).lower():
                 # Try to get conflicting files
                 conflict_files = await git_workflow_manager.get_conflicting_files(project_dir)
-                raise MergeConflictError(str(e), conflict_files)
+
+                # Only treat as merge conflict if there are actual conflicting files
+                # Empty list means no real conflicts (e.g., fresh branch with no upstream)
+                if conflict_files:
+                    raise MergeConflictError(str(e), conflict_files)
+
+            # Not a real merge conflict - re-raise original exception
             raise
 
     async def get_commits_behind_main(self, project_dir: str, branch_name: str) -> int:

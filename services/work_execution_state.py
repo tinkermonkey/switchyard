@@ -826,14 +826,16 @@ class WorkExecutionStateTracker:
                                 )
 
                                 # Emit decision event
-                                from monitoring.observability import get_observability_manager
+                                from monitoring.observability import get_observability_manager, EventType
                                 obs = get_observability_manager()
-                                obs.emit_decision_event(
-                                    decision_type="watchdog_retry_decision",
+                                obs.emit(
+                                    EventType.RETRY_ATTEMPTED,
                                     agent=agent,
+                                    task_id=f"watchdog_{project_name}_issue_{issue_number}",
                                     project=project_name,
-                                    issue_number=issue_number,
-                                    context={
+                                    data={
+                                        "decision_category": "watchdog_retry_decision",
+                                        "issue_number": issue_number,
                                         "should_retry": should_retry,
                                         "reason": retry_reason,
                                         "column": column,
@@ -886,12 +888,14 @@ class WorkExecutionStateTracker:
                                                     )
 
                                                     # Emit retry triggered event
-                                                    obs.emit_decision_event(
-                                                        decision_type="watchdog_retry_triggered",
+                                                    obs.emit(
+                                                        EventType.RETRY_ATTEMPTED,
                                                         agent=agent,
+                                                        task_id=f"watchdog_{project_name}_issue_{issue_number}",
                                                         project=project_name,
-                                                        issue_number=issue_number,
-                                                        context={
+                                                        data={
+                                                            "decision_category": "watchdog_retry_triggered",
+                                                            "issue_number": issue_number,
                                                             "column": column,
                                                             "retry_count": execution['watchdog_retry_count'],
                                                             "previous_failure": execution.get('error', 'Unknown')

@@ -660,22 +660,50 @@ class ProjectMonitor:
         """
         # Check if this stage has specific input requirements
         if current_stage_config and hasattr(current_stage_config, 'inputs_from') and current_stage_config.inputs_from:
-            # Try to find associated discussion even if we're in issues workspace
+            # Determine expected workspace for the current pipeline
+            # Get pipeline config to check workspace type
+            pipeline_workspace = None
+            if project_name:
+                try:
+                    from config.manager import config_manager
+                    project_config = config_manager.get_project_config(project_name)
+                    if project_config:
+                        for pipeline_instance in project_config.pipelines:
+                            # Get the pipeline template to find stages and workspace
+                            pipeline_template = config_manager.get_pipeline_template(pipeline_instance.template)
+                            if pipeline_template and hasattr(pipeline_template, 'stages'):
+                                for stage in pipeline_template.stages:
+                                    if stage.stage == current_stage_config.stage:
+                                        pipeline_workspace = getattr(pipeline_template, 'workspace', 'discussions')
+                                        break
+                                if pipeline_workspace:
+                                    break
+                except Exception as e:
+                    logger.debug(f"Could not determine pipeline workspace: {e}")
+
+            # Default to discussions if we can't determine
+            if not pipeline_workspace:
+                pipeline_workspace = 'discussions'
+
+            # Only attempt discussion lookup if pipeline uses discussions workspace
+            # OR if we're explicitly crossing workspaces (has discussion_id already)
             actual_discussion_id = discussion_id
-            
-            if not actual_discussion_id and workspace_type == 'issues' and project_name:
-                # We're in issues workspace but need discussion context
+
+            if pipeline_workspace == 'discussions' and not actual_discussion_id and workspace_type == 'issues' and project_name:
+                # We're in issues workspace but pipeline expects discussions
                 # Look up the discussion associated with this issue's parent
+                logger.debug(f"Pipeline uses discussions workspace, looking for linked discussion for issue #{issue_number}")
                 try:
                     # For sub-issues, we need to find the parent issue's discussion
                     from config.state_manager import GitHubStateManager
                     state_manager = GitHubStateManager()
                     github_state = state_manager.load_project_state(project_name)
-                    
+
                     if github_state and github_state.issue_discussion_links:
                         # Try to get discussion for this issue
-                        actual_discussion_id = github_state.issue_discussion_links.get(issue_number)
-                        
+                        # Convert to string - YAML keys are strings even for numeric values
+                        actual_discussion_id = github_state.issue_discussion_links.get(str(issue_number))
+
                         if not actual_discussion_id:
                             # This might be a sub-issue, look for parent issue's discussion
                             # Get parent issue number from GitHub (sub-issues have trackedIn field)
@@ -689,13 +717,14 @@ class ProjectMonitor:
                                 )
                                 issue_data = json.loads(result.stdout)
                                 body = issue_data.get('body', '')
-                                
+
                                 # Look for "Part of #NNN" pattern in issue body
                                 import re
                                 parent_match = re.search(r'Part of #(\d+)', body)
                                 if parent_match:
                                     parent_issue_number = int(parent_match.group(1))
-                                    actual_discussion_id = github_state.issue_discussion_links.get(parent_issue_number)
+                                    # Convert to string - YAML keys are strings even for numeric values
+                                    actual_discussion_id = github_state.issue_discussion_links.get(str(parent_issue_number))
                                     if actual_discussion_id:
                                         logger.info(f"Found parent issue #{parent_issue_number} discussion for sub-issue #{issue_number}")
                                     else:
@@ -704,18 +733,22 @@ class ProjectMonitor:
                                     logger.debug(f"No 'Part of #NNN' pattern found in issue #{issue_number} body")
                             except Exception as e:
                                 logger.debug(f"Could not look up parent issue for #{issue_number}: {e}")
-                    
+
                     if actual_discussion_id:
                         logger.info(f"Found associated discussion {actual_discussion_id} for issue #{issue_number}")
                 except Exception as e:
                     logger.warning(f"Error looking up discussion for issue #{issue_number}: {e}")
-            
+
             # Use discussion-based approach for gathering specific agent outputs
             if actual_discussion_id:
-                logger.info(f"Gathering inputs from specific agents: {current_stage_config.inputs_from}")
+                logger.info(f"Gathering inputs from specific agents via discussion: {current_stage_config.inputs_from}")
                 return self._get_agent_outputs_from_discussion(actual_discussion_id, current_stage_config.inputs_from)
             else:
-                logger.warning(f"inputs_from specified but no discussion found for issue #{issue_number}")
+                # For issues workspace, this is expected behavior - use issue-based gathering
+                if pipeline_workspace == 'issues':
+                    logger.debug(f"inputs_from specified for issues-workspace pipeline, using issue-based gathering for #{issue_number}")
+                else:
+                    logger.warning(f"inputs_from specified but no discussion found for discussion-workspace pipeline (issue #{issue_number})")
                 
                 # Fallback 1: Check the current issue for agent outputs
                 logger.info(f"Checking current issue #{issue_number} for outputs from: {current_stage_config.inputs_from}")
@@ -774,7 +807,8 @@ class ProjectMonitor:
                             state_manager = GitHubStateManager()
                             github_state = state_manager.load_project_state(project_name)
                             if github_state and github_state.issue_discussion_links:
-                                parent_discussion_id = github_state.issue_discussion_links.get(parent_issue_number)
+                                # Convert to string - YAML keys are strings even for numeric values
+                                parent_discussion_id = github_state.issue_discussion_links.get(str(parent_issue_number))
                         except Exception as e:
                             logger.warning(f"Error looking up discussion for parent issue #{parent_issue_number}: {e}")
 

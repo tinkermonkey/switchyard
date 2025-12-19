@@ -198,6 +198,7 @@ services:
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN:-}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - MEDIC_SIGNATURE_RETENTION_DAYS=${MEDIC_SIGNATURE_RETENTION_DAYS:-7}
     depends_on:
       redis:
         condition: service_started
@@ -209,7 +210,36 @@ services:
     command: ["python", "-m", "services.medic.main"]
     restart: unless-stopped
 
-
+  fix-orchestrator:
+    build:
+      context: .
+      args:
+        DOCKER_GID: "${DOCKER_GID:-984}"
+    container_name: fix-orchestrator
+    volumes:
+      - ./:/app                                    # Orchestrator code
+      - ..:/workspace                              # Workspace root
+      - /var/run/docker.sock:/var/run/docker.sock  # Docker-in-Docker
+      - ~/.ssh/id_ed25519:/home/orchestrator/.ssh/id_ed25519:ro
+      - ~/.gitconfig:/home/orchestrator/.gitconfig
+      - ~/.orchestrator:/home/orchestrator/.orchestrator
+      - ./.claude-config:/home/orchestrator/.config/claude
+      - ./medic:/medic                             # Medic reports and fix plans
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - WORKSPACE_ROOT=/workspace/clauditoreum
+      - MEDIC_DIR=/medic
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+    depends_on:
+      - redis
+    restart: unless-stopped
+    networks:
+      - orchestrator-net
+    working_dir: /app
+    command: ["python", "-m", "services.fix_orchestrator.main"]
 
 
 

@@ -51,7 +51,7 @@ class GitHubProjectState:
     labels_created: List[str]
     last_sync: str
     sync_hash: str
-    issue_discussion_links: Optional[Dict[int, str]] = None  # issue_number -> discussion_id
+    issue_discussion_links: Optional[Dict[str, str]] = None  # issue_number (as string) -> discussion_id
     discussion_issue_links: Optional[Dict[str, int]] = None  # discussion_id -> issue_number
 
 
@@ -131,8 +131,9 @@ class GitHubStateManager:
             issue_discussion_links = {}
             discussion_issue_links = {}
             if 'issue_discussion_links' in data['github_state']:
+                # Keep string keys - YAML keys are strings even for numeric values
                 for issue_num_str, discussion_id in data['github_state']['issue_discussion_links'].items():
-                    issue_discussion_links[int(issue_num_str)] = discussion_id
+                    issue_discussion_links[issue_num_str] = discussion_id
             if 'discussion_issue_links' in data['github_state']:
                 for discussion_id, issue_num in data['github_state']['discussion_issue_links'].items():
                     discussion_issue_links[discussion_id] = int(issue_num)
@@ -178,10 +179,11 @@ class GitHubStateManager:
             boards_data[board_name] = board_dict
 
         # Convert issue/discussion links to serializable format
+        # Keys are already strings, no conversion needed
         issue_discussion_links = {}
         discussion_issue_links = {}
         if state.issue_discussion_links:
-            issue_discussion_links = {str(k): v for k, v in state.issue_discussion_links.items()}
+            issue_discussion_links = state.issue_discussion_links
         if state.discussion_issue_links:
             discussion_issue_links = state.discussion_issue_links
 
@@ -466,7 +468,8 @@ class GitHubStateManager:
         if state.discussion_issue_links is None:
             state.discussion_issue_links = {}
 
-        state.issue_discussion_links[issue_number] = discussion_id
+        # Use string keys to match YAML serialization format
+        state.issue_discussion_links[str(issue_number)] = discussion_id
         state.discussion_issue_links[discussion_id] = issue_number
 
         self.save_project_state(state)
@@ -478,7 +481,8 @@ class GitHubStateManager:
         if state is None or state.issue_discussion_links is None:
             return None
 
-        return state.issue_discussion_links.get(issue_number)
+        # Convert to string - YAML keys are strings even for numeric values
+        return state.issue_discussion_links.get(str(issue_number))
 
     def get_issue_for_discussion(self, project_name: str, discussion_id: str) -> Optional[int]:
         """Get issue number for a discussion"""
@@ -494,9 +498,10 @@ class GitHubStateManager:
         if state is None:
             return
 
-        if state.issue_discussion_links and issue_number in state.issue_discussion_links:
-            discussion_id = state.issue_discussion_links[issue_number]
-            del state.issue_discussion_links[issue_number]
+        # Convert to string - YAML keys are strings even for numeric values
+        if state.issue_discussion_links and str(issue_number) in state.issue_discussion_links:
+            discussion_id = state.issue_discussion_links[str(issue_number)]
+            del state.issue_discussion_links[str(issue_number)]
 
             if state.discussion_issue_links and discussion_id in state.discussion_issue_links:
                 del state.discussion_issue_links[discussion_id]

@@ -16,9 +16,10 @@ export default function FailureSignatureList() {
   const [sortBy, setSortBy] = useState('last_seen')
   const [sortOrder, setSortOrder] = useState('desc')
   const { medicEvents } = useSocket()
-  
+
   const [processingIds, setProcessingIds] = useState(new Set())
   const [modalConfig, setModalConfig] = useState({ show: false, title: '', message: '', isDangerous: false })
+  const [fixStatuses, setFixStatuses] = useState({})
   const lastProcessedEventRef = useRef(null)
 
   useEffect(() => {
@@ -103,11 +104,42 @@ export default function FailureSignatureList() {
       const sorted = sortSignatures(data.signatures || [], sortBy, sortOrder)
       setSignatures(sorted)
       setError(null)
+
+      // Fetch fix statuses for signatures with completed investigations
+      fetchFixStatuses(sorted)
     } catch (err) {
       setError(err.message)
     } finally {
       setLoading(false)
     }
+  }
+
+  const fetchFixStatuses = async (sigs) => {
+    // Only fetch fix status for signatures with completed investigations
+    const completedSigs = sigs.filter(s =>
+      s.investigation_status === 'diagnosed' || s.investigation_status === 'completed'
+    )
+
+    // Fetch fix status for each signature
+    const statusPromises = completedSigs.map(async (sig) => {
+      try {
+        const response = await fetch(`/api/medic/claude/fixes/${sig.fingerprint_id}/status`)
+        if (response.ok) {
+          const data = await response.json()
+          return { fingerprintId: sig.fingerprint_id, status: data.status || null }
+        }
+      } catch (err) {
+        console.error(`Error fetching fix status for ${sig.fingerprint_id}:`, err)
+      }
+      return { fingerprintId: sig.fingerprint_id, status: null }
+    })
+
+    const results = await Promise.all(statusPromises)
+    const statusMap = {}
+    results.forEach(r => {
+      if (r) statusMap[r.fingerprintId] = r.status
+    })
+    setFixStatuses(statusMap)
   }
 
   const sortSignatures = (sigs, by, order) => {
@@ -184,7 +216,8 @@ export default function FailureSignatureList() {
         const data = await response.json().catch(() => ({}))
         throw new Error(data.error || 'Failed to trigger fix')
       }
-      // Optimistic update not strictly needed as socket will update, but good for feedback
+      // Update fix status optimistically
+      setFixStatuses(prev => ({ ...prev, [fingerprintId]: 'queued' }))
     } catch (err) {
       setModalConfig({
         show: true,
@@ -251,6 +284,9 @@ export default function FailureSignatureList() {
               <option value="queued">Queued</option>
               <option value="in_progress">In Progress</option>
               <option value="completed">Completed</option>
+              <option value="diagnosed">Diagnosed</option>
+              <option value="failed">Failed</option>
+              <option value="ignored">Ignored</option>
             </select>
           </div>
 
@@ -303,6 +339,7 @@ export default function FailureSignatureList() {
               onTriggerInvestigation={triggerInvestigation}
               onTriggerFix={triggerFix}
               isProcessing={processingIds.has(sig.fingerprint_id)}
+              fixStatus={fixStatuses[sig.fingerprint_id]}
             />
           ))}
         </div>
@@ -322,7 +359,7 @@ export default function FailureSignatureList() {
   )
 }
 
-function FailureSignatureCard({ signature, onTriggerInvestigation, onTriggerFix, isProcessing }) {
+function FailureSignatureCard({ signature, onTriggerInvestigation, onTriggerFix, isProcessing, fixStatus }) {
   const getSeverityColor = (severity) => {
     switch (severity) {
       case 'CRITICAL': return 'text-red-500 bg-red-500/10 border-red-500/20'
@@ -417,17 +454,45 @@ function FailureSignatureCard({ signature, onTriggerInvestigation, onTriggerFix,
         )}
         
         {(signature.investigation_status === 'diagnosed' || signature.investigation_status === 'completed') && (
-          <button
-            onClick={(e) => {
-              e.preventDefault()
-              onTriggerFix(signature.fingerprint_id)
-            }}
-            disabled={isProcessing}
-            className={`ml-4 px-3 py-1.5 bg-green-600 text-white rounded text-xs hover:bg-green-700 transition-colors flex items-center gap-1 ${isProcessing ? 'opacity-50 cursor-not-allowed' : ''}`}
-          >
-            {isProcessing ? <Loader2 className="w-3 h-3 animate-spin" /> : <Wrench className="w-3 h-3" />}
-            Fix
-          </button>
+          <>
+            {fixStatus === 'queued' || fixStatus === 'starting' || fixStatus === 'in_progress' ? (
+              <span className="ml-4 px-3 py-1.5 bg-blue-500/10 text-blue-500 rounded text-xs flex items-center gap-1">
+                <Loader2 className="w-3 h-3 animate-spin" />
+                {fixStatus === 'queued' && 'Fix Queued'}
+                {fixStatus === 'starting' && 'Fix Starting'}
+                {fixStatus === 'in_progress' && 'Fix Running'}
+              </span>
+            ) : fixStatus === 'completed' ? (
+              <span className="ml-4 px-3 py-1.5 bg-green-500/10 text-green-500 rounded text-xs flex items-center gap-1">
+                <Wrench className="w-3 h-3" />
+                Fixed ✓
+              </span>
+            ) : fixStatus === 'failed' ? (
+              <button
+                onClick={(e) => {
+                  e.preventDefault()
+                  onTriggerFix(signature.fingerprint_id)
+                }}
+                disabled={isProcessing}
+                className={`ml-4 px-3 py-1.5 bg-orange-600 text-white rounded text-xs hover:bg-orange-700 transition-colors flex items-center gap-1 ${isProcessing ? 'opacity-50 cursor-not-allowed' : ''}`}
+              >
+                {isProcessing ? <Loader2 className="w-3 h-3 animate-spin" /> : <Wrench className="w-3 h-3" />}
+                Retry Fix
+              </button>
+            ) : (
+              <button
+                onClick={(e) => {
+                  e.preventDefault()
+                  onTriggerFix(signature.fingerprint_id)
+                }}
+                disabled={isProcessing}
+                className={`ml-4 px-3 py-1.5 bg-green-600 text-white rounded text-xs hover:bg-green-700 transition-colors flex items-center gap-1 ${isProcessing ? 'opacity-50 cursor-not-allowed' : ''}`}
+              >
+                {isProcessing ? <Loader2 className="w-3 h-3 animate-spin" /> : <Wrench className="w-3 h-3" />}
+                Fix
+              </button>
+            )}
+          </>
         )}
 
         {signature.investigation_status !== 'not_started' && signature.investigation_status !== 'failed' && signature.investigation_status !== 'diagnosed' && signature.investigation_status !== 'completed' && (

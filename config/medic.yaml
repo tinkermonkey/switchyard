@@ -7,6 +7,12 @@ medic:
     enabled: true
     interval_seconds: 60  # Check logs every minute (not currently used - streaming mode)
 
+    # Historical log scanning on startup
+    historical_scan:
+      enabled: true
+      lookback_hours: 24  # Scan last 24 hours of logs on startup
+      max_lookback_hours: 168  # Maximum 7 days (safety limit)
+
     # Container patterns to monitor
     containers:
       - "clauditoreum-orchestrator"

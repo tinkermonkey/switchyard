@@ -311,6 +311,48 @@ class ClaudeInvestigationQueue:
 
         return cleaned
 
+    def cleanup_orphaned_keys(self, fingerprint_ids: List[str]) -> int:
+        """
+        Remove Redis keys for deleted signatures.
+
+        This removes all investigation-related keys for signatures that have been
+        deleted from Elasticsearch due to inactivity.
+
+        Args:
+            fingerprint_ids: List of fingerprint IDs that were deleted
+
+        Returns:
+            Number of keys deleted
+        """
+        if not fingerprint_ids:
+            return 0
+
+        keys_deleted = 0
+
+        for fp_id in fingerprint_ids:
+            # Delete all investigation keys for this fingerprint
+            keys_to_delete = [
+                self._key(fp_id, "pid"),
+                self._key(fp_id, "status"),
+                self._key(fp_id, "lock"),
+                self._key(fp_id, "started_at"),
+                self._key(fp_id, "last_heartbeat"),
+                self._key(fp_id, "agent_output_lines"),
+                self._key(fp_id, "result"),
+                self._key(fp_id, "completed_at"),
+            ]
+
+            deleted = self.redis.delete(*keys_to_delete)
+            keys_deleted += deleted
+
+            # Remove from active set
+            self.redis.srem("medic:claude_investigation:active", fp_id)
+
+        if keys_deleted > 0:
+            logger.info(f"Cleaned up {keys_deleted} orphaned Redis keys for {len(fingerprint_ids)} deleted signatures")
+
+        return keys_deleted
+
 
 # Export
 __all__ = ['ClaudeInvestigationQueue']

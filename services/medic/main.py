@@ -1,13 +1,14 @@
 """
 Medic Unified Service
 
-Runs all Medic-related services in a single container:
+Runs all Medic-related monitoring services in a single container:
 - Docker Log Monitor
 - Claude Failure Monitor
 - Investigation Orchestrator (Standard)
 - Claude Investigation Orchestrator
-- Claude Fix Orchestrator
 - Claude Signature Curator
+
+Note: Claude Fix Orchestrator runs as a separate service (fix-orchestrator).
 """
 
 import asyncio
@@ -29,7 +30,6 @@ from services.medic.failure_signature_store import FailureSignatureStore
 from services.medic.claude_failure_monitor import ClaudeFailureMonitor
 from services.medic.investigation_orchestrator import InvestigationOrchestrator
 from services.medic.claude_investigation_orchestrator import ClaudeInvestigationOrchestrator
-from services.medic.claude_fix_orchestrator import ClaudeFixOrchestrator
 from services.medic.claude_signature_curator import ClaudeSignatureCurator
 
 # Configure logging
@@ -89,9 +89,9 @@ async def main():
     if docker_client:
         fingerprint_engine = FingerprintEngine()
         failure_store = FailureSignatureStore(es_client)
-        docker_monitor = DockerLogMonitor(docker_client, fingerprint_engine, failure_store)
+        docker_monitor = DockerLogMonitor(docker_client, fingerprint_engine, failure_store, redis_client)
         tasks.append(asyncio.create_task(docker_monitor.start_monitoring(), name="DockerLogMonitor"))
-        logger.info("Initialized DockerLogMonitor")
+        logger.info("Initialized DockerLogMonitor with historical scan support")
 
     # 2. Claude Failure Monitor
     claude_failure_monitor = ClaudeFailureMonitor(
@@ -112,6 +112,12 @@ async def main():
     tasks.append(asyncio.create_task(investigation_orchestrator.start(), name="InvestigationOrchestrator"))
     logger.info("Initialized InvestigationOrchestrator")
 
+    # Create background tasks for Investigation Orchestrator at top level (FIX for event loop issue)
+    tasks.append(asyncio.create_task(investigation_orchestrator.queue_processor(), name="InvestigationQueueProcessor"))
+    tasks.append(asyncio.create_task(investigation_orchestrator.heartbeat_monitor(), name="InvestigationHeartbeatMonitor"))
+    tasks.append(asyncio.create_task(investigation_orchestrator.auto_trigger_checker(), name="InvestigationAutoTrigger"))
+    logger.info("Started Investigation Orchestrator background tasks")
+
     # 4. Claude Investigation Orchestrator
     claude_investigation_orchestrator = ClaudeInvestigationOrchestrator(
         redis_client=redis_client,
@@ -122,13 +128,13 @@ async def main():
     tasks.append(asyncio.create_task(claude_investigation_orchestrator.start(), name="ClaudeInvestigationOrchestrator"))
     logger.info("Initialized ClaudeInvestigationOrchestrator")
 
-    # 5. Claude Fix Orchestrator
-    # Note: It initializes its own clients, which is fine.
-    claude_fix_orchestrator = ClaudeFixOrchestrator()
-    tasks.append(asyncio.create_task(claude_fix_orchestrator.start(), name="ClaudeFixOrchestrator"))
-    logger.info("Initialized ClaudeFixOrchestrator")
+    # Create background tasks for Claude Investigation Orchestrator at top level (FIX for event loop issue)
+    tasks.append(asyncio.create_task(claude_investigation_orchestrator.queue_processor(), name="ClaudeInvestigationQueueProcessor"))
+    tasks.append(asyncio.create_task(claude_investigation_orchestrator.heartbeat_monitor(), name="ClaudeInvestigationHeartbeatMonitor"))
+    tasks.append(asyncio.create_task(claude_investigation_orchestrator.auto_trigger_checker(), name="ClaudeInvestigationAutoTrigger"))
+    logger.info("Started Claude Investigation Orchestrator background tasks")
 
-    # 6. Claude Signature Curator
+    # 5. Claude Signature Curator
     # Note: It initializes its own clients.
     claude_signature_curator = ClaudeSignatureCurator()
     tasks.append(asyncio.create_task(claude_signature_curator.start(), name="ClaudeSignatureCurator"))
@@ -137,11 +143,15 @@ async def main():
     # --- Run All ---
     logger.info(f"Running {len(tasks)} services concurrently...")
     try:
-        await asyncio.gather(*tasks)
+        await asyncio.gather(*tasks, return_exceptions=False)
     except asyncio.CancelledError:
         logger.info("Medic Unified Service stopping...")
     except Exception as e:
         logger.error(f"Medic Unified Service failed: {e}", exc_info=True)
+        # Log which task failed
+        for i, task in enumerate(tasks):
+            if task.done() and task.exception():
+                logger.error(f"Task {i} ({task.get_name()}) failed: {task.exception()}")
 
 if __name__ == "__main__":
     try:

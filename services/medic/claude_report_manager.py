@@ -301,6 +301,33 @@ class ClaudeReportManager:
 
         return deleted
 
+    def cleanup_investigation_reports(self, fingerprint_ids: List[str]) -> int:
+        """
+        Delete investigation report directories for specific fingerprint IDs.
+
+        This is used to clean up reports for signatures that have been deleted
+        from Elasticsearch due to inactivity.
+
+        Args:
+            fingerprint_ids: List of fingerprint IDs to delete
+
+        Returns:
+            Number of directories deleted
+        """
+        if not fingerprint_ids:
+            return 0
+
+        deleted_count = 0
+
+        for fp_id in fingerprint_ids:
+            if self.delete_investigation(fp_id):
+                deleted_count += 1
+
+        if deleted_count > 0:
+            logger.info(f"Cleaned up {deleted_count} investigation report directories")
+
+        return deleted_count
+
 
 # Export
 __all__ = ['ClaudeReportManager']
