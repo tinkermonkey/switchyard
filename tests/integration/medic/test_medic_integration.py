@@ -11,7 +11,7 @@ from datetime import datetime
 
 from services.medic.docker_log_monitor import DockerLogMonitor
 from services.medic.fingerprint_engine import FingerprintEngine
-from services.medic.failure_signature_store import FailureSignatureStore
+from services.medic.docker import DockerDockerFailureSignatureStore
 
 
 @pytest.fixture
@@ -65,7 +65,7 @@ def fingerprint_engine():
 @pytest.fixture
 def failure_store(mock_es_client):
     """Create failure store with mocked ES"""
-    return FailureSignatureStore(mock_es_client)
+    return DockerFailureSignatureStore(mock_es_client)
 
 
 @pytest.fixture

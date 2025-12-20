@@ -48,19 +48,19 @@ _medic_queue = None
 _medic_report_manager = None
 
 def get_investigation_queue():
-    """Lazy initialization of investigation queue"""
+    """Lazy initialization of Docker investigation queue"""
     global _medic_queue
     if _medic_queue is None:
-        from services.medic.investigation_queue import InvestigationQueue
-        _medic_queue = InvestigationQueue(redis_client_raw)
+        from services.medic.docker import DockerInvestigationQueue
+        _medic_queue = DockerInvestigationQueue(redis_client_raw)
     return _medic_queue
 
 def get_report_manager():
-    """Lazy initialization of report manager"""
+    """Lazy initialization of Docker report manager"""
     global _medic_report_manager
     if _medic_report_manager is None:
-        from services.medic.report_manager import ReportManager
-        _medic_report_manager = ReportManager()
+        from services.medic.docker import DockerReportManager
+        _medic_report_manager = DockerReportManager()
     return _medic_report_manager
 
 # Track connected clients
@@ -3090,7 +3090,12 @@ def redis_subscriber_thread():
 @app.route('/api/medic/failure-signatures', methods=['GET'])
 def get_failure_signatures():
     """
-    Get all failure signatures with filtering and pagination.
+    Get Docker failure signatures with filtering and pagination.
+
+    BACKWARD COMPATIBILITY: This endpoint is maintained for backward compatibility.
+    - Returns Docker container failure signatures from medic-docker-failures-* indices
+    - For new code, use /api/medic/docker/failure-signatures (explicit)
+    - For unified view (Docker + Claude), use /api/medic/failure-signatures/all
 
     Query params:
     - status: Filter by status (new, recurring, trending, resolved, ignored)
@@ -3146,8 +3151,8 @@ def get_failure_signatures():
                 "sort": [{"last_seen": {"order": "desc"}}]
             }
 
-        # Execute search
-        result = es_client.search(index="medic-failure-signatures-*", body=query)
+        # Execute search (use new index pattern)
+        result = es_client.search(index="medic-docker-failures-*", body=query)
 
         signatures = [hit['_source'] for hit in result['hits']['hits']]
 
@@ -3174,7 +3179,7 @@ def get_failure_signature(fingerprint_id):
     """Get detailed information about a specific failure signature"""
     try:
         result = es_client.search(
-            index="medic-failure-signatures-*",
+            index="medic-docker-failures-*",
             body={
                 "query": {
                     "term": {"fingerprint_id": fingerprint_id}
@@ -3202,7 +3207,7 @@ def delete_failure_signature(fingerprint_id):
     try:
         # 1. Delete from Elasticsearch
         result = es_client.delete_by_query(
-            index="medic-failure-signatures-*",
+            index="medic-docker-failures-*",
             body={
                 "query": {
                     "term": {"fingerprint_id": fingerprint_id}
@@ -3242,21 +3247,21 @@ def get_signature_occurrences(fingerprint_id):
     - limit: Max results (default 100)
     """
     try:
-        # Get signature with sample log entries
+        # Get signature with sample entries
         result = es_client.search(
-            index="medic-failure-signatures-*",
+            index="medic-docker-failures-*",
             body={
                 "query": {
                     "term": {"fingerprint_id": fingerprint_id}
                 },
-                "_source": ["sample_log_entries", "fingerprint_id"]
+                "_source": ["sample_entries", "fingerprint_id"]
             }
         )
 
         if result['hits']['total']['value'] == 0:
             return jsonify({'error': 'Signature not found'}), 404
 
-        occurrences = result['hits']['hits'][0]['_source'].get('sample_log_entries', [])
+        occurrences = result['hits']['hits'][0]['_source'].get('sample_entries', [])
 
         # Apply date filters
         from_date = request.args.get('from_date')
@@ -3311,7 +3316,7 @@ def update_signature_status(fingerprint_id):
         from monitoring.timestamp_utils import utc_isoformat
 
         result = es_client.update_by_query(
-            index="medic-failure-signatures-*",
+            index="medic-docker-failures-*",
             body={
                 "script": {
                     "source": "ctx._source.status = params.status; ctx._source.updated_at = params.updated_at;",
@@ -3345,7 +3350,7 @@ def get_medic_stats():
     """Get overall Medic statistics"""
     try:
         result = es_client.search(
-            index="medic-failure-signatures-*",
+            index="medic-docker-failures-*",
             body={
                 "size": 0,
                 "aggs": {
@@ -3389,6 +3394,112 @@ def get_medic_stats():
             'total_occurrences': 0,
             'occurrences_last_hour': 0,
             'occurrences_last_day': 0
+        }), 200
+
+
+# ========================================
+# New Unified Medic API Endpoints (v2.0)
+# ========================================
+
+@app.route('/api/medic/docker/failure-signatures', methods=['GET'])
+def get_docker_failure_signatures():
+    """
+    Get Docker failure signatures (explicit endpoint for new architecture).
+
+    This is an alias for /api/medic/failure-signatures but makes it clear
+    that it returns Docker container failure data.
+
+    Query params: Same as /api/medic/failure-signatures
+    """
+    # Reuse the existing implementation
+    return get_failure_signatures()
+
+
+@app.route('/api/medic/docker/failure-signatures/<fingerprint_id>', methods=['GET'])
+def get_docker_failure_signature(fingerprint_id):
+    """Get detailed Docker failure signature (explicit endpoint)."""
+    return get_failure_signature(fingerprint_id)
+
+
+@app.route('/api/medic/failure-signatures/all', methods=['GET'])
+def get_all_failure_signatures():
+    """
+    Get failure signatures from both Docker and Claude systems (unified view).
+
+    Query params:
+    - type: Filter by type (docker, claude, or omit for all)
+    - status: Filter by status
+    - severity: Filter by severity
+    - project: Filter by project (for Claude failures)
+    - limit: Max results (default 50)
+    - offset: Pagination offset (default 0)
+    """
+    try:
+        type_filter = request.args.get('type', 'all')
+        limit = int(request.args.get('limit', 50))
+        offset = int(request.args.get('offset', 0))
+
+        # Build base query filters
+        must_clauses = []
+
+        # Status filter
+        if request.args.get('status'):
+            must_clauses.append({"term": {"status": request.args['status']}})
+
+        # Severity filter
+        if request.args.get('severity'):
+            must_clauses.append({"term": {"severity": request.args['severity']}})
+
+        # Project filter (for Claude failures)
+        if request.args.get('project'):
+            must_clauses.append({"term": {"project": request.args['project']}})
+
+        # Determine which indices to query
+        if type_filter == 'docker':
+            indices = "medic-docker-failures-*"
+        elif type_filter == 'claude':
+            indices = "medic-claude-failures-*"
+        else:
+            # Query both
+            indices = "medic-docker-failures-*,medic-claude-failures-*"
+
+        # Build query
+        if must_clauses:
+            query = {
+                "query": {"bool": {"must": must_clauses}},
+                "size": limit,
+                "from": offset,
+                "sort": [{"last_seen": {"order": "desc"}}]
+            }
+        else:
+            query = {
+                "query": {"match_all": {}},
+                "size": limit,
+                "from": offset,
+                "sort": [{"last_seen": {"order": "desc"}}]
+            }
+
+        # Execute search
+        result = es_client.search(index=indices, body=query)
+
+        signatures = [hit['_source'] for hit in result['hits']['hits']]
+
+        return jsonify({
+            'signatures': signatures,
+            'total': result['hits']['total']['value'],
+            'limit': limit,
+            'offset': offset,
+            'type_filter': type_filter
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Failed to get all failure signatures: {e}", exc_info=True)
+        return jsonify({
+            'signatures': [],
+            'total': 0,
+            'limit': limit,
+            'offset': offset,
+            'error': str(e)
         }), 200
 
 
@@ -3437,8 +3548,8 @@ def start_investigation(fingerprint_id):
 
         if enqueued:
             # Update ES investigation status
-            from services.medic.failure_signature_store import FailureSignatureStore
-            store = FailureSignatureStore(es_client)
+            from services.medic.docker import DockerFailureSignatureStore
+            store = DockerFailureSignatureStore(es_client)
             import asyncio
             asyncio.run(store.update_investigation_status(fingerprint_id, "queued"))
 
@@ -3931,7 +4042,7 @@ def get_claude_investigations():
     - offset: Pagination offset (default 0)
     """
     try:
-        from services.medic.claude_report_manager import ClaudeReportManager
+        from services.medic.claude import ClaudeReportManager
 
         report_manager = ClaudeReportManager()
         all_investigations = report_manager.list_all_investigations()
@@ -3996,8 +4107,8 @@ def trigger_claude_investigation(fingerprint_id):
             decode_responses=True
         )
 
-        from services.medic.claude_investigation_queue import ClaudeInvestigationQueue
-        from services.medic.claude_failure_signature_store import ClaudeFailureSignatureStore
+        from services.medic.claude import ClaudeInvestigationQueue
+        from services.medic.claude import ClaudeFailureSignatureStore
 
         queue = ClaudeInvestigationQueue(redis_client)
 
@@ -4035,8 +4146,8 @@ def get_claude_investigation_status(fingerprint_id):
             decode_responses=True
         )
 
-        from services.medic.claude_investigation_queue import ClaudeInvestigationQueue
-        from services.medic.claude_report_manager import ClaudeReportManager
+        from services.medic.claude import ClaudeInvestigationQueue
+        from services.medic.claude import ClaudeReportManager
 
         queue = ClaudeInvestigationQueue(redis_client)
         report_manager = ClaudeReportManager()
@@ -4075,7 +4186,7 @@ def get_claude_investigation_status(fingerprint_id):
 def get_claude_diagnosis(fingerprint_id):
     """Get diagnosis.md content"""
     try:
-        from services.medic.claude_report_manager import ClaudeReportManager
+        from services.medic.claude import ClaudeReportManager
 
         report_manager = ClaudeReportManager()
         diagnosis = report_manager.read_diagnosis(fingerprint_id)
@@ -4097,7 +4208,7 @@ def get_claude_diagnosis(fingerprint_id):
 def get_claude_fix_plan(fingerprint_id):
     """Get fix_plan.md content"""
     try:
-        from services.medic.claude_report_manager import ClaudeReportManager
+        from services.medic.claude import ClaudeReportManager
 
         report_manager = ClaudeReportManager()
         fix_plan = report_manager.read_fix_plan(fingerprint_id)
@@ -4119,7 +4230,7 @@ def get_claude_fix_plan(fingerprint_id):
 def get_claude_recommendations(fingerprint_id):
     """Get recommendations (alias for fix_plan.md)"""
     try:
-        from services.medic.claude_report_manager import ClaudeReportManager
+        from services.medic.claude import ClaudeReportManager
 
         report_manager = ClaudeReportManager()
         recommendations = report_manager.read_fix_plan(fingerprint_id)
@@ -4153,7 +4264,7 @@ def get_claude_recommendations(fingerprint_id):
 def get_claude_ignored(fingerprint_id):
     """Get ignored.md content"""
     try:
-        from services.medic.claude_report_manager import ClaudeReportManager
+        from services.medic.claude import ClaudeReportManager
 
         report_manager = ClaudeReportManager()
         ignored = report_manager.read_ignored(fingerprint_id)
@@ -4175,7 +4286,7 @@ def get_claude_ignored(fingerprint_id):
 def get_claude_investigation_log(fingerprint_id):
     """Get investigation log (agent output)"""
     try:
-        from services.medic.claude_report_manager import ClaudeReportManager
+        from services.medic.claude import ClaudeReportManager
 
         report_manager = ClaudeReportManager()
 
@@ -4274,20 +4385,20 @@ def trigger_claude_fix(fingerprint_id):
     """
     try:
         from services.fix_orchestrator.fix_execution_queue import ClaudeFixExecutionQueue
-        from services.medic.claude_report_manager import ClaudeReportManager
-        from services.medic.report_manager import ReportManager
+        from services.medic.claude import ClaudeReportManager
+        from services.medic.docker import DockerReportManager
         import redis
-        
+
         # Check if fix plan exists in Claude reports
         claude_report_manager = ClaudeReportManager()
         fix_plan = claude_report_manager.read_fix_plan(fingerprint_id)
-        
+
         report_manager = claude_report_manager
         is_claude_report = True
-        
+
         if not fix_plan:
-            # Check standard reports
-            std_report_manager = ReportManager()
+            # Check Docker reports
+            std_report_manager = DockerReportManager()
             fix_plan = std_report_manager.read_fix_plan(fingerprint_id)
             if fix_plan:
                 report_manager = std_report_manager
@@ -4484,6 +4595,58 @@ def get_fix_status(fingerprint_id):
         return jsonify({"error": str(e)}), 500
 
 
+@app.route('/api/medic/investigations/active', methods=['GET'])
+def get_active_investigations():
+    """Get all queued and in-progress investigations."""
+    try:
+        import redis
+        redis_client = redis.Redis(
+            host=os.getenv('REDIS_HOST', 'redis'),
+            port=int(os.getenv('REDIS_PORT', 6379)),
+            decode_responses=True
+        )
+
+        # Get queued Docker investigations
+        queued = redis_client.lrange("medic:docker_investigation:queue", 0, -1)
+
+        # Get active Docker investigations
+        active_fps = redis_client.smembers("medic:docker_investigation:active")
+
+        # Get details for each
+        investigations = []
+
+        # Add queued
+        for fp_id in queued:
+            status_key = f"medic:docker_investigation:{fp_id}:status"
+            started_key = f"medic:docker_investigation:{fp_id}:started_at"
+
+            investigations.append({
+                "fingerprint_id": fp_id,
+                "status": "queued",
+                "started_at": None
+            })
+
+        # Add active
+        for fp_id in active_fps:
+            status_key = f"medic:docker_investigation:{fp_id}:status"
+            started_key = f"medic:docker_investigation:{fp_id}:started_at"
+
+            status = redis_client.get(status_key) or "in_progress"
+            started_at = redis_client.get(started_key)
+
+            investigations.append({
+                "fingerprint_id": fp_id,
+                "status": status,
+                "started_at": started_at
+            })
+
+        redis_client.close()
+        return jsonify(investigations), 200
+    except Exception as e:
+        logger.error(f"Failed to get active investigations: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route('/fix-orchestrator/kill/<fingerprint_id>', methods=['POST'])
 def kill_fix(fingerprint_id):
     """Force-kill a running fix execution."""
@@ -4601,7 +4764,7 @@ def run_claude_advisor(project):
         def run_advisor_bg():
             try:
                 import asyncio
-                from services.medic.claude_advisor_orchestrator import ClaudeAdvisorOrchestrator
+                from services.medic.claude import ClaudeAdvisorOrchestrator
                 
                 orchestrator = ClaudeAdvisorOrchestrator()
                 asyncio.run(orchestrator.run_for_project(project))

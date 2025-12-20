@@ -14,11 +14,11 @@ from pathlib import Path
 from unittest.mock import Mock, patch, AsyncMock, MagicMock
 from datetime import datetime, timezone
 
-from services.medic.report_manager import ReportManager
-from services.medic.investigation_queue import InvestigationQueue
+from services.medic.docker import DockerDockerReportManager
+from services.medic.docker import DockerDockerInvestigationQueue
 from services.medic.investigation_agent_runner import InvestigationAgentRunner
-from services.medic.investigation_recovery import InvestigationRecovery
-from services.medic.investigation_orchestrator import InvestigationOrchestrator
+
+from services.medic.docker import DockerInvestigationOrchestrator
 from monitoring.observability import ObservabilityManager
 
 
@@ -172,8 +172,8 @@ class TestInvestigationWorkflowIntegration:
         mock_run_claude.return_value = "Investigation completed successfully"
 
         # Create components
-        report_manager = ReportManager(base_dir=temp_medic_dir)
-        queue = InvestigationQueue(mock_redis)
+        report_manager = DockerReportManager(base_dir=temp_medic_dir)
+        queue = DockerInvestigationQueue(mock_redis)
         agent_runner = InvestigationAgentRunner(temp_workspace)
 
         fingerprint_id = "sha256:test123"
@@ -269,7 +269,7 @@ Fix the simulated error by updating the test.
 
         # Launch investigation
         agent_runner = InvestigationAgentRunner(temp_workspace)
-        report_manager = ReportManager(base_dir=temp_medic_dir)
+        report_manager = DockerReportManager(base_dir=temp_medic_dir)
 
         fingerprint_id = "sha256:test456"
         context_file = str(Path(temp_medic_dir) / fingerprint_id / "context.json")
@@ -316,7 +316,7 @@ Fix the simulated error by updating the test.
         mock_run_claude.side_effect = Exception("Claude Code execution failed")
 
         agent_runner = InvestigationAgentRunner(temp_workspace)
-        report_manager = ReportManager(base_dir=temp_medic_dir)
+        report_manager = DockerReportManager(base_dir=temp_medic_dir)
 
         fingerprint_id = "sha256:test_failure"
         context_file = str(Path(temp_medic_dir) / fingerprint_id / "context.json")
@@ -358,7 +358,7 @@ Fix the simulated error by updating the test.
         mock_run_claude.side_effect = mock_slow_investigation
 
         agent_runner = InvestigationAgentRunner(temp_workspace)
-        report_manager = ReportManager(base_dir=temp_medic_dir)
+        report_manager = DockerReportManager(base_dir=temp_medic_dir)
 
         # Launch 3 concurrent investigations
         investigations = []
@@ -414,7 +414,7 @@ class TestRecoveryAndCancellation:
         mock_run_claude.side_effect = mock_long_investigation
 
         agent_runner = InvestigationAgentRunner(temp_workspace)
-        report_manager = ReportManager(base_dir=temp_medic_dir)
+        report_manager = DockerReportManager(base_dir=temp_medic_dir)
 
         fingerprint_id = "sha256:test_cancel"
         context_file = str(Path(temp_medic_dir) / fingerprint_id / "context.json")
@@ -450,8 +450,8 @@ class TestRecoveryAndCancellation:
     ):
         """Test recovery detects existing reports and marks investigation complete"""
 
-        report_manager = ReportManager(base_dir=temp_medic_dir)
-        queue = InvestigationQueue(mock_redis)
+        report_manager = DockerReportManager(base_dir=temp_medic_dir)
+        queue = DockerInvestigationQueue(mock_redis)
         agent_runner = InvestigationAgentRunner(temp_workspace)
         recovery = InvestigationRecovery(
             queue, agent_runner, report_manager
@@ -475,7 +475,7 @@ class TestRecoveryAndCancellation:
 
         # Should mark as completed
         status = queue.get_status(fingerprint_id)
-        assert status == InvestigationQueue.STATUS_COMPLETED or status is None
+        assert status == DockerInvestigationQueue.STATUS_COMPLETED or status is None
 
     @pytest.mark.asyncio
     async def test_recovery_with_no_reports_recent_start(
@@ -488,8 +488,8 @@ class TestRecoveryAndCancellation:
     ):
         """Test recovery waits for recent investigations with no reports"""
 
-        report_manager = ReportManager(base_dir=temp_medic_dir)
-        queue = InvestigationQueue(mock_redis)
+        report_manager = DockerReportManager(base_dir=temp_medic_dir)
+        queue = DockerInvestigationQueue(mock_redis)
         agent_runner = InvestigationAgentRunner(temp_workspace)
         recovery = InvestigationRecovery(
             queue, agent_runner, report_manager
@@ -509,7 +509,7 @@ class TestRecoveryAndCancellation:
 
         # Should keep waiting (status remains in_progress)
         status = queue.get_status(fingerprint_id)
-        assert status == InvestigationQueue.STATUS_IN_PROGRESS
+        assert status == DockerInvestigationQueue.STATUS_IN_PROGRESS
 
 
 class TestObservabilityIntegration:
@@ -529,7 +529,7 @@ class TestObservabilityIntegration:
         mock_run_claude.return_value = "Investigation completed"
 
         agent_runner = InvestigationAgentRunner(temp_workspace)
-        report_manager = ReportManager(base_dir=temp_medic_dir)
+        report_manager = DockerReportManager(base_dir=temp_medic_dir)
 
         fingerprint_id = "sha256:test_obs"
         context_file = str(Path(temp_medic_dir) / fingerprint_id / "context.json")
@@ -577,7 +577,7 @@ class TestObservabilityIntegration:
         mock_run_claude.side_effect = mock_with_streaming
 
         agent_runner = InvestigationAgentRunner(temp_workspace)
-        report_manager = ReportManager(base_dir=temp_medic_dir)
+        report_manager = DockerReportManager(base_dir=temp_medic_dir)
 
         fingerprint_id = "sha256:test_stream"
         context_file = str(Path(temp_medic_dir) / fingerprint_id / "context.json")

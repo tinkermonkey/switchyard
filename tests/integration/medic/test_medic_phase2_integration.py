@@ -13,11 +13,11 @@ from pathlib import Path
 from unittest.mock import Mock, patch, AsyncMock
 from datetime import datetime, timezone
 
-from services.medic.report_manager import ReportManager
-from services.medic.investigation_queue import InvestigationQueue
+from services.medic.docker import DockerDockerReportManager
+from services.medic.docker import DockerDockerInvestigationQueue
 from services.medic.investigation_agent_runner import InvestigationAgentRunner
-from services.medic.investigation_recovery import InvestigationRecovery
-from services.medic.investigation_orchestrator import InvestigationOrchestrator
+
+from services.medic.docker import DockerDockerInvestigationOrchestrator
 
 
 @pytest.fixture
@@ -114,13 +114,13 @@ def mock_redis():
 @pytest.fixture
 def report_manager(temp_medic_dir):
     """Create report manager"""
-    return ReportManager(temp_medic_dir)
+    return DockerReportManager(temp_medic_dir)
 
 
 @pytest.fixture
 def investigation_queue(mock_redis):
     """Create investigation queue"""
-    return InvestigationQueue(mock_redis)
+    return DockerInvestigationQueue(mock_redis)
 
 
 @pytest.fixture
@@ -243,7 +243,7 @@ class TestQueueWorkflow:
 
         # Check status
         status = investigation_queue.get_status(sample_fingerprint_id)
-        assert status == InvestigationQueue.STATUS_QUEUED
+        assert status == DockerInvestigationQueue.STATUS_QUEUED
 
         # Acquire lock
         locked = investigation_queue.acquire_lock(sample_fingerprint_id)
@@ -259,18 +259,18 @@ class TestQueueWorkflow:
 
         # Get info
         info = investigation_queue.get_investigation_info(sample_fingerprint_id)
-        assert info["status"] == InvestigationQueue.STATUS_IN_PROGRESS
+        assert info["status"] == DockerInvestigationQueue.STATUS_IN_PROGRESS
         assert info["pid"] == 12345
         assert info["output_lines"] == 100
 
         # Mark completed
         investigation_queue.mark_completed(
-            sample_fingerprint_id, InvestigationQueue.RESULT_SUCCESS
+            sample_fingerprint_id, DockerInvestigationQueue.RESULT_SUCCESS
         )
 
         # Verify completion
         status = investigation_queue.get_status(sample_fingerprint_id)
-        assert status == InvestigationQueue.STATUS_COMPLETED
+        assert status == DockerInvestigationQueue.STATUS_COMPLETED
 
 
 class TestRecoveryWorkflow:
@@ -301,7 +301,7 @@ class TestRecoveryWorkflow:
         # Should mark as completed
         assert result == "completed"
         status = investigation_queue.get_status(sample_fingerprint_id)
-        assert status == InvestigationQueue.STATUS_COMPLETED
+        assert status == DockerInvestigationQueue.STATUS_COMPLETED
 
 
 class TestEndToEndWorkflow:
@@ -319,7 +319,7 @@ class TestEndToEndWorkflow:
 
         # 2. Verify queued
         status = investigation_queue.get_status(sample_fingerprint_id)
-        assert status == InvestigationQueue.STATUS_QUEUED
+        assert status == DockerInvestigationQueue.STATUS_QUEUED
 
         # 3. Acquire lock and start
         locked = investigation_queue.acquire_lock(sample_fingerprint_id)
@@ -336,7 +336,7 @@ class TestEndToEndWorkflow:
         investigation_queue.set_pid(sample_fingerprint_id, 12345)
 
         status = investigation_queue.get_status(sample_fingerprint_id)
-        assert status == InvestigationQueue.STATUS_IN_PROGRESS
+        assert status == DockerInvestigationQueue.STATUS_IN_PROGRESS
 
         # 4. Simulate agent creating reports
         report_dir = report_manager.get_report_dir(sample_fingerprint_id)
@@ -354,12 +354,12 @@ class TestEndToEndWorkflow:
 
         # 5. Mark completed
         investigation_queue.mark_completed(
-            sample_fingerprint_id, InvestigationQueue.RESULT_SUCCESS
+            sample_fingerprint_id, DockerInvestigationQueue.RESULT_SUCCESS
         )
 
         # 6. Verify completion
         status = investigation_queue.get_status(sample_fingerprint_id)
-        assert status == InvestigationQueue.STATUS_COMPLETED
+        assert status == DockerInvestigationQueue.STATUS_COMPLETED
 
         # 7. Verify reports exist
         assert report_manager.read_diagnosis(sample_fingerprint_id) is not None
@@ -388,7 +388,7 @@ class TestMultipleInvestigations:
         # All should be queued
         for fp_id in fingerprints:
             status = investigation_queue.get_status(fp_id)
-            assert status == InvestigationQueue.STATUS_QUEUED
+            assert status == DockerInvestigationQueue.STATUS_QUEUED
 
     def test_concurrent_lock_acquisition(
         self, investigation_queue
@@ -422,16 +422,16 @@ class TestFailureScenarios:
         # Mark as failed
         investigation_queue.mark_completed(
             sample_fingerprint_id,
-            InvestigationQueue.RESULT_FAILED,
+            DockerInvestigationQueue.RESULT_FAILED,
             error_message="Process crashed"
         )
 
         # Verify status - RESULT_FAILED sets STATUS_FAILED
         status = investigation_queue.get_status(sample_fingerprint_id)
-        assert status == InvestigationQueue.STATUS_FAILED
+        assert status == DockerInvestigationQueue.STATUS_FAILED
 
         info = investigation_queue.get_investigation_info(sample_fingerprint_id)
-        assert info.get("result") == InvestigationQueue.RESULT_FAILED
+        assert info.get("result") == DockerInvestigationQueue.RESULT_FAILED
 
     def test_lock_contention(self, investigation_queue, sample_fingerprint_id):
         """Test lock contention between processes"""
@@ -465,7 +465,7 @@ class TestCleanup:
 
         # Mark as completed
         investigation_queue.enqueue(sample_fingerprint_id)
-        investigation_queue.mark_completed(sample_fingerprint_id, InvestigationQueue.RESULT_SUCCESS)
+        investigation_queue.mark_completed(sample_fingerprint_id, DockerInvestigationQueue.RESULT_SUCCESS)
 
         # Cleanup
         investigation_queue.cleanup_investigation(sample_fingerprint_id)

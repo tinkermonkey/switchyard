@@ -13,11 +13,11 @@ from pathlib import Path
 from unittest.mock import Mock, patch, AsyncMock
 from datetime import datetime, timezone, timedelta
 
-from services.medic.report_manager import ReportManager
-from services.medic.investigation_queue import InvestigationQueue
+from services.medic.docker import DockerDockerReportManager
+
 from services.medic.investigation_agent_runner import InvestigationAgentRunner
-from services.medic.investigation_recovery import InvestigationRecovery
-from services.medic.investigation_orchestrator import InvestigationOrchestrator
+
+from services.medic.docker import DockerDockerInvestigationOrchestrator
 from monitoring.observability import EventType
 
 
@@ -158,7 +158,7 @@ class TestStartupRecovery:
     ):
         """Recovery Path 1: Process exists → continue monitoring"""
 
-        report_manager = ReportManager(base_dir=temp_medic_dir)
+        report_manager = DockerReportManager(base_dir=temp_medic_dir)
         queue = InvestigationQueue(mock_redis)
         agent_runner = InvestigationAgentRunner(temp_workspace)
         recovery = InvestigationRecovery(
@@ -194,7 +194,7 @@ class TestStartupRecovery:
     ):
         """Recovery Path 2: Process missing + reports exist → mark completed"""
 
-        report_manager = ReportManager(base_dir=temp_medic_dir)
+        report_manager = DockerReportManager(base_dir=temp_medic_dir)
         queue = InvestigationQueue(mock_redis)
         agent_runner = InvestigationAgentRunner(temp_workspace)
         recovery = InvestigationRecovery(
@@ -234,7 +234,7 @@ class TestStartupRecovery:
     ):
         """Recovery Path 3: Process missing, no reports, <30min → wait"""
 
-        report_manager = ReportManager(base_dir=temp_medic_dir)
+        report_manager = DockerReportManager(base_dir=temp_medic_dir)
         queue = InvestigationQueue(mock_redis)
         agent_runner = InvestigationAgentRunner(temp_workspace)
         recovery = InvestigationRecovery(
@@ -268,7 +268,7 @@ class TestStartupRecovery:
     ):
         """Recovery Path 4: Process missing, no reports, >4hr → mark timeout"""
 
-        report_manager = ReportManager(base_dir=temp_medic_dir)
+        report_manager = DockerReportManager(base_dir=temp_medic_dir)
         queue = InvestigationQueue(mock_redis)
         agent_runner = InvestigationAgentRunner(temp_workspace)
         recovery = InvestigationRecovery(
@@ -313,7 +313,7 @@ class TestStartupRecovery:
 
         mock_run_claude.return_value = "Re-launched investigation"
 
-        report_manager = ReportManager(base_dir=temp_medic_dir)
+        report_manager = DockerReportManager(base_dir=temp_medic_dir)
         queue = InvestigationQueue(mock_redis)
         agent_runner = InvestigationAgentRunner(temp_workspace)
         recovery = InvestigationRecovery(
@@ -332,7 +332,7 @@ class TestStartupRecovery:
         # No reports exist yet
 
         # Create context file (needed for re-launch)
-        report_manager = ReportManager(base_dir=temp_medic_dir)
+        report_manager = DockerReportManager(base_dir=temp_medic_dir)
         signature = {"fingerprint_id": fingerprint_id, "severity": "ERROR", "signature": {}, "sample_log_entries": []}
         context_file = report_manager.write_context(fingerprint_id, signature, [])
         assert Path(context_file).exists()
@@ -377,7 +377,7 @@ class TestCleanShutdown:
         mock_run_claude.side_effect = long_investigation
 
         # Create orchestrator
-        orchestrator = InvestigationOrchestrator(
+        orchestrator = DockerInvestigationOrchestrator(
             redis_client=mock_redis,
             es_client=mock_failure_store,  # Using mock_failure_store as es_client
             workspace_root=temp_workspace,
@@ -453,7 +453,7 @@ class TestCleanShutdown:
         mock_run_claude.side_effect = long_investigation
 
         agent_runner = InvestigationAgentRunner(temp_workspace)
-        report_manager = ReportManager(base_dir=temp_medic_dir)
+        report_manager = DockerReportManager(base_dir=temp_medic_dir)
 
         # Create multiple investigations
         investigations = {}
@@ -514,7 +514,7 @@ class TestCleanShutdown:
         mock_run_claude.side_effect = investigation_with_cleanup
 
         agent_runner = InvestigationAgentRunner(temp_workspace)
-        report_manager = ReportManager(base_dir=temp_medic_dir)
+        report_manager = DockerReportManager(base_dir=temp_medic_dir)
 
         fingerprint_id = "sha256:test_cleanup"
         signature = {"fingerprint_id": fingerprint_id, "severity": "ERROR", "signature": {}, "sample_log_entries": []}
@@ -564,7 +564,7 @@ class TestStallDetection:
 
         mock_run_claude.side_effect = stalled_investigation
 
-        report_manager = ReportManager(base_dir=temp_medic_dir)
+        report_manager = DockerReportManager(base_dir=temp_medic_dir)
         queue = InvestigationQueue(mock_redis)
         recovery = InvestigationRecovery(
             queue, InvestigationAgentRunner(temp_workspace), report_manager
@@ -596,7 +596,7 @@ class TestStallDetection:
     ):
         """Test that active investigations with recent output are not marked stalled"""
 
-        report_manager = ReportManager(base_dir=temp_medic_dir)
+        report_manager = DockerReportManager(base_dir=temp_medic_dir)
         queue = InvestigationQueue(mock_redis)
         recovery = InvestigationRecovery(
             queue, InvestigationAgentRunner(temp_workspace), report_manager

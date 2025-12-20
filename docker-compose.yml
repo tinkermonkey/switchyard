@@ -188,6 +188,8 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock  # Docker CLI access
       - ./medic:/medic  # Investigation reports directory (inside clauditoreum/)
       - ./.claude-config:/home/orchestrator/.config/claude:ro  # MCP config
+      - ~/.ssh/id_ed25519:/home/orchestrator/.ssh/id_ed25519:ro  # SSH keys for git
+      - ~/.gitconfig:/home/orchestrator/.gitconfig  # Git config
     environment:
       - REDIS_HOST=redis
       - REDIS_PORT=6379
@@ -198,6 +200,7 @@ services:
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN:-}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - GITHUB_TOKEN=${GITHUB_TOKEN}
       - MEDIC_SIGNATURE_RETENTION_DAYS=${MEDIC_SIGNATURE_RETENTION_DAYS:-7}
     depends_on:
       redis:

@@ -69,16 +69,47 @@ def to_utc_isoformat(dt: datetime) -> str:
 def timestamp_to_utc_isoformat(timestamp: float) -> str:
     """
     Convert Unix timestamp to ISO8601 string with 'Z' suffix.
-    
+
     Args:
         timestamp: Unix timestamp (seconds since epoch)
-        
+
     Returns:
         str: ISO8601 formatted timestamp with 'Z' suffix
-        
+
     Example:
         >>> timestamp_to_utc_isoformat(1728561600.0)
         '2025-10-10T12:00:00Z'
     """
     dt = datetime.fromtimestamp(timestamp, tz=timezone.utc)
     return dt.isoformat().replace('+00:00', 'Z')
+
+
+def parse_iso_timestamp(iso_string: str) -> datetime:
+    """
+    Parse an ISO8601 timestamp string to a UTC datetime object.
+
+    Args:
+        iso_string: ISO8601 formatted timestamp (e.g., '2025-10-10T12:00:00Z' or '2025-10-10T12:00:00+00:00')
+
+    Returns:
+        datetime: Parsed datetime object in UTC with timezone info
+
+    Example:
+        >>> dt = parse_iso_timestamp('2025-10-10T12:00:00Z')
+        >>> dt.tzinfo == timezone.utc
+        True
+    """
+    # Handle 'Z' suffix (common ISO8601 UTC format)
+    if iso_string.endswith('Z'):
+        iso_string = iso_string[:-1] + '+00:00'
+
+    # Parse the ISO string
+    dt = datetime.fromisoformat(iso_string)
+
+    # Ensure it's in UTC
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    elif dt.tzinfo != timezone.utc:
+        dt = dt.astimezone(timezone.utc)
+
+    return dt

@@ -1,5 +1,5 @@
 """
-Unit tests for Medic Investigation Queue
+Unit tests for Docker Investigation Queue
 """
 
 import pytest
@@ -7,7 +7,7 @@ from unittest.mock import Mock, MagicMock
 from datetime import datetime, timezone, timedelta
 import time
 
-from services.medic.investigation_queue import InvestigationQueue
+from services.medic.docker import DockerDockerInvestigationQueue
 
 
 @pytest.fixture
@@ -30,7 +30,7 @@ def mock_redis():
 @pytest.fixture
 def queue(mock_redis):
     """Create investigation queue with mocked Redis"""
-    return InvestigationQueue(mock_redis)
+    return DockerInvestigationQueue(mock_redis)
 
 
 @pytest.fixture
@@ -39,12 +39,12 @@ def sample_fingerprint_id():
     return "sha256:abc123def456"
 
 
-class TestInvestigationQueueInit:
+class TestDockerInvestigationQueueInit:
     """Test queue initialization"""
 
     def test_init(self, mock_redis):
         """Test queue initialization"""
-        queue = InvestigationQueue(mock_redis)
+        queue = DockerInvestigationQueue(mock_redis)
         assert queue.redis == mock_redis
 
 
@@ -127,7 +127,7 @@ class TestLocking:
         # Check set called with NX and EX
         call_args = mock_redis.set.call_args
         assert call_args[1]["nx"] is True
-        assert call_args[1]["ex"] == InvestigationQueue.LOCK_TTL
+        assert call_args[1]["ex"] == DockerInvestigationQueue.LOCK_TTL
 
     def test_acquire_lock_already_locked(self, queue, mock_redis, sample_fingerprint_id):
         """Test acquiring lock when already locked"""
@@ -150,10 +150,10 @@ class TestStatusManagement:
 
     def test_update_status(self, queue, mock_redis, sample_fingerprint_id):
         """Test updating investigation status"""
-        queue.update_status(sample_fingerprint_id, InvestigationQueue.STATUS_IN_PROGRESS)
+        queue.update_status(sample_fingerprint_id, DockerInvestigationQueue.STATUS_IN_PROGRESS)
 
         status_key = f"medic:investigation:{sample_fingerprint_id}:status"
-        mock_redis.set.assert_called_with(status_key, InvestigationQueue.STATUS_IN_PROGRESS)
+        mock_redis.set.assert_called_with(status_key, DockerInvestigationQueue.STATUS_IN_PROGRESS)
 
     def test_get_status_exists(self, queue, mock_redis, sample_fingerprint_id):
         """Test getting status when it exists"""
@@ -270,7 +270,7 @@ class TestCompletion:
 
     def test_mark_completed_success(self, queue, mock_redis, sample_fingerprint_id):
         """Test marking investigation as completed successfully"""
-        queue.mark_completed(sample_fingerprint_id, InvestigationQueue.RESULT_SUCCESS)
+        queue.mark_completed(sample_fingerprint_id, DockerInvestigationQueue.RESULT_SUCCESS)
 
         # Should set completed_at, result, status
         assert mock_redis.set.call_count >= 3
@@ -285,7 +285,7 @@ class TestCompletion:
         """Test marking investigation as completed with error"""
         queue.mark_completed(
             sample_fingerprint_id,
-            InvestigationQueue.RESULT_FAILED,
+            DockerInvestigationQueue.RESULT_FAILED,
             error_message="Something went wrong",
         )
 
@@ -294,7 +294,7 @@ class TestCompletion:
 
     def test_mark_completed_sets_correct_status(self, queue, mock_redis, sample_fingerprint_id):
         """Test that completion sets correct status based on result"""
-        queue.mark_completed(sample_fingerprint_id, InvestigationQueue.RESULT_SUCCESS)
+        queue.mark_completed(sample_fingerprint_id, DockerInvestigationQueue.RESULT_SUCCESS)
 
         # Find the status set call
         calls = [call for call in mock_redis.set.call_args_list if ":status" in str(call)]

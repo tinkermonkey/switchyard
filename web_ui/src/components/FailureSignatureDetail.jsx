@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { AlertCircle, Clock, Code, Play, FileText, Wrench, Trash2, ChevronDown } from 'lucide-react'
+import { AlertCircle, Clock, Code, Play, FileText, Wrench, Trash2, ChevronDown, Loader2 } from 'lucide-react'
 import { useNavigate } from '@tanstack/react-router'
 import ReactMarkdown from 'react-markdown'
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter'
@@ -255,6 +255,30 @@ export default function FailureSignatureDetail({ fingerprintId }) {
               <span className="px-3 py-1 rounded text-sm bg-gh-canvas border border-gh-border">
                 {signature.status}
               </span>
+              {signature.investigation_status === 'queued' && (
+                <span className="px-3 py-1 rounded text-sm font-medium bg-yellow-500/10 text-yellow-500 border border-yellow-500/20 flex items-center gap-1">
+                  <Clock className="w-3 h-3" />
+                  Investigation Queued
+                </span>
+              )}
+              {(signature.investigation_status === 'in_progress' || signature.investigation_status === 'starting') && (
+                <span className="px-3 py-1 rounded text-sm font-medium bg-blue-500/10 text-blue-500 border border-blue-500/20 flex items-center gap-1">
+                  <Loader2 className="w-3 h-3 animate-spin" />
+                  Investigation Running
+                </span>
+              )}
+              {signature.investigation_status === 'completed' && (
+                <span className="px-3 py-1 rounded text-sm font-medium bg-green-500/10 text-green-500 border border-green-500/20 flex items-center gap-1">
+                  <FileText className="w-3 h-3" />
+                  Investigation Complete
+                </span>
+              )}
+              {signature.investigation_status === 'failed' && (
+                <span className="px-3 py-1 rounded text-sm font-medium bg-red-500/10 text-red-500 border border-red-500/20 flex items-center gap-1">
+                  <AlertCircle className="w-3 h-3" />
+                  Investigation Failed
+                </span>
+              )}
             </div>
             <h2 className="text-xl font-semibold text-gh-fg">
               {signature.signature?.error_type}: {signature.signature?.normalized_message}

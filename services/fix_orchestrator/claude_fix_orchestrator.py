@@ -15,6 +15,7 @@ import redis
 from pathlib import Path
 from datetime import datetime
 from functools import partial
+from elasticsearch import Elasticsearch
 
 # Add project root to path
 sys.path.append(str(Path(__file__).parent.parent.parent))
@@ -62,7 +63,11 @@ class ClaudeFixOrchestrator:
         print("PRINT: Queue created", flush=True)
         self.runner = ClaudeFixAgentRunner()
         print("PRINT: Runner created", flush=True)
-        self.signature_store = ClaudeFailureSignatureStore()
+
+        # Initialize Elasticsearch client for signature store
+        es_hosts = os.getenv('ELASTICSEARCH_HOSTS', 'http://elasticsearch:9200').split(',')
+        self.es_client = Elasticsearch(es_hosts)
+        self.signature_store = ClaudeFailureSignatureStore(self.es_client)
         print("PRINT: Signature store created", flush=True)
         self.active_fixes = {}  # fingerprint_id -> fix_info
         self.poll_interval = 5.0  # seconds
@@ -330,7 +335,7 @@ class ClaudeFixOrchestrator:
 
                             # Mark signature as resolved when fix completes successfully
                             try:
-                                self.signature_store.update_investigation_status(fingerprint_id, "resolved")
+                                self.signature_store.update_status(fingerprint_id, "resolved")
                                 logger.info(f"Marked signature {fingerprint_id} as resolved after successful fix")
                             except Exception as e:
                                 logger.warning(f"Failed to update signature status to resolved: {e}")

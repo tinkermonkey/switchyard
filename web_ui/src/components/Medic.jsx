@@ -2,6 +2,7 @@ import { useState } from 'react'
 import Header from './Header'
 import NavigationTabs from './NavigationTabs'
 import MedicDashboard from './MedicDashboard'
+import ActiveInvestigations from './ActiveInvestigations'
 import ActiveFixes from './ActiveFixes'
 import FailureSignatureList from './FailureSignatureList'
 
@@ -26,10 +27,16 @@ export default function Medic() {
           <MedicDashboard />
         </div>
 
-        {/* Active Fixes */}
-        <div>
-          <h3 className="text-lg font-semibold text-gh-fg mb-3">Active Fix Executions</h3>
-          <ActiveFixes />
+        {/* Active Investigations and Fixes Grid */}
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+          <div>
+            <h3 className="text-lg font-semibold text-gh-fg mb-3">Active Investigations</h3>
+            <ActiveInvestigations />
+          </div>
+          <div>
+            <h3 className="text-lg font-semibold text-gh-fg mb-3">Active Fix Executions</h3>
+            <ActiveFixes />
+          </div>
         </div>
 
         {/* Failure Signatures */}

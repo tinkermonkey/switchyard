@@ -1,0 +1,73 @@
+# ============================================================================
+# Dockerfile.agent for clauditoreum project
+# ============================================================================
+# This Dockerfile builds an AGENT IMAGE for Claude agents to operate within.
+# It extends the orchestrator base image and pre-installs project dependencies.
+#
+# DESIGN PRINCIPLE: Build the ENVIRONMENT, not the source code.
+# Source code is mounted at runtime by the orchestrator via:
+#   docker run -v /host/project:/workspace/clauditoreum ...
+# ============================================================================
+
+# ============================================================================
+# Stage 1: Base Environment from Orchestrator
+# ============================================================================
+FROM clauditoreum-orchestrator:latest
+
+# The base image already includes:
+# - Claude CLI (installed via npm)
+# - Git CLI
+# - GitHub CLI (gh)
+# - Python 3.11
+# - Docker CLI (for nested container operations)
+# - procps package (provides 'ps' command needed by Claude CLI)
+# - Essential build tools
+
+# ============================================================================
+# Stage 2: No Additional Runtimes Needed
+# ============================================================================
+# The orchestrator base image already has everything clauditoreum needs:
+# - Python 3.11 with pip
+# - Node.js (for Claude CLI and other tools)
+# - All system dependencies
+
+# ============================================================================
+# Stage 3: Pre-install Python Dependencies (for faster agent startup)
+# ============================================================================
+USER root
+
+WORKDIR /workspace/clauditoreum
+
+# Copy only the requirements file for dependency installation
+# Source code comes from the runtime mount
+COPY requirements.txt ./
+
+# Install Python dependencies
+# Using --no-cache-dir to reduce image size
+RUN pip install --no-cache-dir -r requirements.txt
+
+# ============================================================================
+# Stage 4: Set Working Directory
+# ============================================================================
+# The orchestrator mounts the project here at runtime
+WORKDIR /workspace/clauditoreum
+
+# ============================================================================
+# Stage 5: Switch to Runtime User
+# ============================================================================
+USER orchestrator
+
+# ============================================================================
+# Stage 6: Verification (MANDATORY)
+# ============================================================================
+# Verify all critical CLIs are present from the base image
+RUN claude --version && \
+    git --version && \
+    gh --version && \
+    python3 --version && \
+    docker --version
+
+# ============================================================================
+# Default command
+# ============================================================================
+CMD ["/bin/bash"]

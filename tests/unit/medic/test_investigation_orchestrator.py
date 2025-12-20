@@ -7,8 +7,8 @@ from unittest.mock import Mock, MagicMock, patch, AsyncMock
 from datetime import datetime, timezone
 import asyncio
 
-from services.medic.investigation_orchestrator import InvestigationOrchestrator
-from services.medic.investigation_queue import InvestigationQueue
+from services.medic.docker import DockerDockerInvestigationOrchestrator
+from services.medic.docker import DockerDockerInvestigationQueue
 
 
 @pytest.fixture
@@ -28,7 +28,7 @@ def orchestrator(mock_redis, mock_es, tmp_path):
     """Create orchestrator with mocks"""
     with patch('services.medic.investigation_orchestrator.get_observability_manager') as mock_obs:
         mock_obs.return_value = Mock()
-        return InvestigationOrchestrator(
+        return DockerInvestigationOrchestrator(
             redis_client=mock_redis,
             es_client=mock_es,
             workspace_root=str(tmp_path / "workspace"),
@@ -63,7 +63,7 @@ class TestOrchestratorInit:
         """Test orchestrator initialization"""
         with patch('services.medic.investigation_orchestrator.get_observability_manager') as mock_obs:
             mock_obs.return_value = Mock()
-            orchestrator = InvestigationOrchestrator(
+            orchestrator = DockerInvestigationOrchestrator(
                 redis_client=mock_redis,
                 es_client=mock_es,
                 workspace_root=str(tmp_path / "workspace"),
@@ -256,7 +256,7 @@ class TestInvestigationCompletion:
                     # Should mark as success
                     call_args = mock_complete.call_args[0]
                     assert call_args[0] == sample_fingerprint_id
-                    assert call_args[1] == InvestigationQueue.RESULT_SUCCESS
+                    assert call_args[1] == DockerInvestigationQueue.RESULT_SUCCESS
 
         # Should remove from active
         assert sample_fingerprint_id not in orchestrator.active_processes
@@ -280,7 +280,7 @@ class TestInvestigationCompletion:
 
                     # Should mark as ignored
                     call_args = mock_complete.call_args[0]
-                    assert call_args[1] == InvestigationQueue.RESULT_IGNORED
+                    assert call_args[1] == DockerInvestigationQueue.RESULT_IGNORED
 
     @pytest.mark.asyncio
     async def test_handle_completion_failed(
@@ -301,7 +301,7 @@ class TestInvestigationCompletion:
 
                     # Should mark as failed
                     call_args = mock_complete.call_args[0]
-                    assert call_args[1] == InvestigationQueue.RESULT_FAILED
+                    assert call_args[1] == DockerInvestigationQueue.RESULT_FAILED
 
 
 class TestAutoTrigger:

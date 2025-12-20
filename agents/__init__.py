@@ -20,6 +20,7 @@ from .senior_software_engineer_agent import SeniorSoftwareEngineerAgent
 from .code_reviewer_agent import CodeReviewerAgent
 from .technical_writer_agent import TechnicalWriterAgent
 from .documentation_editor_agent import DocumentationEditorAgent
+from .medic_investigator_agent import MedicInvestigatorAgent
 
 # Agent registry mapping agent names to classes
 AGENT_REGISTRY = {
@@ -33,6 +34,7 @@ AGENT_REGISTRY = {
     "code_reviewer": CodeReviewerAgent,
     "technical_writer": TechnicalWriterAgent,
     "documentation_editor": DocumentationEditorAgent,
+    "medic_investigator": MedicInvestigatorAgent,
 }
 
 # Export all agents and registry

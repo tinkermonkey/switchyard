@@ -6,7 +6,7 @@ import pytest
 from unittest.mock import Mock, MagicMock, patch, AsyncMock
 from datetime import datetime, timedelta, timezone
 
-from services.medic.failure_signature_store import FailureSignatureStore
+from services.medic.docker import DockerDockerFailureSignatureStore
 from services.medic.fingerprint_engine import ErrorFingerprint
 
 
@@ -25,8 +25,8 @@ def mock_es_client():
 @pytest.fixture
 def failure_store(mock_es_client):
     """Create failure signature store with mocked ES"""
-    with patch.object(FailureSignatureStore, '_setup_elasticsearch'):
-        store = FailureSignatureStore(mock_es_client)
+    with patch.object(DockerFailureSignatureStore, '_setup_elasticsearch'):
+        store = DockerFailureSignatureStore(mock_es_client)
         return store
 
 
@@ -69,14 +69,14 @@ def sample_container_info():
     }
 
 
-class TestFailureSignatureStoreSetup:
+class TestDockerFailureSignatureStoreSetup:
     """Test Elasticsearch setup"""
 
     def test_setup_creates_ilm_policy(self, mock_es_client):
         """Test that setup creates ILM policy"""
         mock_es_client.ilm.get_lifecycle.return_value = None
 
-        store = FailureSignatureStore(mock_es_client)
+        store = DockerFailureSignatureStore(mock_es_client)
 
         mock_es_client.ilm.put_lifecycle.assert_called_once()
         call_args = mock_es_client.ilm.put_lifecycle.call_args
@@ -84,7 +84,7 @@ class TestFailureSignatureStoreSetup:
 
     def test_setup_creates_index_template(self, mock_es_client):
         """Test that setup creates index template"""
-        store = FailureSignatureStore(mock_es_client)
+        store = DockerFailureSignatureStore(mock_es_client)
 
         mock_es_client.indices.put_index_template.assert_called_once()
         call_args = mock_es_client.indices.put_index_template.call_args

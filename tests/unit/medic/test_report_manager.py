@@ -8,7 +8,7 @@ import shutil
 from pathlib import Path
 import json
 
-from services.medic.report_manager import ReportManager
+from services.medic.docker import DockerDockerReportManager
 
 
 @pytest.fixture
@@ -22,7 +22,7 @@ def temp_medic_dir():
 @pytest.fixture
 def report_manager(temp_medic_dir):
     """Create report manager with temp directory"""
-    return ReportManager(temp_medic_dir)
+    return DockerReportManager(temp_medic_dir)
 
 
 @pytest.fixture
@@ -55,7 +55,7 @@ def sample_logs():
     ]
 
 
-class TestReportManagerInit:
+class TestDockerReportManagerInit:
     """Test report manager initialization"""
 
     def test_init_creates_base_dir(self, temp_medic_dir):
@@ -63,12 +63,12 @@ class TestReportManagerInit:
         medic_dir = Path(temp_medic_dir) / "subdir"
         assert not medic_dir.exists()
 
-        manager = ReportManager(str(medic_dir))
+        manager = DockerReportManager(str(medic_dir))
         assert medic_dir.exists()
 
     def test_init_with_existing_dir(self, temp_medic_dir):
         """Test initialization with existing directory"""
-        manager = ReportManager(temp_medic_dir)
+        manager = DockerReportManager(temp_medic_dir)
         assert Path(temp_medic_dir).exists()
 
 

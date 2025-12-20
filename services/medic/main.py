@@ -3,8 +3,8 @@ Medic Unified Service
 
 Runs all Medic-related monitoring services in a single container:
 - Docker Log Monitor
+- Docker Investigation Orchestrator
 - Claude Failure Monitor
-- Investigation Orchestrator (Standard)
 - Claude Investigation Orchestrator
 - Claude Signature Curator
 
@@ -23,14 +23,20 @@ from pathlib import Path
 # Add project root to path
 sys.path.append(str(Path(__file__).parent.parent.parent))
 
-from services.medic.docker_log_monitor import DockerLogMonitor
-from services.medic.fingerprint_engine import FingerprintEngine
-from services.medic.failure_signature_store import FailureSignatureStore
+# Docker system
+from services.medic.docker import (
+    DockerLogMonitor,
+    FingerprintEngine,
+    DockerFailureSignatureStore,
+    DockerInvestigationOrchestrator,
+)
 
-from services.medic.claude_failure_monitor import ClaudeFailureMonitor
-from services.medic.investigation_orchestrator import InvestigationOrchestrator
-from services.medic.claude_investigation_orchestrator import ClaudeInvestigationOrchestrator
-from services.medic.claude_signature_curator import ClaudeSignatureCurator
+# Claude system
+from services.medic.claude import (
+    ClaudeFailureMonitor,
+    ClaudeInvestigationOrchestrator,
+    ClaudeSignatureCurator,
+)
 
 # Configure logging
 logging.basicConfig(
@@ -88,7 +94,7 @@ async def main():
     # 1. Docker Log Monitor
     if docker_client:
         fingerprint_engine = FingerprintEngine()
-        failure_store = FailureSignatureStore(es_client)
+        failure_store = DockerFailureSignatureStore(es_client)
         docker_monitor = DockerLogMonitor(docker_client, fingerprint_engine, failure_store, redis_client)
         tasks.append(asyncio.create_task(docker_monitor.start_monitoring(), name="DockerLogMonitor"))
         logger.info("Initialized DockerLogMonitor with historical scan support")
@@ -102,21 +108,21 @@ async def main():
     tasks.append(asyncio.create_task(claude_failure_monitor.run(), name="ClaudeFailureMonitor"))
     logger.info("Initialized ClaudeFailureMonitor")
 
-    # 3. Investigation Orchestrator (Standard)
-    investigation_orchestrator = InvestigationOrchestrator(
+    # 3. Docker Investigation Orchestrator
+    docker_investigation_orchestrator = DockerInvestigationOrchestrator(
         redis_client=redis_client,
         es_client=es_client,
         workspace_root=workspace_root,
         medic_dir=medic_dir
     )
-    tasks.append(asyncio.create_task(investigation_orchestrator.start(), name="InvestigationOrchestrator"))
-    logger.info("Initialized InvestigationOrchestrator")
+    tasks.append(asyncio.create_task(docker_investigation_orchestrator.start(), name="DockerInvestigationOrchestrator"))
+    logger.info("Initialized DockerInvestigationOrchestrator")
 
-    # Create background tasks for Investigation Orchestrator at top level (FIX for event loop issue)
-    tasks.append(asyncio.create_task(investigation_orchestrator.queue_processor(), name="InvestigationQueueProcessor"))
-    tasks.append(asyncio.create_task(investigation_orchestrator.heartbeat_monitor(), name="InvestigationHeartbeatMonitor"))
-    tasks.append(asyncio.create_task(investigation_orchestrator.auto_trigger_checker(), name="InvestigationAutoTrigger"))
-    logger.info("Started Investigation Orchestrator background tasks")
+    # Create background tasks for Docker Investigation Orchestrator at top level (FIX for event loop issue)
+    tasks.append(asyncio.create_task(docker_investigation_orchestrator.queue_processor(), name="DockerInvestigationQueueProcessor"))
+    tasks.append(asyncio.create_task(docker_investigation_orchestrator.heartbeat_monitor(), name="DockerInvestigationHeartbeatMonitor"))
+    tasks.append(asyncio.create_task(docker_investigation_orchestrator.auto_trigger_checker(), name="DockerInvestigationAutoTrigger"))
+    logger.info("Started Docker Investigation Orchestrator background tasks")
 
     # 4. Claude Investigation Orchestrator
     claude_investigation_orchestrator = ClaudeInvestigationOrchestrator(
