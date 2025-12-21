@@ -47,6 +47,31 @@ redis_client_raw = redis.Redis(host=redis_host, port=redis_port, decode_response
 _medic_queue = None
 _medic_report_manager = None
 
+def check_container_running(container_name):
+    """
+    Check if a Docker container is actually running.
+
+    Args:
+        container_name: Name of the container to check
+
+    Returns:
+        True if container is running, False otherwise
+    """
+    if not container_name:
+        return False
+
+    try:
+        result = subprocess.run(
+            ['docker', 'ps', '-q', '-f', f'name=^{container_name}$'],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        return bool(result.stdout.strip())
+    except Exception as e:
+        logger.error(f"Failed to check container {container_name}: {e}")
+        return False
+
 def get_investigation_queue():
     """Lazy initialization of Docker investigation queue"""
     global _medic_queue
@@ -4597,7 +4622,7 @@ def get_fix_status(fingerprint_id):
 
 @app.route('/api/medic/investigations/active', methods=['GET'])
 def get_active_investigations():
-    """Get all queued and in-progress investigations."""
+    """Get all queued and in-progress investigations with container health status."""
     try:
         import redis
         redis_client = redis.Redis(
@@ -4606,42 +4631,77 @@ def get_active_investigations():
             decode_responses=True
         )
 
-        # Get queued Docker investigations
-        queued = redis_client.lrange("medic:docker_investigation:queue", 0, -1)
-
-        # Get active Docker investigations
-        active_fps = redis_client.smembers("medic:docker_investigation:active")
-
-        # Get details for each
         investigations = []
 
-        # Add queued
-        for fp_id in queued:
-            status_key = f"medic:docker_investigation:{fp_id}:status"
-            started_key = f"medic:docker_investigation:{fp_id}:started_at"
+        # Process both Docker and Claude investigations
+        for prefix in ["medic:docker_investigation", "medic:claude_investigation"]:
+            investigation_type = "docker" if "docker" in prefix else "claude"
 
-            investigations.append({
-                "fingerprint_id": fp_id,
-                "status": "queued",
-                "started_at": None
-            })
+            # Get queued investigations
+            queued = redis_client.lrange(f"{prefix}:queue", 0, -1)
 
-        # Add active
-        for fp_id in active_fps:
-            status_key = f"medic:docker_investigation:{fp_id}:status"
-            started_key = f"medic:docker_investigation:{fp_id}:started_at"
+            # Get active investigations
+            active_fps = redis_client.smembers(f"{prefix}:active")
 
-            status = redis_client.get(status_key) or "in_progress"
-            started_at = redis_client.get(started_key)
+            # Add queued
+            for fp_id in queued:
+                investigations.append({
+                    "fingerprint_id": fp_id,
+                    "type": investigation_type,
+                    "status": "queued",
+                    "container_name": None,
+                    "container_running": False,
+                    "health": "queued",
+                    "started_at": None,
+                    "last_heartbeat": None
+                })
 
-            investigations.append({
-                "fingerprint_id": fp_id,
-                "status": status,
-                "started_at": started_at
-            })
+            # Add active
+            for fp_id in active_fps:
+                status = redis_client.get(f"{prefix}:{fp_id}:status") or "in_progress"
+                container_name = redis_client.get(f"{prefix}:{fp_id}:container_name")
+                started_at = redis_client.get(f"{prefix}:{fp_id}:started_at")
+                last_heartbeat = redis_client.get(f"{prefix}:{fp_id}:last_heartbeat")
+
+                # Verify container is actually running
+                container_running = check_container_running(container_name) if container_name else False
+
+                # Determine health status
+                if status == "in_progress" and container_running:
+                    health = "healthy"
+                elif status == "in_progress" and not container_running:
+                    health = "stale"
+                else:
+                    health = status
+
+                investigations.append({
+                    "fingerprint_id": fp_id,
+                    "type": investigation_type,
+                    "status": status,
+                    "container_name": container_name,
+                    "container_running": container_running,
+                    "health": health,
+                    "started_at": started_at,
+                    "last_heartbeat": last_heartbeat
+                })
 
         redis_client.close()
-        return jsonify(investigations), 200
+
+        # Calculate summary stats
+        total = len(investigations)
+        healthy = sum(1 for inv in investigations if inv['health'] == 'healthy')
+        stale = sum(1 for inv in investigations if inv['health'] == 'stale')
+        queued = sum(1 for inv in investigations if inv['status'] == 'queued')
+
+        return jsonify({
+            "investigations": investigations,
+            "summary": {
+                "total": total,
+                "healthy": healthy,
+                "stale": stale,
+                "queued": queued
+            }
+        }), 200
     except Exception as e:
         logger.error(f"Failed to get active investigations: {e}", exc_info=True)
         return jsonify({"error": str(e)}), 500

@@ -7,11 +7,14 @@ Provides unified lifecycle management for both Docker and Claude investigation s
 
 import logging
 import asyncio
+import subprocess
 from abc import ABC, abstractmethod
 from typing import Dict, Any, Optional, List, Tuple
 from datetime import datetime, timezone, timedelta
 from elasticsearch import Elasticsearch
 import redis
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.interval import IntervalTrigger
 
 from monitoring.observability import get_observability_manager, EventType
 from monitoring.timestamp_utils import utc_now, parse_iso_timestamp
@@ -77,8 +80,140 @@ class BaseInvestigationOrchestrator(ABC):
 
         self.running = True  # Set to True immediately to avoid race condition
         self.active_processes = {}  # fingerprint_id -> investigation_info
+        self.scheduler = AsyncIOScheduler()
 
         logger.info(f"{self.__class__.__name__} initialized")
+
+    def _check_container_running(self, container_name: str) -> bool:
+        """
+        Verify container is actually running in Docker.
+
+        Args:
+            container_name: Name of the container to check
+
+        Returns:
+            True if container is running, False otherwise
+        """
+        try:
+            result = subprocess.run(
+                ['docker', 'ps', '-q', '-f', f'name=^{container_name}$'],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            return bool(result.stdout.strip())
+        except Exception as e:
+            logger.error(f"Failed to check container {container_name}: {e}")
+            return False
+
+    async def _cleanup_orphaned_investigation(self, fingerprint_id: str):
+        """
+        Clean up investigation marked active but container doesn't exist.
+
+        Args:
+            fingerprint_id: Fingerprint ID of orphaned investigation
+        """
+        logger.warning(f"Orphaned investigation detected: {fingerprint_id}")
+
+        try:
+            # Check if reports exist (maybe it completed but state not updated)
+            status = self.report_manager.get_report_status(fingerprint_id)
+            if status.get('has_diagnosis'):
+                # Reports exist - mark as completed
+                self.queue.mark_completed(fingerprint_id, "success")
+                logger.info(f"Orphaned investigation {fingerprint_id} had reports - marked completed")
+
+                # Emit event
+                try:
+                    self.observability.emit(
+                        EventType.MEDIC_INVESTIGATION_COMPLETED,
+                        agent="medic-investigator",
+                        task_id=fingerprint_id,
+                        project="medic",
+                        data={
+                            "fingerprint_id": fingerprint_id,
+                            "result": "success",
+                            "orphaned_cleanup": True,
+                            "had_reports": True
+                        }
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to emit observability event: {e}")
+            else:
+                # No reports - mark as failed
+                self.queue.mark_completed(fingerprint_id, "failed")
+                logger.error(f"Orphaned investigation {fingerprint_id} failed - no reports found")
+
+                # Emit event
+                try:
+                    self.observability.emit(
+                        EventType.MEDIC_INVESTIGATION_FAILED,
+                        agent="medic-investigator",
+                        task_id=fingerprint_id,
+                        project="medic",
+                        data={
+                            "fingerprint_id": fingerprint_id,
+                            "result": "failed",
+                            "orphaned_cleanup": True,
+                            "had_reports": False
+                        }
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to emit observability event: {e}")
+
+            # Remove from active_processes if present
+            if fingerprint_id in self.active_processes:
+                del self.active_processes[fingerprint_id]
+
+        except Exception as e:
+            logger.error(f"Error cleaning up orphaned investigation {fingerprint_id}: {e}", exc_info=True)
+
+    async def _restore_active_processes(self):
+        """
+        Restore active investigations from Redis into active_processes dict.
+
+        Called on startup to resume monitoring investigations that were running
+        when the orchestrator last shut down.
+        """
+        active_fps = self.queue.get_all_active()
+        logger.info(f"Restoring {len(active_fps)} active investigations from Redis")
+
+        restored = 0
+        cleaned = 0
+
+        for fp_id in active_fps:
+            try:
+                info = self.queue.get_investigation_info(fp_id)
+                container_name = info.get('container_name')
+
+                if not container_name:
+                    logger.warning(f"Investigation {fp_id} has no container_name - marking as failed")
+                    self.queue.mark_completed(fp_id, "failed")
+                    cleaned += 1
+                    continue
+
+                # Check if container is actually running
+                if not self._check_container_running(container_name):
+                    logger.warning(f"Investigation {fp_id} container {container_name} not running - cleaning up")
+                    await self._cleanup_orphaned_investigation(fp_id)
+                    cleaned += 1
+                    continue
+
+                # Container is running - restore to active_processes
+                # Note: We can't restore the asyncio Task, but monitoring will still work
+                self.active_processes[fp_id] = {
+                    'container_name': container_name,
+                    'started_at': info.get('started_at'),
+                    'task': None,  # Task can't be restored, but monitoring will still work
+                }
+                restored += 1
+                logger.info(f"Restored active investigation {fp_id} (container: {container_name})")
+
+            except Exception as e:
+                logger.error(f"Error restoring investigation {fp_id}: {e}", exc_info=True)
+                cleaned += 1
+
+        logger.info(f"Restoration complete: {restored} restored, {cleaned} cleaned")
 
     @abstractmethod
     def _prepare_investigation_context(
@@ -142,10 +277,50 @@ class BaseInvestigationOrchestrator(ABC):
         logger.info("Performing startup recovery...")
         await self._recover_stalled_investigations()
 
+        # Restore active processes from Redis
+        logger.info("Restoring active processes from Redis...")
+        await self._restore_active_processes()
+
         self.running = True
         logger.info(f"{self.__class__.__name__} initialized and ready")
 
-        # Background tasks will be started by main.py
+        # Setup scheduled background tasks using APScheduler
+        # This works around the asyncio.sleep() freeze issue
+        self.scheduler.add_job(
+            self._queue_processor_iteration,
+            trigger=IntervalTrigger(seconds=1),
+            id=f'{self.__class__.__name__}_queue_processor',
+            name=f'{self.__class__.__name__} Queue Processor',
+            replace_existing=True
+        )
+
+        self.scheduler.add_job(
+            self._heartbeat_monitor_iteration,
+            trigger=IntervalTrigger(minutes=1),
+            id=f'{self.__class__.__name__}_heartbeat_monitor',
+            name=f'{self.__class__.__name__} Heartbeat Monitor',
+            replace_existing=True
+        )
+
+        self.scheduler.add_job(
+            self._auto_trigger_checker_iteration,
+            trigger=IntervalTrigger(seconds=30),
+            id=f'{self.__class__.__name__}_auto_trigger_checker',
+            name=f'{self.__class__.__name__} Auto Trigger Checker',
+            replace_existing=True
+        )
+
+        self.scheduler.add_job(
+            self._reconciliation_iteration,
+            trigger=IntervalTrigger(minutes=1),
+            id=f'{self.__class__.__name__}_reconciliation',
+            name=f'{self.__class__.__name__} Reconciliation',
+            replace_existing=True
+        )
+
+        self.scheduler.start()
+        logger.info(f"Started scheduler with 4 background jobs")
+
         # Keep this task alive with infinite wait
         try:
             while True:
@@ -153,6 +328,7 @@ class BaseInvestigationOrchestrator(ABC):
         except asyncio.CancelledError:
             logger.info("Orchestrator cancelled")
             self.running = False
+            self.scheduler.shutdown()
             raise
 
     async def stop(self):
@@ -185,41 +361,33 @@ class BaseInvestigationOrchestrator(ABC):
         logger.info(f"{self.__class__.__name__} stopped")
 
     async def queue_processor(self):
-        """Process investigation queue (main loop)"""
-        logger.info("Queue processor started")
+        """Legacy method - background tasks now use scheduled iteration methods"""
+        logger.warning("queue_processor() called but tasks are now scheduled - this should not be called")
+        pass
 
-        while self.running:
-            try:
-                logger.info("Queue processor loop iteration starting")
-                # Check concurrent limit
-                active_count = self.queue.get_active_count()
-                logger.info(f"Active investigation count: {active_count}, MAX_CONCURRENT: {self.queue.MAX_CONCURRENT}")
+    async def _queue_processor_iteration(self):
+        """Process investigation queue (single iteration)"""
+        try:
+            # Check concurrent limit
+            active_count = self.queue.get_active_count()
 
-                if active_count >= self.queue.MAX_CONCURRENT:
-                    logger.info(
-                        f"Max concurrent investigations reached ({active_count}), waiting..."
-                    )
-                    await asyncio.sleep(10)
-                    continue
+            if active_count >= self.queue.MAX_CONCURRENT:
+                logger.debug(f"Max concurrent investigations reached ({active_count}), waiting...")
+                return
 
-                # Get next investigation from queue
-                logger.info("Calling queue.dequeue()...")
-                fingerprint_id = await self.queue.dequeue()
-                logger.info(f"dequeue() returned: {fingerprint_id}")
+            # Get next investigation from queue
+            fingerprint_id = await self.queue.dequeue()
 
-                if not fingerprint_id:
-                    # Queue empty, wait a bit
-                    logger.info("Queue empty, sleeping for 1 second")
-                    await asyncio.sleep(1)
-                    continue
+            if not fingerprint_id:
+                # Queue empty
+                return
 
-                # Start investigation
-                logger.info(f"Dequeued investigation: {fingerprint_id}")
-                await self._start_investigation(fingerprint_id)
+            # Start investigation
+            logger.info(f"Dequeued investigation: {fingerprint_id}")
+            await self._start_investigation(fingerprint_id)
 
-            except Exception as e:
-                logger.error(f"Queue processor error: {e}", exc_info=True)
-                await asyncio.sleep(5)
+        except Exception as e:
+            logger.error(f"Queue processor error: {e}", exc_info=True)
 
     async def _start_investigation(self, fingerprint_id: str):
         """Start an investigation for a fingerprint"""
@@ -374,36 +542,121 @@ class BaseInvestigationOrchestrator(ABC):
             )
 
     async def heartbeat_monitor(self):
-        """Monitor active investigations for progress and completion"""
-        logger.info("Heartbeat monitor started")
+        """Legacy method - background tasks now use scheduled iteration methods"""
+        logger.warning("heartbeat_monitor() called but tasks are now scheduled - this should not be called")
+        pass
 
-        while self.running:
-            try:
-                await asyncio.sleep(self.queue.HEARTBEAT_INTERVAL)
+    async def _heartbeat_monitor_iteration(self):
+        """Monitor active investigations (single iteration)"""
+        try:
+            # Check Redis active set (persistent), not active_processes (volatile)
+            active_fps = self.queue.get_all_active()
 
-                # Check each active investigation
-                active_fps = list(self.active_processes.keys())
-                for fingerprint_id in active_fps:
+            if not active_fps:
+                return
+
+            logger.debug(f"Monitoring {len(active_fps)} active investigations")
+
+            # Check each active investigation
+            for fingerprint_id in active_fps:
+                try:
                     await self._check_investigation_progress(fingerprint_id)
+                except Exception as e:
+                    logger.error(f"Error monitoring investigation {fingerprint_id}: {e}")
 
-                # Check for stalls
-                stalled = self.check_stalled_investigations()
-                if stalled:
-                    logger.warning(f"Stalled investigations: {stalled}")
+            # Check for stalls
+            stalled = self.check_stalled_investigations()
+            if stalled:
+                logger.warning(f"Stalled investigations: {stalled}")
 
-                # Check for timeouts
-                timed_out = self.check_timeouts()
-                if timed_out:
-                    logger.warning(f"Timed out investigations: {timed_out}")
+            # Check for timeouts
+            timed_out = self.check_timeouts()
+            if timed_out:
+                logger.warning(f"Timed out investigations: {timed_out}")
 
-            except Exception as e:
-                logger.error(f"Heartbeat monitor error: {e}", exc_info=True)
+        except Exception as e:
+            logger.error(f"Heartbeat monitor error: {e}", exc_info=True)
+
+    async def reconciliation_loop(self):
+        """Legacy method - background tasks now use scheduled iteration methods"""
+        logger.warning("reconciliation_loop() called but tasks are now scheduled - this should not be called")
+        pass
+
+    async def _reconciliation_iteration(self):
+        """Reconciliation: verify Redis state matches Docker reality (single iteration)"""
+        try:
+            # Get what Redis claims is active
+            redis_active_fps = set(self.queue.get_all_active())
+
+            if not redis_active_fps:
+                return
+
+            logger.debug(f"Reconciliation: Checking {len(redis_active_fps)} investigations")
+
+            # Check each active investigation
+            reconciled = 0
+            cleaned = 0
+
+            for fp_id in redis_active_fps:
+                try:
+                    info = self.queue.get_investigation_info(fp_id)
+                    container_name = info.get('container_name')
+
+                    if not container_name:
+                        logger.warning(f"Reconciliation: {fp_id} has no container_name")
+                        await self._cleanup_orphaned_investigation(fp_id)
+                        cleaned += 1
+                        continue
+
+                    # Verify container is running
+                    if not self._check_container_running(container_name):
+                        logger.warning(f"Reconciliation: {fp_id} container not running")
+                        await self._cleanup_orphaned_investigation(fp_id)
+                        cleaned += 1
+                    else:
+                        reconciled += 1
+
+                except Exception as e:
+                    logger.error(f"Error reconciling {fp_id}: {e}", exc_info=True)
+
+            if cleaned > 0:
+                logger.info(f"Reconciliation: {reconciled} healthy, {cleaned} cleaned")
+
+        except Exception as e:
+            logger.error(f"Reconciliation error: {e}", exc_info=True)
 
     async def _check_investigation_progress(self, fingerprint_id: str):
-        """Check progress of a single investigation"""
+        """Check progress AND verify container is still running"""
         try:
             investigation_info = self.active_processes.get(fingerprint_id)
             if not investigation_info:
+                # Not in active_processes - get from Redis and verify
+                info = self.queue.get_investigation_info(fingerprint_id)
+                if not info:
+                    return
+
+                container_name = info.get('container_name')
+                if container_name:
+                    # CRITICAL: Verify container is actually running
+                    if not self._check_container_running(container_name):
+                        logger.error(f"Container {container_name} for investigation {fingerprint_id} is not running")
+                        await self._cleanup_orphaned_investigation(fingerprint_id)
+                        return
+
+                    # Container running - update heartbeat
+                    line_count = self.report_manager.count_log_lines(fingerprint_id)
+                    self.queue.update_heartbeat(fingerprint_id, line_count)
+                return
+
+            # In active_processes - check both task and container
+            container_name = investigation_info.get('container_name')
+
+            # CRITICAL: Verify container is actually running
+            if container_name and not self._check_container_running(container_name):
+                logger.error(f"Container {container_name} for investigation {fingerprint_id} is not running")
+                # Container died - mark investigation as failed
+                task = investigation_info.get('task')
+                await self._handle_investigation_completion(fingerprint_id, task)
                 return
 
             # Get the asyncio task
@@ -591,42 +844,41 @@ class BaseInvestigationOrchestrator(ABC):
         return "failed"
 
     async def auto_trigger_checker(self):
-        """Periodically check for signatures that should auto-trigger investigation"""
-        logger.info("Auto-trigger checker started")
+        """Legacy method - background tasks now use scheduled iteration methods"""
+        logger.warning("auto_trigger_checker() called but tasks are now scheduled - this should not be called")
+        pass
 
-        while self.running:
-            try:
-                # Run every 5 minutes
-                await asyncio.sleep(300)
+    async def _auto_trigger_checker_iteration(self):
+        """Check for signatures that should auto-trigger investigation (single iteration)"""
+        try:
+            logger.debug("Checking for auto-trigger conditions...")
+            triggered = await self._check_auto_trigger_conditions()
 
-                logger.debug("Checking for auto-trigger conditions...")
-                triggered = await self._check_auto_trigger_conditions()
+            for fingerprint_id in triggered:
+                logger.info(f"Auto-triggering investigation for {fingerprint_id}")
+                self.failure_store.update_investigation_status(fingerprint_id, "queued")
+                self.queue.enqueue(fingerprint_id, priority="high")
 
-                for fingerprint_id in triggered:
-                    logger.info(f"Auto-triggering investigation for {fingerprint_id}")
-                    self.failure_store.update_investigation_status(fingerprint_id, "queued")
-                    self.queue.enqueue(fingerprint_id, priority="high")
+                # Emit event
+                try:
+                    self.observability.emit(
+                        EventType.MEDIC_INVESTIGATION_QUEUED,
+                        agent="medic-investigator",
+                        task_id=fingerprint_id,
+                        project="medic",
+                        data={
+                            "fingerprint_id": fingerprint_id,
+                            "trigger": "auto",
+                        },
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to emit observability event: {e}")
 
-                    # Emit event
-                    try:
-                        self.observability.emit(
-                            EventType.MEDIC_INVESTIGATION_QUEUED,
-                            agent="medic-investigator",
-                            task_id=fingerprint_id,
-                            project="medic",
-                            data={
-                                "fingerprint_id": fingerprint_id,
-                                "trigger": "auto",
-                            },
-                        )
-                    except Exception as e:
-                        logger.warning(f"Failed to emit observability event: {e}")
+            if triggered:
+                logger.info(f"Auto-triggered {len(triggered)} investigations")
 
-                if triggered:
-                    logger.info(f"Auto-triggered {len(triggered)} investigations")
-
-            except Exception as e:
-                logger.error(f"Auto-trigger checker error: {e}", exc_info=True)
+        except Exception as e:
+            logger.error(f"Auto-trigger checker error: {e}", exc_info=True)
 
     async def _check_auto_trigger_conditions(self) -> List[str]:
         """

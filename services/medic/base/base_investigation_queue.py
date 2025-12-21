@@ -254,6 +254,7 @@ class BaseInvestigationQueue:
             "fingerprint_id": fingerprint_id,
             "status": self.get_status(fingerprint_id),
             "pid": self.redis.get(self._key(fingerprint_id, "pid")),
+            "container_name": self.redis.get(self._key(fingerprint_id, "container_name")),
             "started_at": self.redis.get(self._key(fingerprint_id, "started_at")),
             "last_heartbeat": self.redis.get(self._key(fingerprint_id, "last_heartbeat")),
             "agent_output_lines": self.redis.get(self._key(fingerprint_id, "agent_output_lines")),

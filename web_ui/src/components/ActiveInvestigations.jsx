@@ -30,7 +30,7 @@ export default function ActiveInvestigations() {
       const response = await fetch('/api/medic/investigations/active')
       if (!response.ok) throw new Error('Failed to fetch active investigations')
       const data = await response.json()
-      setActiveInvestigations(data)
+      setActiveInvestigations(data.investigations || [])
       setError(null)
     } catch (err) {
       setError(err.message)

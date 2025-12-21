@@ -162,21 +162,83 @@ class DockerLogMonitor:
 
             # Phase 2: Real-time streaming from checkpoint
             logger.info(f"Starting real-time log streaming for {container_name}")
-            for log_line in container.logs(
-                stream=True, follow=True, since=scan_start_time
-            ):
-                if not self.running:
-                    break
 
-                # Process log line
-                await self._process_log_line(
-                    container_name, container_id, log_line, is_historical=False
-                )
+            # Run blocking Docker logs iteration in a thread to avoid blocking event loop
+            await asyncio.to_thread(
+                self._stream_logs_blocking,
+                container,
+                container_name,
+                container_id,
+                scan_start_time
+            )
 
         except Exception as e:
             logger.error(
                 f"Error streaming logs from {container_name}: {e}", exc_info=True
             )
+
+    def _stream_logs_blocking(self, container: Container, container_name: str, container_id: str, scan_start_time):
+        """
+        Blocking synchronous method to stream Docker logs.
+        Runs in a thread via asyncio.to_thread() to avoid blocking the event loop.
+        """
+        try:
+            for log_line in container.logs(stream=True, follow=True, since=scan_start_time):
+                if not self.running:
+                    break
+
+                # Skip non-bytes data (Docker SDK sometimes returns timestamps as integers)
+                if not isinstance(log_line, bytes):
+                    continue
+
+                # Process log line synchronously
+                self._process_log_line_sync(container_name, container_id, log_line, is_historical=False)
+
+        except Exception as e:
+            logger.error(f"Error in blocking log stream for {container_name}: {e}", exc_info=True)
+
+    def _process_log_line_sync(self, container_name: str, container_id: str, log_line: bytes, is_historical: bool):
+        """
+        Synchronous version of log line processing for use in thread.
+        """
+        try:
+            # Decode log line
+            line_str = log_line.decode("utf-8", errors="replace").strip()
+
+            if not line_str:
+                return
+
+            # Parse log entry
+            parsed = self._parse_log_line(line_str)
+
+            # Check if this is an error/warning
+            if parsed["level"] not in self.MONITORED_LEVELS:
+                return
+
+            # Duplicate detection for historical logs
+            if is_historical and self.redis:
+                log_hash = hashlib.md5(f"{container_name}:{line_str}".encode()).hexdigest()
+                cache_key = f"docker_log_monitor:seen:{log_hash}"
+
+                if self.redis.get(cache_key):
+                    return  # Already processed
+
+                # Mark as seen (expire after 1 hour)
+                self.redis.setex(cache_key, 3600, "1")
+
+            # Generate fingerprint
+            fingerprint = self.fingerprint_engine.generate_fingerprint(parsed)
+
+            # Store/update signature
+            self.failure_store.store_failure_signature(
+                fingerprint_id=fingerprint["id"],
+                signature_data=fingerprint,
+                container_name=container_name,
+                log_entry=parsed,
+            )
+
+        except Exception as e:
+            logger.error(f"Failed to process log line: {e}")
 
     async def _scan_historical_logs(self, container_name: str, container_id: str, container: Container) -> datetime:
         """

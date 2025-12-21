@@ -116,13 +116,7 @@ async def main():
         medic_dir=medic_dir
     )
     tasks.append(asyncio.create_task(docker_investigation_orchestrator.start(), name="DockerInvestigationOrchestrator"))
-    logger.info("Initialized DockerInvestigationOrchestrator")
-
-    # Create background tasks for Docker Investigation Orchestrator at top level (FIX for event loop issue)
-    tasks.append(asyncio.create_task(docker_investigation_orchestrator.queue_processor(), name="DockerInvestigationQueueProcessor"))
-    tasks.append(asyncio.create_task(docker_investigation_orchestrator.heartbeat_monitor(), name="DockerInvestigationHeartbeatMonitor"))
-    tasks.append(asyncio.create_task(docker_investigation_orchestrator.auto_trigger_checker(), name="DockerInvestigationAutoTrigger"))
-    logger.info("Started Docker Investigation Orchestrator background tasks")
+    logger.info("Initialized DockerInvestigationOrchestrator (background tasks use APScheduler)")
 
     # 4. Claude Investigation Orchestrator
     claude_investigation_orchestrator = ClaudeInvestigationOrchestrator(
@@ -132,19 +126,24 @@ async def main():
         medic_dir=medic_dir
     )
     tasks.append(asyncio.create_task(claude_investigation_orchestrator.start(), name="ClaudeInvestigationOrchestrator"))
-    logger.info("Initialized ClaudeInvestigationOrchestrator")
-
-    # Create background tasks for Claude Investigation Orchestrator at top level (FIX for event loop issue)
-    tasks.append(asyncio.create_task(claude_investigation_orchestrator.queue_processor(), name="ClaudeInvestigationQueueProcessor"))
-    tasks.append(asyncio.create_task(claude_investigation_orchestrator.heartbeat_monitor(), name="ClaudeInvestigationHeartbeatMonitor"))
-    tasks.append(asyncio.create_task(claude_investigation_orchestrator.auto_trigger_checker(), name="ClaudeInvestigationAutoTrigger"))
-    logger.info("Started Claude Investigation Orchestrator background tasks")
+    logger.info("Initialized ClaudeInvestigationOrchestrator (background tasks use APScheduler)")
 
     # 5. Claude Signature Curator
     # Note: It initializes its own clients.
     claude_signature_curator = ClaudeSignatureCurator()
     tasks.append(asyncio.create_task(claude_signature_curator.start(), name="ClaudeSignatureCurator"))
     logger.info("Initialized ClaudeSignatureCurator")
+
+    # Add diagnostic task
+    async def diagnostic_loop():
+        logger.info("Diagnostic loop started")
+        for i in range(10):
+            logger.info(f"Diagnostic iteration {i+1} - before sleep")
+            await asyncio.sleep(2)
+            logger.info(f"Diagnostic iteration {i+1} - after sleep")
+        logger.info("Diagnostic loop completed")
+
+    tasks.append(asyncio.create_task(diagnostic_loop(), name="Diagnostic"))
 
     # --- Run All ---
     logger.info(f"Running {len(tasks)} services concurrently...")
