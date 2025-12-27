@@ -150,22 +150,42 @@ export function SocketProvider({ children }) {
 
     socketInstance.on('medic_investigation_queued', (event) => {
       console.log('[SocketContext] Received medic_investigation_queued:', event)
-      setMedicEvents(prev => [{ ...event, event_type: 'investigation_queued' }, ...prev].slice(0, 100))
+      const enrichedEvent = {
+        ...event,
+        event_type: 'investigation_queued',
+        fingerprint_id: event.task_id || event.data?.fingerprint_id
+      }
+      setMedicEvents(prev => [enrichedEvent, ...prev].slice(0, 100))
     })
 
     socketInstance.on('medic_investigation_started', (event) => {
       console.log('[SocketContext] Received medic_investigation_started:', event)
-      setMedicEvents(prev => [{ ...event, event_type: 'investigation_started' }, ...prev].slice(0, 100))
+      const enrichedEvent = {
+        ...event,
+        event_type: 'investigation_started',
+        fingerprint_id: event.task_id || event.data?.fingerprint_id
+      }
+      setMedicEvents(prev => [enrichedEvent, ...prev].slice(0, 100))
     })
 
     socketInstance.on('medic_investigation_completed', (event) => {
       console.log('[SocketContext] Received medic_investigation_completed:', event)
-      setMedicEvents(prev => [{ ...event, event_type: 'investigation_completed' }, ...prev].slice(0, 100))
+      const enrichedEvent = {
+        ...event,
+        event_type: 'investigation_completed',
+        fingerprint_id: event.task_id || event.data?.fingerprint_id
+      }
+      setMedicEvents(prev => [enrichedEvent, ...prev].slice(0, 100))
     })
 
     socketInstance.on('medic_investigation_failed', (event) => {
       console.log('[SocketContext] Received medic_investigation_failed:', event)
-      setMedicEvents(prev => [{ ...event, event_type: 'investigation_failed' }, ...prev].slice(0, 100))
+      const enrichedEvent = {
+        ...event,
+        event_type: 'investigation_failed',
+        fingerprint_id: event.task_id || event.data?.fingerprint_id
+      }
+      setMedicEvents(prev => [enrichedEvent, ...prev].slice(0, 100))
     })
 
     // Claude Medic event listeners

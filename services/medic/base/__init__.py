@@ -9,6 +9,7 @@ from .base_investigation_queue import BaseInvestigationQueue
 from .base_investigation_orchestrator import BaseInvestigationOrchestrator
 from .base_agent_runner import BaseInvestigationAgentRunner
 from .base_report_manager import BaseReportManager
+from .investigation_state_machine import InvestigationStateMachine
 
 __all__ = [
     'BaseFailureSignatureStore',
@@ -16,4 +17,5 @@ __all__ = [
     'BaseInvestigationOrchestrator',
     'BaseInvestigationAgentRunner',
     'BaseReportManager',
+    'InvestigationStateMachine',
 ]

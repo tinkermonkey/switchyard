@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { Search, Clock, Loader2, FileText } from 'lucide-react'
+import { Search, Clock, Loader2, FileText, Eye } from 'lucide-react'
 import { useSocket } from '../contexts'
 import { Link } from '@tanstack/react-router'
 
@@ -58,11 +58,20 @@ export default function ActiveInvestigations() {
 
   const getStatusColor = (status) => {
     switch (status) {
-      case 'in_progress':
-      case 'starting':
-        return 'text-blue-500 bg-blue-500/10 border-blue-500/20'
       case 'queued':
         return 'text-yellow-500 bg-yellow-500/10 border-yellow-500/20'
+      case 'starting':
+      case 'in_progress':
+        return 'text-blue-500 bg-blue-500/10 border-blue-500/20'
+      case 'completed':
+        return 'text-green-500 bg-green-500/10 border-green-500/20'
+      case 'failed':
+      case 'timeout':
+        return 'text-red-500 bg-red-500/10 border-red-500/20'
+      case 'stalled':
+        return 'text-orange-500 bg-orange-500/10 border-orange-500/20'
+      case 'ignored':
+        return 'text-gray-500 bg-gray-500/10 border-gray-500/20'
       default:
         return 'text-gray-500 bg-gray-500/10 border-gray-500/20'
     }
@@ -70,12 +79,22 @@ export default function ActiveInvestigations() {
 
   const getStatusLabel = (status) => {
     switch (status) {
-      case 'in_progress':
-        return 'Running'
-      case 'starting':
-        return 'Starting'
       case 'queued':
         return 'Queued'
+      case 'starting':
+        return 'Starting'
+      case 'in_progress':
+        return 'Running'
+      case 'stalled':
+        return 'Stalled'
+      case 'completed':
+        return 'Completed'
+      case 'failed':
+        return 'Failed'
+      case 'timeout':
+        return 'Timed Out'
+      case 'ignored':
+        return 'Ignored'
       default:
         return status
     }
@@ -152,6 +171,16 @@ export default function ActiveInvestigations() {
                 </td>
                 <td className="px-4 py-3">
                   <div className="flex items-center justify-end gap-2">
+                    {investigation.agent_execution_id && (
+                      <Link
+                        to={`/agent-execution/${investigation.agent_execution_id}`}
+                        className="px-2 py-1 text-xs text-green-500 hover:text-green-400 hover:bg-green-500/10 rounded transition-colors flex items-center gap-1"
+                        title="View agent execution"
+                      >
+                        <Eye className="w-3 h-3" />
+                        Execution
+                      </Link>
+                    )}
                     <Link
                       to={`/medic-detail/${investigation.fingerprint_id}`}
                       className="px-2 py-1 text-xs text-blue-500 hover:text-blue-400 hover:bg-blue-500/10 rounded transition-colors flex items-center gap-1"

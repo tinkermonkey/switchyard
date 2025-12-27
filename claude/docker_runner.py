@@ -592,6 +592,15 @@ class DockerAgentRunner:
         else:
             logger.debug("No shared Claude directory found, skipping mount")
 
+        # Mount medic directory for investigation agents
+        # Medic agents need access to investigation context and reports at /medic
+        if 'medic' in agent.lower() or 'investigation' in agent.lower():
+            medic_host_path = f'{host_workspace}/clauditoreum/medic'
+            cmd.extend([
+                '-v', f'{medic_host_path}:/medic:rw'
+            ])
+            logger.info(f"Mounting medic directory: {medic_host_path} -> /medic")
+
         # Mount MCP config file if provided (task-specific MCP servers)
         # The MCP config is written to a temp location accessible from host
         # We need to convert container path to host path for Docker-in-Docker mounting

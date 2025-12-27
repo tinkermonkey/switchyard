@@ -21,6 +21,16 @@ from services.github_api_client import get_github_client
 
 logger = logging.getLogger(__name__)
 
+# Workflow state labels used by git workflow automation
+WORKFLOW_STATE_LABELS = [
+    {
+        'name': 'approved',
+        'color': '0e8a16',  # Green
+        'description': 'PR has been approved by review cycle'
+    },
+    # Future labels can be added here (e.g., 'needs-rebase', 'merge-ready', etc.)
+]
+
 
 class GitHubProjectManager:
     """
@@ -489,6 +499,9 @@ class GitHubProjectManager:
             workflow_templates = self.config_manager.get_workflow_templates()
 
             labels_to_create = []
+
+            # Add workflow state labels (used by git workflow automation)
+            labels_to_create.extend(WORKFLOW_STATE_LABELS)
 
             # Collect all labels from enabled pipelines
             for pipeline in project_config.pipelines:

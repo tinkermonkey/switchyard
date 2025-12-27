@@ -99,6 +99,7 @@ class BaseInvestigationAgentRunner(ABC):
         context_file: str,
         output_log: str,
         observability_manager=None,
+        agent_execution_id: Optional[str] = None,
         **kwargs
     ) -> Optional[Dict]:
         """
@@ -109,10 +110,11 @@ class BaseInvestigationAgentRunner(ABC):
             context_file: Path to context.json
             output_log: Path to investigation_log.txt
             observability_manager: Optional observability manager for events
+            agent_execution_id: Optional execution ID for tracking in UI
             **kwargs: Additional context (e.g., project for Claude failures)
 
         Returns:
-            Dict with 'task' (asyncio task), 'container_name', or None if launch failed
+            Dict with 'task' (asyncio task), 'container_name', 'agent_execution_id', or None if launch failed
         """
         try:
             # Build investigation prompt (subclass-specific)
@@ -130,6 +132,7 @@ class BaseInvestigationAgentRunner(ABC):
                 'project': 'clauditoreum',  # Investigating orchestrator logs
                 'observability': observability_manager,
                 'claude_model': self._get_claude_model(),
+                'agent_execution_id': agent_execution_id,  # For UI tracking
             }
 
             # Container name for tracking
@@ -146,14 +149,43 @@ class BaseInvestigationAgentRunner(ABC):
                 logger.error(f"Failed to open log file {output_log}: {e}", exc_info=True)
                 return None
 
-            def stream_to_file(event):
-                """Stream Claude Code events to log file"""
+            def stream_to_file_and_redis(event):
+                """Stream Claude Code events to log file AND Redis (same as pipeline agents)"""
                 import json
+                import time
                 try:
+                    # Write to local log file
                     log_file_handle.write(json.dumps(event) + "\n")
                     log_file_handle.flush()
+
+                    # Publish to Redis using EXACT same format as pipeline agents
+                    if observability_manager and observability_manager.enabled:
+                        event_data = {
+                            'agent': context['agent'],
+                            'task_id': context['task_id'],
+                            'project': context['project'],
+                            'pipeline_run_id': None,  # Investigations don't have pipeline_run_id
+                            'timestamp': event.get('timestamp') or time.time(),
+                            'event': event
+                        }
+                        event_json = json.dumps(event_data)
+
+                        # Publish to pub/sub for real-time delivery
+                        observability_manager.redis.publish('orchestrator:claude_stream', event_json)
+
+                        # Also add to Redis Stream for history (with automatic trimming)
+                        claude_stream_key = "orchestrator:claude_logs_stream"
+                        observability_manager.redis.xadd(
+                            claude_stream_key,
+                            {'log': event_json},
+                            maxlen=500,
+                            approximate=True
+                        )
+
+                        # Set 2-hour TTL on the stream
+                        observability_manager.redis.expire(claude_stream_key, 7200)
                 except Exception as e:
-                    logger.error(f"Error writing to log file: {e}")
+                    logger.error(f"Error in stream callback: {e}")
 
             # Launch investigation as async task
             async def run_investigation():
@@ -170,7 +202,7 @@ class BaseInvestigationAgentRunner(ABC):
                         context=context,
                         project_dir=Path('/workspace/clauditoreum'),
                         mcp_servers=[],  # No MCP needed for investigations
-                        stream_callback=stream_to_file
+                        stream_callback=stream_to_file_and_redis
                     )
                     logger.info(f"Investigation {fingerprint_id} completed in container, result length: {len(result)}")
                     return result
@@ -190,9 +222,10 @@ class BaseInvestigationAgentRunner(ABC):
                 'task': task,
                 'container_name': container_name,  # Track container for monitoring
                 'log_file': log_file_handle,
+                'agent_execution_id': agent_execution_id,  # For UI tracking
             }
 
-            logger.info(f"Returning investigation_info for {fingerprint_id} with container {container_name}")
+            logger.info(f"Returning investigation_info for {fingerprint_id} with container {container_name}, execution_id={agent_execution_id}")
             return result
 
         except Exception as e:

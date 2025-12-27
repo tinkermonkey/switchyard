@@ -181,12 +181,27 @@ class ClaudeFixOrchestrator:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             log_file = self.logs_dir / f"fix_{fingerprint_id}_{timestamp}.jsonl"
 
+            # Emit agent_initialized event and get execution_id for tracking
+            agent_execution_id = self.observability.emit_agent_initialized(
+                agent="claude-fix-executor",
+                task_id=f"fix-{fingerprint_id[:16]}",
+                project=project,
+                config={
+                    "fingerprint_id": fingerprint_id,
+                    "fix_plan_path": fix_plan_path,
+                    "log_file": str(log_file)
+                },
+                container_name=None  # Fix runs on host, not in container
+            )
+
             # Launch fix
             fix_info = await self.runner.launch_fix(
                 fingerprint_id=fingerprint_id,
                 fix_plan_file=fix_plan_path,
                 output_log=str(log_file),
-                project=project
+                project=project,
+                observability_manager=self.observability,
+                agent_execution_id=agent_execution_id
             )
 
             if fix_info:
@@ -210,7 +225,8 @@ class ClaudeFixOrchestrator:
                         "started_at": datetime.now().isoformat(),
                         "log_file": str(log_file),
                         "container_name": container_name,
-                        "project": project
+                        "project": project,
+                        "agent_execution_id": agent_execution_id or ""
                     }
                 )
                 self.redis_client.expire(f"fix:active:{fingerprint_id}", 7200)  # 2 hour TTL
@@ -280,6 +296,14 @@ class ClaudeFixOrchestrator:
                             project=fix_info.get('project', 'unknown'),
                             data={"fingerprint_id": fingerprint_id, "reason": "killed_by_user"}
                         )
+
+                        # Emit agent execution failure event for UI tracking
+                        agent_execution_id = fix_info.get('agent_execution_id')
+                        if agent_execution_id:
+                            self.observability.emit_agent_failed(
+                                agent_execution_id=agent_execution_id,
+                                error="Killed by user request"
+                            )
                     except Exception as e:
                         logger.warning(f"Failed to emit observability event: {e}")
 
@@ -347,6 +371,20 @@ class ClaudeFixOrchestrator:
                                 project=project,
                                 data={"fingerprint_id": fingerprint_id, "error": error_msg}
                             )
+
+                        # Emit agent execution completion event for UI tracking
+                        agent_execution_id = fix_info.get('agent_execution_id')
+                        if agent_execution_id:
+                            if success:
+                                self.observability.emit_agent_completed(
+                                    agent_execution_id=agent_execution_id,
+                                    outputs={"result": "success", "status": status}
+                                )
+                            else:
+                                self.observability.emit_agent_failed(
+                                    agent_execution_id=agent_execution_id,
+                                    error=error_msg or "Fix execution failed"
+                                )
                     except Exception as e:
                         logger.warning(f"Failed to emit observability event: {e}")
 

@@ -367,6 +367,67 @@ class GitHubIntegration:
             logger.error(f"Failed to get PR details: {e}", exc_info=True)
             return {}
 
+    async def find_pr_by_branch(
+        self,
+        branch: str,
+        base: str = "main",
+        state: str = "open"
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Find an existing PR for the given branch
+
+        Args:
+            branch: The head branch name (e.g., "feature/issue-85-...")
+            base: The base branch (default: "main")
+            state: PR state filter - "open", "closed", "all" (default: "open")
+
+        Returns:
+            PR details dict if found, None otherwise
+        """
+        try:
+            repo_arg = f"{self.repo_owner}/{self.repo_name}"
+
+            # Use gh CLI to list PRs for this branch
+            cmd = [
+                'gh', 'pr', 'list',
+                '--repo', repo_arg,
+                '--head', branch,
+                '--base', base,
+                '--state', state,
+                '--json', 'number,title,url,state,isDraft',
+                '--limit', '1'
+            ]
+
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                env=self._get_gh_env()
+            )
+
+            if result.returncode == 0 and result.stdout.strip():
+                import json
+                prs = json.loads(result.stdout)
+                if prs:
+                    pr = prs[0]
+                    logger.info(f"Found existing PR #{pr['number']} for branch {branch}")
+                    return {
+                        'success': True,
+                        'pr_number': pr['number'],
+                        'pr_url': pr['url'],
+                        'state': pr['state'],
+                        'is_draft': pr.get('isDraft', False),
+                        'title': pr['title']
+                    }
+
+            logger.debug(f"No existing PR found for branch {branch}")
+            return None
+
+        except Exception as e:
+            logger.error(f"Failed to find PR by branch: {e}")
+            return None
+
     async def mention_user(self, username: str) -> str:
         """Format user mention"""
         return f"@{username}"
@@ -538,8 +599,43 @@ class GitHubIntegration:
         body: str,
         draft: bool = True
     ) -> Dict[str, Any]:
-        """Create a pull request"""
+        """
+        Create a pull request (idempotent - returns existing PR if already exists)
+
+        Args:
+            branch: The head branch name
+            title: PR title
+            body: PR description
+            draft: Whether to create as draft (default: True)
+
+        Returns:
+            Dict with success, pr_number, pr_url
+        """
         try:
+            # Check if PR already exists for this branch
+            existing_pr = await self.find_pr_by_branch(branch)
+
+            if existing_pr:
+                logger.info(
+                    f"PR already exists for branch {branch}: #{existing_pr['pr_number']}. "
+                    f"Updating body instead of creating new PR."
+                )
+
+                # Update the existing PR body to reflect current state
+                update_success = await self.update_pr_body(
+                    existing_pr['pr_number'],
+                    body
+                )
+
+                return {
+                    'success': True,
+                    'pr_number': existing_pr['pr_number'],
+                    'pr_url': existing_pr['pr_url'],
+                    'already_existed': True,
+                    'updated': update_success
+                }
+
+            # No existing PR - create new one
             repo_arg = f"{self.repo_owner}/{self.repo_name}"
 
             cmd = [
@@ -571,11 +667,33 @@ class GitHubIntegration:
                 return {
                     'success': True,
                     'pr_number': pr_number,
-                    'pr_url': pr_url
+                    'pr_url': pr_url,
+                    'already_existed': False
                 }
             else:
-                logger.error(f"Failed to create PR: {result.stderr}")
-                return {'success': False, 'error': result.stderr}
+                # Even after checking, creation might fail (race condition)
+                # Try to parse the error to see if it's "already exists"
+                error_msg = result.stderr
+
+                if "already exists" in error_msg.lower():
+                    logger.warning(
+                        f"Race condition detected: PR created between check and create. "
+                        f"Attempting to find the PR..."
+                    )
+
+                    # Retry the lookup
+                    existing_pr = await self.find_pr_by_branch(branch)
+                    if existing_pr:
+                        return {
+                            'success': True,
+                            'pr_number': existing_pr['pr_number'],
+                            'pr_url': existing_pr['pr_url'],
+                            'already_existed': True,
+                            'race_condition': True
+                        }
+
+                logger.error(f"Failed to create PR: {error_msg}")
+                return {'success': False, 'error': error_msg}
 
         except Exception as e:
             logger.error(f"Failed to create PR: {e}")

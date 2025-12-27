@@ -565,6 +565,47 @@ class ObservabilityManager:
             'chunk_length': len(chunk)
         })
 
+    def emit_claude_stream_event(self, agent: str, task_id: str, project: str,
+                                  stream_event: Dict[str, Any],
+                                  pipeline_run_id: Optional[str] = None):
+        """
+        Emit Claude Code stream event to Elasticsearch for agent execution tracking.
+
+        This stores raw Claude Code output events (assistant messages, tool calls, etc.)
+        in the claude-streams-* index for display in the agent execution UI.
+
+        Args:
+            agent: Agent name
+            task_id: Task ID
+            project: Project name
+            stream_event: Raw Claude Code event dict (e.g., {"type": "assistant", "message": {...}})
+            pipeline_run_id: Optional pipeline run ID for tracking
+        """
+        if not self.enabled or not self.es:
+            return
+
+        try:
+            # Create index name based on current date
+            index_name = f"claude-streams-{utc_now().strftime('%Y-%m-%d')}"
+
+            # Prepare document for Elasticsearch
+            doc = {
+                'timestamp': stream_event.get('timestamp', utc_isoformat()),
+                'event_type': 'claude_stream',  # Top-level event type for querying
+                'event_category': 'claude_stream',  # Category for filtering
+                'agent': agent,
+                'task_id': task_id,
+                'project': project,
+                'pipeline_run_id': pipeline_run_id,
+                'raw_event': stream_event  # Store the complete Claude Code event
+            }
+
+            # Index the document
+            self.es.index(index=index_name, document=doc)
+            logger.debug(f"Indexed Claude stream event to {index_name} for {agent}/{task_id}")
+        except Exception as e:
+            logger.error(f"Failed to index Claude stream event to Elasticsearch: {e}")
+
     def emit_tool_execution(self, agent: str, task_id: str, project: str,
                            tool_name: str, started: bool, duration_ms: Optional[float] = None,
                            result_summary: Optional[str] = None):

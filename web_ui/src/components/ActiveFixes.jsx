@@ -98,10 +98,12 @@ export default function ActiveFixes() {
 
   const getStatusColor = (status) => {
     switch (status) {
+      case 'queued':
+        return 'text-yellow-500 bg-yellow-500/10 border-yellow-500/20'
+      case 'starting':
+        return 'text-orange-500 bg-orange-500/10 border-orange-500/20'
       case 'in_progress':
         return 'text-blue-500 bg-blue-500/10 border-blue-500/20'
-      case 'starting':
-        return 'text-yellow-500 bg-yellow-500/10 border-yellow-500/20'
       default:
         return 'text-gray-500 bg-gray-500/10 border-gray-500/20'
     }
@@ -109,10 +111,12 @@ export default function ActiveFixes() {
 
   const getStatusLabel = (status) => {
     switch (status) {
-      case 'in_progress':
-        return 'Running'
+      case 'queued':
+        return 'Queued'
       case 'starting':
         return 'Starting'
+      case 'in_progress':
+        return 'Running'
       default:
         return status
     }
@@ -162,7 +166,11 @@ export default function ActiveFixes() {
                 <tr key={fix.fingerprint_id} className="hover:bg-gh-canvas-inset">
                   <td className="px-4 py-3">
                     <div className="flex items-center gap-2">
-                      <Loader2 className="w-4 h-4 animate-spin text-blue-500" />
+                      {fix.status === 'queued' ? (
+                        <Clock className="w-4 h-4 text-yellow-500" />
+                      ) : (
+                        <Loader2 className="w-4 h-4 animate-spin text-blue-500" />
+                      )}
                       <code className="text-xs text-gh-fg font-mono">
                         {fix.fingerprint_id.substring(0, 16)}...
                       </code>

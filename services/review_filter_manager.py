@@ -39,6 +39,28 @@ class ReviewFilterManager:
 
         self.filters_index = "review-filters"
 
+    def _ensure_index_exists(self) -> bool:
+        """
+        Ensure the review-filters index exists, creating it if necessary.
+
+        Returns:
+            True if index exists or was created, False if creation failed
+        """
+        try:
+            if not self.es.indices.exists(index=self.filters_index):
+                logger.info(f"Creating {self.filters_index} index...")
+                from services.review_learning_schema import REVIEW_FILTERS_INDEX
+
+                self.es.indices.create(
+                    index=self.filters_index,
+                    body=REVIEW_FILTERS_INDEX
+                )
+                logger.info(f"{self.filters_index} index created successfully")
+            return True
+        except Exception as e:
+            logger.warning(f"Could not ensure {self.filters_index} index exists: {e}")
+            return False
+
     async def create_filter(self, filter_data: Dict[str, Any]) -> str:
         """
         Create a new review filter.
@@ -137,7 +159,7 @@ class ReviewFilterManager:
             active_only: Only return active filters
 
         Returns:
-            List of filter configurations
+            List of filter configurations (empty if index doesn't exist)
         """
         # Check cache first
         cache_key = f"filters:{agent_name}:{min_confidence}:{active_only}"
@@ -146,6 +168,12 @@ class ReviewFilterManager:
         if cached:
             import json
             return json.loads(cached)
+
+        # Ensure index exists (lazy initialization)
+        if not self._ensure_index_exists():
+            # Index doesn't exist and couldn't be created - return empty
+            logger.debug(f"Review filters index not available, returning empty filters for {agent_name}")
+            return []
 
         try:
             # Build query
@@ -182,11 +210,15 @@ class ReviewFilterManager:
             import json
             self.redis.setex(cache_key, 300, json.dumps(filters))
 
-            logger.info(f"Retrieved {len(filters)} filters for {agent_name}")
+            if filters:
+                logger.info(f"Retrieved {len(filters)} filters for {agent_name}")
+            else:
+                logger.debug(f"No filters found for {agent_name}")
+
             return filters
 
         except Exception as e:
-            logger.error(f"Error getting agent filters: {e}")
+            logger.warning(f"Error querying agent filters for {agent_name}: {e}")
             return []
 
     async def get_filter_by_pattern(
@@ -206,6 +238,11 @@ class ReviewFilterManager:
         Returns:
             Filter if exists, None otherwise
         """
+        # Ensure index exists (lazy initialization)
+        if not self._ensure_index_exists():
+            logger.debug("Review filters index not available")
+            return None
+
         filter_id = self._generate_filter_id(agent, category, pattern_sig)
 
         try:
@@ -264,6 +301,11 @@ class ReviewFilterManager:
             Number of filters pruned
         """
         logger.info(f"Pruning stale filters (age > {max_age_days}d, effectiveness < {min_effectiveness})")
+
+        # Ensure index exists (lazy initialization)
+        if not self._ensure_index_exists():
+            logger.debug("Review filters index not available")
+            return 0
 
         try:
             # Query for stale filters
@@ -333,6 +375,11 @@ class ReviewFilterManager:
         Returns:
             Dict with metrics
         """
+        # Ensure index exists (lazy initialization)
+        if not self._ensure_index_exists():
+            logger.debug("Review filters index not available")
+            return {}
+
         try:
             # Aggregate metrics
             query = {

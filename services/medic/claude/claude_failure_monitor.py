@@ -125,7 +125,7 @@ class ClaudeFailureMonitor:
             max_timestamp = last_processed
             for project, session_id, timestamp_range in sessions:
                 try:
-                    self._process_session(project, session_id, last_processed, datetime.utcnow().isoformat() + 'Z')
+                    await self._process_session(project, session_id, last_processed, datetime.utcnow().isoformat() + 'Z')
                     self.sessions_processed += 1
 
                     # Track max timestamp
@@ -202,7 +202,7 @@ class ClaudeFailureMonitor:
             self.logger.error(f"Failed to find sessions with failures: {e}")
             return []
 
-    def _process_session(self, project: str, session_id: str, start_time: str, end_time: str):
+    async def _process_session(self, project: str, session_id: str, start_time: str, end_time: str):
         """Process a single session to create failure signatures"""
         # Cluster failures
         clusters = self.clustering_engine.cluster_failures_for_session(
@@ -225,15 +225,19 @@ class ClaudeFailureMonitor:
                 # Generate fingerprint
                 fingerprint = self.fingerprint_engine.generate_from_cluster(cluster)
 
-                # Create or update signature
-                signature = self.signature_store.create_or_update_signature(
+                # Record occurrence (create or update signature)
+                await self.signature_store.record_occurrence(
                     fingerprint,
-                    cluster
+                    cluster,
+                    {"project": project}
                 )
 
                 # Track metrics
                 self.clusters_created += 1
-                if signature.get('cluster_count', 0) == 1:
+
+                # Get signature to check if it's new
+                signature = await self.signature_store._get_signature(fingerprint.fingerprint_id)
+                if signature and signature.get('cluster_count', 0) == 1:
                     self.signatures_created += 1
                     # TODO: Emit event for real-time UI updates
                     # self.obs.emit requires agent, task_id, project - need to adapt for medic events
@@ -241,7 +245,8 @@ class ClaudeFailureMonitor:
                     self.signatures_updated += 1
 
                 # Check auto-trigger thresholds
-                self._check_auto_trigger(fingerprint.fingerprint_id, signature)
+                if signature:
+                    self._check_auto_trigger(fingerprint.fingerprint_id, signature)
 
             except Exception as e:
                 self.logger.error(f"Failed to process cluster {cluster.cluster_id}: {e}", exc_info=True)

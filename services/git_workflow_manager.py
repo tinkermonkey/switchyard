@@ -278,8 +278,9 @@ class GitWorkflowManager:
                     logger.info(f"Added 'approved' label to PR #{pr_number}")
                     return True
                 else:
-                    logger.warning(f"Failed to add approved label: {result.stderr}")
-                    # Not a critical failure
+                    logger.error(f"Failed to add approved label: {result.stderr}. "
+                                 f"Ensure 'approved' label exists in {org}/{repo}")
+                    # Not a critical failure - workflow can continue
                     return True
 
             elif status == 'merged':

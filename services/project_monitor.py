@@ -2526,6 +2526,7 @@ _Review cycle initiated by Claude Code Orchestrator_
         repository: str,
         project_config,
         workflow_template,
+        agent_name: str,
         pipeline_run_id: Optional[str] = None
     ):
         """
@@ -2826,12 +2827,9 @@ _Review cycle initiated by Claude Code Orchestrator_
                 # This prevents stale 'in_progress' states that block future work
                 try:
                     from services.work_execution_state import work_execution_tracker
-                    agent_name = (
-                        repair_result.get('stage', 'senior_software_engineer') 
-                        if repair_result 
-                        else 'senior_software_engineer'
-                    )
-                    
+                    # agent_name is now passed as a parameter to this function
+                    # No need to extract from repair_result
+
                     outcome = 'success' if overall_success else 'failure'
                     
                     # If we never got an exit code, container failed during launch
@@ -3234,6 +3232,7 @@ _Repair cycle initiated by Claude Code Orchestrator_
                 repository=repository,
                 project_config=project_config,
                 workflow_template=workflow_template,
+                agent_name=stage_config.default_agent,
                 pipeline_run_id=pipeline_run.id
             )
 

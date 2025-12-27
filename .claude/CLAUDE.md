@@ -56,6 +56,10 @@ This is the Claude Code Agent Orchestrator - an autonomous AI development system
 - Git state tracking
 - Conversation history for multi-turn interactions
 
+**Debug Scripts** (`scripts/`)
+- Utilities for maintenance tasks (branch cleanup, state inspection)
+- Use these to investigate issues or perform routine maintenance
+
 ### Workspace Isolation
 
 **Host File System**:

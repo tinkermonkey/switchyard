@@ -11,6 +11,7 @@ Subclasses must implement:
 """
 
 import logging
+import time
 from abc import ABC, abstractmethod
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List, Tuple
@@ -325,13 +326,24 @@ class BaseFailureSignatureStore(ABC):
             logger.warning(f"Signature {fingerprint_id} not found for status update")
             return False
 
-    def update_investigation_status(self, fingerprint_id: str, investigation_status: str):
+    def update_investigation_status(
+        self,
+        fingerprint_id: str,
+        investigation_status: str,
+        max_retries: int = 3
+    ) -> bool:
         """
-        Update the investigation status of a failure signature.
+        Update the investigation status of a failure signature with retry logic.
+
+        DEPRECATED: Use update_investigation_status_es_first instead for ES-first architecture.
 
         Args:
             fingerprint_id: Fingerprint ID
             investigation_status: Investigation status (not_started, queued, in_progress, etc.)
+            max_retries: Maximum number of retry attempts (default: 3)
+
+        Returns:
+            True if update succeeded, False otherwise
         """
         now = utc_isoformat()
 
@@ -343,19 +355,181 @@ class BaseFailureSignatureStore(ABC):
             },
         }
 
-        result = update_by_query(
-            self.es,
-            f"{self.INDEX_PREFIX}-*",
-            script,
-            {"term": {"fingerprint_id": fingerprint_id}}
-        )
+        # Retry with exponential backoff: 0.5s, 1s, 2s
+        delays = [0.5, 1.0, 2.0]
 
-        if result and result.get("updated", 0) > 0:
-            logger.info(f"Updated investigation status for {fingerprint_id[:16]}... to {investigation_status}")
-            return True
-        else:
-            logger.warning(f"Signature {fingerprint_id} not found for investigation status update")
-            return False
+        for attempt in range(max_retries):
+            try:
+                result = update_by_query(
+                    self.es,
+                    f"{self.INDEX_PREFIX}-*",
+                    script,
+                    {"term": {"fingerprint_id": fingerprint_id}},
+                    refresh=True,
+                    conflicts="proceed"
+                )
+
+                if result and result.get("updated", 0) > 0:
+                    if attempt > 0:
+                        logger.info(
+                            f"Updated investigation status for {fingerprint_id[:16]}... "
+                            f"to {investigation_status} (succeeded on attempt {attempt + 1})"
+                        )
+                    else:
+                        logger.info(
+                            f"Updated investigation status for {fingerprint_id[:16]}... "
+                            f"to {investigation_status}"
+                        )
+                    return True
+                else:
+                    # Document not found - retry may help if it's an indexing delay
+                    if attempt < max_retries - 1:
+                        logger.debug(
+                            f"Signature {fingerprint_id} not found on attempt {attempt + 1}, "
+                            f"retrying in {delays[attempt]}s..."
+                        )
+                        time.sleep(delays[attempt])
+                    else:
+                        logger.warning(
+                            f"Signature {fingerprint_id} not found after {max_retries} attempts "
+                            f"for investigation status update"
+                        )
+                        return False
+
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    logger.warning(
+                        f"Failed to update investigation status for {fingerprint_id[:16]}... "
+                        f"on attempt {attempt + 1}: {e}. Retrying in {delays[attempt]}s..."
+                    )
+                    time.sleep(delays[attempt])
+                else:
+                    logger.error(
+                        f"Failed to update investigation status for {fingerprint_id[:16]}... "
+                        f"after {max_retries} attempts: {e}"
+                    )
+                    return False
+
+        return False
+
+    def update_investigation_status_es_first(
+        self,
+        fingerprint_id: str,
+        status: str,
+        metadata: Optional[Dict] = None,
+        expected_current: Optional[List[str]] = None,
+        max_retries: int = 3
+    ) -> bool:
+        """
+        Update investigation status in ES with retry and optimistic locking (ES-FIRST).
+
+        This is a BLOCKING operation - caller waits until ES persisted.
+        Use this for the ES-first architecture where ES is the source of truth.
+
+        Args:
+            fingerprint_id: Investigation fingerprint
+            status: New investigation_status value
+            metadata: Optional investigation_metadata fields to update (dict with nested keys like "container_name", "started_at", etc.)
+            expected_current: List of valid current statuses for optimistic locking (None = no check)
+            max_retries: Number of retry attempts (default: 3)
+
+        Returns:
+            True if updated successfully, False if failed after retries or optimistic lock conflict
+
+        Example:
+            success = store.update_investigation_status_es_first(
+                fp_id,
+                status="in_progress",
+                metadata={"container_name": "inv-12345", "started_at": "2025-01-01T00:00:00Z"},
+                expected_current=["queued"]
+            )
+        """
+        now = utc_isoformat()
+
+        # Build Painless script for ES update
+        script_source = """
+            if (params.expected_statuses != null &&
+                !params.expected_statuses.contains(ctx._source.investigation_status)) {
+                ctx.op = 'none';  // Abort - optimistic lock failed
+            } else {
+                ctx._source.investigation_status = params.new_status;
+                ctx._source.updated_at = params.updated_at;
+                if (params.metadata != null) {
+                    if (ctx._source.investigation_metadata == null) {
+                        ctx._source.investigation_metadata = [:];
+                    }
+                    for (entry in params.metadata.entrySet()) {
+                        ctx._source.investigation_metadata[entry.getKey()] = entry.getValue();
+                    }
+                }
+            }
+        """
+
+        script = {
+            "source": script_source,
+            "params": {
+                "new_status": status,
+                "updated_at": now,
+                "expected_statuses": expected_current,
+                "metadata": metadata
+            }
+        }
+
+        # Exponential backoff: 0.5s, 1s, 2s
+        delays = [0.5, 1.0, 2.0]
+
+        for attempt in range(max_retries):
+            try:
+                result = update_by_query(
+                    self.es,
+                    f"{self.INDEX_PREFIX}-*",
+                    script,
+                    {"term": {"fingerprint_id": fingerprint_id}},
+                    refresh=True,  # Block until searchable (wait_for)
+                    conflicts="proceed"
+                )
+
+                if result and result.get("updated", 0) > 0:
+                    logger.info(
+                        f"ES-first update: {fingerprint_id[:16]}... -> {status}" +
+                        (f" (metadata: {list(metadata.keys())})" if metadata else "")
+                    )
+                    return True
+                elif result and result.get("updated", 0) == 0:
+                    # Could be optimistic lock failure or document not found
+                    logger.warning(
+                        f"ES-first update rejected for {fingerprint_id[:16]}... "
+                        f"(optimistic lock failed or not found)"
+                    )
+                    return False
+                else:
+                    # Retry
+                    if attempt < max_retries - 1:
+                        logger.debug(
+                            f"ES-first update attempt {attempt + 1} failed for {fingerprint_id[:16]}..., "
+                            f"retrying in {delays[attempt]}s"
+                        )
+                        time.sleep(delays[attempt])
+                    else:
+                        logger.error(
+                            f"ES-first update failed after {max_retries} attempts for {fingerprint_id[:16]}..."
+                        )
+                        return False
+
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    logger.warning(
+                        f"ES-first update error on attempt {attempt + 1} for {fingerprint_id[:16]}...: {e}. "
+                        f"Retrying in {delays[attempt]}s..."
+                    )
+                    time.sleep(delays[attempt])
+                else:
+                    logger.error(
+                        f"ES-first update failed after {max_retries} attempts for {fingerprint_id[:16]}...: {e}"
+                    )
+                    return False
+
+        return False
 
     def cleanup_stale_signatures(self, days: int = 7) -> Tuple[int, List[str]]:
         """

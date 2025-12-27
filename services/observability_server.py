@@ -10,6 +10,7 @@ import asyncio
 import json
 import logging
 import redis
+from typing import List
 from flask import Flask, request, jsonify
 from flask_socketio import SocketIO, emit
 from flask_cors import CORS
@@ -1456,6 +1457,15 @@ def get_review_filters():
 
         filter_manager = get_review_filter_manager()
 
+        # Check if index exists, create if needed
+        if not filter_manager._ensure_index_exists():
+            return jsonify({
+                'success': True,
+                'filters': [],
+                'count': 0,
+                'message': 'Review filters index not initialized'
+            })
+
         # Get query parameters
         agent = request.args.get('agent')
         active_only = request.args.get('active_only', 'true').lower() == 'true'
@@ -1576,6 +1586,13 @@ def update_review_filter(filter_id):
 
         filter_manager = get_review_filter_manager()
 
+        # Check if index exists
+        if not filter_manager._ensure_index_exists():
+            return jsonify({
+                'success': False,
+                'error': 'Review filters index not available'
+            }), 503
+
         # Get update data from request
         data = request.get_json()
 
@@ -1625,6 +1642,13 @@ def delete_review_filter(filter_id):
 
         filter_manager = get_review_filter_manager()
 
+        # Check if index exists
+        if not filter_manager._ensure_index_exists():
+            return jsonify({
+                'success': False,
+                'error': 'Review filters index not available'
+            }), 503
+
         # Delete from Elasticsearch
         filter_manager.es.delete(
             index=filter_manager.filters_index,
@@ -1655,6 +1679,13 @@ def toggle_review_filter(filter_id):
         from datetime import datetime
 
         filter_manager = get_review_filter_manager()
+
+        # Check if index exists
+        if not filter_manager._ensure_index_exists():
+            return jsonify({
+                'success': False,
+                'error': 'Review filters index not available'
+            }), 503
 
         # Get current state
         result = filter_manager.es.get(
@@ -3110,6 +3141,118 @@ def redis_subscriber_thread():
         redis_subscriber_thread()
 
 
+# ========== MEDIC HELPER FUNCTIONS ==========
+
+def _enrich_signatures_with_redis_status(signatures: List[dict], system_type: str = "docker") -> List[dict]:
+    """
+    Enrich Elasticsearch signature results with real-time Redis status.
+
+    This ensures the UI always shows the authoritative investigation status from Redis,
+    overriding potentially stale Elasticsearch data.
+
+    Args:
+        signatures: List of signature dicts from Elasticsearch
+        system_type: "docker" or "claude" to determine Redis key prefix
+
+    Returns:
+        Enriched signature list with updated investigation_status field
+    """
+    if not signatures:
+        return signatures
+
+    try:
+        # Initialize Redis client with string responses
+        redis_client = redis.Redis(host=redis_host, port=redis_port, decode_responses=True)
+
+        # Determine Redis key prefix
+        if system_type == "docker":
+            prefix = "medic:docker_investigation"
+        elif system_type == "claude":
+            prefix = "medic:claude_investigation"
+        else:
+            logger.warning(f"Unknown system_type '{system_type}', skipping enrichment")
+            return signatures
+
+        # Get current state from Redis (batch operations for efficiency)
+        active_set = redis_client.smembers(f"{prefix}:active")
+        queued_list = redis_client.lrange(f"{prefix}:queue", 0, -1)
+        queued_set = set(queued_list)
+
+        # Enrich each signature
+        for sig in signatures:
+            fp_id = sig.get('fingerprint_id')
+            if not fp_id:
+                continue
+
+            try:
+                # Query Redis for authoritative status
+                redis_status_key = f"{prefix}:{fp_id}:status"
+                redis_status = redis_client.get(redis_status_key)
+                in_active = fp_id in active_set
+                in_queue = fp_id in queued_set
+
+                # Determine authoritative status from Redis
+                authoritative_status = None
+                status_source = "elasticsearch"  # Default
+
+                if in_queue:
+                    authoritative_status = "queued"
+                    status_source = "redis"
+                elif in_active:
+                    # In active set - check status key for precision
+                    if redis_status == "in_progress":
+                        authoritative_status = "in_progress"
+                    elif redis_status == "starting":
+                        authoritative_status = "starting"
+                    else:
+                        authoritative_status = "in_progress"  # Default for active
+                    status_source = "redis"
+                elif redis_status:
+                    # Not in queue or active, but has Redis status
+                    # Map Redis status to ES status
+                    status_map = {
+                        "completed": "completed",
+                        "failed": "failed",
+                        "ignored": "ignored",
+                        "timeout": "timeout",
+                        "stalled": "failed",
+                    }
+                    authoritative_status = status_map.get(redis_status, redis_status)
+                    status_source = "redis"
+
+                # Override ES status if Redis has authoritative data
+                if authoritative_status:
+                    es_status = sig.get('investigation_status')
+                    if es_status != authoritative_status:
+                        logger.debug(
+                            f"Enrichment override for {fp_id[:16]}...: "
+                            f"ES:{es_status} -> Redis:{authoritative_status}"
+                        )
+                        sig['investigation_status'] = authoritative_status
+                        sig['_status_source'] = status_source
+                        sig['_status_enriched'] = True
+                    else:
+                        sig['_status_source'] = status_source
+                        sig['_status_enriched'] = False
+                else:
+                    # No Redis data - keep ES status
+                    sig['_status_source'] = "elasticsearch"
+                    sig['_status_enriched'] = False
+
+            except Exception as e:
+                logger.error(f"Error enriching signature {fp_id}: {e}")
+                # On error, keep original ES data
+                sig['_status_source'] = "elasticsearch"
+                sig['_status_enriched'] = False
+
+        return signatures
+
+    except Exception as e:
+        logger.error(f"Error in signature enrichment: {e}", exc_info=True)
+        # On error, return original signatures unchanged
+        return signatures
+
+
 # ========== MEDIC API ENDPOINTS ==========
 
 @app.route('/api/medic/failure-signatures', methods=['GET'])
@@ -3181,6 +3324,9 @@ def get_failure_signatures():
 
         signatures = [hit['_source'] for hit in result['hits']['hits']]
 
+        # Enrich with real-time Redis status (source of truth)
+        signatures = _enrich_signatures_with_redis_status(signatures, system_type="docker")
+
         return jsonify({
             'signatures': signatures,
             'total': result['hits']['total']['value'],
@@ -3216,6 +3362,21 @@ def get_failure_signature(fingerprint_id):
             return jsonify({'error': 'Signature not found'}), 404
 
         signature = result['hits']['hits'][0]['_source']
+
+        # Fetch agent_execution_id from Redis if investigation is active
+        try:
+            import redis
+            redis_client = redis.Redis(
+                host=os.getenv('REDIS_HOST', 'redis'),
+                port=int(os.getenv('REDIS_PORT', 6379)),
+                decode_responses=True
+            )
+            agent_execution_id = redis_client.get(f"medic:docker_investigation:{fingerprint_id}:agent_execution_id")
+            if agent_execution_id:
+                signature['agent_execution_id'] = agent_execution_id
+            redis_client.close()
+        except Exception as e:
+            logger.warning(f"Failed to fetch agent_execution_id from Redis: {e}")
 
         return jsonify(signature), 200
 
@@ -3572,11 +3733,10 @@ def start_investigation(fingerprint_id):
         enqueued = queue.enqueue(fingerprint_id, priority=priority)
 
         if enqueued:
-            # Update ES investigation status
+            # Update ES investigation status (synchronous with retry logic)
             from services.medic.docker import DockerFailureSignatureStore
             store = DockerFailureSignatureStore(es_client)
-            import asyncio
-            asyncio.run(store.update_investigation_status(fingerprint_id, "queued"))
+            store.update_investigation_status(fingerprint_id, "queued")
 
             return jsonify({
                 "fingerprint_id": fingerprint_id,
@@ -3781,6 +3941,9 @@ def get_claude_failure_signatures():
 
         signatures = [hit['_source'] for hit in result['hits']['hits']]
 
+        # Enrich with real-time Redis status (source of truth)
+        signatures = _enrich_signatures_with_redis_status(signatures, system_type="claude")
+
         return jsonify({
             'signatures': signatures,
             'total': result['hits']['total']['value'],
@@ -3916,15 +4079,19 @@ def get_claude_medic_stats():
         total_failures = int(total_result.get('aggregations', {}).get('total_failures', {}).get('value', 0))
         total_clusters = int(total_result.get('aggregations', {}).get('total_clusters', {}).get('value', 0))
 
-        # Get under investigation count from Redis active set
+        # Get under investigation count from Redis active sets (both Docker and Claude)
         redis_client = redis.Redis(host='redis', port=6379, decode_responses=True)
-        under_investigation = redis_client.scard("medic:claude_investigation:active")
+        docker_active = redis_client.scard("medic:docker_investigation:active") or 0
+        claude_active = redis_client.scard("medic:claude_investigation:active") or 0
+        under_investigation = docker_active + claude_active
 
         return jsonify({
             'total_signatures': sum(status_counts.values()),
             'total_failures': total_failures,
             'total_clusters': total_clusters,
             'under_investigation': under_investigation,
+            'docker_investigations_active': docker_active,
+            'claude_investigations_active': claude_active,
             'by_status': status_counts,
             'by_tool': tool_counts,
             'by_error_type': error_type_counts,
@@ -4495,18 +4662,27 @@ def get_claude_fix_status(fingerprint_id):
     try:
         from services.fix_orchestrator.fix_execution_queue import ClaudeFixExecutionQueue
         import redis
-        
+
         redis_client = redis.Redis(
             host=os.getenv('REDIS_HOST', 'redis'),
             port=int(os.getenv('REDIS_PORT', 6379)),
             decode_responses=True
         )
-        
+
         queue = ClaudeFixExecutionQueue(redis_client)
         status_info = queue.get_fix_info(fingerprint_id)
-        
+
+        # Try to get agent_execution_id from active fix info in Redis
+        try:
+            active_fix = redis_client.hgetall(f"fix:active:{fingerprint_id}")
+            if active_fix and 'agent_execution_id' in active_fix:
+                status_info['agent_execution_id'] = active_fix['agent_execution_id']
+        except Exception as e:
+            logger.warning(f"Failed to fetch agent_execution_id from Redis: {e}")
+
+        redis_client.close()
         return jsonify(status_info), 200
-        
+
     except Exception as e:
         logger.error(f"Failed to get Claude fix status: {e}", exc_info=True)
         return jsonify({'error': str(e)}), 500
@@ -4561,7 +4737,7 @@ def get_claude_fix_log(fingerprint_id):
 
 @app.route('/fix-orchestrator/active', methods=['GET'])
 def get_active_fixes():
-    """Get all currently active fixes."""
+    """Get all currently active and queued fixes."""
     try:
         import redis
         redis_client = redis.Redis(
@@ -4569,12 +4745,32 @@ def get_active_fixes():
             port=int(os.getenv('REDIS_PORT', 6379)),
             decode_responses=True
         )
-        keys = redis_client.keys("fix:active:*")
 
-        active_fixes = []
+        all_fixes = []
+
+        # 1. Get queued fixes from the queue
+        queued_fingerprints = redis_client.lrange("medic:claude_fix:queue", 0, -1)
+        for fingerprint_id in queued_fingerprints:
+            status = redis_client.get(f"medic:claude_fix:{fingerprint_id}:status")
+            project = redis_client.get(f"medic:claude_fix:{fingerprint_id}:project")
+            # Try multiple timestamp fields
+            queued_at = (redis_client.get(f"medic:claude_fix:{fingerprint_id}:queued_at") or
+                        redis_client.get(f"medic:claude_fix:{fingerprint_id}:started_at"))
+
+            all_fixes.append({
+                "fingerprint_id": fingerprint_id,
+                "status": status or "queued",
+                "started_at": queued_at,
+                "log_file": None,
+                "container_name": None,
+                "project": project
+            })
+
+        # 2. Get active/running fixes from fix:active:* keys
+        keys = redis_client.keys("fix:active:*")
         for key in keys:
             fix_data = redis_client.hgetall(key)
-            active_fixes.append({
+            all_fixes.append({
                 "fingerprint_id": fix_data.get("fingerprint_id"),
                 "status": fix_data.get("status"),
                 "started_at": fix_data.get("started_at"),
@@ -4584,7 +4780,7 @@ def get_active_fixes():
             })
 
         redis_client.close()
-        return jsonify(active_fixes), 200
+        return jsonify(all_fixes), 200
     except Exception as e:
         logger.error(f"Failed to get active fixes: {e}", exc_info=True)
         return jsonify({"error": str(e)}), 500
@@ -4662,6 +4858,7 @@ def get_active_investigations():
                 container_name = redis_client.get(f"{prefix}:{fp_id}:container_name")
                 started_at = redis_client.get(f"{prefix}:{fp_id}:started_at")
                 last_heartbeat = redis_client.get(f"{prefix}:{fp_id}:last_heartbeat")
+                agent_execution_id = redis_client.get(f"{prefix}:{fp_id}:agent_execution_id")
 
                 # Verify container is actually running
                 container_running = check_container_running(container_name) if container_name else False
@@ -4682,7 +4879,8 @@ def get_active_investigations():
                     "container_running": container_running,
                     "health": health,
                     "started_at": started_at,
-                    "last_heartbeat": last_heartbeat
+                    "last_heartbeat": last_heartbeat,
+                    "agent_execution_id": agent_execution_id
                 })
 
         redis_client.close()

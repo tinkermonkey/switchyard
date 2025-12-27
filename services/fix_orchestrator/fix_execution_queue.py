@@ -84,8 +84,10 @@ class ClaudeFixExecutionQueue:
         if fix_plan_path:
             self.redis.set(self._key(fingerprint_id, "fix_plan_path"), fix_plan_path)
 
-        # Set initial status
+        # Set initial status and queued timestamp
         self.redis.set(self._key(fingerprint_id, "status"), self.STATUS_QUEUED)
+        queued_at = datetime.now(timezone.utc).isoformat()
+        self.redis.set(self._key(fingerprint_id, "queued_at"), queued_at)
 
         # Add to queue
         self.redis.rpush("medic:claude_fix:queue", fingerprint_id)

@@ -269,6 +269,29 @@ agents:
       - elasticsearch_query
     mcp_servers: []
 
+  medic-investigator:
+    description: "Investigates recurring failure patterns and diagnoses root causes (Docker medic system)"
+    model: "claude-sonnet-4-5-20250929"
+    timeout: 600  # 10 minutes for investigation
+    retries: 1
+    makes_code_changes: false  # Only investigates and produces reports
+    filesystem_write_allowed: true  # Can write investigation reports
+    requires_dev_container: false  # Investigating orchestrator, not project code
+    requires_docker: true
+    capabilities:
+      - failure_pattern_analysis
+      - root_cause_diagnosis
+      - codebase_investigation
+      - log_analysis
+      - elasticsearch_querying
+      - docker_log_analysis
+    tools_enabled:
+      - file_operations
+      - git_integration
+      - grep_search
+      - docker_operations
+    mcp_servers: []
+
 # Default agent configuration applied to all agents
 default_config:
   working_directory: "/workspace/{project_name}"

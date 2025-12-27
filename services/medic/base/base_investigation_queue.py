@@ -72,13 +72,16 @@ class BaseInvestigationQueue:
         """Generate Redis key for investigation data."""
         return f"{self.KEY_PREFIX}:{fingerprint_id}:{suffix}"
 
-    def enqueue(self, fingerprint_id: str, priority: str = "normal") -> bool:
+    def enqueue(self, fingerprint_id: str, priority: str = "normal", es_store=None) -> bool:
         """
         Add investigation to queue if not already queued/in-progress.
+
+        For ES-first architecture: ES is updated first, then Redis.
 
         Args:
             fingerprint_id: Failure signature ID
             priority: "low", "normal", "high" (affects queue position)
+            es_store: Optional ES signature store for ES-first updates (if None, uses Redis-only mode)
 
         Returns:
             True if enqueued, False if already exists
@@ -93,7 +96,20 @@ class BaseInvestigationQueue:
             logger.info(f"Investigation {fingerprint_id} already {status}, not re-enqueuing")
             return False
 
-        # Set initial status
+        # ES-first: Update Elasticsearch first if es_store provided
+        if es_store:
+            from monitoring.timestamp_utils import utc_isoformat
+            success = es_store.update_investigation_status_es_first(
+                fingerprint_id,
+                status="queued",
+                metadata=None,
+                expected_current=["not_started", "failed", "timeout", "completed", "ignored"]
+            )
+            if not success:
+                logger.warning(f"Failed to update ES for {fingerprint_id}, aborting enqueue")
+                return False
+
+        # Set initial status in Redis
         self.redis.set(self._key(fingerprint_id, "status"), self.STATUS_QUEUED)
 
         # Add to queue based on priority
@@ -120,6 +136,15 @@ class BaseInvestigationQueue:
         # If queue is empty, return None (caller will sleep and retry)
         return None
 
+    def get_all_queued(self) -> List[str]:
+        """
+        Get all fingerprint IDs currently in the queue.
+
+        Returns:
+            List of fingerprint IDs in the queue
+        """
+        return self.redis.lrange(self.QUEUE_KEY, 0, -1)
+
     def get_status(self, fingerprint_id: str) -> Optional[str]:
         """
         Get investigation status.
@@ -128,10 +153,15 @@ class BaseInvestigationQueue:
             fingerprint_id: Fingerprint ID
 
         Returns:
-            Status string or None
+            Status string or None (always decoded to string)
         """
         status = self.redis.get(self._key(fingerprint_id, "status"))
-        return status if status else None
+        if status is None:
+            return None
+        # Decode bytes to string if needed
+        if isinstance(status, bytes):
+            return status.decode('utf-8')
+        return status
 
     def update_status(self, fingerprint_id: str, status: str):
         """
@@ -248,18 +278,26 @@ class BaseInvestigationQueue:
             fingerprint_id: Fingerprint ID
 
         Returns:
-            Dict with investigation data
+            Dict with investigation data (all values decoded to strings)
         """
+        def decode_value(value):
+            """Helper to decode bytes to string if needed"""
+            if value is None:
+                return None
+            if isinstance(value, bytes):
+                return value.decode('utf-8')
+            return value
+
         return {
             "fingerprint_id": fingerprint_id,
-            "status": self.get_status(fingerprint_id),
-            "pid": self.redis.get(self._key(fingerprint_id, "pid")),
-            "container_name": self.redis.get(self._key(fingerprint_id, "container_name")),
-            "started_at": self.redis.get(self._key(fingerprint_id, "started_at")),
-            "last_heartbeat": self.redis.get(self._key(fingerprint_id, "last_heartbeat")),
-            "agent_output_lines": self.redis.get(self._key(fingerprint_id, "agent_output_lines")),
-            "result": self.redis.get(self._key(fingerprint_id, "result")),
-            "completed_at": self.redis.get(self._key(fingerprint_id, "completed_at")),
+            "status": self.get_status(fingerprint_id),  # Already returns string
+            "pid": decode_value(self.redis.get(self._key(fingerprint_id, "pid"))),
+            "container_name": decode_value(self.redis.get(self._key(fingerprint_id, "container_name"))),
+            "started_at": decode_value(self.redis.get(self._key(fingerprint_id, "started_at"))),
+            "last_heartbeat": decode_value(self.redis.get(self._key(fingerprint_id, "last_heartbeat"))),
+            "agent_output_lines": decode_value(self.redis.get(self._key(fingerprint_id, "agent_output_lines"))),
+            "result": decode_value(self.redis.get(self._key(fingerprint_id, "result"))),
+            "completed_at": decode_value(self.redis.get(self._key(fingerprint_id, "completed_at"))),
         }
 
     def cleanup_investigation(self, fingerprint_id: str):

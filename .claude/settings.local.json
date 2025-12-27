@@ -87,13 +87,19 @@
       "Bash(then .venv/bin/pytest tests/unit/medic/shared/ -v --tb=short)",
       "Bash(else python3 -m pytest tests/unit/medic/shared/ -v --tb=short)",
       "Bash(fi)",
-      "Bash(timeout 15 docker-compose logs:*)"
+      "Bash(timeout 15 docker-compose logs:*)",
+      "Bash(xargs:*)",
+      "Bash(jq:*)",
+      "Bash(netstat:*)",
+      "Bash(ss:*)",
+      "Bash(docker network ls:*)",
+      "Bash(timeout:*)"
     ],
     "deny": [],
     "ask": []
   },
+  "enableAllProjectMcpServers": true,
   "enabledMcpjsonServers": [
     "context7"
-  ],
-  "enableAllProjectMcpServers": true
+  ]
 }

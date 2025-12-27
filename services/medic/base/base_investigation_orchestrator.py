@@ -13,11 +13,9 @@ from typing import Dict, Any, Optional, List, Tuple
 from datetime import datetime, timezone, timedelta
 from elasticsearch import Elasticsearch
 import redis
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.interval import IntervalTrigger
 
 from monitoring.observability import get_observability_manager, EventType
-from monitoring.timestamp_utils import utc_now, parse_iso_timestamp
+from monitoring.timestamp_utils import utc_now, parse_iso_timestamp, utc_isoformat
 
 logger = logging.getLogger(__name__)
 
@@ -80,7 +78,6 @@ class BaseInvestigationOrchestrator(ABC):
 
         self.running = True  # Set to True immediately to avoid race condition
         self.active_processes = {}  # fingerprint_id -> investigation_info
-        self.scheduler = AsyncIOScheduler()
 
         logger.info(f"{self.__class__.__name__} initialized")
 
@@ -167,6 +164,135 @@ class BaseInvestigationOrchestrator(ABC):
 
         except Exception as e:
             logger.error(f"Error cleaning up orphaned investigation {fingerprint_id}: {e}", exc_info=True)
+
+    async def rebuild_redis_from_es(self):
+        """
+        Rebuild all Redis state from Elasticsearch on startup (ES-FIRST architecture).
+
+        ES is the source of truth - Redis is just a performance cache.
+        This method clears Redis and rebuilds queues/active sets from ES data.
+        """
+        logger.info("Rebuilding Redis state from Elasticsearch (ES-first)...")
+
+        try:
+            # Clear all Redis state
+            self.redis.delete(self.queue.QUEUE_KEY)
+            self.redis.delete(self.queue.ACTIVE_SET_KEY)
+            logger.info("Cleared Redis queue and active set")
+
+            # Query ES for all investigations with non-terminal statuses
+            query = {
+                "query": {
+                    "terms": {
+                        "investigation_status": ["queued", "starting", "in_progress", "stalled"]
+                    }
+                },
+                "size": 1000,
+                "_source": ["fingerprint_id", "investigation_status", "investigation_metadata"]
+            }
+
+            # Search across all index patterns
+            index_patterns = [f"{self.failure_store.INDEX_PREFIX}-*"]
+
+            queued_count = 0
+            active_count = 0
+
+            for index_pattern in index_patterns:
+                try:
+                    result = self.es.search(index=index_pattern, body=query, ignore=[404])
+
+                    for hit in result.get('hits', {}).get('hits', []):
+                        fp_id = hit['_source']['fingerprint_id']
+                        status = hit['_source']['investigation_status']
+                        metadata = hit['_source'].get('investigation_metadata', {})
+
+                        if status == 'queued':
+                            # Add to queue
+                            self.redis.rpush(self.queue.QUEUE_KEY, fp_id)
+                            self.queue.update_status(fp_id, self.queue.STATUS_QUEUED)
+                            queued_count += 1
+                            logger.debug(f"Rebuilt queued: {fp_id[:16]}...")
+
+                        elif status in ['starting', 'in_progress', 'stalled']:
+                            # Add to active set
+                            self.redis.sadd(self.queue.ACTIVE_SET_KEY, fp_id)
+
+                            # Set status in Redis
+                            if status == 'starting':
+                                self.queue.update_status(fp_id, self.queue.STATUS_STARTING)
+                            elif status == 'in_progress':
+                                self.queue.update_status(fp_id, self.queue.STATUS_IN_PROGRESS)
+                            else:
+                                self.queue.update_status(fp_id, self.queue.STATUS_STALLED)
+
+                            active_count += 1
+
+                            # Check if container actually running
+                            container_name = metadata.get('container_name')
+                            if container_name:
+                                # Restore container metadata to Redis
+                                if metadata.get('started_at'):
+                                    self.redis.set(self.queue._key(fp_id, "started_at"), metadata['started_at'])
+                                if metadata.get('last_heartbeat'):
+                                    self.redis.set(self.queue._key(fp_id, "last_heartbeat"), metadata['last_heartbeat'])
+                                self.redis.set(self.queue._key(fp_id, "container_name"), container_name)
+
+                                # Verify container is actually running
+                                if not self._check_container_running(container_name):
+                                    logger.warning(
+                                        f"Rebuilt {fp_id[:16]}... but container {container_name} not running - will clean up"
+                                    )
+                                    await self._mark_investigation_failed(
+                                        fp_id,
+                                        reason="container_not_found_on_startup"
+                                    )
+                                else:
+                                    logger.debug(f"Rebuilt active: {fp_id[:16]}... (container: {container_name})")
+                            else:
+                                logger.warning(f"Rebuilt {fp_id[:16]}... but no container_name - will mark failed")
+                                await self._mark_investigation_failed(
+                                    fp_id,
+                                    reason="no_container_name_in_metadata"
+                                )
+
+                except Exception as e:
+                    logger.debug(f"Could not search {index_pattern}: {e}")
+
+            logger.info(f"Rebuilt Redis from ES: {queued_count} queued, {active_count} active")
+
+        except Exception as e:
+            logger.error(f"Error rebuilding Redis from ES: {e}", exc_info=True)
+
+    async def _mark_investigation_failed(self, fingerprint_id: str, reason: str):
+        """
+        Mark investigation as failed in both ES and Redis (ES-first).
+
+        Args:
+            fingerprint_id: Fingerprint ID
+            reason: Failure reason
+        """
+        from monitoring.timestamp_utils import utc_isoformat
+
+        # ES-first update
+        success = self.failure_store.update_investigation_status_es_first(
+            fingerprint_id,
+            status="failed",
+            metadata={
+                "result": "failed",
+                "error_message": reason,
+                "completed_at": utc_isoformat()
+            }
+        )
+
+        if success:
+            # Update Redis (best effort)
+            try:
+                self.queue.mark_completed(fingerprint_id, self.queue.RESULT_FAILED)
+                self.redis.srem(self.queue.ACTIVE_SET_KEY, fingerprint_id)
+            except Exception as e:
+                logger.warning(f"Redis update failed for {fingerprint_id}, will be reconciled: {e}")
+        else:
+            logger.error(f"Failed to mark {fingerprint_id} as failed in ES")
 
     async def _restore_active_processes(self):
         """
@@ -273,53 +399,36 @@ class BaseInvestigationOrchestrator(ABC):
         else:
             logger.info(f"Claude Code CLI available: {claude_version}")
 
-        # Perform startup recovery
+        # NEW ES-FIRST ARCHITECTURE: Rebuild Redis from Elasticsearch
+        logger.info("Rebuilding Redis from Elasticsearch (ES-first architecture)...")
+        await self.rebuild_redis_from_es()
+
+        # Restore active processes from Redis (after rebuild)
+        logger.info("Restoring active processes from Redis...")
+        await self._restore_active_processes()
+
+        # Perform startup recovery for any remaining issues
         logger.info("Performing startup recovery...")
         await self._recover_stalled_investigations()
 
-        # Restore active processes from Redis
-        logger.info("Restoring active processes from Redis...")
-        await self._restore_active_processes()
+        # Reconcile stuck queued investigations
+        logger.info("Reconciling queued investigations...")
+        await self._reconcile_queued_investigations()
+
+        # Reconcile stale Elasticsearch investigation statuses
+        logger.info("Reconciling Elasticsearch investigation statuses...")
+        await self._reconcile_elasticsearch_statuses()
 
         self.running = True
         logger.info(f"{self.__class__.__name__} initialized and ready")
 
-        # Setup scheduled background tasks using APScheduler
-        # This works around the asyncio.sleep() freeze issue
-        self.scheduler.add_job(
-            self._queue_processor_iteration,
-            trigger=IntervalTrigger(seconds=1),
-            id=f'{self.__class__.__name__}_queue_processor',
-            name=f'{self.__class__.__name__} Queue Processor',
-            replace_existing=True
-        )
-
-        self.scheduler.add_job(
-            self._heartbeat_monitor_iteration,
-            trigger=IntervalTrigger(minutes=1),
-            id=f'{self.__class__.__name__}_heartbeat_monitor',
-            name=f'{self.__class__.__name__} Heartbeat Monitor',
-            replace_existing=True
-        )
-
-        self.scheduler.add_job(
-            self._auto_trigger_checker_iteration,
-            trigger=IntervalTrigger(seconds=30),
-            id=f'{self.__class__.__name__}_auto_trigger_checker',
-            name=f'{self.__class__.__name__} Auto Trigger Checker',
-            replace_existing=True
-        )
-
-        self.scheduler.add_job(
-            self._reconciliation_iteration,
-            trigger=IntervalTrigger(minutes=1),
-            id=f'{self.__class__.__name__}_reconciliation',
-            name=f'{self.__class__.__name__} Reconciliation',
-            replace_existing=True
-        )
-
-        self.scheduler.start()
-        logger.info(f"Started scheduler with 4 background jobs")
+        # Create background tasks using native asyncio instead of APScheduler
+        # This avoids event loop context issues
+        asyncio.create_task(self._queue_processor_loop())
+        asyncio.create_task(self._heartbeat_monitor_loop())
+        asyncio.create_task(self._auto_trigger_checker_loop())
+        asyncio.create_task(self._reconciliation_loop())
+        logger.info(f"Started 4 background tasks")
 
         # Keep this task alive with infinite wait
         try:
@@ -389,22 +498,138 @@ class BaseInvestigationOrchestrator(ABC):
         except Exception as e:
             logger.error(f"Queue processor error: {e}", exc_info=True)
 
+    async def _queue_processor_loop(self):
+        """Background loop for queue processing"""
+        while self.running:
+            try:
+                await self._queue_processor_iteration()
+            except Exception as e:
+                logger.error(f"Queue processor loop error: {e}", exc_info=True)
+            await asyncio.sleep(1)
+
+    async def _heartbeat_monitor_loop(self):
+        """Background loop for heartbeat monitoring"""
+        while self.running:
+            try:
+                await self._heartbeat_monitor_iteration()
+            except Exception as e:
+                logger.error(f"Heartbeat monitor loop error: {e}", exc_info=True)
+            await asyncio.sleep(60)
+
+    async def _auto_trigger_checker_loop(self):
+        """Background loop for auto trigger checking"""
+        while self.running:
+            try:
+                await self._auto_trigger_checker_iteration()
+            except Exception as e:
+                logger.error(f"Auto trigger checker loop error: {e}", exc_info=True)
+            await asyncio.sleep(30)
+
+    async def _reconciliation_loop(self):
+        """Background loop for reconciliation (runs every 30 seconds)"""
+        while self.running:
+            try:
+                await self._reconciliation_iteration()
+            except Exception as e:
+                logger.error(f"Reconciliation loop error: {e}", exc_info=True)
+            await asyncio.sleep(30)
+
+    def _update_investigation_status_atomic(
+        self,
+        fingerprint_id: str,
+        redis_status: str,
+        es_status: str,
+        add_to_active: bool = False,
+        remove_from_active: bool = False
+    ) -> bool:
+        """
+        Atomically update investigation status in both Redis and Elasticsearch.
+
+        Updates Redis first (source of truth), then updates Elasticsearch with retry.
+        If Elasticsearch update fails after retries, creates an inconsistency marker
+        in Redis for later reconciliation.
+
+        Args:
+            fingerprint_id: Fingerprint ID
+            redis_status: Status value for Redis status key
+            es_status: Status value for Elasticsearch investigation_status field
+            add_to_active: Whether to add to Redis active set
+            remove_from_active: Whether to remove from Redis active set
+
+        Returns:
+            True if both Redis and ES updated successfully, False if ES failed
+        """
+        try:
+            # Phase 1: Update Redis (source of truth)
+            self.queue.update_status(fingerprint_id, redis_status)
+
+            if add_to_active:
+                self.redis.sadd(f"{self.queue.KEY_PREFIX}:active", fingerprint_id)
+
+            if remove_from_active:
+                self.redis.srem(f"{self.queue.KEY_PREFIX}:active", fingerprint_id)
+
+            logger.debug(
+                f"Updated Redis status for {fingerprint_id[:16]}... to {redis_status}"
+            )
+
+            # Phase 2: Update Elasticsearch with retry
+            es_success = self.failure_store.update_investigation_status(
+                fingerprint_id, es_status
+            )
+
+            if es_success:
+                # Both updates succeeded
+                return True
+            else:
+                # Elasticsearch update failed after retries
+                logger.warning(
+                    f"INCONSISTENT STATE: Redis updated but Elasticsearch failed for {fingerprint_id[:16]}... "
+                    f"(Redis: {redis_status}, ES target: {es_status})"
+                )
+
+                # Create inconsistency marker for reconciliation
+                marker_key = f"medic:inconsistent_status:{fingerprint_id}"
+                self.redis.setex(marker_key, 300, es_status)  # 5 minute TTL
+
+                return False
+
+        except Exception as e:
+            logger.error(
+                f"Error in atomic status update for {fingerprint_id[:16]}...: {e}",
+                exc_info=True
+            )
+            return False
+
     async def _start_investigation(self, fingerprint_id: str):
-        """Start an investigation for a fingerprint"""
+        """Start an investigation for a fingerprint (ES-FIRST)"""
         logger.info(f"Starting investigation for {fingerprint_id}")
 
         try:
-            # Update status
-            self.queue.update_status(fingerprint_id, self.queue.STATUS_STARTING)
+            # ES-FIRST: Update to "starting" in ES before doing anything
+            now = utc_isoformat()
+            success = self.failure_store.update_investigation_status_es_first(
+                fingerprint_id,
+                status="starting",
+                metadata={"started_at": now},
+                expected_current=["queued"]
+            )
+
+            if not success:
+                logger.error(f"Failed to update ES to 'starting' for {fingerprint_id}")
+                return
+
+            # Update Redis status (best effort)
+            try:
+                self.queue.update_status(fingerprint_id, self.queue.STATUS_STARTING)
+            except Exception as e:
+                logger.warning(f"Redis update failed: {e}")
 
             # Get signature data from Elasticsearch
             signature = self.failure_store.get_signature(fingerprint_id)
             if not signature:
                 logger.error(f"Signature not found: {fingerprint_id}")
-                self.queue.mark_completed(
-                    fingerprint_id,
-                    self.queue.RESULT_FAILED,
-                )
+                await self._mark_investigation_failed(fingerprint_id, "signature_not_found")
                 return
 
             # Prepare context (subclass-specific)
@@ -412,38 +637,75 @@ class BaseInvestigationOrchestrator(ABC):
                 fingerprint_id, signature
             )
 
-            # Launch investigation process
+            # Emit agent_initialized event and get execution_id for tracking
+            agent_execution_id = self.observability.emit_agent_initialized(
+                agent=self.agent_runner._get_investigation_agent_name(),
+                task_id=fingerprint_id[:16],
+                project="medic",
+                config={
+                    "fingerprint_id": fingerprint_id,
+                    "investigation_type": self.__class__.__name__,
+                    "model": self.agent_runner._get_claude_model()
+                },
+                container_name=f"claude-agent-clauditoreum-{fingerprint_id[:16]}"
+            )
+
+            # Launch investigation process with execution_id
             investigation_info = await self.agent_runner.launch_investigation(
                 fingerprint_id=fingerprint_id,
                 context_file=context_file,
                 output_log=output_log,
                 observability_manager=self.observability,
+                agent_execution_id=agent_execution_id,
             )
 
             if not investigation_info:
                 logger.error(f"Failed to launch investigation for {fingerprint_id}")
-                self.queue.mark_completed(
-                    fingerprint_id,
-                    self.queue.RESULT_FAILED,
-                )
+                await self._mark_investigation_failed(fingerprint_id, "launch_failed")
                 return
 
             # Track active investigation
             self.active_processes[fingerprint_id] = investigation_info
             logger.info(f"Tracked active investigation {fingerprint_id}")
 
-            # Mark as started with container name tracking
+            # ES-FIRST: Update to "in_progress" with container info
             container_name = investigation_info.get('container_name')
-            self.queue.mark_started(fingerprint_id, pid=0, container_name=container_name)
+            now = utc_isoformat()
 
-            # Update Elasticsearch signature status to in_progress
-            self.failure_store.update_investigation_status(fingerprint_id, "in_progress")
+            success = self.failure_store.update_investigation_status_es_first(
+                fingerprint_id,
+                status="in_progress",
+                metadata={
+                    "container_name": container_name,
+                    "last_heartbeat": now
+                },
+                expected_current=["starting"]
+            )
+
+            if not success:
+                logger.error(f"Failed to update ES to 'in_progress' for {fingerprint_id}")
+                return
+
+            # Update Redis metadata (best effort)
+            try:
+                self.queue.update_status(fingerprint_id, self.queue.STATUS_IN_PROGRESS)
+                self.redis.set(self.queue._key(fingerprint_id, "pid"), "0")
+                if container_name:
+                    self.redis.set(self.queue._key(fingerprint_id, "container_name"), container_name)
+                if agent_execution_id:
+                    self.redis.set(self.queue._key(fingerprint_id, "agent_execution_id"), agent_execution_id)
+                self.redis.set(self.queue._key(fingerprint_id, "started_at"), now)
+                self.redis.set(self.queue._key(fingerprint_id, "last_heartbeat"), now)
+                self.redis.sadd(self.queue.ACTIVE_SET_KEY, fingerprint_id)
+            except Exception as e:
+                logger.warning(f"Redis update failed: {e}, will be reconciled")
 
             # Set up completion callback
             def done_callback(task):
                 """Schedule completion handler in the event loop"""
                 try:
-                    asyncio.create_task(self._handle_investigation_completion(fingerprint_id, task))
+                    # Pass investigation_info to completion handler for agent_execution_id
+                    asyncio.create_task(self._handle_investigation_completion(fingerprint_id, task, investigation_info))
                 except Exception as e:
                     logger.error(f"Error scheduling investigation completion for {fingerprint_id}: {e}", exc_info=True)
 
@@ -466,20 +728,20 @@ class BaseInvestigationOrchestrator(ABC):
 
         except Exception as e:
             logger.error(f"Error starting investigation {fingerprint_id}: {e}", exc_info=True)
-            self.queue.mark_completed(
+            # ES-FIRST: Mark as failed
+            await self._mark_investigation_failed(
                 fingerprint_id,
-                self.queue.RESULT_FAILED,
+                reason=f"Exception during start: {str(e)}"
             )
-            # Mark signature as failed to allow re-queueing
-            self.failure_store.update_investigation_status(fingerprint_id, "failed")
 
-    async def _handle_investigation_completion(self, fingerprint_id: str, task: asyncio.Task):
+    async def _handle_investigation_completion(self, fingerprint_id: str, task: asyncio.Task, investigation_info: Dict = None):
         """
-        Handle completion of an investigation.
+        Handle completion of an investigation (ES-FIRST).
 
         Args:
             fingerprint_id: Fingerprint ID
             task: Completed task
+            investigation_info: Optional dict with investigation metadata including agent_execution_id
         """
         try:
             # Remove from active processes
@@ -490,24 +752,42 @@ class BaseInvestigationOrchestrator(ABC):
             if task.exception():
                 logger.error(f"Investigation {fingerprint_id} failed with exception: {task.exception()}")
                 result = self.queue.RESULT_FAILED
-                status = self.queue.STATUS_FAILED
+                es_status = "failed"
             else:
                 # Validate result (subclass-specific)
-                result, status = self._validate_investigation_result(fingerprint_id)
+                result, redis_status = self._validate_investigation_result(fingerprint_id)
                 logger.info(f"Investigation {fingerprint_id} completed with result: {result}")
 
-            # Mark as completed
-            self.queue.mark_completed(fingerprint_id, result)
+                # Map to ES status
+                es_status_map = {
+                    self.queue.STATUS_COMPLETED: "completed",
+                    self.queue.STATUS_IGNORED: "ignored",
+                    self.queue.STATUS_FAILED: "failed",
+                    self.queue.STATUS_TIMEOUT: "timeout",
+                }
+                es_status = es_status_map.get(redis_status, "failed")
 
-            # Update Elasticsearch
-            es_status_map = {
-                self.queue.STATUS_COMPLETED: "completed",
-                self.queue.STATUS_IGNORED: "ignored",
-                self.queue.STATUS_FAILED: "failed",
-                self.queue.STATUS_TIMEOUT: "timeout",
-            }
-            es_status = es_status_map.get(status, "failed")
-            self.failure_store.update_investigation_status(fingerprint_id, es_status)
+            # ES-FIRST: Update ES with completion metadata
+            now = utc_isoformat()
+            success = self.failure_store.update_investigation_status_es_first(
+                fingerprint_id,
+                status=es_status,
+                metadata={
+                    "result": result,
+                    "completed_at": now
+                },
+                expected_current=["in_progress", "stalled", "starting"]
+            )
+
+            if not success:
+                logger.error(f"Failed to update ES for completed investigation {fingerprint_id}")
+
+            # Update Redis (best effort)
+            try:
+                self.queue.mark_completed(fingerprint_id, result)
+                self.redis.srem(self.queue.ACTIVE_SET_KEY, fingerprint_id)
+            except Exception as e:
+                logger.warning(f"Redis update failed: {e}, will be reconciled")
 
             # Emit completion event
             try:
@@ -533,6 +813,20 @@ class BaseInvestigationOrchestrator(ABC):
                             "reason": result,
                         },
                     )
+
+                # Emit agent execution completion event for UI tracking
+                if investigation_info and investigation_info.get('agent_execution_id'):
+                    agent_execution_id = investigation_info['agent_execution_id']
+                    if result in [self.queue.RESULT_SUCCESS, self.queue.RESULT_IGNORED]:
+                        self.observability.emit_agent_completed(
+                            agent_execution_id=agent_execution_id,
+                            outputs={"result": result, "status": es_status}
+                        )
+                    else:
+                        self.observability.emit_agent_failed(
+                            agent_execution_id=agent_execution_id,
+                            error=result
+                        )
             except Exception as e:
                 logger.warning(f"Failed to emit observability event: {e}")
 
@@ -582,48 +876,486 @@ class BaseInvestigationOrchestrator(ABC):
         logger.warning("reconciliation_loop() called but tasks are now scheduled - this should not be called")
         pass
 
+    async def _detect_stuck_starting(self):
+        """
+        Find investigations stuck in 'starting' state (ES-first check).
+
+        These should transition to 'in_progress' within 5 minutes.
+        """
+        try:
+            query = {
+                "query": {
+                    "bool": {
+                        "must": [
+                            {"term": {"investigation_status": "starting"}},
+                            {"range": {"updated_at": {"lte": "now-5m"}}}
+                        ]
+                    }
+                },
+                "size": 100,
+                "_source": ["fingerprint_id", "investigation_metadata", "updated_at"]
+            }
+
+            index_pattern = f"{self.failure_store.INDEX_PREFIX}-*"
+            result = self.es.search(index=index_pattern, body=query, ignore=[404])
+
+            for hit in result.get('hits', {}).get('hits', []):
+                fp_id = hit['_source']['fingerprint_id']
+                updated_at = hit['_source'].get('updated_at')
+                metadata = hit['_source'].get('investigation_metadata', {})
+                container_name = metadata.get('container_name')
+
+                logger.error(f"Investigation {fp_id[:16]}... stuck in 'starting' since {updated_at}")
+
+                # Check if container exists
+                if container_name and self._check_container_running(container_name):
+                    # Container is running - update to in_progress (ES-first)
+                    logger.info(f"Container {container_name} running, updating to in_progress")
+                    success = self.failure_store.update_investigation_status_es_first(
+                        fp_id,
+                        status="in_progress",
+                        metadata={"last_heartbeat": utc_isoformat()},
+                        expected_current=["starting"]
+                    )
+                    if success:
+                        # Update Redis (best effort)
+                        self.queue.update_status(fp_id, self.queue.STATUS_IN_PROGRESS)
+                else:
+                    # Container not running - mark as failed (ES-first)
+                    logger.info(f"No container found, marking as failed")
+                    await self._mark_investigation_failed(
+                        fp_id,
+                        reason="Investigation stuck in starting state"
+                    )
+
+        except Exception as e:
+            logger.error(f"Error detecting stuck starting investigations: {e}", exc_info=True)
+
+    async def _detect_stuck_in_progress(self):
+        """
+        Find investigations stuck in 'in_progress' state (ES-first check).
+
+        Uses last_heartbeat in investigation_metadata to detect stalls (2+ hours without heartbeat).
+        """
+        try:
+            query = {
+                "query": {
+                    "bool": {
+                        "must": [
+                            {"term": {"investigation_status": "in_progress"}},
+                            {"range": {"investigation_metadata.last_heartbeat": {"lte": "now-2h"}}}
+                        ]
+                    }
+                },
+                "size": 100,
+                "_source": ["fingerprint_id", "investigation_metadata"]
+            }
+
+            index_pattern = f"{self.failure_store.INDEX_PREFIX}-*"
+            result = self.es.search(index=index_pattern, body=query, ignore=[404])
+
+            for hit in result.get('hits', {}).get('hits', []):
+                fp_id = hit['_source']['fingerprint_id']
+                metadata = hit['_source'].get('investigation_metadata', {})
+                container_name = metadata.get('container_name')
+                last_heartbeat = metadata.get('last_heartbeat')
+
+                logger.error(
+                    f"Investigation {fp_id[:16]}... stuck in 'in_progress' "
+                    f"(last heartbeat: {last_heartbeat})"
+                )
+
+                # Check if container still running
+                if container_name and self._check_container_running(container_name):
+                    # Container running but no heartbeat - mark as stalled (ES-first)
+                    logger.warning(f"Container {container_name} running but stalled")
+                    success = self.failure_store.update_investigation_status_es_first(
+                        fp_id,
+                        status="stalled",
+                        expected_current=["in_progress"]
+                    )
+                    if success:
+                        # Update Redis (best effort)
+                        self.queue.update_status(fp_id, self.queue.STATUS_STALLED)
+                else:
+                    # Container not running - mark as failed (ES-first)
+                    logger.info(f"Container not running, marking as failed")
+                    await self._mark_investigation_failed(
+                        fp_id,
+                        reason="Investigation stuck in progress, container not found"
+                    )
+
+        except Exception as e:
+            logger.error(f"Error detecting stuck in-progress investigations: {e}", exc_info=True)
+
     async def _reconciliation_iteration(self):
         """Reconciliation: verify Redis state matches Docker reality (single iteration)"""
         try:
             # Get what Redis claims is active
             redis_active_fps = set(self.queue.get_all_active())
 
-            if not redis_active_fps:
-                return
+            # Check active investigations if any exist
+            if redis_active_fps:
+                logger.debug(f"Reconciliation: Checking {len(redis_active_fps)} investigations")
 
-            logger.debug(f"Reconciliation: Checking {len(redis_active_fps)} investigations")
+                # Check each active investigation
+                reconciled = 0
+                cleaned = 0
 
-            # Check each active investigation
-            reconciled = 0
-            cleaned = 0
+                for fp_id in redis_active_fps:
+                    try:
+                        info = self.queue.get_investigation_info(fp_id)
+                        container_name = info.get('container_name')
 
-            for fp_id in redis_active_fps:
-                try:
-                    info = self.queue.get_investigation_info(fp_id)
-                    container_name = info.get('container_name')
+                        if not container_name:
+                            logger.warning(f"Reconciliation: {fp_id} has no container_name")
+                            await self._cleanup_orphaned_investigation(fp_id)
+                            cleaned += 1
+                            continue
 
-                    if not container_name:
-                        logger.warning(f"Reconciliation: {fp_id} has no container_name")
-                        await self._cleanup_orphaned_investigation(fp_id)
-                        cleaned += 1
-                        continue
+                        # Verify container is running
+                        if not self._check_container_running(container_name):
+                            logger.warning(f"Reconciliation: {fp_id} container not running")
+                            await self._cleanup_orphaned_investigation(fp_id)
+                            cleaned += 1
+                        else:
+                            reconciled += 1
 
-                    # Verify container is running
-                    if not self._check_container_running(container_name):
-                        logger.warning(f"Reconciliation: {fp_id} container not running")
-                        await self._cleanup_orphaned_investigation(fp_id)
-                        cleaned += 1
-                    else:
-                        reconciled += 1
+                    except Exception as e:
+                        logger.error(f"Error reconciling {fp_id}: {e}", exc_info=True)
 
-                except Exception as e:
-                    logger.error(f"Error reconciling {fp_id}: {e}", exc_info=True)
+                if cleaned > 0:
+                    logger.info(f"Reconciliation: {reconciled} healthy, {cleaned} cleaned")
 
-            if cleaned > 0:
-                logger.info(f"Reconciliation: {reconciled} healthy, {cleaned} cleaned")
+            # Run stuck state detection (ES-first checks)
+            await self._detect_stuck_starting()
+            await self._detect_stuck_in_progress()
+
+            # Always reconcile Elasticsearch investigation statuses (even if no active investigations)
+            await self._reconcile_elasticsearch_statuses()
 
         except Exception as e:
             logger.error(f"Reconciliation error: {e}", exc_info=True)
+
+    async def _reconcile_queued_investigations(self):
+        """
+        Clean up investigations stuck in 'queued' status but not actually in queue.
+        This handles crash scenarios where dequeue happened but mark_started() didn't.
+        """
+        try:
+            # Get all fingerprint IDs that have status="queued"
+            queued_fps = []
+
+            # Scan all keys matching the status pattern
+            for key in self.redis.scan_iter(match=f"{self.queue.KEY_PREFIX}*:status"):
+                status = self.redis.get(key)
+                if status == self.queue.STATUS_QUEUED:
+                    # Extract fingerprint ID from key
+                    fp_id = key.replace(f"{self.queue.KEY_PREFIX}", "").replace(":status", "")
+                    queued_fps.append(fp_id)
+
+            if not queued_fps:
+                return
+
+            # Get actual queue contents
+            queue_list = set(self.queue.get_all_queued())
+
+            # Check for stuck investigations
+            cleaned = 0
+            for fp_id in queued_fps:
+                if fp_id not in queue_list:
+                    # Not in queue but has queued status - check how long
+                    started_at_str = self.redis.get(self.queue._key(fp_id, "started_at"))
+
+                    if not started_at_str:
+                        # No started_at - definitely stuck, clean up
+                        logger.warning(f"Reconciling stuck queued investigation (no started_at): {fp_id}")
+                        self.queue.mark_completed(fp_id, self.queue.RESULT_FAILED)
+                        cleaned += 1
+                        continue
+
+                    # Check elapsed time
+                    try:
+                        from datetime import datetime, timedelta
+                        started_at = datetime.fromisoformat(started_at_str.replace('Z', '+00:00'))
+                        elapsed = datetime.now().astimezone() - started_at
+
+                        # Grace period of 1 hour
+                        if elapsed > timedelta(hours=1):
+                            logger.warning(f"Reconciling stuck queued investigation (stuck {elapsed}): {fp_id}")
+
+                            # Check if it has reports (maybe it actually completed)
+                            status = self.report_manager.get_report_status(fp_id)
+                            if status.get('has_diagnosis'):
+                                self.queue.mark_completed(fp_id, self.queue.RESULT_SUCCESS)
+                            else:
+                                self.queue.mark_completed(fp_id, self.queue.RESULT_FAILED)
+                            cleaned += 1
+
+                    except Exception as e:
+                        logger.error(f"Error checking elapsed time for {fp_id}: {e}")
+
+            if cleaned > 0:
+                logger.info(f"Queued reconciliation: cleaned {cleaned} stuck investigations")
+
+        except Exception as e:
+            logger.error(f"Queued reconciliation error: {e}", exc_info=True)
+
+    async def _reconcile_elasticsearch_statuses(self):
+        """
+        Two-phase reconciliation to sync investigation status between Redis and Elasticsearch.
+
+        Phase 1 (Proactive): Fix known inconsistencies from atomic update failures
+        Phase 2 (Reactive): Scan for stale statuses and correct them
+        """
+        try:
+            total_fixed = 0
+
+            # === PHASE 1: Proactive - Fix known inconsistencies ===
+            proactive_fixed = 0
+            try:
+                # Get all inconsistency markers from Redis
+                marker_pattern = "medic:inconsistent_status:*"
+                inconsistent_keys = []
+
+                # Scan for inconsistency markers (using SCAN to avoid blocking)
+                cursor = 0
+                while True:
+                    cursor, keys = self.redis.scan(cursor, match=marker_pattern, count=100)
+                    inconsistent_keys.extend(keys)
+                    if cursor == 0:
+                        break
+
+                # Fix each known inconsistency
+                for marker_key in inconsistent_keys:
+                    try:
+                        # Extract fingerprint_id from key
+                        fp_id = marker_key.replace("medic:inconsistent_status:", "")
+
+                        # Get expected ES status from marker
+                        expected_es_status = self.redis.get(marker_key)
+                        if not expected_es_status:
+                            continue
+
+                        logger.info(
+                            f"Proactively fixing known inconsistency for {fp_id[:16]}... "
+                            f"(ES target: {expected_es_status})"
+                        )
+
+                        # Retry ES update
+                        es_success = self.failure_store.update_investigation_status(
+                            fp_id, expected_es_status
+                        )
+
+                        if es_success:
+                            # Fixed - delete marker
+                            self.redis.delete(marker_key)
+                            proactive_fixed += 1
+                            logger.info(f"Fixed inconsistency for {fp_id[:16]}...")
+                        else:
+                            logger.warning(
+                                f"Still cannot update ES for {fp_id[:16]}... "
+                                f"(marker will retry later)"
+                            )
+
+                    except Exception as e:
+                        logger.error(f"Error fixing inconsistency for {marker_key}: {e}")
+
+                if proactive_fixed > 0:
+                    logger.info(f"Proactive reconciliation: fixed {proactive_fixed} known inconsistencies")
+
+            except Exception as e:
+                logger.error(f"Proactive reconciliation error: {e}", exc_info=True)
+
+            # === PHASE 2: Reactive - Scan for stale statuses ===
+            reactive_fixed = 0
+            try:
+                # Get current state from Redis (source of truth)
+                active_fps = set(self.queue.get_all_active())
+                queued_fps = set(self.queue.get_all_queued())
+
+                # Query Elasticsearch for signatures with potentially stale statuses
+                stale_statuses = ["in_progress", "queued", "starting", "running"]
+
+                # Search across index patterns
+                index_patterns = [
+                    "medic-failure-signatures-*",
+                    "medic-docker-failures-*",
+                    "medic-claude-failures-*"
+                ]
+
+                for index_pattern in index_patterns:
+                    try:
+                        result = self.es.search(
+                            index=index_pattern,
+                            body={
+                                "size": 1000,
+                                "query": {
+                                    "terms": {
+                                        "investigation_status": stale_statuses
+                                    }
+                                },
+                                "_source": ["fingerprint_id", "investigation_status"]
+                            },
+                            ignore=[404]
+                        )
+
+                        for hit in result.get("hits", {}).get("hits", []):
+                            fp_id = hit["_source"]["fingerprint_id"]
+                            es_status = hit["_source"]["investigation_status"]
+
+                            # Determine correct status from Redis (source of truth)
+                            correct_status = None
+
+                            if fp_id in queued_fps:
+                                correct_status = "queued"
+                            elif fp_id in active_fps:
+                                # Check Redis status key for more precision
+                                redis_status = self.queue.get_status(fp_id)
+                                if redis_status == self.queue.STATUS_IN_PROGRESS:
+                                    correct_status = "in_progress"
+                                elif redis_status == self.queue.STATUS_STARTING:
+                                    correct_status = "starting"
+                                else:
+                                    # In active set but status doesn't match - trust status key
+                                    correct_status = "in_progress"
+                            else:
+                                # Not in queue or active - should be completed/failed
+                                redis_status = self.queue.get_status(fp_id)
+                                if redis_status:
+                                    # Map Redis status to ES status
+                                    status_map = {
+                                        self.queue.STATUS_COMPLETED: "completed",
+                                        self.queue.STATUS_FAILED: "failed",
+                                        self.queue.STATUS_IGNORED: "ignored",
+                                        self.queue.STATUS_TIMEOUT: "timeout",
+                                        self.queue.STATUS_STALLED: "failed",
+                                    }
+                                    correct_status = status_map.get(redis_status, "failed")
+                                else:
+                                    # No Redis status - mark as failed
+                                    correct_status = "failed"
+
+                            # Update ES if status doesn't match
+                            if correct_status and correct_status != es_status:
+                                logger.warning(
+                                    f"Reactive reconciliation: {fp_id[:16]}... "
+                                    f"ES:{es_status} → Redis:{correct_status}"
+                                )
+
+                                # Update in Elasticsearch directly
+                                self.es.update(
+                                    index=hit["_index"],
+                                    id=hit["_id"],
+                                    body={
+                                        "doc": {
+                                            "investigation_status": correct_status
+                                        }
+                                    },
+                                    refresh=True
+                                )
+                                reactive_fixed += 1
+
+                    except Exception as e:
+                        logger.debug(f"Could not search {index_pattern}: {e}")
+
+                if reactive_fixed > 0:
+                    logger.info(f"Reactive reconciliation: fixed {reactive_fixed} stale statuses")
+
+            except Exception as e:
+                logger.error(f"Reactive reconciliation error: {e}", exc_info=True)
+
+            # Emit observability event if any fixes were made
+            total_fixed = proactive_fixed + reactive_fixed
+            if total_fixed > 0:
+                try:
+                    from monitoring.timestamp_utils import utc_isoformat
+                    self.observability.emit(
+                        EventType.MEDIC_STATUS_RECONCILIATION,
+                        agent="medic-reconciler",
+                        task_id="status-reconciliation",
+                        project="medic",
+                        data={
+                            "proactive_fixed": proactive_fixed,
+                            "reactive_fixed": reactive_fixed,
+                            "total_fixed": total_fixed,
+                            "timestamp": utc_isoformat()
+                        }
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to emit reconciliation event: {e}")
+
+        except Exception as e:
+            logger.error(f"Elasticsearch reconciliation error: {e}", exc_info=True)
+
+    async def reconcile_signature_status_now(self, fingerprint_id: str) -> bool:
+        """
+        Immediately reconcile a specific signature's status between Redis and Elasticsearch.
+
+        Useful for API calls or user-triggered actions that need instant reconciliation.
+
+        Args:
+            fingerprint_id: Fingerprint ID to reconcile
+
+        Returns:
+            True if status was reconciled successfully, False otherwise
+        """
+        try:
+            logger.info(f"On-demand reconciliation for {fingerprint_id[:16]}...")
+
+            # Get current state from Redis (source of truth)
+            redis_status = self.queue.get_status(fingerprint_id)
+            in_active = fingerprint_id in self.queue.get_all_active()
+            in_queue = fingerprint_id in self.queue.get_all_queued()
+
+            # Determine correct ES status from Redis state
+            if in_queue:
+                correct_es_status = "queued"
+            elif in_active:
+                # Map Redis status to ES status
+                if redis_status == self.queue.STATUS_IN_PROGRESS:
+                    correct_es_status = "in_progress"
+                elif redis_status == self.queue.STATUS_STARTING:
+                    correct_es_status = "starting"
+                else:
+                    correct_es_status = "in_progress"  # Default for active
+            else:
+                # Not in queue or active
+                if redis_status:
+                    # Map Redis status to ES status
+                    status_map = {
+                        self.queue.STATUS_COMPLETED: "completed",
+                        self.queue.STATUS_FAILED: "failed",
+                        self.queue.STATUS_IGNORED: "ignored",
+                        self.queue.STATUS_TIMEOUT: "timeout",
+                        self.queue.STATUS_STALLED: "failed",
+                    }
+                    correct_es_status = status_map.get(redis_status, "failed")
+                else:
+                    # No Redis state - mark as not_started
+                    correct_es_status = "not_started"
+
+            # Update Elasticsearch to match Redis
+            es_success = self.failure_store.update_investigation_status(
+                fingerprint_id, correct_es_status
+            )
+
+            if es_success:
+                logger.info(
+                    f"Successfully reconciled {fingerprint_id[:16]}... to {correct_es_status}"
+                )
+                return True
+            else:
+                logger.warning(
+                    f"Failed to reconcile {fingerprint_id[:16]}... (ES update failed)"
+                )
+                return False
+
+        except Exception as e:
+            logger.error(
+                f"Error reconciling {fingerprint_id[:16]}...: {e}", exc_info=True
+            )
+            return False
 
     async def _check_investigation_progress(self, fingerprint_id: str):
         """Check progress AND verify container is still running"""
@@ -656,7 +1388,7 @@ class BaseInvestigationOrchestrator(ABC):
                 logger.error(f"Container {container_name} for investigation {fingerprint_id} is not running")
                 # Container died - mark investigation as failed
                 task = investigation_info.get('task')
-                await self._handle_investigation_completion(fingerprint_id, task)
+                await self._handle_investigation_completion(fingerprint_id, task, investigation_info)
                 return
 
             # Get the asyncio task
@@ -856,8 +1588,8 @@ class BaseInvestigationOrchestrator(ABC):
 
             for fingerprint_id in triggered:
                 logger.info(f"Auto-triggering investigation for {fingerprint_id}")
-                self.failure_store.update_investigation_status(fingerprint_id, "queued")
-                self.queue.enqueue(fingerprint_id, priority="high")
+                # ES-first enqueue (ES is updated in enqueue method)
+                self.queue.enqueue(fingerprint_id, priority="high", es_store=self.failure_store)
 
                 # Emit event
                 try:
@@ -913,7 +1645,7 @@ class BaseInvestigationOrchestrator(ABC):
 
     def trigger_investigation(self, fingerprint_id: str, priority: str = "normal") -> bool:
         """
-        Manually trigger investigation for a signature.
+        Manually trigger investigation for a signature (ES-first).
 
         Args:
             fingerprint_id: Signature ID to investigate
@@ -922,7 +1654,7 @@ class BaseInvestigationOrchestrator(ABC):
         Returns:
             True if enqueued, False if already queued/in-progress
         """
-        return self.queue.enqueue(fingerprint_id, priority=priority)
+        return self.queue.enqueue(fingerprint_id, priority=priority, es_store=self.failure_store)
 
     def get_investigation_status(self, fingerprint_id: str) -> Dict:
         """

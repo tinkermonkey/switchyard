@@ -103,6 +103,11 @@ export default function FailureSignatureList() {
       // Sort signatures
       const sorted = sortSignatures(data.signatures || [], sortBy, sortOrder)
       setSignatures(sorted)
+
+      // Log summary for debugging
+      const totalOccurrences = sorted.reduce((sum, sig) => sum + (sig.occurrence_count || 0), 0)
+      console.log(`Loaded ${sorted.length} signatures with ${totalOccurrences} total occurrences (filtered view)`)
+
       setError(null)
 
       // Fetch fix statuses for signatures with completed investigations
@@ -380,6 +385,22 @@ function FailureSignatureCard({ signature, onTriggerInvestigation, onTriggerFix,
     }
   }
 
+  const getInvestigationStatusLabel = (status) => {
+    switch (status) {
+      case 'not_started': return 'Not Started'
+      case 'queued': return 'Queued'
+      case 'starting': return 'Queued'  // Map internal "starting" to user-friendly "Queued"
+      case 'in_progress': return 'In Progress'
+      case 'completed': return 'Completed'
+      case 'diagnosed': return 'Diagnosed'
+      case 'failed': return 'Failed'
+      case 'timeout': return 'Timed Out'
+      case 'stalled': return 'Stalled'
+      case 'ignored': return 'Ignored'
+      default: return status // Fallback to raw value for unknown statuses
+    }
+  }
+
   const formatTimestamp = (timestamp) => {
     const date = new Date(timestamp)
     const now = new Date()
@@ -439,7 +460,7 @@ function FailureSignatureCard({ signature, onTriggerInvestigation, onTriggerFix,
           </div>
         </div>
 
-        {(signature.investigation_status === 'not_started' || signature.investigation_status === 'failed') && (
+        {(signature.investigation_status === 'not_started' || signature.investigation_status === 'failed' || signature.investigation_status === 'timeout' || signature.investigation_status === 'stalled') && (
           <button
             onClick={(e) => {
               e.preventDefault()
@@ -449,7 +470,7 @@ function FailureSignatureCard({ signature, onTriggerInvestigation, onTriggerFix,
             className={`ml-4 px-3 py-1.5 bg-gh-accent-emphasis text-white rounded text-xs hover:bg-gh-accent-primary transition-colors flex items-center gap-1 ${isProcessing ? 'opacity-50 cursor-not-allowed' : ''}`}
           >
             {isProcessing ? <Loader2 className="w-3 h-3 animate-spin" /> : <Play className="w-3 h-3" />}
-            {signature.investigation_status === 'failed' ? 'Retry' : 'Investigate'}
+            {signature.investigation_status === 'not_started' ? 'Investigate' : 'Retry'}
           </button>
         )}
         
@@ -495,9 +516,9 @@ function FailureSignatureCard({ signature, onTriggerInvestigation, onTriggerFix,
           </>
         )}
 
-        {signature.investigation_status !== 'not_started' && signature.investigation_status !== 'failed' && signature.investigation_status !== 'diagnosed' && signature.investigation_status !== 'completed' && (
+        {signature.investigation_status !== 'not_started' && signature.investigation_status !== 'failed' && signature.investigation_status !== 'timeout' && signature.investigation_status !== 'stalled' && signature.investigation_status !== 'diagnosed' && signature.investigation_status !== 'completed' && (
           <span className="ml-4 px-3 py-1.5 bg-blue-500/10 text-blue-500 rounded text-xs">
-            {signature.investigation_status}
+            {getInvestigationStatusLabel(signature.investigation_status)}
           </span>
         )}
       </div>

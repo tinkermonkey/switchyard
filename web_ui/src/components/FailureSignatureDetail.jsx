@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
-import { AlertCircle, Clock, Code, Play, FileText, Wrench, Trash2, ChevronDown, Loader2 } from 'lucide-react'
-import { useNavigate } from '@tanstack/react-router'
+import { AlertCircle, Clock, Code, Play, FileText, Wrench, Trash2, ChevronDown, Loader2, Eye } from 'lucide-react'
+import { useNavigate, Link } from '@tanstack/react-router'
 import ReactMarkdown from 'react-markdown'
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter'
 import { vscDarkPlus } from 'react-syntax-highlighter/dist/esm/styles/prism'
@@ -20,6 +20,7 @@ export default function FailureSignatureDetail({ fingerprintId }) {
   const [showDeleteModal, setShowDeleteModal] = useState(false)
   const [modalConfig, setModalConfig] = useState({ show: false, title: '', message: '', isDangerous: false })
   const [fixStatus, setFixStatus] = useState(null)
+  const [fixStatusInfo, setFixStatusInfo] = useState(null)
   const [fixLog, setFixLog] = useState(null)
   const [toast, setToast] = useState({ show: false, message: '', type: 'info' })
   const { medicEvents } = useSocket()
@@ -81,16 +82,19 @@ export default function FailureSignatureDetail({ fingerprintId }) {
       if (response.ok) {
         const data = await response.json()
         setFixStatus(data.status || null)
+        setFixStatusInfo(data)
         // If fix is completed, also fetch the log
         if (data.status === 'completed' && !fixLog) {
           fetchFixLog()
         }
       } else {
         setFixStatus(null)
+        setFixStatusInfo(null)
       }
     } catch (err) {
       console.error('Error fetching fix status:', err)
       setFixStatus(null)
+      setFixStatusInfo(null)
     }
   }
 
@@ -279,6 +283,28 @@ export default function FailureSignatureDetail({ fingerprintId }) {
                   Investigation Failed
                 </span>
               )}
+              {signature.investigation_status === 'timeout' && (
+                <span className="px-3 py-1 rounded text-sm font-medium bg-red-500/10 text-red-500 border border-red-500/20 flex items-center gap-1">
+                  <AlertCircle className="w-3 h-3" />
+                  Investigation Timed Out
+                </span>
+              )}
+              {signature.investigation_status === 'stalled' && (
+                <span className="px-3 py-1 rounded text-sm font-medium bg-orange-500/10 text-orange-500 border border-orange-500/20 flex items-center gap-1">
+                  <AlertCircle className="w-3 h-3" />
+                  Investigation Stalled
+                </span>
+              )}
+              {signature.agent_execution_id && (signature.investigation_status === 'completed' || signature.investigation_status === 'failed' || signature.investigation_status === 'timeout' || signature.investigation_status === 'stalled' || signature.investigation_status === 'in_progress' || signature.investigation_status === 'starting') && (
+                <Link
+                  to={`/agent-execution/${signature.agent_execution_id}`}
+                  className="px-3 py-1 rounded text-sm font-medium bg-purple-500/10 text-purple-500 border border-purple-500/20 hover:bg-purple-500/20 transition-colors flex items-center gap-1"
+                  title="View agent execution details"
+                >
+                  <Eye className="w-3 h-3" />
+                  View Execution
+                </Link>
+              )}
             </div>
             <h2 className="text-xl font-semibold text-gh-fg">
               {signature.signature?.error_type}: {signature.signature?.normalized_message}
@@ -291,13 +317,13 @@ export default function FailureSignatureDetail({ fingerprintId }) {
             </p>
           </div>
           <div className="flex gap-2">
-            {(signature.investigation_status === 'not_started' || signature.investigation_status === 'failed') && (
+            {(signature.investigation_status === 'not_started' || signature.investigation_status === 'failed' || signature.investigation_status === 'timeout' || signature.investigation_status === 'stalled') && (
               <button
                 onClick={triggerInvestigation}
                 className="px-4 py-2 bg-gh-accent-emphasis text-white rounded hover:bg-gh-accent-primary transition-colors flex items-center gap-2"
               >
                 <Play className="w-4 h-4" />
-                {signature.investigation_status === 'failed' ? 'Retry Investigation' : 'Start Investigation'}
+                {signature.investigation_status === 'not_started' ? 'Start Investigation' : 'Retry Investigation'}
               </button>
             )}
             {(signature.investigation_status === 'diagnosed' || signature.investigation_status === 'completed') && (
@@ -340,6 +366,16 @@ export default function FailureSignatureDetail({ fingerprintId }) {
                     <Wrench className="w-4 h-4" />
                     Launch Fix
                   </button>
+                )}
+                {fixStatusInfo?.agent_execution_id && (
+                  <Link
+                    to={`/agent-execution/${fixStatusInfo.agent_execution_id}`}
+                    className="px-4 py-2 bg-purple-500/10 text-purple-500 border border-purple-500/20 rounded hover:bg-purple-500/20 transition-colors flex items-center gap-2"
+                    title="View fix execution details"
+                  >
+                    <Eye className="w-4 h-4" />
+                    View Fix Execution
+                  </Link>
                 )}
               </>
             )}

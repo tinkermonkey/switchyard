@@ -61,7 +61,8 @@ class ClaudeFixAgentRunner:
         fix_plan_file: str,
         output_log: str,
         project: str,
-        observability_manager=None
+        observability_manager=None,
+        agent_execution_id: Optional[str] = None
     ) -> Optional[dict]:
         """
         Launch Claude Code fix execution process.
@@ -72,9 +73,10 @@ class ClaudeFixAgentRunner:
             output_log: Path to fix_log.txt
             project: Project name
             observability_manager: Optional observability manager for events
+            agent_execution_id: Optional execution ID for tracking in UI
 
         Returns:
-            Dict with 'task' (asyncio task), or None if launch failed
+            Dict with 'task' (asyncio task), 'agent_execution_id', or None if launch failed
         """
         try:
             # Build fix prompt
@@ -96,6 +98,7 @@ class ClaudeFixAgentRunner:
                 'use_docker': False,  # Run on host to access Docker CLI and projects
                 'observability': observability_manager,
                 'claude_model': 'claude-sonnet-4-5-20250929',
+                'agent_execution_id': agent_execution_id,  # For UI tracking
             }
 
             logger.info(f"Launching Claude fix for {fingerprint_id} (project: {project})")
@@ -103,16 +106,45 @@ class ClaudeFixAgentRunner:
             # Create output file writer for streaming to log file
             log_file_handle = open(output_log, "w")
 
-            def stream_to_file(event):
-                """Stream Claude Code events to log file"""
+            def stream_to_file_and_redis(event):
+                """Stream Claude Code events to log file AND Redis (same as pipeline agents)"""
                 import json
+                import time
                 try:
+                    # Write to local log file
                     log_file_handle.write(json.dumps(event) + "\n")
                     log_file_handle.flush()
-                except Exception as e:
-                    logger.error(f"Error writing to log file: {e}")
 
-            context['stream_callback'] = stream_to_file
+                    # Publish to Redis using EXACT same format as pipeline agents
+                    if observability_manager and observability_manager.enabled:
+                        event_data = {
+                            'agent': context['agent'],
+                            'task_id': context['task_id'],
+                            'project': context['project'],
+                            'pipeline_run_id': None,  # Fix executions don't have pipeline_run_id
+                            'timestamp': event.get('timestamp') or time.time(),
+                            'event': event
+                        }
+                        event_json = json.dumps(event_data)
+
+                        # Publish to pub/sub for real-time delivery
+                        observability_manager.redis.publish('orchestrator:claude_stream', event_json)
+
+                        # Also add to Redis Stream for history (with automatic trimming)
+                        claude_stream_key = "orchestrator:claude_logs_stream"
+                        observability_manager.redis.xadd(
+                            claude_stream_key,
+                            {'log': event_json},
+                            maxlen=500,
+                            approximate=True
+                        )
+
+                        # Set 2-hour TTL on the stream
+                        observability_manager.redis.expire(claude_stream_key, 7200)
+                except Exception as e:
+                    logger.error(f"Error in stream callback: {e}")
+
+            context['stream_callback'] = stream_to_file_and_redis
 
             # Launch fix as async task
             async def run_fix():
@@ -138,9 +170,10 @@ class ClaudeFixAgentRunner:
                 'task': task,
                 'pid': None,
                 'log_file': log_file_handle,
+                'agent_execution_id': agent_execution_id,  # For UI tracking
             }
 
-            logger.info(f"Claude fix task created for {fingerprint_id}")
+            logger.info(f"Claude fix task created for {fingerprint_id}, execution_id={agent_execution_id}")
             return result
 
         except Exception as e:

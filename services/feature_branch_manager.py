@@ -1244,6 +1244,20 @@ Waiting for human decision...
             github_integration=github_integration
         )
 
+        # Handle PR creation/update failure gracefully
+        if not pr_result.get('success', True):  # Default True for backward compat
+            logger.warning(
+                f"PR operation failed for issue #{issue_number}: {pr_result.get('error', 'Unknown')}"
+            )
+            # Return partial success - changes were committed and pushed, but PR failed
+            return {
+                "success": True,  # Git operations succeeded
+                "branch_name": feature_branch.branch_name,
+                "pr_failed": True,
+                "pr_error": pr_result.get('error', 'Unknown error'),
+                "all_complete": False  # Can't mark complete without PR
+            }
+
         # Step 7: Check if all sub-issues complete
         all_complete = self.check_all_sub_issues_complete(feature_branch)
 
@@ -1287,7 +1301,7 @@ Waiting for human decision...
         )
 
         if not feature_branch.pr_number:
-            # Create new PR as draft
+            # Attempt to create new PR (will reuse existing if found)
             result = await github_integration.create_pr(
                 branch=feature_branch.branch_name,
                 title=f"[Feature] {parent_issue.get('title', 'Feature')}",
@@ -1295,20 +1309,44 @@ Waiting for human decision...
                 draft=True
             )
 
+            if not result.get('success'):
+                logger.error(
+                    f"Failed to create/find PR for {feature_branch.branch_name}: "
+                    f"{result.get('error', 'Unknown error')}"
+                )
+                return result
+
+            # Update state with PR number (whether it was created or found)
             feature_branch.pr_number = result["pr_number"]
             feature_branch.pr_status = "draft"
             self.save_feature_branch_state(project, feature_branch)
 
-            logger.info(f"Created PR #{result['pr_number']} for parent #{feature_branch.parent_issue}")
+            if result.get('already_existed'):
+                logger.info(
+                    f"Found existing PR #{result['pr_number']} for parent #{feature_branch.parent_issue}"
+                )
+            else:
+                logger.info(
+                    f"Created PR #{result['pr_number']} for parent #{feature_branch.parent_issue}"
+                )
 
             return result
         else:
             # Update existing PR description
-            await github_integration.update_pr_body(feature_branch.pr_number, pr_body)
+            update_success = await github_integration.update_pr_body(feature_branch.pr_number, pr_body)
+
+            if not update_success:
+                logger.error(f"Failed to update PR #{feature_branch.pr_number}")
+                return {
+                    'success': False,
+                    'error': f"Failed to update PR #{feature_branch.pr_number}",
+                    'pr_number': feature_branch.pr_number
+                }
 
             logger.info(f"Updated PR #{feature_branch.pr_number} with latest sub-issue status")
 
             return {
+                'success': True,
                 "pr_number": feature_branch.pr_number,
                 "pr_url": f"https://github.com/{github_integration.repo_owner}/{github_integration.repo_name}/pull/{feature_branch.pr_number}"
             }

@@ -51,6 +51,18 @@ DOCKER_FAILURE_MAPPING = {
             "impact_score": {"type": "float"},
             "status": {"type": "keyword"},
             "investigation_status": {"type": "keyword"},
+            "investigation_metadata": {
+                "properties": {
+                    "container_name": {"type": "keyword"},
+                    "started_at": {"type": "date"},
+                    "last_heartbeat": {"type": "date"},
+                    "completed_at": {"type": "date"},
+                    "result": {"type": "keyword"},
+                    "retry_count": {"type": "integer"},
+                    "error_message": {"type": "text"},
+                }
+            },
+            "version": {"type": "long"},
             "sample_entries": {
                 "type": "nested",
                 "properties": {
@@ -177,6 +189,16 @@ class DockerFailureSignatureStore(BaseFailureSignatureStore):
             "impact_score": impact_score,
             "status": "new",
             "investigation_status": "not_started",
+            "investigation_metadata": {
+                "container_name": None,
+                "started_at": None,
+                "last_heartbeat": None,
+                "completed_at": None,
+                "result": None,
+                "retry_count": 0,
+                "error_message": None,
+            },
+            "version": 1,
             "sample_entries": [sample_entry],
             "tags": tags,
             "related_signatures": [],

@@ -23,7 +23,10 @@ export default function Medic() {
 
         {/* Dashboard Stats */}
         <div>
-          <h3 className="text-lg font-semibold text-gh-fg mb-3">Overview</h3>
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="text-lg font-semibold text-gh-fg">Overview</h3>
+            <p className="text-xs text-gh-fg-muted">Stats reflect all signatures (list below shows filtered/limited view)</p>
+          </div>
           <MedicDashboard />
         </div>
 
@@ -41,7 +44,10 @@ export default function Medic() {
 
         {/* Failure Signatures */}
         <div>
-          <h3 className="text-lg font-semibold text-gh-fg mb-3">Failure Signatures</h3>
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="text-lg font-semibold text-gh-fg">Failure Signatures</h3>
+            <p className="text-xs text-gh-fg-muted">Showing up to 50 signatures (use filters to refine)</p>
+          </div>
           <FailureSignatureList />
         </div>
       </div>
