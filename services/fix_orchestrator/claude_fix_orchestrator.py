@@ -23,7 +23,7 @@ sys.path.append(str(Path(__file__).parent.parent.parent))
 from services.fix_orchestrator.fix_execution_queue import ClaudeFixExecutionQueue
 from services.fix_orchestrator.claude_fix_agent_runner import ClaudeFixAgentRunner
 from monitoring.observability import get_observability_manager, EventType
-from services.medic.claude_failure_signature_store import ClaudeFailureSignatureStore
+from services.medic.claude.claude_signature_store import ClaudeFailureSignatureStore
 
 # Configure logging
 logging.basicConfig(
@@ -329,9 +329,10 @@ class ClaudeFixOrchestrator:
 
                     # Update status
                     status = 'completed' if success else 'failed'
+                    agent_execution_id = fix_info.get('agent_execution_id')
                     await loop.run_in_executor(
                         None,
-                        partial(self.queue.update_status, fingerprint_id, status, error=error_msg)
+                        partial(self.queue.update_status, fingerprint_id, status, error=error_msg, agent_execution_id=agent_execution_id)
                     )
 
                     # Release lock

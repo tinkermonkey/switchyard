@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
-import { Wrench, Clock, XCircle, FileText, Loader2 } from 'lucide-react'
+import { Wrench, Clock, XCircle, FileText, Loader2, Eye } from 'lucide-react'
 import { useSocket } from '../contexts'
+import { Link } from '@tanstack/react-router'
 
 export default function ActiveFixes() {
   const [activeFixes, setActiveFixes] = useState([])
@@ -192,6 +193,17 @@ export default function ActiveFixes() {
                   </td>
                   <td className="px-4 py-3">
                     <div className="flex items-center justify-end gap-2">
+                      {fix.agent_execution_id && (
+                        <Link
+                          to="/agent-execution/$executionId"
+                          params={{ executionId: fix.agent_execution_id }}
+                          className="px-2 py-1 text-xs text-green-500 hover:text-green-400 hover:bg-green-500/10 rounded transition-colors flex items-center gap-1"
+                          title="View live execution"
+                        >
+                          <Eye className="w-3 h-3" />
+                          Live
+                        </Link>
+                      )}
                       <button
                         onClick={() => viewLog(fix.fingerprint_id)}
                         className="px-2 py-1 text-xs text-blue-500 hover:text-blue-400 hover:bg-blue-500/10 rounded transition-colors flex items-center gap-1"

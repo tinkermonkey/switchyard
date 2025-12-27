@@ -3185,65 +3185,58 @@ def _enrich_signatures_with_redis_status(signatures: List[dict], system_type: st
                 continue
 
             try:
-                # Query Redis for authoritative status
-                redis_status_key = f"{prefix}:{fp_id}:status"
-                redis_status = redis_client.get(redis_status_key)
-                in_active = fp_id in active_set
-                in_queue = fp_id in queued_set
+                # Elasticsearch is now the single source of truth for status
+                # No enrichment needed - ES status is authoritative
+                sig['_status_source'] = "elasticsearch"
+                sig['_status_enriched'] = False
 
-                # Determine authoritative status from Redis
-                authoritative_status = None
-                status_source = "elasticsearch"  # Default
+                # ENRICHMENT: Add fix execution status for Claude failures
+                if system_type == "claude":
+                    try:
+                        # Check if fix is queued
+                        fix_in_queue = redis_client.lpos("medic:claude_fix:queue", fp_id) is not None
 
-                if in_queue:
-                    authoritative_status = "queued"
-                    status_source = "redis"
-                elif in_active:
-                    # In active set - check status key for precision
-                    if redis_status == "in_progress":
-                        authoritative_status = "in_progress"
-                    elif redis_status == "starting":
-                        authoritative_status = "starting"
-                    else:
-                        authoritative_status = "in_progress"  # Default for active
-                    status_source = "redis"
-                elif redis_status:
-                    # Not in queue or active, but has Redis status
-                    # Map Redis status to ES status
-                    status_map = {
-                        "completed": "completed",
-                        "failed": "failed",
-                        "ignored": "ignored",
-                        "timeout": "timeout",
-                        "stalled": "failed",
-                    }
-                    authoritative_status = status_map.get(redis_status, redis_status)
-                    status_source = "redis"
+                        # Check if fix is active
+                        fix_active_key = f"fix:active:{fp_id}"
+                        fix_is_active = redis_client.exists(fix_active_key)
 
-                # Override ES status if Redis has authoritative data
-                if authoritative_status:
-                    es_status = sig.get('investigation_status')
-                    if es_status != authoritative_status:
-                        logger.debug(
-                            f"Enrichment override for {fp_id[:16]}...: "
-                            f"ES:{es_status} -> Redis:{authoritative_status}"
-                        )
-                        sig['investigation_status'] = authoritative_status
-                        sig['_status_source'] = status_source
-                        sig['_status_enriched'] = True
-                    else:
-                        sig['_status_source'] = status_source
-                        sig['_status_enriched'] = False
-                else:
-                    # No Redis data - keep ES status
-                    sig['_status_source'] = "elasticsearch"
-                    sig['_status_enriched'] = False
+                        # Check fix status from status key
+                        fix_status_key = f"medic:claude_fix:{fp_id}:status"
+                        fix_status = redis_client.get(fix_status_key)
+
+                        # Determine fix execution status
+                        if fix_in_queue:
+                            sig['fix_execution_status'] = 'queued'
+                        elif fix_is_active:
+                            # Get details from active hash
+                            active_data = redis_client.hgetall(fix_active_key)
+                            sig['fix_execution_status'] = active_data.get('status', 'in_progress')
+                            sig['fix_started_at'] = active_data.get('started_at')
+                            sig['fix_container_name'] = active_data.get('container_name')
+                            sig['agent_execution_id'] = active_data.get('agent_execution_id')
+                        elif fix_status:
+                            sig['fix_execution_status'] = fix_status
+                            # Get additional metadata if available
+                            completed_at = redis_client.get(f"medic:claude_fix:{fp_id}:completed_at")
+                            if completed_at:
+                                sig['fix_completed_at'] = completed_at
+                            # Get agent_execution_id for completed fixes
+                            agent_execution_id = redis_client.get(f"medic:claude_fix:{fp_id}:agent_execution_id")
+                            if agent_execution_id:
+                                sig['agent_execution_id'] = agent_execution_id
+                        else:
+                            sig['fix_execution_status'] = None
+
+                    except Exception as fix_err:
+                        logger.error(f"Error enriching fix status for {fp_id}: {fix_err}")
+                        sig['fix_execution_status'] = None
 
             except Exception as e:
                 logger.error(f"Error enriching signature {fp_id}: {e}")
                 # On error, keep original ES data
                 sig['_status_source'] = "elasticsearch"
                 sig['_status_enriched'] = False
+                sig['fix_execution_status'] = None
 
         return signatures
 
@@ -3628,9 +3621,12 @@ def get_all_failure_signatures():
         # Build base query filters
         must_clauses = []
 
-        # Status filter
+        # Status filter (NOTE: This filters ES data before Redis enrichment,
+        # so it won't show investigations that are "queued" in Redis but "failed" in ES.
+        # Client-side filtering after enrichment is recommended for accurate results.)
         if request.args.get('status'):
-            must_clauses.append({"term": {"status": request.args['status']}})
+            # Filter on investigation_status field (not "status" which is severity)
+            must_clauses.append({"term": {"investigation_status": request.args['status']}})
 
         # Severity filter
         if request.args.get('severity'):
@@ -3669,6 +3665,38 @@ def get_all_failure_signatures():
         result = es_client.search(index=indices, body=query)
 
         signatures = [hit['_source'] for hit in result['hits']['hits']]
+
+        # Enrich with real-time Redis status
+        import redis
+        redis_client = redis.Redis(
+            host=os.getenv('REDIS_HOST', 'redis'),
+            port=int(os.getenv('REDIS_PORT', 6379)),
+            decode_responses=True
+        )
+
+        try:
+            for sig in signatures:
+                fp_id = sig.get('fingerprint_id')
+                system_type = sig.get('type', 'docker')  # docker or claude
+
+                # Determine queue prefix based on type
+                if system_type == 'claude':
+                    queue_prefix = 'medic:claude_investigation'
+                else:
+                    queue_prefix = 'medic:docker_investigation'
+
+                try:
+                    # Elasticsearch is the single source of truth for investigation status
+                    # No Redis enrichment needed - ES status is authoritative
+                    pass  # Keep ES investigation_status as-is
+
+                except Exception as inv_err:
+                    logger.error(f"Error enriching investigation status for {fp_id}: {inv_err}")
+
+        except Exception as e:
+            logger.error(f"Error enriching signatures: {e}")
+        finally:
+            redis_client.close()
 
         return jsonify({
             'signatures': signatures,
@@ -3895,7 +3923,7 @@ def get_claude_failure_signatures():
     """
     try:
         # Build Elasticsearch query
-        must_clauses = [{"term": {"type": "claude_failure"}}]  # Only Claude failures
+        must_clauses = [{"term": {"type": "claude"}}]  # Only Claude failures
 
         # Project filter
         if request.args.get('project'):
@@ -3978,6 +4006,85 @@ def get_claude_failure_signature(fingerprint_id):
             return jsonify({"error": "Signature not found"}), 404
 
         signature = result['hits']['hits'][0]['_source']
+
+        # Enrich with real-time Redis status (same as list view)
+        import redis
+        redis_client = redis.Redis(
+            host=os.getenv('REDIS_HOST', 'redis'),
+            port=int(os.getenv('REDIS_PORT', 6379)),
+            decode_responses=True
+        )
+
+        try:
+            fp_id = signature.get('fingerprint_id')
+
+            # ENRICHMENT: Investigation status
+            try:
+                # Check if investigation is queued
+                inv_in_queue = redis_client.lpos("medic:claude_investigation:queue", fp_id) is not None
+
+                # Check if investigation is active
+                inv_active_key = f"investigation:active:{fp_id}"
+                inv_is_active = redis_client.exists(inv_active_key)
+
+                # Check investigation status from status key
+                inv_status_key = f"medic:claude_investigation:{fp_id}:status"
+                inv_status = redis_client.get(inv_status_key)
+
+                # Determine investigation status (override ES value with real-time Redis status)
+                if inv_in_queue:
+                    signature['investigation_status'] = 'queued'
+                elif inv_is_active:
+                    active_data = redis_client.hgetall(inv_active_key)
+                    signature['investigation_status'] = active_data.get('status', 'in_progress')
+                elif inv_status:
+                    signature['investigation_status'] = inv_status
+                # else: keep the ES value
+
+            except Exception as inv_err:
+                logger.error(f"Error enriching investigation status for {fp_id}: {inv_err}")
+
+            # ENRICHMENT: Fix execution status
+            try:
+                # Check if fix is queued
+                fix_in_queue = redis_client.lpos("medic:claude_fix:queue", fp_id) is not None
+
+                # Check if fix is active
+                fix_active_key = f"fix:active:{fp_id}"
+                fix_is_active = redis_client.exists(fix_active_key)
+
+                # Check fix status from status key
+                fix_status_key = f"medic:claude_fix:{fp_id}:status"
+                fix_status = redis_client.get(fix_status_key)
+
+                # Determine fix execution status
+                if fix_in_queue:
+                    signature['fix_execution_status'] = 'queued'
+                elif fix_is_active:
+                    active_data = redis_client.hgetall(fix_active_key)
+                    signature['fix_execution_status'] = active_data.get('status', 'in_progress')
+                    signature['fix_started_at'] = active_data.get('started_at')
+                    signature['fix_container_name'] = active_data.get('container_name')
+                    signature['agent_execution_id'] = active_data.get('agent_execution_id')
+                elif fix_status:
+                    signature['fix_execution_status'] = fix_status
+                    completed_at = redis_client.get(f"medic:claude_fix:{fp_id}:completed_at")
+                    if completed_at:
+                        signature['fix_completed_at'] = completed_at
+                    agent_execution_id = redis_client.get(f"medic:claude_fix:{fp_id}:agent_execution_id")
+                    if agent_execution_id:
+                        signature['agent_execution_id'] = agent_execution_id
+                else:
+                    signature['fix_execution_status'] = None
+
+            except Exception as fix_err:
+                logger.error(f"Error enriching fix status for {fp_id}: {fix_err}")
+
+        except Exception as e:
+            logger.error(f"Error enriching signature {fingerprint_id}: {e}")
+        finally:
+            redis_client.close()
+
         return jsonify(signature), 200
 
     except Exception as e:
@@ -4023,7 +4130,7 @@ def get_claude_medic_stats():
         status_agg = es_client.search(
             index="medic-claude-failures-*",
             body={
-                "query": {"term": {"type": "claude_failure"}},
+                "query": {"term": {"type": "claude"}},
                 "size": 0,
                 "aggs": {
                     "by_status": {
@@ -4067,7 +4174,7 @@ def get_claude_medic_stats():
         total_result = es_client.search(
             index="medic-claude-failures-*",
             body={
-                "query": {"term": {"type": "claude_failure"}},
+                "query": {"term": {"type": "claude"}},
                 "size": 0,
                 "aggs": {
                     "total_failures": {"sum": {"field": "total_failures"}},
@@ -4118,7 +4225,7 @@ def get_claude_medic_projects():
         result = es_client.search(
             index="medic-claude-failures-*",
             body={
-                "query": {"term": {"type": "claude_failure"}},
+                "query": {"term": {"type": "claude"}},
                 "size": 0,
                 "aggs": {
                     "projects": {
@@ -4162,7 +4269,7 @@ def get_claude_project_stats(project):
                 "query": {
                     "bool": {
                         "must": [
-                            {"term": {"type": "claude_failure"}},
+                            {"term": {"type": "claude"}},
                             {"term": {"project": project}}
                         ]
                     }
@@ -4348,7 +4455,7 @@ def get_claude_investigation_status(fingerprint_id):
         queue_info = queue.get_investigation_info(fingerprint_id)
 
         # Get report info
-        report_summary = report_manager.get_investigation_summary(fingerprint_id)
+        report_summary = report_manager.get_report_status(fingerprint_id)
 
         # Merge information
         status_info = {
@@ -4677,6 +4784,11 @@ def get_claude_fix_status(fingerprint_id):
             active_fix = redis_client.hgetall(f"fix:active:{fingerprint_id}")
             if active_fix and 'agent_execution_id' in active_fix:
                 status_info['agent_execution_id'] = active_fix['agent_execution_id']
+            else:
+                # For completed fixes, check the stored key
+                stored_agent_execution_id = redis_client.get(f"medic:claude_fix:{fingerprint_id}:agent_execution_id")
+                if stored_agent_execution_id:
+                    status_info['agent_execution_id'] = stored_agent_execution_id
         except Exception as e:
             logger.warning(f"Failed to fetch agent_execution_id from Redis: {e}")
 

@@ -418,9 +418,8 @@ class PipelineProgression:
                             created_at=datetime.now().isoformat()
                         )
 
-                        self.task_queue.enqueue(task)
-                        
-                        # Record execution start
+                        # Record execution start FIRST
+                        # CRITICAL: Must happen before enqueue to prevent race condition
                         from services.work_execution_state import work_execution_tracker
                         work_execution_tracker.record_execution_start(
                             issue_number=next_issue['issue_number'],
@@ -429,6 +428,9 @@ class PipelineProgression:
                             trigger_source='pipeline_progression',
                             project_name=project_name
                         )
+
+                        # Enqueue task LAST so workers find in_progress state
+                        self.task_queue.enqueue(task)
                         
                         logger.info(f"Triggered agent {agent} for next waiting issue #{next_issue['issue_number']}")
                     else:
@@ -523,9 +525,8 @@ class PipelineProgression:
                 created_at=datetime.now().isoformat()
             )
 
-            self.task_queue.enqueue(task)
-
-            # Record execution start with 'pipeline_progression' trigger
+            # Record execution start with 'pipeline_progression' trigger FIRST
+            # CRITICAL: Must happen before enqueue to prevent race condition
             from services.work_execution_state import work_execution_tracker
             work_execution_tracker.record_execution_start(
                 issue_number=issue_number,
@@ -534,6 +535,9 @@ class PipelineProgression:
                 trigger_source='pipeline_progression',
                 project_name=project_name
             )
+
+            # Enqueue task LAST so workers find in_progress state
+            self.task_queue.enqueue(task)
 
             logger.info(f"Queued {next_agent} for issue #{issue_number} in column '{next_column}'")
             return True

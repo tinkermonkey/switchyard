@@ -44,6 +44,16 @@ class AgentExecutor:
         """
         Execute an agent with full observability support.
 
+        IMPORTANT: Callers MUST call work_execution_tracker.record_execution_start()
+        BEFORE calling this method, if the task_context contains 'issue_number' and 'column'.
+        This ensures proper execution state tracking and audit trails.
+
+        See examples in:
+        - services/project_monitor.py (lines 1804, 3105)
+        - services/pipeline_progression.py (line 390)
+        - services/human_feedback_loop.py (in _execute_agent method)
+        - services/review_cycle.py (in _execute_agent_directly method)
+
         Args:
             agent_name: Name of the agent to execute (e.g., 'business_analyst')
             project_name: Name of the project

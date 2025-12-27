@@ -696,6 +696,17 @@ DO NOT include any explanation, markdown formatting, or other text - ONLY the JS
                 # Increment agent call counter
                 self._agent_call_count += 1
 
+                # Record execution start for state tracking
+                if 'issue_number' in task_context and 'column' in task_context:
+                    from services.work_execution_state import work_execution_tracker
+                    work_execution_tracker.record_execution_start(
+                        issue_number=task_context['issue_number'],
+                        column=task_context['column'],
+                        agent=self.agent_name,
+                        trigger_source='repair_cycle_test',
+                        project_name=project
+                    )
+
                 # Execute agent through centralized executor with full observability
                 result = await agent_executor.execute_agent(
                     agent_name=self.agent_name,
@@ -949,6 +960,17 @@ DO NOT include any explanation, markdown formatting, or other text - ONLY the JS
             # Increment agent call counter
             self._agent_call_count += 1
 
+            # Record execution start for state tracking
+            if 'issue_number' in task_context and 'column' in task_context:
+                from services.work_execution_state import work_execution_tracker
+                work_execution_tracker.record_execution_start(
+                    issue_number=task_context['issue_number'],
+                    column=task_context['column'],
+                    agent=self.agent_name,
+                    trigger_source='repair_cycle_fix',
+                    project_name=project
+                )
+
             # Execute agent through centralized executor with full observability
             try:
                 result = await agent_executor.execute_agent(
@@ -1072,6 +1094,17 @@ For each warning:
 
             # Increment agent call counter
             self._agent_call_count += 1
+
+            # Record execution start for state tracking
+            if 'issue_number' in task_context and 'column' in task_context:
+                from services.work_execution_state import work_execution_tracker
+                work_execution_tracker.record_execution_start(
+                    issue_number=task_context['issue_number'],
+                    column=task_context['column'],
+                    agent=self.agent_name,
+                    trigger_source='repair_cycle_warning_review',
+                    project_name=project
+                )
 
             # Execute agent through centralized executor with full observability
             try:

@@ -840,7 +840,24 @@ class ProjectMonitor:
                     logger.warning(traceback.format_exc())
                 
                 # Fallback 3: Use general issue context
-                logger.warning(f"No agent outputs found in issue or parent, falling back to general issue context")
+                logger.info(
+                    f"No outputs from {current_stage_config.inputs_from} found for issue #{issue_number}, "
+                    f"using general issue context (fallback)"
+                )
+                # Track metric
+                try:
+                    from monitoring.metrics_collector import metrics_collector
+                    metrics_collector.record_metric(
+                        metric_name="pipeline.input_fallback",
+                        value=1,
+                        tags={
+                            "stage": current_stage_config.stage,
+                            "requested_agents": ",".join(current_stage_config.inputs_from),
+                            "issue": str(issue_number)
+                        }
+                    )
+                except Exception as e:
+                    logger.debug(f"Could not record fallback metric: {e}")
                 return self._get_issue_context(repository, issue_number, org, current_column, workflow_template)
 
         # For hybrid pipelines, determine if previous stage was in discussions or issues
@@ -1280,7 +1297,26 @@ class ProjectMonitor:
                             final_timestamp = comment_time
 
                 if not final_output:
-                    logger.warning(f"No output found from agent '{agent_name}' in issue #{issue_number}")
+                    # Determine appropriate log level based on context
+                    # Check if this is expected (standalone issue) or a workflow gap (sub-issue without parent)
+                    log_level = self._determine_missing_input_severity(
+                        repository, issue_number, org, agent_name
+                    )
+
+                    if log_level == "WARNING":
+                        logger.warning(
+                            f"No output found from agent '{agent_name}' in issue #{issue_number} "
+                            f"(expected parent epic with design)"
+                        )
+                    elif log_level == "INFO":
+                        logger.info(
+                            f"Agent '{agent_name}' output not found in issue #{issue_number}, "
+                            f"using fallback context"
+                        )
+                    else:  # DEBUG
+                        logger.debug(
+                            f"Agent '{agent_name}' output not required for issue #{issue_number}"
+                        )
                     continue
 
                 # Build context for this agent
@@ -1300,6 +1336,59 @@ class ProjectMonitor:
             import traceback
             logger.error(traceback.format_exc())
             return ""
+
+    def _determine_missing_input_severity(
+        self, repository: str, issue_number: int, org: str, agent_name: str
+    ) -> str:
+        """
+        Determine appropriate log severity for missing agent output.
+
+        Returns:
+            "WARNING" if issue should have parent/discussion with agent output
+            "INFO" if missing output is acceptable with fallback
+            "DEBUG" if output is optional for this issue type
+        """
+        try:
+            import subprocess
+            import json
+            import re
+
+            # Get issue metadata
+            result = subprocess.run(
+                ['gh', 'issue', 'view', str(issue_number),
+                 '--repo', f"{org}/{repository}",
+                 '--json', 'body,labels'],
+                capture_output=True, text=True, check=True
+            )
+            issue_data = json.loads(result.stdout)
+            body = issue_data.get('body', '')
+            labels = [label['name'] for label in issue_data.get('labels', [])]
+
+            # Check if this is a sub-issue (should have parent with design)
+            parent_match = re.search(r'Part of #(\d+)', body)
+            is_sub_issue = parent_match is not None
+
+            # Check if this is an environment/tooling issue (doesn't need architecture)
+            is_env_issue = any(
+                label in labels
+                for label in ['pipeline:env', 'environment', 'tooling', 'dependencies']
+            )
+
+            # Determine severity
+            if agent_name == 'software_architect':
+                if is_env_issue:
+                    return "DEBUG"  # Environment issues don't need architecture
+                elif is_sub_issue:
+                    return "WARNING"  # Sub-issue should have parent with design
+                else:
+                    return "INFO"  # Standalone issue, fallback is acceptable
+
+            # For other agents, INFO is appropriate (fallback available)
+            return "INFO"
+
+        except Exception as e:
+            logger.debug(f"Error determining log severity: {e}")
+            return "INFO"  # Default to INFO on error
 
     def _check_agent_processed_issue_sync(self, issue_number: int, agent: str, repository: str, org: str, workspace_type: str = 'issues', discussion_id: Optional[str] = None) -> bool:
         """Synchronous wrapper for checking if agent has processed issue"""
@@ -1904,8 +1993,17 @@ class ProjectMonitor:
                     created_at=utc_isoformat()
                 )
 
-                self.task_queue.enqueue(task)
-                
+                # Record execution start in work execution state FIRST
+                # CRITICAL: Must happen before enqueue to prevent race condition
+                from services.work_execution_state import work_execution_tracker
+                work_execution_tracker.record_execution_start(
+                    issue_number=issue_number,
+                    column=status,
+                    agent=agent,
+                    trigger_source='manual',  # Triggered from project monitor
+                    project_name=project_name
+                )
+
                 # EMIT DECISION EVENT: Task queued
                 self.decision_events.emit_task_queued(
                     agent=agent,
@@ -1917,15 +2015,8 @@ class ProjectMonitor:
                     pipeline_run_id=pipeline_run.id
                 )
 
-                # Record execution start in work execution state
-                from services.work_execution_state import work_execution_tracker
-                work_execution_tracker.record_execution_start(
-                    issue_number=issue_number,
-                    column=status,
-                    agent=agent,
-                    trigger_source='manual',  # Triggered from project monitor
-                    project_name=project_name
-                )
+                # Enqueue task LAST so workers find in_progress state
+                self.task_queue.enqueue(task)
 
                 logger.info(f"Created task for {agent} - Issue #{issue_number} moved to {status} on {board_name}")
                 return agent
@@ -3194,6 +3285,17 @@ _Repair cycle initiated by Claude Code Orchestrator_
             except Exception as e:
                 logger.warning(f"Failed to post initial comment: {e}")
 
+            # Record execution start in work execution state FIRST
+            # CRITICAL: Must happen before launching container to prevent race condition
+            from services.work_execution_state import work_execution_tracker
+            work_execution_tracker.record_execution_start(
+                issue_number=issue_number,
+                column=status,
+                agent=stage_config.default_agent,
+                trigger_source='manual',
+                project_name=project_name
+            )
+
             # Launch Docker container
             container_name = _launch_repair_cycle_container(
                 project_name=project_name,
@@ -3234,16 +3336,6 @@ _Repair cycle initiated by Claude Code Orchestrator_
                 workflow_template=workflow_template,
                 agent_name=stage_config.default_agent,
                 pipeline_run_id=pipeline_run.id
-            )
-
-            # Record execution start in work execution state
-            from services.work_execution_state import work_execution_tracker
-            work_execution_tracker.record_execution_start(
-                issue_number=issue_number,
-                column=status,
-                agent=stage_config.default_agent,
-                trigger_source='manual',
-                project_name=project_name
             )
 
             return stage_config.default_agent

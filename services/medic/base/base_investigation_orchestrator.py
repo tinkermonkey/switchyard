@@ -117,7 +117,7 @@ class BaseInvestigationOrchestrator(ABC):
             status = self.report_manager.get_report_status(fingerprint_id)
             if status.get('has_diagnosis'):
                 # Reports exist - mark as completed
-                self.queue.mark_completed(fingerprint_id, "success")
+                self.queue.mark_completed(fingerprint_id, "success", es_store=self.failure_store)
                 logger.info(f"Orphaned investigation {fingerprint_id} had reports - marked completed")
 
                 # Emit event
@@ -138,7 +138,7 @@ class BaseInvestigationOrchestrator(ABC):
                     logger.warning(f"Failed to emit observability event: {e}")
             else:
                 # No reports - mark as failed
-                self.queue.mark_completed(fingerprint_id, "failed")
+                self.queue.mark_completed(fingerprint_id, "failed", es_store=self.failure_store)
                 logger.error(f"Orphaned investigation {fingerprint_id} failed - no reports found")
 
                 # Emit event
@@ -207,24 +207,14 @@ class BaseInvestigationOrchestrator(ABC):
                         metadata = hit['_source'].get('investigation_metadata', {})
 
                         if status == 'queued':
-                            # Add to queue
+                            # Add to queue (status is in ES, no need to update Redis)
                             self.redis.rpush(self.queue.QUEUE_KEY, fp_id)
-                            self.queue.update_status(fp_id, self.queue.STATUS_QUEUED)
                             queued_count += 1
                             logger.debug(f"Rebuilt queued: {fp_id[:16]}...")
 
                         elif status in ['starting', 'in_progress', 'stalled']:
-                            # Add to active set
+                            # Add to active set (status is in ES, no need to update Redis)
                             self.redis.sadd(self.queue.ACTIVE_SET_KEY, fp_id)
-
-                            # Set status in Redis
-                            if status == 'starting':
-                                self.queue.update_status(fp_id, self.queue.STATUS_STARTING)
-                            elif status == 'in_progress':
-                                self.queue.update_status(fp_id, self.queue.STATUS_IN_PROGRESS)
-                            else:
-                                self.queue.update_status(fp_id, self.queue.STATUS_STALLED)
-
                             active_count += 1
 
                             # Check if container actually running
@@ -285,9 +275,10 @@ class BaseInvestigationOrchestrator(ABC):
         )
 
         if success:
-            # Update Redis (best effort)
+            # Update Redis tracking data (best effort)
             try:
-                self.queue.mark_completed(fingerprint_id, self.queue.RESULT_FAILED)
+                self.redis.set(self.queue._key(fingerprint_id, "result"), self.queue.RESULT_FAILED)
+                self.redis.set(self.queue._key(fingerprint_id, "completed_at"), utc_isoformat())
                 self.redis.srem(self.queue.ACTIVE_SET_KEY, fingerprint_id)
             except Exception as e:
                 logger.warning(f"Redis update failed for {fingerprint_id}, will be reconciled: {e}")
@@ -314,7 +305,7 @@ class BaseInvestigationOrchestrator(ABC):
 
                 if not container_name:
                     logger.warning(f"Investigation {fp_id} has no container_name - marking as failed")
-                    self.queue.mark_completed(fp_id, "failed")
+                    self.queue.mark_completed(fp_id, "failed", es_store=self.failure_store)
                     cleaned += 1
                     continue
 
@@ -457,11 +448,11 @@ class BaseInvestigationOrchestrator(ABC):
                     except asyncio.CancelledError:
                         logger.info(f"Investigation {fingerprint_id} cancelled")
 
-                # Update status
-                self.queue.update_status(fingerprint_id, self.queue.STATUS_FAILED)
+                # Mark as completed (updates ES)
                 self.queue.mark_completed(
                     fingerprint_id,
                     self.queue.RESULT_FAILED,
+                    es_store=self.failure_store
                 )
             except Exception as e:
                 logger.error(f"Error stopping investigation {fingerprint_id}: {e}")
@@ -619,11 +610,8 @@ class BaseInvestigationOrchestrator(ABC):
                 logger.error(f"Failed to update ES to 'starting' for {fingerprint_id}")
                 return
 
-            # Update Redis status (best effort)
-            try:
-                self.queue.update_status(fingerprint_id, self.queue.STATUS_STARTING)
-            except Exception as e:
-                logger.warning(f"Redis update failed: {e}")
+            # Redis tracking is best-effort and not authoritative
+            # (Status is in ES only)
 
             # Get signature data from Elasticsearch
             signature = self.failure_store.get_signature(fingerprint_id)
@@ -686,9 +674,8 @@ class BaseInvestigationOrchestrator(ABC):
                 logger.error(f"Failed to update ES to 'in_progress' for {fingerprint_id}")
                 return
 
-            # Update Redis metadata (best effort)
+            # Update Redis tracking metadata (best effort, not authoritative)
             try:
-                self.queue.update_status(fingerprint_id, self.queue.STATUS_IN_PROGRESS)
                 self.redis.set(self.queue._key(fingerprint_id, "pid"), "0")
                 if container_name:
                     self.redis.set(self.queue._key(fingerprint_id, "container_name"), container_name)
@@ -782,9 +769,10 @@ class BaseInvestigationOrchestrator(ABC):
             if not success:
                 logger.error(f"Failed to update ES for completed investigation {fingerprint_id}")
 
-            # Update Redis (best effort)
+            # Update Redis tracking data (best effort)
             try:
-                self.queue.mark_completed(fingerprint_id, result)
+                self.redis.set(self.queue._key(fingerprint_id, "result"), result)
+                self.redis.set(self.queue._key(fingerprint_id, "completed_at"), now)
                 self.redis.srem(self.queue.ACTIVE_SET_KEY, fingerprint_id)
             except Exception as e:
                 logger.warning(f"Redis update failed: {e}, will be reconciled")
@@ -917,9 +905,8 @@ class BaseInvestigationOrchestrator(ABC):
                         metadata={"last_heartbeat": utc_isoformat()},
                         expected_current=["starting"]
                     )
-                    if success:
-                        # Update Redis (best effort)
-                        self.queue.update_status(fp_id, self.queue.STATUS_IN_PROGRESS)
+                    # Redis tracking is best-effort and not authoritative
+                    # (Status is in ES only)
                 else:
                     # Container not running - mark as failed (ES-first)
                     logger.info(f"No container found, marking as failed")
@@ -974,9 +961,8 @@ class BaseInvestigationOrchestrator(ABC):
                         status="stalled",
                         expected_current=["in_progress"]
                     )
-                    if success:
-                        # Update Redis (best effort)
-                        self.queue.update_status(fp_id, self.queue.STATUS_STALLED)
+                    # Redis tracking is best-effort and not authoritative
+                    # (Status is in ES only)
                 else:
                     # Container not running - mark as failed (ES-first)
                     logger.info(f"Container not running, marking as failed")
@@ -1070,7 +1056,7 @@ class BaseInvestigationOrchestrator(ABC):
                     if not started_at_str:
                         # No started_at - definitely stuck, clean up
                         logger.warning(f"Reconciling stuck queued investigation (no started_at): {fp_id}")
-                        self.queue.mark_completed(fp_id, self.queue.RESULT_FAILED)
+                        self.queue.mark_completed(fp_id, self.queue.RESULT_FAILED, es_store=self.failure_store)
                         cleaned += 1
                         continue
 
@@ -1087,9 +1073,9 @@ class BaseInvestigationOrchestrator(ABC):
                             # Check if it has reports (maybe it actually completed)
                             status = self.report_manager.get_report_status(fp_id)
                             if status.get('has_diagnosis'):
-                                self.queue.mark_completed(fp_id, self.queue.RESULT_SUCCESS)
+                                self.queue.mark_completed(fp_id, self.queue.RESULT_SUCCESS, es_store=self.failure_store)
                             else:
-                                self.queue.mark_completed(fp_id, self.queue.RESULT_FAILED)
+                                self.queue.mark_completed(fp_id, self.queue.RESULT_FAILED, es_store=self.failure_store)
                             cleaned += 1
 
                     except Exception as e:
@@ -1429,7 +1415,7 @@ class BaseInvestigationOrchestrator(ABC):
             if elapsed > self.queue.STALL_THRESHOLD:
                 logger.warning(f"{fingerprint_id}: Investigation stalled ({int(elapsed/60)}m)")
                 stalled.append(fingerprint_id)
-                self.queue.update_status(fingerprint_id, self.queue.STATUS_STALLED)
+                # Status updates now happen via ES, not Redis
 
         return stalled
 
@@ -1465,12 +1451,12 @@ class BaseInvestigationOrchestrator(ABC):
 
                     del self.active_processes[fingerprint_id]
 
-                # Mark as timeout
+                # Mark as timeout (updates ES)
                 self.queue.mark_completed(
                     fingerprint_id,
                     self.queue.RESULT_TIMEOUT,
+                    es_store=self.failure_store
                 )
-                self.failure_store.update_investigation_status(fingerprint_id, "timeout")
                 timed_out.append(fingerprint_id)
 
                 # Emit timeout event
@@ -1542,19 +1528,16 @@ class BaseInvestigationOrchestrator(ABC):
         has_reports = result in [self.queue.RESULT_SUCCESS, self.queue.RESULT_IGNORED]
 
         if has_reports:
-            # Reports exist - mark as completed
+            # Reports exist - mark as completed (updates ES)
             logger.info(f"{fingerprint_id}: Reports exist, marking as completed")
-            self.queue.mark_completed(fingerprint_id, result)
-            es_status = "completed" if result == self.queue.RESULT_SUCCESS else "ignored"
-            self.failure_store.update_investigation_status(fingerprint_id, es_status)
+            self.queue.mark_completed(fingerprint_id, result, es_store=self.failure_store)
             return "completed"
 
         # No reports - decide based on elapsed time
         if not elapsed_seconds:
-            # No start time - shouldn't happen, but mark as failed
+            # No start time - shouldn't happen, but mark as failed (updates ES)
             logger.warning(f"{fingerprint_id}: No start time, marking as failed")
-            self.queue.mark_completed(fingerprint_id, self.queue.RESULT_FAILED)
-            self.failure_store.update_investigation_status(fingerprint_id, "failed")
+            self.queue.mark_completed(fingerprint_id, self.queue.RESULT_FAILED, es_store=self.failure_store)
             return "failed"
 
         if elapsed_seconds < self.WAIT_THRESHOLD:
@@ -1563,16 +1546,14 @@ class BaseInvestigationOrchestrator(ABC):
             return "waiting"
 
         if elapsed_seconds > self.TIMEOUT_THRESHOLD:
-            # Exceeded timeout - mark as timeout
+            # Exceeded timeout - mark as timeout (updates ES)
             logger.warning(f"{fingerprint_id}: Exceeded timeout ({int(elapsed_seconds/3600)}h)")
-            self.queue.mark_completed(fingerprint_id, self.queue.RESULT_TIMEOUT)
-            self.failure_store.update_investigation_status(fingerprint_id, "timeout")
+            self.queue.mark_completed(fingerprint_id, self.queue.RESULT_TIMEOUT, es_store=self.failure_store)
             return "timeout"
 
-        # Between 30min and 4hr - mark as failed (can't re-launch without process context)
+        # Between 30min and 4hr - mark as failed (can't re-launch without process context, updates ES)
         logger.info(f"{fingerprint_id}: Stalled at {int(elapsed_seconds/60)}m, marking as failed")
-        self.queue.mark_completed(fingerprint_id, self.queue.RESULT_FAILED)
-        self.failure_store.update_investigation_status(fingerprint_id, "failed")
+        self.queue.mark_completed(fingerprint_id, self.queue.RESULT_FAILED, es_store=self.failure_store)
         return "failed"
 
     async def auto_trigger_checker(self):

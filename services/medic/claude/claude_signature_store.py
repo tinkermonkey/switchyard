@@ -140,7 +140,7 @@ class ClaudeFailureSignatureStore(BaseFailureSignatureStore):
             Signature document dict
         """
         now = utc_isoformat()
-        cluster = entry_data  # For Claude, entry_data is actually a FailureCluster dict
+        cluster = entry_data  # For Claude, entry_data is actually a FailureCluster object
         project = metadata.get("project", fingerprint.project)
 
         # Extract tags
@@ -151,7 +151,7 @@ class ClaudeFailureSignatureStore(BaseFailureSignatureStore):
 
         # Calculate initial impact score
         impact_score = calculate_impact_score(
-            total_failures=cluster.get("failure_count", 1),
+            total_failures=cluster.failure_count,
             total_occurrences=1,
             severity="ERROR"
         )
@@ -162,17 +162,17 @@ class ClaudeFailureSignatureStore(BaseFailureSignatureStore):
             "fingerprint_id": fingerprint.fingerprint_id,
             "created_at": now,
             "updated_at": now,
-            "first_seen": cluster.get("first_failure", {}).get("timestamp", now),
-            "last_seen": cluster.get("last_failure", {}).get("timestamp", now),
+            "first_seen": cluster.first_failure.get("timestamp", now),
+            "last_seen": cluster.last_failure.get("timestamp", now),
             "signature": {
                 "tool_name": fingerprint.tool_name,
                 "error_type": fingerprint.error_type,
                 "error_pattern": fingerprint.error_pattern,
                 "context_signature": fingerprint.context_signature,
-                "cluster_size_avg": cluster.get("failure_count", 1)
+                "cluster_size_avg": cluster.failure_count
             },
             "cluster_count": 1,
-            "total_failures": cluster.get("failure_count", 1),
+            "total_failures": cluster.failure_count,
             "occurrences_last_hour": 1,
             "occurrences_last_day": 1,
             "severity": "ERROR",  # All tool failures are ERROR
@@ -222,27 +222,27 @@ class ClaudeFailureSignatureStore(BaseFailureSignatureStore):
         """
         return fingerprint.fingerprint_id
 
-    def _cluster_to_sample(self, cluster: dict) -> Dict[str, Any]:
+    def _cluster_to_sample(self, cluster) -> Dict[str, Any]:
         """
         Convert cluster to sample entry.
 
         Args:
-            cluster: FailureCluster dict
+            cluster: FailureCluster object
 
         Returns:
             Sample entry dict
         """
-        last_failure = cluster.get("last_failure", {})
-        primary_failure = cluster.get("primary_failure", last_failure)
+        last_failure = cluster.last_failure
+        primary_failure = cluster.primary_failure if hasattr(cluster, 'primary_failure') else last_failure
 
         return {
-            "cluster_id": cluster.get("cluster_id", "unknown"),
+            "cluster_id": cluster.cluster_id,
             "timestamp": last_failure.get("timestamp"),
-            "session_id": cluster.get("session_id", "unknown"),
+            "session_id": cluster.session_id,
             "task_id": last_failure.get("call_event", {}).get("task_id", "unknown"),
-            "failure_count": cluster.get("failure_count", 1),
-            "duration_seconds": cluster.get("duration_seconds", 0.0),
-            "tools_attempted": cluster.get("tools_attempted", []),
+            "failure_count": cluster.failure_count,
+            "duration_seconds": cluster.duration_seconds,
+            "tools_attempted": cluster.tools_attempted,
             "primary_error": primary_failure.get("error_message", "")[:200]
         }
 

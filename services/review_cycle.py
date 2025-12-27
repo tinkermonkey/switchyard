@@ -2215,8 +2215,24 @@ class ReviewCycleExecutor:
     ):
         """Execute agent using centralized executor (ensures observability)"""
         from services.agent_executor import get_agent_executor
+        from services.work_execution_state import work_execution_tracker
 
         logger.info(f"Executing {agent_name} directly for review cycle")
+
+        # Record execution start for state tracking
+        if 'issue_number' in task_context and 'column' in task_context:
+            work_execution_tracker.record_execution_start(
+                issue_number=task_context['issue_number'],
+                column=task_context['column'],
+                agent=agent_name,
+                trigger_source='review_cycle',  # Clear audit trail
+                project_name=project_name
+            )
+        else:
+            logger.warning(
+                f"Cannot record execution start for {agent_name}: "
+                f"missing issue_number or column in task_context"
+            )
 
         executor = get_agent_executor()
         return await executor.execute_agent(

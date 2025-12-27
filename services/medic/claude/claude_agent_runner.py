@@ -145,4 +145,4 @@ Begin your investigation now!
 
     def _get_investigation_agent_name(self) -> str:
         """Get the agent name for observability."""
-        return "claude-medic-investigator"
+        return "medic-investigator"

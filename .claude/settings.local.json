@@ -93,7 +93,8 @@
       "Bash(netstat:*)",
       "Bash(ss:*)",
       "Bash(docker network ls:*)",
-      "Bash(timeout:*)"
+      "Bash(timeout:*)",
+      "Bash(while read key)"
     ],
     "deny": [],
     "ask": []

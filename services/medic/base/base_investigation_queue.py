@@ -76,43 +76,52 @@ class BaseInvestigationQueue:
         """
         Add investigation to queue if not already queued/in-progress.
 
-        For ES-first architecture: ES is updated first, then Redis.
+        Elasticsearch is the single source of truth for status.
+        Redis queue is just a list of fingerprint IDs to process.
 
         Args:
             fingerprint_id: Failure signature ID
             priority: "low", "normal", "high" (affects queue position)
-            es_store: Optional ES signature store for ES-first updates (if None, uses Redis-only mode)
+            es_store: REQUIRED - ES signature store for status checks and updates
 
         Returns:
             True if enqueued, False if already exists
         """
-        # Check if already in queue or active
-        status = self.get_status(fingerprint_id)
-        if status in [
-            self.STATUS_QUEUED,
-            self.STATUS_STARTING,
-            self.STATUS_IN_PROGRESS,
-        ]:
-            logger.info(f"Investigation {fingerprint_id} already {status}, not re-enqueuing")
+        if not es_store:
+            logger.error(f"Cannot enqueue {fingerprint_id}: es_store is required")
             return False
 
-        # ES-first: Update Elasticsearch first if es_store provided
-        if es_store:
-            from monitoring.timestamp_utils import utc_isoformat
-            success = es_store.update_investigation_status_es_first(
-                fingerprint_id,
-                status="queued",
-                metadata=None,
-                expected_current=["not_started", "failed", "timeout", "completed", "ignored"]
-            )
-            if not success:
-                logger.warning(f"Failed to update ES for {fingerprint_id}, aborting enqueue")
-                return False
+        # Check if already in queue (simple list membership check)
+        in_queue = self.redis.lpos(self.QUEUE_KEY, fingerprint_id) is not None
+        if in_queue:
+            logger.info(f"Investigation {fingerprint_id} already in queue, not re-enqueuing")
+            return False
 
-        # Set initial status in Redis
-        self.redis.set(self._key(fingerprint_id, "status"), self.STATUS_QUEUED)
+        # Check ES status (single source of truth)
+        try:
+            current_status = es_store.get_investigation_status(fingerprint_id)
+        except Exception as e:
+            logger.error(f"Failed to get ES status for {fingerprint_id}: {e}")
+            return False
 
-        # Add to queue based on priority
+        # Don't re-enqueue if currently active
+        if current_status in [self.STATUS_STARTING, self.STATUS_IN_PROGRESS]:
+            logger.info(f"Investigation {fingerprint_id} already {current_status}, not re-enqueuing")
+            return False
+
+        # Update ES status to "queued" (with optimistic locking)
+        from monitoring.timestamp_utils import utc_isoformat
+        success = es_store.update_investigation_status_es_first(
+            fingerprint_id,
+            status="queued",
+            metadata={"queued_at": utc_isoformat()},
+            expected_current=["not_started", "failed", "timeout", "completed", "ignored", "queued"]
+        )
+        if not success:
+            logger.warning(f"Failed to update ES for {fingerprint_id}, aborting enqueue")
+            return False
+
+        # Add to queue based on priority (just the list, no status keys)
         if priority == "high":
             self.redis.lpush(self.QUEUE_KEY, fingerprint_id)
         else:
@@ -145,36 +154,24 @@ class BaseInvestigationQueue:
         """
         return self.redis.lrange(self.QUEUE_KEY, 0, -1)
 
+    # DEPRECATED: Status now stored in Elasticsearch only
+    # These methods are kept for backwards compatibility but should not be used
     def get_status(self, fingerprint_id: str) -> Optional[str]:
         """
-        Get investigation status.
-
-        Args:
-            fingerprint_id: Fingerprint ID
-
-        Returns:
-            Status string or None (always decoded to string)
+        DEPRECATED: Get investigation status from Elasticsearch instead.
+        Use es_store.get_investigation_status(fingerprint_id)
         """
-        status = self.redis.get(self._key(fingerprint_id, "status"))
-        if status is None:
-            return None
-        # Decode bytes to string if needed
-        if isinstance(status, bytes):
-            return status.decode('utf-8')
-        return status
+        logger.warning(f"get_status() is deprecated, use ES signature store instead")
+        return None
 
     def update_status(self, fingerprint_id: str, status: str):
         """
-        Update investigation status.
-
-        Args:
-            fingerprint_id: Fingerprint ID
-            status: New status
+        DEPRECATED: Update investigation status in Elasticsearch instead.
+        Use es_store.update_investigation_status() or update_investigation_status_es_first()
         """
-        self.redis.set(self._key(fingerprint_id, "status"), status)
-        logger.debug(f"Updated status for {fingerprint_id}: {status}")
+        logger.warning(f"update_status() is deprecated, use ES signature store instead")
 
-    def mark_started(self, fingerprint_id: str, pid: int = 0, container_name: str = None):
+    def mark_started(self, fingerprint_id: str, pid: int = 0, container_name: str = None, es_store=None):
         """
         Mark investigation as started.
 
@@ -182,16 +179,38 @@ class BaseInvestigationQueue:
             fingerprint_id: Fingerprint ID
             pid: Process ID (legacy, defaults to 0 for containerized execution)
             container_name: Docker container name (for containerized execution)
+            es_store: REQUIRED - ES signature store for status updates
         """
-        now = datetime.now(timezone.utc).isoformat()
+        from monitoring.timestamp_utils import utc_isoformat
+        now = utc_isoformat()
 
+        # Store tracking data in Redis (non-authoritative)
         self.redis.set(self._key(fingerprint_id, "pid"), str(pid))
         if container_name:
             self.redis.set(self._key(fingerprint_id, "container_name"), container_name)
-        self.redis.set(self._key(fingerprint_id, "status"), self.STATUS_IN_PROGRESS)
         self.redis.set(self._key(fingerprint_id, "started_at"), now)
         self.redis.set(self._key(fingerprint_id, "last_heartbeat"), now)
         self.redis.sadd(self.ACTIVE_SET_KEY, fingerprint_id)
+
+        # Update status in ES (single source of truth)
+        if es_store:
+            try:
+                metadata = {"started_at": now}
+                if container_name:
+                    metadata["container_name"] = container_name
+                if pid:
+                    metadata["pid"] = str(pid)
+
+                es_store.update_investigation_status_es_first(
+                    fingerprint_id,
+                    status=self.STATUS_IN_PROGRESS,
+                    metadata=metadata,
+                    expected_current=["queued", "starting"]
+                )
+            except Exception as e:
+                logger.error(f"Failed to update ES status for {fingerprint_id}: {e}")
+        else:
+            logger.warning(f"mark_started() called without es_store for {fingerprint_id}")
 
         if container_name:
             logger.info(f"Marked investigation {fingerprint_id} as started (container: {container_name})")
@@ -216,7 +235,8 @@ class BaseInvestigationQueue:
         self,
         fingerprint_id: str,
         result: str,
-        output_path: Optional[str] = None
+        output_path: Optional[str] = None,
+        es_store=None
     ):
         """
         Mark investigation as completed.
@@ -225,8 +245,10 @@ class BaseInvestigationQueue:
             fingerprint_id: Fingerprint ID
             result: Investigation result (success, failed, ignored, timeout)
             output_path: Optional path to investigation output
+            es_store: REQUIRED - ES signature store for status updates
         """
-        now = datetime.now(timezone.utc).isoformat()
+        from monitoring.timestamp_utils import utc_isoformat
+        now = utc_isoformat()
 
         # Determine status based on result
         status = self.STATUS_COMPLETED if result == self.RESULT_SUCCESS else self.STATUS_FAILED
@@ -235,10 +257,31 @@ class BaseInvestigationQueue:
         elif result == self.RESULT_IGNORED:
             status = self.STATUS_IGNORED
 
-        self.redis.set(self._key(fingerprint_id, "status"), status)
+        # Store tracking data in Redis (non-authoritative)
         self.redis.set(self._key(fingerprint_id, "result"), result)
         self.redis.set(self._key(fingerprint_id, "completed_at"), now)
         self.redis.srem(self.ACTIVE_SET_KEY, fingerprint_id)
+
+        # Update status in ES (single source of truth)
+        if es_store:
+            try:
+                metadata = {
+                    "completed_at": now,
+                    "result": result
+                }
+                if output_path:
+                    metadata["output_path"] = output_path
+
+                es_store.update_investigation_status_es_first(
+                    fingerprint_id,
+                    status=status,
+                    metadata=metadata,
+                    expected_current=["in_progress", "starting", "queued"]
+                )
+            except Exception as e:
+                logger.error(f"Failed to update ES status for {fingerprint_id}: {e}")
+        else:
+            logger.warning(f"mark_completed() called without es_store for {fingerprint_id}")
 
         logger.info(f"Marked investigation {fingerprint_id} as {status} ({result})")
 

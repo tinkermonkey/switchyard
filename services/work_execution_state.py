@@ -130,7 +130,24 @@ class WorkExecutionStateTracker:
         trigger_source: str,
         project_name: str
     ):
-        """Record the start of work execution"""
+        """
+        Record the start of work execution.
+
+        CRITICAL: This MUST be called BEFORE enqueuing the task to prevent
+        race conditions where the task completes before the in_progress
+        state is recorded.
+
+        Correct order:
+        1. record_execution_start()  <- Creates in_progress state
+        2. task_queue.enqueue()      <- Worker can now find in_progress state
+
+        Args:
+            issue_number: Issue number for the execution
+            column: Workflow column/status
+            agent: Agent name
+            trigger_source: Source of the trigger (e.g., 'manual', 'pipeline_progression')
+            project_name: Project name
+        """
         state = self.load_state(project_name, issue_number)
 
         execution = {
@@ -183,9 +200,10 @@ class WorkExecutionStateTracker:
 
         # If we get here, no in_progress execution was found
         # Create a new record (edge case where start wasn't recorded)
-        logger.warning(
+        logger.error(
             f"No in_progress execution found for {agent} in {column}, "
-            f"creating new record with outcome {outcome}"
+            f"creating new record with outcome {outcome}. "
+            f"This should only happen after orchestrator restart/crash."
         )
 
         execution = {

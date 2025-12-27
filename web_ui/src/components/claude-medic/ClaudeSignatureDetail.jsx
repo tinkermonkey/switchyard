@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { useParams, Link } from '@tanstack/react-router'
-import { ArrowLeft, Play, FileText, TrendingUp, Clock, AlertCircle, Code2, FolderGit2, Wrench, Loader2 } from 'lucide-react'
+import { ArrowLeft, Play, FileText, TrendingUp, Clock, AlertCircle, Code2, FolderGit2, Wrench, Loader2, Eye } from 'lucide-react'
 import Header from '../Header'
 import NavigationTabs from '../NavigationTabs'
 import ClaudeClusterView from './ClaudeClusterView'
@@ -300,14 +300,40 @@ export default function ClaudeSignatureDetail() {
                 {investigationStatus?.has_fix_plan && (
                   <div className="flex items-center gap-2 ml-auto">
                     {fixStatus && (fixStatus.status === 'queued' || fixStatus.status === 'in_progress') ? (
-                      <div className="flex items-center gap-2 px-4 py-2 bg-blue-500/10 border border-blue-500/20 rounded text-blue-500 text-sm">
-                        <Loader2 className="w-4 h-4 animate-spin" />
-                        <span>Fixing... {fixStatus.status}</span>
+                      <div className="flex items-center gap-2">
+                        <div className="flex items-center gap-2 px-4 py-2 bg-blue-500/10 border border-blue-500/20 rounded text-blue-500 text-sm">
+                          <Loader2 className="w-4 h-4 animate-spin" />
+                          <span>Fixing... {fixStatus.status}</span>
+                        </div>
+                        {fixStatus.agent_execution_id && (
+                          <Link
+                            to="/agent-execution/$executionId"
+                            params={{ executionId: fixStatus.agent_execution_id }}
+                            className="px-3 py-2 bg-green-600 text-white rounded hover:bg-green-700 transition-colors flex items-center gap-2 text-sm font-medium"
+                            title="View live execution"
+                          >
+                            <Eye className="w-4 h-4" />
+                            View Live
+                          </Link>
+                        )}
                       </div>
                     ) : fixStatus && fixStatus.status === 'completed' ? (
-                      <div className="flex items-center gap-2 px-4 py-2 bg-green-500/10 border border-green-500/20 rounded text-green-500 text-sm">
-                        <Wrench className="w-4 h-4" />
-                        <span>Fix Applied</span>
+                      <div className="flex items-center gap-2">
+                        <div className="flex items-center gap-2 px-4 py-2 bg-green-500/10 border border-green-500/20 rounded text-green-500 text-sm">
+                          <Wrench className="w-4 h-4" />
+                          <span>Fix Applied</span>
+                        </div>
+                        {fixStatus.agent_execution_id && (
+                          <Link
+                            to="/agent-execution/$executionId"
+                            params={{ executionId: fixStatus.agent_execution_id }}
+                            className="px-3 py-2 bg-gh-accent-emphasis text-white rounded hover:bg-gh-accent-primary transition-colors flex items-center gap-2 text-sm"
+                            title="View execution logs"
+                          >
+                            <Eye className="w-4 h-4" />
+                            View Logs
+                          </Link>
+                        )}
                       </div>
                     ) : (
                       <button

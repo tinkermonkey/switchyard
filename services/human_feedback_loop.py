@@ -807,6 +807,23 @@ class HumanFeedbackLoopExecutor:
         logger.info(f"Executing {state.agent} (iteration {state.current_iteration}, is_initial={is_initial})")
 
         from services.agent_executor import get_agent_executor
+        from services.work_execution_state import work_execution_tracker
+
+        # Record execution start in work execution state
+        trigger_source = 'human_feedback_loop_initial' if is_initial else 'human_feedback_loop_response'
+
+        work_execution_tracker.record_execution_start(
+            issue_number=state.issue_number,
+            column=column.name,
+            agent=state.agent,
+            trigger_source=trigger_source,
+            project_name=state.project_name
+        )
+
+        logger.info(
+            f"Recorded execution start for {state.agent} on {state.project_name}/#{state.issue_number} "
+            f"in column {column.name} (trigger: {trigger_source})"
+        )
 
         executor = get_agent_executor()
         result = await executor.execute_agent(

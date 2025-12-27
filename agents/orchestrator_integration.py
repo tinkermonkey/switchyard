@@ -282,6 +282,21 @@ async def process_task_integrated(task, state_manager, logger):
         
         raise Exception(f"Task blocked: {validation_result['reason']}")
 
+    # Record execution start in work execution state
+    if 'issue_number' in task_context and 'column' in task_context:
+        from services.work_execution_state import work_execution_tracker
+        work_execution_tracker.record_execution_start(
+            issue_number=task_context['issue_number'],
+            column=task_context['column'],
+            agent=task.agent,
+            trigger_source='task_queue',
+            project_name=task.project
+        )
+        logger.info(
+            f"Recorded execution start for {task.agent} on {task.project}/#{task_context['issue_number']} "
+            f"in column {task_context['column']} (trigger: task_queue)"
+        )
+
     # Execute agent using centralized executor
     executor = get_agent_executor()
     result = await executor.execute_agent(

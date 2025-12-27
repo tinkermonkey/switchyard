@@ -598,6 +598,21 @@ class BaseFailureSignatureStore(ABC):
         """
         return get_signature_by_id(self.es, f"{self.INDEX_PREFIX}-*", fingerprint_id)
 
+    def get_investigation_status(self, fingerprint_id: str) -> Optional[str]:
+        """
+        Get investigation status from Elasticsearch (single source of truth).
+
+        Args:
+            fingerprint_id: Fingerprint ID
+
+        Returns:
+            Investigation status or "not_started" if signature doesn't exist
+        """
+        sig = self.get_signature(fingerprint_id)
+        if not sig:
+            return "not_started"
+        return sig.get('investigation_status', 'not_started')
+
     def get_unresolved_signatures(self, max_count: int = 100) -> List[Dict[str, Any]]:
         """
         Get unresolved failure signatures.

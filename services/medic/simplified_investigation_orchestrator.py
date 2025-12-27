@@ -123,14 +123,11 @@ class SimplifiedInvestigationOrchestrator:
         try:
             logger.info(f"Starting investigation for {fingerprint_id}")
 
-            # Update status
-            self.queue.update_status(fingerprint_id, self.queue.STATUS_STARTING)
-
             # Get signature data
             signature = self.failure_store.get_signature(fingerprint_id)
             if not signature:
                 logger.error(f"Signature not found: {fingerprint_id}")
-                self.queue.mark_completed(fingerprint_id, self.queue.RESULT_FAILED)
+                self.queue.mark_completed(fingerprint_id, self.queue.RESULT_FAILED, es_store=self.failure_store)
                 return
 
             # Prepare investigation context
@@ -165,22 +162,19 @@ class SimplifiedInvestigationOrchestrator:
 
             logger.info(f"Created orchestrator task {task_id} for investigation {fingerprint_id}")
 
-            # Mark as started (orchestrator will handle it from here)
+            # Mark as started (orchestrator will handle it from here, also updates ES)
             self.queue.mark_started(
                 fingerprint_id,
                 pid=0,
-                container_name=f"medic-task-{task_id}"  # Track by task ID
+                container_name=f"medic-task-{task_id}",  # Track by task ID
+                es_store=self.failure_store
             )
-
-            # Update Elasticsearch
-            self.failure_store.update_investigation_status(fingerprint_id, "in_progress")
 
             logger.info(f"Investigation {fingerprint_id} delegated to orchestrator task {task_id}")
 
         except Exception as e:
             logger.error(f"Error starting investigation {fingerprint_id}: {e}", exc_info=True)
-            self.queue.mark_completed(fingerprint_id, self.queue.RESULT_FAILED)
-            self.failure_store.update_investigation_status(fingerprint_id, "failed")
+            self.queue.mark_completed(fingerprint_id, self.queue.RESULT_FAILED, es_store=self.failure_store)
 
     async def heartbeat_monitor(self):
         """
@@ -218,11 +212,7 @@ class SimplifiedInvestigationOrchestrator:
                             logger.info(f"Investigation {fp_id} task completed with status: {task_status}")
 
                             result = self.queue.RESULT_SUCCESS if task_status == "completed" else self.queue.RESULT_FAILED
-                            self.queue.mark_completed(fp_id, result)
-                            self.failure_store.update_investigation_status(
-                                fp_id,
-                                "completed" if task_status == "completed" else "failed"
-                            )
+                            self.queue.mark_completed(fp_id, result, es_store=self.failure_store)
 
                 # Sleep before next check
                 await asyncio.sleep(30)
