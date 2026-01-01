@@ -717,50 +717,94 @@ class DockerAgentRunner:
 
     def _detect_rate_limit_reset_time(self, project_dir: Path) -> Optional[datetime]:
         """
-        Detect Claude Code rate limit reset time by running a quick test.
-        
-        When Claude Code is rate limited, it outputs: "Limit reached · resets 3pm (UTC)"
-        This method captures that message and parses the reset time.
-        
+        Detect Claude Code rate limit reset time by querying Elasticsearch for recent rate limit errors.
+
+        Claude Code logs rate limit errors to claude-streams-* indices with:
+        - raw_event.event.error: "rate_limit"
+        - raw_event.event.message.content: [{type: "text", text: "You've hit your limit · resets 5pm (UTC)"}]
+
+        This method queries the structured logs which contain precise error classification and reset times,
+        instead of trying to parse ephemeral stdout/stderr which often produces no output.
+
         Args:
-            project_dir: Project directory path
-            
+            project_dir: Project directory path (unused, kept for signature compatibility)
+
         Returns:
-            Datetime when rate limit resets, or None if detection failed
+            Datetime when rate limit resets, or None if no rate limit detected
         """
         try:
-            # Run a minimal Claude Code command to trigger the rate limit message
-            test_cmd = [
-                'docker', 'run', '--rm',
-                '-e', f'CLAUDE_CODE_OAUTH_TOKEN={os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "")}',
-                '--user', 'orchestrator',
-                'clauditoreum-orchestrator:latest',
-                'sh', '-c', 'echo "test" | claude - 2>&1 | head -5'
-            ]
-            
-            result = subprocess.run(
-                test_cmd,
-                capture_output=True,
-                text=True,
-                timeout=10
-            )
-            
-            output = result.stdout + result.stderr
-            logger.debug(f"Rate limit detection output: {output[:200]}")
-            
-            # Look for the limit message
+            from elasticsearch import Elasticsearch
+
+            # Connect to Elasticsearch
+            es_host = os.environ.get('ELASTICSEARCH_HOST', 'elasticsearch')
+            es_port = os.environ.get('ELASTICSEARCH_PORT', '9200')
+            es = Elasticsearch([f"http://{es_host}:{es_port}"])
+
+            # Query for rate limit errors in the last 5 minutes
+            now_utc = datetime.now(timezone.utc)
+            five_min_ago = now_utc - timedelta(minutes=5)
+
+            query = {
+                "size": 5,
+                "sort": [{"timestamp": "desc"}],
+                "query": {
+                    "bool": {
+                        "must": [
+                            {
+                                "range": {
+                                    "timestamp": {
+                                        "gte": five_min_ago.isoformat(),
+                                        "lte": now_utc.isoformat()
+                                    }
+                                }
+                            },
+                            {
+                                "term": {
+                                    "raw_event.event.error.keyword": "rate_limit"
+                                }
+                            }
+                        ]
+                    }
+                }
+            }
+
+            result = es.search(index="claude-streams-*", body=query)
+            hits = result.get("hits", {}).get("hits", [])
+
+            if not hits:
+                logger.debug("No rate limit errors found in Elasticsearch (last 5 minutes)")
+                return None
+
+            # Extract the most recent rate limit event
+            event = hits[0]["_source"]["raw_event"]["event"]
+            message_content = event.get("message", {}).get("content", [])
+
+            # Find the text content with the reset time
+            limit_message = None
+            for content in message_content:
+                if content.get("type") == "text":
+                    limit_message = content.get("text", "")
+                    break
+
+            if not limit_message:
+                logger.warning("Rate limit event found but no message text")
+                return None
+
+            logger.info(f"✓ Found rate limit error in Elasticsearch: {limit_message}")
+
+            # Parse reset time from message using circuit breaker's parser
             breaker = get_breaker()
             if breaker:
-                is_limit, reset_time = breaker.detect_session_limit(output)
+                is_limit, reset_time = breaker.detect_session_limit(limit_message)
                 if is_limit and reset_time:
-                    logger.info(f"✓ Detected rate limit reset time from Claude Code output: {reset_time}")
+                    logger.info(f"✓ Detected rate limit reset time from Elasticsearch: {reset_time}")
                     return reset_time
-            
-            logger.warning("Could not detect rate limit reset time from output")
+
+            logger.warning(f"Could not parse reset time from message: {limit_message}")
             return None
-            
+
         except Exception as e:
-            logger.warning(f"Failed to detect rate limit reset time: {e}")
+            logger.warning(f"Failed to detect rate limit from Elasticsearch: {e}")
             return None
 
     def _setup_shared_claude(self, project_dir: Path) -> None:
@@ -1181,23 +1225,27 @@ class DockerAgentRunner:
                         if breaker.state == breaker.OPEN:
                             logger.error("🔴 Claude Code breaker is OPEN - rate limit confirmed")
                             raise Exception("Claude Code rate limit reached. Please wait for reset.")
-                        # Otherwise, trip it and try to detect actual reset time
+                        # Otherwise, try to verify if this is actually a rate limit
                         else:
-                            logger.error("🔴 Tripping Claude Code breaker - suspicious exit 1 with no real error output")
-                            
+                            logger.warning("🟡 Suspicious exit 1 with no error output - verifying if rate limit...")
+
                             # Try to detect actual reset time by running a quick test
                             # This captures the "Limit reached · resets 3pm (UTC)" message
                             reset_time = self._detect_rate_limit_reset_time(project_dir)
-                            
+
                             if not reset_time:
-                                # Fallback to 1 hour from now
-                                logger.warning("Could not detect reset time, using 1-hour default")
-                                reset_time = datetime.now(timezone.utc) + timedelta(hours=1)
+                                # Could not verify it's a rate limit - treat as regular failure
+                                logger.warning(
+                                    "⚠️ Could not confirm rate limit. Exit 1 with no output could be: "
+                                    "CLI bug, auth issue, config error, etc. Treating as regular failure."
+                                )
+                                # Let the normal error handling take over
+                                # Don't trip the circuit breaker without confirmation
                             else:
-                                logger.info(f"Detected rate limit reset time: {reset_time.strftime('%Y-%m-%d %H:%M:%S %Z')}")
-                            
-                            breaker.trip(reset_time)
-                            raise Exception("Claude Code likely hit rate limit (exit 1, no error logged). Breaker tripped.")
+                                # Confirmed rate limit - trip the breaker
+                                logger.error(f"🔴 CONFIRMED rate limit. Tripping breaker. Resets at: {reset_time.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+                                breaker.trip(reset_time)
+                                raise Exception(f"Claude Code rate limit confirmed. Breaker tripped. Resets at {reset_time.strftime('%I:%M %p')}.")
                 
                 if not stderr_text:
                     stderr_text = f"Container exited with code {exit_code} but no error output captured."

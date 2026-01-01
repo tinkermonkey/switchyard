@@ -94,7 +94,8 @@
       "Bash(ss:*)",
       "Bash(docker network ls:*)",
       "Bash(timeout:*)",
-      "Bash(while read key)"
+      "Bash(while read key)",
+      "Bash(git -C /home/austinsand/workspace/orchestrator/clauditoreum show d84d807:claude/docker_runner.py)"
     ],
     "deny": [],
     "ask": []

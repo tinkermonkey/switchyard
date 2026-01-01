@@ -132,8 +132,9 @@ Files: {context.get('files', [])}
                 cmd.extend(['--resume', existing_session_id])
                 logger.info(f"Resuming Claude Code session: {existing_session_id}")
 
-            # Add prompt last
-            cmd.append(prompt)
+            # NOTE: Do NOT append prompt to cmd - we'll pass it via stdin to avoid ARG_MAX issues
+            # Large prompts cause "[Errno 7] Argument list too long" errors
+            # cmd.append(prompt)  # REMOVED
 
             # Ensure working directory exists or use current directory
             if not work_dir.exists():
@@ -213,15 +214,26 @@ Files: {context.get('files', [])}
             stream_callback = context.get('stream_callback')
 
             # Use Popen to stream output in real-time
+            # Pass prompt via stdin to avoid ARG_MAX "Argument list too long" errors
             process = subprocess.Popen(
                 cmd,
                 cwd=work_dir,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
+                stdin=subprocess.PIPE,  # Changed from DEVNULL to PIPE for prompt input
                 text=True,
-                env=env,
-                stdin=subprocess.DEVNULL
+                env=env
             )
+
+            # Write prompt to stdin and close it immediately
+            try:
+                process.stdin.write(prompt)
+                process.stdin.close()
+                logger.debug(f"Wrote {len(prompt)} characters to stdin")
+            except Exception as e:
+                logger.error(f"Failed to write prompt to stdin: {e}")
+                process.kill()
+                raise Exception(f"Failed to pass prompt to Claude CLI: {e}")
 
             # Collect all output for final result
             result_parts = []

@@ -362,11 +362,72 @@ class FeatureBranchManager:
 
         Note: Since we no longer track sub-issue status persistently,
         this method only works with the in-memory FeatureBranch object provided.
+
+        DEPRECATED: This method is unreliable because sub_issues list may be empty.
+        Use _verify_all_sub_issues_complete instead to check GitHub directly.
         """
         return all(
             si.status in ["completed", "cancelled"]
             for si in feature_branch.sub_issues
         )
+
+    async def _get_sub_issues_from_parent(self, github_integration, parent_issue_data: dict) -> List[dict]:
+        """
+        Extract sub-issue numbers from parent issue body and fetch their data.
+
+        Looks for task list items like:
+        - [ ] #123
+        - [x] #124
+
+        Args:
+            github_integration: GitHubIntegration instance
+            parent_issue_data: Parent issue data from GitHub API
+
+        Returns:
+            List of issue data dicts for each sub-issue
+        """
+        import re
+
+        body = parent_issue_data.get('body', '')
+        if not body:
+            return []
+
+        # Find all task list items with issue references
+        # Matches: - [ ] #123 or - [x] #123
+        pattern = r'-\s*\[([ xX])\]\s*#(\d+)'
+        matches = re.findall(pattern, body)
+
+        sub_issues = []
+        for _, issue_num_str in matches:
+            issue_num = int(issue_num_str)
+            try:
+                issue_data = await github_integration.get_issue(issue_num)
+                sub_issues.append(issue_data)
+            except Exception as e:
+                logger.warning(f"Failed to fetch sub-issue #{issue_num}: {e}")
+
+        return sub_issues
+
+    async def _verify_all_sub_issues_complete(
+        self,
+        github_integration,
+        sub_issues: List[dict]
+    ) -> bool:
+        """
+        Verify that all sub-issues are actually closed in GitHub.
+
+        Args:
+            github_integration: GitHubIntegration instance
+            sub_issues: List of issue data dicts from GitHub
+
+        Returns:
+            True if all sub-issues are closed, False otherwise
+        """
+        if not sub_issues:
+            # No sub-issues means nothing to complete
+            return False
+
+        return all(issue.get('state') == 'closed' for issue in sub_issues)
 
     async def get_parent_issue(self, github_integration, issue_number: int, project: Optional[str] = None) -> Optional[int]:
         """
@@ -1259,23 +1320,54 @@ Waiting for human decision...
             }
 
         # Step 7: Check if all sub-issues complete
-        all_complete = self.check_all_sub_issues_complete(feature_branch)
+        # CRITICAL FIX: Only check/post completion if we're finalizing the PARENT issue itself,
+        # not a sub-issue. Sub-issues should not trigger completion comments.
+        is_parent_issue = (issue_number == feature_branch.parent_issue)
 
-        if all_complete:
-            logger.info(f"All sub-issues complete for parent #{feature_branch.parent_issue}")
+        if is_parent_issue:
+            # Query GitHub to get the ACTUAL list of sub-issues from the parent issue body
+            try:
+                parent_issue_data = await github_integration.get_issue(feature_branch.parent_issue)
+                actual_sub_issues = await self._get_sub_issues_from_parent(github_integration, parent_issue_data)
 
-            # Mark PR as ready for review
-            if feature_branch.pr_number:
-                await github_integration.mark_pr_ready(feature_branch.pr_number)
-                feature_branch.pr_status = "ready"
-                self.save_feature_branch_state(project, feature_branch)
-
-                # Post completion comment to parent issue
-                await self.post_feature_completion_comment(
+                # Check if ALL sub-issues are actually complete in GitHub
+                all_complete = await self._verify_all_sub_issues_complete(
                     github_integration,
-                    feature_branch.parent_issue,
-                    pr_result.get("pr_url")
+                    actual_sub_issues
                 )
+
+                if all_complete and len(actual_sub_issues) > 0:
+                    logger.info(
+                        f"All {len(actual_sub_issues)} sub-issues complete for parent #{feature_branch.parent_issue}"
+                    )
+
+                    # Mark PR as ready for review
+                    if feature_branch.pr_number:
+                        await github_integration.mark_pr_ready(feature_branch.pr_number)
+                        feature_branch.pr_status = "ready"
+                        self.save_feature_branch_state(project, feature_branch)
+
+                        # Post completion comment to parent issue
+                        await self.post_feature_completion_comment(
+                            github_integration,
+                            feature_branch.parent_issue,
+                            pr_result.get("pr_url")
+                        )
+                else:
+                    logger.debug(
+                        f"Not all sub-issues complete for parent #{feature_branch.parent_issue} "
+                        f"(complete: {sum(1 for si in actual_sub_issues if si.get('state') == 'closed')}/{len(actual_sub_issues)})"
+                    )
+            except Exception as e:
+                logger.error(f"Failed to check sub-issue completion for parent #{feature_branch.parent_issue}: {e}")
+                all_complete = False
+        else:
+            # This is a sub-issue being finalized - don't post completion comments
+            logger.debug(
+                f"Finalized sub-issue #{issue_number} for parent #{feature_branch.parent_issue} "
+                f"(completion will be checked when parent is finalized)"
+            )
+            all_complete = False
 
         return {
             "success": True,

@@ -599,9 +599,23 @@ class WorkExecutionStateTracker:
             logger.error(f"Error checking issue state: {e}")
             return False, f"error_checking_issue_state: {str(e)}"
 
-        # Check 3: Column requires agent
+        # Check 3: Pipeline run active (moved before workflow check to get board name)
         try:
-            workflow_template = config_manager.get_workflow_template_for_project(project_name)
+            from services.pipeline_run import get_pipeline_run_manager
+
+            pipeline_run_mgr = get_pipeline_run_manager()
+            active_run = pipeline_run_mgr.get_active_pipeline_run(project_name, issue_number)
+
+            if not active_run:
+                return False, "no_active_pipeline_run"
+
+        except Exception as e:
+            logger.error(f"Error checking pipeline run: {e}")
+            return False, f"error_checking_pipeline_run: {str(e)}"
+
+        # Check 4: Column requires agent
+        try:
+            workflow_template = config_manager.get_project_workflow(project_name, active_run.board)
             if not workflow_template:
                 return False, "workflow_template_not_found"
 
@@ -617,20 +631,6 @@ class WorkExecutionStateTracker:
         except Exception as e:
             logger.error(f"Error checking workflow template: {e}")
             return False, f"error_checking_workflow: {str(e)}"
-
-        # Check 4: Pipeline run active
-        try:
-            from services.pipeline_run import get_pipeline_run_manager
-
-            pipeline_run_mgr = get_pipeline_run_manager()
-            active_run = pipeline_run_mgr.get_active_pipeline_run(project_name, issue_number)
-
-            if not active_run:
-                return False, "no_active_pipeline_run"
-
-        except Exception as e:
-            logger.error(f"Error checking pipeline run: {e}")
-            return False, f"error_checking_pipeline_run: {str(e)}"
 
         # Check 6: Claude Code circuit breaker
         try:

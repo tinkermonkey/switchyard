@@ -253,19 +253,17 @@ workflow_templates:
               labels: ["status:backlog"]
 
       - name: "In Progress"
-        type: "conversational"
         stage_mapping: "environment_setup"
         agent: "dev_environment_setup"
         auto_advance_on_approval: true
-        feedback_timeout_seconds: 7200
-        description: "Environment setup in progress - conversational mode enabled"
+        description: "Environment setup in progress"
         automation_rules:
           - trigger: "item_moved_to_column"
             action: "assign_label"
             parameters:
               labels: ["stage:environment-setup"]
           - trigger: "item_moved_to_column"
-            action: "execute_stage"
+            action: "start_pipeline_stage"
             parameters:
               stage: "environment_setup"
 
@@ -280,7 +278,7 @@ workflow_templates:
             parameters:
               labels: ["stage:environment-verification"]
           - trigger: "item_moved_to_column"
-            action: "execute_stage"
+            action: "start_pipeline_stage"
             parameters:
               stage: "environment_verification"
 

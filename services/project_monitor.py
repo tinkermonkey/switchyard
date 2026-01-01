@@ -3588,7 +3588,7 @@ _Repair cycle initiated by Claude Code Orchestrator_
                         if not is_repair_cycle:  # Repair cycles should always run if no container exists
                             try:
                                 # Check workspace for existing agent output
-                                workspace_type = pipeline_config.workspace if hasattr(pipeline_config, 'workspace') else 'issues'
+                                workspace_type = pipeline.workspace if hasattr(pipeline, 'workspace') else 'issues'
 
                                 if workspace_type == 'discussions':
                                     # For discussions workspace, check if discussion has agent output
