@@ -853,9 +853,9 @@ class GitHubAPIClient:
             description: Human-readable description of what was done
         """
         self.total_requests += 1
-        
+
         # Log the operation at INFO level for visibility
-        logger.debug(f"📊 GitHub CLI operation tracked: {operation_type} - {description}")
+        logger.info(f"📊 GitHub CLI operation tracked: {operation_type} - {description}")
         
         # Record in request history for debugging
         self._record_request(operation_type, True)
