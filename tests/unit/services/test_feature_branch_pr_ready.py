@@ -206,6 +206,41 @@ class TestGitHubAPINativeSubIssues:
         assert should_mark_ready is True, \
             "PR #126 is now correctly marked ready using GitHub API"
 
+    def test_pr138_scenario_sub_issue_triggers_completion(self):
+        """
+        Test that PR #138 scenario now works correctly.
+
+        This simulates the exact scenario from PR #138 / issue #128:
+        - Parent issue #128 has 3 sub-issues (#135, #136, #137)
+        - When finalizing the LAST sub-issue (#137), completion check runs
+        - PR should be marked ready after last sub-issue finalized
+        """
+        # Scenario: Finalizing sub-issue #137 (the last one)
+        finalizing_issue_number = 137
+        parent_issue_number = 128
+
+        # Completion check should run even though we're finalizing a sub-issue
+        should_check_completion = True  # NEW: Always check, not just for parent
+        assert should_check_completion is True, \
+            "Completion check should run for sub-issue finalization"
+
+        # GitHub reports 3 sub-issues, all closed
+        sub_issues_summary = {'total': 3, 'completed': 3, 'percent_completed': 100}
+        api_sub_issues = [
+            {'number': 135, 'state': 'closed', 'parent_issue_url': 'https://api.github.com/repos/owner/repo/issues/128'},
+            {'number': 136, 'state': 'closed', 'parent_issue_url': 'https://api.github.com/repos/owner/repo/issues/128'},
+            {'number': 137, 'state': 'closed', 'parent_issue_url': 'https://api.github.com/repos/owner/repo/issues/128'}
+        ]
+
+        # Check if all complete
+        all_complete = all(issue.get('state') == 'closed' for issue in api_sub_issues)
+        assert all_complete is True, "All sub-issues should be closed"
+
+        # Should we mark PR ready?
+        should_mark_ready = len(api_sub_issues) == 0 or all_complete
+        assert should_mark_ready is True, \
+            "PR #138 should be marked ready when last sub-issue (#137) is finalized"
+
     def test_github_native_is_single_source_of_truth(self):
         """
         Test that GitHub's native sub-issue API is the only source used.

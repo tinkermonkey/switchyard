@@ -1352,81 +1352,77 @@ Waiting for human decision...
             }
 
         # Step 7: Check if all sub-issues complete
-        # CRITICAL FIX: Only check/post completion if we're finalizing the PARENT issue itself,
-        # not a sub-issue. Sub-issues should not trigger completion comments.
+        # CRITICAL: Check completion after EVERY finalization (parent or sub-issue)
+        # This ensures PRs are marked ready as soon as the last sub-issue completes
         is_parent_issue = (issue_number == feature_branch.parent_issue)
 
-        if is_parent_issue:
-            # Query GitHub to get the ACTUAL list of sub-issues from the parent issue body
-            try:
-                parent_issue_data = await github_integration.get_issue(feature_branch.parent_issue)
-                actual_sub_issues = await self._get_sub_issues_from_parent(github_integration, parent_issue_data)
+        # Query GitHub to get the ACTUAL current state of all sub-issues
+        try:
+            parent_issue_data = await github_integration.get_issue(feature_branch.parent_issue)
+            actual_sub_issues = await self._get_sub_issues_from_parent(github_integration, parent_issue_data)
 
-                # Check if ALL sub-issues are actually complete in GitHub
-                all_complete = await self._verify_all_sub_issues_complete(
-                    github_integration,
-                    actual_sub_issues
-                )
+            # Check if ALL sub-issues are actually complete in GitHub
+            all_complete = await self._verify_all_sub_issues_complete(
+                github_integration,
+                actual_sub_issues
+            )
 
-                # Issue is complete if: no sub-issues defined (standalone work) OR all sub-issues are complete
-                if len(actual_sub_issues) == 0 or all_complete:
-                    if len(actual_sub_issues) == 0:
-                        logger.info(
-                            f"Parent issue #{feature_branch.parent_issue} has no sub-issues (standalone work) - marking PR ready"
+            # Issue is complete if: no sub-issues defined (standalone work) OR all sub-issues are complete
+            if len(actual_sub_issues) == 0 or all_complete:
+                if len(actual_sub_issues) == 0:
+                    logger.info(
+                        f"Parent issue #{feature_branch.parent_issue} has no sub-issues (standalone work) - marking PR ready"
+                    )
+                else:
+                    logger.info(
+                        f"All {len(actual_sub_issues)} sub-issues complete for parent #{feature_branch.parent_issue} "
+                        f"(triggered by finalizing issue #{issue_number})"
+                    )
+
+                # Mark PR as ready for review
+                if feature_branch.pr_number:
+                    success = await github_integration.mark_pr_ready(feature_branch.pr_number)
+
+                    if success:
+                        feature_branch.pr_status = "ready"
+                        self.save_feature_branch_state(project, feature_branch)
+                        logger.info(f"✓ Successfully marked PR #{feature_branch.pr_number} as ready for review")
+
+                        # Post completion comment to parent issue
+                        # Only post once - check if we already posted by looking for existing comment
+                        await self.post_feature_completion_comment(
+                            github_integration,
+                            feature_branch.parent_issue,
+                            pr_result.get("pr_url")
                         )
                     else:
-                        logger.info(
-                            f"All {len(actual_sub_issues)} sub-issues complete for parent #{feature_branch.parent_issue}"
+                        # Log prominent error and post warning to parent issue
+                        logger.error(
+                            f"✗ FAILED to mark PR #{feature_branch.pr_number} as ready for review. "
+                            f"All sub-issues are complete but GitHub API call failed. "
+                            f"Manual intervention required."
                         )
 
-                    # Mark PR as ready for review
-                    if feature_branch.pr_number:
-                        success = await github_integration.mark_pr_ready(feature_branch.pr_number)
+                        # Post warning comment to parent issue
+                        await github_integration.add_comment(
+                            feature_branch.parent_issue,
+                            f"⚠️ **Warning**: All sub-issues have been completed, but the system failed to mark "
+                            f"PR #{feature_branch.pr_number} as ready for review. Please manually mark it ready:\n\n"
+                            f"```\ngh pr ready {feature_branch.pr_number}\n```"
+                        )
 
-                        if success:
-                            feature_branch.pr_status = "ready"
-                            self.save_feature_branch_state(project, feature_branch)
-                            logger.info(f"✓ Successfully marked PR #{feature_branch.pr_number} as ready for review")
-
-                            # Post completion comment to parent issue
-                            await self.post_feature_completion_comment(
-                                github_integration,
-                                feature_branch.parent_issue,
-                                pr_result.get("pr_url")
-                            )
-                        else:
-                            # Log prominent error and post warning to parent issue
-                            logger.error(
-                                f"✗ FAILED to mark PR #{feature_branch.pr_number} as ready for review. "
-                                f"All sub-issues are complete but GitHub API call failed. "
-                                f"Manual intervention required."
-                            )
-
-                            # Post warning comment to parent issue
-                            await github_integration.add_comment(
-                                feature_branch.parent_issue,
-                                f"⚠️ **Warning**: All sub-issues have been completed, but the system failed to mark "
-                                f"PR #{feature_branch.pr_number} as ready for review. Please manually mark it ready:\n\n"
-                                f"```\ngh pr ready {feature_branch.pr_number}\n```"
-                            )
-
-                            # Keep PR status as draft so we can retry later
-                            feature_branch.pr_status = "draft"
-                            self.save_feature_branch_state(project, feature_branch)
-                else:
-                    logger.debug(
-                        f"Not all sub-issues complete for parent #{feature_branch.parent_issue} "
-                        f"(complete: {sum(1 for si in actual_sub_issues if si.get('state') == 'closed')}/{len(actual_sub_issues)})"
-                    )
-            except Exception as e:
-                logger.error(f"Failed to check sub-issue completion for parent #{feature_branch.parent_issue}: {e}")
+                        # Keep PR status as draft so we can retry later
+                        feature_branch.pr_status = "draft"
+                        self.save_feature_branch_state(project, feature_branch)
+            else:
+                logger.debug(
+                    f"Not all sub-issues complete for parent #{feature_branch.parent_issue} "
+                    f"(complete: {sum(1 for si in actual_sub_issues if si.get('state') == 'closed')}/{len(actual_sub_issues)}) "
+                    f"- just finalized issue #{issue_number}"
+                )
                 all_complete = False
-        else:
-            # This is a sub-issue being finalized - don't post completion comments
-            logger.debug(
-                f"Finalized sub-issue #{issue_number} for parent #{feature_branch.parent_issue} "
-                f"(completion will be checked when parent is finalized)"
-            )
+        except Exception as e:
+            logger.error(f"Failed to check sub-issue completion for parent #{feature_branch.parent_issue}: {e}")
             all_complete = False
 
         return {
