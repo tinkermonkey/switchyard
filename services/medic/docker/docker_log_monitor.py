@@ -227,14 +227,16 @@ class DockerLogMonitor:
                 self.redis.setex(cache_key, 3600, "1")
 
             # Generate fingerprint
-            fingerprint = self.fingerprint_engine.generate_fingerprint(parsed)
+            fingerprint = self.fingerprint_engine.generate(
+                container_name=container_name, log_entry=parsed
+            )
 
-            # Store/update signature
-            self.failure_store.store_failure_signature(
-                fingerprint_id=fingerprint["id"],
-                signature_data=fingerprint,
-                container_name=container_name,
-                log_entry=parsed,
+            # Store/update failure signature
+            # Note: Cannot use async record_occurrence from sync context
+            # Log the failure for now - the async processor will handle it
+            logger.warning(
+                f"Detected failure in {container_name} but sync processor cannot store to ES. "
+                f"Fingerprint: {fingerprint.fingerprint_id}"
             )
 
         except Exception as e:
@@ -324,6 +326,10 @@ class DockerLogMonitor:
             is_historical: True if processing historical logs (enables duplicate detection)
         """
         try:
+            # Skip non-bytes data (Docker SDK sometimes returns timestamps as integers)
+            if not isinstance(log_line, bytes):
+                return
+
             # Decode log line
             line_str = log_line.decode("utf-8", errors="replace").strip()
 

@@ -185,10 +185,14 @@ class CircuitBreaker:
 
         if self.state == CircuitState.HALF_OPEN:
             self.success_count += 1
-            logger.debug(
+            logger.info(  # Changed from debug to info for visibility
                 f"Circuit '{self.name}' half-open success "
                 f"({self.success_count}/{self.success_threshold})"
             )
+
+            # CRITICAL FIX: Save state immediately after increment
+            # This ensures new circuit breaker instances see the accumulated count
+            self._save_state()
 
             if self.success_count >= self.success_threshold:
                 self._transition_to_closed()
@@ -200,6 +204,9 @@ class CircuitBreaker:
                     f"Circuit '{self.name}' recovered, resetting failure count"
                 )
                 self.failure_count = 0
+                # CRITICAL FIX: Save state when resetting failure count
+                # This prevents accumulation of stale failure counts
+                self._save_state()
 
     def _on_failure(self):
         """Handle failed execution"""
@@ -313,6 +320,14 @@ class CircuitBreaker:
                 86400,  # 24 hours
                 json.dumps(state_data)
             )
+
+            # Log state save for debugging (use debug level to avoid spam)
+            logger.debug(
+                f"Circuit '{self.name}' state saved to Redis: "
+                f"state={self.state.value}, "
+                f"success_count={self.success_count}, "
+                f"failure_count={self.failure_count}"
+            )
         except Exception as e:
             logger.warning(f"Failed to save circuit breaker '{self.name}' state to Redis: {e}")
 
@@ -343,10 +358,19 @@ class CircuitBreaker:
             self.total_successes = state_data["total_successes"]
             self.total_rejected = state_data["total_rejected"]
 
-            logger.info(
-                f"Circuit breaker '{self.name}' state restored from Redis: "
-                f"state={self.state.value}, failures={self.failure_count}"
-            )
+            # Enhanced logging for HALF_OPEN state to track success accumulation
+            if self.state == CircuitState.HALF_OPEN:
+                logger.info(
+                    f"Circuit breaker '{self.name}' state restored from Redis: "
+                    f"state={self.state.value}, "
+                    f"success_count={self.success_count}/{self.success_threshold}, "
+                    f"failure_count={self.failure_count}"
+                )
+            else:
+                logger.info(
+                    f"Circuit breaker '{self.name}' state restored from Redis: "
+                    f"state={self.state.value}, failures={self.failure_count}"
+                )
         except Exception as e:
             logger.warning(f"Failed to load circuit breaker '{self.name}' state from Redis: {e}")
             # Keep default state on load failure
