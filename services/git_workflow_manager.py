@@ -274,14 +274,54 @@ class GitWorkflowManager:
                         'gh_pr_edit_add_label',
                         f"Added 'approved' label to PR #{pr_number} in {org}/{repo}"
                     )
-                    
+
                     logger.info(f"Added 'approved' label to PR #{pr_number}")
                     return True
                 else:
-                    logger.error(f"Failed to add approved label: {result.stderr}. "
-                                 f"Ensure 'approved' label exists in {org}/{repo}")
-                    # Not a critical failure - workflow can continue
-                    return True
+                    error_msg = result.stderr.strip()
+
+                    # Check if label doesn't exist - if so, create it and retry
+                    if "'approved' not found" in error_msg:
+                        logger.info(f"Creating 'approved' label in {org}/{repo}")
+                        create_result = subprocess.run(
+                            ['gh', 'label', 'create', 'approved',
+                             '--color', '0e8a16',  # Green
+                             '--description', 'PR approved and ready to merge',
+                             '--repo', f"{org}/{repo}"],
+                            cwd=project_dir,
+                            capture_output=True,
+                            text=True,
+                            timeout=30
+                        )
+
+                        if create_result.returncode == 0:
+                            logger.info(f"Created 'approved' label, retrying add to PR #{pr_number}")
+                            # Retry adding the label
+                            retry_result = subprocess.run(
+                                ['gh', 'pr', 'edit', str(pr_number), '--add-label', 'approved', '--repo', f"{org}/{repo}"],
+                                cwd=project_dir,
+                                capture_output=True,
+                                text=True,
+                                timeout=30
+                            )
+
+                            if retry_result.returncode == 0:
+                                github_client = get_github_client()
+                                github_client.track_gh_operation(
+                                    'gh_pr_edit_add_label',
+                                    f"Created and added 'approved' label to PR #{pr_number} in {org}/{repo}"
+                                )
+                                logger.info(f"Successfully added 'approved' label to PR #{pr_number}")
+                                return True
+                            else:
+                                logger.error(f"Failed to add 'approved' label after creation: {retry_result.stderr}")
+                                return False
+                        else:
+                            logger.error(f"Failed to create 'approved' label: {create_result.stderr}")
+                            return False
+                    else:
+                        logger.error(f"Failed to add approved label: {error_msg}")
+                        return False
 
             elif status == 'merged':
                 # PR was merged

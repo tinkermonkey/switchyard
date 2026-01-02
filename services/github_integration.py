@@ -6,6 +6,7 @@ import subprocess
 import json
 import os
 import logging
+import asyncio
 import requests
 from typing import Dict, Any, List, Optional
 
@@ -729,34 +730,79 @@ class GitHubIntegration:
             logger.error(f"Failed to update PR body: {e}")
             return False
 
-    async def mark_pr_ready(self, pr_number: int) -> bool:
-        """Mark a draft PR as ready for review"""
-        try:
-            repo_arg = f"{self.repo_owner}/{self.repo_name}"
+    async def mark_pr_ready(self, pr_number: int, max_retries: int = 3) -> bool:
+        """
+        Mark a draft PR as ready for review with exponential backoff retry.
 
-            cmd = [
-                'gh', 'pr', 'ready', str(pr_number),
-                '--repo', repo_arg
-            ]
+        Args:
+            pr_number: PR number to mark ready
+            max_retries: Maximum retry attempts (default 3)
 
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=30,
-                env=self._get_gh_env()
-            )
+        Returns:
+            True if successfully marked ready, False otherwise
+        """
+        repo_arg = f"{self.repo_owner}/{self.repo_name}"
 
-            if result.returncode == 0:
-                logger.info(f"Marked PR #{pr_number} as ready for review")
-                return True
-            else:
-                logger.error(f"Failed to mark PR ready: {result.stderr}")
-                return False
+        for attempt in range(1, max_retries + 1):
+            try:
+                cmd = ['gh', 'pr', 'ready', str(pr_number), '--repo', repo_arg]
 
-        except Exception as e:
-            logger.error(f"Failed to mark PR ready: {e}")
-            return False
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    env=self._get_gh_env()
+                )
+
+                if result.returncode == 0:
+                    logger.info(
+                        f"Marked PR #{pr_number} as ready for review "
+                        f"(attempt {attempt}/{max_retries})"
+                    )
+                    return True
+                else:
+                    error_msg = result.stderr.strip()
+
+                    # Check if already ready (not an error)
+                    if "is not a draft" in error_msg.lower():
+                        logger.info(f"PR #{pr_number} is already ready for review")
+                        return True
+
+                    # Log error and retry if not last attempt
+                    logger.warning(
+                        f"Failed to mark PR #{pr_number} ready (attempt {attempt}/{max_retries}): "
+                        f"{error_msg}"
+                    )
+
+                    if attempt < max_retries:
+                        # Exponential backoff: 2s, 4s, 8s
+                        backoff = 2 ** attempt
+                        logger.info(f"Retrying in {backoff}s...")
+                        await asyncio.sleep(backoff)
+                    else:
+                        logger.error(
+                            f"Failed to mark PR #{pr_number} ready after {max_retries} attempts: "
+                            f"{error_msg}"
+                        )
+                        return False
+
+            except subprocess.TimeoutExpired:
+                logger.warning(f"PR ready command timed out (attempt {attempt}/{max_retries})")
+                if attempt < max_retries:
+                    await asyncio.sleep(2 ** attempt)
+                else:
+                    logger.error(f"Failed to mark PR #{pr_number} ready: timeout after {max_retries} attempts")
+                    return False
+
+            except Exception as e:
+                logger.error(f"Failed to mark PR #{pr_number} ready (attempt {attempt}/{max_retries}): {e}")
+                if attempt < max_retries:
+                    await asyncio.sleep(2 ** attempt)
+                else:
+                    return False
+
+        return False
 
     async def delete_branch(self, branch_name: str) -> bool:
         """Delete a remote branch"""

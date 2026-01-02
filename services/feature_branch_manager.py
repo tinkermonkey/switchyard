@@ -373,11 +373,11 @@ class FeatureBranchManager:
 
     async def _get_sub_issues_from_parent(self, github_integration, parent_issue_data: dict) -> List[dict]:
         """
-        Extract sub-issue numbers from parent issue body and fetch their data.
+        Extract sub-issues from GitHub's native sub-issue API.
 
-        Looks for task list items like:
-        - [ ] #123
-        - [x] #124
+        Uses GitHub's parent_issue_url relationship to detect sub-issues.
+        This is the single source of truth - markdown checkboxes in issue
+        bodies are NOT used for sub-issue detection.
 
         Args:
             github_integration: GitHubIntegration instance
@@ -386,25 +386,57 @@ class FeatureBranchManager:
         Returns:
             List of issue data dicts for each sub-issue
         """
-        import re
-
-        body = parent_issue_data.get('body', '')
-        if not body:
-            return []
-
-        # Find all task list items with issue references
-        # Matches: - [ ] #123 or - [x] #123
-        pattern = r'-\s*\[([ xX])\]\s*#(\d+)'
-        matches = re.findall(pattern, body)
-
+        parent_number = parent_issue_data.get('number')
         sub_issues = []
-        for _, issue_num_str in matches:
-            issue_num = int(issue_num_str)
+
+        # Query GitHub's sub_issues_summary to check if sub-issues exist
+        sub_issues_summary = parent_issue_data.get('sub_issues_summary', {})
+        total_sub_issues = sub_issues_summary.get('total', 0)
+
+        if total_sub_issues > 0:
+            logger.info(
+                f"GitHub reports {total_sub_issues} sub-issues for issue #{parent_number}. "
+                f"Querying via parent_issue_url relationship..."
+            )
+
             try:
-                issue_data = await github_integration.get_issue(issue_num)
-                sub_issues.append(issue_data)
+                # Query GitHub REST API for issues where parent_issue_url points to this parent
+                from services.github_api_client import get_github_client
+                github_client = get_github_client()
+
+                parent_url = parent_issue_data.get('url')  # API URL of the parent issue
+
+                if parent_url:
+                    # Get all open and closed issues for this repo
+                    repo_path = f"{github_integration.github_org}/{github_integration.repo_name}"
+                    endpoint = f"repos/{repo_path}/issues"
+
+                    # Query with state=all to get both open and closed
+                    success, issues_data = github_client.rest('GET', endpoint, params={'state': 'all', 'per_page': 100})
+
+                    if success and isinstance(issues_data, list):
+                        # Filter for issues where parent_issue_url matches our parent
+                        for issue in issues_data:
+                            issue_parent_url = issue.get('parent_issue_url')
+                            if issue_parent_url and issue_parent_url == parent_url:
+                                sub_issues.append(issue)
+                                logger.debug(
+                                    f"Found sub-issue #{issue.get('number')} of parent #{parent_number} "
+                                    f"via parent_issue_url"
+                                )
+
+                        logger.info(
+                            f"Found {len(sub_issues)} sub-issues for parent #{parent_number} via GitHub API "
+                            f"(expected {total_sub_issues})"
+                        )
+                    else:
+                        logger.warning(f"Failed to query issues for repo {repo_path}: {issues_data}")
+
             except Exception as e:
-                logger.warning(f"Failed to fetch sub-issue #{issue_num}: {e}")
+                logger.error(f"Failed to query sub-issues via GitHub API for parent #{parent_number}: {e}")
+
+        else:
+            logger.debug(f"Issue #{parent_number} has no sub-issues (sub_issues_summary.total = 0)")
 
         return sub_issues
 
@@ -1336,23 +1368,51 @@ Waiting for human decision...
                     actual_sub_issues
                 )
 
-                if all_complete and len(actual_sub_issues) > 0:
-                    logger.info(
-                        f"All {len(actual_sub_issues)} sub-issues complete for parent #{feature_branch.parent_issue}"
-                    )
+                # Issue is complete if: no sub-issues defined (standalone work) OR all sub-issues are complete
+                if len(actual_sub_issues) == 0 or all_complete:
+                    if len(actual_sub_issues) == 0:
+                        logger.info(
+                            f"Parent issue #{feature_branch.parent_issue} has no sub-issues (standalone work) - marking PR ready"
+                        )
+                    else:
+                        logger.info(
+                            f"All {len(actual_sub_issues)} sub-issues complete for parent #{feature_branch.parent_issue}"
+                        )
 
                     # Mark PR as ready for review
                     if feature_branch.pr_number:
-                        await github_integration.mark_pr_ready(feature_branch.pr_number)
-                        feature_branch.pr_status = "ready"
-                        self.save_feature_branch_state(project, feature_branch)
+                        success = await github_integration.mark_pr_ready(feature_branch.pr_number)
 
-                        # Post completion comment to parent issue
-                        await self.post_feature_completion_comment(
-                            github_integration,
-                            feature_branch.parent_issue,
-                            pr_result.get("pr_url")
-                        )
+                        if success:
+                            feature_branch.pr_status = "ready"
+                            self.save_feature_branch_state(project, feature_branch)
+                            logger.info(f"✓ Successfully marked PR #{feature_branch.pr_number} as ready for review")
+
+                            # Post completion comment to parent issue
+                            await self.post_feature_completion_comment(
+                                github_integration,
+                                feature_branch.parent_issue,
+                                pr_result.get("pr_url")
+                            )
+                        else:
+                            # Log prominent error and post warning to parent issue
+                            logger.error(
+                                f"✗ FAILED to mark PR #{feature_branch.pr_number} as ready for review. "
+                                f"All sub-issues are complete but GitHub API call failed. "
+                                f"Manual intervention required."
+                            )
+
+                            # Post warning comment to parent issue
+                            await github_integration.add_comment(
+                                feature_branch.parent_issue,
+                                f"⚠️ **Warning**: All sub-issues have been completed, but the system failed to mark "
+                                f"PR #{feature_branch.pr_number} as ready for review. Please manually mark it ready:\n\n"
+                                f"```\ngh pr ready {feature_branch.pr_number}\n```"
+                            )
+
+                            # Keep PR status as draft so we can retry later
+                            feature_branch.pr_status = "draft"
+                            self.save_feature_branch_state(project, feature_branch)
                 else:
                     logger.debug(
                         f"Not all sub-issues complete for parent #{feature_branch.parent_issue} "
