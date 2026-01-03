@@ -226,7 +226,31 @@ class TestGitHubAPIClientREST:
         assert success == True
         assert response == response_data
         assert client.total_requests == 1
-    
+
+    @patch('subprocess.run')
+    def test_rest_get_with_query_parameters(self, mock_run, client):
+        """Test REST GET request with query parameters in URL."""
+        response_data = [
+            {'id': 1, 'state': 'open'},
+            {'id': 2, 'state': 'closed'}
+        ]
+
+        mock_run.return_value = Mock(
+            returncode=0,
+            stdout=json.dumps(response_data)
+        )
+
+        # Query parameters should be in the endpoint URL
+        endpoint = 'repos/owner/repo/issues?state=all&per_page=100'
+        success, response = client.rest('GET', endpoint)
+
+        assert success == True
+        assert response == response_data
+
+        # Verify the command includes query params in URL
+        call_args = mock_run.call_args[0][0]
+        assert 'state=all' in ' '.join(call_args)
+
     @patch('subprocess.run')
     def test_rest_post_with_data(self, mock_run, client):
         """Test REST POST with request body."""

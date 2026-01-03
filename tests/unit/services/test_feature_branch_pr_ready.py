@@ -268,5 +268,63 @@ class TestGitHubAPINativeSubIssues:
             "GitHub API is the single source of truth"
 
 
+class TestSubIssueDetectionAPICall:
+    """Regression test for sub-issue detection API calls"""
+
+    def test_api_call_formatting(self):
+        """
+        Verify REST API call uses query parameters in URL, not as kwargs.
+
+        Regression test for bug where params={'state': 'all'} was passed
+        as a keyword argument to rest() which caused TypeError.
+        The fix embeds query params in the URL string.
+        """
+        from services.github_api_client import GitHubAPIClient
+        from unittest.mock import patch, Mock
+        import json
+
+        client = GitHubAPIClient()
+
+        # Mock subprocess.run to simulate successful API response
+        with patch('subprocess.run') as mock_run:
+            response_data = [
+                {'number': 1, 'state': 'open'},
+                {'number': 2, 'state': 'closed'}
+            ]
+            mock_run.return_value = Mock(
+                returncode=0,
+                stdout=json.dumps(response_data)
+            )
+
+            # This is how the code SHOULD call the API (with params in URL)
+            endpoint_with_params = 'repos/owner/repo/issues?state=all&per_page=100'
+            success, response = client.rest('GET', endpoint_with_params)
+
+            # Verify it succeeds
+            assert success == True
+            assert response == response_data
+
+            # Verify the subprocess was called with query params in the URL
+            call_args = mock_run.call_args[0][0]
+            assert any('state=all' in str(arg) for arg in call_args), \
+                "Query parameters should be in the URL, not passed as kwargs"
+
+    def test_params_kwarg_raises_typeerror(self):
+        """
+        Verify that passing params as kwargs raises TypeError.
+
+        This documents the bug that was fixed: rest() does not accept
+        a 'params' keyword argument.
+        """
+        from services.github_api_client import GitHubAPIClient
+
+        client = GitHubAPIClient()
+
+        # Attempting to pass params as kwarg should raise TypeError
+        with pytest.raises(TypeError, match="unexpected keyword argument"):
+            # This is the BUGGY way that caused the original issue
+            client.rest('GET', 'repos/owner/repo/issues', params={'state': 'all'})
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])

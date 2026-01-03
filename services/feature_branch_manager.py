@@ -412,7 +412,8 @@ class FeatureBranchManager:
                     endpoint = f"repos/{repo_path}/issues"
 
                     # Query with state=all to get both open and closed
-                    success, issues_data = github_client.rest('GET', endpoint, params={'state': 'all', 'per_page': 100})
+                    endpoint_with_params = f"{endpoint}?state=all&per_page=100"
+                    success, issues_data = github_client.rest('GET', endpoint_with_params)
 
                     if success and isinstance(issues_data, list):
                         # Filter for issues where parent_issue_url matches our parent
