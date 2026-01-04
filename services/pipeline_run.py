@@ -477,6 +477,18 @@ class PipelineRunManager:
         # Update in Elasticsearch
         self._persist_to_elasticsearch(pipeline_run)
         
+        # Release pipeline lock if this issue holds it
+        # This prevents stale locks from blocking other issues when runs end due to errors
+        try:
+            from services.pipeline_lock_manager import get_pipeline_lock_manager
+            lock_manager = get_pipeline_lock_manager()
+            current_lock = lock_manager.get_lock(project, pipeline_run.board)
+            if current_lock and current_lock.lock_status == 'locked' and current_lock.locked_by_issue == issue_number:
+                lock_manager.release_lock(project, pipeline_run.board, issue_number)
+                logger.info(f"Released pipeline lock for {project} issue #{issue_number} after ending run")
+        except Exception as e:
+            logger.warning(f"Failed to release pipeline lock for {project} issue #{issue_number}: {e}")
+        
         reason_msg = f" ({reason})" if reason else ""
         logger.info(
             f"Ended pipeline run {pipeline_run.id} for "

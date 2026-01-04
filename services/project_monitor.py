@@ -3415,6 +3415,72 @@ _Repair cycle initiated by Claude Code Orchestrator_
                                     lock_manager.release_lock(project_name, pipeline.board_name, item.issue_number)
                                     logger.info(f"Released lock for issue #{item.issue_number}")
 
+            # CRITICAL WATCHDOG: Check for stale locks (locks without active runs/containers)
+            # This prevents deadlocks when pipeline runs end due to errors but locks aren't released
+            for project_name in self.config_manager.list_visible_projects():
+                project_config = self.config_manager.get_project_config(project_name)
+                
+                for pipeline in project_config.pipelines:
+                    if not pipeline.active:
+                        continue
+                    
+                    # Check if this board has a lock
+                    from services.pipeline_lock_manager import get_pipeline_lock_manager
+                    lock_manager = get_pipeline_lock_manager()
+                    lock = lock_manager.get_lock(project_name, pipeline.board_name)
+                    
+                    if lock and lock.lock_status == 'locked':
+                        # Check if the locking issue has an active run
+                        pipeline_run = self.pipeline_run_manager.get_active_pipeline_run(
+                            project_name, lock.locked_by_issue
+                        )
+                        
+                        if not pipeline_run:
+                            # Stale lock! No active run but lock exists
+                            logger.warning(
+                                f"Found stale lock on {project_name}/{pipeline.board_name} "
+                                f"held by issue #{lock.locked_by_issue} with no active pipeline run. "
+                                f"Releasing lock..."
+                            )
+                            lock_manager.release_lock(project_name, pipeline.board_name, lock.locked_by_issue)
+                            logger.info(f"Released stale lock for issue #{lock.locked_by_issue}")
+                        else:
+                            # Lock exists with active run - verify container is actually running
+                            container_running = False
+                            if self.task_queue.redis_client:
+                                # Check repair cycle container key
+                                redis_key = f"repair_cycle:container:{project_name}:{lock.locked_by_issue}"
+                                container_name = self.task_queue.redis_client.get(redis_key)
+                                
+                                # Also check active_agent from pipeline run
+                                if not container_name and hasattr(pipeline_run, 'active_agent') and pipeline_run.active_agent:
+                                    container_name = pipeline_run.active_agent
+                                
+                                if container_name:
+                                    try:
+                                        import subprocess
+                                        c_name = container_name.decode() if isinstance(container_name, bytes) else container_name
+                                        result = subprocess.run(
+                                            ['docker', 'inspect', c_name],
+                                            capture_output=True,
+                                            timeout=5
+                                        )
+                                        container_running = (result.returncode == 0)
+                                    except Exception as e:
+                                        logger.warning(f"Error checking container for issue #{lock.locked_by_issue}: {e}")
+                            
+                            if not container_running:
+                                logger.warning(
+                                    f"Found lock on {project_name}/{pipeline.board_name} "
+                                    f"held by issue #{lock.locked_by_issue} with active run {pipeline_run.id} "
+                                    f"but no running container. Ending run and releasing lock..."
+                                )
+                                self.pipeline_run_manager.end_pipeline_run(
+                                    project_name, lock.locked_by_issue, 
+                                    "Container not running (detected by watchdog)"
+                                )
+                                # Lock will be released by end_pipeline_run (with the fix we just added)
+
         except Exception as e:
             logger.error(f"Error reconciling active runs: {e}")
             import traceback
