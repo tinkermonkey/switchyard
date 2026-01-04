@@ -13,6 +13,7 @@ export function useCircuitBreakers() {
     hasOpenBreakers,
     hasHalfOpenBreakers,
     refreshCircuitBreakers,
+    resetCircuitBreaker,
   } = useSystemState()
 
   // Get breakers that are not closed
@@ -42,5 +43,6 @@ export function useCircuitBreakers() {
 
     // Actions
     refresh: refreshCircuitBreakers,
+    reset: resetCircuitBreaker,
   }
 }

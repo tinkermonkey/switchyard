@@ -51,6 +51,35 @@ export function SystemStateProvider({ children }) {
     }
   }
 
+  // Reset a circuit breaker
+  const resetCircuitBreaker = async (circuitBreaker) => {
+    try {
+      let response
+      
+      // Determine which API to call based on breaker service/type
+      if (circuitBreaker.service === 'agent_execution' && circuitBreaker.agent) {
+        response = await systemApi.resetAgentBreaker(circuitBreaker.agent)
+      } else if (circuitBreaker.service === 'claude_code') {
+        response = await systemApi.resetClaudeCodeBreaker()
+      } else if (circuitBreaker.service === 'github_api') {
+        response = await systemApi.resetGitHubApiBreaker()
+      } else {
+        throw new Error(`Unknown circuit breaker type: ${circuitBreaker.service}`)
+      }
+
+      if (response.success) {
+        // Refresh circuit breakers to show updated state
+        await fetchCircuitBreakers()
+        return { success: true, message: response.message }
+      } else {
+        return { success: false, error: response.error || 'Reset failed' }
+      }
+    } catch (error) {
+      console.error('Error resetting circuit breaker:', error)
+      return { success: false, error: error.message }
+    }
+  }
+
   // Set up polling for health checks
   useEffect(() => {
     const cleanup = startPolling(fetchHealth, POLLING_INTERVALS.HEALTH_CHECK)
@@ -84,6 +113,9 @@ export function SystemStateProvider({ children }) {
     // Manual refresh functions
     refreshHealth: fetchHealth,
     refreshCircuitBreakers: fetchCircuitBreakers,
+    
+    // Circuit breaker actions
+    resetCircuitBreaker,
   }
 
   return (

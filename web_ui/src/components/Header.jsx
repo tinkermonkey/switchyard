@@ -226,7 +226,7 @@ export default function Header() {
                         State: <span className={`font-medium ${getStateColor(cb.state)}`}>
                           {cb.state.replace('_', ' ').toUpperCase()}
                         </span>
-                        {cb.state === 'open' && ` • Rejected: ${cb.total_rejected}`}
+                        {cb.state === 'open' && cb.total_rejected !== undefined && ` • Rejected: ${cb.total_rejected}`}
                         {cb.state === 'half_open' && ` • Testing...`}
                       </div>
                     </div>

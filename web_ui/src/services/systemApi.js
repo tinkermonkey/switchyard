@@ -17,4 +17,26 @@ export const systemApi = {
   async getCircuitBreakers() {
     return apiClient.get('/api/circuit-breakers')
   },
+
+  /**
+   * Reset an agent circuit breaker
+   * @param {string} agentName - Name of the agent (e.g., 'code_reviewer')
+   */
+  async resetAgentBreaker(agentName) {
+    return apiClient.post(`/api/circuit-breakers/agent/${agentName}/reset`)
+  },
+
+  /**
+   * Reset the Claude Code circuit breaker
+   */
+  async resetClaudeCodeBreaker() {
+    return apiClient.post('/api/circuit-breakers/claude-code/reset')
+  },
+
+  /**
+   * Reset the GitHub API circuit breaker
+   */
+  async resetGitHubApiBreaker() {
+    return apiClient.post('/api/circuit-breakers/github-api/reset')
+  },
 }

@@ -37,32 +37,25 @@ class ClaudeCodeBreaker:
     # Redis key for persisting breaker state
     REDIS_KEY = "orchestrator:claude_code_breaker:state"
     
-    # Pattern to detect session limit messages in multiple formats:
-    # - "Session limit reached ∙ resets 12am" (in assistant content)
-    # - "session limit exceeded. Reset at 1:30pm"
-    # - "SESSION_LIMIT_IN_RESPONSE: ..."
-    # - "token limit reached/exceeded" (with action verb)
-    # - "Limit reached resets 7pm (UTC)" (specific format seen in logs)
+    # Maximum message length to check (prevents matching user content discussing limits)
+    # Real Claude Code error messages are ~50 chars, set to 150 for safety margin
+    MAX_MESSAGE_LENGTH = 150
+    
+    # Pattern to detect Claude Code limit messages based on actual observed formats:
+    # - "You've hit your limit · resets 3pm (UTC)"
+    # - "You've hit your limit · resets 5pm (UTC)"
     #
-    # IMPORTANT: Must be specific to avoid false positives!
-    # Only match specific limit types (session/token/rate/request/usage) with action verbs
-    # Don't match generic "limit reached" which appears in documentation
-    #
-    # FIX: Added ^ anchor to ensure we match start of line/string for some patterns
-    # to avoid matching inside sentences
+    # NOTE: Groups 1 and 2 from previous regex were theoretical patterns that have
+    # NEVER occurred in production (verified via Elasticsearch analysis of all 18
+    # rate_limit errors). Simplified to match only the actual format.
     SESSION_LIMIT_PATTERN = re.compile(
-        r'(?:SESSION_LIMIT_IN_RESPONSE:\s+)?(?:'
-        # Group 1: Explicit type (session/token/etc)
-        r'(?:'
-            r'(?:(?:session|token|request|rate|usage)\s+(?:limit|quota)\s+(?:reached|exceeded|hit|met|violated)'
-            r'|(?:reached|exceeded|hit|met|violated)\s+(?:session|token|request|rate|usage)\s+(?:limit|quota))'
-            r'(?:.*?(?:resets?|reset)(?:\s+at)?\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)?)?'
-        r')'
-        r'|'
-        # Group 2: "Limit reached" followed by "resets"
-        r'(?:limit\s+reached\s+.*?(?:resets?|reset)(?:\s+at)?\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)?)'
-        r')',
-        re.IGNORECASE | re.DOTALL
+        r"(?:you[''']ve\s+)?hit\s+(?:your\s+)?limit"  # "hit your limit" or "you've hit your limit"
+        r".*?"                                          # Flexible separator (·, -, etc.)
+        r"resets?\s+"                                   # "reset" or "resets"
+        r"(?:at\s+)?"                                   # Optional "at"
+        r"(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)"           # Time: "3pm", "5pm", "1:30pm"
+        r"(?:\s*\([^)]+\))?",                           # Optional timezone: "(UTC)"
+        re.IGNORECASE
     )
     
     def __init__(self):
@@ -156,10 +149,10 @@ class ClaudeCodeBreaker:
         if not message:
             return False, None
             
-        # FIX: Length restriction to prevent false positives from long prompts/discussions
-        # Real error messages are typically short (< 200 chars)
-        # If the message is very long, it's likely a prompt or file content
-        if len(message) > 300:
+        # Length restriction to prevent false positives from long prompts/discussions
+        # Real Claude Code error messages are ~50 chars, use 150 char limit for safety
+        # Anything longer is likely user content discussing limits, not an actual error
+        if len(message) > self.MAX_MESSAGE_LENGTH:
             return False, None
             
         match = self.SESSION_LIMIT_PATTERN.search(message)

@@ -1,13 +1,15 @@
 /**
  * HeaderCircuitBreakers - Shows individual circuit breaker states
  */
-import { CheckCircle, XCircle, AlertCircle } from 'lucide-react'
+import { useState } from 'react'
+import { CheckCircle, XCircle, AlertCircle, RotateCcw } from 'lucide-react'
 import HeaderBox from './HeaderBox'
 import { useCircuitBreakers } from '../hooks/useCircuitBreakers'
 
 export default function HeaderCircuitBreakers() {
-  const { circuitBreakers, loading } = useCircuitBreakers()
+  const { circuitBreakers, loading, reset } = useCircuitBreakers()
   const maxDisplayedBreakers = 5
+  const [resetting, setResetting] = useState({})
 
   if (loading) {
     return (
@@ -15,6 +17,23 @@ export default function HeaderCircuitBreakers() {
         <p className="text-xs text-gh-fg-muted">Loading...</p>
       </HeaderBox>
     )
+  }
+
+  const handleReset = async (cb, idx) => {
+    // Set loading state for this specific breaker
+    setResetting(prev => ({ ...prev, [idx]: true }))
+    
+    try {
+      const result = await reset(cb)
+      if (!result.success) {
+        console.error('Failed to reset circuit breaker:', result.error)
+        // Could show a toast notification here
+      }
+    } catch (error) {
+      console.error('Error resetting circuit breaker:', error)
+    } finally {
+      setResetting(prev => ({ ...prev, [idx]: false }))
+    }
   }
 
   const getStateIcon = (state) => {
@@ -56,6 +75,10 @@ export default function HeaderCircuitBreakers() {
     }
   }
 
+  const canReset = (cb) => {
+    return cb.state === 'open' || cb.state === 'half_open'
+  }
+
   return (
     <HeaderBox title="Circuit Breakers" minWidth="min-w-[180px]">
       <div className="space-y-1">
@@ -65,15 +88,27 @@ export default function HeaderCircuitBreakers() {
           circuitBreakers.slice(0, maxDisplayedBreakers).map((cb, idx) => (
             <div key={idx}>
               <div className="flex items-center justify-between text-xs">
-                <div className="flex items-center gap-1.5">
+                <div className="flex items-center gap-1.5 flex-1 min-w-0">
                   {getStateIcon(cb.state)}
                   <span className="text-gh-fg-default truncate max-w-[100px]" title={cb.name}>
                     {cb.name}
                   </span>
                 </div>
-                <span className={getStateColor(cb.state)}>
-                  {getStateLabel(cb.state)}
-                </span>
+                <div className="flex items-center gap-1.5">
+                  <span className={getStateColor(cb.state)}>
+                    {getStateLabel(cb.state)}
+                  </span>
+                  {canReset(cb) && (
+                    <button
+                      onClick={() => handleReset(cb, idx)}
+                      disabled={resetting[idx]}
+                      className="p-0.5 hover:bg-gh-canvas-subtle rounded transition-colors disabled:opacity-50"
+                      title="Reset circuit breaker"
+                    >
+                      <RotateCcw className={`w-3 h-3 text-gh-fg-muted hover:text-gh-fg-default ${resetting[idx] ? 'animate-spin' : ''}`} />
+                    </button>
+                  )}
+                </div>
               </div>
               {cb.rate_limit && (
                 <div className="text-xs text-gh-fg-muted ml-5">
