@@ -863,8 +863,15 @@ class WorkExecutionStateTracker:
                                 )
 
                                 if should_retry:
-                                    # Trigger retry via ProjectMonitor
-                                    try:
+                                    # TODO: Retry mechanism requires refactoring
+                                    # The get_project_monitor() function doesn't exist and this code path
+                                    # was never functional. Watchdog retries need to be redesigned.
+                                    logger.warning(
+                                        f"Watchdog retry mechanism not implemented for {project_name}/#{issue_number}. "
+                                        f"Marking execution as failed without retry."
+                                    )
+                                    # Skip retry logic for now
+                                    if False:  # Disabled - needs implementation
                                         # Import here to avoid circular dependency
                                         from services.project_monitor import get_project_monitor
 
