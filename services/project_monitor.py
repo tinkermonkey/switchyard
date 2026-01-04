@@ -3585,42 +3585,6 @@ _Repair cycle initiated by Claude Code Orchestrator_
                             )
                             lock_manager.release_lock(project_name, pipeline.board_name, lock.locked_by_issue)
                             logger.info(f"Released stale lock for issue #{lock.locked_by_issue}")
-                        else:
-                            # Lock exists with active run - verify container is actually running
-                            container_running = False
-                            if self.task_queue.redis_client:
-                                # Check repair cycle container key
-                                redis_key = f"repair_cycle:container:{project_name}:{lock.locked_by_issue}"
-                                container_name = self.task_queue.redis_client.get(redis_key)
-                                
-                                # Also check active_agent from pipeline run
-                                if not container_name and hasattr(pipeline_run, 'active_agent') and pipeline_run.active_agent:
-                                    container_name = pipeline_run.active_agent
-                                
-                                if container_name:
-                                    try:
-                                        import subprocess
-                                        c_name = container_name.decode() if isinstance(container_name, bytes) else container_name
-                                        result = subprocess.run(
-                                            ['docker', 'inspect', c_name],
-                                            capture_output=True,
-                                            timeout=5
-                                        )
-                                        container_running = (result.returncode == 0)
-                                    except Exception as e:
-                                        logger.warning(f"Error checking container for issue #{lock.locked_by_issue}: {e}")
-                            
-                            if not container_running:
-                                logger.warning(
-                                    f"Found lock on {project_name}/{pipeline.board_name} "
-                                    f"held by issue #{lock.locked_by_issue} with active run {pipeline_run.id} "
-                                    f"but no running container. Ending run and releasing lock..."
-                                )
-                                self.pipeline_run_manager.end_pipeline_run(
-                                    project_name, lock.locked_by_issue, 
-                                    "Container not running (detected by watchdog)"
-                                )
-                                # Lock will be released by end_pipeline_run (with the fix we just added)
 
         except Exception as e:
             logger.error(f"Error reconciling active runs: {e}")
@@ -3717,56 +3681,10 @@ _Repair cycle initiated by Claude Code Orchestrator_
                             project_name, item.issue_number
                         )
 
-                        # CRITICAL: Check if container is actually running for ANY active run
-                        # If container is missing, we need to restart even with active pipeline run
-                        container_is_running = False
+                        # Skip if active pipeline run exists
                         if has_active_run:
-                            # Check Redis for container tracking
-                            if self.task_queue.redis_client:
-                                # Try repair cycle key first
-                                redis_key = f"repair_cycle:container:{project_name}:{item.issue_number}"
-                                container_name = self.task_queue.redis_client.get(redis_key)
-                                
-                                # If not found, try agent key (from pipeline_run)
-                                if not container_name and hasattr(has_active_run, 'active_agent') and has_active_run.active_agent:
-                                    container_name = has_active_run.active_agent
-                                
-                                if container_name:
-                                    # Check if container actually exists
-                                    try:
-                                        c_name = container_name.decode() if isinstance(container_name, bytes) else container_name
-                                        result = subprocess.run(
-                                            ['docker', 'inspect', c_name],
-                                            capture_output=True,
-                                            timeout=5
-                                        )
-                                        container_is_running = (result.returncode == 0)
-
-                                        if not container_is_running:
-                                            logger.warning(
-                                                f"Issue #{item.issue_number} has active pipeline run "
-                                                f"but container {c_name} is not running - will restart"
-                                            )
-                                    except Exception as e:
-                                        logger.warning(f"Error checking container status for issue #{item.issue_number}: {e}")
-                                        container_is_running = False
-                                else:
-                                    # No container name found, but active run exists.
-                                    # For normal agents, this might mean it finished or hasn't started.
-                                    # But if it finished, the run should be closed?
-                                    # If it's a conversational agent, it might be waiting?
-                                    # Assume not running if we can't find a container.
-                                    logger.warning(
-                                        f"Issue #{item.issue_number} has active pipeline run "
-                                        f"but no container tracking found - assuming not running"
-                                    )
-                                    container_is_running = False
-
-                        # Skip if active pipeline run exists AND container is running
-                        if has_active_run and container_is_running:
                             logger.debug(
-                                f"Issue #{item.issue_number} in {item.status} already has active pipeline run "
-                                f"with running container - skipping"
+                                f"Issue #{item.issue_number} in {item.status} already has active pipeline run - skipping"
                             )
                             continue
 
