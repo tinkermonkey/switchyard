@@ -825,46 +825,10 @@ class ReviewCycleExecutor:
 
                 self._remove_cycle_state(cycle_state)
 
-                # Update PR status if using git workflow
-                if cycle_state.workspace_type == 'issues':
-                    from services.git_workflow_manager import git_workflow_manager
-                    from services.project_workspace import workspace_manager
-
-                    project_dir = workspace_manager.get_project_dir(cycle_state.project_name)
-                    
-                    # Ensure branch is tracked before updating PR
-                    branch_info = git_workflow_manager.get_branch_info(
-                        cycle_state.project_name,
-                        cycle_state.issue_number
-                    )
-                    
-                    if not branch_info:
-                        # Branch not tracked yet - get current branch and track it
-                        try:
-                            current_branch = await git_workflow_manager.get_current_branch(project_dir)
-                            if current_branch and current_branch != 'main':
-                                git_workflow_manager.track_branch(
-                                    cycle_state.project_name,
-                                    cycle_state.issue_number,
-                                    current_branch
-                                )
-                                logger.info(f"Tracked existing branch {current_branch} for issue #{cycle_state.issue_number}")
-                            else:
-                                logger.warning(f"Cannot update PR status - no feature branch found for issue #{cycle_state.issue_number}")
-                                # Don't fail the review cycle just because PR update failed
-                        except Exception as e:
-                            logger.warning(f"Could not track branch for PR update: {e}")
-                    
-                    if branch_info or git_workflow_manager.get_branch_info(cycle_state.project_name, cycle_state.issue_number):
-                        # Only try to update PR if we have a tracked branch
-                        await git_workflow_manager.update_pr_status(
-                            project=cycle_state.project_name,
-                            issue_number=cycle_state.issue_number,
-                            project_dir=project_dir,
-                            status='approved',
-                            org=org,
-                            repo=cycle_state.repository
-                        )
+                # NOTE: Do NOT update PR status here!
+                # PR status is managed by feature_branch_manager.finalize_workspace()
+                # which checks if ALL sub-issues are complete before marking PR ready.
+                # The review cycle only approves individual code changes, not the entire PR.
 
             elif review_result.status == ReviewStatus.CHANGES_REQUESTED:
                 logger.info(f"Changes requested, executing maker for revision")
@@ -1721,27 +1685,10 @@ class ReviewCycleExecutor:
                 self._save_cycle_state(cycle_state)
                 self._remove_cycle_state(cycle_state)
 
-                # Update PR status to approved if using git workflow
-                if cycle_state.workspace_type == 'issues':
-                    from services.git_workflow_manager import git_workflow_manager
-                    from services.project_workspace import workspace_manager
-
-                    project_dir = workspace_manager.get_project_dir(cycle_state.project_name)
-
-                    # Mark PR as ready for review (remove draft status)
-                    pr_updated = await git_workflow_manager.update_pr_status(
-                        project=cycle_state.project_name,
-                        issue_number=cycle_state.issue_number,
-                        project_dir=project_dir,
-                        status='approved',
-                        org=org,
-                        repo=cycle_state.repository
-                    )
-
-                    if pr_updated:
-                        logger.info(f"PR marked as approved for issue #{cycle_state.issue_number}")
-                    else:
-                        logger.warning(f"Failed to update PR status for issue #{cycle_state.issue_number}")
+                # NOTE: Do NOT update PR status here!
+                # PR status is managed by feature_branch_manager.finalize_workspace()
+                # which checks if ALL sub-issues are complete before marking PR ready.
+                # The review cycle only approves individual code changes, not the entire PR.
 
                 if column.auto_advance_on_approval:
                     next_column = self._get_next_column_name(column)
