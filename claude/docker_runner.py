@@ -578,17 +578,31 @@ class DockerAgentRunner:
         ])
         logger.info(f"Mounting Claude config: {claude_config_host_path} -> /home/orchestrator/.config/claude")
 
+        # Mount entire .claude directory as tmpfs
+        # This allows Claude Code to create any subdirectories it needs (todos, debug, etc.)
+        # while still overlaying shared resources (agents, commands, skills) on top
+        cmd.extend([
+            '--tmpfs', '/home/orchestrator/.claude:rw,exec,uid=1000,gid=1000,size=100m',
+        ])
+        logger.info("Mounting tmpfs for entire .claude directory (allows todos, debug, etc.)")
+
         # Mount shared Claude Code library (read-only)
-        # This makes shared agents, commands, and skills available to all containers
-        shared_claude_host_path = f'{host_workspace}/clauditoreum/config/shared_claude'
-        shared_claude_container_path = '/shared_claude'
+        # Mount individual subdirectories so Claude Code can still write to .claude/debug and other dirs
+        # This makes shared agents, commands, and skills available to all containers at user scope
+        shared_claude_base_host = f'{host_workspace}/clauditoreum/config/shared_claude/.claude'
 
         # Check if shared Claude directory exists before mounting
         if Path('/app/config/shared_claude/.claude').exists():
-            cmd.extend([
-                '-v', f'{shared_claude_host_path}:{shared_claude_container_path}:ro'
-            ])
-            logger.info(f"Mounting shared Claude library: {shared_claude_host_path} -> {shared_claude_container_path}")
+            # Mount each subdirectory individually (agents, commands, skills)
+            for resource_type in ['agents', 'commands', 'skills']:
+                shared_resource_host = f'{shared_claude_base_host}/{resource_type}'
+                shared_resource_container = f'/home/orchestrator/.claude/{resource_type}'
+
+                if Path(f'/app/config/shared_claude/.claude/{resource_type}').exists():
+                    cmd.extend([
+                        '-v', f'{shared_resource_host}:{shared_resource_container}:ro'
+                    ])
+                    logger.info(f"Mounting shared {resource_type}: {shared_resource_host} -> {shared_resource_container}")
         else:
             logger.debug("No shared Claude directory found, skipping mount")
 
@@ -902,12 +916,9 @@ class DockerAgentRunner:
                 raise Exception("Container write access verification failed - agent would not be able to write files")
             logger.info("✓ Pre-launch verification passed: Container has write access")
 
-        # Setup shared Claude resources - copy to project directory for Claude Code discovery
-        try:
-            self._setup_shared_claude(project_dir)
-        except Exception as e:
-            logger.warning(f"Failed to setup shared Claude resources: {e}")
-            # Not critical - continue execution
+        # Shared Claude resources are now available via Docker mount to /home/orchestrator/.claude
+        # No need to copy files - Claude Code discovers them automatically at user scope
+        # The _setup_shared_claude() method is deprecated and no longer used
 
         # Build the Claude command to run inside container
         # We use file-based input/output to support detached execution and orchestrator restarts
