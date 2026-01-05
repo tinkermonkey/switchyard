@@ -1189,7 +1189,31 @@ class DockerAgentRunner:
             if exit_code == 0:
                 result_text = ''.join(result_parts)
                 logger.info(f"Agent completed successfully in container, result length: {len(result_text)}")
-                
+
+                # CRITICAL: Record successful outcome immediately before any result processing
+                # This ensures outcome is recorded even if result processing fails
+                if 'issue_number' in context.get('context', {}):
+                    try:
+                        from services.work_execution_state import work_execution_tracker
+                        task_context = context.get('context', {})
+                        issue_number = task_context['issue_number']
+                        column = task_context.get('column', 'unknown')
+
+                        if column != 'unknown':
+                            work_execution_tracker.record_execution_outcome(
+                                issue_number=issue_number,
+                                column=column,
+                                agent=agent,
+                                outcome='success',
+                                project_name=project,
+                                error=None
+                            )
+                            logger.info(
+                                f"✓ Docker runner recorded success for {project}/#{issue_number} {agent} in {column}"
+                            )
+                    except Exception as outcome_error:
+                        logger.error(f"Failed to record outcome in docker_runner: {outcome_error}", exc_info=True)
+
                 # Close Claude Code breaker if it was open/half-open
                 # This allows recovery after rate limit reset
                 breaker = get_breaker()
@@ -1260,8 +1284,33 @@ class DockerAgentRunner:
                 
                 if not stderr_text:
                     stderr_text = f"Container exited with code {exit_code} but no error output captured."
-                
+
                 logger.error(f"Agent failed in container (exit_code={exit_code}): {stderr_text[:500]}")
+
+                # CRITICAL: Record failure outcome immediately before raising exception
+                # This ensures outcome is recorded even if exception handling fails
+                if 'issue_number' in context.get('context', {}):
+                    try:
+                        from services.work_execution_state import work_execution_tracker
+                        task_context = context.get('context', {})
+                        issue_number = task_context['issue_number']
+                        column = task_context.get('column', 'unknown')
+
+                        if column != 'unknown':
+                            work_execution_tracker.record_execution_outcome(
+                                issue_number=issue_number,
+                                column=column,
+                                agent=agent,
+                                outcome='failure',
+                                project_name=project,
+                                error=stderr_text[:500]
+                            )
+                            logger.info(
+                                f"✓ Docker runner recorded failure for {project}/#{issue_number} {agent} in {column}"
+                            )
+                    except Exception as outcome_error:
+                        logger.error(f"Failed to record outcome in docker_runner: {outcome_error}", exc_info=True)
+
                 raise Exception(f"Agent execution failed (exit_code={exit_code}): {stderr_text[:500]}")
 
         except Exception as e:

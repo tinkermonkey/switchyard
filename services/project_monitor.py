@@ -2769,12 +2769,12 @@ _Review cycle initiated by Claude Code Orchestrator_
                         # CRITICAL: Process next waiting issue in queue after lock release
                         # This ensures queued issues are picked up when review cycle completes
                         try:
-                            from services.pipeline_queue_manager import get_pipeline_queue
+                            from services.pipeline_queue_manager import get_pipeline_queue_manager
                             from task_queue.models import Task, TaskPriority
                             from datetime import datetime
                             import time
-                            
-                            pipeline_queue = get_pipeline_queue()
+
+                            pipeline_queue = get_pipeline_queue_manager(project_name, board_name)
                             next_issue = pipeline_queue.get_next_waiting_issue()
                             
                             if next_issue:

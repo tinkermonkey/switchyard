@@ -490,11 +490,11 @@ class PipelineRunManager:
                 # CRITICAL: Process next waiting issue in queue after lock release
                 # This ensures queued issues are picked up when the current issue completes
                 try:
-                    from services.pipeline_queue_manager import get_pipeline_queue
+                    from services.pipeline_queue_manager import get_pipeline_queue_manager
                     from task_queue.models import Task, TaskPriority
                     import time
-                    
-                    pipeline_queue = get_pipeline_queue()
+
+                    pipeline_queue = get_pipeline_queue_manager(project, pipeline_run.board)
                     next_issue = pipeline_queue.get_next_waiting_issue()
                     
                     if next_issue:
