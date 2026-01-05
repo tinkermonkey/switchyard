@@ -2806,7 +2806,7 @@ _Review cycle initiated by Claude Code Orchestrator_
                                         import json as json_module
                                         result = subprocess.run(
                                             ['gh', 'issue', 'view', str(next_issue['issue_number']), '--repo',
-                                             f"{project_config.github['org']}/{next_issue.get('repository')}", '--json', 'projectItems'],
+                                             f"{project_config.github['org']}/{project_config.github['repo']}", '--json', 'projectItems'],
                                             capture_output=True, text=True, check=True
                                         )
                                         issue_data_check = json_module.loads(result.stdout)
@@ -2834,7 +2834,7 @@ _Review cycle initiated by Claude Code Orchestrator_
                                                 'project': project_name,
                                                 'board': board_name,
                                                 'pipeline': pipeline_config.name,
-                                                'repository': next_issue.get('repository'),
+                                                'repository': project_config.github['repo'],
                                                 'issue_number': next_issue['issue_number'],
                                                 'column': actual_column,  # Use verified actual column
                                                 'trigger': 'review_cycle_completion_queue_processing',
