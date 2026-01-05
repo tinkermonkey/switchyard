@@ -508,11 +508,17 @@ class PipelineRunManager:
                         )
                         
                         if acquired:
+                            # CRITICAL: Mark issue active IMMEDIATELY after lock acquisition
+                            # This prevents monitoring loop from seeing "issue has lock" and creating duplicate task
+                            # The monitoring loop checks if issue holds lock (line 1507 in project_monitor.py)
+                            # If yes, it assumes work is resuming and proceeds to create task
+                            # We must mark active BEFORE that check can happen
+                            pipeline_queue.mark_issue_active(next_issue['issue_number'])
                             logger.info(f"Successfully acquired lock for issue #{next_issue['issue_number']}")
                             
                             # CRITICAL: Actually dispatch the agent by creating a task
                             # Not sufficient to just acquire lock - need to enqueue task
-                            # SAFETY: Mark active AFTER task creation succeeds to avoid inconsistent state
+                            # SAFETY: Track task_created for rollback if creation fails
                             task_created = False
                             try:
                                 from config.manager import ConfigManager
@@ -576,9 +582,6 @@ class PipelineRunManager:
                                     
                                     task_queue.enqueue(task)
                                     task_created = True
-                                    
-                                    # SAFETY: Only mark active AFTER task successfully created and enqueued
-                                    pipeline_queue.mark_issue_active(next_issue['issue_number'])
                                     
                                     logger.info(
                                         f"Dispatched agent {agent} for next queued issue #{next_issue['issue_number']} "

@@ -2788,11 +2788,14 @@ _Review cycle initiated by Claude Code Orchestrator_
                                 )
                                 
                                 if acquired:
+                                    # CRITICAL: Mark issue active IMMEDIATELY after lock acquisition
+                                    # This prevents monitoring loop from seeing "issue has lock" and creating duplicate task
+                                    pipeline_queue.mark_issue_active(next_issue['issue_number'])
                                     logger.info(f"Successfully acquired lock for issue #{next_issue['issue_number']}")
                                     
                                     # CRITICAL: Actually dispatch the agent by creating a task
                                     # Not sufficient to just acquire lock - need to enqueue task
-                                    # SAFETY: Mark active AFTER task creation succeeds to avoid inconsistent state
+                                    # SAFETY: Track task_created for rollback if creation fails
                                     task_created = False
                                     try:
                                         workflow_template_obj = self.config_manager.get_workflow_template(pipeline_config.workflow)
@@ -2852,9 +2855,6 @@ _Review cycle initiated by Claude Code Orchestrator_
                                             
                                             task_queue.enqueue(task)
                                             task_created = True
-                                            
-                                            # SAFETY: Only mark active AFTER task successfully created and enqueued
-                                            pipeline_queue.mark_issue_active(next_issue['issue_number'])
                                             
                                             logger.info(
                                                 f"Dispatched agent {agent} for next queued issue #{next_issue['issue_number']} "
