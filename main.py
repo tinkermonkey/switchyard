@@ -277,15 +277,25 @@ async def main():
                         )
                         locks_recovered += 1
 
-                        # CRITICAL: Check if repair cycle container is already running
+                        # CRITICAL: Check if any container is already running for this issue
                         # Agent container recovery may reconnect to it, so don't re-trigger
                         should_retrigger = True
 
-                        # Check if there's a repair cycle container for this issue
-                        redis_key = f"repair_cycle:container:{project_name}:{lock.locked_by_issue}"
-                        container_name = None
                         if task_queue.redis_client:
-                            container_name = task_queue.redis_client.get(redis_key)
+                            # Check for repair cycle containers
+                            repair_key = f"repair_cycle:container:{project_name}:{lock.locked_by_issue}"
+                            container_name = task_queue.redis_client.get(repair_key)
+                            
+                            # Check for regular agent containers
+                            if not container_name:
+                                # Search for agent container tracking keys
+                                agent_keys = task_queue.redis_client.keys(f"agent:container:*{project_name}*{lock.locked_by_issue}*")
+                                if agent_keys:
+                                    # Get the first matching container info
+                                    container_info = task_queue.redis_client.hgetall(agent_keys[0])
+                                    if container_info:
+                                        container_name = agent_keys[0].decode() if isinstance(agent_keys[0], bytes) else agent_keys[0]
+                                        container_name = container_name.replace('agent:container:', '')
 
                             if container_name:
                                 # Check if container actually exists
@@ -298,7 +308,7 @@ async def main():
                                     )
                                     if result.returncode == 0:
                                         logger.info(
-                                            f"Repair cycle container {container_name} already exists for issue #{lock.locked_by_issue} "
+                                            f"Container {container_name} already exists for issue #{lock.locked_by_issue} "
                                             f"- skipping re-trigger (agent container recovery will reconnect)"
                                         )
                                         should_retrigger = False
