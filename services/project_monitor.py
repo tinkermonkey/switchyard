@@ -2770,6 +2770,10 @@ _Review cycle initiated by Claude Code Orchestrator_
                         # This ensures queued issues are picked up when review cycle completes
                         try:
                             from services.pipeline_queue_manager import get_pipeline_queue
+                            from task_queue.models import Task, TaskPriority
+                            from datetime import datetime
+                            import time
+                            
                             pipeline_queue = get_pipeline_queue()
                             next_issue = pipeline_queue.get_next_waiting_issue()
                             
@@ -2784,13 +2788,61 @@ _Review cycle initiated by Claude Code Orchestrator_
                                 )
                                 
                                 if acquired:
-                                    # Lock acquired - trigger item processing
-                                    # The monitoring loop will detect this and dispatch the agent
                                     pipeline_queue.mark_issue_active(next_issue['issue_number'])
-                                    logger.info(
-                                        f"Successfully acquired lock for issue #{next_issue['issue_number']}, "
-                                        f"monitoring loop will dispatch agent"
-                                    )
+                                    logger.info(f"Successfully acquired lock for issue #{next_issue['issue_number']}")
+                                    
+                                    # CRITICAL: Actually dispatch the agent by creating a task
+                                    # Not sufficient to just acquire lock - need to enqueue task
+                                    try:
+                                        workflow_template_obj = self.config_manager.get_workflow_template(pipeline_config.workflow)
+                                        
+                                        # Get agent for current column
+                                        current_column = next_issue.get('column')
+                                        agent = None
+                                        for col in workflow_template_obj.columns:
+                                            if col.name == current_column:
+                                                agent = col.agent
+                                                break
+                                        
+                                        if agent and agent != 'null':
+                                            # Create task for next issue
+                                            task_context = {
+                                                'project': project_name,
+                                                'board': board_name,
+                                                'pipeline': pipeline_config.name,
+                                                'repository': next_issue.get('repository'),
+                                                'issue_number': next_issue['issue_number'],
+                                                'column': current_column,
+                                                'trigger': 'review_cycle_completion_queue_processing',
+                                                'timestamp': datetime.utcnow().isoformat() + 'Z'
+                                            }
+                                            
+                                            from task_queue.task_queue_factory import get_task_queue
+                                            task_queue = get_task_queue()
+                                            
+                                            task = Task(
+                                                id=f"{agent}_{project_name}_{board_name}_{next_issue['issue_number']}_{int(time.time())}",
+                                                agent=agent,
+                                                project=project_name,
+                                                priority=TaskPriority.MEDIUM,
+                                                context=task_context,
+                                                created_at=datetime.utcnow().isoformat() + 'Z'
+                                            )
+                                            
+                                            task_queue.enqueue(task)
+                                            logger.info(
+                                                f"Dispatched agent {agent} for next queued issue #{next_issue['issue_number']} "
+                                                f"in column '{current_column}'"
+                                            )
+                                        else:
+                                            logger.warning(
+                                                f"Next queued issue #{next_issue['issue_number']} in column '{current_column}' "
+                                                f"has no agent configured"
+                                            )
+                                    except Exception as dispatch_error:
+                                        logger.error(f"Error dispatching agent for next issue: {dispatch_error}")
+                                        import traceback
+                                        logger.error(traceback.format_exc())
                                 else:
                                     logger.info(
                                         f"Could not acquire lock for next issue #{next_issue['issue_number']}: {acquire_reason}"
