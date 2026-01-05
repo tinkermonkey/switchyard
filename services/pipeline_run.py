@@ -530,7 +530,6 @@ class PipelineRunManager:
                                 # SAFETY: Re-fetch issue from GitHub to verify it hasn't moved columns
                                 # The queue cache might be stale if user moved the issue
                                 import subprocess
-                                import json
                                 result = subprocess.run(
                                     ['gh', 'issue', 'view', str(next_issue['issue_number']), '--repo',
                                      f"{project_config.github['org']}/{project_config.github['repo']}", '--json', 'projectItems'],
