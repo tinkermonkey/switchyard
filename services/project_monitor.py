@@ -2770,7 +2770,7 @@ _Review cycle initiated by Claude Code Orchestrator_
                         # This ensures queued issues are picked up when review cycle completes
                         try:
                             from services.pipeline_queue_manager import get_pipeline_queue_manager
-                            from task_queue.models import Task, TaskPriority
+                            from task_queue.task_manager import Task, TaskPriority
                             from datetime import datetime
                             import time
 
