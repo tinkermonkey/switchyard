@@ -2879,9 +2879,6 @@ _Review cycle initiated by Claude Code Orchestrator_
                                             except Exception as rollback_error:
                                                 logger.error(f"Failed to rollback lock: {rollback_error}")
                                         
-                                        logger.error(f"Error dispatching agent for next issue: {dispatch_error}\")")
-                                            )
-                                    except Exception as dispatch_error:
                                         logger.error(f"Error dispatching agent for next issue: {dispatch_error}")
                                         import traceback
                                         logger.error(traceback.format_exc())
