@@ -2599,9 +2599,33 @@ class ProjectMonitor:
             )
             logger.debug(f"Using pipeline run {pipeline_run.id} for review cycle on issue #{issue_number}")
 
+            # CRITICAL: Try to acquire pipeline lock for review cycle
+            # Review cycles must hold locks just like regular agent execution to prevent
+            # multiple issues from working on the same board simultaneously
+            from services.pipeline_lock_manager import get_pipeline_lock_manager
+            lock_manager = get_pipeline_lock_manager()
+            
+            can_execute, reason = lock_manager.try_acquire_lock(
+                project=project_name,
+                board=board_name,
+                issue_number=issue_number
+            )
+            
+            if not can_execute:
+                logger.warning(
+                    f"Cannot start review cycle for issue #{issue_number}: {reason}. "
+                    f"Another issue is currently working on this board."
+                )
+                # End the pipeline run we just created since we can't proceed
+                self.pipeline_run_manager.end_pipeline_run(
+                    project_name, issue_number, 
+                    reason=f"Could not acquire lock: {reason}"
+                )
+                return None
+            
             logger.info(
-                f"Starting review cycle for issue #{issue_number} in background thread "
-                f"(reviewer: {column.agent}, maker: {column.maker_agent})"
+                f"Review cycle acquired pipeline lock for issue #{issue_number}. "
+                f"Starting in background thread (reviewer: {column.agent}, maker: {column.maker_agent})"
             )
 
             def run_cycle_in_thread():
@@ -2733,6 +2757,16 @@ _Review cycle initiated by Claude Code Orchestrator_
                     logger.error(f"Error in review cycle thread: {e}")
                     import traceback
                     logger.error(traceback.format_exc())
+                finally:
+                    # CRITICAL: Always release pipeline lock when review cycle completes
+                    # This ensures the lock is released even if there's an exception
+                    try:
+                        from services.pipeline_lock_manager import get_pipeline_lock_manager
+                        lock_mgr = get_pipeline_lock_manager()
+                        lock_mgr.release_lock(project_name, board_name, issue_number)
+                        logger.info(f"Released pipeline lock for issue #{issue_number} after review cycle completion")
+                    except Exception as lock_error:
+                        logger.error(f"Failed to release pipeline lock for issue #{issue_number}: {lock_error}")
 
             # Start in background thread (non-blocking)
             thread = threading.Thread(target=run_cycle_in_thread, daemon=True)
