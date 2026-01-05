@@ -508,11 +508,12 @@ class PipelineRunManager:
                         )
                         
                         if acquired:
-                            pipeline_queue.mark_issue_active(next_issue['issue_number'])
                             logger.info(f"Successfully acquired lock for issue #{next_issue['issue_number']}")
                             
                             # CRITICAL: Actually dispatch the agent by creating a task
                             # Not sufficient to just acquire lock - need to enqueue task
+                            # SAFETY: Mark active AFTER task creation succeeds to avoid inconsistent state
+                            task_created = False
                             try:
                                 from config.manager import ConfigManager
                                 config_manager = ConfigManager()
@@ -520,23 +521,43 @@ class PipelineRunManager:
                                 pipeline_config = next(p for p in project_config.pipelines if p.board_name == pipeline_run.board)
                                 workflow_template = config_manager.get_workflow_template(pipeline_config.workflow)
                                 
-                                # Get agent for current column
-                                current_column = next_issue.get('column')
+                                # SAFETY: Re-fetch issue from GitHub to verify it hasn't moved columns
+                                # The queue cache might be stale if user moved the issue
+                                import subprocess
+                                import json
+                                result = subprocess.run(
+                                    ['gh', 'issue', 'view', str(next_issue['issue_number']), '--repo',
+                                     f"{project_config.github['org']}/{next_issue.get('repository')}", '--json', 'projectItems'],
+                                    capture_output=True, text=True, check=True
+                                )
+                                issue_data = json.loads(result.stdout)
+                                
+                                # Find current column for this board
+                                actual_column = None
+                                for item in issue_data.get('projectItems', {}).get('nodes', []):
+                                    if item.get('project', {}).get('title') == pipeline_run.board:
+                                        actual_column = item.get('fieldValueByName', {}).get('name')
+                                        break
+                                
+                                if not actual_column:
+                                    raise Exception(f"Issue #{next_issue['issue_number']} not found on board '{pipeline_run.board}'")
+                                
+                                # Get agent for ACTUAL current column (not cached column)
                                 agent = None
                                 for col in workflow_template.columns:
-                                    if col.name == current_column:
+                                    if col.name == actual_column:
                                         agent = col.agent
                                         break
                                 
                                 if agent and agent != 'null':
-                                    # Create task for next issue
+                                    # Create task for next issue with ACTUAL column (not cached)
                                     task_context = {
                                         'project': project,
                                         'board': pipeline_run.board,
                                         'pipeline': pipeline_config.name,
                                         'repository': next_issue.get('repository'),
                                         'issue_number': next_issue['issue_number'],
-                                        'column': current_column,
+                                        'column': actual_column,  # Use verified actual column
                                         'trigger': 'lock_release_queue_processing',
                                         'timestamp': datetime.utcnow().isoformat() + 'Z'
                                     }
@@ -554,16 +575,34 @@ class PipelineRunManager:
                                     )
                                     
                                     task_queue.enqueue(task)
+                                    task_created = True
+                                    
+                                    # SAFETY: Only mark active AFTER task successfully created and enqueued
+                                    pipeline_queue.mark_issue_active(next_issue['issue_number'])
+                                    
                                     logger.info(
                                         f"Dispatched agent {agent} for next queued issue #{next_issue['issue_number']} "
-                                        f"in column '{current_column}'"
+                                        f"in column '{actual_column}'"
                                     )
                                 else:
-                                    logger.warning(
-                                        f"Next queued issue #{next_issue['issue_number']} in column '{current_column}' "
+                                    raise Exception(
+                                        f"Next queued issue #{next_issue['issue_number']} in column '{actual_column}' "
                                         f"has no agent configured"
                                     )
                             except Exception as dispatch_error:
+                                # CRITICAL: Rollback lock acquisition if task creation failed
+                                # Otherwise lock is held with no work happening (deadlock)
+                                if not task_created:
+                                    logger.error(
+                                        f"Task creation failed for issue #{next_issue['issue_number']}, "
+                                        f"rolling back lock acquisition to prevent deadlock"
+                                    )
+                                    try:
+                                        lock_manager.release_lock(project, pipeline_run.board, next_issue['issue_number'])
+                                        logger.info(f"Rolled back lock for issue #{next_issue['issue_number']}")
+                                    except Exception as rollback_error:
+                                        logger.error(f"Failed to rollback lock: {rollback_error}")
+                                
                                 logger.error(f"Error dispatching agent for next issue: {dispatch_error}")
                                 import traceback
                                 logger.error(traceback.format_exc())
