@@ -2765,6 +2765,43 @@ _Review cycle initiated by Claude Code Orchestrator_
                         lock_mgr = get_pipeline_lock_manager()
                         lock_mgr.release_lock(project_name, board_name, issue_number)
                         logger.info(f"Released pipeline lock for issue #{issue_number} after review cycle completion")
+                        
+                        # CRITICAL: Process next waiting issue in queue after lock release
+                        # This ensures queued issues are picked up when review cycle completes
+                        try:
+                            from services.pipeline_queue_manager import get_pipeline_queue
+                            pipeline_queue = get_pipeline_queue()
+                            next_issue = pipeline_queue.get_next_waiting_issue()
+                            
+                            if next_issue:
+                                logger.info(f"Attempting to acquire lock for next queued issue #{next_issue['issue_number']} after review cycle for #{issue_number} completed")
+                                
+                                # Try to acquire lock for next issue
+                                acquired, acquire_reason = lock_mgr.try_acquire_lock(
+                                    project=project_name,
+                                    board=board_name,
+                                    issue_number=next_issue['issue_number']
+                                )
+                                
+                                if acquired:
+                                    # Lock acquired - trigger item processing
+                                    # The monitoring loop will detect this and dispatch the agent
+                                    pipeline_queue.mark_issue_active(next_issue['issue_number'])
+                                    logger.info(
+                                        f"Successfully acquired lock for issue #{next_issue['issue_number']}, "
+                                        f"monitoring loop will dispatch agent"
+                                    )
+                                else:
+                                    logger.info(
+                                        f"Could not acquire lock for next issue #{next_issue['issue_number']}: {acquire_reason}"
+                                    )
+                            else:
+                                logger.debug(f"No more issues waiting in queue for {project_name}/{board_name}")
+                        except Exception as queue_error:
+                            logger.error(f"Error processing next queued issue for {project_name}/{board_name}: {queue_error}")
+                            import traceback
+                            logger.error(traceback.format_exc())
+                            
                     except Exception as lock_error:
                         logger.error(f"Failed to release pipeline lock for issue #{issue_number}: {lock_error}")
 

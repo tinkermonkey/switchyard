@@ -486,6 +486,43 @@ class PipelineRunManager:
             if current_lock and current_lock.lock_status == 'locked' and current_lock.locked_by_issue == issue_number:
                 lock_manager.release_lock(project, pipeline_run.board, issue_number)
                 logger.info(f"Released pipeline lock for {project} issue #{issue_number} after ending run")
+                
+                # CRITICAL: Process next waiting issue in queue after lock release
+                # This ensures queued issues are picked up when the current issue completes
+                try:
+                    from services.pipeline_queue_manager import get_pipeline_queue
+                    pipeline_queue = get_pipeline_queue()
+                    next_issue = pipeline_queue.get_next_waiting_issue()
+                    
+                    if next_issue:
+                        logger.info(f"Attempting to acquire lock for next queued issue #{next_issue['issue_number']} after #{issue_number} completed")
+                        
+                        # Try to acquire lock for next issue
+                        acquired, acquire_reason = lock_manager.try_acquire_lock(
+                            project=project,
+                            board=pipeline_run.board,
+                            issue_number=next_issue['issue_number']
+                        )
+                        
+                        if acquired:
+                            # Lock acquired - trigger item processing
+                            # The monitoring loop will detect this and dispatch the agent
+                            pipeline_queue.mark_issue_active(next_issue['issue_number'])
+                            logger.info(
+                                f"Successfully acquired lock for issue #{next_issue['issue_number']}, "
+                                f"monitoring loop will dispatch agent"
+                            )
+                        else:
+                            logger.info(
+                                f"Could not acquire lock for next issue #{next_issue['issue_number']}: {acquire_reason}"
+                            )
+                    else:
+                        logger.debug(f"No more issues waiting in queue for {project}/{pipeline_run.board}")
+                except Exception as queue_error:
+                    logger.error(f"Error processing next queued issue for {project}/{pipeline_run.board}: {queue_error}")
+                    import traceback
+                    logger.error(traceback.format_exc())
+                    
         except Exception as e:
             logger.warning(f"Failed to release pipeline lock for {project} issue #{issue_number}: {e}")
         
