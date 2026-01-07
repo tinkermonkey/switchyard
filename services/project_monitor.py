@@ -4110,6 +4110,121 @@ _Repair cycle initiated by Claude Code Orchestrator_
             import traceback
             logger.error(traceback.format_exc())
 
+    def _check_and_process_waiting_issues_failsafe(self):
+        """
+        Failsafe mechanism to catch cases where waiting issues aren't being processed.
+
+        This handles situations where a pipeline run ends but doesn't trigger the
+        "process next" logic, leaving waiting issues stuck in the queue.
+
+        The failsafe checks each pipeline for:
+        1. Pipeline is unlocked (no active work)
+        2. Waiting issues exist in queue
+        3. If both true → try to start the next waiting issue
+
+        Safety: Uses same lock acquisition as normal flow - prevents duplicate launches.
+        Lock acquisition is atomic in Redis - only ONE process can acquire successfully.
+        """
+        from services.pipeline_lock_manager import get_pipeline_lock_manager
+        from services.pipeline_queue_manager import get_pipeline_queue_manager
+
+        try:
+            for project_name in self.config_manager.list_visible_projects():
+                project_config = self.config_manager.get_project_config(project_name)
+
+                for pipeline in project_config.pipelines:
+                    if not pipeline.active:
+                        continue
+
+                    try:
+                        lock_manager = get_pipeline_lock_manager()
+                        pipeline_queue = get_pipeline_queue_manager(
+                            project_name, pipeline.board_name
+                        )
+
+                        # CRITICAL: Check if pipeline is unlocked
+                        lock = lock_manager.get_lock(project_name, pipeline.board_name)
+                        if lock and lock.lock_status == 'locked':
+                            continue  # Pipeline busy, skip
+
+                        # CRITICAL: Check if there are waiting issues
+                        # This also syncs queue with GitHub (ensures up-to-date state)
+                        next_issue = pipeline_queue.get_next_waiting_issue()
+                        if not next_issue:
+                            continue  # No waiting issues, skip
+
+                        # We have: waiting issue + unlocked pipeline = should be processing!
+                        logger.info(
+                            f"⚡ FAILSAFE: Found waiting issue #{next_issue['issue_number']} "
+                            f"for unlocked pipeline {project_name}/{pipeline.board_name} - attempting to process"
+                        )
+
+                        # CRITICAL: Try to acquire lock (atomic operation in Redis)
+                        # If another process is processing this issue, acquisition will fail
+                        acquired, reason = lock_manager.try_acquire_lock(
+                            project=project_name,
+                            board=pipeline.board_name,
+                            issue_number=next_issue['issue_number']
+                        )
+
+                        if not acquired:
+                            logger.debug(
+                                f"FAILSAFE: Could not acquire lock for issue "
+                                f"#{next_issue['issue_number']}: {reason} "
+                                f"(likely being processed by another path)"
+                            )
+                            continue
+
+                        # Mark as active in queue
+                        pipeline_queue.mark_issue_active(next_issue['issue_number'])
+
+                        # Get current column from GitHub (may have moved since queued)
+                        current_column = self.get_issue_column_sync(
+                            project_name,
+                            pipeline.board_name,
+                            next_issue['issue_number']
+                        )
+
+                        if current_column:
+                            logger.info(
+                                f"⚡ FAILSAFE: Triggering agent for issue "
+                                f"#{next_issue['issue_number']} in column '{current_column}'"
+                            )
+
+                            # Trigger agent using normal flow
+                            self.trigger_agent_for_status(
+                                project_name,
+                                pipeline.board_name,
+                                next_issue['issue_number'],
+                                current_column,
+                                project_config.github['repo']
+                            )
+                        else:
+                            # Issue not in any column - clean up
+                            logger.warning(
+                                f"FAILSAFE: Issue #{next_issue['issue_number']} not found "
+                                f"in any column, removing from queue and releasing lock"
+                            )
+                            pipeline_queue.remove_issue_from_queue(next_issue['issue_number'])
+                            lock_manager.release_lock(
+                                project_name,
+                                pipeline.board_name,
+                                next_issue['issue_number']
+                            )
+
+                    except Exception as e:
+                        logger.error(
+                            f"Error in failsafe check for {project_name}/{pipeline.board_name}: {e}"
+                        )
+                        import traceback
+                        logger.error(traceback.format_exc())
+                        continue
+
+        except Exception as e:
+            logger.error(f"Error in queue processing failsafe: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+
     def monitor_projects(self):
         """Main monitoring loop using new configuration system"""
         import sys
@@ -4331,6 +4446,11 @@ _Repair cycle initiated by Claude Code Orchestrator_
                                 project_config.github['org'],
                                 project_config.github['repo']
                             )
+
+                # FAILSAFE: Check for waiting issues that haven't been processed
+                # This catches edge cases where pipeline lock is released but next issue isn't triggered
+                logger.debug("Running queue processing failsafe check...")
+                self._check_and_process_waiting_issues_failsafe()
 
                 logger.debug(f"Sleeping for {self.poll_interval} seconds...")
                 time.sleep(self.poll_interval)
