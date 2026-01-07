@@ -267,7 +267,7 @@ def build_projects_v2_query(owner_login: str, project_number: int) -> Optional[s
                 projectV2(number: {project_number}) {{
                     id
                     title
-                    items(first: 100) {{
+                    items(first: 100, orderBy: {{field: POSITION, direction: ASC}}) {{
                         nodes {{
                             id
                             content {{
@@ -306,7 +306,7 @@ def build_projects_v2_query(owner_login: str, project_number: int) -> Optional[s
                 projectV2(number: {project_number}) {{
                     id
                     title
-                    items(first: 100) {{
+                    items(first: 100, orderBy: {{field: POSITION, direction: ASC}}) {{
                         nodes {{
                             id
                             content {{
