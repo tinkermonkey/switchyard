@@ -2205,13 +2205,18 @@ class ProjectMonitor:
     ):
         """
         Check if PR should be marked ready when an issue exits the pipeline.
-        
+
         This handles the case where:
         1. Agent finishes work and calls finalize_workspace() BEFORE issue is closed
         2. finalize_workspace() checks sub-issue completion but some are still open
         3. Issue then gets moved to Done/Staged (exit column) and closes
         4. NOW all sub-issues might be complete, so we check again and mark PR ready
-        
+
+        Safety features:
+        - Idempotent: Multiple concurrent calls won't cause duplicate PR marking
+        - Defensive: Validates parent/PR existence at each step
+        - Race-condition safe: Uses GitHub as source of truth
+
         Args:
             project_name: Project name
             issue_number: Issue number that just exited pipeline
@@ -2220,109 +2225,134 @@ class ProjectMonitor:
         try:
             from services.feature_branch_manager import feature_branch_manager
             from services.github_integration import GitHubIntegration
-            
-            # Check if this issue has a parent (is it a sub-issue?)
+
+            # Step 1: Initialize GitHub integration
             project_config = self.config_manager.get_project_config(project_name)
             github = GitHubIntegration(project_config)
-            
-            issue_data = await github.get_issue(issue_number)
-            if not issue_data:
-                logger.debug(f"Could not get issue data for #{issue_number}, skipping PR ready check")
-                return
-            
-            # Check if issue has a parent (parent_issue_url in body)
-            parent_issue_number = feature_branch_manager._get_parent_issue_number(issue_data)
+
+            # Step 2: Check if this issue has a parent (is it a sub-issue?)
+            # FIX: Use correct async method get_parent_issue instead of non-existent _get_parent_issue_number
+            parent_issue_number = await feature_branch_manager.get_parent_issue(
+                github,
+                issue_number,
+                project=project_name
+            )
+
             if not parent_issue_number:
                 logger.debug(f"Issue #{issue_number} has no parent, skipping PR ready check")
                 return
-            
+
             logger.info(
                 f"Issue #{issue_number} is sub-issue of #{parent_issue_number} and reached '{exit_column}'. "
                 f"Checking if all sub-issues complete to mark PR ready..."
             )
-            
-            # Get parent issue data
+
+            # Step 3: Get parent issue data
             parent_issue_data = await github.get_issue(parent_issue_number)
             if not parent_issue_data:
-                logger.warning(f"Could not get parent issue #{parent_issue_number}")
+                logger.warning(f"Could not get parent issue #{parent_issue_number}, skipping PR ready check")
                 return
-            
-            # Get all sub-issues from parent
+
+            # Step 4: Get all sub-issues from parent (queries GitHub directly)
             actual_sub_issues = await feature_branch_manager._get_sub_issues_from_parent(
                 github, parent_issue_data
             )
-            
+
             if len(actual_sub_issues) == 0:
-                logger.debug(f"Parent #{parent_issue_number} has no sub-issues")
+                logger.debug(f"Parent #{parent_issue_number} has no sub-issues, skipping PR ready check")
                 return
-            
-            # Check if ALL sub-issues are complete
+
+            # Step 5: Check if ALL sub-issues are actually complete in GitHub
             all_complete = await feature_branch_manager._verify_all_sub_issues_complete(
                 github, actual_sub_issues
             )
-            
+
             if not all_complete:
+                closed_count = len([s for s in actual_sub_issues if s.get('state') == 'closed'])
                 logger.info(
                     f"Not all sub-issues complete for parent #{parent_issue_number} yet "
-                    f"({len([s for s in actual_sub_issues if s.get('state') == 'CLOSED'])}/{len(actual_sub_issues)} closed)"
+                    f"({closed_count}/{len(actual_sub_issues)} closed)"
                 )
                 return
-            
+
             logger.info(
                 f"✓ All {len(actual_sub_issues)} sub-issues complete for parent #{parent_issue_number}! "
-                f"Marking PR ready for review..."
+                f"Checking PR status..."
             )
-            
-            # Load feature branch state
-            feature_branch = feature_branch_manager.load_feature_branch_state(
+
+            # Step 6: Get feature branch state (queries git for branch name)
+            # FIX: Use correct method name get_feature_branch_state instead of non-existent load_feature_branch_state
+            feature_branch = feature_branch_manager.get_feature_branch_state(
                 project_name, parent_issue_number
             )
-            
+
             if not feature_branch:
-                logger.warning(f"No feature branch found for parent #{parent_issue_number}")
+                logger.warning(
+                    f"No feature branch found for parent #{parent_issue_number}. "
+                    f"Cannot mark PR ready without branch information."
+                )
                 return
-            
-            if not feature_branch.pr_number:
-                logger.warning(f"No PR found for parent #{parent_issue_number}")
+
+            # Step 7: Find PR for this branch (queries GitHub)
+            # FIX: get_feature_branch_state doesn't populate pr_number, so we need to query it
+            pr_data = await github.find_pr_by_branch(feature_branch.branch_name)
+
+            if not pr_data:
+                logger.warning(
+                    f"No PR found for branch '{feature_branch.branch_name}' (parent #{parent_issue_number}). "
+                    f"PR may not have been created yet."
+                )
                 return
-            
-            if feature_branch.pr_status == 'ready':
-                logger.debug(f"PR #{feature_branch.pr_number} already marked ready")
+
+            pr_number = pr_data.get('number')
+            is_draft = pr_data.get('isDraft', True)
+
+            # Step 8: Check if PR is already ready (idempotent check for race conditions)
+            if not is_draft:
+                logger.debug(f"PR #{pr_number} is already marked ready, skipping")
                 return
-            
-            # Mark PR as ready for review
-            success = await github.mark_pr_ready(feature_branch.pr_number)
-            
+
+            logger.info(f"PR #{pr_number} is currently draft, marking as ready for review...")
+
+            # Step 9: Mark PR as ready for review
+            success = await github.mark_pr_ready(pr_number)
+
             if success:
+                # Update cache with PR status (cache-only, no file persistence)
+                feature_branch.pr_number = pr_number
                 feature_branch.pr_status = "ready"
                 feature_branch_manager.save_feature_branch_state(project_name, feature_branch)
+
                 logger.info(
-                    f"✓ Successfully marked PR #{feature_branch.pr_number} as ready for review "
+                    f"✓ Successfully marked PR #{pr_number} as ready for review "
                     f"(triggered by issue #{issue_number} completing)"
                 )
-                
-                # Post completion comment to parent issue
+
+                # Step 10: Post completion comment to parent issue
+                pr_url = pr_data.get('url') or f"https://github.com/{project_config.github['org']}/{project_config.github['repo']}/pull/{pr_number}"
                 await feature_branch_manager.post_feature_completion_comment(
                     github,
                     parent_issue_number,
-                    f"https://github.com/{project_config.github['org']}/{project_config.github['repo']}/pull/{feature_branch.pr_number}"
+                    pr_url
                 )
+
+                logger.info(f"✓ Posted completion comment to parent issue #{parent_issue_number}")
             else:
                 logger.error(
-                    f"✗ FAILED to mark PR #{feature_branch.pr_number} as ready for review. "
-                    f"Manual intervention required."
+                    f"✗ FAILED to mark PR #{pr_number} as ready for review. "
+                    f"GitHub API call failed. Manual intervention required."
                 )
-                
+
                 # Post warning comment to parent issue
                 await github.add_comment(
                     parent_issue_number,
                     f"⚠️ **Warning**: All sub-issues have been completed, but the system failed to mark "
-                    f"PR #{feature_branch.pr_number} as ready for review. Please manually mark it ready:\n\n"
-                    f"```\ngh pr ready {feature_branch.pr_number}\n```"
+                    f"PR #{pr_number} as ready for review. Please manually mark it ready:\n\n"
+                    f"```\ngh pr ready {pr_number}\n```"
                 )
-        
+
         except Exception as e:
-            logger.error(f"Error checking PR ready on issue exit: {e}")
+            logger.error(f"Error checking PR ready on issue exit for #{issue_number}: {e}")
             import traceback
             logger.error(traceback.format_exc())
 
@@ -2813,7 +2843,7 @@ _Review cycle initiated by Claude Code Orchestrator_
                                         
                                         # Find current column for this board
                                         actual_column = None
-                                        for item in issue_data_check.get('projectItems', {}).get('nodes', []):
+                                        for item in issue_data_check.get('projectItems', []):
                                             if item.get('project', {}).get('title') == board_name:
                                                 actual_column = item.get('fieldValueByName', {}).get('name')
                                                 break
