@@ -539,7 +539,7 @@ class PipelineRunManager:
                                 
                                 # Find current column for this board
                                 actual_column = None
-                                for item in issue_data.get('projectItems', {}).get('nodes', []):
+                                for item in issue_data.get('projectItems', []):
                                     if item.get('project', {}).get('title') == pipeline_run.board:
                                         actual_column = item.get('fieldValueByName', {}).get('name')
                                         break
