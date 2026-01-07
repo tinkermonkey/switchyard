@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import re
+import threading
 from typing import Dict, Any, Optional, Callable
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
@@ -1190,6 +1191,21 @@ class DockerAgentRunner:
                 result_text = ''.join(result_parts)
                 logger.info(f"Agent completed successfully in container, result length: {len(result_text)}")
 
+                # NEW: Persist result to Redis BEFORE processing
+                # This ensures result survives if orchestrator crashes during processing
+                if 'issue_number' in context.get('context', {}):
+                    task_context = context.get('context', {})
+                    issue_number = task_context['issue_number']
+                    self._persist_agent_result_to_redis(
+                        container_name=container_name,
+                        project=project,
+                        issue_number=issue_number,
+                        agent=agent,
+                        task_id=task_id,
+                        exit_code=exit_code,
+                        output=result_text
+                    )
+
                 # CRITICAL: Record successful outcome immediately before any result processing
                 # This ensures outcome is recorded even if result processing fails
                 if 'issue_number' in context.get('context', {}):
@@ -1227,7 +1243,22 @@ class DockerAgentRunner:
                 return result_text
             else:
                 stderr_text = ''.join(stderr_parts)
-                
+
+                # NEW: Persist result to Redis even on failure
+                # This ensures error output survives if orchestrator crashes
+                if 'issue_number' in context.get('context', {}):
+                    task_context = context.get('context', {})
+                    issue_number = task_context['issue_number']
+                    self._persist_agent_result_to_redis(
+                        container_name=container_name,
+                        project=project,
+                        issue_number=issue_number,
+                        agent=agent,
+                        task_id=task_id,
+                        exit_code=exit_code,
+                        output=stderr_text
+                    )
+
                 # Check if this might be a rate limit error
                 # Claude Code exits with code 1 when rate limited, but the "Limit reached" message
                 # is not always captured by docker logs (especially in detached mode)
@@ -1399,6 +1430,303 @@ class DockerAgentRunner:
             logger.debug(f"Cleaned up container {container_name}")
         except Exception as e:
             logger.warning(f"Failed to cleanup container {container_name}: {e}")
+
+    def _persist_agent_result_to_redis(
+        self,
+        container_name: str,
+        project: str,
+        issue_number: int,
+        agent: str,
+        task_id: str,
+        exit_code: int,
+        output: str
+    ):
+        """
+        Persist agent execution result to Redis for recovery.
+
+        This provides safety during the ~30s orchestrator recovery window.
+        If container exits while orchestrator is down, result is not lost.
+
+        Args:
+            container_name: Container name
+            project: Project name
+            issue_number: Issue number
+            agent: Agent name
+            task_id: Task ID
+            exit_code: Container exit code
+            output: Agent output (stdout/stderr combined)
+        """
+        try:
+            import redis
+            import json
+            from datetime import datetime, timezone
+
+            redis_client = redis.Redis(host='redis', port=6379, decode_responses=True)
+
+            result = {
+                'container_name': container_name,
+                'project': project,
+                'issue_number': issue_number,
+                'agent': agent,
+                'task_id': task_id,
+                'exit_code': exit_code,
+                'output': output,
+                'completed_at': datetime.now(timezone.utc).isoformat(),
+                'recovered': False
+            }
+
+            # Store result with 2-hour TTL (same as container age limit)
+            redis_key = f"agent_result:{project}:{issue_number}:{task_id}"
+            redis_client.setex(redis_key, 7200, json.dumps(result))
+
+            logger.info(f"Persisted agent result to Redis: {redis_key}")
+
+        except Exception as e:
+            logger.warning(f"Failed to persist agent result to Redis: {e}")
+            # Don't fail the whole execution if Redis write fails
+
+    def reconnect_to_container(
+        self,
+        container_name: str,
+        project: str,
+        issue_number: int,
+        agent: str,
+        task_id: str
+    ):
+        """
+        Reconnect to a running container after orchestrator restart.
+
+        Spawns monitoring thread to wait for container exit and process results.
+        This is called during container recovery to restore monitoring.
+
+        Args:
+            container_name: Container name
+            project: Project name
+            issue_number: Issue number
+            agent: Agent name
+            task_id: Task ID
+        """
+        logger.info(f"Reconnecting to container {container_name}")
+
+        # Spawn daemon thread to monitor container until exit
+        monitoring_thread = threading.Thread(
+            target=self._monitor_recovered_container,
+            args=(container_name, project, issue_number, agent, task_id),
+            daemon=True
+        )
+        monitoring_thread.start()
+
+        logger.info(f"✓ Monitoring thread started for recovered container {container_name}")
+
+    def _monitor_recovered_container(
+        self,
+        container_name: str,
+        project: str,
+        issue_number: int,
+        agent: str,
+        task_id: str
+    ):
+        """
+        Monitor a recovered container until it exits.
+
+        This runs in a separate daemon thread and waits for container to exit,
+        then processes the results (checks Redis for persisted output, posts to GitHub, etc.)
+
+        Args:
+            container_name: Container name
+            project: Project name
+            issue_number: Issue number
+            agent: Agent name
+            task_id: Task ID
+        """
+        try:
+            logger.info(
+                f"Monitoring recovered container {container_name} "
+                f"(project={project}, issue=#{issue_number}, agent={agent})"
+            )
+
+            # Wait for container to exit (blocks until container stops)
+            result = subprocess.run(
+                ['docker', 'wait', container_name],
+                capture_output=True,
+                text=True,
+                timeout=7200  # 2 hours max
+            )
+
+            exit_code = int(result.stdout.strip()) if result.stdout.strip() else -1
+
+            logger.info(
+                f"Recovered container {container_name} exited with code {exit_code}"
+            )
+
+            # Try to get persisted result from Redis
+            output = None
+            try:
+                import redis
+                import json
+                redis_client = redis.Redis(host='redis', port=6379, decode_responses=True)
+
+                redis_key = f"agent_result:{project}:{issue_number}:{task_id}"
+                result_json = redis_client.get(redis_key)
+
+                if result_json:
+                    result_data = json.loads(result_json)
+                    output = result_data.get('output', '')
+                    logger.info(f"Loaded persisted result from Redis: {redis_key}")
+
+                    # Mark as recovered and update TTL
+                    result_data['recovered'] = True
+                    redis_client.setex(redis_key, 300, json.dumps(result_data))  # 5 min TTL
+                else:
+                    logger.warning(
+                        f"No persisted result in Redis for {redis_key} - "
+                        f"container may have exited before result was written"
+                    )
+            except Exception as e:
+                logger.error(f"Failed to load persisted result from Redis: {e}")
+
+            # If no Redis result, try to get logs from stopped container (if still exists)
+            if not output:
+                try:
+                    result = subprocess.run(
+                        ['docker', 'logs', container_name],
+                        capture_output=True,
+                        text=True,
+                        timeout=60
+                    )
+                    if result.returncode == 0:
+                        output = result.stdout + result.stderr
+                        logger.info(f"Retrieved logs from stopped container {container_name}")
+                except Exception as e:
+                    logger.warning(f"Could not retrieve logs from container: {e}")
+
+            # Process the completion (post to GitHub, record execution outcome, etc.)
+            if output:
+                self._process_recovered_container_completion(
+                    container_name=container_name,
+                    project=project,
+                    issue_number=issue_number,
+                    agent=agent,
+                    task_id=task_id,
+                    exit_code=exit_code,
+                    output=output
+                )
+            else:
+                logger.error(
+                    f"No output available for recovered container {container_name} - "
+                    f"cannot process results"
+                )
+                # Mark execution as failed
+                from services.work_execution_state import work_execution_tracker
+                work_execution_tracker.record_execution_outcome(
+                    issue_number=issue_number,
+                    column='unknown',
+                    agent=agent,
+                    outcome='failed',
+                    project_name=project,
+                    error='Container completed after restart but no output was available'
+                )
+
+        except subprocess.TimeoutExpired:
+            logger.error(f"Timeout waiting for recovered container {container_name}")
+        except Exception as e:
+            logger.error(f"Error monitoring recovered container {container_name}: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+
+    def _process_recovered_container_completion(
+        self,
+        container_name: str,
+        project: str,
+        issue_number: int,
+        agent: str,
+        task_id: str,
+        exit_code: int,
+        output: str
+    ):
+        """
+        Process completion of a recovered container.
+
+        Posts output to GitHub, records execution outcome, cleans up container.
+        Similar to normal completion flow but handles the recovery case.
+
+        Args:
+            container_name: Container name
+            project: Project name
+            issue_number: Issue number
+            agent: Agent name
+            task_id: Task ID
+            exit_code: Container exit code
+            output: Agent output
+        """
+        try:
+            logger.info(
+                f"Processing recovered container completion: {container_name} "
+                f"(exit_code={exit_code})"
+            )
+
+            # Get GitHub integration
+            from services.github_integration import GitHubIntegration
+            from config.manager import config_manager
+
+            project_config = config_manager.get_project_config(project)
+            github = GitHubIntegration(project_config)
+
+            # Post output to GitHub (same as normal flow)
+            import asyncio
+            context = {
+                'issue_number': issue_number,
+                'repository': project_config.github.get('repo', project),
+                'workspace_type': 'issues'
+            }
+
+            # Run async code in new event loop
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                loop.run_until_complete(
+                    github.post_agent_output(context, output)
+                )
+            finally:
+                loop.close()
+
+            logger.info(f"Posted recovered container output to GitHub issue #{issue_number}")
+
+            # Record execution outcome
+            from services.work_execution_state import work_execution_tracker
+
+            outcome = 'success' if exit_code == 0 else 'failed'
+            error = None if exit_code == 0 else f"Container exited with code {exit_code}"
+
+            work_execution_tracker.record_execution_outcome(
+                issue_number=issue_number,
+                column='unknown',  # We don't know which column anymore
+                agent=agent,
+                outcome=outcome,
+                project_name=project,
+                error=error
+            )
+
+            logger.info(
+                f"Recorded execution outcome for recovered container: "
+                f"{project}/#{issue_number} {agent} → {outcome}"
+            )
+
+            # Clean up container tracking
+            self.unregister_active_container(container_name)
+
+            # Try to remove container (may already be removed by --rm)
+            try:
+                subprocess.run(['docker', 'rm', '-f', container_name], timeout=30)
+            except Exception:
+                pass  # Container may already be auto-removed
+
+            logger.info(f"✓ Completed processing recovered container {container_name}")
+
+        except Exception as e:
+            logger.error(f"Error processing recovered container completion: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
 
     @staticmethod
     def cleanup_orphaned_redis_keys():

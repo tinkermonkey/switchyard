@@ -277,43 +277,54 @@ async def main():
                         )
                         locks_recovered += 1
 
-                        # CRITICAL: Check if any container is already running for this issue
-                        # Agent container recovery may reconnect to it, so don't re-trigger
+                        # CRITICAL: Check if any container is ACTUALLY RUNNING for this issue
+                        # Use Docker ps as source of truth (not Redis which can have stale data)
                         should_retrigger = True
 
-                        if task_queue.redis_client:
-                            # Check for repair cycle containers
-                            repair_key = f"repair_cycle:container:{project_name}:{lock.locked_by_issue}"
-                            container_name = task_queue.redis_client.get(repair_key)
-                            
-                            # Check for regular agent containers
-                            if not container_name:
-                                # Search for agent container tracking keys
-                                agent_keys = task_queue.redis_client.keys(f"agent:container:*{project_name}*{lock.locked_by_issue}*")
-                                if agent_keys:
-                                    # Get the first matching container info
-                                    container_info = task_queue.redis_client.hgetall(agent_keys[0])
-                                    if container_info:
-                                        container_name = agent_keys[0].decode() if isinstance(agent_keys[0], bytes) else agent_keys[0]
-                                        container_name = container_name.replace('agent:container:', '')
+                        import subprocess
+                        try:
+                            # Check for running agent containers for this project and issue
+                            # Format: claude-agent-{project}-*{issue}*
+                            result = subprocess.run(
+                                ['docker', 'ps', '--filter', f'name=claude-agent-{project_name}-', '--format', '{{.Names}}'],
+                                capture_output=True,
+                                text=True,
+                                timeout=5
+                            )
 
-                            if container_name:
-                                # Check if container actually exists
-                                import subprocess
-                                try:
-                                    result = subprocess.run(
-                                        ['docker', 'inspect', container_name.decode() if isinstance(container_name, bytes) else container_name],
-                                        capture_output=True,
-                                        timeout=5
-                                    )
-                                    if result.returncode == 0:
+                            if result.returncode == 0 and result.stdout.strip():
+                                # Check if any container name contains the issue number
+                                running_containers = result.stdout.strip().split('\n')
+                                for container_name in running_containers:
+                                    # Container naming format includes issue number
+                                    # Example: claude-agent-project-senior_software_engineer_project_SDLC-Execution_142_1767816286_senior_software_engineer_1767816286
+                                    # Check if issue number appears in container name (with underscores as separators)
+                                    if f"_{lock.locked_by_issue}_" in container_name or container_name.endswith(f"_{lock.locked_by_issue}"):
                                         logger.info(
-                                            f"Container {container_name} already exists for issue #{lock.locked_by_issue} "
-                                            f"- skipping re-trigger (agent container recovery will reconnect)"
+                                            f"Found running container {container_name} for issue #{lock.locked_by_issue} "
+                                            f"- skipping re-trigger (container still active)"
                                         )
                                         should_retrigger = False
-                                except Exception as e:
-                                    logger.warning(f"Error checking container {container_name}: {e}")
+                                        break
+
+                            # Also check for running repair cycle containers
+                            if should_retrigger:
+                                result = subprocess.run(
+                                    ['docker', 'ps', '--filter', f'name=repair-cycle-{project_name}-{lock.locked_by_issue}', '--format', '{{.Names}}'],
+                                    capture_output=True,
+                                    text=True,
+                                    timeout=5
+                                )
+
+                                if result.returncode == 0 and result.stdout.strip():
+                                    logger.info(
+                                        f"Found running repair cycle container for issue #{lock.locked_by_issue} "
+                                        f"- skipping re-trigger (container still active)"
+                                    )
+                                    should_retrigger = False
+                        except Exception as e:
+                            logger.warning(f"Error checking Docker for running containers: {e}")
+                            # If we can't check Docker, err on the side of retriggering
 
                         # Re-trigger agent only if no container is running
                         # (May have been interrupted mid-execution during restart)

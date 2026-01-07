@@ -815,20 +815,12 @@ class WorkExecutionStateTracker:
 
                             if not has_running_container:
                                 # No container found - agent may have finished or been killed
-                                # Check if we can determine the actual outcome by looking for output
-
-                                # For now, we conservatively mark as failed since we can't verify success
-                                # If the agent completed successfully, agent_executor should have recorded it
-                                # The fact that it's still in_progress means either:
-                                # 1. Agent crashed/was killed before completing
-                                # 2. Orchestrator was killed before outcome could be recorded
-                                # 3. Bug in execution outcome recording (which we just fixed above)
-
+                                # Mark as failed since we can't verify success
                                 execution['outcome'] = 'failure'
                                 execution['error'] = (
-                                    'Agent execution interrupted by orchestrator restart. '
-                                    'Container no longer exists and execution state was not updated. '
-                                    'This indicates the agent did not complete normally or the outcome was not recorded before restart.'
+                                    'Agent execution interrupted. Container no longer exists and execution '
+                                    'state was not updated. This may indicate the agent crashed, was killed, '
+                                    'or the orchestrator was restarted before outcome could be recorded.'
                                 )
                                 modified = True
                                 cleaned_count += 1
@@ -837,43 +829,6 @@ class WorkExecutionStateTracker:
                                     f"Marked stuck execution as failed: {project_name}/#{issue_number} "
                                     f"{agent} in {column} (no container found, outcome not recorded)"
                                 )
-
-                                # NEW: Check if we should retry this failed execution
-                                should_retry, retry_reason = self._should_retry_failed_execution(
-                                    project_name, issue_number, agent, column, execution
-                                )
-
-                                # Emit decision event
-                                from monitoring.observability import get_observability_manager, EventType
-                                obs = get_observability_manager()
-                                obs.emit(
-                                    EventType.RETRY_ATTEMPTED,
-                                    agent=agent,
-                                    task_id=f"watchdog_{project_name}_issue_{issue_number}",
-                                    project=project_name,
-                                    data={
-                                        "decision_category": "watchdog_retry_decision",
-                                        "issue_number": issue_number,
-                                        "should_retry": should_retry,
-                                        "reason": retry_reason,
-                                        "column": column,
-                                        "retry_count": execution.get('watchdog_retry_count', 0),
-                                        "execution_timestamp": execution['timestamp']
-                                    }
-                                )
-
-                                if should_retry:
-                                    # TODO: Retry mechanism requires refactoring
-                                    # The get_project_monitor() function doesn't exist and this code path
-                                    # was never functional. Watchdog retries need to be redesigned.
-                                    logger.warning(
-                                        f"Watchdog retry mechanism not implemented for {project_name}/#{issue_number}. "
-                                        f"Marking execution as failed without retry."
-                                    )
-                                else:
-                                    logger.info(
-                                        f"Not retrying {project_name}/#{issue_number}: {retry_reason}"
-                                    )
                             else:
                                 logger.info(
                                     f"Agent container still running for {project_name}/#{issue_number}, "

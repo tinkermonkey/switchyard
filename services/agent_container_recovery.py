@@ -480,12 +480,12 @@ class AgentContainerRecovery:
                 except Exception as e:
                     logger.warning(f"Could not parse container age: {e}")
                 
-                # Container looks valid - reconnect to it by re-registering in Redis
+                # Container looks valid - reconnect monitoring
                 logger.info(
-                    f"Container {container_name} appears valid, re-registering for tracking"
+                    f"Container {container_name} appears valid, reconnecting monitoring"
                 )
 
-                # Re-register container in Redis
+                # Re-register in Redis (keep existing tracking)
                 container_info = {
                     'container_name': container_name,
                     'agent': agent,
@@ -495,7 +495,6 @@ class AgentContainerRecovery:
                     'recovered': 'true'
                 }
 
-                # Add optional fields if available
                 if issue_number:
                     container_info['issue_number'] = str(issue_number)
 
@@ -507,8 +506,25 @@ class AgentContainerRecovery:
 
                 self.redis.hset(f'agent:container:{container_name}', mapping=container_info)
                 self.redis.expire(f'agent:container:{container_name}', 7200)
-                
-                logger.info(f"✓ Recovered container: {container_name}")
+
+                # CRITICAL: Restart monitoring thread
+                from claude.docker_runner import DockerAgentRunner
+                docker_runner = DockerAgentRunner()
+
+                if issue_number:
+                    docker_runner.reconnect_to_container(
+                        container_name=container_name,
+                        project=project,
+                        issue_number=issue_number,
+                        agent=agent,
+                        task_id=task_id
+                    )
+                    logger.info(f"✓ Recovered container with monitoring: {container_name}")
+                else:
+                    logger.warning(
+                        f"✓ Recovered container without monitoring (no issue number): {container_name}"
+                    )
+
                 recovered += 1
                 
             except Exception as e:
