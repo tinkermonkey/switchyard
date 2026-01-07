@@ -2182,15 +2182,16 @@ class ProjectMonitor:
 
             # CRITICAL: Check if PR should be marked ready after issue exits pipeline
             # This handles the case where all sub-issues complete after the last finalization
-            # Schedule as background task since this method is not async
             import asyncio
             try:
-                asyncio.create_task(
+                asyncio.run(
                     self._check_pr_ready_on_issue_exit(project_name, issue_number, exit_column)
                 )
-            except RuntimeError:
-                # If no event loop running, skip PR check (shouldn't happen in normal operation)
-                logger.warning(f"Could not schedule PR ready check for issue #{issue_number}: no event loop")
+            except Exception as e:
+                logger.error(
+                    f"CRITICAL: Failed to check PR ready on issue exit for #{issue_number}: {e}",
+                    exc_info=True
+                )
 
         except Exception as e:
             logger.error(f"Error releasing pipeline lock and processing next issue: {e}")
