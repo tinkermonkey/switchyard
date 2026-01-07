@@ -44,6 +44,23 @@ medic:
     # If occurrences_last_hour > previous_hour * threshold, mark as trending
     trending_threshold: 2.0
 
+    # AI-powered normalization (optional, requires Claude Code CLI)
+    # Uses Claude to analyze complex error messages when static normalizers
+    # have low confidence. Results are cached in Redis for 24 hours.
+    ai_normalization:
+      enabled: true  # Set to true to enable AI normalization
+      confidence_threshold: 0.8  # Only use AI if static confidence < threshold
+      cache_ttl: 86400  # Cache results for 24 hours (in seconds)
+      store_pattern_suggestions: true  # Store Claude's suggested patterns for review
+      max_pattern_suggestions: 100  # Maximum number of suggestions to keep
+
+    # How to enable AI normalization:
+    # 1. Ensure Claude Code CLI is installed: `claude --version`
+    # 2. Authenticate: `claude auth login`
+    # 3. Set ai_normalization.enabled to true
+    # 4. Restart: `docker-compose restart orchestrator`
+    # 5. View suggestions: GET /api/medic/suggested-patterns
+
   # Elasticsearch configuration
   elasticsearch:
     index_prefix: "medic-failure-signatures"

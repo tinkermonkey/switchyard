@@ -25,7 +25,7 @@ def setup_index_template(
     Args:
         es_client: Elasticsearch client
         template_name: Name of the index template
-        index_patterns: List of index patterns (e.g., ["medic-docker-failures-*"])
+        index_patterns: List of index patterns (e.g., ["medic-failure-signatures-*"])
         mapping: Index mapping configuration
         ilm_policy_name: Optional ILM policy name
         ilm_policy_body: Optional ILM policy configuration

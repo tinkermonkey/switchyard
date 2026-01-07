@@ -3753,6 +3753,93 @@ _Repair cycle initiated by Claude Code Orchestrator_
             import traceback
             logger.error(traceback.format_exc())
 
+    def _sort_items_by_board_position(self, items: list) -> list:
+        """
+        Sort items by board position to ensure correct processing order.
+
+        Uses a hybrid approach:
+        1. Column order (from workflow template)
+        2. Issue number (ascending) within each column
+
+        This ensures items are processed in board order:
+        - Earlier columns processed first (Backlog → Development → Testing → Done)
+        - Within a column, lower issue numbers (older issues) processed first
+
+        Args:
+            items: List of item_data dictionaries with 'change', 'project_name',
+                   'board_name', 'column_config' keys
+
+        Returns:
+            Sorted list of items
+        """
+        if not items:
+            return items
+
+        # Build column order maps for each unique project/board
+        column_order_maps = {}
+
+        for item_data in items:
+            project_name = item_data['project_name']
+            board_name = item_data['board_name']
+            board_key = f"{project_name}/{board_name}"
+
+            if board_key not in column_order_maps:
+                # Get workflow template to determine column order
+                try:
+                    project_config = self.config_manager.get_project_config(project_name)
+                    pipeline = next(
+                        (p for p in project_config.pipelines if p.board_name == board_name),
+                        None
+                    )
+
+                    if pipeline:
+                        workflow_template = self.config_manager.get_workflow_template(pipeline.workflow)
+                        if workflow_template:
+                            # Create column order map: column_name -> position
+                            column_order_maps[board_key] = {
+                                col.name: idx
+                                for idx, col in enumerate(workflow_template.columns)
+                            }
+                            logger.debug(
+                                f"Created column order map for {board_key}: "
+                                f"{list(column_order_maps[board_key].keys())}"
+                            )
+                        else:
+                            logger.warning(f"No workflow template found for {board_key}")
+                            column_order_maps[board_key] = {}
+                    else:
+                        logger.warning(f"No pipeline config found for {board_key}")
+                        column_order_maps[board_key] = {}
+
+                except Exception as e:
+                    logger.warning(f"Error building column order map for {board_key}: {e}")
+                    column_order_maps[board_key] = {}
+
+        # Sort items by (column_order, issue_number)
+        def sort_key(item_data):
+            board_key = f"{item_data['project_name']}/{item_data['board_name']}"
+            column_name = item_data['change']['status']
+            issue_number = item_data['change']['issue_number']
+
+            # Get column order (default to 999 if column not found)
+            column_order = column_order_maps.get(board_key, {}).get(column_name, 999)
+
+            return (column_order, issue_number)
+
+        sorted_items = sorted(items, key=sort_key)
+
+        # Log the sorted order for debugging
+        if sorted_items:
+            logger.info(
+                f"Sorted {len(sorted_items)} items by board position: " +
+                ", ".join([
+                    f"#{item['change']['issue_number']} ({item['change']['status']})"
+                    for item in sorted_items
+                ])
+            )
+
+        return sorted_items
+
     def _rescan_boards_for_stalled_items(self):
         """
         Rescan all boards after startup to dispatch agents for items already in action-required columns.
@@ -3987,8 +4074,10 @@ _Repair cycle initiated by Claude Code Orchestrator_
                         else:
                             other_items.append(item_data)
 
-            # PHASE 2: Process repair cycles FIRST (they have priority and may steal locks)
+            # PHASE 2: Sort and process repair cycles FIRST (they have priority and may steal locks)
             if repair_cycle_items:
+                # Sort repair cycles by board position (column order + issue number)
+                repair_cycle_items = self._sort_items_by_board_position(repair_cycle_items)
                 logger.info(f"Processing {len(repair_cycle_items)} repair cycle items first (high priority)")
                 for item_data in repair_cycle_items:
                     logger.info(
@@ -3998,8 +4087,10 @@ _Repair cycle initiated by Claude Code Orchestrator_
                     self.process_board_changes([item_data['change']], item_data['project_name'], item_data['board_name'])
                     dispatched_count += 1
 
-            # PHASE 3: Process other items (Development, etc.)
+            # PHASE 3: Sort and process other items (Development, etc.)
             if other_items:
+                # Sort by board position (column order + issue number) to respect board ordering
+                other_items = self._sort_items_by_board_position(other_items)
                 logger.info(f"Processing {len(other_items)} other stalled items")
                 for item_data in other_items:
                     logger.info(

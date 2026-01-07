@@ -55,7 +55,7 @@ class BaseFailureSignatureStore(ABC):
 
         Args:
             es_client: Elasticsearch client
-            index_prefix: Index name prefix (e.g., "medic-docker-failures")
+            index_prefix: Index name prefix (e.g., "medic-failure-signatures")
             ilm_policy_name: Optional ILM policy name
             ilm_policy_body: Optional ILM policy configuration
         """

@@ -75,7 +75,7 @@ CLAUDE_FAILURE_MAPPING = {
     "settings": {
         "number_of_shards": 1,
         "number_of_replicas": 0,
-        "index.lifecycle.name": "medic-claude-ilm-policy",
+        "index.lifecycle.name": "medic-ilm-policy",
     },
 }
 
@@ -111,8 +111,8 @@ class ClaudeFailureSignatureStore(BaseFailureSignatureStore):
         """
         super().__init__(
             es_client=es_client,
-            index_prefix="medic-claude-failures",
-            ilm_policy_name="medic-claude-ilm-policy",
+            index_prefix="medic-failure-signatures",
+            ilm_policy_name="medic-ilm-policy",
             ilm_policy_body=CLAUDE_ILM_POLICY,
         )
         logger.info("ClaudeFailureSignatureStore initialized")
@@ -123,7 +123,7 @@ class ClaudeFailureSignatureStore(BaseFailureSignatureStore):
 
     def _get_template_name(self) -> str:
         """Return index template name."""
-        return "medic-claude-failures"
+        return "medic-failure-signatures"
 
     def _create_signature_doc(
         self, fingerprint: Any, entry_data: dict, metadata: dict

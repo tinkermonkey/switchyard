@@ -5,12 +5,17 @@ Unit tests for Medic normalizers
 import pytest
 from services.medic.normalizers import (
     TimestampNormalizer,
+    DurationNormalizer,
     UUIDNormalizer,
     PathNormalizer,
     IssueNumberNormalizer,
     ContainerIDNormalizer,
     LineNumberNormalizer,
     JSONBlobNormalizer,
+    CounterNormalizer,
+    AttemptNormalizer,
+    StatusCodeNormalizer,
+    RatioNormalizer,
     get_default_normalizers,
 )
 
@@ -192,15 +197,198 @@ class TestJSONBlobNormalizer:
         assert '{"key": "val"}' in result
 
 
+class TestCounterNormalizer:
+    """Test counter and metric normalization"""
+
+    def setup_method(self):
+        self.normalizer = CounterNormalizer()
+
+    def test_normalize_failed_for_times(self):
+        """Critical test: The pattern that caused 1,945 duplicate signatures"""
+        message = "Elasticsearch connection failed for 1000 times"
+        result = self.normalizer.normalize(message)
+        assert result == "Elasticsearch connection failed for {count} times"
+
+    def test_normalize_failed_for_times_variants(self):
+        """Verify all counter values normalize to same pattern"""
+        messages = [
+            "failed for 1000 times",
+            "failed for 1001 times",
+            "failed for 2388 times",
+        ]
+        results = [self.normalizer.normalize(msg) for msg in messages]
+        # All should normalize to the same pattern
+        assert len(set(results)) == 1
+        assert results[0] == "failed for {count} times"
+
+    def test_normalize_succeeded_times(self):
+        message = "Operation succeeded 5 times"
+        result = self.normalizer.normalize(message)
+        assert result == "Operation succeeded {count} times"
+
+    def test_normalize_times_in_a_row(self):
+        message = "Failed 1000 times in a row"
+        result = self.normalizer.normalize(message)
+        assert result == "Failed {count} times in a row"
+
+    def test_normalize_timeout_value(self):
+        message = "Connection timeout 30"
+        result = self.normalizer.normalize(message)
+        assert result == "Connection timeout {value}"
+
+    def test_normalize_items_count(self):
+        message = "Processed 500 items successfully"
+        result = self.normalizer.normalize(message)
+        assert result == "Processed {count} items successfully"
+
+    def test_normalize_records_count(self):
+        message = "Found 42 records in database"
+        result = self.normalizer.normalize(message)
+        assert result == "Found {count} records in database"
+
+    def test_preserve_non_counter_numbers(self):
+        message = "Error code 123 occurred"
+        result = self.normalizer.normalize(message)
+        # Should not normalize error codes (handled by StatusCodeNormalizer)
+        assert result == "Error code 123 occurred"
+
+
+class TestAttemptNormalizer:
+    """Test retry and attempt counter normalization"""
+
+    def setup_method(self):
+        self.normalizer = AttemptNormalizer()
+
+    def test_normalize_attempt_of_total(self):
+        """Test the pattern that caused 6+ duplicate signatures"""
+        message = "Failed on attempt 0 of 3"
+        result = self.normalizer.normalize(message)
+        assert result == "Failed on attempt {n} of {total}"
+
+    def test_normalize_attempt_of_total_variants(self):
+        """Verify all attempt numbers normalize to same pattern"""
+        messages = [
+            "attempt 0 of 3",
+            "attempt 1 of 3",
+            "attempt 2 of 3",
+        ]
+        results = [self.normalizer.normalize(msg) for msg in messages]
+        # All should normalize to the same pattern
+        assert len(set(results)) == 1
+        assert results[0] == "attempt {n} of {total}"
+
+    def test_normalize_try_number(self):
+        message = "Retry failed on try 2"
+        result = self.normalizer.normalize(message)
+        assert result == "Retry failed on try {n}"
+
+    def test_normalize_attempt_in_parens(self):
+        message = "Connection failed (attempt 1)"
+        result = self.normalizer.normalize(message)
+        assert result == "Connection failed (attempt {n})"
+
+    def test_normalize_retry_hash(self):
+        message = "Failed on retry #5"
+        result = self.normalizer.normalize(message)
+        assert result == "Failed on retry {n}"
+
+    def test_normalize_retry_without_hash(self):
+        message = "Giving up on retry 3"
+        result = self.normalizer.normalize(message)
+        assert result == "Giving up on retry {n}"
+
+
+class TestStatusCodeNormalizer:
+    """Test HTTP and error status code normalization"""
+
+    def setup_method(self):
+        self.normalizer = StatusCodeNormalizer()
+
+    def test_normalize_status_503(self):
+        message = "Server returned status 503"
+        result = self.normalizer.normalize(message)
+        assert result == "Server returned status {code}"
+
+    def test_normalize_http_status(self):
+        message = "HTTP 500 Internal Server Error"
+        result = self.normalizer.normalize(message)
+        assert result == "HTTP {code} Internal Server Error"
+
+    def test_normalize_error_code(self):
+        message = "Failed with error 404"
+        result = self.normalizer.normalize(message)
+        assert result == "Failed with error {code}"
+
+    def test_normalize_exit_code(self):
+        message = "Process exited with exit code 1"
+        result = self.normalizer.normalize(message)
+        assert result == "Process exited with exit code {code}"
+
+    def test_normalize_multiple_status_codes(self):
+        message = "Retried after status 503, got status 500"
+        result = self.normalizer.normalize(message)
+        assert result == "Retried after status {code}, got status {code}"
+
+    def test_preserve_non_status_numbers(self):
+        message = "Connection to port 8080 failed"
+        result = self.normalizer.normalize(message)
+        # Port numbers should not be normalized
+        assert "8080" in result
+
+
+class TestRatioNormalizer:
+    """Test ratio and percentage normalization"""
+
+    def setup_method(self):
+        self.normalizer = RatioNormalizer()
+
+    def test_normalize_n_of_total(self):
+        message = "Completed 0 of 3 tasks"
+        result = self.normalizer.normalize(message)
+        assert result == "Completed {n} of {total} tasks"
+
+    def test_normalize_n_of_total_variants(self):
+        """Verify all ratio values normalize to same pattern"""
+        messages = [
+            "0 of 3",
+            "1 of 3",
+            "2 of 3",
+        ]
+        results = [self.normalizer.normalize(msg) for msg in messages]
+        # All should normalize to the same pattern
+        assert len(set(results)) == 1
+        assert results[0] == "{n} of {total}"
+
+    def test_normalize_fraction(self):
+        message = "Progress: 5/10 items"
+        result = self.normalizer.normalize(message)
+        assert result == "Progress: {n}/{total} items"
+
+    def test_normalize_percentage(self):
+        message = "Processed 50% of records"
+        result = self.normalizer.normalize(message)
+        assert result == "Processed {percentage}% of records"
+
+    def test_normalize_multiple_percentages(self):
+        message = "CPU at 80%, memory at 95%"
+        result = self.normalizer.normalize(message)
+        assert result == "CPU at {percentage}%, memory at {percentage}%"
+
+
 class TestNormalizerChain:
     """Test applying multiple normalizers in sequence"""
 
     def test_get_default_normalizers(self):
         normalizers = get_default_normalizers()
-        assert len(normalizers) == 7
+        assert len(normalizers) == 12
         assert isinstance(normalizers[0], TimestampNormalizer)
-        assert isinstance(normalizers[1], IssueNumberNormalizer)  # Changed order
-        assert isinstance(normalizers[2], UUIDNormalizer)
+        assert isinstance(normalizers[1], DurationNormalizer)
+        assert isinstance(normalizers[2], CounterNormalizer)
+        assert isinstance(normalizers[3], AttemptNormalizer)
+        assert isinstance(normalizers[4], StatusCodeNormalizer)
+        assert isinstance(normalizers[5], RatioNormalizer)
+        assert isinstance(normalizers[6], IssueNumberNormalizer)
+        assert isinstance(normalizers[7], UUIDNormalizer)
 
     def test_chain_normalization(self):
         """Test that normalizers work together correctly"""
@@ -233,6 +421,55 @@ class TestNormalizerChain:
         assert "'issue_number'" in message
         assert "task context" in message
         assert "main.py" in message
+
+    def test_signature_explosion_fix(self):
+        """
+        Critical integration test: Verify that the 1,945 duplicate signatures
+        for "failed for X times" now normalize to a single pattern.
+        """
+        normalizers = get_default_normalizers()
+
+        # Real error messages that caused signature explosion
+        messages = [
+            "Elasticsearch connection failed for 1000 times",
+            "Elasticsearch connection failed for 1001 times",
+            "Elasticsearch connection failed for 2388 times",
+        ]
+
+        normalized_messages = []
+        for message in messages:
+            result = message
+            for normalizer in normalizers:
+                result = normalizer.normalize(result)
+            normalized_messages.append(result)
+
+        # All messages should normalize to the same pattern
+        assert len(set(normalized_messages)) == 1
+        assert normalized_messages[0] == "Elasticsearch connection failed for {count} times"
+
+    def test_attempt_variants_fix(self):
+        """
+        Verify that different attempt numbers normalize to the same pattern.
+        """
+        normalizers = get_default_normalizers()
+
+        # Real error messages with varying attempt numbers
+        messages = [
+            "Retry failed on attempt 0 of 3",
+            "Retry failed on attempt 1 of 3",
+            "Retry failed on attempt 2 of 3",
+        ]
+
+        normalized_messages = []
+        for message in messages:
+            result = message
+            for normalizer in normalizers:
+                result = normalizer.normalize(result)
+            normalized_messages.append(result)
+
+        # All messages should normalize to the same pattern
+        assert len(set(normalized_messages)) == 1
+        assert normalized_messages[0] == "Retry failed on attempt {n} of {total}"
 
 
 class TestEdgeCases:

@@ -3253,10 +3253,8 @@ def get_failure_signatures():
     """
     Get Docker failure signatures with filtering and pagination.
 
-    BACKWARD COMPATIBILITY: This endpoint is maintained for backward compatibility.
-    - Returns Docker container failure signatures from medic-docker-failures-* indices
-    - For new code, use /api/medic/docker/failure-signatures (explicit)
-    - For unified view (Docker + Claude), use /api/medic/failure-signatures/all
+    Returns Docker container failure signatures from the unified medic-failure-signatures-* index.
+    Both Docker and Claude failures are stored in this unified index with a type field to distinguish them.
 
     Query params:
     - status: Filter by status (new, recurring, trending, resolved, ignored)
@@ -3313,7 +3311,7 @@ def get_failure_signatures():
             }
 
         # Execute search (use new index pattern)
-        result = es_client.search(index="medic-docker-failures-*", body=query)
+        result = es_client.search(index="medic-failure-signatures-*", body=query)
 
         signatures = [hit['_source'] for hit in result['hits']['hits']]
 
@@ -3343,7 +3341,7 @@ def get_failure_signature(fingerprint_id):
     """Get detailed information about a specific failure signature"""
     try:
         result = es_client.search(
-            index="medic-docker-failures-*",
+            index="medic-failure-signatures-*",
             body={
                 "query": {
                     "term": {"fingerprint_id": fingerprint_id}
@@ -3386,7 +3384,7 @@ def delete_failure_signature(fingerprint_id):
     try:
         # 1. Delete from Elasticsearch
         result = es_client.delete_by_query(
-            index="medic-docker-failures-*",
+            index="medic-failure-signatures-*",
             body={
                 "query": {
                     "term": {"fingerprint_id": fingerprint_id}
@@ -3428,7 +3426,7 @@ def get_signature_occurrences(fingerprint_id):
     try:
         # Get signature with sample entries
         result = es_client.search(
-            index="medic-docker-failures-*",
+            index="medic-failure-signatures-*",
             body={
                 "query": {
                     "term": {"fingerprint_id": fingerprint_id}
@@ -3495,7 +3493,7 @@ def update_signature_status(fingerprint_id):
         from monitoring.timestamp_utils import utc_isoformat
 
         result = es_client.update_by_query(
-            index="medic-docker-failures-*",
+            index="medic-failure-signatures-*",
             body={
                 "script": {
                     "source": "ctx._source.status = params.status; ctx._source.updated_at = params.updated_at;",
@@ -3529,7 +3527,7 @@ def get_medic_stats():
     """Get overall Medic statistics"""
     try:
         result = es_client.search(
-            index="medic-docker-failures-*",
+            index="medic-failure-signatures-*",
             body={
                 "size": 0,
                 "aggs": {
@@ -3574,6 +3572,82 @@ def get_medic_stats():
             'occurrences_last_hour': 0,
             'occurrences_last_day': 0
         }), 200
+
+
+@app.route('/api/medic/suggested-patterns', methods=['GET'])
+def get_suggested_patterns():
+    """
+    Get patterns suggested by Claude Code normalizer for review.
+
+    These are regex patterns that Claude identified as potentially useful
+    for improving the static normalizers. Admins can review and approve
+    these for incorporation into the normalizer codebase.
+
+    Returns:
+        {
+            "suggestions": [
+                {
+                    "pattern": "regex pattern",
+                    "examples": ["error message 1", "error message 2"],
+                    "count": 5,
+                    "first_seen": "ISO timestamp",
+                    "reasoning": "why this pattern was suggested"
+                }
+            ],
+            "total": 10
+        }
+    """
+    try:
+        # Get suggestions from Redis
+        suggestions = redis_client_raw.lrange("medic:suggested_patterns", 0, 49)
+
+        if not suggestions:
+            return jsonify({
+                "suggestions": [],
+                "total": 0
+            }), 200
+
+        # Parse and group by pattern
+        parsed = [json.loads(s) for s in suggestions]
+
+        grouped = {}
+        for suggestion in parsed:
+            pattern = suggestion.get("pattern", "unknown")
+
+            if pattern not in grouped:
+                grouped[pattern] = {
+                    "pattern": pattern,
+                    "examples": [],
+                    "count": 0,
+                    "first_seen": suggestion.get("timestamp", ""),
+                    "reasoning": suggestion.get("reasoning", "")
+                }
+
+            example = suggestion.get("example", "")
+            if example and example not in grouped[pattern]["examples"]:
+                grouped[pattern]["examples"].append(example)
+
+            grouped[pattern]["count"] += 1
+
+        # Sort by count (most frequent first)
+        suggestions_list = sorted(
+            grouped.values(),
+            key=lambda x: x["count"],
+            reverse=True
+        )
+
+        return jsonify({
+            "suggestions": suggestions_list,
+            "total": len(suggestions_list)
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Failed to get suggested patterns: {e}", exc_info=True)
+        return jsonify({
+            "error": str(e),
+            "suggestions": [],
+            "total": 0
+        }), 500
 
 
 # ========================================
@@ -3638,12 +3712,12 @@ def get_all_failure_signatures():
 
         # Determine which indices to query
         if type_filter == 'docker':
-            indices = "medic-docker-failures-*"
+            indices = "medic-failure-signatures-*"
         elif type_filter == 'claude':
-            indices = "medic-claude-failures-*"
+            indices = "medic-failure-signatures-*"
         else:
             # Query both
-            indices = "medic-docker-failures-*,medic-claude-failures-*"
+            indices = "medic-failure-signatures-*,medic-failure-signatures-*"
 
         # Build query
         if must_clauses:
@@ -3965,7 +4039,7 @@ def get_claude_failure_signatures():
         }
 
         # Execute search
-        result = es_client.search(index="medic-claude-failures-*", body=query)
+        result = es_client.search(index="medic-failure-signatures-*", body=query)
 
         signatures = [hit['_source'] for hit in result['hits']['hits']]
 
@@ -3995,7 +4069,7 @@ def get_claude_failure_signature(fingerprint_id):
     """Get details of a specific Claude failure signature"""
     try:
         result = es_client.search(
-            index="medic-claude-failures-*",
+            index="medic-failure-signatures-*",
             body={
                 "query": {"term": {"fingerprint_id": fingerprint_id}},
                 "size": 1
@@ -4097,7 +4171,7 @@ def get_claude_failure_clusters(fingerprint_id):
     """Get sample clusters for a Claude failure signature"""
     try:
         result = es_client.search(
-            index="medic-claude-failures-*",
+            index="medic-failure-signatures-*",
             body={
                 "query": {"term": {"fingerprint_id": fingerprint_id}},
                 "size": 1
@@ -4128,7 +4202,7 @@ def get_claude_medic_stats():
     try:
         # Get signature counts by status
         status_agg = es_client.search(
-            index="medic-claude-failures-*",
+            index="medic-failure-signatures-*",
             body={
                 "query": {"term": {"type": "claude"}},
                 "size": 0,
@@ -4172,7 +4246,7 @@ def get_claude_medic_stats():
 
         # Get total failures (sum of total_failures across all signatures)
         total_result = es_client.search(
-            index="medic-claude-failures-*",
+            index="medic-failure-signatures-*",
             body={
                 "query": {"term": {"type": "claude"}},
                 "size": 0,
@@ -4223,7 +4297,7 @@ def get_claude_medic_projects():
     """Get list of projects with Claude failure data"""
     try:
         result = es_client.search(
-            index="medic-claude-failures-*",
+            index="medic-failure-signatures-*",
             body={
                 "query": {"term": {"type": "claude"}},
                 "size": 0,
@@ -4264,7 +4338,7 @@ def get_claude_project_stats(project):
     try:
         # Get signature counts by status for this project
         result = es_client.search(
-            index="medic-claude-failures-*",
+            index="medic-failure-signatures-*",
             body={
                 "query": {
                     "bool": {

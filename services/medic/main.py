@@ -17,6 +17,7 @@ import os
 import sys
 import docker
 import redis
+import yaml
 from elasticsearch import Elasticsearch
 from pathlib import Path
 
@@ -37,6 +38,9 @@ from services.medic.claude import (
     ClaudeInvestigationOrchestrator,
     ClaudeSignatureCurator,
 )
+
+# AI normalization
+from services.medic.claude_normalizer import ClaudeCodeNormalizer
 
 # Configure logging
 logging.basicConfig(
@@ -60,6 +64,20 @@ async def main():
 
     workspace_root = os.environ.get("WORKSPACE_ROOT", "/workspace/clauditoreum")
     medic_dir = os.environ.get("MEDIC_DIR", "/medic")
+
+    # --- Load Configuration ---
+    config_path = Path(__file__).parent.parent.parent / "config" / "medic.yaml"
+    medic_config = {}
+    if config_path.exists():
+        try:
+            with open(config_path, 'r') as f:
+                full_config = yaml.safe_load(f)
+                medic_config = full_config.get("medic", {})
+            logger.info(f"Loaded medic configuration from {config_path}")
+        except Exception as e:
+            logger.warning(f"Failed to load medic config: {e}, using defaults")
+    else:
+        logger.warning(f"Config file not found at {config_path}, using defaults")
 
     # --- Shared Clients ---
     try:
@@ -91,9 +109,29 @@ async def main():
 
     tasks = []
 
+    # Initialize AI Normalization (if enabled)
+    ai_config = medic_config.get("fingerprinting", {}).get("ai_normalization", {})
+    use_ai = ai_config.get("enabled", False)
+    claude_normalizer = None
+
+    if use_ai:
+        try:
+            claude_normalizer = ClaudeCodeNormalizer(
+                redis_client=redis_client,
+                cache_ttl=ai_config.get("cache_ttl", 86400)
+            )
+            logger.info("AI normalization enabled with Claude Code")
+        except Exception as e:
+            logger.warning(f"Failed to initialize Claude normalizer: {e}, AI normalization disabled")
+            use_ai = False
+
     # 1. Docker Log Monitor
     if docker_client:
-        fingerprint_engine = FingerprintEngine()
+        fingerprint_engine = FingerprintEngine(
+            claude_normalizer=claude_normalizer,
+            use_ai=use_ai,
+            confidence_threshold=ai_config.get("confidence_threshold", 0.8)
+        )
         failure_store = DockerFailureSignatureStore(es_client)
         docker_monitor = DockerLogMonitor(docker_client, fingerprint_engine, failure_store, redis_client)
         tasks.append(asyncio.create_task(docker_monitor.start_monitoring(), name="DockerLogMonitor"))

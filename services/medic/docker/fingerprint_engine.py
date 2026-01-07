@@ -3,15 +3,21 @@ Fingerprint Engine for Error Deduplication
 
 Generates unique fingerprints for errors by extracting key components
 and normalizing variable parts.
+
+Supports both static normalization (fast, regex-based) and AI-powered
+normalization (slower, handles edge cases) with automatic confidence scoring.
 """
 
 import hashlib
 import json
+import logging
 import re
 from typing import Optional
 from dataclasses import dataclass
 
 from services.medic.normalizers import get_default_normalizers
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -31,10 +37,29 @@ class FingerprintEngine:
     """
     Generates unique fingerprints for error patterns.
     Implements normalization and similarity detection.
+
+    Supports both static normalization (fast) and AI-powered normalization
+    (slower but more accurate for edge cases).
     """
 
-    def __init__(self):
+    def __init__(self, claude_normalizer=None, use_ai: bool = False, confidence_threshold: float = 0.8):
+        """
+        Initialize fingerprint engine.
+
+        Args:
+            claude_normalizer: Optional ClaudeCodeNormalizer instance for AI normalization
+            use_ai: Whether to use AI normalization for low-confidence cases
+            confidence_threshold: Minimum confidence for static normalization (default: 0.8)
+        """
         self.normalizers = get_default_normalizers()
+        self.claude_normalizer = claude_normalizer
+        self.use_ai = use_ai and claude_normalizer is not None
+        self.confidence_threshold = confidence_threshold
+
+        if self.use_ai:
+            logger.info(f"AI normalization enabled (threshold: {confidence_threshold})")
+        else:
+            logger.info("Static normalization only")
 
     def generate(self, container_name: str, log_entry: dict) -> ErrorFingerprint:
         """
@@ -87,6 +112,141 @@ class FingerprintEngine:
                 "log_entry": log_entry,
             },
         )
+
+    async def generate_with_ai(self, container_name: str, log_entry: dict) -> ErrorFingerprint:
+        """
+        Generate fingerprint with optional AI normalization.
+
+        Uses static normalizers first, then falls back to AI normalization
+        if confidence is below threshold.
+
+        Args:
+            container_name: Name of the container that produced the log
+            log_entry: Parsed log entry with keys: level, message, timestamp, etc.
+
+        Returns:
+            ErrorFingerprint object with unique ID and signature components
+        """
+        # Extract components
+        error_type = self._extract_error_type(log_entry)
+        error_message = self._extract_error_message(log_entry)
+        stack_trace = self._extract_stack_trace(log_entry)
+
+        # Step 1: Apply static normalizers
+        normalized_message = self._normalize(error_message)
+
+        # Step 2: Check confidence
+        confidence = self._calculate_confidence(error_message, normalized_message)
+
+        # Step 3: Use AI normalization if confidence is low
+        if confidence < self.confidence_threshold and self.use_ai:
+            logger.info(
+                f"Low confidence ({confidence:.2f}), using AI normalization for: {error_message[:50]}..."
+            )
+
+            try:
+                ai_result = await self.claude_normalizer.normalize(
+                    error_message,
+                    context={
+                        "container": container_name,
+                        "level": log_entry.get("level", "ERROR"),
+                        "timestamp": log_entry.get("timestamp", ""),
+                    }
+                )
+
+                normalized_message = ai_result["normalized"]
+
+                # Store pattern suggestion if provided
+                if ai_result.get("suggested_pattern"):
+                    self.claude_normalizer.store_pattern_suggestion(
+                        pattern=ai_result["suggested_pattern"],
+                        example=error_message,
+                        reasoning=ai_result.get("reasoning", "")
+                    )
+                    logger.info(f"Stored pattern suggestion: {ai_result['suggested_pattern'][:50]}...")
+
+            except Exception as e:
+                logger.error(f"AI normalization failed, falling back to static: {e}")
+                # Use static normalization result
+
+        # Continue with fingerprint generation
+        stack_signature = self._generate_stack_signature(stack_trace)
+        container_pattern = self._normalize_container_name(container_name)
+
+        # Build error pattern
+        if error_type:
+            error_pattern = f"{error_type}: {normalized_message}"
+        else:
+            error_pattern = normalized_message
+
+        # Generate fingerprint ID
+        fingerprint_data = {
+            "container_pattern": container_pattern,
+            "error_type": error_type or "Unknown",
+            "error_pattern": error_pattern,
+            "stack_signature": stack_signature,
+        }
+
+        fingerprint_id = self._hash(fingerprint_data)
+
+        return ErrorFingerprint(
+            fingerprint_id=fingerprint_id,
+            container_pattern=container_pattern,
+            error_type=error_type or "Unknown",
+            error_pattern=error_pattern,
+            stack_signature=stack_signature,
+            normalized_message=normalized_message,
+            raw_data={
+                "original_message": error_message,
+                "original_container": container_name,
+                "stack_trace": stack_trace,
+                "log_entry": log_entry,
+            },
+        )
+
+    def _calculate_confidence(self, original: str, normalized: str) -> float:
+        """
+        Calculate confidence that static normalization was sufficient.
+
+        Low confidence indicators:
+        - Multiple standalone numbers remain (likely counters)
+        - Numbers adjacent to uncommon words
+        - Complex nested patterns
+        - Very long messages with many numbers
+
+        Returns:
+            Confidence score between 0.0 and 1.0
+        """
+        # Count remaining standalone numbers
+        remaining_numbers = len(re.findall(r'\b\d+\b', normalized))
+
+        # Count placeholder replacements (how much normalization happened)
+        placeholders = len(re.findall(r'\{[a-z_]+\}', normalized))
+
+        # If many numbers remain, confidence is low
+        if remaining_numbers > 3:
+            confidence = 0.4
+        elif remaining_numbers > 1:
+            confidence = 0.6
+        elif remaining_numbers == 1:
+            # Check if it's in a known context (like a port number, which is okay)
+            # If it's standalone without context, reduce confidence
+            if re.search(r':\d+\b', normalized):  # Port number
+                confidence = 0.85
+            else:
+                confidence = 0.75
+        else:
+            confidence = 0.95
+
+        # Boost confidence if we normalized a lot
+        if placeholders > 3:
+            confidence = min(1.0, confidence + 0.05)
+
+        # Reduce confidence for very long messages (might have missed patterns)
+        if len(normalized) > 200:
+            confidence = max(0.5, confidence - 0.1)
+
+        return confidence
 
     def _extract_error_type(self, log_entry: dict) -> Optional[str]:
         """

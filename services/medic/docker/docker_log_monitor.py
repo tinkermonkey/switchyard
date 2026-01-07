@@ -232,12 +232,16 @@ class DockerLogMonitor:
             )
 
             # Store/update failure signature
-            # Note: Cannot use async record_occurrence from sync context
-            # Log the failure for now - the async processor will handle it
-            logger.warning(
-                f"Detected failure in {container_name} but sync processor cannot store to ES. "
-                f"Fingerprint: {fingerprint.fingerprint_id}"
-            )
+            # Use asyncio.run() to call async storage from sync context
+            try:
+                import asyncio
+                container_info = {"id": container_id, "name": container_name}
+                asyncio.run(self.failure_store.record_occurrence(
+                    fingerprint, parsed, container_info
+                ))
+                logger.info(f"Stored failure fingerprint {fingerprint.fingerprint_id} for {container_name}")
+            except Exception as storage_error:
+                logger.error(f"Failed to store failure to Elasticsearch: {storage_error}", exc_info=True)
 
         except Exception as e:
             logger.error(f"Failed to process log line: {e}")

@@ -10,6 +10,8 @@ Other issues wait in queue based on their position in the GitHub board column.
 
 import yaml
 import logging
+import fcntl
+import contextlib
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 from datetime import datetime, timezone
@@ -47,6 +49,70 @@ class PipelineQueueManager:
         """Get YAML state file path for queue"""
         return self.state_dir / f"{self.project_name}_{self.board_name}.yaml"
 
+    def _get_lock_file(self) -> Path:
+        """Get lock file path for queue operations"""
+        return self.state_dir / f"{self.project_name}_{self.board_name}.lock"
+
+    @contextlib.contextmanager
+    def _queue_lock(self, timeout: int = 10):
+        """
+        Context manager for exclusive queue file access.
+
+        Uses POSIX file locking (fcntl) to prevent concurrent modifications
+        to the queue state file. This prevents race conditions when multiple
+        threads/processes attempt to sync or modify the queue simultaneously.
+
+        Args:
+            timeout: Maximum seconds to wait for lock (default 10)
+
+        Yields:
+            None - just provides locked context
+
+        Raises:
+            TimeoutError: If lock cannot be acquired within timeout
+        """
+        lock_file = self._get_lock_file()
+        lock_file.parent.mkdir(parents=True, exist_ok=True)
+
+        # Open lock file (create if doesn't exist)
+        f = open(lock_file, 'w')
+
+        try:
+            # Try to acquire exclusive lock with timeout
+            import time
+            start_time = time.time()
+
+            while True:
+                try:
+                    # LOCK_EX = exclusive lock, LOCK_NB = non-blocking
+                    fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    logger.debug(f"Acquired queue lock for {self.project_name}/{self.board_name}")
+                    break
+                except (IOError, OSError):
+                    # Lock is held by another process
+                    if time.time() - start_time > timeout:
+                        raise TimeoutError(
+                            f"Could not acquire queue lock for {self.project_name}/{self.board_name} "
+                            f"within {timeout} seconds"
+                        )
+                    time.sleep(0.1)  # Wait 100ms before retry
+
+            yield  # Execute code within locked context
+
+        finally:
+            # Release lock
+            try:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                logger.debug(f"Released queue lock for {self.project_name}/{self.board_name}")
+            except:
+                pass
+
+            # Close lock file
+            try:
+                f.close()
+            except:
+                pass
+
     def load_queue(self) -> List[Dict[str, Any]]:
         """Load queue state from YAML"""
         state_file = self._get_state_file()
@@ -63,23 +129,27 @@ class PipelineQueueManager:
             return []
 
     def save_queue(self, queue: List[Dict[str, Any]]):
-        """Save queue state to YAML"""
+        """
+        Save queue state to YAML.
+
+        Raises:
+            Exception: If save operation fails (disk full, permissions, etc.)
+
+        Note: Does NOT swallow exceptions - caller must handle failures.
+        """
         state_file = self._get_state_file()
 
-        try:
-            data = {
-                'project': self.project_name,
-                'board': self.board_name,
-                'queue': queue,
-                'last_updated': datetime.now(timezone.utc).isoformat()
-            }
+        data = {
+            'project': self.project_name,
+            'board': self.board_name,
+            'queue': queue,
+            'last_updated': datetime.now(timezone.utc).isoformat()
+        }
 
-            with open(state_file, 'w') as f:
-                yaml.dump(data, f, default_flow_style=False, sort_keys=False)
+        with open(state_file, 'w') as f:
+            yaml.dump(data, f, default_flow_style=False, sort_keys=False)
 
-            logger.debug(f"Saved queue state: {len(queue)} issues")
-        except Exception as e:
-            logger.error(f"Failed to save queue state: {e}")
+        logger.debug(f"Saved queue state: {len(queue)} issues")
 
     def get_issues_in_column_order(self, column_name: str) -> List[Dict[str, Any]]:
         """
@@ -204,9 +274,14 @@ class PipelineQueueManager:
             return []
 
     def is_issue_in_queue(self, issue_number: int) -> bool:
-        """Check if issue is already in queue"""
-        queue = self.load_queue()
-        return any(issue['issue_number'] == issue_number for issue in queue)
+        """
+        Check if issue is already in queue.
+
+        Uses lock to prevent reading partially written queue state.
+        """
+        with self._queue_lock():
+            queue = self.load_queue()
+            return any(issue['issue_number'] == issue_number for issue in queue)
 
     def enqueue_issue(self, issue_number: int, column: str, timestamp: str):
         """
@@ -220,26 +295,11 @@ class PipelineQueueManager:
             issue_number: Issue number to add
             column: Column the issue is in
             timestamp: Timestamp when queued
+
+        Note: GitHub API call is performed OUTSIDE the lock to minimize lock hold time.
+        Only file I/O operations are performed within the lock.
         """
-        queue = self.load_queue()
-
-        # Check if already in queue
-        existing_issue = next((issue for issue in queue if issue['issue_number'] == issue_number), None)
-
-        if existing_issue:
-            # If issue is active, don't modify it (work in progress)
-            if existing_issue['status'] == 'active':
-                logger.debug(f"Issue #{issue_number} already active in queue, skipping enqueue")
-                return
-
-            # If waiting, update the timestamp (issue was re-detected)
-            existing_issue['queued_at'] = timestamp
-            existing_issue['last_position_check'] = timestamp
-            self.save_queue(queue)
-            logger.debug(f"Updated timestamp for issue #{issue_number} in queue")
-            return
-
-        # Fetch current position from GitHub
+        # STEP 1: Fetch position from GitHub OUTSIDE the lock (network I/O)
         issues_in_column = self.get_issues_in_column_order(column)
         position = next(
             (item['position'] for item in issues_in_column
@@ -247,35 +307,57 @@ class PipelineQueueManager:
             999  # Default if not found
         )
 
-        queue.append({
-            'issue_number': issue_number,
-            'queued_at': timestamp,
-            'initial_column': column,
-            'status': 'waiting',
-            'last_position_check': timestamp,
-            'position_in_column': position
-        })
+        # STEP 2: Hold lock ONLY for file read-modify-write
+        with self._queue_lock():
+            queue = self.load_queue()
 
-        self.save_queue(queue)
+            # Check if already in queue
+            existing_issue = next((issue for issue in queue if issue['issue_number'] == issue_number), None)
 
-        logger.info(
-            f"Added issue #{issue_number} to pipeline queue "
-            f"(position: {position}, status: waiting)"
-        )
+            if existing_issue:
+                # If issue is active, don't modify it (work in progress)
+                if existing_issue['status'] == 'active':
+                    logger.debug(f"Issue #{issue_number} already active in queue, skipping enqueue")
+                    return
+
+                # If waiting, update the timestamp and position (issue was re-detected)
+                existing_issue['queued_at'] = timestamp
+                existing_issue['last_position_check'] = timestamp
+                existing_issue['position_in_column'] = position
+                self.save_queue(queue)
+                logger.debug(f"Updated timestamp for issue #{issue_number} in queue")
+                return
+
+            queue.append({
+                'issue_number': issue_number,
+                'queued_at': timestamp,
+                'initial_column': column,
+                'status': 'waiting',
+                'last_position_check': timestamp,
+                'position_in_column': position
+            })
+
+            self.save_queue(queue)
+
+            logger.info(
+                f"Added issue #{issue_number} to pipeline queue "
+                f"(position: {position}, status: waiting)"
+            )
 
     def mark_issue_active(self, issue_number: int):
         """Mark issue as active (currently executing)"""
-        queue = self.load_queue()
+        with self._queue_lock():
+            queue = self.load_queue()
 
-        for issue in queue:
-            if issue['issue_number'] == issue_number:
-                issue['status'] = 'active'
-                issue['activated_at'] = datetime.now(timezone.utc).isoformat()
-                break
+            for issue in queue:
+                if issue['issue_number'] == issue_number:
+                    issue['status'] = 'active'
+                    issue['activated_at'] = datetime.now(timezone.utc).isoformat()
+                    break
 
-        self.save_queue(queue)
+            self.save_queue(queue)
 
-        logger.info(f"Marked issue #{issue_number} as active in pipeline queue")
+            logger.info(f"Marked issue #{issue_number} as active in pipeline queue")
 
     def sync_queue_with_github(self) -> None:
         """
@@ -285,12 +367,15 @@ class PipelineQueueManager:
         - Removes issues that are no longer in the trigger column
         - Updates positions for issues still in the column
         - Re-calculates status based on GitHub state
+        - Adds newly discovered issues from GitHub
 
         Call this before selecting the next issue to execute.
-        """
-        trigger_column = self._get_pipeline_trigger_column()
 
-        # Fetch current issues in trigger column from GitHub
+        Note: GitHub API call is performed OUTSIDE the lock to minimize lock hold time.
+        Only file I/O operations are performed within the lock.
+        """
+        # STEP 1: Fetch data from GitHub OUTSIDE the lock (network I/O)
+        trigger_column = self._get_pipeline_trigger_column()
         issues_in_column = self.get_issues_in_column_order(trigger_column)
         github_issue_numbers = {item['issue_number'] for item in issues_in_column}
 
@@ -298,64 +383,82 @@ class PipelineQueueManager:
             logger.debug(f"No issues in trigger column '{trigger_column}', queue sync skipped")
             return
 
-        queue = self.load_queue()
-        updated_queue = []
+        # STEP 2: Hold lock ONLY for file read-modify-write
+        with self._queue_lock():
+            queue = self.load_queue()
+            updated_queue = []
 
-        for issue in queue:
-            issue_number = issue['issue_number']
+            for issue in queue:
+                issue_number = issue['issue_number']
 
-            # If issue is no longer in trigger column, remove it from queue
-            # (unless it's currently active - let the agent finish)
-            if issue_number not in github_issue_numbers:
-                if issue['status'] == 'active':
-                    # Keep active issues even if moved out - they need to complete
-                    logger.info(
-                        f"Issue #{issue_number} moved out of trigger column but still active, "
-                        f"keeping in queue until completion"
-                    )
-                    updated_queue.append(issue)
-                else:
-                    logger.info(
-                        f"Issue #{issue_number} no longer in trigger column '{trigger_column}', "
-                        f"removing from queue"
-                    )
-                    # Don't add to updated_queue (effectively removing it)
-                continue
+                # If issue is no longer in trigger column, remove it from queue
+                # (unless it's currently active - let the agent finish)
+                if issue_number not in github_issue_numbers:
+                    if issue['status'] == 'active':
+                        # Keep active issues even if moved out - they need to complete
+                        logger.info(
+                            f"Issue #{issue_number} moved out of trigger column but still active, "
+                            f"keeping in queue until completion"
+                        )
+                        updated_queue.append(issue)
+                    else:
+                        logger.info(
+                            f"Issue #{issue_number} no longer in trigger column '{trigger_column}', "
+                            f"removing from queue"
+                        )
+                        # Don't add to updated_queue (effectively removing it)
+                    continue
 
-            # Issue is still in column - update its position
-            github_position = next(
-                (item['position'] for item in issues_in_column
-                 if item['issue_number'] == issue_number),
-                None
-            )
+                # Issue is still in column - update its position
+                github_position = next(
+                    (item['position'] for item in issues_in_column
+                     if item['issue_number'] == issue_number),
+                    None
+                )
 
-            if github_position is not None:
-                old_position = issue.get('position_in_column')
-                if old_position != github_position:
-                    logger.info(
-                        f"Issue #{issue_number} position changed: {old_position} → {github_position}"
-                    )
-                    issue['position_in_column'] = github_position
-                    issue['last_position_check'] = datetime.now(timezone.utc).isoformat()
+                if github_position is not None:
+                    old_position = issue.get('position_in_column')
+                    if old_position != github_position:
+                        logger.info(
+                            f"Issue #{issue_number} position changed: {old_position} → {github_position}"
+                        )
+                        issue['position_in_column'] = github_position
+                        issue['last_position_check'] = datetime.now(timezone.utc).isoformat()
 
-            updated_queue.append(issue)
+                updated_queue.append(issue)
 
-        # Save the synchronized queue
-        if len(updated_queue) != len(queue):
-            logger.info(
-                f"Queue sync complete: {len(queue)} → {len(updated_queue)} issues "
-                f"({len(queue) - len(updated_queue)} removed)"
-            )
+            # Add newly discovered issues from GitHub that aren't in the queue yet
+            queued_issue_numbers = {issue['issue_number'] for issue in updated_queue}
+            for github_item in issues_in_column:
+                if github_item['issue_number'] not in queued_issue_numbers:
+                    new_issue = {
+                        'issue_number': github_item['issue_number'],
+                        'position_in_column': github_item['position'],
+                        'status': 'waiting',
+                        'added_at': datetime.now(timezone.utc).isoformat(),
+                        'last_position_check': datetime.now(timezone.utc).isoformat(),
+                        'title': github_item.get('title', f"Issue #{github_item['issue_number']}")
+                    }
+                    updated_queue.append(new_issue)
+                    logger.info(f"Added newly discovered issue #{github_item['issue_number']} to queue with status=waiting")
 
-        self.save_queue(updated_queue)
+            # Save the synchronized queue
+            if len(updated_queue) != len(queue):
+                logger.info(
+                    f"Queue sync complete: {len(queue)} → {len(updated_queue)} issues "
+                    f"({len(queue) - len(updated_queue)} removed or added)"
+                )
+
+            self.save_queue(updated_queue)
 
     def remove_issue_from_queue(self, issue_number: int):
         """Remove issue from queue entirely"""
-        queue = self.load_queue()
-        queue = [issue for issue in queue if issue['issue_number'] != issue_number]
-        self.save_queue(queue)
+        with self._queue_lock():
+            queue = self.load_queue()
+            queue = [issue for issue in queue if issue['issue_number'] != issue_number]
+            self.save_queue(queue)
 
-        logger.info(f"Removed issue #{issue_number} from pipeline queue")
+            logger.info(f"Removed issue #{issue_number} from pipeline queue")
 
     def reset_issue_to_waiting(self, issue_number: int):
         """
@@ -366,41 +469,47 @@ class PipelineQueueManager:
         Args:
             issue_number: Issue number to reset
         """
-        queue = self.load_queue()
+        with self._queue_lock():
+            queue = self.load_queue()
 
-        for issue in queue:
-            if issue['issue_number'] == issue_number:
-                if issue['status'] == 'active':
-                    issue['status'] = 'waiting'
+            for issue in queue:
+                if issue['issue_number'] == issue_number:
+                    if issue['status'] == 'active':
+                        issue['status'] = 'waiting'
 
-                    # Clear activation timestamp
-                    if 'activated_at' in issue:
-                        del issue['activated_at']
+                        # Clear activation timestamp
+                        if 'activated_at' in issue:
+                            del issue['activated_at']
 
-                    self.save_queue(queue)
-                    logger.info(
-                        f"Reset issue #{issue_number} from active to waiting in queue "
-                        f"(recovering from stale lock)"
-                    )
-                    return True
-                else:
-                    logger.debug(
-                        f"Issue #{issue_number} has status {issue['status']}, no reset needed"
-                    )
-                    return False
+                        self.save_queue(queue)
+                        logger.info(
+                            f"Reset issue #{issue_number} from active to waiting in queue "
+                            f"(recovering from stale lock)"
+                        )
+                        return True
+                    else:
+                        logger.debug(
+                            f"Issue #{issue_number} has status {issue['status']}, no reset needed"
+                        )
+                        return False
 
-        logger.debug(f"Issue #{issue_number} not found in queue, no reset performed")
-        return False
+            logger.debug(f"Issue #{issue_number} not found in queue, no reset performed")
+            return False
 
     def get_issue_status(self, issue_number: int) -> Optional[str]:
-        """Get status of issue in queue"""
-        queue = self.load_queue()
+        """
+        Get status of issue in queue.
 
-        for issue in queue:
-            if issue['issue_number'] == issue_number:
-                return issue['status']
+        Uses lock to prevent reading partially written queue state.
+        """
+        with self._queue_lock():
+            queue = self.load_queue()
 
-        return None
+            for issue in queue:
+                if issue['issue_number'] == issue_number:
+                    return issue['status']
+
+            return None
 
     def _get_pipeline_trigger_column(self) -> str:
         """
@@ -436,32 +545,35 @@ class PipelineQueueManager:
 
         Returns:
             Issue dict with 'issue_number', 'position', etc., or None
+
+        Note: Uses atomic read under lock after sync to prevent race conditions.
         """
-        # CRITICAL: Sync with GitHub first to ensure accurate state
+        # STEP 1: Sync with GitHub first to ensure accurate state (has its own locking)
         logger.info(
             f"Syncing queue with GitHub for {self.project_name}/{self.board_name}"
         )
         self.sync_queue_with_github()
 
-        # Load queue after sync
-        queue = self.load_queue()
+        # STEP 2: Atomically read queue under lock to prevent torn reads
+        with self._queue_lock():
+            queue = self.load_queue()
 
-        # Filter to 'waiting' issues only
-        waiting_issues = [
-            issue for issue in queue
-            if issue['status'] == 'waiting'
-        ]
+            # Filter to 'waiting' issues only
+            waiting_issues = [
+                issue for issue in queue
+                if issue['status'] == 'waiting'
+            ]
 
-        if not waiting_issues:
-            logger.debug(
-                f"No waiting issues in pipeline queue for "
-                f"{self.project_name}/{self.board_name}"
-            )
-            return None
+            if not waiting_issues:
+                logger.debug(
+                    f"No waiting issues in pipeline queue for "
+                    f"{self.project_name}/{self.board_name}"
+                )
+                return None
 
-        # Sort by position (lowest = topmost on board = highest priority)
-        waiting_issues.sort(key=lambda x: x.get('position_in_column', 999))
-        next_issue = waiting_issues[0]
+            # Sort by position (lowest = topmost on board = highest priority)
+            waiting_issues.sort(key=lambda x: x.get('position_in_column', 999))
+            next_issue = waiting_issues[0]
 
         trigger_column = self._get_pipeline_trigger_column()
         logger.info(
@@ -477,22 +589,25 @@ class PipelineQueueManager:
 
         Returns:
             Dictionary with queue statistics and waiting issues
+
+        Uses lock to prevent reading partially written queue state.
         """
-        queue = self.load_queue()
+        with self._queue_lock():
+            queue = self.load_queue()
 
-        active_issues = [i for i in queue if i['status'] == 'active']
-        waiting_issues = [i for i in queue if i['status'] == 'waiting']
+            active_issues = [i for i in queue if i['status'] == 'active']
+            waiting_issues = [i for i in queue if i['status'] == 'waiting']
 
-        return {
-            'project': self.project_name,
-            'board': self.board_name,
-            'total_issues': len(queue),
-            'active_count': len(active_issues),
-            'waiting_count': len(waiting_issues),
-            'active_issue': active_issues[0] if active_issues else None,
-            'waiting_issues': waiting_issues,
-            'last_updated': datetime.now(timezone.utc).isoformat()
-        }
+            return {
+                'project': self.project_name,
+                'board': self.board_name,
+                'total_issues': len(queue),
+                'active_count': len(active_issues),
+                'waiting_count': len(waiting_issues),
+                'active_issue': active_issues[0] if active_issues else None,
+                'waiting_issues': waiting_issues,
+                'last_updated': datetime.now(timezone.utc).isoformat()
+            }
 
 
 def get_pipeline_queue_manager(project_name: str, board_name: str) -> PipelineQueueManager:

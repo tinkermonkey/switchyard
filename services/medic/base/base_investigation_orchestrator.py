@@ -1163,11 +1163,9 @@ class BaseInvestigationOrchestrator(ABC):
                 # Query Elasticsearch for signatures with potentially stale statuses
                 stale_statuses = ["in_progress", "queued", "starting", "running"]
 
-                # Search across index patterns
+                # Search the unified index pattern
                 index_patterns = [
-                    "medic-failure-signatures-*",
-                    "medic-docker-failures-*",
-                    "medic-claude-failures-*"
+                    "medic-failure-signatures-*"
                 ]
 
                 for index_pattern in index_patterns:

@@ -80,7 +80,7 @@ DOCKER_FAILURE_MAPPING = {
     "settings": {
         "number_of_shards": 1,
         "number_of_replicas": 0,
-        "index.lifecycle.name": "medic-docker-ilm-policy",
+        "index.lifecycle.name": "medic-ilm-policy",
     },
 }
 
@@ -116,8 +116,8 @@ class DockerFailureSignatureStore(BaseFailureSignatureStore):
         """
         super().__init__(
             es_client=es_client,
-            index_prefix="medic-docker-failures",
-            ilm_policy_name="medic-docker-ilm-policy",
+            index_prefix="medic-failure-signatures",
+            ilm_policy_name="medic-ilm-policy",
             ilm_policy_body=DOCKER_ILM_POLICY,
         )
         logger.info("DockerFailureSignatureStore initialized")
@@ -128,7 +128,7 @@ class DockerFailureSignatureStore(BaseFailureSignatureStore):
 
     def _get_template_name(self) -> str:
         """Return index template name."""
-        return "medic-docker-failures"
+        return "medic-failure-signatures"
 
     def _create_signature_doc(
         self, fingerprint: Any, entry_data: dict, metadata: dict
