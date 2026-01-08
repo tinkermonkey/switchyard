@@ -670,6 +670,16 @@ class DockerAgentRunner:
         else:
             logger.warning("No authentication token found - agent will likely fail")
 
+        # NEW: Redis connection info for direct container writes (container-side Redis communication)
+        cmd.extend([
+            '-e', 'REDIS_HOST=redis',
+            '-e', 'REDIS_PORT=6379',
+            '-e', f'AGENT={agent}',
+            '-e', f'TASK_ID={task_id}',
+            '-e', f'PROJECT={project}',
+            '-e', f'ISSUE_NUMBER={context.get("issue_number", "unknown")}',
+        ])
+
         # Special handling for dev_environment_setup agent: mount Docker socket for image building
         if agent == 'dev_environment_setup':
             logger.info("Mounting Docker socket for dev_environment_setup agent")
@@ -975,8 +985,27 @@ class DockerAgentRunner:
             logger.info(f"Resuming Claude Code session: {existing_session_id}")
 
         # Read prompt from the mounted file
-        # We use 'cat file | claude -' pattern
-        claude_exec_cmd = ' '.join(claude_cmd) + ' -'
+        # We use 'cat file | wrapper | claude -' pattern
+        # NEW: Use wrapper to enable container-side Redis writes
+        wrapper_cmd = [
+            'python3', '/app/scripts/docker-claude-wrapper.py',
+            '--print', '--verbose', '--output-format', 'stream-json',
+            '--model', claude_model,
+        ]
+
+        # Add MCP config if provided
+        if mcp_config_path:
+            wrapper_cmd.extend(['--mcp-config', '/home/orchestrator/.mcp_config.json'])
+
+        # Use bypassPermissions for all agents
+        wrapper_cmd.extend(['--permission-mode', 'bypassPermissions'])
+
+        # Add --resume flag if continuing an existing session
+        if existing_session_id:
+            wrapper_cmd.extend(['--resume', existing_session_id])
+
+        wrapper_cmd.append('-')
+        claude_exec_cmd = ' '.join(wrapper_cmd)
         
         # Prepare the shell command
         # 1. Setup gh auth if needed

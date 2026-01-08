@@ -77,6 +77,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY . .
 
+# NEW: Ensure Claude Code wrapper is executable (for container-side Redis writes)
+RUN chmod +x /app/scripts/docker-claude-wrapper.py
+
 # Copy and set permissions for entrypoint script
 COPY docker-entrypoint.sh /usr/local/bin/
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
