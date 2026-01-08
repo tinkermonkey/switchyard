@@ -1405,8 +1405,22 @@ class ProjectMonitor:
             logger.warning(f"Could not check for prior agent work: {e}")
             return False
 
-    def trigger_agent_for_status(self, project_name: str, board_name: str, issue_number: int, status: str, repository: str) -> Optional[str]:
-        """Determine which agent should handle this status and create a task or review cycle"""
+    def trigger_agent_for_status(
+        self,
+        project_name: str,
+        board_name: str,
+        issue_number: int,
+        status: str,
+        repository: str,
+        lock_already_acquired: bool = False
+    ) -> Optional[str]:
+        """
+        Determine which agent should handle this status and create a task or review cycle
+
+        Args:
+            lock_already_acquired: If True, caller has already acquired the pipeline lock
+                                   for this issue, so skip lock acquisition check
+        """
         try:
             # Get workflow template for this board
             project_config = self.config_manager.get_project_config(project_name)
@@ -1497,12 +1511,17 @@ class ProjectMonitor:
                 # Check if this issue already holds the pipeline lock
                 # If it does, skip queue priority check to avoid race conditions
                 # (The lock was already acquired with priority validation)
-                current_lock = lock_manager.get_lock(project_name, board_name)
-                already_has_lock = (current_lock and
-                                   current_lock.lock_status == 'locked' and
-                                   current_lock.locked_by_issue == issue_number)
+                # Check if we need to acquire lock (skip if lock_already_acquired=True from caller)
+                if not lock_already_acquired:
+                    current_lock = lock_manager.get_lock(project_name, board_name)
+                    already_has_lock = (current_lock and
+                                       current_lock.lock_status == 'locked' and
+                                       current_lock.locked_by_issue == issue_number)
+                else:
+                    # Caller already acquired lock, skip all lock checks
+                    already_has_lock = True
 
-                if not already_has_lock:
+                if not lock_already_acquired and not already_has_lock:
                     # CRITICAL: Check if this issue is next in line based on GitHub board order
                     # This ensures we respect the user's ordering on the GitHub board
                     next_issue = pipeline_queue.get_next_waiting_issue()
@@ -1530,11 +1549,37 @@ class ProjectMonitor:
                     # Lock acquired - mark issue as active in queue
                     pipeline_queue.mark_issue_active(issue_number)
                     logger.info(f"Issue #{issue_number} acquired pipeline lock, proceeding with execution")
-                else:
-                    # Issue already holds the lock (called from queue processor after lock acquisition)
-                    # Ensure it's marked as active in the queue
+                elif lock_already_acquired:
+                    # Caller (e.g., failsafe) already acquired lock - proceed with execution
                     pipeline_queue.mark_issue_active(issue_number)
-                    logger.info(f"Issue #{issue_number} already holds pipeline lock, proceeding with execution")
+                    logger.info(
+                        f"Issue #{issue_number} lock already acquired by caller, "
+                        f"proceeding with execution"
+                    )
+                else:
+                    # Issue already holds the lock - need to determine if this is:
+                    # A) Workflow progression (Development → Code Review) - SHOULD PROCEED
+                    # B) Duplicate execution (same column detected twice) - SHOULD SKIP
+
+                    # Check if there's an active execution for this issue
+                    from services.work_execution_state import work_execution_tracker
+                    has_active = work_execution_tracker.has_active_execution(project_name, issue_number)
+
+                    if has_active:
+                        # An agent is currently running - skip to prevent duplicate
+                        logger.debug(
+                            f"Issue #{issue_number} already holds pipeline lock with active execution "
+                            f"(agent in progress), skipping to prevent duplicate execution"
+                        )
+                        return None  # Skip - agent is already running
+                    else:
+                        # No active execution - this is workflow progression to a new column
+                        # The lock is held but previous agent completed, now moving to next stage
+                        pipeline_queue.mark_issue_active(issue_number)
+                        logger.info(
+                            f"Issue #{issue_number} holds pipeline lock but no active execution "
+                            f"(workflow progression), proceeding with new agent"
+                        )
 
             if agent and agent != 'null':
                 # Determine workspace type and get discussion ID FIRST, before using them
@@ -2833,22 +2878,12 @@ _Review cycle initiated by Claude Code Orchestrator_
                                         
                                         # SAFETY: Re-fetch issue from GitHub to verify it hasn't moved columns
                                         # The queue cache might be stale if user moved the issue
-                                        import subprocess
-                                        import json as json_module
-                                        result = subprocess.run(
-                                            ['gh', 'issue', 'view', str(next_issue['issue_number']), '--repo',
-                                             f"{project_config.github['org']}/{project_config.github['repo']}", '--json', 'projectItems'],
-                                            capture_output=True, text=True, check=True
+                                        # FIX: Use GraphQL query instead of gh issue view --json projectItems
+                                        # because projectItems can be stale/empty due to GitHub eventual consistency
+                                        actual_column = self.get_issue_column_sync(
+                                            project_name, board_name, next_issue['issue_number']
                                         )
-                                        issue_data_check = json_module.loads(result.stdout)
-                                        
-                                        # Find current column for this board
-                                        actual_column = None
-                                        for item in issue_data_check.get('projectItems', []):
-                                            if item.get('project', {}).get('title') == board_name:
-                                                actual_column = item.get('fieldValueByName', {}).get('name')
-                                                break
-                                        
+
                                         if not actual_column:
                                             raise Exception(f"Issue #{next_issue['issue_number']} not found on board '{board_name}'")
                                         
@@ -4223,12 +4258,14 @@ _Repair cycle initiated by Claude Code Orchestrator_
                             )
 
                             # Trigger agent using normal flow
+                            # Pass lock_already_acquired=True since we just acquired it above
                             self.trigger_agent_for_status(
                                 project_name,
                                 pipeline.board_name,
                                 next_issue['issue_number'],
                                 current_column,
-                                project_config.github['repo']
+                                project_config.github['repo'],
+                                lock_already_acquired=True
                             )
                         else:
                             # Issue not in any column - clean up

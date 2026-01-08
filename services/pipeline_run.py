@@ -529,21 +529,12 @@ class PipelineRunManager:
                                 
                                 # SAFETY: Re-fetch issue from GitHub to verify it hasn't moved columns
                                 # The queue cache might be stale if user moved the issue
-                                import subprocess
-                                result = subprocess.run(
-                                    ['gh', 'issue', 'view', str(next_issue['issue_number']), '--repo',
-                                     f"{project_config.github['org']}/{project_config.github['repo']}", '--json', 'projectItems'],
-                                    capture_output=True, text=True, check=True
+                                # FIX: Use GraphQL query instead of gh issue view --json projectItems
+                                # because projectItems can be stale/empty due to GitHub eventual consistency
+                                actual_column = self._get_issue_column_from_github(
+                                    project_config, pipeline_config, next_issue['issue_number']
                                 )
-                                issue_data = json.loads(result.stdout)
-                                
-                                # Find current column for this board
-                                actual_column = None
-                                for item in issue_data.get('projectItems', []):
-                                    if item.get('project', {}).get('title') == pipeline_run.board:
-                                        actual_column = item.get('fieldValueByName', {}).get('name')
-                                        break
-                                
+
                                 if not actual_column:
                                     raise Exception(f"Issue #{next_issue['issue_number']} not found on board '{pipeline_run.board}'")
                                 
