@@ -579,6 +579,13 @@ class DockerAgentRunner:
         ])
         logger.info(f"Mounting Claude config: {claude_config_host_path} -> /home/orchestrator/.config/claude")
 
+        # NEW: Mount Claude Code wrapper script for container-side Redis writes
+        wrapper_host_path = f'{host_workspace}/clauditoreum/scripts/docker-claude-wrapper.py'
+        cmd.extend([
+            '-v', f'{wrapper_host_path}:/app/scripts/docker-claude-wrapper.py:ro'
+        ])
+        logger.info(f"Mounting wrapper: {wrapper_host_path} -> /app/scripts/docker-claude-wrapper.py")
+
         # Mount entire .claude directory as tmpfs
         # This allows Claude Code to create any subdirectories it needs (todos, debug, etc.)
         # while still overlaying shared resources (agents, commands, skills) on top
@@ -675,8 +682,8 @@ class DockerAgentRunner:
             '-e', 'REDIS_HOST=redis',
             '-e', 'REDIS_PORT=6379',
             '-e', f'AGENT={agent}',
-            '-e', f'TASK_ID={task_id}',
-            '-e', f'PROJECT={project}',
+            '-e', f'TASK_ID={context.get("task_id", "unknown")}',
+            '-e', f'PROJECT={context.get("project", "unknown")}',
             '-e', f'ISSUE_NUMBER={context.get("issue_number", "unknown")}',
         ])
 
