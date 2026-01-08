@@ -382,6 +382,80 @@ class WorkExecutionStateTracker:
         state = self.load_state(project_name, issue_number)
         return state['execution_history']
 
+    def has_active_execution(
+        self,
+        project_name: str,
+        issue_number: int
+    ) -> bool:
+        """
+        Check if there's an active (in_progress) execution for this issue.
+
+        This method checks ALL types of work that can be active on an issue:
+        1. Regular agent execution (execution_history with outcome='in_progress')
+        2. Active review cycles (maker-checker loops)
+        3. Repair cycle containers (long-running test containers)
+        4. Conversational feedback loops (human-in-the-loop)
+
+        Returns True if ANY type of work is currently active for this issue,
+        preventing duplicate work from being scheduled.
+
+        This is critical for preventing race conditions between:
+        - Project Monitor and Review Cycle Manager
+        - Project Monitor and Repair Cycle containers
+        - Pipeline Orchestrator and Project Monitor
+        - Any concurrent work trigger sources
+        """
+        # Check 1: Regular agent execution in execution_history
+        state = self.load_state(project_name, issue_number)
+        for execution in state['execution_history']:
+            if execution.get('outcome') == 'in_progress':
+                logger.debug(
+                    f"Active execution found in history for {project_name}/#{issue_number}: "
+                    f"{execution.get('agent')} in {execution.get('column')}"
+                )
+                return True
+
+        # Check 2: Active review cycles
+        try:
+            from services.review_cycle import review_cycle_executor
+            if issue_number in review_cycle_executor.active_cycles:
+                cycle = review_cycle_executor.active_cycles[issue_number]
+                if cycle.project_name == project_name:
+                    logger.debug(
+                        f"Active review cycle found for {project_name}/#{issue_number}: "
+                        f"iteration {cycle.current_iteration}, phase={cycle.phase}"
+                    )
+                    return True
+        except (ImportError, AttributeError) as e:
+            # Review cycle module may not be available or initialized
+            logger.debug(f"Could not check review cycles: {e}")
+            pass
+
+        # Check 3: Repair cycle containers
+        if self._check_redis_repair_cycle_tracking(project_name, issue_number):
+            logger.debug(
+                f"Active repair cycle container found for {project_name}/#{issue_number}"
+            )
+            return True
+
+        # Check 4: Conversational feedback loops
+        try:
+            from services.human_feedback_loop import human_feedback_loop_executor
+            if issue_number in human_feedback_loop_executor.active_loops:
+                loop = human_feedback_loop_executor.active_loops[issue_number]
+                if loop.project_name == project_name:
+                    logger.debug(
+                        f"Active feedback loop found for {project_name}/#{issue_number}"
+                    )
+                    return True
+        except (ImportError, AttributeError) as e:
+            # Feedback loop module may not be available or initialized
+            logger.debug(f"Could not check feedback loops: {e}")
+            pass
+
+        # No active work found
+        return False
+
     def was_recent_programmatic_change(
         self,
         project_name: str,
