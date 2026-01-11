@@ -725,6 +725,304 @@ class WorkExecutionStateTracker:
         # All checks passed
         return True, "eligible_for_retry"
 
+    def should_retry_execution(
+        self,
+        project_name: str,
+        issue_number: int,
+        max_retries: int = None
+    ) -> tuple:
+        """
+        Check if execution should be retried (works for both failed and successful-but-empty executions).
+
+        This is the public API for checking retry eligibility. It wraps _should_retry_failed_execution
+        with additional context loading.
+
+        Args:
+            project_name: Project name
+            issue_number: Issue number
+            max_retries: Optional max retry limit (defaults to WATCHDOG_MAX_RETRIES env var)
+
+        Returns:
+            (should_retry: bool, reason: str)
+        """
+        state = self.load_state(project_name, issue_number)
+        if not state or not state['execution_history']:
+            return False, "No execution state found"
+
+        # Get last execution
+        last_execution = state['execution_history'][-1]
+        agent = last_execution.get('agent')
+        column = last_execution.get('column')
+
+        if not agent or not column:
+            return False, "Missing agent or column in execution state"
+
+        # Use comprehensive eligibility checks
+        return self._should_retry_failed_execution(
+            project_name, issue_number, agent, column, last_execution
+        )
+
+    def detect_and_retry_empty_successful_executions(self) -> int:
+        """
+        Detect executions marked as 'success' but with no GitHub output.
+        Mark them as 'failure' to trigger retry.
+
+        This watchdog runs as a scheduled task and uses comprehensive race condition
+        protections to prevent duplicate work launches:
+        1. has_active_execution() - Checks ALL 4 types of active work
+        2. Pipeline lock verification
+        3. Queue status check
+        4. Execution eligibility via _should_retry_failed_execution
+        5. 5-minute recency check
+
+        CRITICAL: This method only marks executions as 'failure' - it does NOT
+        directly trigger work. The project_monitor picks up failed executions and
+        handles retry with its own race protections.
+
+        Returns:
+            Number of executions marked for retry
+        """
+        import os
+        from pathlib import Path
+        from datetime import datetime, timedelta
+        import re
+
+        if not self.state_dir.exists():
+            logger.debug("No execution state directory found, skipping empty output detection")
+            return 0
+
+        retried_count = 0
+        state_files = list(self.state_dir.glob("*.yaml"))
+
+        logger.info(f"Watchdog: Checking {len(state_files)} execution state files for empty outputs")
+
+        for state_file in state_files:
+            try:
+                from utils.file_lock import file_lock
+
+                # Use file lock for entire read-modify-write cycle
+                lock_file = state_file.with_suffix(state_file.suffix + '.lock')
+                with file_lock(lock_file):
+                    # Load state
+                    if not state_file.exists():  # Check inside lock
+                        continue
+                    with open(state_file, 'r') as f:
+                        state = yaml.safe_load(f)
+
+                    if not state or not state['execution_history']:
+                        continue
+
+                    # Get last execution
+                    last_exec = state['execution_history'][-1]
+
+                    # Only check successful executions
+                    if last_exec.get('outcome') != 'success':
+                        continue
+
+                    # Parse project and issue from state
+                    project_name = state.get('project_name')
+                    issue_number = state.get('issue_number')
+
+                    if not project_name or not issue_number:
+                        logger.warning(f"Malformed state file {state_file}: missing project or issue")
+                        continue
+
+                    # PROTECTION 1: Check for active execution (ANY type of work)
+                    if self.has_active_execution(project_name, issue_number):
+                        logger.debug(
+                            f"Watchdog: Skipping {project_name}/#{issue_number}: work already in progress"
+                        )
+                        continue
+
+                    # PROTECTION 2: Check pipeline lock
+                    try:
+                        from services.pipeline_lock_manager import get_pipeline_lock_manager
+                        from config.manager import config_manager
+
+                        lock_manager = get_pipeline_lock_manager()
+                        project_config = config_manager.get_project_config(project_name)
+
+                        if project_config:
+                            # Get pipeline config for this project
+                            pipeline_configs = project_config.get('pipelines', {}).get('enabled', [])
+                            for pipeline_config in pipeline_configs:
+                                board_name = pipeline_config.get('workflow', 'unknown')
+                                lock_status = lock_manager.get_lock_status(project_name, board_name)
+                                if lock_status and lock_status.issue_number:
+                                    logger.debug(
+                                        f"Watchdog: Skipping {project_name}/#{issue_number}: "
+                                        f"pipeline locked by issue #{lock_status.issue_number}"
+                                    )
+                                    continue
+                    except Exception as e:
+                        logger.debug(f"Watchdog: Could not check pipeline lock: {e}")
+
+                    # PROTECTION 3: Check queue state
+                    try:
+                        from services.pipeline_queue_manager import get_pipeline_queue
+
+                        queue_manager = get_pipeline_queue()
+                        # Check if issue is already queued or active
+                        # Note: This is a simple check - queue manager would need to expose status API
+                        # For now, skip this protection as it requires queue manager changes
+                    except Exception as e:
+                        logger.debug(f"Watchdog: Could not check queue status: {e}")
+
+                    # PROTECTION 4: Check execution eligibility
+                    agent = last_exec.get('agent')
+                    column = last_exec.get('column')
+
+                    if not agent or not column:
+                        logger.warning(f"Watchdog: Missing agent or column for {project_name}/#{issue_number}")
+                        continue
+
+                    should_retry, reason = self._should_retry_failed_execution(
+                        project_name, issue_number, agent, column, last_exec
+                    )
+
+                    if not should_retry:
+                        logger.debug(
+                            f"Watchdog: Not eligible for retry {project_name}/#{issue_number}: {reason}"
+                        )
+                        continue
+
+                    # PROTECTION 5: Verify no recent execution started
+                    # Check if execution completed within last 5 minutes
+                    # (could be starting but not yet marked as in_progress)
+                    if last_exec.get('completed_at'):
+                        try:
+                            completed_at_str = last_exec['completed_at'].replace('Z', '+00:00')
+                            completed_at = datetime.fromisoformat(completed_at_str)
+                            if datetime.now(completed_at.tzinfo) - completed_at < timedelta(minutes=5):
+                                logger.debug(
+                                    f"Watchdog: Skipping {project_name}/#{issue_number}: "
+                                    f"execution too recent ({completed_at})"
+                                )
+                                continue
+                        except Exception as e:
+                            logger.debug(f"Could not parse completed_at timestamp: {e}")
+
+                    # Check if GitHub output exists
+                    if self._has_github_output(project_name, issue_number, last_exec):
+                        logger.debug(
+                            f"Watchdog: {project_name}/#{issue_number} has GitHub output, "
+                            f"execution is truly successful"
+                        )
+                        continue
+
+                    # ALL PROTECTIONS PASSED - Safe to mark for retry
+                    logger.warning(
+                        f"Watchdog: Detected successful execution with no output for "
+                        f"{project_name}/#{issue_number} - marking as failure to trigger retry"
+                    )
+
+                    # Mark as failure to trigger retry
+                    last_exec['outcome'] = 'failure'
+                    last_exec['error'] = 'Execution marked as success but produced no visible GitHub output'
+                    last_exec['watchdog_retry_triggered'] = True
+                    last_exec['watchdog_retry_count'] = last_exec.get('watchdog_retry_count', 0) + 1
+                    last_exec['watchdog_last_retry_at'] = datetime.now().isoformat() + 'Z'
+
+                    # Write updated state
+                    with open(state_file, 'w') as f:
+                        yaml.dump(state, f, default_flow_style=False, sort_keys=False)
+
+                    retried_count += 1
+
+                    # Emit observability event
+                    try:
+                        from monitoring.observability import get_observability_manager, EventType
+                        obs = get_observability_manager()
+                        obs.emit(
+                            EventType.RETRY_ATTEMPTED,
+                            agent='watchdog',
+                            project=project_name,
+                            data={
+                                'issue_number': issue_number,
+                                'reason': 'empty_output_on_success',
+                                'retry_count': last_exec['watchdog_retry_count']
+                            }
+                        )
+                    except Exception as e:
+                        logger.debug(f"Could not emit observability event: {e}")
+
+            except Exception as e:
+                logger.error(f"Watchdog: Error processing {state_file}: {e}", exc_info=True)
+
+        if retried_count > 0:
+            logger.info(f"Watchdog: Marked {retried_count} executions for retry (empty output)")
+
+        return retried_count
+
+    def _has_github_output(self, project_name: str, issue_number: int, execution: dict) -> bool:
+        """
+        Check if execution resulted in GitHub output (comment/discussion post).
+
+        Args:
+            project_name: Project name
+            issue_number: Issue number
+            execution: Execution record dict
+
+        Returns:
+            True if GitHub output exists, False otherwise
+        """
+        from datetime import datetime
+
+        try:
+            from services.github_api_client import get_github_client
+            from config.manager import config_manager
+
+            gh = get_github_client()
+            project_config = config_manager.get_project_config(project_name)
+
+            if not project_config:
+                logger.warning(f"No project config for {project_name}")
+                return False  # Can't verify, assume no output
+
+            agent = execution.get('agent')
+            completed_at = execution.get('completed_at')
+
+            if not agent or not completed_at:
+                logger.debug("Missing agent or completed_at in execution record")
+                return False
+
+            # Parse completion timestamp
+            completed_at_str = completed_at.replace('Z', '+00:00')
+            completed_dt = datetime.fromisoformat(completed_at_str)
+
+            # Check for comments after completion time
+            org = project_config['github']['org']
+            repo = project_config['github']['repo']
+            endpoint = f'repos/{org}/{repo}/issues/{issue_number}/comments'
+
+            success, comments = gh.rest('GET', endpoint)
+
+            if not success:
+                logger.warning(f"Failed to fetch comments for {project_name}/#{issue_number}")
+                return False  # Can't verify, assume no output to be safe
+
+            # Check if any comment was created after completion
+            for comment in comments:
+                try:
+                    created_at = datetime.fromisoformat(comment['created_at'].replace('Z', '+00:00'))
+                    if created_at > completed_dt:
+                        # Found a comment after execution - assume it's the output
+                        logger.debug(
+                            f"Found GitHub comment after execution completion for "
+                            f"{project_name}/#{issue_number}"
+                        )
+                        return True
+                except Exception as e:
+                    logger.debug(f"Error parsing comment timestamp: {e}")
+                    continue
+
+            logger.debug(f"No GitHub output found for {project_name}/#{issue_number} after {completed_dt}")
+            return False
+
+        except Exception as e:
+            logger.error(f"Error checking GitHub output for {project_name}/#{issue_number}: {e}")
+            return False  # Can't verify, mark as no output to be safe
+
     def cleanup_stuck_in_progress_states(self):
         """
         Clean up execution states that are stuck as 'in_progress'.
@@ -901,8 +1199,42 @@ class WorkExecutionStateTracker:
 
                                 logger.info(
                                     f"Marked stuck execution as failed: {project_name}/#{issue_number} "
-                                    f"{agent} in {column} (no container found, outcome not recorded)"
+                                    f"{agent} in {column} (no container found, outcome not recorded)."
                                 )
+
+                                # CRITICAL BUG FIX: End the pipeline run to allow retry
+                                # The root cause of deadlocks is that pipeline runs stay active after
+                                # execution failures, blocking the project monitor from re-triggering work.
+                                #
+                                # The project monitor checks `has_active_run` and skips issues with active
+                                # pipeline runs, assuming work is in progress. But when executions fail and
+                                # containers die, there's no active work - just a stale pipeline run blocking retry.
+                                #
+                                # Ending the pipeline run allows the project monitor to see the issue needs work:
+                                # - If issue holds lock → Monitor will retry (lock already acquired)
+                                # - If issue in queue → Monitor will process when lock available
+                                #
+                                # The end_pipeline_run() function handles lock release and queue processing automatically.
+                                try:
+                                    from services.pipeline_run import get_pipeline_run_manager
+                                    pipeline_run_mgr = get_pipeline_run_manager()
+                                    active_run = pipeline_run_mgr.get_active_pipeline_run(project_name, issue_number)
+
+                                    if active_run:
+                                        logger.info(
+                                            f"Ending stale pipeline run for {project_name}/#{issue_number} to allow retry. "
+                                            f"Pipeline run was active but all executions failed and container is gone."
+                                        )
+                                        pipeline_run_mgr.end_pipeline_run(project_name, issue_number)
+                                    else:
+                                        logger.debug(
+                                            f"No active pipeline run found for {project_name}/#{issue_number}"
+                                        )
+                                except Exception as e:
+                                    logger.error(
+                                        f"Failed to end pipeline run for {project_name}/#{issue_number}: {e}. "
+                                        f"Issue may remain stuck - manual intervention may be required."
+                                    )
                             else:
                                 logger.info(
                                     f"Agent container still running for {project_name}/#{issue_number}, "

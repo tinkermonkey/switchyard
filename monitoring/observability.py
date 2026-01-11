@@ -172,7 +172,14 @@ class EventType(Enum):
     CIRCUIT_BREAKER_OPENED = "circuit_breaker_opened"
     CIRCUIT_BREAKER_CLOSED = "circuit_breaker_closed"
     RETRY_ATTEMPTED = "retry_attempted"
-    
+
+    # Container Result Persistence & Recovery
+    RESULT_PERSISTENCE_FAILED = "result_persistence_failed"
+    FALLBACK_STORAGE_USED = "fallback_storage_used"
+    OUTPUT_VALIDATION_FAILED = "output_validation_failed"
+    EMPTY_OUTPUT_DETECTED = "empty_output_detected"
+    CONTAINER_RESULT_RECOVERED = "container_result_recovered"
+
     # Task Queue Management
     TASK_QUEUED = "task_queued"
     TASK_DEQUEUED = "task_dequeued"
@@ -369,6 +376,12 @@ class ObservabilityManager:
             EventType.CIRCUIT_BREAKER_OPENED,
             EventType.CIRCUIT_BREAKER_CLOSED,
             EventType.RETRY_ATTEMPTED,
+            # Container Result Persistence & Recovery
+            EventType.RESULT_PERSISTENCE_FAILED,
+            EventType.FALLBACK_STORAGE_USED,
+            EventType.OUTPUT_VALIDATION_FAILED,
+            EventType.EMPTY_OUTPUT_DETECTED,
+            EventType.CONTAINER_RESULT_RECOVERED,
             # Task Queue Management
             EventType.TASK_QUEUED,
             EventType.TASK_DEQUEUED,

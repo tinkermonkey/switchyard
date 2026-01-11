@@ -1225,6 +1225,56 @@ class DockerAgentRunner:
 
             if exit_code == 0:
                 result_text = ''.join(result_parts)
+
+                # CRITICAL: Validate output before marking as success
+                # Exit code 0 with empty output is a failure (wrapper couldn't persist, or Claude crashed)
+                is_valid, validation_error = self._validate_result(exit_code, result_text, container_name)
+
+                if not is_valid:
+                    # Validation failed - treat as failure even though exit code was 0
+                    logger.error(
+                        f"❌ Container {container_name} validation failed: {validation_error} - "
+                        f"marking as failure to trigger retry"
+                    )
+
+                    # Persist failure result to Redis
+                    if 'issue_number' in context.get('context', {}):
+                        task_context = context.get('context', {})
+                        issue_number = task_context['issue_number']
+                        self._persist_agent_result_to_redis(
+                            container_name=container_name,
+                            project=project,
+                            issue_number=issue_number,
+                            agent=agent,
+                            task_id=task_id,
+                            exit_code=1,  # Mark as failure exit code
+                            output=f"VALIDATION FAILED: {validation_error}\n\nOutput:\n{result_text}"
+                        )
+
+                        # Record as failure
+                        try:
+                            from services.work_execution_state import work_execution_tracker
+                            column = task_context.get('column', 'unknown')
+
+                            if column != 'unknown':
+                                work_execution_tracker.record_execution_outcome(
+                                    issue_number=issue_number,
+                                    column=column,
+                                    agent=agent,
+                                    outcome='failure',
+                                    project_name=project,
+                                    error=validation_error
+                                )
+                                logger.info(
+                                    f"✓ Docker runner recorded validation failure for {project}/#{issue_number} {agent} in {column}"
+                                )
+                        except Exception as outcome_error:
+                            logger.error(f"Failed to record validation failure outcome: {outcome_error}", exc_info=True)
+
+                    # Return empty string to indicate failure
+                    return ""
+
+                # Validation passed - proceed with success
                 logger.info(f"Agent completed successfully in container, result length: {len(result_text)}")
 
                 # NEW: Persist result to Redis BEFORE processing
@@ -1467,6 +1517,62 @@ class DockerAgentRunner:
         except Exception as e:
             logger.warning(f"Failed to cleanup container {container_name}: {e}")
 
+    def _validate_result(self, exit_code: int, result_text: str, container_name: str) -> tuple:
+        """
+        Validate that exit code and result match expected success criteria.
+
+        Exit code 0 should mean success, but only if we actually have output.
+        Empty output with exit 0 indicates:
+        - Wrapper failed to persist result (Redis + file both failed)
+        - Claude crashed after wrapper started but before producing output
+        - Container was killed mid-execution
+
+        All of these are failures that should trigger retry.
+
+        Returns:
+            (is_valid: bool, error_message: str)
+            - (True, '') if valid success
+            - (False, error_message) if validation failed
+        """
+        if exit_code == 0:
+            # Success exit code - validate we actually have output
+            if not result_text or result_text.strip() == '':
+                return (
+                    False,
+                    'Container exited with code 0 but produced no output (wrapper persistence failure or Claude crash)'
+                )
+
+            # Additional validation: check if output is just whitespace or minimal
+            stripped = result_text.strip()
+            if len(stripped) < 50:
+                return (
+                    False,
+                    f'Container produced insufficient output: {len(stripped)} chars (minimum 50 expected)'
+                )
+
+            # Check for error markers in output (even though exit code was 0)
+            error_markers = [
+                'CRITICAL ERROR',
+                'FATAL:',
+                'Traceback (most recent call last):',
+                'redis.exceptions',
+                'ConnectionRefusedError'
+            ]
+
+            for marker in error_markers:
+                if marker in result_text[:1000]:  # Check first 1KB
+                    return (
+                        False,
+                        f'Output contains error marker "{marker}" despite exit code 0'
+                    )
+
+            # All validations passed
+            return (True, '')
+
+        else:
+            # Non-zero exit code is expected failure (no validation needed)
+            return (True, '')
+
     def _persist_agent_result_to_redis(
         self,
         container_name: str,
@@ -1621,7 +1727,31 @@ class DockerAgentRunner:
             except Exception as e:
                 logger.error(f"Failed to load persisted result from Redis: {e}")
 
-            # If no Redis result, try to get logs from stopped container (if still exists)
+            # Fallback 2: Try to get result from container's fallback file (/tmp/agent_result_{task_id}.json)
+            # This is written by docker-claude-wrapper.py when Redis write fails
+            if not output:
+                try:
+                    result_file = f"/tmp/agent_result_{task_id}.json"
+                    result = subprocess.run(
+                        ['docker', 'cp', f'{container_name}:{result_file}', '-'],
+                        capture_output=True,
+                        text=True,
+                        timeout=10
+                    )
+                    if result.returncode == 0 and result.stdout:
+                        import json
+                        fallback_data = json.loads(result.stdout)
+                        output = fallback_data.get('output', '')
+                        logger.info(
+                            f"✓ Retrieved result from container fallback file: {result_file} "
+                            f"(Redis write failed during execution)"
+                        )
+                    else:
+                        logger.debug(f"No fallback file found in container at {result_file}")
+                except Exception as e:
+                    logger.debug(f"Could not retrieve fallback file from container: {e}")
+
+            # Fallback 3: Try to get logs from stopped container (if still exists)
             if not output:
                 try:
                     result = subprocess.run(
