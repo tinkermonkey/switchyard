@@ -45,6 +45,8 @@ class HealthMonitor:
         
     async def check_health(self) -> Dict[str, Any]:
         """Run all health checks"""
+        import logging
+        logging.getLogger("orchestrator").info("⚕️  Running health check")
         results = {}
 
         for name, check in self.health_checks.items():
@@ -81,6 +83,7 @@ class HealthMonitor:
                 600,  # 10 minute TTL (health check max backoff is 5 minutes)
                 json.dumps(health_result)
             )
+            logging.getLogger("orchestrator").info(f"✓ Health check complete: healthy={health_result['healthy']}, stored in Redis")
         except Exception as e:
             # Log but don't fail health check if Redis is unavailable
             import logging
