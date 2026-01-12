@@ -460,6 +460,97 @@ class PipelineQueueManager:
 
             logger.info(f"Removed issue #{issue_number} from pipeline queue")
 
+    def force_sync_with_github(self):
+        """
+        Force complete resynchronization with GitHub board state.
+
+        This is a more aggressive version of sync_queue_with_github that:
+        - Removes ALL issues not currently in the GitHub trigger column
+        - Does NOT preserve "active" issues that have moved
+        - Treats GitHub as absolute source of truth
+
+        Use this for state recovery when queue has become corrupted or out of sync.
+        Scheduled to run every 10 minutes to prevent long-term drift.
+        """
+        logger.info(
+            f"FORCE SYNC: Completely resynchronizing {self.project_name}/{self.board_name} "
+            f"queue with GitHub board state"
+        )
+
+        # STEP 1: Fetch data from GitHub OUTSIDE the lock
+        trigger_column = self._get_pipeline_trigger_column()
+        issues_in_column = self.get_issues_in_column_order(trigger_column)
+        github_issue_numbers = {item['issue_number'] for item in issues_in_column}
+
+        # STEP 2: Hold lock for file read-modify-write
+        with self._queue_lock():
+            queue = self.load_queue()
+            updated_queue = []
+            removed_count = 0
+            updated_count = 0
+
+            for issue in queue:
+                issue_number = issue['issue_number']
+
+                # If issue is NO LONGER in trigger column, REMOVE it (even if active)
+                if issue_number not in github_issue_numbers:
+                    logger.info(
+                        f"FORCE SYNC: Removing issue #{issue_number} "
+                        f"(not in GitHub '{trigger_column}' column, status was '{issue['status']}')"
+                    )
+                    removed_count += 1
+                    continue  # Don't add to updated_queue
+
+                # Issue is still in column - update its position from GitHub
+                github_position = next(
+                    (item['position'] for item in issues_in_column
+                     if item['issue_number'] == issue_number),
+                    None
+                )
+
+                if github_position is not None:
+                    old_position = issue.get('position_in_column')
+                    if old_position != github_position:
+                        logger.info(
+                            f"FORCE SYNC: Issue #{issue_number} position updated: "
+                            f"{old_position} → {github_position}"
+                        )
+                        issue['position_in_column'] = github_position
+                        issue['last_position_check'] = datetime.now(timezone.utc).isoformat()
+                        updated_count += 1
+
+                updated_queue.append(issue)
+
+            # Add newly discovered issues from GitHub that aren't in the queue yet
+            queued_issue_numbers = {issue['issue_number'] for issue in updated_queue}
+            added_count = 0
+
+            for github_item in issues_in_column:
+                if github_item['issue_number'] not in queued_issue_numbers:
+                    new_issue = {
+                        'issue_number': github_item['issue_number'],
+                        'position_in_column': github_item['position'],
+                        'status': 'waiting',
+                        'added_at': datetime.now(timezone.utc).isoformat(),
+                        'last_position_check': datetime.now(timezone.utc).isoformat(),
+                        'title': github_item.get('title', f"Issue #{github_item['issue_number']}")
+                    }
+                    updated_queue.append(new_issue)
+                    added_count += 1
+                    logger.info(
+                        f"FORCE SYNC: Added new issue #{github_item['issue_number']} "
+                        f"at position {github_item['position']}"
+                    )
+
+            # Save the synchronized queue
+            self.save_queue(updated_queue)
+
+            logger.info(
+                f"FORCE SYNC complete for {self.project_name}/{self.board_name}: "
+                f"{len(updated_queue)} issues in queue "
+                f"({removed_count} removed, {added_count} added, {updated_count} updated)"
+            )
+
     def reset_issue_to_waiting(self, issue_number: int):
         """
         Reset an issue from active back to waiting status.
