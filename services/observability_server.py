@@ -1043,7 +1043,7 @@ def kill_pipeline_run(pipeline_run_id):
 
 @app.route('/active-pipeline-runs')
 def get_active_pipeline_runs():
-    """Get all currently active pipeline runs"""
+    """Get all currently active pipeline runs with lock status"""
     try:
         # Query Elasticsearch for active pipeline runs
         query = {
@@ -1055,22 +1055,50 @@ def get_active_pipeline_runs():
             "sort": [{"started_at": "desc"}],
             "size": 100
         }
-        
+
         result = es_client.search(
             index="pipeline-runs-*",
             body=query
         )
-        
+
+        # Get pipeline lock manager for lock status
+        from services.pipeline_lock_manager import get_pipeline_lock_manager
+        lock_manager = get_pipeline_lock_manager()
+
         runs = []
         for hit in result['hits']['hits']:
-            runs.append(hit['_source'])
-        
+            run_data = hit['_source']
+
+            # Add lock status information
+            project = run_data.get('project')
+            board = run_data.get('board')
+            issue_number = run_data.get('issue_number')
+
+            if project and board and issue_number:
+                lock_status = lock_manager.get_lock_status_for_issue(
+                    project, board, issue_number
+                )
+                lock_holder = lock_manager.get_lock_holder(project, board)
+
+                run_data['lock_status'] = lock_status
+                run_data['lock_holder_issue'] = lock_holder
+
+                # Add additional context based on lock status
+                if lock_status == 'waiting_for_lock' and lock_holder:
+                    run_data['blocked_by_issue'] = lock_holder
+            else:
+                # Missing data - mark as unknown
+                run_data['lock_status'] = 'unknown'
+                run_data['lock_holder_issue'] = None
+
+            runs.append(run_data)
+
         return jsonify({
             'success': True,
             'runs': runs,
             'count': len(runs)
         })
-        
+
     except Exception as e:
         # Handle index not found gracefully (returns empty list at debug level)
         if 'index_not_found_exception' in str(e) or 'no such index' in str(e):
@@ -2571,6 +2599,70 @@ def release_pipeline_lock(project, board):
 
     except Exception as e:
         logger.error(f"Error releasing pipeline lock: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+@app.route('/api/reconcile-state', methods=['POST'])
+def reconcile_state():
+    """
+    Force reconciliation of system state.
+
+    This endpoint triggers immediate reconciliation of:
+    - Docker container state with tracking systems
+    - Pipeline queues with GitHub board state
+    - Execution states and pipeline locks
+
+    Request body (optional):
+        {
+            "docker": true,     # Reconcile Docker containers (default: true)
+            "queues": true,     # Force sync queues with GitHub (default: true)
+            "project": "name"   # Optional: only reconcile specific project
+        }
+
+    Returns:
+        JSON with reconciliation results
+    """
+    try:
+        from services.scheduled_tasks import get_scheduled_tasks_service
+
+        scheduler = get_scheduled_tasks_service()
+
+        # Get request options
+        request_data = request.get_json() if request.is_json else {}
+        reconcile_docker = request_data.get('docker', True)
+        reconcile_queues = request_data.get('queues', True)
+        specific_project = request_data.get('project')
+
+        results = {
+            'docker_reconciliation': None,
+            'queue_reconciliation': None
+        }
+
+        # Trigger Docker state reconciliation
+        if reconcile_docker:
+            logger.info("Manual trigger: Docker state reconciliation")
+            scheduler.run_docker_reconciliation_now()
+            results['docker_reconciliation'] = 'triggered'
+
+        # Trigger queue state reconciliation
+        if reconcile_queues:
+            logger.info("Manual trigger: Queue state reconciliation")
+            scheduler.run_queue_reconciliation_now()
+            results['queue_reconciliation'] = 'triggered'
+
+        return jsonify({
+            'success': True,
+            'message': 'State reconciliation triggered',
+            'results': results,
+            'note': 'Reconciliation runs asynchronously - check logs for results'
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Error triggering state reconciliation: {e}")
         import traceback
         logger.error(traceback.format_exc())
         return jsonify({

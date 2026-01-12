@@ -1,5 +1,5 @@
 import { createFileRoute } from '@tanstack/react-router'
-import { RefreshCw, Activity, CheckCircle, XCircle, AlertCircle, MessageSquare, GitBranch, PlayCircle } from 'lucide-react'
+import { RefreshCw, Activity, CheckCircle, XCircle, AlertCircle, MessageSquare, GitBranch, PlayCircle, Lock, Unlock, Clock } from 'lucide-react'
 import Header from '../components/Header'
 import NavigationTabs from '../components/NavigationTabs'
 import CycleBoundingNode from '../components/CycleBoundingNode'
@@ -201,6 +201,35 @@ const PipelineEventNode = ({ data }) => {
 const nodeTypes = {
   pipelineEvent: PipelineEventNode,
   cycleBounding: CycleBoundingNode,
+}
+
+/**
+ * Render lock status badge for a pipeline run
+ */
+const LockStatusBadge = ({ lockStatus, lockHolderIssue, currentIssue }) => {
+  if (lockStatus === 'holding_lock') {
+    return (
+      <div className="flex items-center gap-1 text-xs text-green-400 bg-green-900/20 border border-green-700/30 px-2 py-0.5 rounded">
+        <Lock className="w-3 h-3" />
+        <span>Holding Lock</span>
+      </div>
+    )
+  } else if (lockStatus === 'waiting_for_lock') {
+    return (
+      <div className="flex items-center gap-1 text-xs text-yellow-400 bg-yellow-900/20 border border-yellow-700/30 px-2 py-0.5 rounded">
+        <Clock className="w-3 h-3" />
+        <span>Waiting (#{lockHolderIssue})</span>
+      </div>
+    )
+  } else if (lockStatus === 'no_lock') {
+    return (
+      <div className="flex items-center gap-1 text-xs text-blue-400 bg-blue-900/20 border border-blue-700/30 px-2 py-0.5 rounded">
+        <Unlock className="w-3 h-3" />
+        <span>No Lock</span>
+      </div>
+    )
+  }
+  return null
 }
 
 function PipelineRunView() {
@@ -899,6 +928,15 @@ function PipelineRunView() {
                       <div className="text-xs mt-1 opacity-75">
                         Started {formatDuration(run.started_at)} ago
                       </div>
+                      {run.lock_status && (
+                        <div className="mt-2">
+                          <LockStatusBadge
+                            lockStatus={run.lock_status}
+                            lockHolderIssue={run.lock_holder_issue}
+                            currentIssue={run.issue_number}
+                          />
+                        </div>
+                      )}
                     </button>
                   ))}
                 </div>
@@ -984,7 +1022,16 @@ function PipelineRunView() {
               <>
                 <div className="mb-4 flex items-start justify-between">
                   <div>
-                    <h2 className="text-xl font-semibold">{selectedPipelineRun.issue_title}</h2>
+                    <div className="flex items-center gap-3">
+                      <h2 className="text-xl font-semibold">{selectedPipelineRun.issue_title}</h2>
+                      {selectedPipelineRun.lock_status && (
+                        <LockStatusBadge
+                          lockStatus={selectedPipelineRun.lock_status}
+                          lockHolderIssue={selectedPipelineRun.lock_holder_issue}
+                          currentIssue={selectedPipelineRun.issue_number}
+                        />
+                      )}
+                    </div>
                     <p className="text-sm text-gh-fg-muted mt-1">
                       {selectedPipelineRun.project} • Issue #{selectedPipelineRun.issue_number} • Board: {selectedPipelineRun.board}
                     </p>
@@ -992,6 +1039,11 @@ function PipelineRunView() {
                       Started: {new Date(selectedPipelineRun.started_at).toLocaleString()}
                       {selectedPipelineRun.ended_at && ` • Ended: ${new Date(selectedPipelineRun.ended_at).toLocaleString()}`}
                     </p>
+                    {selectedPipelineRun.lock_status === 'waiting_for_lock' && selectedPipelineRun.blocked_by_issue && (
+                      <div className="mt-2 text-xs text-yellow-400 bg-yellow-900/10 border border-yellow-700/20 px-3 py-2 rounded">
+                        ⚠️ This pipeline is waiting for lock currently held by issue #{selectedPipelineRun.blocked_by_issue}
+                      </div>
+                    )}
                   </div>
                   
                   <div className="flex gap-2">
