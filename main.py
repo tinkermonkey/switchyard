@@ -192,7 +192,13 @@ async def main():
     lock_manager = get_pipeline_lock_manager()
     locks_recovered = 0
     locks_released = 0
-    
+
+    # NEW: Force sync YAML locks to Redis BEFORE processing them
+    # This ensures Redis (source of truth) is populated from YAML persistence
+    logger.info("Syncing YAML locks to Redis for recovery")
+    locks_synced = lock_manager.sync_yaml_locks_to_redis()
+    logger.info(f"Synced {locks_synced} locks to Redis from YAML")
+
     # Track issues that were re-triggered during lock recovery
     # These should NOT be cleaned up during pipeline run cleanup
     retriggered_issues = set()  # Set of (project, issue_number) tuples
@@ -359,6 +365,11 @@ async def main():
         f"Pipeline lock recovery complete: {locks_recovered} locks kept, "
         f"{locks_released} locks released, {len(retriggered_issues)} issues re-triggered"
     )
+
+    # NOTE: Known race condition: If lock recovery re-triggered work, the board rescan
+    # might dispatch the same issue before containers register in work_execution_state.
+    # The has_active_execution() check in rescan provides partial mitigation but is not
+    # perfect due to timing window. Proper fix requires atomic check-and-dispatch pattern.
 
     # NOTE: Stall detection moved to after startup rescan completes
     # This prevents race condition where review cycles haven't queued tasks yet

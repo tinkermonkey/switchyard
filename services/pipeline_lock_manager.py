@@ -472,6 +472,132 @@ class PipelineLockManager:
 
         return locks
 
+    def sync_yaml_locks_to_redis(self) -> int:
+        """
+        Sync all YAML locks to Redis during startup recovery.
+
+        This ensures Redis (source of truth) matches YAML persistence
+        after orchestrator restart when Redis may have been cleared.
+
+        IMPORTANT: This has a known race condition if multiple orchestrator
+        instances start simultaneously. Proper fix requires leader election.
+
+        Returns:
+            Number of locks synced to Redis
+        """
+        if not self.redis_client:
+            logger.warning("Cannot sync locks to Redis - Redis not available")
+            return 0
+
+        synced_count = 0
+        skipped_count = 0
+        locks = self.get_all_locks()  # Read from YAML
+
+        for lock in locks:
+            try:
+                lock_key = self._get_lock_key(lock.project, lock.board)
+
+                # Validate lock age - don't sync stale locks (older than 2 hours)
+                from datetime import datetime, timezone, timedelta
+                lock_age_threshold = datetime.now(timezone.utc) - timedelta(hours=2)
+                lock_acquired_time = datetime.fromisoformat(lock.lock_acquired_at.replace('Z', '+00:00'))
+
+                if lock_acquired_time < lock_age_threshold:
+                    logger.warning(
+                        f"Skipping stale lock sync: {lock.project}/{lock.board} "
+                        f"held by issue #{lock.locked_by_issue} (age: {datetime.now(timezone.utc) - lock_acquired_time})"
+                    )
+                    skipped_count += 1
+                    continue
+
+                # Check if lock already exists in Redis
+                existing_lock = self.redis_client.hgetall(lock_key)
+
+                if not existing_lock:
+                    # Lock missing in Redis - sync it
+                    lock_data = asdict(lock)
+                    self.redis_client.hset(lock_key, mapping=lock_data)
+                    self.redis_client.expire(lock_key, 7200)  # 2 hour TTL
+                    logger.info(
+                        f"Synced lock to Redis: {lock.project}/{lock.board} "
+                        f"held by issue #{lock.locked_by_issue}"
+                    )
+                    synced_count += 1
+                else:
+                    # Lock exists in Redis - don't overwrite to avoid conflicts
+                    existing_holder = existing_lock.get(b'locked_by_issue', existing_lock.get('locked_by_issue'))
+                    logger.warning(
+                        f"Lock already in Redis: {lock.project}/{lock.board} "
+                        f"(Redis: issue #{existing_holder}, YAML: issue #{lock.locked_by_issue}) - "
+                        f"not overwriting to prevent race condition"
+                    )
+                    skipped_count += 1
+            except Exception as e:
+                logger.error(f"Failed to sync lock to Redis: {e}")
+
+        if skipped_count > 0:
+            logger.info(f"Lock sync summary: {synced_count} synced, {skipped_count} skipped")
+
+        return synced_count
+
+    def get_lock_holder(self, project: str, board: str) -> Optional[int]:
+        """
+        Get the issue number that currently holds the lock for a pipeline.
+
+        Args:
+            project: Project name
+            board: Board name
+
+        Returns:
+            Issue number holding the lock, or None if unlocked
+        """
+        lock = self.get_lock(project, board)
+        return lock.locked_by_issue if lock else None
+
+    def is_locked_by_issue(self, project: str, board: str, issue_number: int) -> bool:
+        """
+        Check if a specific issue currently holds the lock.
+
+        Args:
+            project: Project name
+            board: Board name
+            issue_number: Issue number to check
+
+        Returns:
+            True if the issue holds the lock, False otherwise
+        """
+        lock_holder = self.get_lock_holder(project, board)
+        return lock_holder == issue_number if lock_holder is not None else False
+
+    def get_lock_status_for_issue(
+        self,
+        project: str,
+        board: str,
+        issue_number: int
+    ) -> str:
+        """
+        Get the lock status for a specific issue in a pipeline.
+
+        Args:
+            project: Project name
+            board: Board name
+            issue_number: Issue number to check
+
+        Returns:
+            'holding_lock' - Issue currently holds the lock
+            'waiting_for_lock' - Issue is waiting, another issue holds lock
+            'no_lock' - Pipeline is unlocked
+        """
+        lock = self.get_lock(project, board)
+
+        if not lock:
+            return 'no_lock'
+
+        if lock.locked_by_issue == issue_number:
+            return 'holding_lock'
+        else:
+            return 'waiting_for_lock'
+
 
 # Singleton instance
 _pipeline_lock_manager = None

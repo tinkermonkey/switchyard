@@ -1582,6 +1582,20 @@ class ProjectMonitor:
                         )
 
             if agent and agent != 'null':
+                # DEFENSE-IN-DEPTH: Verify lock is still held before execution
+                # This catches race conditions that slipped through earlier checks
+                from services.pipeline_lock_manager import get_pipeline_lock_manager
+                lock_manager_verify = get_pipeline_lock_manager()
+                current_lock_verify = lock_manager_verify.get_lock(project_name, pipeline_config.board_name)
+
+                if current_lock_verify and current_lock_verify.locked_by_issue != issue_number:
+                    logger.error(
+                        f"CRITICAL: Issue #{issue_number} lost pipeline lock before execution! "
+                        f"Now held by issue #{current_lock_verify.locked_by_issue}. "
+                        f"Aborting to prevent race condition."
+                    )
+                    return None
+
                 # Determine workspace type and get discussion ID FIRST, before using them
                 from config.state_manager import state_manager
                 workspace_type = pipeline_config.workspace
@@ -2907,9 +2921,7 @@ _Review cycle initiated by Claude Code Orchestrator_
                                                 'timestamp': datetime.utcnow().isoformat() + 'Z'
                                             }
                                             
-                                            from task_queue.task_queue_factory import get_task_queue
-                                            task_queue = get_task_queue()
-                                            
+                                            # Use self.task_queue that was passed to ProjectMonitor during initialization
                                             task = Task(
                                                 id=f"{agent}_{project_name}_{board_name}_{next_issue['issue_number']}_{int(time.time())}",
                                                 agent=agent,
@@ -2918,8 +2930,8 @@ _Review cycle initiated by Claude Code Orchestrator_
                                                 context=task_context,
                                                 created_at=datetime.utcnow().isoformat() + 'Z'
                                             )
-                                            
-                                            task_queue.enqueue(task)
+
+                                            self.task_queue.enqueue(task)
                                             task_created = True
                                             
                                             logger.info(
@@ -3909,17 +3921,17 @@ _Repair cycle initiated by Claude Code Orchestrator_
     def _rescan_boards_for_stalled_items(self):
         """
         Rescan all boards after startup to dispatch agents for items already in action-required columns.
-        
+
         This handles the case where:
         1. Orchestrator cleaned up stale pipeline runs during startup
         2. Items are sitting in columns that require agent action (Development, Testing, etc.)
         3. No active pipeline runs exist for these items
-        
+
         We simulate an "item_added" event for each item in an action-required column
         that doesn't have an active pipeline run.
         """
         from config.state_manager import state_manager
-        
+
         try:
             dispatched_count = 0
 
@@ -4020,6 +4032,17 @@ _Repair cycle initiated by Claude Code Orchestrator_
                                 logger.debug(
                                     f"Issue #{item.issue_number} in {item.status} skipped - pipeline locked by issue #{current_lock.locked_by_issue}"
                                 )
+                            continue
+
+                        # CRITICAL: Check if work has already been scheduled for this issue
+                        # This prevents race condition where lock recovery re-triggered work
+                        # but rescan runs before container starts (same fix as regular monitoring)
+                        from services.work_execution_state import work_execution_tracker
+                        if work_execution_tracker.has_active_execution(project_name, item.issue_number):
+                            logger.debug(
+                                f"Issue #{item.issue_number} in {item.status} already has active work "
+                                f"(scheduled by lock recovery or other source) - skipping"
+                            )
                             continue
 
                         # CRITICAL: Check if work has already been completed for this column/agent
@@ -4448,8 +4471,12 @@ _Repair cycle initiated by Claude Code Orchestrator_
                     continue
                 
                 if was_breaker_open:
-                    logger.info("🟢 Claude Code circuit breaker recovered - rescanning for stalled items...")
-                    self._rescan_boards_for_stalled_items()
+                    logger.info(
+                        "🟢 Claude Code circuit breaker recovered - regular monitoring will resume "
+                        "(no immediate rescan to prevent duplicate dispatch)"
+                    )
+                    # Don't rescan immediately - let regular monitoring loop handle stalled items
+                    # This prevents duplicate dispatches when rescan was triggered recently
                     was_breaker_open = False
                 
                 # Get all configured visible projects (exclude hidden/test projects)
