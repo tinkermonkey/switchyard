@@ -892,11 +892,28 @@ class AgentContainerRecovery:
 
             # Get repository
             repository = project_config.github.get('repo', project)
-            
+
+            # Load context to get agent_name
+            from pathlib import Path
+            import json
+
+            context_file = Path(f"/workspace/clauditoreum/orchestrator_data/repair_cycles/{project}/{issue_number}/context.json")
+            agent_name = 'senior_software_engineer'  # Default fallback
+
+            if context_file.exists():
+                try:
+                    with open(context_file, 'r') as f:
+                        context = json.load(f)
+                        agent_name = context.get('agent_name', agent_name)
+                except Exception as e:
+                    logger.warning(f"Could not load context file for agent_name: {e}, using default")
+            else:
+                logger.warning(f"Context file not found: {context_file}, using default agent_name={agent_name}")
+
             # Create monitor instance (without starting main loop)
             task_queue = TaskQueue()  # Dummy queue
             monitor = ProjectMonitor(task_queue, config_manager)
-            
+
             # Restart monitoring thread
             monitor._monitor_repair_cycle_container(
                 container_name=container_name,
@@ -907,6 +924,7 @@ class AgentContainerRecovery:
                 repository=repository,
                 project_config=project_config,
                 workflow_template=workflow_template,
+                agent_name=agent_name,
                 pipeline_run_id=run_id
             )
             
