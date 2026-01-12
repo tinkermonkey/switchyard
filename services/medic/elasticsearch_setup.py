@@ -68,6 +68,7 @@ def setup_medic_elasticsearch():
             },
             "mappings": {
                 "properties": {
+                    "@timestamp": {"type": "date"},  # Standard ES timestamp for sorting/queries
                     "fingerprint_id": {"type": "keyword"},
                     "created_at": {"type": "date"},
                     "updated_at": {"type": "date"},

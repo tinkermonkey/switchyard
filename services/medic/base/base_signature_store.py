@@ -227,6 +227,7 @@ class BaseFailureSignatureStore(ABC):
         # Build update script
         script = {
             "source": """
+                ctx._source['@timestamp'] = params.timestamp;
                 ctx._source.updated_at = params.updated_at;
                 ctx._source.last_seen = params.last_seen;
                 ctx._source.occurrence_count += 1;
@@ -240,6 +241,7 @@ class BaseFailureSignatureStore(ABC):
                 }
             """,
             "params": {
+                "timestamp": now,
                 "updated_at": now,
                 "last_seen": now,
                 "occurrences_last_hour": occurrences_last_hour,

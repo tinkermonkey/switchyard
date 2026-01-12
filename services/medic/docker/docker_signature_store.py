@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 DOCKER_FAILURE_MAPPING = {
     "mappings": {
         "properties": {
+            "@timestamp": {"type": "date"},  # Standard ES timestamp for sorting/queries
             "type": {"type": "keyword"},  # "docker"
             "project": {"type": "keyword"},  # "orchestrator"
             "fingerprint_id": {"type": "keyword"},
@@ -167,6 +168,7 @@ class DockerFailureSignatureStore(BaseFailureSignatureStore):
         impact_score = self._calculate_initial_impact_score(severity)
 
         doc = {
+            "@timestamp": now,  # Standard ES timestamp for sorting/queries
             "type": "docker",
             "project": "orchestrator",
             "fingerprint_id": fingerprint.fingerprint_id,

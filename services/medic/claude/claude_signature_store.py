@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 CLAUDE_FAILURE_MAPPING = {
     "mappings": {
         "properties": {
+            "@timestamp": {"type": "date"},  # Standard ES timestamp for sorting/queries
             "type": {"type": "keyword"},  # "claude"
             "project": {"type": "keyword"},  # Project name
             "fingerprint_id": {"type": "keyword"},
@@ -157,6 +158,7 @@ class ClaudeFailureSignatureStore(BaseFailureSignatureStore):
         )
 
         doc = {
+            "@timestamp": now,  # Standard ES timestamp for sorting/queries
             "type": "claude",
             "project": project,
             "fingerprint_id": fingerprint.fingerprint_id,
