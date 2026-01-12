@@ -478,6 +478,14 @@ class FeatureBranchManager:
         """
         import re
 
+        # Validate repository information before making API calls
+        if not github_integration.github_org or not github_integration.repo_name:
+            logger.warning(
+                f"Cannot get parent issue for #{issue_number}: "
+                f"github_org={github_integration.github_org}, repo_name={github_integration.repo_name}"
+            )
+            return None
+
         # Step 1: Try to get parent from GitHub's parent_issue_url field (REST API)
         try:
             # Use GitHub API client to query the issue with parent_issue_url field

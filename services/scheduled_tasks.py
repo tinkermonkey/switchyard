@@ -346,12 +346,15 @@ class ScheduledTasksService:
             from claude.docker_runner import DockerAgentRunner
             from services.work_execution_state import work_execution_tracker
             
+            # Run blocking operations in thread pool to avoid blocking the event loop
+            loop = asyncio.get_event_loop()
+            
             # Run the Redis key cleanup (it's synchronous)
-            DockerAgentRunner.cleanup_orphaned_redis_keys()
+            await loop.run_in_executor(None, DockerAgentRunner.cleanup_orphaned_redis_keys)
             
             # Run the execution state cleanup (it's synchronous)
             # This ensures that if a container dies silently, the state is updated to 'failure'
-            work_execution_tracker.cleanup_stuck_in_progress_states()
+            await loop.run_in_executor(None, work_execution_tracker.cleanup_stuck_in_progress_states)
             
             logger.info("Orphaned container and stuck state cleanup completed successfully")
 
@@ -378,13 +381,17 @@ class ScheduledTasksService:
             from services.work_execution_state import work_execution_tracker
             from services.pipeline_lock_manager import PipelineLockManager
 
-            # Get actual running agent containers from Docker
-            result = subprocess.run(
-                ['docker', 'ps', '--filter', 'name=claude-agent-', '--format', '{{.Names}}'],
-                capture_output=True,
-                text=True,
-                timeout=10
-            )
+            # Get actual running agent containers from Docker (run in thread pool - blocking I/O)
+            def get_docker_containers():
+                return subprocess.run(
+                    ['docker', 'ps', '--filter', 'name=claude-agent-', '--format', '{{.Names}}'],
+                    capture_output=True,
+                    text=True,
+                    timeout=10
+                )
+            
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(None, get_docker_containers)
 
             actual_containers = set()
             if result.returncode == 0 and result.stdout.strip():
@@ -622,8 +629,13 @@ class ScheduledTasksService:
         try:
             from services.work_execution_state import work_execution_tracker
 
-            # Run the detection (synchronous method)
-            retried_count = work_execution_tracker.detect_and_retry_empty_successful_executions()
+            # Run the detection in a thread pool to avoid blocking the event loop
+            # This method processes 447+ files with file locks and blocking I/O
+            loop = asyncio.get_event_loop()
+            retried_count = await loop.run_in_executor(
+                None,  # Uses default ThreadPoolExecutor
+                work_execution_tracker.detect_and_retry_empty_successful_executions
+            )
 
             if retried_count > 0:
                 logger.info(

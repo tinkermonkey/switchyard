@@ -287,6 +287,44 @@ class PipelineRunManager:
         pipeline_run_id = self.redis.hget(self.redis_issue_mapping, issue_key)
         
         if not pipeline_run_id:
+            # FALLBACK: Check Elasticsearch for active runs that aged out of Redis
+            # This handles cases where pipeline runs are older than Redis TTL
+            if self.es:
+                try:
+                    result = self.es.search(
+                        index=f"{self.es_index_pattern}-*",
+                        body={
+                            "query": {
+                                "bool": {
+                                    "must": [
+                                        {"term": {"project": project}},
+                                        {"term": {"issue_number": issue_number}},
+                                        {"term": {"status": "active"}}
+                                    ]
+                                }
+                            },
+                            "size": 1,
+                            "sort": [{"started_at": {"order": "desc"}}]
+                        }
+                    )
+                    
+                    if result['hits']['total']['value'] > 0:
+                        pipeline_run = PipelineRun.from_dict(result['hits']['hits'][0]['_source'])
+                        logger.debug(f"Found active pipeline run {pipeline_run.id} in Elasticsearch (not in Redis)")
+                        
+                        # Restore to Redis for future lookups
+                        redis_key = self._get_redis_key(pipeline_run.id)
+                        self.redis.setex(
+                            redis_key,
+                            3600,  # 1 hour TTL
+                            json.dumps(pipeline_run.to_dict())
+                        )
+                        self.redis.hset(self.redis_issue_mapping, issue_key, pipeline_run.id)
+                        
+                        return pipeline_run
+                except Exception as e:
+                    logger.debug(f"Error searching Elasticsearch for active pipeline run: {e}")
+            
             return None
         
         # Get pipeline run data
@@ -558,9 +596,10 @@ class PipelineRunManager:
                                         'timestamp': datetime.utcnow().isoformat() + 'Z'
                                     }
                                     
-                                    from task_queue.task_queue_factory import get_task_queue
-                                    task_queue = get_task_queue()
-                                    
+                                    # Instantiate TaskQueue using the correct import
+                                    from task_queue.task_manager import TaskQueue
+                                    task_queue = TaskQueue(use_redis=True)
+
                                     task = Task(
                                         id=f"{agent}_{project}_{pipeline_run.board}_{next_issue['issue_number']}_{int(time.time())}",
                                         agent=agent,
@@ -569,7 +608,7 @@ class PipelineRunManager:
                                         context=task_context,
                                         created_at=datetime.utcnow().isoformat() + 'Z'
                                     )
-                                    
+
                                     task_queue.enqueue(task)
                                     task_created = True
                                     
