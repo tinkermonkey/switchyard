@@ -1745,6 +1745,36 @@ class ProjectMonitor:
 
                             # For review columns, attempt to resume the review cycle in background thread
                             if column and hasattr(column, 'type') and column.type == 'review':
+                                # CRITICAL: Check if there's already active work for this issue
+                                # This prevents race condition where resume thread launches while
+                                # review cycle is already executing (Bug: pipeline run 10407364-868d-4870-9c57-c1bed3907d6c)
+                                # Both code_reviewer and senior_software_engineer were launched simultaneously
+                                # because ProjectMonitor polling triggered resume while cycle was already running.
+                                from services.work_execution_state import work_execution_tracker
+
+                                if work_execution_tracker.has_active_execution(project_name, issue_number):
+                                    logger.info(
+                                        f"Skipping review cycle resume for issue #{issue_number} - "
+                                        f"work already in progress (prevents concurrent agent launches)"
+                                    )
+
+                                    # Log decision event for observability
+                                    self.observability.index_decision_event(
+                                        decision_type="review_cycle_resume_skipped",
+                                        project=project_name,
+                                        board=board_name,
+                                        issue_number=issue_number,
+                                        reason="work_already_in_progress",
+                                        details={
+                                            "column": status,
+                                            "agent": agent,
+                                            "trigger": "project_monitor_polling"
+                                        }
+                                    )
+
+                                    already_handled = True
+                                    return None  # Don't interfere with active work
+
                                 logger.info(f"Attempting to resume review cycle for issue #{issue_number} in background thread")
                                 try:
                                     from services.review_cycle import review_cycle_executor
@@ -1796,6 +1826,34 @@ class ProjectMonitor:
                                     logger.error(traceback.format_exc())
                             # For conversational columns, resume the feedback monitoring loop
                             elif column and hasattr(column, 'type') and column.type == 'conversational':
+                                # CRITICAL: Check if there's already active work for this issue
+                                # Same race condition prevention as review cycles - prevents ProjectMonitor
+                                # from launching duplicate conversational loops during active execution
+                                from services.work_execution_state import work_execution_tracker
+
+                                if work_execution_tracker.has_active_execution(project_name, issue_number):
+                                    logger.info(
+                                        f"Skipping conversational loop resume for issue #{issue_number} - "
+                                        f"work already in progress"
+                                    )
+
+                                    # Log decision event for observability
+                                    self.observability.index_decision_event(
+                                        decision_type="conversational_resume_skipped",
+                                        project=project_name,
+                                        board=board_name,
+                                        issue_number=issue_number,
+                                        reason="work_already_in_progress",
+                                        details={
+                                            "column": status,
+                                            "agent": agent,
+                                            "trigger": "project_monitor_polling"
+                                        }
+                                    )
+
+                                    already_handled = True
+                                    return None  # Don't interfere with active work
+
                                 logger.info(f"Resuming conversational feedback loop for issue #{issue_number} in background thread")
                                 try:
                                     from services.human_feedback_loop import human_feedback_loop_executor
@@ -2993,6 +3051,36 @@ _Review cycle initiated by Claude Code Orchestrator_
                                                     break
 
                                             if agent and agent != 'null':
+                                                # CRITICAL: Get or create pipeline run for next issue
+                                                from services.pipeline_run import get_pipeline_run_manager
+                                                pipeline_run_manager = get_pipeline_run_manager()
+
+                                                # Fetch issue details for pipeline run
+                                                try:
+                                                    next_issue_data = self.get_issue_details(
+                                                        project_config.github['repo'],
+                                                        next_issue['issue_number'],
+                                                        project_config.github['org']
+                                                    )
+                                                except Exception as issue_fetch_error:
+                                                    logger.warning(
+                                                        f"Could not fetch issue details for #{next_issue['issue_number']}: "
+                                                        f"{issue_fetch_error}"
+                                                    )
+                                                    next_issue_data = None
+
+                                                pipeline_run_id = pipeline_run_manager.ensure_pipeline_run_for_task(
+                                                    project=project_name,
+                                                    board=board_name,
+                                                    issue_number=next_issue['issue_number'],
+                                                    issue_data=next_issue_data
+                                                )
+
+                                                if not pipeline_run_id:
+                                                    raise Exception(
+                                                        f"Failed to create/retrieve pipeline run for issue #{next_issue['issue_number']}"
+                                                    )
+
                                                 # Create task for next issue with ACTUAL column (not cached)
                                                 task_context = {
                                                     'project': project_name,
@@ -3000,8 +3088,10 @@ _Review cycle initiated by Claude Code Orchestrator_
                                                     'pipeline': pipeline_config.name,
                                                     'repository': project_config.github['repo'],
                                                     'issue_number': next_issue['issue_number'],
+                                                    'issue': next_issue_data,  # ADD THIS
                                                     'column': actual_column,  # Use verified actual column
                                                     'trigger': 'review_cycle_completion_queue_processing',
+                                                    'pipeline_run_id': pipeline_run_id,  # ADD THIS
                                                     'timestamp': datetime.utcnow().isoformat() + 'Z'
                                                 }
 

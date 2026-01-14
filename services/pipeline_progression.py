@@ -395,7 +395,22 @@ class PipelineProgression:
                     if agent and agent != 'null':
                         # Fetch issue details
                         issue_data = self._get_issue_details(repository, next_issue['issue_number'], project_config.github['org'])
-                        
+
+                        # Get or create pipeline run for next issue
+                        from services.pipeline_run import get_pipeline_run_manager
+                        pipeline_run_manager = get_pipeline_run_manager()
+                        pipeline_run_id = pipeline_run_manager.ensure_pipeline_run_for_task(
+                            project=project_name,
+                            board=board_name,
+                            issue_number=next_issue['issue_number'],
+                            issue_data=issue_data  # Already fetched on line 397
+                        )
+
+                        if not pipeline_run_id:
+                            raise Exception(
+                                f"Failed to create/retrieve pipeline run for issue #{next_issue['issue_number']}"
+                            )
+
                         # Create task
                         task_context = {
                             'project': project_name,
@@ -406,6 +421,7 @@ class PipelineProgression:
                             'issue': issue_data,
                             'column': current_column,
                             'trigger': 'pipeline_progression', # Triggered by previous issue exiting
+                            'pipeline_run_id': pipeline_run_id,  # ADD THIS
                             'timestamp': datetime.now().isoformat()
                         }
 
@@ -503,6 +519,23 @@ class PipelineProgression:
                 logger.info(f"No agent assigned to column '{next_column}'")
                 return True  # Successfully moved, but no agent to trigger
 
+            # Get or create pipeline run for this issue
+            from services.pipeline_run import get_pipeline_run_manager
+            pipeline_run_manager = get_pipeline_run_manager()
+            pipeline_run_id = pipeline_run_manager.ensure_pipeline_run_for_task(
+                project=project_name,
+                board=board_name,
+                issue_number=issue_number,
+                issue_data=issue_data  # Already fetched earlier
+            )
+
+            if not pipeline_run_id:
+                logger.warning(
+                    f"Failed to create/retrieve pipeline run for issue #{issue_number}, "
+                    f"continuing without run ID"
+                )
+                pipeline_run_id = None  # Continue anyway
+
             # Create task for next agent
             task_context = {
                 'project': project_name,
@@ -513,6 +546,7 @@ class PipelineProgression:
                 'issue': issue_data,
                 'column': next_column,
                 'trigger': 'pipeline_progression',
+                'pipeline_run_id': pipeline_run_id,  # ADD THIS
                 'timestamp': datetime.now().isoformat()
             }
 

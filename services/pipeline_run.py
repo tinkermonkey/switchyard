@@ -469,7 +469,64 @@ class PipelineRunManager:
                 project=project,
                 board=board
             )
-    
+
+    def ensure_pipeline_run_for_task(
+        self,
+        project: str,
+        board: str,
+        issue_number: int,
+        issue_data: Optional[Dict[str, Any]] = None
+    ) -> Optional[str]:
+        """
+        Ensure a pipeline run exists for a task being created.
+
+        Convenience method for queue processing paths that need to create/retrieve
+        pipeline run before task dispatch. Uses get_or_create_pipeline_run() under
+        the hood, so it returns existing run if one is active.
+
+        Args:
+            project: Project name
+            board: Board name
+            issue_number: Issue number
+            issue_data: Optional issue data. If not provided, uses fallback values.
+
+        Returns:
+            Pipeline run ID if successful, None if failed
+        """
+        try:
+            # Extract issue metadata
+            if issue_data:
+                issue_title = issue_data.get('title', f'Issue #{issue_number}')
+                issue_url = issue_data.get('url', f'https://github.com/unknown/{issue_number}')
+            else:
+                # Fallback if issue data not provided
+                issue_title = f'Issue #{issue_number}'
+                issue_url = f'https://github.com/unknown/{issue_number}'
+                logger.debug(
+                    f"No issue data provided for pipeline run creation, using fallback"
+                )
+
+            # Get or create pipeline run (returns existing if active)
+            pipeline_run = self.get_or_create_pipeline_run(
+                issue_number=issue_number,
+                issue_title=issue_title,
+                issue_url=issue_url,
+                project=project,
+                board=board
+            )
+
+            logger.debug(
+                f"Ensured pipeline run {pipeline_run.id} for {project} issue #{issue_number}"
+            )
+
+            return pipeline_run.id
+
+        except Exception as e:
+            logger.error(
+                f"Failed to ensure pipeline run for {project} issue #{issue_number}: {e}"
+            )
+            return None
+
     def end_pipeline_run(
         self,
         project: str,
@@ -584,6 +641,38 @@ class PipelineRunManager:
                                         break
                                 
                                 if agent and agent != 'null':
+                                    # CRITICAL: Get or create pipeline run for next queued issue
+                                    # Ensures work is tracked under a pipeline run from the start
+                                    try:
+                                        # Fetch issue details for pipeline run (need title and URL)
+                                        import subprocess
+                                        import json
+                                        result = subprocess.run(
+                                            ['gh', 'issue', 'view', str(next_issue['issue_number']),
+                                             '--repo', f"{project_config.github['org']}/{project_config.github['repo']}",
+                                             '--json', 'title,url'],
+                                            capture_output=True, text=True, check=True
+                                        )
+                                        next_issue_data = json.loads(result.stdout)
+                                    except Exception as e:
+                                        logger.warning(
+                                            f"Could not fetch issue details for #{next_issue['issue_number']}: {e}"
+                                        )
+                                        next_issue_data = None
+
+                                    # Get or create pipeline run for next issue
+                                    pipeline_run_id = self.ensure_pipeline_run_for_task(
+                                        project=project,
+                                        board=pipeline_run.board,
+                                        issue_number=next_issue['issue_number'],
+                                        issue_data=next_issue_data
+                                    )
+
+                                    if not pipeline_run_id:
+                                        raise Exception(
+                                            f"Failed to create/retrieve pipeline run for issue #{next_issue['issue_number']}"
+                                        )
+
                                     # Create task for next issue with ACTUAL column (not cached)
                                     task_context = {
                                         'project': project,
@@ -591,8 +680,10 @@ class PipelineRunManager:
                                         'pipeline': pipeline_config.name,
                                         'repository': project_config.github['repo'],
                                         'issue_number': next_issue['issue_number'],
+                                        'issue': next_issue_data,  # ADD THIS
                                         'column': actual_column,  # Use verified actual column
                                         'trigger': 'lock_release_queue_processing',
+                                        'pipeline_run_id': pipeline_run_id,  # ADD THIS
                                         'timestamp': datetime.utcnow().isoformat() + 'Z'
                                     }
                                     
