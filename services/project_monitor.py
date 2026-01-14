@@ -3199,6 +3199,7 @@ The automated test-fix-validate cycle has failed and requires manual interventio
             repair_result = None
             error_message = None
             pipeline_run_ended = False
+            next_column = None  # Initialize to prevent NameError in PR ready check
 
             try:
                 logger.info(f"Starting container monitor for {container_name}")
@@ -3389,8 +3390,7 @@ The automated test-fix-validate cycle has failed and requires manual interventio
 
                             # CRITICAL: Check if PR should be marked ready after repair cycle completes
                             # This handles the case where the last sub-issue completes and exits pipeline
-                            if next_column and next_column.name in ['Staged', 'Done']:  # Exit columns
-                                import asyncio
+                            if next_column is not None and next_column.name in ['Staged', 'Done']:  # Exit columns
                                 try:
                                     asyncio.run(
                                         self._check_pr_ready_on_issue_exit(
