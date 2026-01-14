@@ -1114,8 +1114,40 @@ class AgentContainerRecovery:
                     result = result_info['result']
 
                     logger.info(
-                        f"Found orphaned result for {project}/#{issue_number} (run {run_id}), processing it"
+                        f"Found orphaned result for {project}/#{issue_number} (run {run_id}), validating..."
                     )
+
+                    # CRITICAL: Only process if this result belongs to the current active pipeline run
+                    # This prevents stale results from previous runs from affecting current work
+                    from services.pipeline_run import PipelineRunManager
+                    run_manager = PipelineRunManager()
+                    current_run = run_manager.get_active_pipeline_run(project, issue_number)
+
+                    if not current_run:
+                        logger.info(
+                            f"No active pipeline run for {project}/#{issue_number}. "
+                            f"Cleaning up stale orphaned result from run {run_id}"
+                        )
+                        # Clean up the stale result
+                        result_key = f"repair_cycle:result:{project}:{issue_number}:{run_id}"
+                        self.redis.delete(result_key)
+                        continue
+
+                    if current_run.id != run_id:
+                        logger.warning(
+                            f"Orphaned result run ID mismatch for {project}/#{issue_number}. "
+                            f"Result is from run {run_id}, but current active run is {current_run.id}. "
+                            f"Cleaning up stale result."
+                        )
+                        # Clean up the stale result
+                        result_key = f"repair_cycle:result:{project}:{issue_number}:{run_id}"
+                        self.redis.delete(result_key)
+                        continue
+
+                    logger.info(
+                        f"✓ Orphaned result validated: run {run_id} matches current active pipeline run. Processing..."
+                    )
+
                     self._process_completed_repair_cycle(
                         f"repair-cycle-{project}-{issue_number}-{run_id[:8]}",  # Reconstruct container name
                         "exited",  # Container ID (doesn't matter, container is gone)
@@ -1213,6 +1245,40 @@ class AgentContainerRecovery:
         column = context['column']
         pipeline_run_id = context.get('pipeline_run_id')
 
+        # SAFETY CHECK: Validate this result belongs to current active pipeline run
+        # This is a second line of defense in case the result was already validated
+        # but pipeline state changed between validation and processing
+        from services.pipeline_run import PipelineRunManager
+        run_manager = PipelineRunManager()
+        current_run = run_manager.get_active_pipeline_run(project, issue_number)
+
+        if not current_run:
+            logger.warning(
+                f"No active pipeline run found for {project}/#{issue_number} while processing repair cycle. "
+                f"This result is from run {pipeline_run_id}. Skipping processing to prevent state issues."
+            )
+            # Clean up the result
+            result_key = f"repair_cycle:result:{project}:{issue_number}:{pipeline_run_id}"
+            if self.redis:
+                self.redis.delete(result_key)
+            return
+
+        if current_run.id != pipeline_run_id:
+            logger.warning(
+                f"Pipeline run mismatch for {project}/#{issue_number}. "
+                f"Orphaned result is for run {pipeline_run_id}, but current active run is {current_run.id}. "
+                f"Skipping processing to prevent state desynchronization."
+            )
+            # Clean up the result
+            result_key = f"repair_cycle:result:{project}:{issue_number}:{pipeline_run_id}"
+            if self.redis:
+                self.redis.delete(result_key)
+            return
+
+        logger.info(
+            f"✓ Validated: Processing orphaned result for current pipeline run {pipeline_run_id}"
+        )
+
         # Get success status
         overall_success = result.get('overall_success', False)
 
@@ -1252,30 +1318,55 @@ class AgentContainerRecovery:
         summary_lines.append("---")
         summary_lines.append("_Repair cycle recovered after orchestrator restart_")
 
-        # Post comment
-        # Run async code in a new thread to avoid event loop conflicts
-        import threading
+        # Check if we've already posted this comment (idempotency)
+        # Use Redis to track posted comments for this container
+        comment_posted_key = f"repair_cycle:comment_posted:{project}:{issue_number}:{container_name}"
+        comment_already_posted = False
 
-        comment_context = {
-            'issue_number': issue_number,
-            'repository': repository,
-            'workspace_type': context.get('workspace_type', 'issues'),
-            'discussion_id': context.get('discussion_id')
-        }
-
-        def post_comment():
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
+        if self.redis:
             try:
-                loop.run_until_complete(
-                    github.post_agent_output(comment_context, "\n".join(summary_lines))
-                )
-            finally:
-                loop.close()
+                comment_already_posted = self.redis.get(comment_posted_key) is not None
+                if comment_already_posted:
+                    logger.info(
+                        f"Skipping duplicate comment post for {container_name} - "
+                        f"comment already posted for this container"
+                    )
+            except Exception as e:
+                logger.warning(f"Failed to check comment idempotency: {e}")
 
-        thread = threading.Thread(target=post_comment)
-        thread.start()
-        thread.join(timeout=30)  # Wait up to 30 seconds
+        # Post comment only if not already posted
+        if not comment_already_posted:
+            # Run async code in a new thread to avoid event loop conflicts
+            import threading
+
+            comment_context = {
+                'issue_number': issue_number,
+                'repository': repository,
+                'workspace_type': context.get('workspace_type', 'issues'),
+                'discussion_id': context.get('discussion_id')
+            }
+
+            def post_comment():
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    loop.run_until_complete(
+                        github.post_agent_output(comment_context, "\n".join(summary_lines))
+                    )
+                finally:
+                    loop.close()
+
+            thread = threading.Thread(target=post_comment)
+            thread.start()
+            thread.join(timeout=30)  # Wait up to 30 seconds
+
+            # Mark comment as posted (TTL: 7 days - long enough to prevent duplicates across restarts)
+            if self.redis:
+                try:
+                    self.redis.setex(comment_posted_key, 604800, "1")  # 7 days
+                    logger.info(f"Marked comment as posted for {container_name}")
+                except Exception as e:
+                    logger.warning(f"Failed to mark comment as posted: {e}")
 
         # Auto-commit if successful
         if overall_success:
@@ -1355,11 +1446,34 @@ class AgentContainerRecovery:
             except Exception as e:
                 logger.error(f"Failed to auto-advance issue: {e}", exc_info=True)
 
-        # End pipeline run
+        # End pipeline run (with validation to prevent ending wrong run)
         if pipeline_run_id:
             try:
                 from services.pipeline_run import get_pipeline_run_manager
                 pipeline_run_manager = get_pipeline_run_manager()
+
+                # CRITICAL: Validate that we're ending the correct pipeline run
+                # Get the current active pipeline run for this issue
+                current_active_run = pipeline_run_manager.get_active_pipeline_run(project, issue_number)
+
+                if current_active_run:
+                    current_run_id = current_active_run.get('id')
+
+                    if current_run_id != pipeline_run_id:
+                        # The current active run is DIFFERENT from the one that started this container
+                        # This means a NEW pipeline run was started while we were recovering the OLD one
+                        # Do NOT end the current run - it belongs to different work
+                        logger.warning(
+                            f"Skipping pipeline run end: Current active run {current_run_id} "
+                            f"does not match container's original run {pipeline_run_id}. "
+                            f"Not ending current run to prevent disrupting active work for {project}/#{issue_number}"
+                        )
+                        return  # Exit without ending the run
+                    else:
+                        # The current active run matches the container's original run - safe to end
+                        logger.info(f"Validated: Current active run {current_run_id} matches container run {pipeline_run_id}")
+
+                # Proceed to end the run (either matched or no active run found)
                 ended = pipeline_run_manager.end_pipeline_run(
                     project=project,
                     issue_number=issue_number,
