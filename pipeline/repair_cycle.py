@@ -187,6 +187,32 @@ class RepairCycleStage(PipelineStage):
         self.checkpoint_interval = checkpoint_interval
         self._agent_call_count = 0
 
+    @staticmethod
+    def _sanitize_filename(filename: str) -> str:
+        """
+        Sanitize a filename for use in Docker volume mounts and file paths.
+
+        Replaces all characters that could cause issues with underscores.
+        This is critical for Docker volume mounts which interpret colons (:) as
+        mount separators, causing "too many colons" errors.
+
+        Args:
+            filename: The filename to sanitize (may include path separators and line numbers)
+
+        Returns:
+            Sanitized filename safe for use in Docker mounts and filesystem paths
+
+        Example:
+            >>> RepairCycleStage._sanitize_filename("task_manager.py:269")
+            'task_manager_py_269'
+        """
+        # Replace Docker mount separators and other problematic characters
+        # Critical: colons (:) are interpreted by Docker as volume mount separators
+        problematic_chars = ['/', '.', ':', ' ', '\\', '*', '?', '"', '<', '>', '|']
+        for char in problematic_chars:
+            filename = filename.replace(char, '_')
+        return filename
+
     async def execute(self, context: Dict[str, Any]) -> Dict[str, Any]:
         """
         Execute test-fix cycles for each configured test type.
@@ -921,7 +947,7 @@ DO NOT include any explanation, markdown formatting, or other text - ONLY the JS
                 obs.emit(
                     EventType.REPAIR_CYCLE_FILE_FIX_STARTED,
                     "repair_cycle_fix",
-                    f"{task_id}_fix_{test_file.replace('/', '_').replace('.', '_')}",
+                    f"{task_id}_fix_{self._sanitize_filename(test_file)}",
                     project,
                     {
                         "test_file": test_file,
@@ -977,7 +1003,7 @@ DO NOT include any explanation, markdown formatting, or other text - ONLY the JS
                     agent_name=self.agent_name,
                     project_name=project,
                     task_context=task_context,
-                    task_id_prefix=f"repair_fix_{test_file.replace('/', '_').replace('.', '_')}",
+                    task_id_prefix=f"repair_fix_{self._sanitize_filename(test_file)}",
                 )
 
                 logger.info(f"Fixed failures in {test_file}")
@@ -988,7 +1014,7 @@ DO NOT include any explanation, markdown formatting, or other text - ONLY the JS
                     obs.emit(
                         EventType.REPAIR_CYCLE_FILE_FIX_COMPLETED,
                         "repair_cycle_fix",
-                        f"{task_id}_fix_{test_file.replace('/', '_').replace('.', '_')}",
+                        f"{task_id}_fix_{self._sanitize_filename(test_file)}",
                         project,
                         {
                             "test_file": test_file,
@@ -1007,7 +1033,7 @@ DO NOT include any explanation, markdown formatting, or other text - ONLY the JS
                     obs.emit(
                         EventType.REPAIR_CYCLE_FILE_FIX_FAILED,
                         "repair_cycle_fix",
-                        f"{task_id}_fix_{test_file.replace('/', '_').replace('.', '_')}",
+                        f"{task_id}_fix_{self._sanitize_filename(test_file)}",
                         project,
                         {
                             "test_file": test_file,
@@ -1056,7 +1082,7 @@ DO NOT include any explanation, markdown formatting, or other text - ONLY the JS
                 obs.emit(
                     EventType.REPAIR_CYCLE_WARNING_REVIEW_STARTED,
                     "repair_cycle_warnings",
-                    f"{task_id}_warn_{source_file.replace('/', '_').replace('.', '_')}",
+                    f"{task_id}_warn_{self._sanitize_filename(source_file)}",
                     project,
                     {
                         "source_file": source_file,
@@ -1112,7 +1138,7 @@ For each warning:
                     agent_name=self.agent_name,
                     project_name=project,
                     task_context=task_context,
-                    task_id_prefix=f"repair_warn_{source_file.replace('/', '_').replace('.', '_')}",
+                    task_id_prefix=f"repair_warn_{self._sanitize_filename(source_file)}",
                 )
 
                 logger.info(f"Reviewed warnings in {source_file}")
@@ -1123,7 +1149,7 @@ For each warning:
                     obs.emit(
                         EventType.REPAIR_CYCLE_WARNING_REVIEW_COMPLETED,
                         "repair_cycle_warnings",
-                        f"{task_id}_warn_{source_file.replace('/', '_').replace('.', '_')}",
+                        f"{task_id}_warn_{self._sanitize_filename(source_file)}",
                         project,
                         {
                             "source_file": source_file,
@@ -1143,7 +1169,7 @@ For each warning:
                     obs.emit(
                         EventType.REPAIR_CYCLE_WARNING_REVIEW_FAILED,
                         "repair_cycle_warnings",
-                        f"{task_id}_warn_{source_file.replace('/', '_').replace('.', '_')}",
+                        f"{task_id}_warn_{self._sanitize_filename(source_file)}",
                         project,
                         {
                             "source_file": source_file,

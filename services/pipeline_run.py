@@ -556,7 +556,36 @@ class PipelineRunManager:
         # Mark as completed
         pipeline_run.ended_at = datetime.utcnow().isoformat() + 'Z'
         pipeline_run.status = "completed"
-        
+
+        # Emit pipeline completion event BEFORE updating Redis
+        # This ensures observability matches state transitions
+        try:
+            from monitoring.observability import get_observability_manager, EventType
+            obs = get_observability_manager()
+            obs.emit(
+                EventType.PIPELINE_RUN_COMPLETED,
+                "pipeline_lifecycle",
+                pipeline_run.id,
+                project,
+                {
+                    "pipeline_run_id": pipeline_run.id,
+                    "issue_number": issue_number,
+                    "board": pipeline_run.board,
+                    "started_at": pipeline_run.started_at,
+                    "ended_at": pipeline_run.ended_at,
+                    "reason": reason or "completed",
+                    "duration_seconds": (
+                        datetime.fromisoformat(pipeline_run.ended_at.rstrip('Z')) -
+                        datetime.fromisoformat(pipeline_run.started_at.rstrip('Z'))
+                    ).total_seconds()
+                },
+                pipeline_run_id=pipeline_run.id
+            )
+            logger.info(f"Emitted pipeline_run_completed event for {project} issue #{issue_number}")
+        except Exception as e:
+            logger.error(f"Failed to emit pipeline completion event: {e}", exc_info=True)
+            # Continue with state update even if event emission fails
+
         # Update Redis
         redis_key = self._get_redis_key(pipeline_run.id)
         self.redis.setex(

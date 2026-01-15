@@ -417,6 +417,23 @@ class DockerAgentRunner:
         import time
 
         timestamp = int(time.time())
+
+        # Defensive validation: Sanitize task_id to prevent Docker mount parsing errors
+        # Docker interprets colons (:) as volume mount separators, causing "too many colons" errors
+        if ':' in task_id:
+            original_task_id = task_id
+            task_id = task_id.replace(':', '_')
+            logger.warning(
+                f"Task ID contained colon (Docker mount separator), sanitized for safety: "
+                f"'{original_task_id}' -> '{task_id}'"
+            )
+
+        # Additional sanitization for other problematic characters in filenames
+        problematic_chars = ['/', '\\', ' ', '*', '?', '"', '<', '>', '|']
+        for char in problematic_chars:
+            if char in task_id:
+                task_id = task_id.replace(char, '_')
+
         mcp_config_filename = f"mcp_config_{agent}_{task_id}_{timestamp}.json"
 
         # Try to find a writable directory

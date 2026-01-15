@@ -127,7 +127,10 @@ class EventType(Enum):
     STATUS_PROGRESSION_COMPLETED = "status_progression_completed"
     STATUS_PROGRESSION_FAILED = "status_progression_failed"
     PIPELINE_STAGE_TRANSITION = "pipeline_stage_transition"
-    
+    PIPELINE_RUN_STARTED = "pipeline_run_started"
+    PIPELINE_RUN_COMPLETED = "pipeline_run_completed"
+    PIPELINE_RUN_FAILED = "pipeline_run_failed"
+
     # Review Cycle Management
     REVIEW_CYCLE_STARTED = "review_cycle_started"
     REVIEW_CYCLE_ITERATION = "review_cycle_iteration"

@@ -3306,6 +3306,15 @@ The automated test-fix-validate cycle has failed and requires manual interventio
                 exit_code = int(result.stdout.strip()) if result.stdout.strip() else 2
                 logger.info(f"Container {container_name} exited with code {exit_code}")
 
+                # Log additional context for debugging termination
+                if exit_code == 137:
+                    logger.warning(
+                        f"Exit code 137 indicates SIGKILL - container was forcibly terminated. "
+                        f"Check for: manual kill, OOM, resource limits, or orchestrator shutdown."
+                    )
+                elif exit_code == 143:
+                    logger.info(f"Exit code 143 indicates SIGTERM - container was gracefully terminated.")
+
                 # Load result from Redis
                 repair_result = None
                 try:
