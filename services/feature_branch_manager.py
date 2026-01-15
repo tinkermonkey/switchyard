@@ -375,71 +375,82 @@ class FeatureBranchManager:
         """
         Extract sub-issues from GitHub's native sub-issue API.
 
-        Uses GitHub's parent_issue_url relationship to detect sub-issues.
-        This is the single source of truth - markdown checkboxes in issue
-        bodies are NOT used for sub-issue detection.
+        Uses GitHub's structured subIssues field via GraphQL to query child issues.
+        This is reliable structured data, not parsed from issue body checkboxes.
 
         Args:
             github_integration: GitHubIntegration instance
-            parent_issue_data: Parent issue data from GitHub API
+            parent_issue_data: Parent issue data from GitHub API (must contain 'number' key)
 
         Returns:
             List of issue data dicts for each sub-issue
         """
         parent_number = parent_issue_data.get('number')
-        sub_issues = []
 
-        # Query GitHub's sub_issues_summary to check if sub-issues exist
-        sub_issues_summary = parent_issue_data.get('sub_issues_summary', {})
-        total_sub_issues = sub_issues_summary.get('total', 0)
+        if not parent_number:
+            logger.error("parent_issue_data missing 'number' key, cannot query sub-issues")
+            return []
 
-        if total_sub_issues > 0:
-            logger.info(
-                f"GitHub reports {total_sub_issues} sub-issues for issue #{parent_number}. "
-                f"Querying via parent_issue_url relationship..."
-            )
+        # Query GitHub's structured subIssues field via GraphQL
+        try:
+            from services.github_api_client import get_github_client
+            github_client = get_github_client()
 
-            try:
-                # Query GitHub REST API for issues where parent_issue_url points to this parent
-                from services.github_api_client import get_github_client
-                github_client = get_github_client()
+            query = '''
+            query($owner: String!, $repo: String!, $issueNumber: Int!) {
+              repository(owner: $owner, name: $repo) {
+                issue(number: $issueNumber) {
+                  number
+                  subIssues(first: 100) {
+                    totalCount
+                    nodes {
+                      number
+                      title
+                      state
+                      url
+                    }
+                  }
+                }
+              }
+            }
+            '''
 
-                parent_url = parent_issue_data.get('url')  # API URL of the parent issue
+            variables = {
+                "owner": github_integration.github_org,
+                "repo": github_integration.repo_name,
+                "issueNumber": parent_number
+            }
 
-                if parent_url:
-                    # Get all open and closed issues for this repo
-                    repo_path = f"{github_integration.github_org}/{github_integration.repo_name}"
-                    endpoint = f"repos/{repo_path}/issues"
+            success, result = github_client.graphql(query, variables)
 
-                    # Query with state=all to get both open and closed
-                    endpoint_with_params = f"{endpoint}?state=all&per_page=100"
-                    success, issues_data = github_client.rest('GET', endpoint_with_params)
+            if not success:
+                logger.error(f"GraphQL query failed for issue #{parent_number} sub-issues: {result}")
+                return []
 
-                    if success and isinstance(issues_data, list):
-                        # Filter for issues where parent_issue_url matches our parent
-                        for issue in issues_data:
-                            issue_parent_url = issue.get('parent_issue_url')
-                            if issue_parent_url and issue_parent_url == parent_url:
-                                sub_issues.append(issue)
-                                logger.debug(
-                                    f"Found sub-issue #{issue.get('number')} of parent #{parent_number} "
-                                    f"via parent_issue_url"
-                                )
+            # Extract sub-issues from response
+            issue_data = result.get('data', {}).get('repository', {}).get('issue', {})
+            sub_issues_data = issue_data.get('subIssues', {})
+            total_count = sub_issues_data.get('totalCount', 0)
+            sub_issues = sub_issues_data.get('nodes', [])
 
-                        logger.info(
-                            f"Found {len(sub_issues)} sub-issues for parent #{parent_number} via GitHub API "
-                            f"(expected {total_sub_issues})"
-                        )
-                    else:
-                        logger.warning(f"Failed to query issues for repo {repo_path}: {issues_data}")
+            if sub_issues:
+                logger.info(
+                    f"Found {len(sub_issues)} sub-issues for parent #{parent_number} "
+                    f"(total: {total_count}) via GitHub structured API"
+                )
+                for sub_issue in sub_issues:
+                    logger.debug(
+                        f"  Sub-issue #{sub_issue['number']}: {sub_issue.get('title', 'N/A')} "
+                        f"(state: {sub_issue.get('state', 'unknown')})"
+                    )
+            else:
+                logger.debug(f"Issue #{parent_number} has no sub-issues")
 
-            except Exception as e:
-                logger.error(f"Failed to query sub-issues via GitHub API for parent #{parent_number}: {e}")
+            return sub_issues
 
-        else:
-            logger.debug(f"Issue #{parent_number} has no sub-issues (sub_issues_summary.total = 0)")
-
-        return sub_issues
+        except Exception as e:
+            logger.error(f"Failed to query sub-issues for parent #{parent_number}: {e}")
+            return []
 
     async def _verify_all_sub_issues_complete(
         self,
@@ -464,20 +475,13 @@ class FeatureBranchManager:
 
     async def get_parent_issue(self, github_integration, issue_number: int, project: Optional[str] = None) -> Optional[int]:
         """
-        Get parent issue number from GitHub's parent_issue_url field or issue body
+        Get parent issue number from GitHub's structured parent field
 
-        First attempts to extract parent from the `parent_issue_url` field in the REST API response.
-        Falls back to parsing issue body for parent references if not found.
-
-        Looks for patterns in body:
-        - "Part of #123"
-        - "Parent Issue: #123"
-        - "## Parent Issue" followed by #123
+        Uses GitHub's native sub-issues API via GraphQL to query the parent field.
+        This is reliable structured data, not parsed from issue body text.
 
         Returns parent issue number if found, None otherwise
         """
-        import re
-
         # Validate repository information before making API calls
         if not github_integration.github_org or not github_integration.repo_name:
             logger.warning(
@@ -486,54 +490,52 @@ class FeatureBranchManager:
             )
             return None
 
-        # Step 1: Try to get parent from GitHub's parent_issue_url field (REST API)
+        # Query GitHub's structured parent field via GraphQL
         try:
-            # Use GitHub API client to query the issue with parent_issue_url field
             github_client = get_github_client()
-            endpoint = f'repos/{github_integration.github_org}/{github_integration.repo_name}/issues/{issue_number}'
-            success, result = github_client.rest('GET', endpoint)
-            
-            if success and 'parent_issue_url' in result:
-                parent_issue_url = result.get('parent_issue_url')
-                
-                # Extract issue number from URL like "https://api.github.com/repos/owner/repo/issues/146"
-                if parent_issue_url and parent_issue_url != "null":
-                    url_match = re.search(r'/issues/(\d+)$', parent_issue_url)
-                    if url_match:
-                        parent_num = int(url_match.group(1))
-                        logger.info(f"Issue #{issue_number} is sub-issue of parent #{parent_num} (from parent_issue_url)")
-                        return parent_num
-        except Exception as e:
-            logger.debug(f"Failed to query parent_issue_url from GitHub REST API: {e}")
-            # Fall through to body parsing
 
-        # Step 2: Fall back to parsing issue body
-        try:
-            issue = await github_integration.get_issue(issue_number)
-            body = issue.get("body", "")
+            query = '''
+            query($owner: String!, $repo: String!, $issueNumber: Int!) {
+              repository(owner: $owner, name: $repo) {
+                issue(number: $issueNumber) {
+                  number
+                  parent {
+                    ... on Issue {
+                      number
+                      title
+                    }
+                  }
+                }
+              }
+            }
+            '''
 
-            if not body:
-                logger.info(f"Issue #{issue_number} has no body - no parent detected")
+            variables = {
+                "owner": github_integration.github_org,
+                "repo": github_integration.repo_name,
+                "issueNumber": issue_number
+            }
+
+            success, result = github_client.graphql(query, variables)
+
+            if not success:
+                logger.error(f"GraphQL query failed for issue #{issue_number} parent: {result}")
                 return None
 
-            # Parse for parent references (most specific to least specific)
-            patterns = [
-                r'Parent Issue[:\s]+#(\d+)',  # "Parent Issue: #123" or "Parent Issue #123"
-                r'Part of #(\d+)',            # "Part of #123"
-                r'##\s*Parent Issue[^\d]*#(\d+)',  # "## Parent Issue\nPart of #123"
-                r'##\s*Parent Issue[^\d]*Closes\s+#(\d+)',  # "## Parent Issue\nCloses #123"
-                r'Sub-issue of #(\d+)',       # "Sub-issue of #123"
-                r'Child of #(\d+)',           # "Child of #123"
-            ]
+            # Extract parent from response
+            issue_data = result.get('data', {}).get('repository', {}).get('issue', {})
+            parent_data = issue_data.get('parent')
 
-            for pattern in patterns:
-                match = re.search(pattern, body, re.IGNORECASE)
-                if match:
-                    parent_num = int(match.group(1))
-                    logger.info(f"Issue #{issue_number} is sub-issue of parent #{parent_num} (matched pattern: {pattern})")
-                    return parent_num
+            if parent_data and 'number' in parent_data:
+                parent_num = parent_data['number']
+                parent_title = parent_data.get('title', 'Unknown')
+                logger.info(
+                    f"Issue #{issue_number} is sub-issue of parent #{parent_num} "
+                    f"('{parent_title}') via GitHub structured API"
+                )
+                return parent_num
 
-            logger.info(f"Issue #{issue_number} has no parent reference in body")
+            logger.debug(f"Issue #{issue_number} has no parent (structured API returned null)")
             return None
 
         except Exception as e:
