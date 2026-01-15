@@ -1,0 +1,30 @@
+[tool.pylint.messages_control]
+# Enable warnings for variable shadowing and imports outside toplevel
+enable = [
+    "redefined-outer-name",  # Catches variables that shadow outer scope (like json import)
+    "import-outside-toplevel"  # Flags imports that aren't at module level
+]
+
+[tool.pylint.basic]
+# Good variable names
+good-names = ["i", "j", "k", "ex", "Run", "_", "id", "pk", "db", "e"]
+
+[tool.pylint.design]
+# Maximum number of arguments for function / method
+max-args = 10
+# Maximum number of locals for function / method body
+max-locals = 20
+# Maximum number of return / yield for function / method body
+max-returns = 10
+# Maximum number of branch for function / method body
+max-branches = 15
+# Maximum number of statements in function / method body
+max-statements = 60
+
+[tool.pylint.format]
+# Maximum number of characters on a single line
+max-line-length = 120
+
+[tool.pylint.imports]
+# Warn about imports that shadow built-in modules or cause scoping issues
+check-imports = true

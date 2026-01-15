@@ -646,7 +646,6 @@ class PipelineRunManager:
                                     try:
                                         # Fetch issue details for pipeline run (need title and URL)
                                         import subprocess
-                                        import json
                                         result = subprocess.run(
                                             ['gh', 'issue', 'view', str(next_issue['issue_number']),
                                              '--repo', f"{project_config.github['org']}/{project_config.github['repo']}",
