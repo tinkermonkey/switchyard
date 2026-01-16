@@ -434,7 +434,8 @@ class FeatureBranchManager:
                 return []
 
             # Extract sub-issues from response
-            issue_data = result.get('data', {}).get('repository', {}).get('issue', {})
+            # Note: github_client.graphql() already extracts 'data' field, so access directly
+            issue_data = result.get('repository', {}).get('issue', {})
             sub_issues_data = issue_data.get('subIssues', {})
             total_count = sub_issues_data.get('totalCount', 0)
             sub_issues = sub_issues_data.get('nodes', [])
@@ -529,7 +530,8 @@ class FeatureBranchManager:
                 return None
 
             # Extract parent from response
-            issue_data = result.get('data', {}).get('repository', {}).get('issue', {})
+            # Note: github_client.graphql() already extracts 'data' field, so access directly
+            issue_data = result.get('repository', {}).get('issue', {})
             parent_data = issue_data.get('parent')
 
             if parent_data and 'number' in parent_data:
@@ -912,6 +914,12 @@ git push --force-with-lease
 
         # Step 1: Determine parent issue
         parent_issue = await self.get_parent_issue(github_integration, issue_number, project=project)
+        logger.info(
+            f"Parent detection result for issue #{issue_number}: "
+            f"parent_issue={parent_issue}, "
+            f"org={github_integration.github_org}, "
+            f"repo={github_integration.repo_name}"
+        )
 
         # Step 2: Find related branches (prioritizes reuse over creation)
         related_branches = await self.find_related_branches(
