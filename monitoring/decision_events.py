@@ -1070,7 +1070,50 @@ class DecisionEventEmitter:
                 'reason': reason
             }
         )
-    
+
+    def emit_branch_reused(
+        self,
+        project: str,
+        issue_number: int,
+        branch_name: str,
+        reason: str,
+        parent_issue: Optional[int] = None
+    ):
+        """
+        Emit event when existing branch is reused instead of creating new one
+
+        Args:
+            project: Project name
+            issue_number: Issue number being assigned to branch
+            branch_name: Existing branch name being reused
+            reason: Why this branch was reused (e.g., "Found via direct git check")
+            parent_issue: Parent issue number if applicable
+        """
+        task_id = f"branch_management_{project}_{issue_number}"
+
+        reuse_method = "direct_git_fallback" if "direct git" in reason else "cache_hit"
+
+        self.obs.emit(
+            EventType.BRANCH_REUSED,
+            agent="orchestrator",
+            task_id=task_id,
+            project=project,
+            data={
+                'decision_category': 'branch_management',
+                'issue_number': issue_number,
+                'parent_issue': parent_issue,
+                'inputs': {
+                    'has_parent': parent_issue is not None,
+                    'reuse_method': reuse_method
+                },
+                'decision': {
+                    'action': 'reuse_existing_branch',
+                    'branch_name': branch_name
+                },
+                'reason': reason
+            }
+        )
+
     def emit_branch_selection_escalated(
         self,
         project: str,

@@ -135,13 +135,19 @@ class FeatureBranchManager:
 
         try:
             # Prune stale remote references first to avoid detecting deleted branches
-            subprocess.run(
+            fetch_result = subprocess.run(
                 ["git", "fetch", "--prune"],
                 cwd=project_dir,
                 capture_output=True,
                 text=True,
                 check=False  # Don't fail if fetch has issues
             )
+
+            if fetch_result.returncode != 0:
+                logger.warning(
+                    f"git fetch --prune failed in {project_dir}: {fetch_result.stderr.strip()}. "
+                    f"Branch detection may be incomplete. Continuing with local branches only."
+                )
 
             result = subprocess.run(
                 ["git", "branch", "-a"],
@@ -1115,6 +1121,63 @@ Waiting for human decision...
         # Step 5: Parent issue detected - get or create feature branch
         feature_branch = self.get_feature_branch_state(project, parent_issue)
 
+        # DEFENSIVE CHECK: If state lookup failed, verify branch doesn't exist in git
+        # This prevents duplicate branch creation when get_feature_branch_state()
+        # returns None due to cache miss or fetch failure
+        if not feature_branch:
+            logger.info(
+                f"No cached state found for parent #{parent_issue}. "
+                f"Performing direct git check before creating new branch."
+            )
+
+            # Direct git query bypassing cache
+            all_branches = self._get_all_feature_branches_sync(project_dir)
+            existing_parent_branch = None
+
+            for branch in all_branches:
+                # Match pattern: feature/issue-{parent_issue} or feature/issue-{parent_issue}-*
+                issue_num = self._parse_issue_from_branch_name(branch)
+                if issue_num == parent_issue:
+                    existing_parent_branch = branch
+                    logger.info(
+                        f"✓ Found existing parent branch in git: {branch}. "
+                        f"Issue #{issue_number} will reuse this branch instead of creating new one."
+                    )
+                    break
+
+            if existing_parent_branch:
+                # Parent branch exists - create state object and reuse it
+                feature_branch = FeatureBranch(
+                    parent_issue=parent_issue,
+                    branch_name=existing_parent_branch,
+                    created_at=datetime.now().isoformat(),
+                    sub_issues=[issue_number]
+                )
+
+                # Update cache to prevent future misses
+                self._cache_branch(project, parent_issue, existing_parent_branch)
+
+                # Checkout existing branch
+                await self.git_checkout(project_dir, existing_parent_branch)
+
+                # Track in git workflow manager
+                from services.git_workflow_manager import git_workflow_manager
+                git_workflow_manager.track_branch(project, parent_issue, existing_parent_branch)
+
+                # Emit observability event
+                self.decision_events.emit_branch_reused(
+                    project=project,
+                    issue_number=issue_number,
+                    branch_name=existing_parent_branch,
+                    reason=f"Found existing parent #{parent_issue} branch via direct git check",
+                    parent_issue=parent_issue
+                )
+
+                logger.info(
+                    f"Successfully attached issue #{issue_number} to existing parent branch: {existing_parent_branch}"
+                )
+
+        # Original "if not feature_branch:" block continues here
         if not feature_branch:
             # First sub-issue - create feature branch
             parent_details = await github_integration.get_issue(parent_issue)
