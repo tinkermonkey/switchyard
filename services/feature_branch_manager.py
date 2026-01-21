@@ -11,8 +11,9 @@ Manages hierarchical branch workflows where:
 import os
 import yaml
 import logging
+import time
 from datetime import datetime
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
 
@@ -60,6 +61,13 @@ class FeatureBranchManager:
         # In-memory cache for branch discovery (ephemeral, process-lifetime)
         # Cache structure: {(project, parent_issue): "branch_name"}
         self._branch_cache: Dict[tuple, str] = {}
+
+        # In-memory cache for parent issue lookups with TTL
+        # Cache structure: {issue_number: (parent_number, cached_at_timestamp)}
+        # Reduces GitHub API usage by caching stable parent relationships
+        self._parent_cache: Dict[int, Tuple[Optional[int], float]] = {}
+        self._parent_cache_ttl = 3600  # 1 hour in seconds
+        self._parent_cache_max_size = 1000  # Prevent unbounded growth
 
         # Initialize decision observability
         from monitoring.observability import get_observability_manager
@@ -487,8 +495,28 @@ class FeatureBranchManager:
         Uses GitHub's native sub-issues API via GraphQL to query the parent field.
         This is reliable structured data, not parsed from issue body text.
 
+        Caches results with 1-hour TTL to reduce GitHub API usage.
+
         Returns parent issue number if found, None otherwise
         """
+        # Check cache with TTL before making API call
+        if issue_number in self._parent_cache:
+            parent_num, cached_at = self._parent_cache[issue_number]
+            age = time.time() - cached_at
+
+            if age < self._parent_cache_ttl:
+                logger.debug(
+                    f"Cache hit for issue #{issue_number} parent: #{parent_num} "
+                    f"(age: {age:.0f}s, TTL: {self._parent_cache_ttl}s)"
+                )
+                return parent_num
+            else:
+                logger.debug(
+                    f"Cache expired for issue #{issue_number} parent "
+                    f"(age: {age:.0f}s > TTL: {self._parent_cache_ttl}s)"
+                )
+                del self._parent_cache[issue_number]  # Clean up expired entry
+
         # Validate repository information before making API calls
         if not github_integration.github_org or not github_integration.repo_name:
             logger.warning(
@@ -541,9 +569,27 @@ class FeatureBranchManager:
                     f"Issue #{issue_number} is sub-issue of parent #{parent_num} "
                     f"('{parent_title}') via GitHub structured API"
                 )
+
+                # Cache the result with current timestamp
+                self._parent_cache[issue_number] = (parent_num, time.time())
+
+                # Enforce max cache size with simple FIFO eviction
+                if len(self._parent_cache) > self._parent_cache_max_size:
+                    # Remove oldest 10% of entries
+                    entries_to_remove = len(self._parent_cache) - self._parent_cache_max_size + 100
+                    oldest_keys = sorted(
+                        self._parent_cache.keys(),
+                        key=lambda k: self._parent_cache[k][1]  # Sort by timestamp
+                    )[:entries_to_remove]
+                    for key in oldest_keys:
+                        del self._parent_cache[key]
+                    logger.debug(f"Evicted {len(oldest_keys)} old parent cache entries")
+
                 return parent_num
 
+            # No parent found - cache this result too (None with timestamp)
             logger.debug(f"Issue #{issue_number} has no parent (structured API returned null)")
+            self._parent_cache[issue_number] = (None, time.time())
             return None
 
         except Exception as e:
