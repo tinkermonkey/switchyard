@@ -299,6 +299,116 @@ class AgentExecutor:
                     logger.warning(f"Failed to finalize workspace: {e}")
                     # Continue execution even if finalization fails
 
+            # Check if this issue completion should trigger PR marking
+            # This handles the case where all sub-issues of a parent are now complete
+            if 'issue_number' in task_context and project_name:
+                try:
+                    from services.feature_branch_manager import feature_branch_manager
+                    from services.github_integration import GitHubIntegration
+                    from config.config_manager import config_manager
+
+                    issue_number = task_context['issue_number']
+
+                    # Get GitHub integration
+                    project_config = config_manager.get_project_config(project_name)
+                    if project_config and project_config.github:
+                        repo_owner = project_config.github.get('org')
+                        repo_name = project_config.github.get('repo')
+
+                        if repo_owner and repo_name:
+                            github_integration = GitHubIntegration(repo_owner=repo_owner, repo_name=repo_name)
+
+                            # Check if this is a child issue
+                            parent_issue = await feature_branch_manager.get_parent_issue(
+                                github_integration,
+                                issue_number,
+                                project_name
+                            )
+
+                            if parent_issue:
+                                logger.info(
+                                    f"Issue #{issue_number} is child of parent #{parent_issue}, "
+                                    f"checking if all siblings complete"
+                                )
+
+                                # Get parent issue data to fetch all sub-issues
+                                parent_data = await github_integration.get_issue(parent_issue)
+                                sub_issues = await feature_branch_manager._get_sub_issues_from_parent(
+                                    github_integration,
+                                    parent_data
+                                )
+
+                                if sub_issues:
+                                    # Check if all sub-issues are closed
+                                    all_complete = all(issue.get('state') == 'CLOSED' for issue in sub_issues)
+
+                                    closed_count = sum(1 for issue in sub_issues if issue.get('state') == 'CLOSED')
+                                    logger.info(
+                                        f"Parent #{parent_issue} has {len(sub_issues)} sub-issues, "
+                                        f"{closed_count} closed, all_complete={all_complete}"
+                                    )
+
+                                    if all_complete:
+                                        logger.info(
+                                            f"✓ All {len(sub_issues)} sub-issues of parent #{parent_issue} are complete! "
+                                            f"Marking PR ready for review."
+                                        )
+
+                                        # Get feature branch for parent issue
+                                        feature_branch = feature_branch_manager.get_feature_branch(project_name, parent_issue)
+
+                                        if feature_branch and feature_branch.pr_number:
+                                            # Mark PR as ready for review
+                                            success = await github_integration.mark_pr_ready(feature_branch.pr_number)
+
+                                            if success:
+                                                logger.info(
+                                                    f"✓ Successfully marked PR #{feature_branch.pr_number} as ready for review"
+                                                )
+
+                                                # Post completion comment to parent issue
+                                                await feature_branch_manager.post_feature_completion_comment(
+                                                    github_integration,
+                                                    parent_issue,
+                                                    feature_branch.pr_url
+                                                )
+                                                logger.info(f"✓ Posted completion comment to parent issue #{parent_issue}")
+                                            else:
+                                                logger.error(
+                                                    f"✗ Failed to mark PR #{feature_branch.pr_number} as ready for review. "
+                                                    f"Manual intervention required."
+                                                )
+
+                                                # Post warning to parent issue
+                                                await github_integration.add_comment(
+                                                    parent_issue,
+                                                    f"⚠️ **Warning**: All sub-issues have been completed, but the system failed to mark "
+                                                    f"PR #{feature_branch.pr_number} as ready for review. Please manually mark it ready:\n\n"
+                                                    f"```\ngh pr ready {feature_branch.pr_number}\n```"
+                                                )
+                                        else:
+                                            logger.warning(
+                                                f"Parent issue #{parent_issue} has no PR number in feature branch state. "
+                                                f"Cannot mark PR ready."
+                                            )
+                                    else:
+                                        logger.debug(
+                                            f"Not all sub-issues complete yet for parent #{parent_issue} "
+                                            f"({closed_count}/{len(sub_issues)} closed)"
+                                        )
+                                else:
+                                    logger.debug(f"Parent issue #{parent_issue} has no sub-issues")
+                            else:
+                                logger.debug(f"Issue #{issue_number} is not a child issue (no parent detected)")
+                        else:
+                            logger.debug(f"Cannot check PR ready: missing repo_owner or repo_name in config")
+                    else:
+                        logger.debug(f"Cannot check PR ready: missing project config or github config")
+
+                except Exception as e:
+                    logger.warning(f"Failed to check/mark PR ready for issue #{task_context.get('issue_number')}: {e}", exc_info=True)
+                    # Don't fail agent execution if this fails - it's a non-critical operation
+
             # Record successful execution outcome
             # CRITICAL: Always try to record outcome to prevent stuck "in_progress" states
             if 'issue_number' in task_context:
