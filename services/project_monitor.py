@@ -4027,6 +4027,16 @@ _Repair cycle initiated by Claude Code Orchestrator_
                         container_name=container_name,
                         redis_client=self.task_queue.redis_client
                     )
+
+                    # Store full run ID for recovery after restart
+                    # Key expires after 2 hours (max repair cycle duration)
+                    run_id_key = f"repair_cycle:full_run_id:{container_name}"
+                    self.task_queue.redis_client.setex(
+                        run_id_key,
+                        7200,  # 2 hours TTL
+                        pipeline_run.id  # Full UUID
+                    )
+                    logger.debug(f"Stored full run ID for recovery: {run_id_key} → {pipeline_run.id}")
             except Exception as e:
                 logger.warning(f"Failed to register container in Redis: {e}")
 

@@ -605,8 +605,33 @@ class AgentContainerRecovery:
             logger.warning(f"Invalid repair cycle container name format: {container_name}")
             return None
         
-        # Last part is run_id
+        # Last part is run_id (truncated to 8 chars in container name)
         run_id = parts[-1]
+
+        # Try to retrieve full run ID from Redis (for recovery after restart)
+        full_run_id_key = f"repair_cycle:full_run_id:{container_name}"
+        try:
+            full_run_id = self.redis.get(full_run_id_key)
+            if full_run_id:
+                if isinstance(full_run_id, bytes):
+                    full_run_id = full_run_id.decode('utf-8')
+                logger.info(
+                    f"Recovered full run ID for {container_name}: {full_run_id} "
+                    f"(container name only had: {run_id})"
+                )
+                run_id = full_run_id
+            else:
+                logger.warning(
+                    f"No full run ID found in Redis for {container_name}. "
+                    f"Using truncated ID from container name: {run_id}. "
+                    f"This may cause result lookup failure if container was created before this fix."
+                )
+        except Exception as e:
+            logger.error(
+                f"Failed to retrieve full run ID from Redis for {container_name}: {e}. "
+                f"Falling back to truncated ID: {run_id}"
+            )
+
         # Second to last is issue_number
         issue_number = parts[-2]
         # Everything else is project name (may contain hyphens)
