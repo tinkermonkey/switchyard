@@ -2381,7 +2381,10 @@ class ProjectMonitor:
 
             # Step 1: Initialize GitHub integration
             project_config = self.config_manager.get_project_config(project_name)
-            github = GitHubIntegration(project_config)
+            github = GitHubIntegration(
+                repo_owner=project_config.github['org'],
+                repo_name=project_config.github['repo']
+            )
 
             # Step 2: Check if this issue has a parent (is it a sub-issue?)
             # FIX: Use correct async method get_parent_issue instead of non-existent _get_parent_issue_number

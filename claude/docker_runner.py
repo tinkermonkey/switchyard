@@ -1853,7 +1853,10 @@ class DockerAgentRunner:
             from config.manager import config_manager
 
             project_config = config_manager.get_project_config(project)
-            github = GitHubIntegration(project_config)
+            github = GitHubIntegration(
+                repo_owner=project_config.github['org'],
+                repo_name=project_config.github['repo']
+            )
 
             # Post output to GitHub (same as normal flow)
             import asyncio
