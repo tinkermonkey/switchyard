@@ -2569,14 +2569,27 @@ class ProjectMonitor:
             Agent name if found, None otherwise
         """
         try:
-            workflow_name = self.project_state_manager.get_workflow_for_board(project_name, board_name)
-            if not workflow_name:
-                logger.debug(f"No workflow found for {project_name}/{board_name}")
+            # Get project config and find pipeline for this board
+            project_config = self.config_manager.get_project_config(project_name)
+            if not project_config:
+                logger.debug(f"No project config found for {project_name}")
                 return None
 
-            workflow = self.workflow_manager.get_workflow(workflow_name)
+            # Find the pipeline config for this board
+            pipeline_config = None
+            for pipeline in project_config.pipelines:
+                if pipeline.board_name == board_name:
+                    pipeline_config = pipeline
+                    break
+
+            if not pipeline_config:
+                logger.debug(f"No pipeline config found for {project_name}/{board_name}")
+                return None
+
+            # Get workflow template
+            workflow = self.config_manager.get_workflow_template(pipeline_config.workflow)
             if not workflow:
-                logger.debug(f"Workflow '{workflow_name}' not found")
+                logger.debug(f"Workflow '{pipeline_config.workflow}' not found")
                 return None
 
             # Find the column matching the status
@@ -2584,7 +2597,7 @@ class ProjectMonitor:
                 if column.name == status:
                     return column.agent
 
-            logger.debug(f"No agent found for status '{status}' in workflow '{workflow_name}'")
+            logger.debug(f"No agent found for status '{status}' in workflow '{pipeline_config.workflow}'")
             return None
 
         except Exception as e:
@@ -2983,8 +2996,18 @@ _Review cycle initiated by Claude Code Orchestrator_
                         lock_mgr = get_pipeline_lock_manager()
 
                         # Get workflow template to check exit columns
-                        workflow_name = self.project_state_manager.get_workflow_for_board(project_name, board_name)
-                        workflow_template_obj = self.workflow_manager.get_workflow(workflow_name)
+                        workflow_template_obj = None
+                        try:
+                            # pipeline_config is already available in parent function scope
+                            if pipeline_config:
+                                workflow_template_obj = self.config_manager.get_workflow_template(pipeline_config.workflow)
+                        except Exception as workflow_lookup_error:
+                            logger.error(
+                                f"Error looking up workflow for lock management (issue #{issue_number}): {workflow_lookup_error}",
+                                exc_info=True
+                            )
+                            # Default to NOT releasing lock on error (safer than releasing)
+                            workflow_template_obj = None
 
                         # Check if current status is an exit column
                         is_exit_column = False
