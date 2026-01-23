@@ -2986,12 +2986,19 @@ _Review cycle initiated by Claude Code Orchestrator_
                             import traceback
                             logger.error(traceback.format_exc())
 
-                    loop.close()
                 except Exception as e:
                     logger.error(f"Error in review cycle thread: {e}")
                     import traceback
                     logger.error(traceback.format_exc())
                 finally:
+                    # Always close the event loop to prevent resource leak
+                    try:
+                        if 'loop' in locals() and loop is not None:
+                            loop.close()
+                            logger.debug("Closed event loop for review cycle thread")
+                    except Exception as loop_error:
+                        logger.warning(f"Error closing event loop: {loop_error}")
+
                     # Only release lock if this is an EXIT column
                     # Otherwise, keep lock for next stage in pipeline
                     try:
