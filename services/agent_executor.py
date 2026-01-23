@@ -142,9 +142,64 @@ class AgentExecutor:
                             f"Prepared {workspace_type} workspace: {prep_result.get('branch_name', prep_result.get('discussion_id'))}"
                         )
 
+                        # CRITICAL: Verify the correct branch is checked out for git-based workspaces
+                        # This prevents commits to wrong branches (e.g., committing to main instead of feature branch)
+                        if workspace_context.supports_git_operations and branch_name:
+                            from services.feature_branch_manager import feature_branch_manager
+                            import subprocess
+                            project_dir = f"/workspace/{project_name}"
+
+                            try:
+                                actual_branch = await feature_branch_manager.get_current_branch(project_dir)
+
+                                if actual_branch != branch_name:
+                                    error_msg = (
+                                        f"Branch verification failed for issue #{task_context.get('issue_number')}: "
+                                        f"expected branch '{branch_name}', but repository is on '{actual_branch}'. "
+                                        f"This indicates workspace preparation did not complete successfully. "
+                                        f"Cannot continue safely to prevent commits to wrong branch."
+                                    )
+                                    logger.error(error_msg)
+                                    raise RuntimeError(error_msg)
+
+                                logger.info(f"Branch verification passed: confirmed on '{actual_branch}'")
+
+                            except RuntimeError as runtime_error:
+                                # Re-raise our own branch mismatch errors
+                                raise
+                            except subprocess.CalledProcessError as git_error:
+                                # Git command failed (e.g., not a git repo, directory doesn't exist)
+                                # This is common in test environments - log warning but don't halt
+                                logger.warning(
+                                    f"Could not verify git branch (git command failed): {git_error}. "
+                                    f"This may indicate a test environment or missing repository. "
+                                    f"Continuing with caution."
+                                )
+                            except Exception as branch_check_error:
+                                # Other unexpected errors during branch checking
+                                logger.warning(
+                                    f"Branch verification encountered unexpected error: {branch_check_error}. "
+                                    f"Continuing with caution.",
+                                    exc_info=True
+                                )
+
             except Exception as e:
+                # Check if this workspace requires git operations
+                # For git-based workspaces, workspace prep failures are CRITICAL
+                # For non-git workspaces (discussions), we can continue with a warning
+                if workspace_context is not None and hasattr(workspace_context, 'supports_git_operations'):
+                    if workspace_context.supports_git_operations:
+                        logger.error(
+                            f"Failed to prepare git-based workspace: {e}. "
+                            f"Halting execution to prevent commits to wrong branch.",
+                            exc_info=True
+                        )
+                        raise RuntimeError(f"Git workspace preparation failed: {e}") from e
+
+                # For other cases (no workspace context yet, or non-git workspace), log warning and continue
+                # This preserves backward compatibility for agents that don't need git operations
                 logger.warning(f"Failed to prepare workspace: {e}", exc_info=True)
-                # Continue execution even if workspace preparation fails
+                # Continue execution even if workspace preparation fails for non-critical cases
         
         # Generate container name if agent will use Docker
         # This matches the naming logic in docker_runner.py:206-207
