@@ -689,6 +689,7 @@ class FeatureBranchManager:
 
     async def create_branch_from_main(self, project_dir: str, branch_name: str):
         """Create a new branch from main"""
+        import subprocess
         from services.git_workflow_manager import git_workflow_manager
 
         # Ensure we're on main and up to date
@@ -708,9 +709,33 @@ class FeatureBranchManager:
                 raise Exception(f"Failed to create or checkout branch {branch_name}")
 
             logger.info(f"Checked out existing branch {branch_name} (race condition resolved)")
+
+            # Verify tracking is set up (checkout_branch should have done this, but verify)
+            # If remote doesn't exist, push it now to ensure tracking works
+            check_tracking = subprocess.run(
+                ['git', 'config', '--get', f'branch.{branch_name}.remote'],
+                cwd=project_dir,
+                capture_output=True,
+                timeout=10
+            )
+
+            if check_tracking.returncode != 0:
+                # No tracking configured - push to set it up
+                logger.warning(f"Existing branch {branch_name} has no tracking, pushing to remote")
+                push_success = await git_workflow_manager.push_branch(project_dir, branch_name)
+                if not push_success:
+                    raise Exception(f"Failed to push existing branch {branch_name} to set up tracking")
+                logger.info(f"Pushed existing branch {branch_name} and configured tracking")
         else:
             await git_workflow_manager.checkout_branch(project_dir, branch_name)
             logger.info(f"Created branch {branch_name} from main")
+
+            # Push branch to remote with -u to set up tracking
+            # This is critical - without it, git pull will fail with "no tracking information"
+            push_success = await git_workflow_manager.push_branch(project_dir, branch_name)
+            if not push_success:
+                raise Exception(f"Failed to push branch {branch_name} to remote")
+            logger.info(f"Pushed branch {branch_name} to remote with upstream tracking")
 
     async def git_checkout(self, project_dir: str, branch_name: str):
         """Checkout a branch"""

@@ -461,12 +461,12 @@ class GitWorkflowManager:
                 text=True,
                 timeout=10
             )
-            
+
             has_changes = bool(status_result.stdout.strip())
-            
+
             if has_changes:
                 logger.info(f"Working directory has uncommitted changes, stashing before checkout")
-                
+
                 # Stash changes including untracked files
                 stash_result = subprocess.run(
                     ['git', 'stash', 'push', '--include-untracked', '-m', f'Auto-stash before checkout {branch_name}'],
@@ -475,25 +475,142 @@ class GitWorkflowManager:
                     text=True,
                     timeout=30
                 )
-                
+
                 if stash_result.returncode != 0:
                     logger.error(f"Failed to stash changes: {stash_result.stderr}")
                     raise Exception(f"Failed to stash changes: {stash_result.stderr}")
-                
+
                 logger.info("Successfully stashed uncommitted changes")
-            
-            # Now checkout the branch
-            result = subprocess.run(
-                ['git', 'checkout', branch_name],
+
+            # Check if branch exists locally first
+            check_local = subprocess.run(
+                ['git', 'rev-parse', '--verify', branch_name],
                 cwd=project_dir,
                 capture_output=True,
-                text=True,
-                timeout=30
+                timeout=10
             )
+
+            if check_local.returncode != 0:
+                # Branch doesn't exist locally - check if it exists remotely
+                logger.info(f"Branch {branch_name} doesn't exist locally, checking remote...")
+
+                # Fetch to ensure we have latest remote refs
+                subprocess.run(
+                    ['git', 'fetch', 'origin'],
+                    cwd=project_dir,
+                    capture_output=True,
+                    timeout=30
+                )
+
+                # Check if remote branch exists
+                check_remote = subprocess.run(
+                    ['git', 'rev-parse', '--verify', f'origin/{branch_name}'],
+                    cwd=project_dir,
+                    capture_output=True,
+                    timeout=10
+                )
+
+                if check_remote.returncode == 0:
+                    # Remote branch exists - create local tracking branch
+                    logger.info(f"Creating local tracking branch for remote origin/{branch_name}")
+                    result = subprocess.run(
+                        ['git', 'checkout', '-b', branch_name, '--track', f'origin/{branch_name}'],
+                        cwd=project_dir,
+                        capture_output=True,
+                        text=True,
+                        timeout=30
+                    )
+
+                    # Verify tracking was set up correctly
+                    if result.returncode == 0:
+                        verify_tracking = subprocess.run(
+                            ['git', 'config', '--get', f'branch.{branch_name}.remote'],
+                            cwd=project_dir,
+                            capture_output=True,
+                            timeout=10
+                        )
+
+                        if verify_tracking.returncode != 0:
+                            logger.error(
+                                f"Created branch {branch_name} from remote with --track, "
+                                f"but tracking was not configured. This is unexpected."
+                            )
+                        else:
+                            logger.info(f"Verified tracking configured for {branch_name}")
+                else:
+                    # Neither local nor remote exists - use regular checkout (will fail with clear error)
+                    result = subprocess.run(
+                        ['git', 'checkout', branch_name],
+                        cwd=project_dir,
+                        capture_output=True,
+                        text=True,
+                        timeout=30
+                    )
+            else:
+                # Branch exists locally - regular checkout
+                result = subprocess.run(
+                    ['git', 'checkout', branch_name],
+                    cwd=project_dir,
+                    capture_output=True,
+                    text=True,
+                    timeout=30
+                )
+
+                # After checkout, verify tracking is configured
+                # This handles legacy branches created before the push fix was applied
+                if result.returncode == 0:
+                    check_tracking = subprocess.run(
+                        ['git', 'config', '--get', f'branch.{branch_name}.remote'],
+                        cwd=project_dir,
+                        capture_output=True,
+                        timeout=10
+                    )
+
+                    if check_tracking.returncode != 0:
+                        # No tracking configured - set it up if remote branch exists
+                        logger.warning(f"Branch {branch_name} exists locally but has no tracking configured")
+
+                        # Check if remote branch exists
+                        fetch_result = subprocess.run(
+                            ['git', 'fetch', 'origin'],
+                            cwd=project_dir,
+                            capture_output=True,
+                            timeout=30
+                        )
+
+                        check_remote = subprocess.run(
+                            ['git', 'rev-parse', '--verify', f'origin/{branch_name}'],
+                            cwd=project_dir,
+                            capture_output=True,
+                            timeout=10
+                        )
+
+                        if check_remote.returncode == 0:
+                            # Remote exists - set up tracking
+                            logger.info(f"Setting up tracking for {branch_name} -> origin/{branch_name}")
+                            set_upstream = subprocess.run(
+                                ['git', 'branch', '--set-upstream-to', f'origin/{branch_name}', branch_name],
+                                cwd=project_dir,
+                                capture_output=True,
+                                text=True,
+                                timeout=10
+                            )
+
+                            if set_upstream.returncode == 0:
+                                logger.info(f"Successfully configured tracking for {branch_name}")
+                            else:
+                                logger.warning(
+                                    f"Failed to set upstream tracking for {branch_name}: {set_upstream.stderr}. "
+                                    f"This may cause git pull to fail."
+                                )
+                        else:
+                            # Remote doesn't exist - this will be pushed later by push_branch
+                            # The caller (feature_branch_manager) should ensure a push happens
+                            logger.info(f"Remote branch origin/{branch_name} doesn't exist yet (will be created on first push)")
 
             if result.returncode == 0:
                 logger.info(f"Checked out branch {branch_name}")
-                
+
                 if has_changes:
                     logger.info("Restoring stashed changes...")
                     try:
@@ -504,7 +621,7 @@ class GitWorkflowManager:
                             text=True,
                             timeout=30
                         )
-                        
+
                         if pop_result.returncode != 0:
                             logger.warning(f"Failed to pop stash (changes are saved in stash list): {pop_result.stderr}")
                         else:
