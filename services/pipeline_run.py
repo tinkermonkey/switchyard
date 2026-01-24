@@ -83,7 +83,7 @@ PIPELINE_RUNS_TEMPLATE = {
 class PipelineRun:
     """
     Represents a single run of an issue through the workflow pipeline
-    
+
     A pipeline run starts when an agent is about to be launched for an issue
     and ends when the issue reaches a column with no agent defined.
     """
@@ -96,6 +96,7 @@ class PipelineRun:
     started_at: str
     ended_at: Optional[str] = None
     status: str = "active"  # active, completed
+    discussion_id: Optional[str] = None  # GitHub discussion node ID for context continuity
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for storage"""
@@ -213,23 +214,25 @@ class PipelineRunManager:
         issue_title: str,
         issue_url: str,
         project: str,
-        board: str
+        board: str,
+        discussion_id: Optional[str] = None
     ) -> PipelineRun:
         """
         Create a new pipeline run
-        
+
         Args:
             issue_number: GitHub issue number
             issue_title: Issue title
             issue_url: Issue URL
             project: Project name
             board: Board name
-            
+            discussion_id: Optional GitHub discussion node ID for context continuity
+
         Returns:
             New PipelineRun instance
         """
         pipeline_run_id = str(uuid.uuid4())
-        
+
         pipeline_run = PipelineRun(
             id=pipeline_run_id,
             issue_number=issue_number,
@@ -238,7 +241,8 @@ class PipelineRunManager:
             project=project,
             board=board,
             started_at=datetime.utcnow().isoformat() + 'Z',
-            status="active"
+            status="active",
+            discussion_id=discussion_id
         )
         
         # Store in Redis for fast access
@@ -357,24 +361,26 @@ class PipelineRunManager:
         issue_title: str,
         issue_url: str,
         project: str,
-        board: str
+        board: str,
+        discussion_id: Optional[str] = None
     ) -> PipelineRun:
         """
         Get existing active pipeline run or create a new one
-        
+
         This method ensures that only ONE active run exists per issue by:
         1. Checking Redis for an active run
         2. If not in Redis, querying Elasticsearch for any active runs
         3. Ending any old active runs found in Elasticsearch
         4. Creating a new run if needed
-        
+
         Args:
             issue_number: GitHub issue number
             issue_title: Issue title
             issue_url: Issue URL
             project: Project name
             board: Board name
-            
+            discussion_id: Optional GitHub discussion node ID for context continuity
+
         Returns:
             PipelineRun instance (existing or new)
         """
@@ -450,7 +456,8 @@ class PipelineRunManager:
                     issue_title=issue_title,
                     issue_url=issue_url,
                     project=project,
-                    board=board
+                    board=board,
+                    discussion_id=discussion_id
                 )
         except redis.exceptions.LockError:
             logger.warning(f"Could not acquire lock for pipeline run creation: {project} #{issue_number}")
@@ -475,7 +482,8 @@ class PipelineRunManager:
         project: str,
         board: str,
         issue_number: int,
-        issue_data: Optional[Dict[str, Any]] = None
+        issue_data: Optional[Dict[str, Any]] = None,
+        discussion_id: Optional[str] = None
     ) -> Optional[str]:
         """
         Ensure a pipeline run exists for a task being created.
@@ -489,6 +497,7 @@ class PipelineRunManager:
             board: Board name
             issue_number: Issue number
             issue_data: Optional issue data. If not provided, uses fallback values.
+            discussion_id: Optional GitHub discussion node ID for context continuity
 
         Returns:
             Pipeline run ID if successful, None if failed
@@ -512,7 +521,8 @@ class PipelineRunManager:
                 issue_title=issue_title,
                 issue_url=issue_url,
                 project=project,
-                board=board
+                board=board,
+                discussion_id=discussion_id
             )
 
             logger.debug(

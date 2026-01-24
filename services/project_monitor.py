@@ -1628,6 +1628,17 @@ class ProjectMonitor:
                 if workspace_type in ['discussions', 'hybrid']:
                     discussion_id = state_manager.get_discussion_for_issue(project_name, issue_number)
 
+                    # Verify discussion still exists in GitHub (might have been deleted)
+                    if discussion_id:
+                        existing = self.discussions.get_discussion(discussion_id)
+                        if not existing:
+                            logger.warning(
+                                f"Discussion {discussion_id} for issue #{issue_number} not found in GitHub, "
+                                f"unlinking from state"
+                            )
+                            state_manager.unlink_issue_discussion(project_name, issue_number)
+                            discussion_id = None
+
                 # Get or create pipeline run early so we can tag all events
                 # Fetch issue details for pipeline run
                 issue_data_early = self.get_issue_details(repository, issue_number, project_config.github['org'])
@@ -1636,7 +1647,8 @@ class ProjectMonitor:
                     issue_title=issue_data_early.get('title', f'Issue #{issue_number}'),
                     issue_url=issue_data_early.get('url', ''),
                     project=project_name,
-                    board=board_name
+                    board=board_name,
+                    discussion_id=discussion_id
                 )
                 logger.debug(f"Using pipeline run {pipeline_run.id} for issue #{issue_number}")
 
@@ -2418,9 +2430,32 @@ class ProjectMonitor:
                 logger.debug(f"Parent #{parent_issue_number} has no sub-issues, skipping PR ready check")
                 return
 
-            # Step 5: Check if ALL sub-issues are actually complete in GitHub
+            # Step 5: Get workflow template for exit column check
+            workflow_template = None
+            try:
+                from config.manager import config_manager
+                project_config = config_manager.get_project_config(project_name)
+                # Find the SDLC/dev pipeline workflow (consistent lookup strategy)
+                for pipeline in project_config.pipelines:
+                    if 'sdlc' in pipeline.name.lower() or 'dev' in pipeline.workflow.lower():
+                        workflow_template = config_manager.get_workflow_template(pipeline.workflow)
+                        break
+
+                if not workflow_template:
+                    logger.warning(
+                        f"Could not find dev/SDLC workflow for project '{project_name}' "
+                        f"- exit column check will be skipped"
+                    )
+            except Exception as e:
+                logger.warning(f"Error getting workflow template for exit column check: {e}")
+
+            # Step 6: Check if ALL sub-issues are actually complete in GitHub
             all_complete = await feature_branch_manager._verify_all_sub_issues_complete(
-                github, actual_sub_issues
+                github,
+                actual_sub_issues,
+                project_name=project_name,
+                workflow_template=workflow_template,
+                project_monitor=self
             )
 
             if not all_complete:
@@ -2436,7 +2471,7 @@ class ProjectMonitor:
                 f"Checking PR status..."
             )
 
-            # Step 6: Get feature branch state (queries git for branch name)
+            # Step 7: Get feature branch state (queries git for branch name)
             # FIX: Use correct method name get_feature_branch_state instead of non-existent load_feature_branch_state
             feature_branch = feature_branch_manager.get_feature_branch_state(
                 project_name, parent_issue_number
@@ -2449,7 +2484,7 @@ class ProjectMonitor:
                 )
                 return
 
-            # Step 7: Find PR for this branch (queries GitHub)
+            # Step 8: Find PR for this branch (queries GitHub)
             # FIX: get_feature_branch_state doesn't populate pr_number, so we need to query it
             pr_data = await github.find_pr_by_branch(feature_branch.branch_name)
 
@@ -2463,14 +2498,14 @@ class ProjectMonitor:
             pr_number = pr_data.get('number')
             is_draft = pr_data.get('isDraft', True)
 
-            # Step 8: Check if PR is already ready (idempotent check for race conditions)
+            # Step 9: Check if PR is already ready (idempotent check for race conditions)
             if not is_draft:
                 logger.debug(f"PR #{pr_number} is already marked ready, skipping")
                 return
 
             logger.info(f"PR #{pr_number} is currently draft, marking as ready for review...")
 
-            # Step 9: Mark PR as ready for review
+            # Step 10: Mark PR as ready for review
             success = await github.mark_pr_ready(pr_number)
 
             if success:
@@ -2484,7 +2519,7 @@ class ProjectMonitor:
                     f"(triggered by issue #{issue_number} completing)"
                 )
 
-                # Step 10: Post completion comment to parent issue
+                # Step 11: Post completion comment to parent issue
                 pr_url = pr_data.get('url') or f"https://github.com/{project_config.github['org']}/{project_config.github['repo']}/pull/{pr_number}"
                 await feature_branch_manager.post_feature_completion_comment(
                     github,
@@ -2829,7 +2864,8 @@ class ProjectMonitor:
                 issue_title=issue_data.get('title', f'Issue #{issue_number}'),
                 issue_url=issue_data.get('url', ''),
                 project=project_name,
-                board=board_name
+                board=board_name,
+                discussion_id=discussion_id
             )
             logger.debug(f"Using pipeline run {pipeline_run.id} for review cycle on issue #{issue_number}")
 
@@ -3860,7 +3896,8 @@ The automated test-fix-validate cycle has failed and requires manual interventio
                 issue_title=issue_data.get('title', f'Issue #{issue_number}'),
                 issue_url=issue_data.get('url', ''),
                 project=project_name,
-                board=board_name
+                board=board_name,
+                discussion_id=discussion_id
             )
             logger.debug(f"Using pipeline run {pipeline_run.id} for repair cycle on issue #{issue_number}")
 
@@ -5570,13 +5607,41 @@ _Repair cycle initiated by Claude Code Orchestrator_
         try:
             from config.state_manager import state_manager
 
-            # Check if discussion already exists for this issue
-            if state_manager.get_discussion_for_issue(project_name, issue_number):
-                logger.debug(f"Discussion already exists for issue #{issue_number}")
-                return
-
-            # Get project config
+            # Get project config first (needed for GitHub queries)
             project_config = self.config_manager.get_project_config(project_name)
+
+            # Check if discussion already exists for this issue in state file
+            existing_discussion_id = state_manager.get_discussion_for_issue(project_name, issue_number)
+            if existing_discussion_id:
+                # Verify it still exists in GitHub (might be deleted)
+                existing = self.discussions.get_discussion(existing_discussion_id)
+                if existing:
+                    logger.debug(f"Discussion {existing_discussion_id} verified for issue #{issue_number}")
+                    return
+                else:
+                    logger.warning(
+                        f"Discussion {existing_discussion_id} not found in GitHub for issue #{issue_number}, "
+                        f"will search for orphaned discussions"
+                    )
+                    state_manager.unlink_issue_discussion(project_name, issue_number)
+
+            # CRITICAL: Query GitHub for orphaned discussions not tracked in state
+            # This handles cases where state file lost track of existing discussions
+            orphaned_discussion = self._find_orphaned_discussion(
+                project_config.github['org'],
+                repository,
+                issue_number
+            )
+
+            if orphaned_discussion:
+                # Found an existing discussion - link it instead of creating duplicate
+                logger.warning(
+                    f"Found orphaned discussion #{orphaned_discussion['number']} "
+                    f"(ID: {orphaned_discussion['id']}) for issue #{issue_number}. "
+                    f"Linking to state instead of creating duplicate."
+                )
+                state_manager.link_issue_to_discussion(project_name, issue_number, orphaned_discussion['id'])
+                return
 
             # Find pipeline config
             pipeline_config = None
@@ -5598,12 +5663,6 @@ _Repair cycle initiated by Claude Code Orchestrator_
             if not auto_create:
                 return
 
-            # SAFETY LATCH: Only create discussions for items in Backlog column of Planning & Design board
-            # This prevents erroneous discussion creation when sub-issues are linked to parent issues
-            if status and status.lower() != 'backlog':
-                logger.debug(f"Skipping discussion creation for issue #{issue_number} - not in Backlog column (current: {status})")
-                return
-
             logger.info(f"Creating discussion for issue #{issue_number} (workspace: {workspace})")
 
             # Create the discussion
@@ -5620,10 +5679,96 @@ _Repair cycle initiated by Claude Code Orchestrator_
             import traceback
             logger.error(traceback.format_exc())
 
+    def _find_orphaned_discussion(self, owner: str, repo: str, issue_number: int) -> Optional[Dict]:
+        """
+        Search GitHub for existing discussions related to an issue.
+
+        Returns the discussion data if found, None otherwise.
+        This prevents creating duplicates when state file loses track of discussions.
+        """
+        try:
+            # Fetch issue details to get its title
+            import subprocess
+            result = subprocess.run(
+                ['gh', 'api', f'repos/{owner}/{repo}/issues/{issue_number}'],
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+
+            if result.returncode != 0:
+                logger.warning(f"Could not fetch issue #{issue_number} details: {result.stderr}")
+                return None
+
+            import json
+            issue_data = json.loads(result.stdout)
+            issue_title = issue_data.get('title', '')
+
+            if not issue_title:
+                return None
+
+            # Search for discussions with titles containing the issue title or issue number
+            # Discussions are typically titled "Requirements: <issue title>" or similar
+            discussions = self.discussions.list_discussions(owner, repo, first=100)
+
+            # Find ALL matching discussions (there may be duplicates)
+            matches = []
+            for discussion in discussions:
+                discussion_title = discussion.get('title', '')
+
+                # Check if discussion title contains the issue title
+                # Remove common prefixes like "Requirements: " for comparison
+                clean_discussion_title = discussion_title.lower()
+                for prefix in ['requirements:', 'design:', 'research:']:
+                    clean_discussion_title = clean_discussion_title.replace(prefix, '').strip()
+
+                # Match if discussion title contains most of the issue title
+                if issue_title.lower() in clean_discussion_title or clean_discussion_title in issue_title.lower():
+                    matches.append(discussion)
+                    logger.debug(
+                        f"Found matching discussion: #{discussion['number']} '{discussion_title}' "
+                        f"created at {discussion.get('createdAt', 'unknown')}"
+                    )
+
+            if not matches:
+                # No matching discussion found
+                return None
+
+            # If multiple matches exist, return the OLDEST one (to prefer original over duplicates)
+            if len(matches) > 1:
+                # Sort by createdAt ascending (oldest first)
+                from datetime import datetime
+                matches.sort(key=lambda d: datetime.fromisoformat(d.get('createdAt', '').replace('Z', '+00:00')))
+                duplicate_numbers = ', '.join([f"#{d['number']}" for d in matches[1:]])
+                logger.warning(
+                    f"Found {len(matches)} matching discussions for issue #{issue_number}. "
+                    f"Selecting oldest: #{matches[0]['number']} (created {matches[0].get('createdAt')}). "
+                    f"Newer discussions may be duplicates: {duplicate_numbers}"
+                )
+
+            oldest_match = matches[0]
+            logger.info(
+                f"Found orphaned discussion: #{oldest_match['number']} '{oldest_match['title']}' "
+                f"matches issue #{issue_number} '{issue_title}'"
+            )
+            return oldest_match
+
+        except Exception as e:
+            logger.error(f"Error searching for orphaned discussion: {e}")
+            return None
+
     def _create_discussion_from_issue(self, project_name: str, issue_number: int,
                                      repository: str, pipeline_config, project_config):
         """Auto-create discussion from issue"""
         try:
+            from config.state_manager import state_manager
+
+            # RACE CONDITION CHECK: Double-check state hasn't changed since the caller checked
+            existing_id = state_manager.get_discussion_for_issue(project_name, issue_number)
+            if existing_id:
+                logger.info(f"Discussion {existing_id} already linked, aborting creation")
+                return
+
             # Fetch issue details
             issue_data = self.get_issue_details(repository, issue_number, project_config.github['org'])
 
@@ -5680,8 +5825,19 @@ _Repair cycle initiated by Claude Code Orchestrator_
 
             logger.info(f"Created discussion #{discussion_number} (ID: {discussion_id}) for issue #{issue_number}")
 
+            # RACE CONDITION CHECK: Verify no other process linked a discussion while we were creating
+            current_link = state_manager.get_discussion_for_issue(project_name, issue_number)
+            if current_link and current_link != discussion_id:
+                logger.error(
+                    f"Race condition detected: issue #{issue_number} already linked to {current_link}, "
+                    f"newly created discussion {discussion_id} (#{discussion_number}) is now orphaned. "
+                    f"Using existing discussion {current_link} instead."
+                )
+                # Note: We don't delete the duplicate discussion here as that would require additional GitHub API calls
+                # and permissions. The orphaned discussion can be manually cleaned up if needed.
+                return
+
             # Store link in state
-            from config.state_manager import state_manager
             state_manager.link_issue_to_discussion(project_name, issue_number, discussion_id)
 
             # Add comment to issue linking to discussion

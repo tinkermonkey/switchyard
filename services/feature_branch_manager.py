@@ -470,23 +470,97 @@ class FeatureBranchManager:
     async def _verify_all_sub_issues_complete(
         self,
         github_integration,
-        sub_issues: List[dict]
+        sub_issues: List[dict],
+        project_name: Optional[str] = None,
+        workflow_template = None,
+        project_monitor = None
     ) -> bool:
         """
-        Verify that all sub-issues are actually closed in GitHub.
+        Verify that all sub-issues are complete (closed OR in exit columns).
+
+        An issue is considered complete if:
+        1. Its GitHub state is 'closed', OR
+        2. It's currently in a pipeline exit column (Done, Staged, etc.)
 
         Args:
             github_integration: GitHubIntegration instance
             sub_issues: List of issue data dicts from GitHub
+            project_name: Project name (optional, for exit column check)
+            workflow_template: Workflow template with exit columns (optional)
+            project_monitor: ProjectMonitor instance (optional, for querying issue columns)
 
         Returns:
-            True if all sub-issues are closed, False otherwise
+            True if all sub-issues are complete, False otherwise
         """
         if not sub_issues:
             # No sub-issues means nothing to complete
             return False
 
-        return all(issue.get('state') == 'closed' for issue in sub_issues)
+        # Performance optimization: Fetch board name and issue columns once before the loop
+        board_name = None
+        issue_columns = {}  # Cache of issue_number -> column_name
+
+        if project_name and workflow_template and project_monitor:
+            if hasattr(workflow_template, 'pipeline_exit_columns') and workflow_template.pipeline_exit_columns:
+                try:
+                    # Find the board name for this project's dev workflow
+                    from config.manager import config_manager
+                    project_config = config_manager.get_project_config(project_name)
+
+                    # Use consistent lookup strategy: check for 'sdlc' or 'dev' in pipeline name/workflow
+                    for pipeline in project_config.pipelines:
+                        if 'sdlc' in pipeline.name.lower() or 'dev' in pipeline.workflow.lower():
+                            board_name = pipeline.board_name
+                            break
+
+                    if not board_name:
+                        logger.warning(
+                            f"Could not find dev/SDLC board for workflow '{workflow_template.name}' "
+                            f"in project '{project_name}' - exit column check will be skipped"
+                        )
+                    else:
+                        # Batch fetch: Get columns for all sub-issues at once
+                        logger.debug(f"Fetching columns for {len(sub_issues)} sub-issues from board '{board_name}'")
+                        for issue in sub_issues:
+                            try:
+                                column_name = await project_monitor.get_issue_column_async(
+                                    project_name,
+                                    board_name,
+                                    issue.get('number')
+                                )
+                                if column_name:
+                                    issue_columns[issue.get('number')] = column_name
+                            except Exception as e:
+                                logger.debug(f"Could not get column for sub-issue #{issue.get('number')}: {e}")
+
+                except Exception as e:
+                    logger.warning(f"Error setting up exit column check: {e}")
+
+        # Now check each sub-issue for completion
+        for issue in sub_issues:
+            issue_number = issue.get('number')
+            state = issue.get('state')
+
+            # Check 1: Issue is closed
+            if state == 'closed':
+                logger.debug(f"Sub-issue #{issue_number} is closed - treating as complete")
+                continue
+
+            # Check 2: Issue is in an exit column (using pre-fetched data)
+            if issue_number in issue_columns:
+                column_name = issue_columns[issue_number]
+                if column_name in workflow_template.pipeline_exit_columns:
+                    logger.info(
+                        f"Sub-issue #{issue_number} is in exit column '{column_name}' "
+                        f"(state={state}) - treating as complete"
+                    )
+                    continue  # Treat as complete
+
+            # If we get here, issue is neither closed nor in exit column
+            logger.debug(f"Sub-issue #{issue_number} is not complete (state={state}, not in exit column)")
+            return False
+
+        return True
 
     async def get_parent_issue(self, github_integration, issue_number: int, project: Optional[str] = None) -> Optional[int]:
         """
@@ -1489,10 +1563,30 @@ Waiting for human decision...
             parent_issue_data = await github_integration.get_issue(feature_branch.parent_issue)
             actual_sub_issues = await self._get_sub_issues_from_parent(github_integration, parent_issue_data)
 
+            # Get workflow template for exit column check
+            # Note: We don't pass project_monitor here, so exit column check won't work
+            # The delayed check in project_monitor._check_pr_ready_on_issue_exit() handles it
+            workflow_template = None
+            try:
+                from config.manager import config_manager
+                project_config = config_manager.get_project_config(project)
+                # Find the SDLC/dev pipeline workflow (consistent lookup strategy)
+                for pipeline in project_config.pipelines:
+                    if 'sdlc' in pipeline.name.lower() or 'dev' in pipeline.workflow.lower():
+                        workflow_template = config_manager.get_workflow_template(pipeline.workflow)
+                        break
+            except Exception as e:
+                logger.debug(f"Could not get workflow template for exit column check: {e}")
+
             # Check if ALL sub-issues are actually complete in GitHub
+            # Note: project_monitor=None here means exit column check won't work in this path
+            # The delayed check in project_monitor._check_pr_ready_on_issue_exit() will handle it
             all_complete = await self._verify_all_sub_issues_complete(
                 github_integration,
-                actual_sub_issues
+                actual_sub_issues,
+                project_name=project,
+                workflow_template=workflow_template,
+                project_monitor=None
             )
 
             # Issue is complete if: no sub-issues defined (standalone work) OR all sub-issues are complete
