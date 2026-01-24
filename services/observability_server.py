@@ -3119,6 +3119,80 @@ def refresh_pipeline_queue_order(project, board):
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/api/blocked-issues', methods=['GET'])
+def get_blocked_issues():
+    """
+    Get all issues that are blocking pipelines across all projects.
+
+    An issue is "blocked" if:
+    - It has status='active' (holds the lock)
+    - Its last execution outcome is 'failure'
+    - No container is currently running for it
+
+    This indicates the agent failed and the pipeline is stuck waiting
+    for manual intervention (move to Backlog, close, or move to non-trigger column).
+
+    Returns:
+        JSON response with:
+        {
+            'blocked_issues': [
+                {
+                    'project': 'context-studio',
+                    'board': 'SDLC Execution',
+                    'issue_number': 159,
+                    'position': 0,
+                    'failed_agent': 'senior_software_engineer',
+                    'error': 'Agent execution interrupted...',
+                    'failed_at': '2025-01-24T10:30:00Z',
+                    'column': 'Development'
+                },
+                ...
+            ],
+            'count': 1
+        }
+    """
+    try:
+        from services.pipeline_queue_manager import get_pipeline_queue_manager
+        from config.manager import config_manager
+
+        all_blocked = []
+
+        # Iterate through all projects and their pipelines
+        for project_name in config_manager.get_project_names():
+            project_config = config_manager.get_project_config(project_name)
+
+            for pipeline in project_config.pipelines:
+                try:
+                    queue_mgr = get_pipeline_queue_manager(
+                        project_name, pipeline.board_name
+                    )
+
+                    blocked = queue_mgr.get_blocked_issues()
+
+                    # Add project and board context to each blocked issue
+                    for issue in blocked:
+                        issue['project'] = project_name
+                        issue['board'] = pipeline.board_name
+                        all_blocked.append(issue)
+
+                except Exception as e:
+                    logger.error(
+                        f"Failed to get blocked issues for {project_name}/{pipeline.board_name}: {e}",
+                        exc_info=True
+                    )
+                    # Continue with other pipelines
+
+        return jsonify({
+            'blocked_issues': all_blocked,
+            'count': len(all_blocked),
+            'timestamp': datetime.utcnow().isoformat() + 'Z'
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Failed to get blocked issues: {e}", exc_info=True)
+        return jsonify({'error': str(e)}), 500
+
+
 # ============================================================================
 # END PIPELINE QUEUE AND LOCK STATUS ENDPOINTS
 # ============================================================================

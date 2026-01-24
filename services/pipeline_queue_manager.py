@@ -700,6 +700,93 @@ class PipelineQueueManager:
                 'last_updated': datetime.now(timezone.utc).isoformat()
             }
 
+    def get_blocked_issues(self) -> List[Dict]:
+        """
+        Get issues that are blocking the pipeline.
+
+        An issue is "blocked" if:
+        - It has status='active' (holds the lock)
+        - Its last execution outcome is 'failure'
+        - No container is currently running for it
+
+        This indicates the agent failed and the pipeline is stuck waiting
+        for manual intervention.
+
+        Returns:
+            List of blocked issue dicts with failure details:
+            [
+                {
+                    'issue_number': 123,
+                    'position': 0,
+                    'failed_agent': 'senior_software_engineer',
+                    'error': 'Agent execution interrupted...',
+                    'failed_at': '2025-01-24T10:30:00Z',
+                    'column': 'Development'
+                },
+                ...
+            ]
+        """
+        from services.work_execution_state import work_execution_tracker
+        import subprocess
+
+        with self._queue_lock():
+            queue = self.load_queue()
+            blocked_issues = []
+
+            for issue in queue:
+                if issue['status'] != 'active':
+                    continue
+
+                issue_number = issue['issue_number']
+
+                # Check if last execution failed
+                state = work_execution_tracker.load_state(
+                    self.project_name, issue_number
+                )
+
+                if not state or not state.get('execution_history'):
+                    continue
+
+                last_exec = state['execution_history'][-1]
+
+                if last_exec.get('outcome') == 'failure':
+                    # Verify no container is running
+                    try:
+                        result = subprocess.run(
+                            ['docker', 'ps', '--filter',
+                             f'name=claude-agent-{self.project_name}-',
+                             '--format', '{{.Names}}'],
+                            capture_output=True, text=True, timeout=5
+                        )
+
+                        has_container = bool(result.stdout.strip())
+
+                        if not has_container:
+                            blocked_issues.append({
+                                'issue_number': issue_number,
+                                'position': issue.get('position_in_column', 0),
+                                'failed_agent': last_exec.get('agent'),
+                                'error': last_exec.get('error'),
+                                'failed_at': last_exec.get('timestamp'),
+                                'column': last_exec.get('column')
+                            })
+                    except Exception as e:
+                        logger.error(
+                            f"Failed to check container for issue #{issue_number}: {e}"
+                        )
+                        # Include as blocked if we can't verify container status
+                        blocked_issues.append({
+                            'issue_number': issue_number,
+                            'position': issue.get('position_in_column', 0),
+                            'failed_agent': last_exec.get('agent'),
+                            'error': last_exec.get('error'),
+                            'failed_at': last_exec.get('timestamp'),
+                            'column': last_exec.get('column'),
+                            'container_check_failed': True
+                        })
+
+            return blocked_issues
+
 
 def get_pipeline_queue_manager(project_name: str, board_name: str) -> PipelineQueueManager:
     """Get pipeline queue manager instance"""

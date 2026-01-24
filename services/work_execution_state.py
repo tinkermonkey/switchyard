@@ -1197,44 +1197,84 @@ class WorkExecutionStateTracker:
                                 modified = True
                                 cleaned_count += 1
 
-                                logger.info(
+                                logger.warning(
                                     f"Marked stuck execution as failed: {project_name}/#{issue_number} "
-                                    f"{agent} in {column} (no container found, outcome not recorded)."
+                                    f"{agent} in {column} (no container found, outcome not recorded). "
+                                    f"Pipeline is now blocked - manual intervention required."
                                 )
 
-                                # CRITICAL BUG FIX: End the pipeline run to allow retry
-                                # The root cause of deadlocks is that pipeline runs stay active after
-                                # execution failures, blocking the project monitor from re-triggering work.
+                                # CRITICAL CHANGE: DO NOT call end_pipeline_run()
                                 #
-                                # The project monitor checks `has_active_run` and skips issues with active
-                                # pipeline runs, assuming work is in progress. But when executions fail and
-                                # containers die, there's no active work - just a stale pipeline run blocking retry.
+                                # Previous behavior (REMOVED): Called end_pipeline_run() which:
+                                # - Released the pipeline lock
+                                # - Processed the next waiting issue in queue
+                                # - This caused issues to be skipped on failure (violated FIFO ordering)
                                 #
-                                # Ending the pipeline run allows the project monitor to see the issue needs work:
-                                # - If issue holds lock → Monitor will retry (lock already acquired)
-                                # - If issue in queue → Monitor will process when lock available
+                                # New behavior: DO NOT end the pipeline run when agent fails:
+                                # - Pipeline run remains active (keeps the lock)
+                                # - Failed issue blocks the queue (enforces FIFO ordering)
+                                # - Requires manual intervention to unblock:
+                                #   * Move issue to Backlog (releases lock, allows retry)
+                                #   * Move to non-trigger column (releases lock, skips issue)
+                                #   * Close issue (releases lock, abandons work)
                                 #
-                                # The end_pipeline_run() function handles lock release and queue processing automatically.
+                                # Emit comprehensive failure events for UX visibility
                                 try:
+                                    from monitoring.decision_events import DecisionEventEmitter
+                                    from monitoring.observability import get_observability_manager, EventType
                                     from services.pipeline_run import get_pipeline_run_manager
+
+                                    obs = get_observability_manager()
+                                    decision_events = DecisionEventEmitter(obs)
                                     pipeline_run_mgr = get_pipeline_run_manager()
                                     active_run = pipeline_run_mgr.get_active_pipeline_run(project_name, issue_number)
 
-                                    if active_run:
-                                        logger.info(
-                                            f"Ending stale pipeline run for {project_name}/#{issue_number} to allow retry. "
-                                            f"Pipeline run was active but all executions failed and container is gone."
-                                        )
-                                        pipeline_run_mgr.end_pipeline_run(project_name, issue_number)
-                                    else:
-                                        logger.debug(
-                                            f"No active pipeline run found for {project_name}/#{issue_number}"
-                                        )
-                                except Exception as e:
-                                    logger.error(
-                                        f"Failed to end pipeline run for {project_name}/#{issue_number}: {e}. "
-                                        f"Issue may remain stuck - manual intervention may be required."
+                                    # Emit error decision event with blocking context
+                                    decision_events.emit_error_decision(
+                                        error_type='ExecutionContainerLost',
+                                        error_message=execution['error'],
+                                        context={
+                                            'project': project_name,
+                                            'issue_number': issue_number,
+                                            'agent': agent,
+                                            'column': column,
+                                            'timestamp': timestamp,
+                                            'blocking_pipeline': True,  # Indicate this blocks pipeline
+                                            'pipeline_run_id': active_run.id if active_run else None,
+                                            'lock_held': True  # Issue still holds the lock
+                                        },
+                                        recovery_action='manual_intervention_required',
+                                        success=False,
+                                        project=project_name
                                     )
+
+                                    # Emit specific pipeline blocked event
+                                    if active_run:
+                                        obs.emit(
+                                            EventType.PIPELINE_RUN_FAILED,
+                                            "pipeline_lifecycle",
+                                            active_run.id,
+                                            project_name,
+                                            {
+                                                "pipeline_run_id": active_run.id,
+                                                "issue_number": issue_number,
+                                                "board": active_run.board,
+                                                "reason": "agent_execution_failed",
+                                                "error": execution['error'],
+                                                "blocking_pipeline": True,
+                                                "requires_manual_intervention": True
+                                            },
+                                            pipeline_run_id=active_run.id
+                                        )
+
+                                    logger.info(
+                                        f"Emitted failure events for {project_name}/#{issue_number}. "
+                                        f"UX should display: 'Pipeline blocked - manual intervention required'"
+                                    )
+
+                                except Exception as e:
+                                    logger.error(f"Failed to emit execution failure events: {e}", exc_info=True)
+                                    # Continue anyway - the execution state is still marked as failed
                             else:
                                 logger.info(
                                     f"Agent container still running for {project_name}/#{issue_number}, "
