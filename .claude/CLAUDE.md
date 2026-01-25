@@ -534,6 +534,51 @@ redis-cli -h localhost -p 6379 ping
 # Orchestrator falls back to in-memory queue if Redis unavailable
 ```
 
+### Diagnostic Scripts
+
+Three specialized diagnostic scripts provide deep visibility into pipeline execution and queue health:
+
+**Pipeline Timeline** - Visualize complete pipeline execution history:
+```bash
+# Show timeline for a specific pipeline run
+docker-compose exec orchestrator python scripts/inspect_pipeline_timeline.py <pipeline_run_id>
+
+# With verbose output
+docker-compose exec orchestrator python scripts/inspect_pipeline_timeline.py <pipeline_run_id> --verbose
+
+# JSON output
+docker-compose exec orchestrator python scripts/inspect_pipeline_timeline.py <pipeline_run_id> --json
+```
+
+**Task Health** - Monitor task queue health and detect stuck tasks:
+```bash
+# Check queue health
+docker-compose exec orchestrator python scripts/inspect_task_health.py
+
+# Show all tasks
+docker-compose exec orchestrator python scripts/inspect_task_health.py --show-all
+
+# Filter by project
+docker-compose exec orchestrator python scripts/inspect_task_health.py --project context-studio
+
+# JSON output (suitable for monitoring systems)
+docker-compose exec orchestrator python scripts/inspect_task_health.py --json
+```
+
+**Checkpoint Inspector** - Verify pipeline recovery state:
+```bash
+# List recent checkpoints
+docker-compose exec orchestrator python scripts/inspect_checkpoint.py
+
+# Inspect specific pipeline
+docker-compose exec orchestrator python scripts/inspect_checkpoint.py <pipeline_run_id>
+
+# Verify recovery readiness
+docker-compose exec orchestrator python scripts/inspect_checkpoint.py <pipeline_run_id> --verify-recovery
+```
+
+See `scripts/DIAGNOSTIC_SCRIPTS.md` for complete documentation, examples, and common workflows.
+
 ## Security Considerations
 
 - API keys stored in `.env` (NEVER commit)

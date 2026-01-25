@@ -22,10 +22,12 @@ You have mastery over:
 **Diagnostic Data Sources**:
 - **Primary Diagnostic Scripts** (`scripts/` directory): Purpose-built tools for comprehensive investigation
   - `inspect_run_details.py` - Complete pipeline run analysis (Redis + Elasticsearch + events)
+  - `inspect_pipeline_timeline.py` - Visual timeline of pipeline execution with durations and bottlenecks
   - `watch_agent_logs.sh` - Real-time agent monitoring and status updates
   - `inspect_circuit_breakers.py` - Service health and failure state detection
-  - `inspect_queue.py` - Task queue analysis and backlog identification
-  - See "Primary Diagnostic Scripts" section for full details and usage guidance
+  - `inspect_task_health.py` - Queue health monitoring with stuck task detection
+  - `inspect_checkpoint.py` - Checkpoint recovery verification and state auditing
+  - See `scripts/DIAGNOSTIC_SCRIPTS.md` and "Primary Diagnostic Scripts" section for full details
 - Docker containers: `docker ps`, `docker logs`, `docker inspect`
 - Orchestrator logs: structured JSON logs in stdout and `orchestrator_data/logs/`
 - Elasticsearch indices: `orchestrator-task-metrics-*`, `orchestrator-quality-metrics-*`, pipeline events
@@ -63,6 +65,9 @@ You have mastery over:
 2. `watch_agent_logs.sh` - For real-time monitoring and active debugging
 3. `inspect_circuit_breakers.py` - For stuck pipelines and service degradation
 4. `inspect_queue.py` - For task queue backups and priority issues
+5. `inspect_pipeline_timeline.py` - For pipeline execution flow analysis and bottleneck identification
+6. `inspect_task_health.py` - For proactive queue health monitoring and stuck task detection
+7. `inspect_checkpoint.py` - For checkpoint recovery verification and state auditing
 
 ## Diagnostic Methodology
 
@@ -76,9 +81,11 @@ When investigating an issue, follow this systematic approach:
 
 2. **Collect Evidence** (Use diagnostic scripts proactively):
    - **For pipeline failures:** Run `python scripts/inspect_run_details.py <run_id>` for comprehensive analysis
+   - **For pipeline execution flow:** Run `python scripts/inspect_pipeline_timeline.py <run_id>` to visualize timeline
    - **For real-time monitoring:** Run `./scripts/watch_agent_logs.sh` to watch active agents
    - **For stuck pipelines:** Run `python scripts/inspect_circuit_breakers.py` to check service health
-   - **For queue issues:** Run `python scripts/inspect_queue.py` to see task backlog
+   - **For queue issues:** Run `python scripts/inspect_task_health.py` to detect stuck tasks and analyze distribution
+   - **For recovery verification:** Run `python scripts/inspect_checkpoint.py <run_id>` to verify checkpoint state
    - Check system health: `curl http://localhost:5001/health`
    - View active processes: `docker ps` and `curl http://localhost:5001/agents/active`
    - Examine recent logs: `docker-compose logs -f orchestrator --tail=100`
@@ -249,6 +256,80 @@ python scripts/inspect_queue.py
 - Identifies queue depth and oldest tasks
 
 **When to use:** Work not being picked up, queue backlog suspected, priority queue issues
+
+---
+
+### 5. inspect_pipeline_timeline.py ⭐ **BEST FOR PIPELINE EXECUTION ANALYSIS**
+
+**Use this for:** Understanding pipeline execution flow, identifying bottlenecks, analyzing review cycles
+
+```bash
+python scripts/inspect_pipeline_timeline.py <pipeline_run_id>
+python scripts/inspect_pipeline_timeline.py <pipeline_run_id> --verbose  # Full event details
+python scripts/inspect_pipeline_timeline.py <pipeline_run_id> --json     # Machine-readable output
+```
+
+**What it does:**
+- Visualizes complete pipeline execution as chronological timeline
+- Shows agent lifecycle (initialization, execution, completion) with durations
+- Displays decision points (routing, status progression, review cycles)
+- Calculates agent execution times and identifies slowest stages
+- Highlights errors and failure points with context
+- Generates summary statistics (agents used, review iterations, status changes)
+
+**When to use:** Debugging slow pipelines, understanding why a stage was skipped, analyzing review cycle iterations, identifying performance bottlenecks
+
+---
+
+### 6. inspect_task_health.py ⭐ **BEST FOR QUEUE HEALTH MONITORING**
+
+**Use this for:** Detecting stuck tasks, monitoring queue depth, capacity planning
+
+```bash
+python scripts/inspect_task_health.py                    # Check current health
+python scripts/inspect_task_health.py --show-all         # List all tasks
+python scripts/inspect_task_health.py --project <name>   # Filter by project
+python scripts/inspect_task_health.py --json             # For monitoring systems
+```
+
+**What it does:**
+- Monitors all priority queues (high/medium/low) for task buildup
+- Detects stuck tasks exceeding age thresholds (30min/1hr/4hr by priority)
+- Analyzes task distribution by project and agent
+- Provides health status with actionable recommendations
+- Returns appropriate exit codes (0=healthy, 1=warning, 2=critical)
+- Supports custom age thresholds for different environments
+
+**When to use:** Proactive queue monitoring, investigating why work isn't being processed, identifying bottlenecks by agent type, integration with monitoring systems (Nagios, Prometheus)
+
+**Exit codes:** 0=healthy, 1=stuck tasks detected, 2=critical issues or Redis unavailable
+
+---
+
+### 7. inspect_checkpoint.py **BEST FOR RECOVERY VERIFICATION**
+
+**Use this for:** Verifying pipeline recovery state, debugging resume failures, auditing checkpoints
+
+```bash
+python scripts/inspect_checkpoint.py                            # List recent checkpoints
+python scripts/inspect_checkpoint.py <pipeline_run_id>          # Inspect specific pipeline
+python scripts/inspect_checkpoint.py <pipeline_run_id> --show-context      # Show full context JSON
+python scripts/inspect_checkpoint.py <pipeline_run_id> --verify-recovery   # Test recovery readiness
+```
+
+**What it does:**
+- Lists all checkpoint files for a pipeline run
+- Shows stage progression and completion timeline
+- Verifies checkpoint can be used for recovery (JSON serializable, complete context)
+- Displays checkpoint age and warns if stale (>24 hours)
+- Shows context summary (project, issue, outputs, conversation history)
+- Checks for required fields and data completeness
+
+**When to use:** Pipeline won't resume after crash, verifying checkpoint system is working, investigating stale state, confirming recovery readiness before restart
+
+---
+
+**📚 Comprehensive Documentation:** See `scripts/DIAGNOSTIC_SCRIPTS.md` for detailed usage examples, common workflows, troubleshooting, and integration patterns for all diagnostic scripts.
 
 ---
 
