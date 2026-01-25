@@ -286,11 +286,12 @@ class ClaudeCodeBreaker:
     
     def is_open(self) -> bool:
         """Check if breaker is open (agents cannot run).
-        Also checks Redis to detect external resets."""
-        
-        # Sync from Redis to detect if another worker tripped it
-        if self.state == self.CLOSED:
-            self._load_from_redis()
+        Always syncs from Redis to detect state changes from other processes."""
+
+        # ALWAYS sync from Redis to detect if another process tripped the breaker
+        # This is critical for Docker containers that start with CLOSED state
+        # but need to immediately detect when another process opens the breaker
+        self._load_from_redis()
 
         # Check Redis for external reset before checking state
         if self.state == self.OPEN:
