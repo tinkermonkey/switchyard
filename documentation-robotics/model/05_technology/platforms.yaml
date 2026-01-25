@@ -1,0 +1,17 @@
+docker:
+  id: technology.platform.docker
+  name: Docker
+  type: platform
+  documentation: Container platform for agent isolation and project development
+    environments with Docker-in-Docker support
+  properties:
+    client_version: ">=7.0.0"
+    features:
+      - docker-in-docker
+      - dev-containers
+      - agent-isolation
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: docker-compose.yml

@@ -1,0 +1,14 @@
+metrics-collector:
+  id: apm.collector.metrics-collector
+  name: Task and Quality Metrics Collector
+  type: collector
+  documentation: Elasticsearch-backed metrics collector for task execution (agent,
+    duration, success) and quality metrics (agent, metric_name, score) with
+    7-day ILM retention policy and JSON backup to orchestrator_data/metrics/
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: monitoring/metrics.py
+            symbol: MetricsCollector

@@ -1,0 +1,173 @@
+health-check:
+  id: api.operation.health-check
+  name: Health Check Endpoint
+  type: operation
+  documentation: Returns system health status including Redis, GitHub, and Docker
+    connectivity checks
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: monitoring/observability.py
+    crossLayerRelationships:
+      returns:
+        - data_model.schema.health-check
+list-active-agents:
+  id: api.operation.list-active-agents
+  name: List Active Agents
+  type: operation
+  documentation: Returns currently running agent containers
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: monitoring/observability.py
+kill-agent:
+  id: api.operation.kill-agent
+  name: Kill Agent Container
+  type: operation
+  documentation: Terminates a running agent container by name
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: monitoring/observability.py
+get-execution-history:
+  id: api.operation.get-execution-history
+  name: Get Execution History
+  type: operation
+  documentation: Returns agent execution history
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: monitoring/observability.py
+get-claude-logs:
+  id: api.operation.get-claude-logs
+  name: Get Claude Logs
+  type: operation
+  documentation: Returns Claude Code logs history
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: monitoring/observability.py
+get-current-pipeline:
+  id: api.operation.get-current-pipeline
+  name: Get Current Pipeline State
+  type: operation
+  documentation: Returns current pipeline state information
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: monitoring/observability.py
+get-pipeline-events:
+  id: api.operation.get-pipeline-events
+  name: Get Pipeline Run Events
+  type: operation
+  documentation: Returns pipeline run events history
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: monitoring/observability.py
+    crossLayerRelationships:
+      returns:
+        - data_model.schema.pipeline-run
+get-active-pipelines:
+  id: api.operation.get-active-pipelines
+  name: Get Active Pipeline Runs
+  type: operation
+  documentation: Returns currently active pipeline runs
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: monitoring/observability.py
+    crossLayerRelationships:
+      returns:
+        - data_model.schema.pipeline-run
+list-review-filters:
+  id: api.operation.list-review-filters
+  name: List Review Filters
+  type: operation
+  documentation: Returns all learned review filters
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: monitoring/observability.py
+    crossLayerRelationships:
+      returns:
+        - data_model.schema.review-filter
+create-review-filter:
+  id: api.operation.create-review-filter
+  name: Create Review Filter
+  type: operation
+  documentation: Creates a new review filter rule
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: monitoring/observability.py
+    crossLayerRelationships:
+      accepts:
+        - data_model.schema.review-filter
+update-review-filter:
+  id: api.operation.update-review-filter
+  name: Update Review Filter
+  type: operation
+  documentation: Updates an existing review filter by ID
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: monitoring/observability.py
+    crossLayerRelationships:
+      accepts:
+        - data_model.schema.review-filter
+delete-review-filter:
+  id: api.operation.delete-review-filter
+  name: Delete Review Filter
+  type: operation
+  documentation: Deletes a review filter by ID
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: monitoring/observability.py
+get-circuit-breakers:
+  id: api.operation.get-circuit-breakers
+  name: Get Circuit Breakers State
+  type: operation
+  documentation: Returns current state of all circuit breakers
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: monitoring/observability.py
+list-projects:
+  id: api.operation.list-projects
+  name: List Projects
+  type: operation
+  documentation: Returns list of all managed projects and their status
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: monitoring/observability.py

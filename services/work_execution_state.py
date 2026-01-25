@@ -1240,12 +1240,12 @@ class WorkExecutionStateTracker:
                                             'column': column,
                                             'timestamp': timestamp,
                                             'blocking_pipeline': True,  # Indicate this blocks pipeline
-                                            'pipeline_run_id': active_run.id if active_run else None,
                                             'lock_held': True  # Issue still holds the lock
                                         },
                                         recovery_action='manual_intervention_required',
                                         success=False,
-                                        project=project_name
+                                        project=project_name,
+                                        pipeline_run_id=active_run.id if active_run else None
                                     )
 
                                     # Emit specific pipeline blocked event

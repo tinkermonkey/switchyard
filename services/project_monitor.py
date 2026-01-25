@@ -3026,6 +3026,43 @@ _Review cycle initiated by Claude Code Orchestrator_
                     logger.error(f"Error in review cycle thread: {e}")
                     import traceback
                     logger.error(traceback.format_exc())
+
+                    # EMIT ERROR EVENT for UI visibility
+                    try:
+                        from monitoring.decision_events import DecisionEventEmitter
+                        from monitoring.observability import get_observability_manager
+
+                        decision_emitter = DecisionEventEmitter(get_observability_manager())
+
+                        context = {
+                            'thread': 'review_cycle_thread',
+                            'issue_number': issue_number if 'issue_number' in locals() else None,
+                            'project': project_name if 'project_name' in locals() else None,
+                            'board': pipeline_config.board_name if 'pipeline_config' in locals() and pipeline_config else None
+                        }
+
+                        # Try to get pipeline_run_id if we have issue_number and project_name
+                        pipeline_run_id = None
+                        if 'issue_number' in locals() and issue_number and 'project_name' in locals() and project_name:
+                            try:
+                                from services.pipeline_run import get_pipeline_run_manager
+                                prm = get_pipeline_run_manager()
+                                pipeline_run_id = prm.get_active_run_id(project_name, issue_number)
+                            except Exception:
+                                pass  # pipeline_run_id will remain None
+
+                        decision_emitter.emit_error_decision(
+                            error_type="review_cycle_thread_failure",
+                            error_message=str(e),
+                            context=context,
+                            recovery_action="Review cycle thread terminated, pipeline lock retained",
+                            success=False,
+                            project=context.get('project', 'unknown'),
+                            pipeline_run_id=pipeline_run_id
+                        )
+                    except Exception as emit_error:
+                        logger.error(f"Failed to emit thread error event: {emit_error}", exc_info=True)
+
                 finally:
                     # Always close the event loop to prevent resource leak
                     try:
@@ -5490,6 +5527,15 @@ _Repair cycle initiated by Claude Code Orchestrator_
                 for comment in feedback_comments
             ])
 
+            # Get pipeline_run_id for traceability
+            pipeline_run_id = None
+            try:
+                active_run = self.pipeline_run_manager.get_active_pipeline_run(project_name, issue_number)
+                if active_run:
+                    pipeline_run_id = active_run.id
+            except Exception as e:
+                logger.debug(f"Could not get pipeline_run_id for feedback task: {e}")
+
             # Create task context with feedback
             task_context = {
                 'project': project_name,
@@ -5505,6 +5551,7 @@ _Repair cycle initiated by Claude Code Orchestrator_
                     'formatted_text': feedback_text
                 },
                 'previous_output': previous_output,  # Include agent's previous work
+                'pipeline_run_id': pipeline_run_id,  # For event tracking
                 'timestamp': utc_isoformat()
             }
 
@@ -6679,6 +6726,15 @@ Moving to implementation phase.
                 for comment in feedback_comments
             ])
 
+            # Get pipeline_run_id for traceability
+            pipeline_run_id = None
+            try:
+                active_run = self.pipeline_run_manager.get_active_pipeline_run(project_name, issue_number)
+                if active_run:
+                    pipeline_run_id = active_run.id
+            except Exception as e:
+                logger.debug(f"Could not get pipeline_run_id for feedback task: {e}")
+
             # Create task context with feedback and discussion info
             task_context = {
                 'project': project_name,
@@ -6699,6 +6755,7 @@ Moving to implementation phase.
                     'formatted_text': feedback_text
                 },
                 'previous_output': previous_output,
+                'pipeline_run_id': pipeline_run_id,  # For event tracking
                 'timestamp': utc_isoformat()
             }
 

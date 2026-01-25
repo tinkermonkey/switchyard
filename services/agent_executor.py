@@ -73,6 +73,8 @@ class AgentExecutor:
 
         # Extract pipeline_run_id from task_context for stream callback
         pipeline_run_id = task_context.get('pipeline_run_id')
+        logger.info(f"[DIAGNOSTIC] Extracted pipeline_run_id from task_context: {pipeline_run_id} (type: {type(pipeline_run_id)})")
+        logger.info(f"[DIAGNOSTIC] Full task_context keys: {list(task_context.keys())}")
 
         # Create stream callback for live Claude Code output
         stream_callback = self._create_stream_callback(agent_name, task_id, project_name, pipeline_run_id)
@@ -94,7 +96,14 @@ class AgentExecutor:
         workspace_context = None
         branch_name = None
         skip_workspace_prep = task_context.get('skip_workspace_prep', False)
-        
+
+        logger.info(
+            f"🔍 WORKSPACE PREP DEBUG: agent={agent_name}, "
+            f"skip_workspace_prep={skip_workspace_prep}, "
+            f"has_issue_number={'issue_number' in task_context}, "
+            f"issue_number={task_context.get('issue_number', 'N/A')}"
+        )
+
         if skip_workspace_prep:
             logger.info(f"Skipping workspace preparation (skip_workspace_prep=True) for {agent_name}")
             # Extract branch_name from context if available
@@ -118,6 +127,10 @@ class AgentExecutor:
 
                         # Create workspace context based on type
                         workspace_type = task_context.get('workspace_type', 'issues')
+                        logger.info(
+                            f"🔍 WORKSPACE PREP DEBUG: Creating {workspace_type} workspace context for issue #{task_context['issue_number']}"
+                        )
+
                         workspace_context = WorkspaceContextFactory.create(
                             workspace_type=workspace_type,
                             project=project_name,
@@ -126,8 +139,15 @@ class AgentExecutor:
                             github_integration=gh_integration
                         )
 
+                        logger.info(
+                            f"🔍 WORKSPACE PREP DEBUG: workspace_context created, type={type(workspace_context).__name__}, "
+                            f"supports_git={getattr(workspace_context, 'supports_git_operations', 'N/A')}"
+                        )
+
                         # Prepare workspace (git branch OR discussion context)
+                        logger.info(f"🔍 WORKSPACE PREP DEBUG: Calling prepare_execution() on {workspace_type} workspace")
                         prep_result = await workspace_context.prepare_execution()
+                        logger.info(f"🔍 WORKSPACE PREP DEBUG: prepare_execution() returned: {prep_result}")
                         
                         if prep_result is None:
                             logger.error(f"Workspace prepare_execution returned None for {workspace_type} workspace")
@@ -184,6 +204,13 @@ class AgentExecutor:
                                 )
 
             except Exception as e:
+                logger.error(
+                    f"🔍 WORKSPACE PREP DEBUG: Exception during workspace preparation: {e}\n"
+                    f"  workspace_context={'present' if workspace_context else 'NONE'}\n"
+                    f"  Exception type: {type(e).__name__}",
+                    exc_info=True
+                )
+
                 # Check if this workspace requires git operations
                 # For git-based workspaces, workspace prep failures are CRITICAL
                 # For non-git workspaces (discussions), we can continue with a warning
@@ -194,6 +221,31 @@ class AgentExecutor:
                             f"Halting execution to prevent commits to wrong branch.",
                             exc_info=True
                         )
+
+                        # Emit error event if this is part of a review cycle
+                        if pipeline_run_id and 'issue_number' in task_context:
+                            try:
+                                from monitoring.decision_events import DecisionEventEmitter
+                                decision_emitter = DecisionEventEmitter(self.obs)
+
+                                decision_emitter.emit_error_decision(
+                                    error_type="workspace_preparation_git_failure",
+                                    error_message=str(e),
+                                    context={
+                                        'agent': agent_name,
+                                        'project': project_name,
+                                        'issue_number': task_context.get('issue_number'),
+                                        'branch_name': task_context.get('branch_name'),
+                                        'workspace_type': task_context.get('workspace_type', 'issues')
+                                    },
+                                    recovery_action="Agent execution halted to prevent commits to wrong branch",
+                                    success=False,
+                                    project=project_name,
+                                    pipeline_run_id=pipeline_run_id
+                                )
+                            except Exception as emit_error:
+                                logger.error(f"Failed to emit workspace prep error event: {emit_error}", exc_info=True)
+
                         raise RuntimeError(f"Git workspace preparation failed: {e}") from e
 
                 # For other cases (no workspace context yet, or non-git workspace), log warning and continue
@@ -335,10 +387,23 @@ class AgentExecutor:
             # Post agent output to GitHub (centralized posting)
             await self._post_agent_output_to_github(agent_name, task_context, result)
 
+            logger.info(
+                f"🔍 FINALIZATION DEBUG: workspace_context={'present' if workspace_context else 'NONE'}, "
+                f"workspace_type={workspace_context.__class__.__name__ if workspace_context else 'N/A'}, "
+                f"issue_number={task_context.get('issue_number', 'N/A')}"
+            )
+
             # Finalize workspace using abstraction layer
             if workspace_context:
+                logger.info(f"🔍 FINALIZATION DEBUG: Entering workspace finalization block")
                 try:
-                    commit_message = f"Complete work for issue #{task_context['issue_number']}\n\nAgent: {agent_name}\nTask: {task_id}"
+                    commit_message = (
+                        f"Complete work for issue #{task_context['issue_number']}\n\n"
+                        f"Agent: {agent_name}\n"
+                        f"Task: {task_id}\n\n"
+                        f"Co-Authored-By: Claude Sonnet 4.5 <noreply@anthropic.com>\n"
+                        f"[orchestrator-commit]"
+                    )
 
                     finalize_result = await workspace_context.finalize_execution(
                         result=result,
@@ -346,13 +411,68 @@ class AgentExecutor:
                     )
 
                     if finalize_result.get('success'):
-                        logger.info(f"Finalized workspace: {finalize_result}")
+                        logger.info(f"✅ Finalized workspace: {finalize_result}")
                     else:
-                        logger.warning(f"Workspace finalization had issues: {finalize_result}")
+                        # Finalization returned failure - log details and check for uncommitted changes
+                        logger.warning(
+                            f"⚠️ Workspace finalization reported issues: {finalize_result}\n"
+                            f"  Error: {finalize_result.get('error', 'Unknown')}\n"
+                            f"  Checking for uncommitted changes via failsafe..."
+                        )
+
+                        # Run failsafe check to handle any uncommitted changes
+                        if 'issue_number' in task_context:
+                            await self._failsafe_commit_check(
+                                project_name=project_name,
+                                agent_name=agent_name,
+                                task_context=task_context,
+                                task_id=task_id
+                            )
 
                 except Exception as e:
-                    logger.warning(f"Failed to finalize workspace: {e}")
+                    logger.error(
+                        f"❌ FINALIZATION DEBUG: Exception during workspace finalization: {e}\n"
+                        f"  Exception type: {type(e).__name__}",
+                        exc_info=True
+                    )
+
+                    # Run failsafe check even on exception to handle uncommitted changes
+                    if 'issue_number' in task_context:
+                        logger.info("Running failsafe commit check after finalization exception...")
+                        try:
+                            await self._failsafe_commit_check(
+                                project_name=project_name,
+                                agent_name=agent_name,
+                                task_context=task_context,
+                                task_id=task_id
+                            )
+                        except Exception as failsafe_error:
+                            logger.error(
+                                f"❌ Failsafe commit check also failed: {failsafe_error}",
+                                exc_info=True
+                            )
                     # Continue execution even if finalization fails
+            else:
+                # CRITICAL FAILSAFE: workspace_context is None, but agent may have made changes
+                # This happens when:
+                # 1. Workspace preparation was skipped (repair cycles)
+                # 2. Workspace preparation failed but agent still ran
+                # 3. Agent doesn't have an issue_number (unlikely)
+                logger.warning(
+                    f"⚠️ FAILSAFE: workspace_context is None for {agent_name}, "
+                    f"but agent completed. Checking for uncommitted changes..."
+                )
+
+                # Check if there are any uncommitted changes in the workspace
+                if 'issue_number' in task_context:
+                    await self._failsafe_commit_check(
+                        project_name=project_name,
+                        agent_name=agent_name,
+                        task_context=task_context,
+                        task_id=task_id
+                    )
+                else:
+                    logger.info("No issue_number in task_context - skipping failsafe commit check")
 
             # PR-ready marking is handled by two idempotent checks:
             # 1. feature_branch_manager.finalize_workspace() - immediate check during finalization
@@ -657,6 +777,291 @@ class AgentExecutor:
 
         logger.warning(f"Could not find markdown output for {agent_name} in keys: {list(result.keys())}")
         return None
+
+    async def _failsafe_commit_check(
+        self,
+        project_name: str,
+        agent_name: str,
+        task_context: Dict[str, Any],
+        task_id: str
+    ):
+        """
+        Failsafe: Check for uncommitted changes when workspace_context is None.
+
+        This handles scenarios where:
+        - Claude Code partially stages files but doesn't commit
+        - Agent makes changes but workspace finalization doesn't run
+        - There's a mix of staged and unstaged changes
+
+        Args:
+            project_name: Name of the project
+            agent_name: Name of the agent that ran
+            task_context: Task context containing issue info
+            task_id: Task identifier
+        """
+        import subprocess
+        import glob
+
+        try:
+            project_dir = f"/workspace/{project_name}"
+            issue_number = task_context.get('issue_number')
+
+            logger.info(f"🔍 FAILSAFE: Checking git status in {project_dir}")
+
+            # Get git status
+            status_result = subprocess.run(
+                ['git', 'status', '--porcelain'],
+                cwd=project_dir,
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+
+            if status_result.returncode != 0:
+                logger.error(f"❌ FAILSAFE: git status failed: {status_result.stderr}")
+                return
+
+            status_output = status_result.stdout.strip()
+
+            if not status_output:
+                logger.info("✅ FAILSAFE: No uncommitted changes found - workspace is clean")
+                return
+
+            # Parse git status output
+            # Format: "XY filename" where X=staged, Y=unstaged
+            # A  = added to index (staged)
+            #  M = modified in working tree (unstaged)
+            # M  = modified in index (staged)
+            # ?? = untracked
+
+            staged_files = []
+            unstaged_files = []
+            untracked_files = []
+
+            for line in status_output.split('\n'):
+                if not line:
+                    continue
+
+                status_code = line[:2]
+                filename = line[3:]
+
+                # Check staged status (first character)
+                if status_code[0] in ('A', 'M', 'D', 'R', 'C'):
+                    staged_files.append(filename)
+
+                # Check unstaged status (second character)
+                if status_code[1] in ('M', 'D'):
+                    unstaged_files.append(filename)
+
+                # Check untracked
+                if status_code == '??':
+                    untracked_files.append(filename)
+
+            logger.warning(
+                f"⚠️ FAILSAFE: Found uncommitted changes:\n"
+                f"  Staged: {len(staged_files)} files\n"
+                f"  Unstaged: {len(unstaged_files)} files\n"
+                f"  Untracked: {len(untracked_files)} files"
+            )
+
+            # Clean up prompt files FIRST (critical to prevent them being committed)
+            try:
+                prompt_files = glob.glob(f"{project_dir}/.claude_prompt_*.txt")
+                for prompt_file in prompt_files:
+                    try:
+                        import os
+                        os.remove(prompt_file)
+                        logger.info(f"🔍 FAILSAFE: Removed prompt file: {os.path.basename(prompt_file)}")
+                    except Exception as e:
+                        logger.warning(f"Failed to remove prompt file {prompt_file}: {e}")
+            except Exception as e:
+                logger.warning(f"Error during failsafe prompt file cleanup: {e}")
+
+            # Decision logic based on what we found
+            if staged_files and not unstaged_files:
+                # Only staged files - safe to commit
+                logger.info("🔍 FAILSAFE: Only staged files found - proceeding with commit")
+                await self._failsafe_commit_staged(
+                    project_dir, project_name, issue_number, agent_name, task_id, staged_files
+                )
+
+            elif unstaged_files and not staged_files:
+                # Only unstaged files - stage them and commit
+                logger.info("🔍 FAILSAFE: Only unstaged files found - staging and committing")
+                await self._failsafe_stage_and_commit(
+                    project_dir, project_name, issue_number, agent_name, task_id, unstaged_files
+                )
+
+            elif staged_files and unstaged_files:
+                # MIXED STATE - this is the problematic scenario
+                logger.warning(
+                    f"⚠️ FAILSAFE: MIXED STATE detected - both staged and unstaged changes\n"
+                    f"  This usually happens when Claude Code partially stages files.\n"
+                    f"  Staged: {staged_files}\n"
+                    f"  Unstaged: {unstaged_files}"
+                )
+                # Stage everything and commit
+                await self._failsafe_stage_and_commit(
+                    project_dir, project_name, issue_number, agent_name, task_id,
+                    staged_files + unstaged_files
+                )
+
+            elif untracked_files:
+                # Only untracked files - these might be artifacts, log cautiously
+                logger.info(f"🔍 FAILSAFE: Only untracked files: {untracked_files}")
+                # Don't commit untracked files automatically - might be build artifacts
+
+        except Exception as e:
+            logger.error(f"❌ FAILSAFE: Exception during commit check: {e}", exc_info=True)
+
+    async def _failsafe_commit_staged(
+        self,
+        project_dir: str,
+        project_name: str,
+        issue_number: int,
+        agent_name: str,
+        task_id: str,
+        staged_files: list
+    ):
+        """Commit already-staged files"""
+        import subprocess
+
+        try:
+            commit_message = (
+                f"Complete work for issue #{issue_number}\n\n"
+                f"Agent: {agent_name}\n"
+                f"Task: {task_id}\n\n"
+                f"Co-Authored-By: Claude Sonnet 4.5 <noreply@anthropic.com>\n"
+                f"[orchestrator-commit]\n\n"
+                f"(Failsafe commit: staged files)"
+            )
+
+            logger.info(f"🔍 FAILSAFE: Committing {len(staged_files)} staged files")
+
+            # Skip pre-commit hooks for failsafe commits (same as normal orchestrator commits)
+            commit_result = subprocess.run(
+                ['git', 'commit', '-m', commit_message, '--no-verify'],
+                cwd=project_dir,
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+
+            if commit_result.returncode == 0:
+                logger.info(f"✅ FAILSAFE: Successfully committed staged changes")
+
+                # Try to push
+                await self._failsafe_push(project_dir, project_name, issue_number)
+            else:
+                logger.error(f"❌ FAILSAFE: Commit failed: {commit_result.stderr}")
+
+        except Exception as e:
+            logger.error(f"❌ FAILSAFE: Exception during commit: {e}", exc_info=True)
+
+    async def _failsafe_stage_and_commit(
+        self,
+        project_dir: str,
+        project_name: str,
+        issue_number: int,
+        agent_name: str,
+        task_id: str,
+        all_files: list
+    ):
+        """Stage all changes and commit"""
+        import subprocess
+
+        try:
+            logger.info(f"🔍 FAILSAFE: Staging {len(all_files)} files")
+
+            # Stage all changes
+            add_result = subprocess.run(
+                ['git', 'add', '-A'],
+                cwd=project_dir,
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+
+            if add_result.returncode != 0:
+                logger.error(f"❌ FAILSAFE: git add failed: {add_result.stderr}")
+                return
+
+            logger.info(f"✅ FAILSAFE: Staged all changes")
+
+            # Commit
+            commit_message = (
+                f"Complete work for issue #{issue_number}\n\n"
+                f"Agent: {agent_name}\n"
+                f"Task: {task_id}\n\n"
+                f"Co-Authored-By: Claude Sonnet 4.5 <noreply@anthropic.com>\n"
+                f"[orchestrator-commit]\n\n"
+                f"(Failsafe commit: auto-staged all changes)"
+            )
+
+            # Skip pre-commit hooks for failsafe commits (same as normal orchestrator commits)
+            commit_result = subprocess.run(
+                ['git', 'commit', '-m', commit_message, '--no-verify'],
+                cwd=project_dir,
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+
+            if commit_result.returncode == 0:
+                logger.info(f"✅ FAILSAFE: Successfully committed all changes")
+
+                # Try to push
+                await self._failsafe_push(project_dir, project_name, issue_number)
+            else:
+                logger.error(f"❌ FAILSAFE: Commit failed: {commit_result.stderr}")
+
+        except Exception as e:
+            logger.error(f"❌ FAILSAFE: Exception during stage and commit: {e}", exc_info=True)
+
+    async def _failsafe_push(
+        self,
+        project_dir: str,
+        project_name: str,
+        issue_number: int
+    ):
+        """Try to push committed changes"""
+        import subprocess
+
+        try:
+            from services.git_workflow_manager import git_workflow_manager
+
+            # Get current branch
+            branch_result = subprocess.run(
+                ['git', 'rev-parse', '--abbrev-ref', 'HEAD'],
+                cwd=project_dir,
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+
+            if branch_result.returncode != 0:
+                logger.error(f"❌ FAILSAFE: Could not determine current branch: {branch_result.stderr}")
+                return
+
+            branch_name = branch_result.stdout.strip()
+            logger.info(f"🔍 FAILSAFE: Pushing to branch: {branch_name}")
+
+            # Push
+            push_result = subprocess.run(
+                ['git', 'push', 'origin', branch_name],
+                cwd=project_dir,
+                capture_output=True,
+                text=True,
+                timeout=60
+            )
+
+            if push_result.returncode == 0:
+                logger.info(f"✅ FAILSAFE: Successfully pushed to origin/{branch_name}")
+            else:
+                logger.warning(f"⚠️ FAILSAFE: Push failed (non-critical): {push_result.stderr}")
+
+        except Exception as e:
+            logger.warning(f"⚠️ FAILSAFE: Exception during push (non-critical): {e}")
 
     async def _queue_environment_verifier(
         self,

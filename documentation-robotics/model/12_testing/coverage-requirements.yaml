@@ -1,0 +1,28 @@
+code-coverage-target:
+  id: testing.coverage-requirement.code-coverage-target
+  name: Code Coverage Target Requirement
+  type: coverage-requirement
+  documentation: Maintain >80% line coverage and >70% branch coverage for critical
+    paths using pytest-cov and coverage.py
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: tests/conftest.py
+    motivation:
+      validates:
+        - motivation.requirement.quality-gates
+integration-coverage:
+  id: testing.coverage-requirement.integration-coverage
+  name: Integration Test Coverage Requirement
+  type: coverage-requirement
+  documentation: All critical workflows must have integration test coverage
+    including planning pipeline, SDLC pipeline, environment setup, GitHub sync,
+    and checkpoint recovery
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: tests/integration/

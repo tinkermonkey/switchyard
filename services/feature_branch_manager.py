@@ -1039,6 +1039,17 @@ git push --force-with-lease
         """
         project_dir = os.path.join(self.workspace_root, project)
 
+        # Get pipeline_run_id for event tracking
+        pipeline_run_id = None
+        try:
+            from services.pipeline_run import get_pipeline_run_manager
+            prm = get_pipeline_run_manager()
+            active_run = prm.get_active_pipeline_run(project, issue_number)
+            if active_run:
+                pipeline_run_id = active_run.id
+        except Exception:
+            pass  # pipeline_run_id remains None
+
         # Step 0: Validate issue exists and is valid
         if issue_number <= 0:
             raise ValueError(f"Invalid issue number: {issue_number}. Issue numbers must be positive integers.")
@@ -1092,7 +1103,8 @@ git push --force-with-lease
                     branch_name=branch_name,
                     confidence=best_match["confidence"],
                     match_reason=best_match["reason"],
-                    parent_issue=parent_issue
+                    parent_issue=parent_issue,
+                    pipeline_run_id=pipeline_run_id
                 )
 
                 # Get or create feature branch state
@@ -1113,6 +1125,20 @@ git push --force-with-lease
                 # Checkout and continue with existing flow
                 await self.git_checkout(project_dir, branch_name)
 
+                # Clean up any prompt file artifacts before pull rebase
+                # These files can cause "uncommitted changes" errors during git pull --rebase
+                try:
+                    import glob
+                    prompt_files = glob.glob(os.path.join(project_dir, '.claude_prompt_*.txt'))
+                    for prompt_file in prompt_files:
+                        try:
+                            os.remove(prompt_file)
+                            logger.info(f"Cleaned up prompt artifact before pull: {os.path.basename(prompt_file)}")
+                        except Exception as e:
+                            logger.warning(f"Failed to clean prompt file {prompt_file}: {e}")
+                except Exception as e:
+                    logger.warning(f"Error during prompt file cleanup: {e}")
+
                 # Pull latest (Step 4 in original flow)
                 try:
                     await self.git_pull_rebase(project_dir)
@@ -1129,7 +1155,8 @@ git push --force-with-lease
                         issue_number=issue_number,
                         branch_name=branch_name,
                         conflicting_files=e.files,
-                        parent_issue=parent_issue
+                        parent_issue=parent_issue,
+                        pipeline_run_id=pipeline_run_id
                     )
                     
                     await self.escalate_merge_conflict(
@@ -1152,7 +1179,8 @@ git push --force-with-lease
                             branch_name=branch_name,
                             commits_behind=commits_behind,
                             action_taken="escalate_stale_branch",
-                            parent_issue=parent_issue
+                            parent_issue=parent_issue,
+                            pipeline_run_id=pipeline_run_id
                         )
                         
                         await self.escalate_stale_branch(
@@ -1169,7 +1197,8 @@ git push --force-with-lease
                             branch_name=branch_name,
                             commits_behind=commits_behind,
                             action_taken="warn_stale_branch",
-                            parent_issue=parent_issue
+                            parent_issue=parent_issue,
+                            pipeline_run_id=pipeline_run_id
                         )
                         
                         logger.warning(f"Branch {branch_name} is {commits_behind} commits behind main")
@@ -1204,7 +1233,8 @@ git push --force-with-lease
                     issue_number=issue_number,
                     confidence=best_match["confidence"],
                     candidate_branches=related_branches[:3],
-                    reason=f"Medium confidence match ({best_match['confidence']:.0%}), escalating to human"
+                    reason=f"Medium confidence match ({best_match['confidence']:.0%}), escalating to human",
+                    pipeline_run_id=pipeline_run_id
                 )
 
                 await github_integration.post_comment(
@@ -1245,7 +1275,8 @@ Waiting for human decision...
                     branch_name=branch_name,
                     reason="No parent issue and no related branches found - creating new standalone branch",
                     parent_issue=None,
-                    is_standalone=True
+                    is_standalone=True,
+                    pipeline_run_id=pipeline_run_id
                 )
                 
                 await self.create_branch_from_main(project_dir, branch_name)
@@ -1323,7 +1354,8 @@ Waiting for human decision...
                     issue_number=issue_number,
                     branch_name=existing_parent_branch,
                     reason=f"Found existing parent #{parent_issue} branch via direct git check",
-                    parent_issue=parent_issue
+                    parent_issue=parent_issue,
+                    pipeline_run_id=pipeline_run_id
                 )
 
                 logger.info(
@@ -1362,7 +1394,8 @@ Waiting for human decision...
                 branch_name=branch_name,
                 reason=f"First sub-issue of parent #{parent_issue} - creating shared feature branch",
                 parent_issue=parent_issue,
-                is_standalone=False
+                is_standalone=False,
+                pipeline_run_id=pipeline_run_id
             )
 
             await self.create_branch_from_main(project_dir, branch_name)
@@ -1392,6 +1425,20 @@ Waiting for human decision...
         # Step 3: Checkout branch
         await self.git_checkout(project_dir, feature_branch.branch_name)
 
+        # Clean up any prompt file artifacts before pull rebase
+        # These files can cause "uncommitted changes" errors during git pull --rebase
+        try:
+            import glob
+            prompt_files = glob.glob(os.path.join(project_dir, '.claude_prompt_*.txt'))
+            for prompt_file in prompt_files:
+                try:
+                    os.remove(prompt_file)
+                    logger.info(f"Cleaned up prompt artifact before pull: {os.path.basename(prompt_file)}")
+                except Exception as e:
+                    logger.warning(f"Failed to clean prompt file {prompt_file}: {e}")
+        except Exception as e:
+            logger.warning(f"Error during prompt file cleanup: {e}")
+
         # Step 4: Pull latest changes (critical for multi-sub-issue coordination)
         try:
             await self.git_pull_rebase(project_dir)
@@ -1410,7 +1457,8 @@ Waiting for human decision...
                 issue_number=issue_number,
                 branch_name=feature_branch.branch_name,
                 conflicting_files=e.files,
-                parent_issue=parent_issue
+                parent_issue=parent_issue,
+                pipeline_run_id=pipeline_run_id
             )
             
             await self.escalate_merge_conflict(
@@ -1433,7 +1481,8 @@ Waiting for human decision...
                 branch_name=feature_branch.branch_name,
                 commits_behind=commits_behind,
                 action_taken="escalate_stale_branch",
-                parent_issue=parent_issue
+                parent_issue=parent_issue,
+                pipeline_run_id=pipeline_run_id
             )
             
             await self.escalate_stale_branch(
@@ -1450,7 +1499,8 @@ Waiting for human decision...
                 branch_name=feature_branch.branch_name,
                 commits_behind=commits_behind,
                 action_taken="warn_stale_branch",
-                parent_issue=parent_issue
+                parent_issue=parent_issue,
+                pipeline_run_id=pipeline_run_id
             )
             
             logger.warning(
@@ -1499,6 +1549,21 @@ Waiting for human decision...
             logger.info(f"No feature branch state for issue #{issue_number} - handling as standalone")
 
             try:
+                # Clean up ALL prompt files BEFORE staging to prevent accidental commits
+                try:
+                    import glob
+                    prompt_files = glob.glob(os.path.join(project_dir, '.claude_prompt_*.txt'))
+                    for prompt_file in prompt_files:
+                        try:
+                            os.remove(prompt_file)
+                            logger.info(f"Cleaned up prompt file before commit: {os.path.basename(prompt_file)}")
+                        except Exception as e:
+                            logger.warning(f"Failed to remove prompt file {prompt_file}: {e}")
+                    if prompt_files:
+                        logger.info(f"Removed {len(prompt_files)} prompt file(s) before staging changes")
+                except Exception as e:
+                    logger.warning(f"Error during pre-commit prompt file cleanup: {e}")
+
                 # Commit and push standalone branch
                 await self.git_add_all(project_dir)
                 await self.git_commit(project_dir, commit_message)
@@ -1533,7 +1598,23 @@ Waiting for human decision...
             )
             feature_branch.branch_name = current_branch
 
-        # Step 2: Commit changes
+        # Step 2: Clean up ALL prompt files BEFORE staging to prevent accidental commits
+        # This is CRITICAL: git add . will stage prompt files if they exist
+        try:
+            import glob
+            prompt_files = glob.glob(os.path.join(project_dir, '.claude_prompt_*.txt'))
+            for prompt_file in prompt_files:
+                try:
+                    os.remove(prompt_file)
+                    logger.info(f"Cleaned up prompt file before commit: {os.path.basename(prompt_file)}")
+                except Exception as e:
+                    logger.warning(f"Failed to remove prompt file {prompt_file}: {e}")
+            if prompt_files:
+                logger.info(f"Removed {len(prompt_files)} prompt file(s) before staging changes")
+        except Exception as e:
+            logger.warning(f"Error during pre-commit prompt file cleanup: {e}")
+
+        # Step 3: Commit changes
         await self.git_add_all(project_dir)
         await self.git_commit(project_dir, commit_message)
 

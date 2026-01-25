@@ -1176,6 +1176,21 @@ class DockerAgentRunner:
                         if 'usage' in event:
                             input_tokens = event['usage'].get('input_tokens', input_tokens)
                             output_tokens = event['usage'].get('output_tokens', output_tokens)
+                            logger.debug(f"Token usage: {input_tokens} input, {output_tokens} output")
+
+                        # Log tool use for visibility in orchestrator logs
+                        if event_type == 'tool_use':
+                            tool_name = event.get('name', 'unknown')
+                            logger.info(f"[Claude] Using tool: {tool_name}")
+
+                        # Log tool results
+                        if event_type == 'tool_result':
+                            tool_use_id = event.get('tool_use_id', 'unknown')
+                            is_error = event.get('is_error', False)
+                            if is_error:
+                                logger.warning(f"[Claude] Tool result (error): {tool_use_id}")
+                            else:
+                                logger.debug(f"[Claude] Tool result: {tool_use_id}")
 
                         if event_type in ('error', 'error_detail', 'error_event'):
                             error_msg = event.get('message') or event.get('error') or str(event)
@@ -1190,6 +1205,10 @@ class DockerAgentRunner:
                                     text = item.get('text', '')
                                     if text:
                                         result_parts.append(text)
+                                        # Log Claude output to orchestrator logs for visibility
+                                        # Truncate long outputs to avoid log spam
+                                        log_text = text[:500] + '...' if len(text) > 500 else text
+                                        logger.info(f"[Claude] {log_text}")
 
                     except json.JSONDecodeError:
                         # Non-JSON output might be error messages or raw text
@@ -1226,12 +1245,21 @@ class DockerAgentRunner:
             stdout_thread.join(timeout=1)
             stderr_thread.join(timeout=1)
 
-            # Cleanup prompt file
+            # Cleanup ALL prompt files in project directory
+            # This handles accumulation from multiple runs and prevents workspace contamination
             try:
-                if os.path.exists(prompt_path):
-                    os.remove(prompt_path)
+                import glob
+                project_prompt_files = glob.glob(str(project_dir / '.claude_prompt_*.txt'))
+                for prompt_file in project_prompt_files:
+                    try:
+                        os.remove(prompt_file)
+                        logger.debug(f"Cleaned up prompt file: {os.path.basename(prompt_file)}")
+                    except Exception as e:
+                        logger.warning(f"Failed to remove prompt file {prompt_file}: {e}")
+                if project_prompt_files:
+                    logger.info(f"Cleaned up {len(project_prompt_files)} prompt file(s) after agent completion")
             except Exception as e:
-                logger.warning(f"Failed to remove prompt file: {e}")
+                logger.warning(f"Failed to cleanup prompt files: {e}")
 
             # Emit completion
             if obs:
@@ -1451,14 +1479,62 @@ class DockerAgentRunner:
             logger.error(f"Agent execution error: {e}")
             # Try to kill container if it's still running
             self._cleanup_container(container_name)
+
+            # Cleanup ALL prompt files in project directory on exception
+            try:
+                import glob
+                project_prompt_files = glob.glob(str(project_dir / '.claude_prompt_*.txt'))
+                for prompt_file in project_prompt_files:
+                    try:
+                        os.remove(prompt_file)
+                        logger.debug(f"Cleaned up prompt file after exception: {os.path.basename(prompt_file)}")
+                    except Exception as cleanup_err:
+                        logger.warning(f"Failed to remove prompt file {prompt_file}: {cleanup_err}")
+                if project_prompt_files:
+                    logger.info(f"Cleaned up {len(project_prompt_files)} prompt file(s) after exception")
+            except Exception as cleanup_err:
+                logger.warning(f"Failed to cleanup prompt files during exception: {cleanup_err}")
+
             raise
 
         except subprocess.TimeoutExpired:
             logger.error("Agent execution timed out")
             self._cleanup_container(container_name)
+
+            # Cleanup ALL prompt files in project directory on timeout
+            try:
+                import glob
+                project_prompt_files = glob.glob(str(project_dir / '.claude_prompt_*.txt'))
+                for prompt_file in project_prompt_files:
+                    try:
+                        os.remove(prompt_file)
+                        logger.debug(f"Cleaned up prompt file after timeout: {os.path.basename(prompt_file)}")
+                    except Exception as cleanup_err:
+                        logger.warning(f"Failed to remove prompt file {prompt_file}: {cleanup_err}")
+                if project_prompt_files:
+                    logger.info(f"Cleaned up {len(project_prompt_files)} prompt file(s) after timeout")
+            except Exception as cleanup_err:
+                logger.warning(f"Failed to cleanup prompt files during timeout: {cleanup_err}")
+
             raise Exception("Agent execution timed out")
         except Exception as e:
             logger.error(f"Agent execution error: {e}")
+
+            # Cleanup ALL prompt files in project directory on exception
+            try:
+                import glob
+                project_prompt_files = glob.glob(str(project_dir / '.claude_prompt_*.txt'))
+                for prompt_file in project_prompt_files:
+                    try:
+                        os.remove(prompt_file)
+                        logger.debug(f"Cleaned up prompt file after exception: {os.path.basename(prompt_file)}")
+                    except Exception as cleanup_err:
+                        logger.warning(f"Failed to remove prompt file {prompt_file}: {cleanup_err}")
+                if project_prompt_files:
+                    logger.info(f"Cleaned up {len(project_prompt_files)} prompt file(s) after exception")
+            except Exception as cleanup_err:
+                logger.warning(f"Failed to cleanup prompt files during exception: {cleanup_err}")
+
             raise
 
     def _register_active_container(self, container_name: str, agent: str, project: str, task_id: str, context: Dict[str, Any]):

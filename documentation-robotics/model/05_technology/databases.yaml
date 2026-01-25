@@ -1,0 +1,37 @@
+redis:
+  id: technology.database.redis
+  name: Redis 7
+  type: database
+  documentation: In-memory key-value store for task queue, pipeline locks, and pub/sub events
+  properties:
+    version: 7-alpine
+    client_version: ">=5.0.1"
+    use_cases:
+      - task_queue
+      - pipeline_locks
+      - pubsub_events
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: docker-compose.yml
+            symbol: redis
+elasticsearch:
+  id: technology.database.elasticsearch
+  name: Elasticsearch 9.0
+  type: database
+  documentation: Distributed search and analytics engine for metrics, logs, and
+    events aggregation
+  properties:
+    version: 9.0.0
+    client_version: ">=8.11.0"
+    indices:
+      - orchestrator-task-metrics
+      - orchestrator-quality-metrics
+      - orchestrator-logs
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: docker-compose.yml
+            symbol: elasticsearch

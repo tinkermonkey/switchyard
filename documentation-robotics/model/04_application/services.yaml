@@ -1,0 +1,370 @@
+github-project-manager:
+  id: application.service.github-project-manager
+  name: GitHub Project Manager
+  type: service
+  documentation: Manages GitHub Projects v2 boards with configuration
+    reconciliation, ensuring boards match desired state from config files
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/github_project_manager.py
+            symbol: GitHubProjectManager
+    crossLayerRelationships:
+      exposes:
+        - api.operation.list-projects
+      uses:
+        - datastore.datastore.yaml-config-store
+      manages:
+        - data_model.schema.github-state
+    uses_technologies:
+      - technology.api-client.github-api
+      - technology.language.python-3-11
+      - technology.data-format.yaml
+project-workspace-manager:
+  id: application.service.project-workspace-manager
+  name: Project Workspace Manager
+  type: service
+  documentation: Manages project repository checkouts and initialization, handling
+    workspace isolation between orchestrator and managed projects
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/project_workspace.py
+            symbol: ProjectWorkspaceManager
+    uses_technologies:
+      - technology.platform.docker
+      - technology.vcs.git
+      - technology.language.python-3-11
+feature-branch-manager:
+  id: application.service.feature-branch-manager
+  name: Feature Branch Manager
+  type: service
+  documentation: Manages hierarchical branch workflows where parent issues get
+    shared feature branches and sub-issues contribute to parent branch with PR
+    accumulation
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/feature_branch_manager.py
+            symbol: FeatureBranchManager
+    crossLayerRelationships:
+      manages:
+        - data_model.schema.feature-branch
+git-workflow-manager:
+  id: application.service.git-workflow-manager
+  name: Git Workflow Manager
+  type: service
+  documentation: Manages git workflow lifecycle including branch creation,
+    tracking, pull request creation and status updates based on review cycle
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/git_workflow_manager.py
+            symbol: GitWorkflowManager
+    uses_technologies:
+      - technology.vcs.git
+      - technology.api-client.github-api
+      - technology.language.python-3-11
+dev-container-state-manager:
+  id: application.service.dev-container-state-manager
+  name: Dev Container State Manager
+  type: service
+  documentation: "Tracks Docker development container image state for projects
+    through lifecycle: unverified, in_progress, verified, blocked"
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/dev_container_state.py
+            symbol: DevContainerStateManager
+    crossLayerRelationships:
+      uses:
+        - datastore.datastore.yaml-config-store
+    uses_technologies:
+      - technology.platform.docker
+      - technology.data-format.yaml
+      - technology.language.python-3-11
+pipeline-run-manager:
+  id: application.service.pipeline-run-manager
+  name: Pipeline Run Manager
+  type: service
+  documentation: Manages pipeline run lifecycle with dual storage in Redis and
+    Elasticsearch, tracking issue journey through workflow pipeline with 7-day
+    retention
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/pipeline_run.py
+            symbol: PipelineRunManager
+    crossLayerRelationships:
+      uses:
+        - datastore.datastore.redis
+        - datastore.datastore.elasticsearch
+      manages:
+        - data_model.schema.pipeline-run
+    uses_technologies:
+      - technology.database.redis
+      - technology.database.elasticsearch
+      - technology.framework.asyncio
+      - technology.language.python-3-11
+worker-pool-manager:
+  id: application.service.worker-pool-manager
+  name: Worker Pool Manager
+  type: service
+  documentation: Manages pool of worker threads for concurrent multi-project task
+    processing with Redis atomic operations ensuring thread safety
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/worker_pool.py
+            symbol: WorkerPoolManager
+    crossLayerRelationships:
+      uses:
+        - datastore.datastore.redis
+      manages:
+        - data_model.schema.task-info
+    uses_technologies:
+      - technology.database.redis
+      - technology.framework.asyncio
+      - technology.language.python-3-11
+project-monitor:
+  id: application.service.project-monitor
+  name: Project Monitor
+  type: service
+  documentation: Monitors GitHub Projects v2 boards continuously, polling every 30
+    seconds to detect card movements and enqueue tasks for appropriate agents
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/project_monitor.py
+project-manager:
+  id: application.service.project-manager
+  name: Project Manager
+  type: service
+  documentation: Auto-clones repositories and manages project configurations,
+    extracting repo names from Git URLs and ensuring projects are cloned locally
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/project_manager.py
+            symbol: ProjectManager
+    crossLayerRelationships:
+      uses:
+        - datastore.datastore.yaml-config-store
+      manages:
+        - data_model.schema.project-config
+pipeline-lock-manager:
+  id: application.service.pipeline-lock-manager
+  name: Pipeline Lock Manager
+  type: service
+  documentation: Manages exclusive locks for pipeline execution with Redis and
+    YAML persistence, ensuring only one issue holds pipeline lock at a time
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/pipeline_lock_manager.py
+            symbol: PipelineLockManager
+    crossLayerRelationships:
+      uses:
+        - datastore.datastore.redis
+      manages:
+        - data_model.schema.pipeline-checkpoint
+    uses_technologies:
+      - technology.database.redis
+      - technology.framework.asyncio
+      - technology.language.python-3-11
+conversational-session-state-manager:
+  id: application.service.conversational-session-state-manager
+  name: Conversational Session State Manager
+  type: service
+  documentation: Persists Claude Code session IDs for conversational feedback
+    loops across orchestrator restarts
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/conversational_session_state.py
+            symbol: ConversationalSessionStateManager
+    crossLayerRelationships:
+      uses:
+        - datastore.datastore.yaml-config-store
+review-filter-manager:
+  id: application.service.review-filter-manager
+  name: Review Filter Manager
+  type: service
+  documentation: Manages learned review filters stored in Elasticsearch. Provides
+    CRUD operations, filter retrieval, and effectiveness tracking for
+    pattern-based review suppression
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/review_filter_manager.py
+            symbol: ReviewFilterManager
+    crossLayerRelationships:
+      exposes:
+        - api.operation.list-review-filters
+        - api.operation.create-review-filter
+        - api.operation.update-review-filter
+        - api.operation.delete-review-filter
+      manages:
+        - data_model.schema.review-filter
+pattern-analysis-service:
+  id: application.service.pattern-analysis-service
+  name: Pattern Analysis Service
+  type: service
+  documentation: "Consolidated service managing three analyzers: daily aggregation
+    (statistical analysis), weekly LLM meta-analysis (Claude API), and daily
+    similarity analysis (pattern clustering)"
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/pattern_analysis_service.py
+            symbol: PatternAnalysisService
+    crossLayerRelationships:
+      uses:
+        - datastore.datastore.elasticsearch
+    uses_technologies:
+      - technology.database.elasticsearch
+      - technology.language.python-3-11
+auto-commit-service:
+  id: application.service.auto-commit-service
+  name: Auto-Commit Service
+  type: service
+  documentation: Automatically commits code changes made by agents to feature
+    branches with proper validation and git push
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/auto_commit.py
+            symbol: AutoCommitService
+feedback-manager:
+  id: application.service.feedback-manager
+  name: Feedback Manager
+  type: service
+  documentation: Manages feedback loop state using Redis for human-in-the-loop
+    interactions via GitHub comments
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/feedback_manager.py
+            symbol: FeedbackManager
+pipeline-queue-manager:
+  id: application.service.pipeline-queue-manager
+  name: Pipeline Queue Manager
+  type: service
+  documentation: Manages the queue of issues waiting to execute in a pipeline
+    using GitHub board column order as source of truth with file-based locking
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/pipeline_queue_manager.py
+            symbol: PipelineQueueManager
+    crossLayerRelationships:
+      uses:
+        - datastore.datastore.redis
+scheduled-tasks-service:
+  id: application.service.scheduled-tasks-service
+  name: Scheduled Tasks Service
+  type: service
+  documentation: "Runs periodic maintenance tasks using APScheduler: orphaned
+    branch cleanup, stale branch checks, review learning, container cleanup,
+    Docker state reconciliation, and queue synchronization"
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/scheduled_tasks.py
+            symbol: ScheduledTasksService
+circuit-breaker:
+  id: application.service.circuit-breaker
+  name: Circuit Breaker Service
+  type: service
+  documentation: Implements circuit breaker pattern with Redis-backed state
+    persistence to prevent cascading failures. Supports CLOSED, OPEN, and
+    HALF_OPEN states with automatic recovery testing
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/circuit_breaker.py
+            symbol: CircuitBreaker
+github-cache-manager:
+  id: application.service.github-cache-manager
+  name: GitHub Cache Manager
+  type: service
+  documentation: Redis-backed cache for GitHub API responses with circuit breaker
+    protection, retry logic, and rate limit handling for owner type detection
+    and project queries
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/github_owner_utils.py
+            symbol: GitHubCacheManager
+observability-manager:
+  id: application.service.observability-manager
+  name: Observability Manager
+  type: service
+  documentation: Manages real-time agent monitoring with event streaming via Redis
+    pub/sub and Elasticsearch indexing for decision events, agent lifecycle, and
+    Claude stream events
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: monitoring/observability.py
+            symbol: ObservabilityManager
+    crossLayerRelationships:
+      exposes:
+        - api.operation.health-check
+        - api.operation.list-active-agents
+        - api.operation.kill-agent
+        - api.operation.get-execution-history
+        - api.operation.get-claude-logs
+        - api.operation.get-current-pipeline
+        - api.operation.get-pipeline-events
+        - api.operation.get-active-pipelines
+        - api.operation.get-circuit-breakers
+      uses:
+        - datastore.datastore.elasticsearch
+        - datastore.datastore.json-metrics-backup
+    uses_technologies:
+      - technology.framework.flask
+      - technology.library.socket-io
+      - technology.database.redis
+      - technology.database.elasticsearch
+      - technology.language.python-3-11

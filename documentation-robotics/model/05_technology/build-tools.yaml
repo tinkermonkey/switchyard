@@ -1,0 +1,16 @@
+vite:
+  id: technology.build-tool.vite
+  name: Vite
+  type: build-tool
+  documentation: Fast frontend build tool with Hot Module Replacement (HMR) for development
+  properties:
+    version: ">=7.1.7"
+    features:
+      - hmr
+      - fast_builds
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: web_ui/package.json
+            symbol: vite

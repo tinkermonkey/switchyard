@@ -1,0 +1,166 @@
+autonomous-sdlc-automation:
+  id: business.capability.autonomous-sdlc-automation
+  name: Autonomous SDLC Automation
+  type: capability
+  documentation: End-to-end automation of software development lifecycle from
+    requirements gathering through deployment, coordinated through GitHub
+    Projects v2 boards
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: .claude/CLAUDE.md
+    application:
+      realized-by:
+        - application.service.pipeline-run-manager
+        - application.service.github-project-manager
+        - application.service.project-monitor
+ai-powered-development:
+  id: business.capability.ai-powered-development
+  name: AI-Powered Software Development
+  type: capability
+  documentation: Specialized AI agents (Claude models) perform development tasks
+    including coding, review, testing, and documentation
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: .claude/CLAUDE.md
+    application:
+      realized-by:
+        - application.service.worker-pool-manager
+        - application.component.senior-software-engineer-agent
+        - application.component.business-analyst-agent
+        - application.component.software-architect-agent
+continuous-code-review:
+  id: business.capability.continuous-code-review
+  name: Continuous Code Review & Quality Assurance
+  type: capability
+  documentation: Automated maker-checker workflow where every code change is
+    reviewed by AI code reviewer before acceptance
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: .claude/CLAUDE.md
+    application:
+      realized-by:
+        - application.component.code-reviewer-agent
+        - application.service.review-filter-manager
+epic-planning-breakdown:
+  id: business.capability.epic-planning-breakdown
+  name: Epic Planning & Work Breakdown
+  type: capability
+  documentation: Decompose complex features into phase-based implementable
+    sub-issues with dependencies
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: config/foundations/pipelines.yaml
+    application:
+      realized-by:
+        - application.component.work-breakdown-agent
+        - application.component.software-architect-agent
+        - application.component.idea-researcher-agent
+github-project-management:
+  id: business.capability.github-project-management
+  name: GitHub Project Board Management
+  type: capability
+  documentation: Automated GitHub Projects v2 board reconciliation, monitoring,
+    and task routing based on Kanban column movements
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/github_project_manager.py
+    application:
+      realized-by:
+        - application.service.github-project-manager
+        - application.service.project-monitor
+development-environment-automation:
+  id: business.capability.development-environment-automation
+  name: Development Environment Automation
+  type: capability
+  documentation: Automated Docker container setup, dependency detection,
+    Dockerfile generation, and environment verification
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/dev_container_state_manager.py
+    application:
+      realized-by:
+        - application.component.dev-environment-setup-agent
+        - application.component.dev-environment-verifier-agent
+        - application.service.dev-container-state-manager
+conversational-requirements-gathering:
+  id: business.capability.conversational-requirements-gathering
+  name: Conversational Requirements Gathering
+  type: capability
+  documentation: Interactive multi-turn conversations with AI agents to refine
+    requirements, designs, and specifications
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: claude/session_manager.py
+    application:
+      realized-by:
+        - application.service.conversational-session-state-manager
+        - application.service.feedback-manager
+automated-testing-validation:
+  id: business.capability.automated-testing-validation
+  name: Automated Testing & Validation
+  type: capability
+  documentation: Repair cycle-based iterative testing with automated test
+    execution, failure analysis, and fix implementation
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: pipeline/orchestrator.py
+    application:
+      realized-by:
+        - application.service.pipeline-run-manager
+git-workflow-automation:
+  id: business.capability.git-workflow-automation
+  name: Git Workflow Automation
+  type: capability
+  documentation: Automated feature branch management, PR creation, merge conflict
+    handling, and branch lifecycle management
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/git_workflow_manager.py
+    application:
+      realized-by:
+        - application.service.git-workflow-manager
+        - application.service.feature-branch-manager
+pipeline-orchestration:
+  id: business.capability.pipeline-orchestration
+  name: Pipeline Orchestration & Recovery
+  type: capability
+  documentation: Sequential pipeline execution with checkpointing, fault tolerance
+    via circuit breakers, and automatic recovery
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: pipeline/orchestrator.py
+    application:
+      realized-by:
+        - application.service.pipeline-run-manager
+        - application.service.pipeline-lock-manager
+        - application.service.circuit-breaker-service

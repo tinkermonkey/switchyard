@@ -1,0 +1,106 @@
+automate-sdlc-lifecycle:
+  id: motivation.goal.automate-sdlc-lifecycle
+  name: Automate Complete SDLC Lifecycle
+  type: goal
+  documentation: Fully automate software development from requirements gathering
+    through deployment using AI agents coordinated via GitHub Projects v2. This
+    goal aims to eliminate manual SDLC overhead and enable continuous delivery
+    through intelligent agent orchestration.
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: documentation/vision.md
+    business:
+      supports:
+        - business.capability.autonomous-sdlc-automation
+improve-code-quality:
+  id: motivation.goal.improve-code-quality
+  name: Improve Code Quality Through Continuous Review
+  type: goal
+  documentation: Maintain consistent high code quality through automated
+    maker-checker workflows and AI-powered reviews. Every artifact passes
+    through quality gates ensuring >80% test coverage, security validation, and
+    architectural compliance.
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: documentation/agent_collaboration_patterns.md
+    business:
+      supports:
+        - business.capability.continuous-code-review
+        - business.capability.automated-testing-validation
+accelerate-delivery-cycles:
+  id: motivation.goal.accelerate-delivery-cycles
+  name: Accelerate Software Delivery Cycles
+  type: goal
+  documentation: Reduce time from idea to production through parallel agent
+    execution and automated workflows. Enable continuous deployment with
+    quality-focused processing that prioritizes correctness over raw speed.
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: documentation/vision.md
+    business:
+      supports:
+        - business.capability.pipeline-orchestration
+        - business.capability.git-workflow-automation
+        - business.capability.automated-testing-validation
+enable-scalable-development:
+  id: motivation.goal.enable-scalable-development
+  name: Enable Scalable Development Capacity
+  type: goal
+  documentation: Scale development capacity beyond human team size using AI agents
+    that work 24/7 without context switching costs. Each agent operates in
+    isolated 200K token context windows enabling sophisticated task
+    decomposition without context pollution.
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: documentation/vision.md
+    business:
+      supports:
+        - business.capability.ai-powered-development
+        - business.capability.autonomous-sdlc-automation
+reduce-environment-friction:
+  id: motivation.goal.reduce-environment-friction
+  name: Eliminate Development Environment Friction
+  type: goal
+  documentation: Remove setup and configuration barriers through automated
+    environment detection and Docker containerization. Each agent runs in
+    isolated containers with project-specific dependencies, preventing
+    environmental conflicts while maintaining security boundaries.
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: documentation/vision.md
+    business:
+      supports:
+        - business.capability.development-environment-automation
+maintain-human-oversight:
+  id: motivation.goal.maintain-human-oversight
+  name: Maintain Human Oversight and Control
+  type: goal
+  documentation: Ensure human visibility and intervention capabilities through
+    GitHub integration and escalation workflows. All agent activities are
+    visible through GitHub Projects v2 boards with clear escalation paths when
+    agents encounter issues or conflicts.
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: documentation/agent_collaboration_patterns.md
+    business:
+      supports:
+        - business.capability.github-project-management
+        - business.capability.conversational-requirements-gathering

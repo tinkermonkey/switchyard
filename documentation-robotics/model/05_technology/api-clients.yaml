@@ -1,0 +1,38 @@
+anthropic-claude:
+  id: technology.api-client.anthropic-claude
+  name: Anthropic Claude API
+  type: api-client
+  documentation: Claude AI models (Sonnet 4.5, Opus 4.5) providing agent
+    intelligence and natural language understanding
+  properties:
+    version: ">=0.7.7"
+    models:
+      - claude-sonnet-4-5-20250929
+      - claude-opus-4-5-20251101
+      - claude-haiku-4-5-20251001
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: requirements.txt
+            symbol: anthropic
+github-api:
+  id: technology.api-client.github-api
+  name: GitHub API
+  type: api-client
+  documentation: GitHub REST and GraphQL APIs for project management, issues,
+    discussions, and PR automation
+  properties:
+    version: ">=1.59.1"
+    features:
+      - Projects v2
+      - Issues
+      - Discussions
+      - Pull Requests
+      - GraphQL
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: requirements.txt
+            symbol: PyGithub

@@ -1,4 +1,4 @@
-.PHONY: help test test-unit test-integration test-all test-coverage test-verbose test-fast clean-test cleanup-branches
+.PHONY: help test test-unit test-integration test-all test-coverage test-verbose test-fast clean-test cleanup-branches cleanup-project rebuild-images rebuild-images-verify rebuild-images-agents rebuild-project
 
 help:
 	@echo "Claude Code Agent Orchestrator - Commands"
@@ -15,8 +15,12 @@ help:
 	@echo "  make clean-test        Clean test artifacts and cache"
 	@echo ""
 	@echo "Maintenance:"
-	@echo "  make cleanup-branches  Cleanup orphaned feature branches (all projects)"
-	@echo "  make cleanup-project   Cleanup orphaned branches for specific project (usage: make cleanup-project PROJECT=name)"
+	@echo "  make cleanup-branches         Cleanup orphaned feature branches (all projects)"
+	@echo "  make cleanup-project          Cleanup orphaned branches for specific project (usage: make cleanup-project PROJECT=name)"
+	@echo "  make rebuild-images           Rebuild all project Docker images"
+	@echo "  make rebuild-images-verify    Rebuild images and update state to VERIFIED"
+	@echo "  make rebuild-images-agents    Rebuild via dev environment agents"
+	@echo "  make rebuild-project          Rebuild Docker image for specific project (usage: make rebuild-project PROJECT=name)"
 	@echo ""
 
 test: test-unit
@@ -103,6 +107,33 @@ ifdef PROJECT
 else
 	@echo "Error: PROJECT not specified"
 	@echo "Usage: make cleanup-project PROJECT=context-studio"
+	@exit 1
+endif
+
+# Docker image rebuild
+rebuild-images:
+	@echo "Rebuilding all project Docker images..."
+	@PYTHONPATH=. python scripts/rebuild_project_images.py
+	@echo "✓ Image rebuild complete"
+
+rebuild-images-verify:
+	@echo "Rebuilding all project Docker images with state verification..."
+	@PYTHONPATH=. python scripts/rebuild_project_images.py --update-state
+	@echo "✓ Image rebuild and verification complete"
+
+rebuild-images-agents:
+	@echo "Rebuilding images via dev environment agents..."
+	@PYTHONPATH=. python scripts/rebuild_project_images.py --with-agents
+	@echo "✓ Agent tasks queued (monitor at http://localhost:5001/agents/active)"
+
+rebuild-project:
+ifdef PROJECT
+	@echo "Rebuilding Docker image for project: $(PROJECT)"
+	@PYTHONPATH=. python scripts/rebuild_project_images.py --project $(PROJECT)
+	@echo "✓ Image rebuild complete"
+else
+	@echo "Error: PROJECT not specified"
+	@echo "Usage: make rebuild-project PROJECT=context-studio"
 	@exit 1
 endif
 

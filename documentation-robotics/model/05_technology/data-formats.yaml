@@ -1,0 +1,36 @@
+yaml:
+  id: technology.data-format.yaml
+  name: YAML
+  type: data-format
+  documentation: Human-readable configuration format for agent configs, pipeline
+    configs, and project configs
+  properties:
+    version: ">=6.0.1"
+    use_cases:
+      - agent_configs
+      - pipeline_configs
+      - project_configs
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: requirements.txt
+            symbol: pyyaml
+json:
+  id: technology.data-format.json
+  name: JSON
+  type: data-format
+  documentation: Structured data interchange format for metrics backup, structured
+    logging, and API responses
+  properties:
+    logger_version: ">=2.0.7"
+    use_cases:
+      - metrics_backup
+      - structured_logging
+      - api_responses
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: requirements.txt
+            symbol: python-json-logger

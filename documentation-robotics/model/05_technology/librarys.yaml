@@ -1,0 +1,84 @@
+pydantic:
+  id: technology.library.pydantic
+  name: Pydantic
+  type: library
+  documentation: Data validation and settings management library for configuration
+    and schema validation
+  properties:
+    version: ">=2.4.2"
+    use_cases:
+      - config_validation
+      - data_schemas
+      - settings_management
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: requirements.txt
+            symbol: pydantic
+apscheduler:
+  id: technology.library.apscheduler
+  name: APScheduler
+  type: library
+  documentation: Advanced Python Scheduler for background tasks including project
+    monitoring and scheduled cleanup
+  properties:
+    version: ">=3.10.4"
+    use_cases:
+      - project_monitoring
+      - scheduled_cleanup
+      - background_tasks
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: requirements.txt
+            symbol: apscheduler
+tanstack-router:
+  id: technology.library.tanstack-router
+  name: TanStack Router
+  type: library
+  documentation: Type-safe file-based routing for React applications with route validation
+  properties:
+    version: ">=1.132.31"
+    features:
+      - file_based_routing
+      - type_safety
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: web_ui/package.json
+            symbol: "@tanstack/react-router"
+xyflow:
+  id: technology.library.xyflow
+  name: XYFlow (ReactFlow)
+  type: library
+  documentation: Graph visualization library for pipeline flows and repair cycle visualization
+  properties:
+    version: ">=12.8.6"
+    use_cases:
+      - pipeline_graphs
+      - repair_cycle_visualization
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: web_ui/package.json
+            symbol: "@xyflow/react"
+socket-io:
+  id: technology.library.socket-io
+  name: Socket.IO
+  type: library
+  documentation: Real-time bidirectional event-based communication for UI updates
+  properties:
+    version: ">=4.8.1"
+    use_cases:
+      - realtime_updates
+      - websocket_communication
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: web_ui/package.json
+            symbol: socket.io-client

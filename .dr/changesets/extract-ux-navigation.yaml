@@ -1,0 +1,7 @@
+id: extract-ux-navigation
+name: extract-ux-navigation
+description: Extract UX and Navigation layers from web UI
+status: draft
+created_at: $(date -Iseconds)
+updated_at: $(date -Iseconds)
+changes: []

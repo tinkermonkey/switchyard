@@ -1,0 +1,52 @@
+mock-github-integration:
+  id: testing.fixture.mock-github-integration
+  name: Mock GitHub Integration Fixture
+  type: fixture
+  documentation: Mocks GitHub API, Projects v2, issues, and discussions for
+    isolated testing without real API calls
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: tests/mocks/github_mock.py
+            symbol: MockGitHubIntegration
+mock-agent-executor:
+  id: testing.fixture.mock-agent-executor
+  name: Mock Agent Executor Fixture
+  type: fixture
+  documentation: Mocks Claude Code agent execution for testing pipelines without
+    AI API calls or costs
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: tests/mocks/github_mock.py
+            symbol: MockAgentExecutor
+test-data-builders:
+  id: testing.fixture.test-data-builders
+  name: Test Data Builder Fixtures
+  type: fixture
+  documentation: Fluent builders for test data construction including
+    ReviewCycleStateBuilder, DiscussionBuilder, and TaskContextBuilder for clean
+    test setup
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: tests/utils/builders.py
+environment-configuration:
+  id: testing.fixture.environment-configuration
+  name: Environment Configuration Fixture
+  type: fixture
+  documentation: Loads .env file and configures test environment with API keys at
+    session scope for integration tests
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: tests/conftest.py
+            symbol: pytest_configure

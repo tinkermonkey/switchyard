@@ -1,0 +1,18 @@
+docker-compose:
+  id: technology.orchestration.docker-compose
+  name: Docker Compose
+  type: orchestration
+  documentation: Multi-container orchestration for local development with
+    orchestrator, Redis, Elasticsearch, and Chromium services
+  properties:
+    compose_version: "3.8"
+    services:
+      - orchestrator
+      - redis
+      - elasticsearch
+      - chromium
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: docker-compose.yml

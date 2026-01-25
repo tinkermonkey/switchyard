@@ -1,0 +1,28 @@
+black:
+  id: technology.tool.black
+  name: Black
+  type: tool
+  documentation: Opinionated Python code formatter for consistent code style
+  properties:
+    version: ">=23.11.0"
+    category: code_formatter
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: requirements.txt
+            symbol: black
+mypy:
+  id: technology.tool.mypy
+  name: MyPy
+  type: tool
+  documentation: Static type checker for Python with gradual typing support
+  properties:
+    version: ">=1.7.1"
+    category: type_checker
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: requirements.txt
+            symbol: mypy

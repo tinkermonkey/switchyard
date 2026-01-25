@@ -1,0 +1,72 @@
+planning-design-pipeline:
+  id: business.service.planning-design-pipeline
+  name: Planning & Design Pipeline Service
+  type: service
+  documentation: Pre-SDLC planning service orchestrating research, requirements,
+    architecture design, and work breakdown
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: config/foundations/pipelines.yaml
+            symbol: planning_design
+    application:
+      realized-by:
+        - application.service.pipeline-run-manager
+        - application.service.conversational-session-state-manager
+sdlc-execution-pipeline:
+  id: business.service.sdlc-execution-pipeline
+  name: SDLC Execution Pipeline Service
+  type: service
+  documentation: Core development service orchestrating implementation, code
+    review, testing, and staging
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: config/foundations/pipelines.yaml
+            symbol: sdlc_execution
+    application:
+      realized-by:
+        - application.service.pipeline-run-manager
+        - application.service.worker-pool-manager
+        - application.component.code-reviewer-agent
+        - application.component.senior-software-engineer-agent
+environment-support-pipeline:
+  id: business.service.environment-support-pipeline
+  name: Environment Support Pipeline Service
+  type: service
+  documentation: Development environment troubleshooting and configuration service
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: config/foundations/pipelines.yaml
+            symbol: environment_support
+    application:
+      realized-by:
+        - application.component.dev-environment-setup-agent
+        - application.component.dev-environment-verifier-agent
+        - application.service.dev-container-state-manager
+        - application.service.project-workspace-manager
+project-lifecycle-management:
+  id: business.service.project-lifecycle-management
+  name: Project Lifecycle Management Service
+  type: service
+  documentation: End-to-end project management from onboarding through active development
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/project_manager.py
+    application:
+      realized-by:
+        - application.service.github-project-manager
+        - application.service.project-manager
+        - application.service.project-monitor
+        - application.service.git-workflow-manager
+        - application.service.feature-branch-manager

@@ -1,0 +1,61 @@
+unit-tests:
+  id: testing.test-suite.unit-tests
+  name: Unit Test Suite
+  type: test-suite
+  documentation: Fast, isolated unit tests for individual components with mocks
+    covering agents, services, pipeline, and orchestrator modules
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: tests/unit/
+    crossLayerRelationships:
+      tests:
+        - application.service.pipeline-run-manager
+        - application.service.github-project-manager
+        - application.service.worker-pool-manager
+integration-tests:
+  id: testing.test-suite.integration-tests
+  name: Integration Test Suite
+  type: test-suite
+  documentation: Medium-speed integration tests with real services (Redis) and
+    mocked external APIs (GitHub, Claude) covering pipeline execution,
+    conversational loops, and resilience
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: tests/integration/
+    crossLayerRelationships:
+      tests:
+        - business.capability.autonomous-sdlc-automation
+        - business.capability.pipeline-orchestration
+medic-integration-tests:
+  id: testing.test-suite.medic-integration-tests
+  name: Medic Integration Test Suite
+  type: test-suite
+  documentation: Specialized tests for Medic investigator and recovery workflows
+    including investigation, recovery, cancellation, and failure analysis
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: tests/integration/medic/
+    crossLayerRelationships:
+      tests:
+        - application.component.medic-investigator-agent
+e2e-tests:
+  id: testing.test-suite.e2e-tests
+  name: End-to-End Test Suite
+  type: test-suite
+  documentation: Full system E2E tests with all services and optional real GitHub
+    integration for complete workflow validation
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: tests/e2e/

@@ -1,0 +1,42 @@
+docker-container-isolation:
+  id: security.isolation-policy.docker-container-isolation
+  name: Docker Container Isolation
+  type: isolation-policy
+  documentation: Each agent runs in isolated Docker container with
+    project-specific dependencies, separate PID namespaces, and workspace-only
+    filesystem access
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: claude/docker_runner.py
+    crossLayerRelationships:
+      protects:
+        - business.capability.development-environment-automation
+      secures:
+        - application.service.worker-pool-manager
+agent-context-isolation:
+  id: security.isolation-policy.agent-context-isolation
+  name: Agent Context Window Isolation
+  type: isolation-policy
+  documentation: Each agent operates in isolated 200K token context window with
+    separate Claude Code sessions preventing context pollution between agents
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: claude/session_manager.py
+project-workspace-isolation:
+  id: security.isolation-policy.project-workspace-isolation
+  name: Project Workspace Isolation
+  type: isolation-policy
+  documentation: Projects isolated in separate /workspace/<project> directories
+    with git checkouts preventing cross-project contamination and data leakage
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/project_workspace.py

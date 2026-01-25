@@ -1,0 +1,25 @@
+gitignore-secrets:
+  id: security.data-protection.gitignore-secrets
+  name: Git Ignore Secrets Protection
+  type: data-protection
+  documentation: .env files and secrets excluded from version control via
+    .gitignore to prevent credential leaks, with .env.example for templates
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: .gitignore
+webhook-signature-verification:
+  id: security.data-protection.webhook-signature-verification
+  name: Webhook Signature Verification
+  type: data-protection
+  documentation: Validates GitHub webhook signatures using HMAC-SHA256 to prevent
+    spoofing via X-Hub-Signature-256 header validation
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: .env.example
+            symbol: GITHUB_WEBHOOK_SECRET

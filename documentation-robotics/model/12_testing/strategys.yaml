@@ -1,0 +1,58 @@
+maker-checker-testing:
+  id: testing.strategy.maker-checker-testing
+  name: Maker-Checker Pattern Testing Strategy
+  type: strategy
+  documentation: Tests validate both maker agent outputs and checker agent reviews
+    including quality gates, feedback loops, and approval workflows
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: tests/integration/test_conversational_loop.py
+    motivation:
+      validates:
+        - motivation.principle.maker-checker-pattern
+resilience-testing:
+  id: testing.strategy.resilience-testing
+  name: Resilience and Fault Tolerance Testing
+  type: strategy
+  documentation: Tests circuit breakers, retry logic, checkpoint recovery, and
+    GitHub API failures for fault tolerance and graceful degradation validation
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: tests/integration/test_resilience.py
+    crossLayerRelationships:
+      validates:
+        - business.capability.pipeline-orchestration
+    motivation:
+      validates:
+        - motivation.requirement.fault-tolerance
+mocking-external-dependencies:
+  id: testing.strategy.mocking-external-dependencies
+  name: External Dependency Mocking Strategy
+  type: strategy
+  documentation: Mocks all external APIs (GitHub, Claude, Elasticsearch) for fast,
+    isolated tests with deterministic results and zero API costs
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: tests/mocks/github_mock.py
+pytest-markers:
+  id: testing.strategy.pytest-markers
+  name: Pytest Marker-Based Test Organization
+  type: strategy
+  documentation: Tests categorized by speed and dependencies using pytest markers
+    (unit, integration, e2e, slow) for flexible execution and CI/CD optimization
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: tests/conftest.py
+            symbol: pytest_configure

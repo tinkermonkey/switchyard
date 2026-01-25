@@ -1,0 +1,308 @@
+idea-researcher-agent:
+  id: application.component.idea-researcher-agent
+  name: Idea Researcher Agent
+  type: component
+  documentation: Market research and idea validation with web search capabilities
+  properties:
+    model: claude-opus-4-5-20251101
+    timeout: 300
+    capabilities:
+      - research
+      - market_analysis
+      - feasibility_assessment
+    requires_docker: true
+    requires_dev_container: false
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: agents/idea_researcher_agent.py
+            symbol: IdeaResearcherAgent
+    uses_technologies:
+      - technology.api-client.anthropic-claude
+      - technology.language.python-3-11
+business-analyst-agent:
+  id: application.component.business-analyst-agent
+  name: Business Analyst Agent
+  type: component
+  documentation: Requirements analysis and user story development for project planning
+  properties:
+    model: claude-sonnet-4-5-20250929
+    timeout: 300
+    capabilities:
+      - requirements_analysis
+      - user_story_creation
+      - stakeholder_analysis
+    requires_docker: true
+    requires_dev_container: false
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: agents/business_analyst_agent.py
+            symbol: BusinessAnalystAgent
+    uses_technologies:
+      - technology.api-client.anthropic-claude
+      - technology.api-client.github-api
+      - technology.language.python-3-11
+software-architect-agent:
+  id: application.component.software-architect-agent
+  name: Software Architect Agent
+  type: component
+  documentation: System architecture and technical design with performance and
+    security planning
+  properties:
+    model: claude-opus-4-5-20251101
+    timeout: 600
+    capabilities:
+      - system_architecture
+      - technical_design
+      - architecture_review
+    requires_docker: true
+    requires_dev_container: false
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: agents/software_architect_agent.py
+            symbol: SoftwareArchitectAgent
+    uses_technologies:
+      - technology.api-client.anthropic-claude
+      - technology.language.python-3-11
+work-breakdown-agent:
+  id: application.component.work-breakdown-agent
+  name: Work Breakdown Agent
+  type: component
+  documentation: Epic decomposition into implementable sub-issues with dependency
+    analysis and estimation
+  properties:
+    model: claude-sonnet-4-5-20250929
+    timeout: 300
+    capabilities:
+      - task_decomposition
+      - dependency_analysis
+      - estimation
+    requires_docker: true
+    requires_dev_container: false
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: agents/work_breakdown_agent.py
+            symbol: WorkBreakdownAgent
+    uses_technologies:
+      - technology.api-client.anthropic-claude
+      - technology.api-client.github-api
+      - technology.language.python-3-11
+senior-software-engineer-agent:
+  id: application.component.senior-software-engineer-agent
+  name: Senior Software Engineer Agent
+  type: component
+  documentation: Code implementation with best practices, testing, and debugging capabilities
+  properties:
+    model: claude-haiku-4-5-20251001
+    timeout: 1800
+    capabilities:
+      - coding
+      - testing
+      - debugging
+      - refactoring
+    requires_docker: true
+    requires_dev_container: true
+    makes_code_changes: true
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: agents/senior_software_engineer_agent.py
+            symbol: SeniorSoftwareEngineerAgent
+    uses_technologies:
+      - technology.api-client.anthropic-claude
+      - technology.api-client.github-api
+      - technology.language.python-3-11
+      - technology.platform.docker
+code-reviewer-agent:
+  id: application.component.code-reviewer-agent
+  name: Code Reviewer Agent
+  type: component
+  documentation: Code quality review with security analysis and best practices validation
+  properties:
+    model: claude-opus-4-5-20251101
+    timeout: 300
+    capabilities:
+      - code_review
+      - quality_assessment
+      - security_review
+    requires_docker: true
+    requires_dev_container: false
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: agents/code_reviewer_agent.py
+            symbol: CodeReviewerAgent
+    uses_technologies:
+      - technology.api-client.anthropic-claude
+      - technology.language.python-3-11
+dev-environment-setup-agent:
+  id: application.component.dev-environment-setup-agent
+  name: Dev Environment Setup Agent
+  type: component
+  documentation: Dockerfile generation and dev container configuration with
+    automated dependency detection and build validation
+  properties:
+    model: claude-opus-4-5-20251101
+    timeout: 1800
+    capabilities:
+      - dockerfile_generation
+      - dependency_detection
+      - docker_build_validation
+    requires_docker: false
+    requires_dev_container: false
+    makes_code_changes: true
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: agents/dev_environment_setup_agent.py
+            symbol: DevEnvironmentSetupAgent
+    uses_technologies:
+      - technology.api-client.anthropic-claude
+      - technology.platform.docker
+      - technology.language.python-3-11
+dev-environment-verifier-agent:
+  id: application.component.dev-environment-verifier-agent
+  name: Dev Environment Verifier Agent
+  type: component
+  documentation: Verifies dev environment setup and marks container as verified
+    after Docker image validation
+  properties:
+    model: claude-sonnet-4-5-20250929
+    timeout: 300
+    capabilities:
+      - environment_verification
+      - docker_image_validation
+    requires_docker: false
+    requires_dev_container: false
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: agents/dev_environment_verifier_agent.py
+            symbol: DevEnvironmentVerifierAgent
+    uses_technologies:
+      - technology.api-client.anthropic-claude
+      - technology.platform.docker
+      - technology.language.python-3-11
+technical-writer-agent:
+  id: application.component.technical-writer-agent
+  name: Technical Writer Agent
+  type: component
+  documentation: Technical documentation creation including API docs and user guides
+  properties:
+    model: claude-sonnet-4-5-20250929
+    timeout: 300
+    capabilities:
+      - documentation_writing
+      - api_documentation
+      - user_guides
+    requires_docker: true
+    requires_dev_container: false
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: agents/technical_writer_agent.py
+            symbol: TechnicalWriterAgent
+    uses_technologies:
+      - technology.api-client.anthropic-claude
+      - technology.language.python-3-11
+documentation-editor-agent:
+  id: application.component.documentation-editor-agent
+  name: Documentation Editor Agent
+  type: component
+  documentation: Documentation review and editing with style enforcement and
+    clarity improvement
+  properties:
+    model: claude-sonnet-4-5-20250929
+    timeout: 300
+    capabilities:
+      - documentation_review
+      - style_enforcement
+      - clarity_improvement
+    requires_docker: true
+    requires_dev_container: false
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: agents/documentation_editor_agent.py
+            symbol: DocumentationEditorAgent
+    uses_technologies:
+      - technology.api-client.anthropic-claude
+      - technology.language.python-3-11
+medic-investigator-agent:
+  id: application.component.medic-investigator-agent
+  name: Medic Investigator Agent
+  type: component
+  documentation: Failure investigation and root cause analysis with log analysis
+    and pattern detection
+  properties:
+    model: claude-sonnet-4-5-20250929
+    timeout: 600
+    capabilities:
+      - failure_analysis
+      - log_analysis
+      - root_cause_investigation
+    requires_docker: true
+    requires_dev_container: false
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: agents/medic_investigator_agent.py
+            symbol: MedicInvestigatorAgent
+    uses_technologies:
+      - technology.api-client.anthropic-claude
+      - technology.database.elasticsearch
+      - technology.language.python-3-11
+      - technology.platform.docker
+base-maker-agent:
+  id: application.component.base-maker-agent
+  name: Base Maker Agent
+  type: component
+  documentation: "Base class for agents that create deliverables with three
+    execution modes: Initial, Revision, and Question"
+  properties:
+    type: base_class
+    modes:
+      - initial
+      - revision
+      - question
+    features:
+      - output_sections
+      - review_handling
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: agents/base_maker_agent.py
+            symbol: MakerAgent
+base-analysis-agent:
+  id: application.component.base-analysis-agent
+  name: Base Analysis Agent
+  type: component
+  documentation: Base class for analysis and review agents with quality assessment
+    and feedback generation
+  properties:
+    type: base_class
+    features:
+      - quality_assessment
+      - feedback_generation
+      - approval_rejection
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: agents/base_analysis_agent.py
+            symbol: AnalysisAgent

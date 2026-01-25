@@ -633,6 +633,17 @@ class ReviewCycleExecutor:
 
                 except Exception as e:
                     logger.error(f"Review cycle failed for issue #{issue_number}: {e}")
+
+                    # EMIT ERROR EVENT for UI visibility
+                    if issue_number in self.active_cycles:
+                        existing_cycle = self.active_cycles[issue_number]
+                        self._emit_review_cycle_error(
+                            cycle_state=existing_cycle,
+                            error=e,
+                            error_context="execution",
+                            recovery_action="Review cycle terminated, GitHub comment posted"
+                        )
+
                     # Clean up on error
                     if issue_number in self.active_cycles:
                         del self.active_cycles[issue_number]
@@ -753,6 +764,17 @@ class ReviewCycleExecutor:
 
         except Exception as e:
             logger.error(f"Review cycle failed for issue #{issue_number}: {e}")
+
+            # EMIT ERROR EVENT for UI visibility
+            if issue_number in self.active_cycles:
+                cycle = self.active_cycles[issue_number]
+                self._emit_review_cycle_error(
+                    cycle_state=cycle,
+                    error=e,
+                    error_context="startup",
+                    recovery_action="Review cycle terminated, GitHub error comment posted"
+                )
+
             # Clean up on error
             if issue_number in self.active_cycles:
                 del self.active_cycles[issue_number]
@@ -1977,7 +1999,7 @@ class ReviewCycleExecutor:
             if scoped_diff:
                 logger.info(f"Generated scoped git diff ({len(scoped_diff)} chars) since commit {cycle_state.last_approved_commit[:8]}")
 
-        return {
+        task_context = {
             'project': cycle_state.project_name,
             'board': cycle_state.board_name,
             'repository': cycle_state.repository,
@@ -1999,6 +2021,8 @@ class ReviewCycleExecutor:
             'scoped_git_diff': scoped_diff,  # Git diff since last approval (issues workspace only)
             'timestamp': datetime.now().isoformat()
         }
+        logger.info(f"[DIAGNOSTIC] Created review task_context with pipeline_run_id: {cycle_state.pipeline_run_id} for issue #{cycle_state.issue_number}")
+        return task_context
 
     def _create_maker_revision_task_context(
         self,
@@ -2017,7 +2041,7 @@ class ReviewCycleExecutor:
         # Get the original output for reference
         original_output = cycle_state.maker_outputs[0]['output'] if cycle_state.maker_outputs else ""
 
-        return {
+        task_context = {
             'project': cycle_state.project_name,
             'board': cycle_state.board_name,
             'repository': cycle_state.repository,
@@ -2045,6 +2069,8 @@ class ReviewCycleExecutor:
             },
             'timestamp': datetime.now().isoformat()
         }
+        logger.info(f"[DIAGNOSTIC] Created maker revision task_context with pipeline_run_id: {cycle_state.pipeline_run_id} for issue #{cycle_state.issue_number}")
+        return task_context
 
     async def _get_fresh_discussion_context(
         self,
@@ -2188,6 +2214,38 @@ class ReviewCycleExecutor:
             task_context=task_context,
             task_id_prefix="review_cycle"
         )
+
+    def _emit_review_cycle_error(
+        self,
+        cycle_state: ReviewCycleState,
+        error: Exception,
+        error_context: str,
+        recovery_action: str = "Review cycle terminated"
+    ):
+        """Emit error event for UI visibility"""
+        try:
+            # Get pipeline_run_id from cycle state if available
+            pipeline_run_id = getattr(cycle_state, 'pipeline_run_id', None)
+
+            self.decision_events.emit_error_decision(
+                error_type=f"review_cycle_{error_context}",
+                error_message=str(error),
+                context={
+                    'issue_number': cycle_state.issue_number,
+                    'project': cycle_state.project_name,
+                    'board': cycle_state.board_name,
+                    'cycle_iteration': cycle_state.current_iteration,
+                    'maker_agent': cycle_state.maker_agent,
+                    'reviewer_agent': cycle_state.reviewer_agent,
+                    'workspace_type': cycle_state.workspace_type
+                },
+                recovery_action=recovery_action,
+                success=False,
+                project=cycle_state.project_name,
+                pipeline_run_id=pipeline_run_id
+            )
+        except Exception as emit_error:
+            logger.error(f"Failed to emit review cycle error event: {emit_error}", exc_info=True)
 
     async def _get_latest_agent_comment(
         self,

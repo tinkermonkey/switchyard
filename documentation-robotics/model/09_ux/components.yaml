@@ -1,0 +1,216 @@
+header:
+  id: ux.component.header
+  name: Main Application Header
+  type: component
+  documentation: Top-level header with system health alerts, circuit breaker
+    status, active agent count, Claude usage, and theme toggle
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: web_ui/src/components/Header.jsx
+            symbol: Header
+active-agents-list:
+  id: ux.component.active-agents-list
+  name: Active Agents List
+  type: component
+  documentation: Displays currently running agents with runtime duration,
+    project/branch badges, and kill buttons for containerized agents
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: web_ui/src/components/ActiveAgents.jsx
+            symbol: ActiveAgents
+projects-list:
+  id: ux.component.projects-list
+  name: Projects List View
+  type: component
+  documentation: Displays all configured orchestrator projects with workspace
+    status, dev container status, and pipeline information
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: web_ui/src/components/Projects.jsx
+            symbol: Projects
+pipelines-status:
+  id: ux.component.pipelines-status
+  name: Pipeline Status Display
+  type: component
+  documentation: Shows pipeline configurations with lock status and ability to
+    release pipeline locks held by issues
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: web_ui/src/components/PipelinesStatus.jsx
+            symbol: PipelinesStatus
+live-logs:
+  id: ux.component.live-logs
+  name: Live Claude Logs Viewer
+  type: component
+  documentation: Real-time streaming log viewer for Claude API calls showing tool
+    uses, text output, token usage, and tool results with markdown rendering
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: web_ui/src/components/LiveLogs.jsx
+            symbol: LiveLogs
+event-timeline:
+  id: ux.component.event-timeline
+  name: Agent Event Timeline
+  type: component
+  documentation: Timeline view of agent lifecycle events including task received,
+    initialization, Claude API calls, completion/failure with expandable details
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: web_ui/src/components/EventTimeline.jsx
+            symbol: EventTimeline
+pipeline-event-log:
+  id: ux.component.pipeline-event-log
+  name: Pipeline Run Event Log
+  type: component
+  documentation: Comprehensive event log for pipeline runs showing agent routing,
+    feedback, status progression, review cycles, errors, and branch management
+    with real-time updates
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: web_ui/src/components/PipelineRunEventLog.jsx
+            symbol: PipelineRunEventLog
+    uses_technologies:
+      - technology.framework.react
+      - technology.library.socket-io
+      - technology.library.xyflow
+project-card:
+  id: ux.component.project-card
+  name: Project Card
+  type: component
+  documentation: Individual project card showing GitHub repository link, dev
+    container status, workspace status, and pipeline configuration
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: web_ui/src/components/ProjectCard.jsx
+            symbol: ProjectCard
+navigation-tabs:
+  id: ux.component.navigation-tabs
+  name: Main Navigation Tabs
+  type: component
+  documentation: Top-level horizontal navigation menu with active highlighting for
+    Dashboard, Pipeline Run Debug, Medic, Claude Medic, Projects, Repair Cycles,
+    Pipeline Run Graphs, and Review Learning
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: web_ui/src/components/NavigationTabs.jsx
+            symbol: NavigationTabs
+    uses_technologies:
+      - technology.framework.react
+      - technology.library.tanstack-router
+header-active-agents:
+  id: ux.component.header-active-agents
+  name: Header Active Agents Widget
+  type: component
+  documentation: Compact widget showing active agents count and status in header
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: web_ui/src/components/HeaderActiveAgents.jsx
+            symbol: HeaderActiveAgents
+header-system-health:
+  id: ux.component.header-system-health
+  name: Header System Health Widget
+  type: component
+  documentation: Displays API usage metrics for GitHub and Claude in header
+    including rate limits and token usage
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: web_ui/src/components/HeaderSystemHealth.jsx
+            symbol: HeaderSystemHealth
+header-circuit-breakers:
+  id: ux.component.header-circuit-breakers
+  name: Header Circuit Breakers Widget
+  type: component
+  documentation: Shows individual circuit breaker states with reset capability for
+    open/half-open breakers
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: web_ui/src/components/HeaderCircuitBreakers.jsx
+            symbol: HeaderCircuitBreakers
+workspace-status:
+  id: ux.component.workspace-status
+  name: Workspace Status Display
+  type: component
+  documentation: Shows workspace existence, path, Git branches with file changes,
+    and stash information for project workspaces
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: web_ui/src/components/WorkspaceStatus.jsx
+            symbol: WorkspaceStatus
+dev-container-status:
+  id: ux.component.dev-container-status
+  name: Dev Container Status Display
+  type: component
+  documentation: Shows dev container verification status (verified, in_progress,
+    blocked, unverified) with image name, timestamp, and error messages
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: web_ui/src/components/DevContainerStatus.jsx
+            symbol: DevContainerStatus
+repair-cycle-card:
+  id: ux.component.repair-cycle-card
+  name: Repair Cycle Dashboard Card
+  type: component
+  documentation: Compact dashboard widget showing repair cycle statistics
+    (running, completed, failed, stale) with recent cycle list
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: web_ui/src/components/RepairCycleCard.jsx
+            symbol: RepairCycleCard
+modal:
+  id: ux.component.modal
+  name: Generic Modal Dialog
+  type: component
+  documentation: Reusable full-screen overlay modal component with title, close
+    button, and keyboard support (ESC)
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: web_ui/src/components/Modal.jsx
+            symbol: Modal

@@ -158,7 +158,18 @@ class PipelineProgression:
                                         break
             except Exception as e:
                 logger.debug(f"Could not determine current status: {e}")
-            
+
+            # Get pipeline_run_id for event tracking
+            pipeline_run_id = None
+            try:
+                from services.pipeline_run import get_pipeline_run_manager
+                pipeline_run_manager = get_pipeline_run_manager()
+                active_run = pipeline_run_manager.get_active_pipeline_run(project_name, issue_number)
+                if active_run:
+                    pipeline_run_id = active_run.id
+            except Exception as e:
+                logger.debug(f"Could not get pipeline_run_id: {e}")
+
             # EMIT DECISION EVENT: Status progression started
             self.decision_events.emit_status_progression(
                 issue_number=issue_number,
@@ -167,7 +178,8 @@ class PipelineProgression:
                 from_status=current_status or 'unknown',
                 to_status=target_column,
                 trigger=trigger,
-                success=None  # Not yet executed
+                success=None,  # Not yet executed
+                pipeline_run_id=pipeline_run_id
             )
 
             # Get the field ID for Status from board state
@@ -305,7 +317,8 @@ class PipelineProgression:
                 from_status=current_status or 'unknown',
                 to_status=target_column,
                 trigger=trigger,
-                success=True
+                success=True,
+                pipeline_run_id=pipeline_run_id
             )
 
             logger.info(f"Moved issue #{issue_number} to column '{target_column}' in {board_name}")
@@ -323,7 +336,8 @@ class PipelineProgression:
                 to_status=target_column,
                 trigger=trigger,
                 success=False,
-                error=str(e)
+                error=str(e),
+                pipeline_run_id=pipeline_run_id
             )
             
             return False

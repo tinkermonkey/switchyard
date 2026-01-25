@@ -1,0 +1,41 @@
+redis:
+  id: datastore.datastore.redis
+  name: Redis In-Memory Store
+  type: datastore
+  documentation: In-memory key-value store for task queue, pipeline locks, active
+    runs, circuit breaker state, and caching
+  properties:
+    crossLayerRelationships:
+      stores:
+        - data_model.schema.task-info
+        - data_model.schema.pipeline-checkpoint
+        - data_model.schema.pipeline-run
+elasticsearch:
+  id: datastore.datastore.elasticsearch
+  name: Elasticsearch Search Engine
+  type: datastore
+  documentation: Search and analytics engine for metrics, logs, events, pattern
+    detection, and decision event storage with ILM policies
+  properties:
+    crossLayerRelationships:
+      stores:
+        - data_model.schema.task-metrics
+        - data_model.schema.pipeline-run
+yaml-config-store:
+  id: datastore.datastore.yaml-config-store
+  name: YAML Configuration Store
+  type: datastore
+  documentation: File-based configuration store for foundation configs, project
+    configs, and runtime state persistence
+  properties:
+    crossLayerRelationships:
+      stores:
+        - data_model.schema.project-config
+        - data_model.schema.agent-config
+        - data_model.schema.github-state
+json-metrics-backup:
+  id: datastore.datastore.json-metrics-backup
+  name: JSON Metrics Backup
+  type: datastore
+  documentation: JSONL file-based backup storage for metrics fallback when
+    Elasticsearch is unavailable

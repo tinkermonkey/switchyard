@@ -464,6 +464,10 @@ class ObservabilityManager:
                         'pipeline_run_id': pipeline_run_id,
                         **data  # Flatten data into document
                     }
+
+                    # Diagnostic logging for error events
+                    if event_type == EventType.ERROR_ENCOUNTERED or event_type == EventType.ERROR_RECOVERED:
+                        logger.info(f"[DIAGNOSTIC] Writing {event.event_type} to ES with pipeline_run_id: {pipeline_run_id} (is None: {pipeline_run_id is None}), project: {project}")
                     
                     # Index the document
                     self.es.index(index=index_name, document=doc)

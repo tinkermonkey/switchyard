@@ -241,6 +241,22 @@ async def process_task_integrated(task, state_manager, logger):
     # Feature branch management handled by AgentExecutor's FeatureBranchManager
     # This provides hierarchical parent/sub-issue branch support
 
+    # Extract pipeline_run_id for event tracking
+    pipeline_run_id = None
+    if hasattr(task, 'context') and task.context:
+        pipeline_run_id = task.context.get('pipeline_run_id')
+
+    # If not in task context, try to look it up
+    if not pipeline_run_id and issue_number:
+        try:
+            from services.pipeline_run import get_pipeline_run_manager
+            prm = get_pipeline_run_manager()
+            active_run = prm.get_active_pipeline_run(task.project, issue_number)
+            if active_run:
+                pipeline_run_id = active_run.id
+        except Exception:
+            pass  # pipeline_run_id remains None
+
     # Validate task can run (check dev container requirements)
     validation_result = await validate_task_can_run(task, logger)
     if not validation_result['can_run']:
@@ -258,7 +274,8 @@ async def process_task_integrated(task, state_manager, logger):
             },
             recovery_action='queue_dev_environment_setup' if validation_result.get('needs_dev_setup') else 'block_task',
             success=validation_result.get('needs_dev_setup', False),
-            project=task.project
+            project=task.project,
+            pipeline_run_id=pipeline_run_id
         )
         
         # Queue dev_environment_setup task if needed
@@ -277,7 +294,8 @@ async def process_task_integrated(task, state_manager, logger):
                 },
                 recovery_action='queue_dev_environment_setup',
                 success=True,
-                project=task.project
+                project=task.project,
+                pipeline_run_id=pipeline_run_id
             )
         
         raise Exception(f"Task blocked: {validation_result['reason']}")
@@ -383,7 +401,8 @@ async def process_task_integrated(task, state_manager, logger):
                 },
                 recovery_action='log_and_continue',
                 success=False,
-                project=task.project
+                project=task.project,
+                pipeline_run_id=pipeline_run_id
             )
 
     return result

@@ -1,0 +1,15 @@
+pytest:
+  id: technology.testing.pytest
+  name: Pytest
+  type: testing
+  documentation: Python testing framework with async support for unit and integration testing
+  properties:
+    version: ">=8.0.0"
+    plugins:
+      - pytest-asyncio>=1.0.0
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: requirements.txt
+            symbol: pytest

@@ -315,7 +315,8 @@ class DecisionEventEmitter:
         to_status: str,
         trigger: str,
         success: Optional[bool] = None,
-        error: Optional[str] = None
+        error: Optional[str] = None,
+        pipeline_run_id: Optional[str] = None
     ):
         """
         Emit event when orchestrator moves an issue to a new status
@@ -345,6 +346,7 @@ class DecisionEventEmitter:
             agent="orchestrator",
             task_id=task_id,
             project=project,
+            pipeline_run_id=pipeline_run_id,
             data={
                 'decision_category': 'progression',
                 'issue_number': issue_number,
@@ -642,11 +644,12 @@ class DecisionEventEmitter:
         context: Dict[str, Any],
         recovery_action: str,
         success: bool,
-        project: str = "unknown"
+        project: str = "unknown",
+        pipeline_run_id: Optional[str] = None
     ):
         """
         Emit event when orchestrator handles an error
-        
+
         Args:
             error_type: Type/class of error
             error_message: Error message
@@ -654,15 +657,17 @@ class DecisionEventEmitter:
             recovery_action: What action was taken to recover
             success: Whether recovery succeeded
             project: Project name (if applicable)
+            pipeline_run_id: Optional pipeline run ID to associate with this error
         """
         task_id = f"error_{datetime.now().timestamp()}"
         event_type = EventType.ERROR_RECOVERED if success else EventType.ERROR_ENCOUNTERED
-        
+
         self.obs.emit(
             event_type,
             agent="orchestrator",
             task_id=task_id,
             project=project,
+            pipeline_run_id=pipeline_run_id,
             data={
                 'decision_category': 'error_handling',
                 'error_type': error_type,
@@ -781,7 +786,8 @@ class DecisionEventEmitter:
         stage: str,
         selected_workspace: str,
         category_id: Optional[str],
-        reason: str
+        reason: str,
+        pipeline_run_id: Optional[str] = None
     ):
         """
         Emit event when orchestrator routes work to issues vs discussions
@@ -802,6 +808,7 @@ class DecisionEventEmitter:
             agent="orchestrator",
             task_id=task_id,
             project=project,
+            pipeline_run_id=pipeline_run_id,
             data={
                 'decision_category': 'routing',
                 'issue_number': issue_number,
@@ -986,7 +993,8 @@ class DecisionEventEmitter:
         reason: Optional[str] = None,
         match_reason: Optional[str] = None,
         confidence: Optional[float] = None,
-        parent_issue: Optional[int] = None
+        parent_issue: Optional[int] = None,
+        pipeline_run_id: Optional[str] = None
     ):
         """
         Emit event when existing branch is reused
@@ -1048,6 +1056,7 @@ class DecisionEventEmitter:
             agent="orchestrator",
             task_id=task_id,
             project=project,
+            pipeline_run_id=pipeline_run_id,
             data=event_data
         )
     
@@ -1058,7 +1067,8 @@ class DecisionEventEmitter:
         branch_name: str,
         reason: str,
         parent_issue: Optional[int] = None,
-        is_standalone: bool = True
+        is_standalone: bool = True,
+        pipeline_run_id: Optional[str] = None
     ):
         """
         Emit event when new branch is created
@@ -1080,6 +1090,7 @@ class DecisionEventEmitter:
             agent="orchestrator",
             task_id=task_id,
             project=project,
+            pipeline_run_id=pipeline_run_id,
             data={
                 'decision_category': 'branch_management',
                 'issue_number': issue_number,
@@ -1104,7 +1115,8 @@ class DecisionEventEmitter:
         issue_number: int,
         confidence: float,
         candidate_branches: List[Dict[str, Any]],
-        reason: str
+        reason: str,
+        pipeline_run_id: Optional[str] = None
     ):
         """
         Emit event when branch selection is escalated to human
@@ -1123,6 +1135,7 @@ class DecisionEventEmitter:
             agent="orchestrator",
             task_id=task_id,
             project=project,
+            pipeline_run_id=pipeline_run_id,
             data={
                 'decision_category': 'branch_management',
                 'issue_number': issue_number,
@@ -1145,7 +1158,8 @@ class DecisionEventEmitter:
         issue_number: int,
         branch_name: str,
         conflicting_files: List[str],
-        parent_issue: Optional[int] = None
+        parent_issue: Optional[int] = None,
+        pipeline_run_id: Optional[str] = None
     ):
         """
         Emit event when merge conflict is detected
@@ -1164,6 +1178,7 @@ class DecisionEventEmitter:
             agent="orchestrator",
             task_id=task_id,
             project=project,
+            pipeline_run_id=pipeline_run_id,
             data={
                 'decision_category': 'branch_management',
                 'issue_number': issue_number,
@@ -1188,7 +1203,8 @@ class DecisionEventEmitter:
         branch_name: str,
         commits_behind: int,
         action_taken: str,
-        parent_issue: Optional[int] = None
+        parent_issue: Optional[int] = None,
+        pipeline_run_id: Optional[str] = None
     ):
         """
         Emit event when stale branch is detected
@@ -1210,6 +1226,7 @@ class DecisionEventEmitter:
             agent="orchestrator",
             task_id=task_id,
             project=project,
+            pipeline_run_id=pipeline_run_id,
             data={
                 'decision_category': 'branch_management',
                 'issue_number': issue_number,

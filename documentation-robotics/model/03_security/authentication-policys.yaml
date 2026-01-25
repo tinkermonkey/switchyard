@@ -1,0 +1,48 @@
+github-app-jwt-auth:
+  id: security.authentication-policy.github-app-jwt-auth
+  name: GitHub App JWT Authentication
+  type: authentication-policy
+  documentation: JWT-based authentication for GitHub Apps with 10-minute token
+    validity, providing installation tokens for API access with bot
+    identification
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/github_app_auth.py
+            symbol: GitHubAppAuth
+    crossLayerRelationships:
+      protects:
+        - business.capability.github-project-management
+      secures:
+        - application.service.github-project-manager
+claude-api-key-auth:
+  id: security.authentication-policy.claude-api-key-auth
+  name: Claude API Key Authentication
+  type: authentication-policy
+  documentation: API key-based authentication for Anthropic Claude API access
+    using bearer token in Authorization header
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: config/environment.py
+            symbol: anthropic_api_key
+    crossLayerRelationships:
+      protects:
+        - business.capability.ai-powered-development
+github-pat-auth:
+  id: security.authentication-policy.github-pat-auth
+  name: GitHub Personal Access Token Authentication
+  type: authentication-policy
+  documentation: Personal access token for GitHub API when GitHub App not
+    configured, requiring repo, project, and admin:repo_hook scopes
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/github_app_auth.py
+            symbol: get_installation_token

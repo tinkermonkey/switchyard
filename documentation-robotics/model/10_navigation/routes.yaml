@@ -1,0 +1,132 @@
+home:
+  id: navigation.route.home
+  name: Home/Dashboard Route
+  type: route
+  documentation: Main dashboard route at / showing agent activity, system health,
+    logs, and event timeline
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: web_ui/src/routes/index.jsx
+projects:
+  id: navigation.route.projects
+  name: Projects List Route
+  type: route
+  documentation: Projects management route at /projects showing all configured
+    orchestrator projects
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: web_ui/src/routes/projects.jsx
+pipeline-run:
+  id: navigation.route.pipeline-run
+  name: Pipeline Run Graphs Route
+  type: route
+  documentation: Beta pipeline run visualization route at /pipeline-run with
+    graph-based monitoring
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: web_ui/src/routes/pipeline-run.jsx
+pipeline-run-debug:
+  id: navigation.route.pipeline-run-debug
+  name: Pipeline Run Debug Route
+  type: route
+  documentation: Detailed pipeline debugging route at /pipeline-run-debug for
+    troubleshooting pipeline execution
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: web_ui/src/routes/pipeline-run-debug.jsx
+medic:
+  id: navigation.route.medic
+  name: Medic Dashboard Route
+  type: route
+  documentation: System diagnostics route at /medic showing failure signatures and
+    health metrics
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: web_ui/src/routes/medic.jsx
+claude-medic:
+  id: navigation.route.claude-medic
+  name: Claude Medic Route
+  type: route
+  documentation: AI-powered failure analysis route at /claude-medic using Claude
+    for diagnostics
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: web_ui/src/routes/claude-medic.jsx
+repair-cycles:
+  id: navigation.route.repair-cycles
+  name: Repair Cycles Route
+  type: route
+  documentation: Repair cycle monitoring route at /repair-cycles showing container
+    status and progress
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: web_ui/src/routes/repair-cycles.jsx
+review-learning:
+  id: navigation.route.review-learning
+  name: Review Learning Route
+  type: route
+  documentation: Review filter management route at /review-learning for
+    configuring review patterns
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: web_ui/src/routes/review-learning.jsx
+agent-execution-detail:
+  id: navigation.route.agent-execution-detail
+  name: Agent Execution Detail Route
+  type: route
+  documentation: Dynamic route at /agent-execution/:executionId showing detailed
+    agent execution logs and metadata
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: web_ui/src/routes/agent-execution.$executionId.jsx
+medic-detail:
+  id: navigation.route.medic-detail
+  name: Medic Signature Detail Route
+  type: route
+  documentation: Dynamic route at /medic-detail/:fingerprintId showing failure
+    signature details
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: web_ui/src/routes/medic-detail.$fingerprintId.jsx
+claude-medic-detail:
+  id: navigation.route.claude-medic-detail
+  name: Claude Medic Signature Detail Route
+  type: route
+  documentation: Dynamic route at /claude-medic-detail/:fingerprintId showing
+    AI-analyzed failure details
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: web_ui/src/routes/claude-medic-detail.$fingerprintId.jsx

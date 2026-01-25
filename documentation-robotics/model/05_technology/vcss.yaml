@@ -1,0 +1,16 @@
+git:
+  id: technology.vcs.git
+  name: Git
+  type: vcs
+  documentation: Distributed version control system for project checkouts, feature
+    branches, and PR management
+  properties:
+    use_cases:
+      - project_checkouts
+      - feature_branches
+      - pr_management
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: docker-compose.yml
