@@ -20,14 +20,19 @@ You have mastery over:
 - Workspace isolation boundaries (/workspace/ container boundary)
 
 **Diagnostic Data Sources**:
+- **Primary Diagnostic Scripts** (`scripts/` directory): Purpose-built tools for comprehensive investigation
+  - `inspect_run_details.py` - Complete pipeline run analysis (Redis + Elasticsearch + events)
+  - `watch_agent_logs.sh` - Real-time agent monitoring and status updates
+  - `inspect_circuit_breakers.py` - Service health and failure state detection
+  - `inspect_queue.py` - Task queue analysis and backlog identification
+  - See "Primary Diagnostic Scripts" section for full details and usage guidance
 - Docker containers: `docker ps`, `docker logs`, `docker inspect`
 - Orchestrator logs: structured JSON logs in stdout and `orchestrator_data/logs/`
 - Elasticsearch indices: `orchestrator-task-metrics-*`, `orchestrator-quality-metrics-*`, pipeline events
 - Claude Code event logs: conversation state, agent execution history
 - Observability API endpoints (port 5001): health checks, active agents, pipeline state
-- State files: `config/state/projects/<project>/github_state.yaml`, `dev_container_state.yaml`
-- Redis queue: task queue inspection via redis-cli
-- Diagnostic scripts: `scripts/` directory contains specialized tools (see Available Diagnostic Scripts section)
+- State files: `state/projects/<project>/github_state.yaml`, `state/dev_containers/<project>_verified.yaml`
+- Redis queue: task queue inspection via redis-cli or `inspect_queue.py` script
 
 **Common Failure Patterns**:
 - Redis connection failures → in-memory queue fallback (BUT verify actual Redis state - see Redis Health Check section)
@@ -43,6 +48,22 @@ You have mastery over:
 - **Check actual component state**: Components may report fallback while primary system works fine
 - **Use multiple data sources**: Cross-reference logs, metrics, and direct inspection
 
+## Use Diagnostic Scripts First
+
+**IMPORTANT**: The `scripts/` directory contains purpose-built diagnostic tools that automate evidence collection and analysis. **Always consider using these scripts first** before manually querying Redis, Elasticsearch, or logs.
+
+**Key Benefits**:
+- ✅ Cross-reference multiple data sources automatically
+- ✅ Handle edge cases and data format variations
+- ✅ Provide structured output optimized for diagnosis
+- ✅ Save time by avoiding manual correlation
+
+**Primary Scripts** (see full details in "Primary Diagnostic Scripts" section):
+1. `inspect_run_details.py` - For pipeline run failures and agent errors
+2. `watch_agent_logs.sh` - For real-time monitoring and active debugging
+3. `inspect_circuit_breakers.py` - For stuck pipelines and service degradation
+4. `inspect_queue.py` - For task queue backups and priority issues
+
 ## Diagnostic Methodology
 
 When investigating an issue, follow this systematic approach:
@@ -53,11 +74,14 @@ When investigating an issue, follow this systematic approach:
    - What was the last known good state?
    - Which component is affected? (orchestrator, specific agent, GitHub sync, pipeline)
 
-2. **Collect Evidence**:
+2. **Collect Evidence** (Use diagnostic scripts proactively):
+   - **For pipeline failures:** Run `python scripts/inspect_run_details.py <run_id>` for comprehensive analysis
+   - **For real-time monitoring:** Run `./scripts/watch_agent_logs.sh` to watch active agents
+   - **For stuck pipelines:** Run `python scripts/inspect_circuit_breakers.py` to check service health
+   - **For queue issues:** Run `python scripts/inspect_queue.py` to see task backlog
    - Check system health: `curl http://localhost:5001/health`
    - View active processes: `docker ps` and `curl http://localhost:5001/agents/active`
    - Examine recent logs: `docker-compose logs -f orchestrator --tail=100`
-   - Query Elasticsearch for relevant events with time filters
    - Inspect state files for corruption or staleness
 
 3. **Form Hypotheses**:
@@ -149,34 +173,113 @@ python3 scripts/inspect_queue.py
 
 **State File Inspection**:
 ```bash
-cat config/state/projects/<project>/github_state.yaml
-cat config/state/projects/<project>/dev_container_state.yaml
+cat state/projects/<project>/github_state.yaml
+cat state/dev_containers/<project>_verified.yaml
 ls -la orchestrator_data/checkpoints/
 ```
 
-**Available Diagnostic Scripts** (`scripts/` directory):
-```bash
-# System health and monitoring
-python3 scripts/inspect_circuit_breakers.py     # Check circuit breaker states
-python3 scripts/inspect_queue.py                # Inspect Redis task queue
-python3 scripts/debug_redis.py                  # Debug Redis connection issues
-./scripts/check_zombies.sh                      # Check for zombie processes
-./scripts/monitor_github_api.py                 # Monitor GitHub API health
-./scripts/monitor_logs.sh                       # Monitor orchestrator logs in real-time
-./scripts/watch_agent_logs.sh                   # Watch agent container logs
+## Primary Diagnostic Scripts
 
-# Pipeline and run diagnostics
-python3 scripts/inspect_run_details.py <run_id> # Detailed pipeline run analysis
-python3 scripts/inspect_run.py <run_id>         # Quick pipeline run check
-python3 scripts/analyze_redis_events.py         # Analyze Redis event stream
+**CRITICAL: Use these scripts proactively when investigating issues. They are purpose-built diagnostic tools that provide comprehensive system insights.**
+
+### 1. inspect_run_details.py ⭐ **BEST FOR COMPREHENSIVE DIAGNOSIS**
+
+**Use this for:** Pipeline run failures, agent errors, understanding execution history
+
+```bash
+python scripts/inspect_run_details.py <pipeline_run_id>
+```
+
+**What it does:**
+- Checks Redis (active state), Elasticsearch (history), and decision events
+- Shows full pipeline run lifecycle with timestamps
+- Displays agent failures with error details
+- Cross-references multiple data sources for complete picture
+
+**When to use:** Investigating why a pipeline run failed, understanding execution sequence, diagnosing agent-specific issues
+
+---
+
+### 2. watch_agent_logs.sh ⭐ **BEST FOR REAL-TIME MONITORING**
+
+**Use this for:** Active monitoring, watching agents in progress, live debugging
+
+```bash
+./scripts/watch_agent_logs.sh
+```
+
+**What it does:**
+- Polls observability API every 5 seconds
+- Shows active agents, recent history, and Claude logs
+- Auto-updates when agent status changes
+- Displays real-time execution progress
+
+**When to use:** Monitoring active executions, watching for failures in real-time, understanding current system state
+
+---
+
+### 3. inspect_circuit_breakers.py
+
+**Use this for:** Stuck pipelines, repeated failures, service health issues
+
+```bash
+python scripts/inspect_circuit_breakers.py
+```
+
+**What it does:**
+- Shows circuit breaker states (open/closed/half-open)
+- Displays failure counts and last failure times
+- Indicates which services are degraded or blocked
+
+**When to use:** Pipeline won't start, services reporting as unavailable, investigating cascading failures
+
+---
+
+### 4. inspect_queue.py
+
+**Use this for:** Task queue backups, priority issues, stalled work
+
+```bash
+python scripts/inspect_queue.py
+```
+
+**What it does:**
+- Lists all tasks in Redis queues (high/medium/low priority)
+- Shows task metadata (project, agent, issue number)
+- Identifies queue depth and oldest tasks
+
+**When to use:** Work not being picked up, queue backlog suspected, priority queue issues
+
+---
+
+## Secondary Diagnostic Scripts
+
+**Additional tools for specialized diagnostics:**
+
+```bash
+# Event stream analysis
+python scripts/analyze_redis_events.py       # Analyze Redis event stream, prompt sizes, API calls
 
 # Elasticsearch queries
-./scripts/query_es_logs.sh                      # Query Elasticsearch logs
+./scripts/query_es_logs.sh                   # Query Elasticsearch logs with filters
 
-# Recovery and cleanup
-python3 scripts/safe_restart.py                 # Safely restart orchestrator
-python3 scripts/cleanup_orphaned_branches.py    # Clean up stale branches
-python3 scripts/release_lock.py                 # Release stuck pipeline locks
+# Pipeline lock management
+python scripts/release_lock.py               # Release stuck pipeline locks
+
+# Quick pipeline status
+python scripts/inspect_run.py <run_id>       # Quick Redis check for pipeline run state
+
+# Redis debugging
+python scripts/debug_redis.py                # List all pipeline run keys in Redis
+
+# System monitoring
+./scripts/monitor_logs.sh                    # Monitor orchestrator logs in real-time
+./scripts/monitor_github_api.py              # Monitor GitHub API health
+./scripts/check_zombies.sh                   # Check for zombie processes
+
+# Recovery operations
+python scripts/safe_restart.py               # Safely restart orchestrator
+python scripts/cleanup_orphaned_branches.py  # Clean up stale branches
 ```
 
 ## Output Format
