@@ -1720,18 +1720,19 @@ class DockerAgentRunner:
 
             # Try to get persisted result from Redis
             output = None
+            redis_key = f"agent_result:{project}:{issue_number}:{task_id}"
+            logger.info(f"Attempting to retrieve result from Redis: {redis_key}")
             try:
                 import redis
                 import json
                 redis_client = redis.Redis(host='redis', port=6379, decode_responses=True)
 
-                redis_key = f"agent_result:{project}:{issue_number}:{task_id}"
                 result_json = redis_client.get(redis_key)
 
                 if result_json:
                     result_data = json.loads(result_json)
                     output = result_data.get('output', '')
-                    logger.info(f"Loaded persisted result from Redis: {redis_key}")
+                    logger.info(f"✓ Loaded persisted result from Redis: {redis_key}")
 
                     # Mark as recovered and update TTL
                     result_data['recovered'] = True
@@ -1739,7 +1740,7 @@ class DockerAgentRunner:
                 else:
                     logger.warning(
                         f"No persisted result in Redis for {redis_key} - "
-                        f"container may have exited before result was written"
+                        f"container may have exited before result was written, will try fallback methods"
                     )
             except Exception as e:
                 logger.error(f"Failed to load persisted result from Redis: {e}")
@@ -1747,6 +1748,7 @@ class DockerAgentRunner:
             # Fallback 2: Try to get result from container's fallback file (/tmp/agent_result_{task_id}.json)
             # This is written by docker-claude-wrapper.py when Redis write fails
             if not output:
+                logger.info(f"Attempting fallback retrieval via docker cp from {container_name}")
                 try:
                     result_file = f"/tmp/agent_result_{task_id}.json"
                     result = subprocess.run(
@@ -1764,12 +1766,16 @@ class DockerAgentRunner:
                             f"(Redis write failed during execution)"
                         )
                     else:
-                        logger.debug(f"No fallback file found in container at {result_file}")
+                        logger.info(
+                            f"No fallback file found in container at {result_file} "
+                            f"(returncode={result.returncode}, stderr={result.stderr[:200] if result.stderr else 'none'})"
+                        )
                 except Exception as e:
-                    logger.debug(f"Could not retrieve fallback file from container: {e}")
+                    logger.warning(f"Could not retrieve fallback file from container: {e}")
 
             # Fallback 3: Try to get logs from stopped container (if still exists)
             if not output:
+                logger.info(f"Attempting fallback retrieval via docker logs from {container_name}")
                 try:
                     result = subprocess.run(
                         ['docker', 'logs', container_name],
@@ -1779,9 +1785,14 @@ class DockerAgentRunner:
                     )
                     if result.returncode == 0:
                         output = result.stdout + result.stderr
-                        logger.info(f"Retrieved logs from stopped container {container_name}")
+                        logger.info(f"✓ Retrieved logs from stopped container {container_name}")
+                    else:
+                        logger.info(
+                            f"Could not retrieve logs from container {container_name} "
+                            f"(returncode={result.returncode}, stderr={result.stderr[:200] if result.stderr else 'none'})"
+                        )
                 except Exception as e:
-                    logger.warning(f"Could not retrieve logs from container: {e}")
+                    logger.warning(f"Could not retrieve logs from container {container_name}: {e}")
 
             # Process the completion (post to GitHub, record execution outcome, etc.)
             if output:
