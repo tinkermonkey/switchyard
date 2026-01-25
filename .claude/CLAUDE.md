@@ -4,6 +4,13 @@ This file provides guidance to coding agents when working with this codebase.
 
 **IMPORTANT**: Do not create markdown files or any documentation during your tasks unless creating documentation is explicitly part of the task requirements.
 
+## Quick Reference by Role
+
+- **Coding Agent**: Core Architecture (§11), Development Workflow (§280)
+- **DevOps Engineer**: Running the Orchestrator (§175), Troubleshooting (§471)
+- **System Designer**: Project Overview (§7), Configuration Management (§97)
+- **Deep Technical Details**: See `documentation/agent-execution-architecture.md`
+
 ## Project Overview
 
 This is the Claude Code Agent Orchestrator - an autonomous AI development system that manages GitHub-integrated software development workflows. The orchestrator coordinates specialized AI agents through GitHub Projects v2 Kanban boards, executing complete SDLC pipelines from requirements analysis to deployment.
@@ -98,7 +105,7 @@ volumes:
 
 ### Foundational Layer (`config/foundations/`)
 
-**agents.yaml**: Defines all 17 agents with capabilities, timeouts, Docker requirements
+**agents.yaml**: Defines 14 specialized agents with capabilities, timeouts, Docker requirements
 - `requires_dev_container: true` - Needs project dependencies
 - `requires_docker: true` - Must run in Docker
 - `makes_code_changes: true` - Modifies codebase
@@ -135,20 +142,21 @@ project:
 
 Auto-managed runtime state (DO NOT edit manually):
 - `github_state.yaml` - Board IDs, column IDs, sync status
-- `dev_container_state.yaml` - Docker image verification status
+
+Note: Dev container state is tracked separately in `state/dev_containers/`
+
+> **For detailed configuration reference:**
+> See `documentation/agent-execution-architecture.md` lines 99-152
 
 ## Agent Execution Modes
 
-All maker agents support three modes:
+All maker agents support three modes determined automatically from task context:
+- **Initial Mode**: First-time creation from requirements
+- **Revision Mode**: Update based on reviewer feedback (`trigger: 'review_cycle_revision'`)
+- **Question Mode**: Conversational Q&A (`trigger: 'feedback_loop'` + `conversation_mode: 'threaded'`)
 
-1. **Initial Mode**: First-time creation from requirements
-2. **Revision Mode**: Update based on reviewer feedback
-3. **Question Mode**: Conversational Q&A about previous output
-
-Mode detection is automatic based on task context:
-- `trigger: 'feedback_loop'` + `conversation_mode: 'threaded'` → Question mode
-- `trigger: 'review_cycle_revision'` or `revision` in context → Revision mode
-- Otherwise → Initial mode
+> **For detailed mode detection logic and prompt building:**
+> See `documentation/agent-execution-architecture.md` lines 948-1105
 
 ## Docker-in-Docker Agent Execution
 
@@ -171,6 +179,9 @@ docker run \
 - `dev_environment_setup` agent creates `Dockerfile.agent` for each project
 - `dev_environment_verifier` agent validates the Docker image
 - Images must include: project dependencies, git, Claude CLI, GitHub CLI
+
+> **For complete container execution flow:**
+> See `documentation/agent-execution-architecture.md` Phase 6 (lines 311-381)
 
 ## Common Commands
 
@@ -345,7 +356,7 @@ pipelines:
 ### Modifying Agent Behavior
 
 Agents use Claude instructions via `claude/claude_integration.py`:
-- Instructions are in `agents/<agent>/.claude/instructions.md`
+- Instructions are in `.claude/agents/<agent-name>.md`
 - Context includes: issue details, previous outputs, review feedback
 - Output posted to GitHub as discussion comment or issue comment
 
@@ -493,7 +504,7 @@ docker-compose logs orchestrator | grep dev_environment_setup
 docker build -f /workspace/<project>/Dockerfile.agent -t <project>-agent /workspace/<project>
 
 # Check dev container state
-cat state/projects/<project>/dev_container_state.yaml
+cat state/dev_containers/<project>_verified.yaml
 ```
 
 ### Agent Task Fails
@@ -504,9 +515,11 @@ cat state/projects/<project>/dev_container_state.yaml
 docker-compose logs -f orchestrator
 
 # View task queue
-# Redis CLI
+# Redis CLI (queue names follow pattern: tasks:{priority})
 redis-cli
-> LRANGE orchestrator:tasks:queue 0 -1
+> LRANGE tasks:high 0 -1
+> LRANGE tasks:medium 0 -1
+> LRANGE tasks:low 0 -1
 ```
 
 ### Redis Connection Issues
@@ -534,7 +547,7 @@ redis-cli -h localhost -p 6379 ping
 
 ```
 clauditoreum/
-├── agents/                      # 17 specialized AI agents
+├── agents/                      # 14 specialized AI agents
 │   ├── base_maker_agent.py     # Base class for maker agents
 │   ├── business_analyst_agent.py
 │   ├── senior_software_engineer_agent.py

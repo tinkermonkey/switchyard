@@ -126,10 +126,11 @@ curl http://localhost:5001/api/circuit-breakers | jq .
 docker-compose ps redis
 
 # Test Redis connectivity from inside container
-docker exec clauditoreum-redis-1 redis-cli ping
+# NOTE: Container names follow docker-compose project naming: <project>-redis-1
+docker exec <project>-redis-1 redis-cli ping
 
 # Check what keys exist (proves Redis is working)
-docker exec clauditoreum-redis-1 redis-cli KEYS "*" | head -20
+docker exec <project>-redis-1 redis-cli KEYS "*" | head -20
 
 # Check orchestrator logs for Redis connection messages
 docker-compose logs orchestrator 2>&1 | grep -i "connected to redis" | tail -10
@@ -232,7 +233,7 @@ Structure your diagnostic report as follows:
 
 **RIGHT**: Verify Redis state with:
 1. `docker-compose ps redis` - Is container running?
-2. `docker exec clauditoreum-redis-1 redis-cli ping` - Can it respond?
+2. `docker exec <project>-redis-1 redis-cli ping` - Can it respond?
 3. `docker-compose logs orchestrator | grep "Connected to Redis"` - Did main orchestrator connect?
 4. Check `main.py`: Main orchestrator uses `TaskQueue(use_redis=True)` while helper components may use defaults
 

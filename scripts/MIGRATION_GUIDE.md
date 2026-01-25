@@ -1,5 +1,9 @@
 # Medic Data Migration Guide
 
+> **Note**: Migration scripts referenced in this guide have been archived as of January 2026.
+> The migrations described below were completed in January 2025. If you need to reference
+> the migration scripts, see the `archive/helper-scripts-cleanup` branch.
+
 ## Overview
 
 This guide covers the migration of existing Docker failure data from the old schema to the new unified medic architecture introduced in v2.0.0.
