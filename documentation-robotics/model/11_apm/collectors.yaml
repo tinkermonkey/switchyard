@@ -12,3 +12,10 @@ metrics-collector:
         locations:
           - file: monitoring/metrics.py
             symbol: MetricsCollector
+    crossLayerRelationships:
+      stores-in:
+        - datastore.datastore.elasticsearch
+        - datastore.datastore.json-metrics-backup
+      collects-from:
+        - application.service.worker-pool-manager
+        - application.service.pipeline-run-manager

@@ -22,6 +22,9 @@ pipeline-checkpoint:
         provenance: extracted
         locations:
           - file: pipeline/orchestrator.py
+    crossLayerRelationships:
+      persistedIn:
+        - data-store.datastore.redis-pipeline-mappings
 github-state:
   id: data_model.schema.github-state
   name: GitHub State Schema
@@ -34,6 +37,9 @@ github-state:
         provenance: extracted
         locations:
           - file: state_management/github_state.py
+    crossLayerRelationships:
+      persistedIn:
+        - data-store.datastore.yaml-configuration-store
 task-metrics:
   id: data_model.schema.task-metrics
   name: Task Metrics Schema
@@ -46,30 +52,35 @@ task-metrics:
         provenance: extracted
         locations:
           - file: monitoring/metrics.py
+    crossLayerRelationships:
+      persistedIn:
+        - data-store.datastore.elasticsearch-task-metrics-index
 agent-config:
-  id: data_model.schema.agent-config
-  name: Agent Configuration Schema
+  id: data-model.object-schema.agent-config
+  name: Agent Configuration Dataclass
   type: object-schema
-  documentation: Agent configuration with model, timeout, retries, capabilities,
-    and Docker requirements
-  properties:
-    source:
-      reference:
-        provenance: extracted
-        locations:
-          - file: config/foundations/agents.yaml
-project-config:
-  id: data_model.schema.project-config
-  name: Project Configuration Schema
-  type: object-schema
-  documentation: Project configuration with GitHub repo info, tech stacks, and
-    enabled pipelines
+  documentation: Configuration dataclass for defining agent capabilities, models,
+    timeouts, and execution requirements
   properties:
     source:
       reference:
         provenance: extracted
         locations:
           - file: config/manager.py
+            symbol: AgentConfig
+project-config:
+  id: data-model.object-schema.project-config
+  name: Project Configuration Dataclass
+  type: object-schema
+  documentation: Complete project configuration including GitHub info, tech
+    stacks, and enabled pipelines
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: config/manager.py
+            symbol: ProjectConfig
 pipeline-run:
   id: data_model.schema.pipeline-run
   name: Pipeline Run Schema
@@ -81,6 +92,9 @@ pipeline-run:
         provenance: extracted
         locations:
           - file: services/pipeline_run_tracker.py
+    crossLayerRelationships:
+      persistedIn:
+        - data-store.datastore.elasticsearch-pipeline-runs-index
 review-filter:
   id: data_model.schema.review-filter
   name: Review Filter Schema
@@ -93,18 +107,25 @@ review-filter:
         provenance: extracted
         locations:
           - file: services/review_filter_manager.py
+    crossLayerRelationships:
+      persistedIn:
+        - data-store.datastore.redis
+        - data-store.datastore.json-metrics-backup
 feature-branch:
-  id: data_model.schema.feature-branch
-  name: Feature Branch Schema
+  id: data-model.object-schema.feature-branch
+  name: Feature Branch
   type: object-schema
-  documentation: Feature branch state with parent issue, sub-issues, commits
-    behind main, and lifecycle tracking
+  documentation: Represents a feature branch for a parent issue with sub-issue tracking
   properties:
     source:
       reference:
         provenance: extracted
         locations:
           - file: services/feature_branch_manager.py
+            symbol: FeatureBranch
+    crossLayerRelationships:
+      persistedIn:
+        - data-store.datastore.yaml-configuration-store
 health-check:
   id: data_model.schema.health-check
   name: Health Check Response Schema
@@ -118,11 +139,10 @@ health-check:
         locations:
           - file: monitoring/observability.py
 task:
-  id: data_model.schema.task
+  id: data-model.object-schema.task
   name: Task Queue Entry
   type: object-schema
-  documentation: Represents an asynchronous task in the Redis-backed priority
-    queue system with support for three priority levels (HIGH, MEDIUM, LOW)
+  documentation: Task entry in the orchestrator queue with agent, project, and context
   properties:
     source:
       reference:
@@ -130,6 +150,10 @@ task:
         locations:
           - file: task_queue/task_manager.py
             symbol: Task
+    crossLayerRelationships:
+      persistedIn:
+        - data-store.datastore.redis-task-queues
+        - data-store.datastore.redis-task-metadata
 task-priority:
   id: data_model.schema.task-priority
   name: Task Priority Enum
@@ -157,6 +181,10 @@ pipeline-state:
         locations:
           - file: pipeline/base.py
             symbol: PipelineState
+    crossLayerRelationships:
+      persistedIn:
+        - data-store.datastore.redis-pipeline-mappings
+        - data-store.datastore.elasticsearch-pipeline-runs-index
 repair-test-config:
   id: data_model.schema.repair-test-config
   name: Repair Test Run Configuration
@@ -171,11 +199,11 @@ repair-test-config:
           - file: pipeline/repair_cycle.py
             symbol: RepairTestRunConfig
 repair-test-result:
-  id: data_model.schema.repair-test-result
-  name: Repair Test Execution Results
+  id: data-model.object-schema.repair-test-result
+  name: Repair Test Result
   type: object-schema
-  documentation: Structured test execution results including pass/fail counts,
-    failures list, warnings list, and raw test output for debugging
+  documentation: Structured test execution results with pass/fail counts,
+    failures, and warnings
   properties:
     source:
       reference:
@@ -183,6 +211,9 @@ repair-test-result:
         locations:
           - file: pipeline/repair_cycle.py
             symbol: RepairTestResult
+    crossLayerRelationships:
+      persistedIn:
+        - data-store.datastore.elasticsearch-agent-events-index
 conversational-session-state:
   id: data_model.schema.conversational-session-state
   name: Conversational Session State
@@ -197,6 +228,9 @@ conversational-session-state:
         locations:
           - file: services/conversational_session_state.py
             symbol: ConversationalSessionState
+    crossLayerRelationships:
+      persistedIn:
+        - data-store.datastore.redis
 dev-container-verification-state:
   id: data_model.schema.dev-container-verification-state
   name: Dev Container Verification State
@@ -211,6 +245,9 @@ dev-container-verification-state:
         locations:
           - file: services/dev_container_state.py
             symbol: DevContainerVerificationState
+    crossLayerRelationships:
+      persistedIn:
+        - data-store.datastore.yaml-configuration-store
 circuit-breaker-state:
   id: data_model.schema.circuit-breaker-state
   name: Circuit Breaker State
@@ -225,6 +262,9 @@ circuit-breaker-state:
         locations:
           - file: services/circuit_breaker.py
             symbol: CircuitBreakerState
+    crossLayerRelationships:
+      persistedIn:
+        - data-store.datastore.redis-circuit-breaker-state
 git-branch-metadata:
   id: data_model.schema.git-branch-metadata
   name: Git Branch Metadata
@@ -239,6 +279,9 @@ git-branch-metadata:
         locations:
           - file: services/feature_branch_manager.py
             symbol: BranchMetadata
+    crossLayerRelationships:
+      persistedIn:
+        - data-store.datastore.yaml-configuration-store
 github-rate-limit-status:
   id: data_model.schema.github-rate-limit-status
   name: GitHub Rate Limit Status
@@ -252,6 +295,9 @@ github-rate-limit-status:
         locations:
           - file: services/github_api_client.py
             symbol: GitHubRateLimitStatus
+    crossLayerRelationships:
+      persistedIn:
+        - data-store.datastore.redis
 human-feedback-state:
   id: data_model.schema.human-feedback-state
   name: Human Feedback Loop State
@@ -266,12 +312,10 @@ human-feedback-state:
           - file: services/human_feedback_loop.py
             symbol: HumanFeedbackState
 metrics-summary:
-  id: data_model.schema.metrics-summary
+  id: data-model.object-schema.metrics-summary
   name: Metrics Summary Dataclass
   type: object-schema
-  documentation: Aggregated metrics for a time period with total events, events by
-    type, events by category, success rate, error count, and average events per
-    minute
+  documentation: Aggregated metrics for a time period including event counts and success rates
   properties:
     source:
       reference:
@@ -279,13 +323,16 @@ metrics-summary:
         locations:
           - file: monitoring/decision_analytics.py
             symbol: MetricsSummary
+    crossLayerRelationships:
+      persistedIn:
+        - data-store.datastore.elasticsearch-task-metrics-index
+        - data-store.datastore.json-metrics-backup
 review-cycle-metrics:
-  id: data_model.schema.review-cycle-metrics
+  id: data-model.object-schema.review-cycle-metrics
   name: Review Cycle Metrics Dataclass
   type: object-schema
-  documentation: Metrics for maker-checker review cycles with total cycles,
-    average iterations, escalation rate, success rate, and average duration in
-    minutes
+  documentation: Metrics for review cycle performance including iterations and
+    escalation rates
   properties:
     source:
       reference:
@@ -294,12 +341,10 @@ review-cycle-metrics:
           - file: monitoring/decision_analytics.py
             symbol: ReviewCycleMetrics
 routing-metrics:
-  id: data_model.schema.routing-metrics
-  name: Agent Routing Decision Metrics
+  id: data-model.object-schema.routing-metrics
+  name: Routing Metrics Dataclass
   type: object-schema
-  documentation: Metrics for agent selection routing decisions with total
-    decisions, agents selected counts, null selections, and average alternatives
-    considered
+  documentation: Metrics for agent routing decisions and selections
   properties:
     source:
       reference:
@@ -308,12 +353,10 @@ routing-metrics:
           - file: monitoring/decision_analytics.py
             symbol: RoutingMetrics
 error-metrics:
-  id: data_model.schema.error-metrics
-  name: Error Handling Metrics Dataclass
+  id: data-model.object-schema.error-metrics
+  name: Error Metrics Dataclass
   type: object-schema
-  documentation: Metrics for error handling and recovery with total errors, errors
-    by type, recovery rate, circuit breaker trips, and average retries to
-    success
+  documentation: Metrics for error handling including recovery rate and circuit breaker trips
   properties:
     source:
       reference:
@@ -350,11 +393,11 @@ event-type-enum:
           - file: monitoring/observability.py
             symbol: EventType
 pattern-detection:
-  id: data_model.schema.pattern-detection
-  name: Analytics Pattern Detection
+  id: data-model.object-schema.pattern-detection
+  name: Pattern Detection Result
   type: object-schema
-  documentation: Detected patterns from decision analytics with pattern type,
-    frequency, affected entities, severity, and actionable recommendations
+  documentation: Detected pattern in observability events with severity and
+    occurrence tracking
   properties:
     source:
       reference:
@@ -362,3 +405,538 @@ pattern-detection:
         locations:
           - file: monitoring/decision_analytics.py
             symbol: Pattern
+error-fingerprint:
+  id: data-model.object-schema.error-fingerprint
+  name: Error Fingerprint Schema
+  type: object-schema
+  documentation: Docker container failure fingerprint with container pattern,
+    error type, error pattern, stack signature, and normalized message for
+    deduplication and pattern matching
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/medic/docker/fingerprint_engine.py
+            symbol: ErrorFingerprint
+claude-failure-fingerprint:
+  id: data-model.object-schema.claude-failure-fingerprint
+  name: Claude Failure Fingerprint Schema
+  type: object-schema
+  documentation: Project-scoped Claude Code tool execution failure fingerprint
+    with tool name, error type, error pattern, context signature, and cluster
+    metadata for project-specific failure tracking
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/medic/claude/claude_fingerprint_engine.py
+            symbol: ClaudeFailureFingerprint
+failure-cluster:
+  id: data-model.object-schema.failure-cluster
+  name: Failure Cluster Schema
+  type: object-schema
+  documentation: Grouped set of similar Claude Code failures with cluster ID,
+    project, failure list, primary failure reference, and cluster metadata for
+    batched investigation
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/medic/claude/claude_clustering_engine.py
+            symbol: FailureCluster
+failure-signature:
+  id: data-model.object-schema.failure-signature
+  name: Failure Signature Document Schema
+  type: object-schema
+  documentation: Elasticsearch document storing deduplicated failure signature
+    with fingerprint ID, occurrence counts, severity, status, investigation
+    metadata, sample entries, and related signatures for failure tracking and
+    investigation
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/medic/docker/docker_signature_store.py
+            symbol: DOCKER_FAILURE_MAPPING
+investigation-metadata:
+  id: data-model.object-schema.investigation-metadata
+  name: Investigation Metadata Schema
+  type: object-schema
+  documentation: Investigation state tracking with container name, timestamps
+    (started, last heartbeat, completed), investigation result, retry count, and
+    error message for investigation lifecycle management
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/medic/docker/docker_signature_store.py
+            symbol: investigation_metadata
+sample-entry:
+  id: data-model.object-schema.sample-entry
+  name: Sample Entry Schema
+  type: object-schema
+  documentation: Individual failure occurrence sample with timestamp,
+    container/session ID, container/session name, raw message, and context
+    metadata for failure evidence storage
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/medic/shared/sample_manager.py
+            symbol: create_sample_entry
+investigation-context:
+  id: data-model.object-schema.investigation-context
+  name: Investigation Context Schema
+  type: object-schema
+  documentation: Investigation input context with fingerprint ID, failure
+    signature data, sample failures (logs or clusters), project name,
+    investigation type, and creation timestamp for Claude Code investigation
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/medic/claude/claude_report_manager.py
+            symbol: context
+investigation-report:
+  id: data-model.object-schema.investigation-report
+  name: Investigation Report Schema
+  type: object-schema
+  documentation: Investigation output bundle containing context.json (input),
+    diagnosis.md (root cause), fix_plan.md (recommendations), ignored.md (skip
+    reason), and investigation_log.txt (execution log) for failure resolution
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/medic/base/base_report_manager.py
+            symbol: BaseReportManager
+pipeline-stage-config:
+  id: data-model.object-schema.pipeline-stage-config
+  name: Pipeline Stage Configuration
+  type: object-schema
+  documentation: Configuration dataclass for pipeline stage definitions including
+    agent selection, timeouts, and review requirements
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: config/manager.py
+            symbol: PipelineStage
+pipeline-template-config:
+  id: data-model.object-schema.pipeline-template-config
+  name: Pipeline Template Configuration
+  type: object-schema
+  documentation: Configuration dataclass for complete pipeline templates with
+    stages and workflow mappings
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: config/manager.py
+            symbol: PipelineTemplate
+workflow-column-config:
+  id: data-model.object-schema.workflow-column-config
+  name: Workflow Column Configuration
+  type: object-schema
+  documentation: Configuration dataclass for Kanban board column definitions with
+    automation rules
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: config/manager.py
+            symbol: WorkflowColumn
+workflow-template-config:
+  id: data-model.object-schema.workflow-template-config
+  name: Workflow Template Configuration
+  type: object-schema
+  documentation: Configuration dataclass for complete workflow templates with
+    columns and pipeline mappings
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: config/manager.py
+            symbol: WorkflowTemplate
+project-pipeline-config:
+  id: data-model.object-schema.project-pipeline-config
+  name: Project Pipeline Configuration
+  type: object-schema
+  documentation: Configuration dataclass for project-specific pipeline instances
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: config/manager.py
+            symbol: ProjectPipeline
+repair-test-type:
+  id: data-model.object-schema.repair-test-type
+  name: Repair Test Type Enum
+  type: object-schema
+  documentation: Enumeration of supported test types (unit, integration, e2e) for
+    repair cycles
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: pipeline/repair_cycle.py
+            symbol: RepairTestType
+repair-test-run-config:
+  id: data-model.object-schema.repair-test-run-config
+  name: Repair Test Run Configuration
+  type: object-schema
+  documentation: Configuration for a single test type run cycle including timeout
+    and iteration limits
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: pipeline/repair_cycle.py
+            symbol: RepairTestRunConfig
+repair-test-failure:
+  id: data-model.object-schema.repair-test-failure
+  name: Repair Test Failure
+  type: object-schema
+  documentation: Individual test failure with file, test name, and failure message
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: pipeline/repair_cycle.py
+            symbol: RepairTestFailure
+repair-test-warning:
+  id: data-model.object-schema.repair-test-warning
+  name: Repair Test Warning
+  type: object-schema
+  documentation: Individual test warning with source file and warning message
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: pipeline/repair_cycle.py
+            symbol: RepairTestWarning
+cycle-result:
+  id: data-model.object-schema.cycle-result
+  name: Cycle Result
+  type: object-schema
+  documentation: Result of a complete test-fix cycle for one test type with iteration metrics
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: pipeline/repair_cycle.py
+            symbol: CycleResult
+circuit-state-enum:
+  id: data-model.object-schema.circuit-state-enum
+  name: Circuit State Enumeration
+  type: object-schema
+  documentation: Circuit breaker state enumeration (CLOSED, OPEN, HALF_OPEN)
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/circuit_breaker.py
+            symbol: CircuitState
+circuit-breaker-config:
+  id: data-model.object-schema.circuit-breaker-config
+  name: Circuit Breaker Configuration
+  type: object-schema
+  documentation: Configuration for circuit breaker including thresholds and recovery timeout
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/circuit_breaker.py
+            symbol: CircuitBreakerConfig
+branch-info:
+  id: data-model.object-schema.branch-info
+  name: Branch Information
+  type: object-schema
+  documentation: Information about a feature branch including PR status and commit tracking
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/git_workflow_manager.py
+            symbol: BranchInfo
+sub-issue-state:
+  id: data-model.object-schema.sub-issue-state
+  name: Sub-Issue State
+  type: object-schema
+  documentation: Tracks a sub-issue's progress in a feature branch workflow
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/feature_branch_manager.py
+            symbol: SubIssueState
+    crossLayerRelationships:
+      persistedIn:
+        - data-store.datastore.redis
+        - data-store.datastore.yaml-configuration-store
+task-priority-enum:
+  id: data-model.object-schema.task-priority-enum
+  name: Task Priority Enumeration
+  type: object-schema
+  documentation: Priority levels for task queue (HIGH, MEDIUM, LOW)
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: task_queue/task_manager.py
+            symbol: TaskPriority
+execution-record:
+  id: data-model.object-schema.execution-record
+  name: Execution Record
+  type: object-schema
+  documentation: Record of a single work execution attempt tracking column, agent,
+    outcome, and trigger source
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/work_execution_state.py
+            symbol: ExecutionRecord
+    crossLayerRelationships:
+      persistedIn:
+        - data-store.datastore.elasticsearch-agent-events-index
+status-change:
+  id: data-model.object-schema.status-change
+  name: Status Change Record
+  type: object-schema
+  documentation: Record of a workflow status change tracking from/to status and trigger type
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/work_execution_state.py
+            symbol: StatusChange
+pipeline-lock:
+  id: data-model.object-schema.pipeline-lock
+  name: Pipeline Lock
+  type: object-schema
+  documentation: Exclusive lock for pipeline execution preventing concurrent work
+    on multiple issues within same pipeline
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/pipeline_lock_manager.py
+            symbol: PipelineLock
+    crossLayerRelationships:
+      persistedIn:
+        - data-store.datastore.redis-pipeline-mappings
+review-status-enum:
+  id: data-model.object-schema.review-status-enum
+  name: Review Status Enumeration
+  type: object-schema
+  documentation: "Review status values: approved, changes_requested, blocked,
+    pending, unknown"
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/review_parser.py
+            symbol: ReviewStatus
+review-finding:
+  id: data-model.object-schema.review-finding
+  name: Review Finding
+  type: object-schema
+  documentation: Represents a single review finding with category, severity,
+    message and optional suggestion
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/review_parser.py
+            symbol: ReviewFinding
+review-result:
+  id: data-model.object-schema.review-result
+  name: Review Result
+  type: object-schema
+  documentation: Parsed review result containing status, findings list, score,
+    summary and severity counts
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/review_parser.py
+            symbol: ReviewResult
+review-outcome:
+  id: data-model.object-schema.review-outcome
+  name: Review Outcome
+  type: object-schema
+  documentation: Represents the outcome of a single review finding tracking
+    whether it was accepted, modified, ignored or unclear
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/review_outcome_correlator.py
+            symbol: ReviewOutcome
+sub-issue-state-2:
+  id: data-model.object-schema.sub-issue-state-2
+  name: Sub-Issue State Tracking
+  type: object-schema
+  documentation: Tracks a sub-issue's progress in a feature branch with status and timestamps
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/feature_branch_manager.py
+            symbol: SubIssueState
+feature-branch-2:
+  id: data-model.object-schema.feature-branch-2
+  name: Feature Branch Metadata
+  type: object-schema
+  documentation: Represents a feature branch for a parent issue with sub-issues,
+    PR status and tracking information
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/feature_branch_manager.py
+            symbol: FeatureBranch
+pipeline-run-2:
+  id: data-model.object-schema.pipeline-run-2
+  name: Pipeline Run Tracking
+  type: object-schema
+  documentation: Represents a single run of an issue through the workflow pipeline
+    with lifecycle tracking
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/pipeline_run.py
+            symbol: PipelineRun
+circuit-state-enum-2:
+  id: data-model.object-schema.circuit-state-enum-2
+  name: Circuit State Enum
+  type: object-schema
+  documentation: "Circuit breaker states: closed (normal), open (failing),
+    half_open (testing recovery)"
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/circuit_breaker.py
+            symbol: CircuitState
+circuit-breaker-config-2:
+  id: data-model.object-schema.circuit-breaker-config-2
+  name: Circuit Breaker Configuration
+  type: object-schema
+  documentation: Configuration for circuit breaker including thresholds and timeouts
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/circuit_breaker.py
+            symbol: CircuitBreakerConfig
+metrics-summary-2:
+  id: data-model.object-schema.metrics-summary-2
+  name: Metrics Summary
+  type: object-schema
+  documentation: Summary of metrics for a time period including event counts and success rates
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: monitoring/decision_analytics.py
+            symbol: MetricsSummary
+review-cycle-metrics-2:
+  id: data-model.object-schema.review-cycle-metrics-2
+  name: Review Cycle Metrics
+  type: object-schema
+  documentation: Metrics for review cycles including iterations, escalation rate and duration
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: monitoring/decision_analytics.py
+            symbol: ReviewCycleMetrics
+routing-metrics-2:
+  id: data-model.object-schema.routing-metrics-2
+  name: Routing Metrics
+  type: object-schema
+  documentation: Metrics for agent routing decisions including selection counts
+    and alternatives considered
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: monitoring/decision_analytics.py
+            symbol: RoutingMetrics
+error-metrics-2:
+  id: data-model.object-schema.error-metrics-2
+  name: Error Metrics
+  type: object-schema
+  documentation: Metrics for error handling including recovery rates and circuit breaker trips
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: monitoring/decision_analytics.py
+            symbol: ErrorMetrics
+task-priority-enum-2:
+  id: data-model.object-schema.task-priority-enum-2
+  name: Task Priority Enum
+  type: object-schema
+  documentation: "Task priority levels: HIGH (1), MEDIUM (2), LOW (3)"
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: task_queue/task_manager.py
+            symbol: TaskPriority
+task-2:
+  id: data-model.object-schema.task-2
+  name: Task Queue Entry
+  type: object-schema
+  documentation: Task queue entry with agent, project, priority, context and status
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: task_queue/task_manager.py
+            symbol: Task

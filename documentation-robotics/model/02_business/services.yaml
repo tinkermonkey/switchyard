@@ -11,10 +11,20 @@ planning-design-pipeline:
         locations:
           - file: config/foundations/pipelines.yaml
             symbol: planning_design
+    motivation:
+      supports-goals:
+        - motivation.goal.improve-code-quality
+        - motivation.goal.automate-sdlc
+      governed-by-principles:
+        - motivation.principle.conversational-refinement
+        - motivation.principle.sequential-pipeline
     application:
       realized-by:
         - application.service.pipeline-run-manager
         - application.service.conversational-session-state-manager
+    supportsGoals:
+      - motivation.goal.accelerate-development
+      - motivation.goal.improve-software-quality
 sdlc-execution-pipeline:
   id: business.service.sdlc-execution-pipeline
   name: SDLC Execution Pipeline Service
@@ -28,6 +38,18 @@ sdlc-execution-pipeline:
         locations:
           - file: config/foundations/pipelines.yaml
             symbol: sdlc_execution
+    motivation:
+      supports-goals:
+        - motivation.goal.automate-sdlc
+        - motivation.goal.improve-code-quality
+        - motivation.goal.accelerate-delivery
+      governed-by-principles:
+        - motivation.principle.maker-checker-pattern
+        - motivation.principle.sequential-pipeline
+        - motivation.principle.stateful-checkpoint-recovery
+      satisfies-requirements:
+        - motivation.requirement.quality-gates
+        - motivation.requirement.fault-tolerance-recovery
     application:
       realized-by:
         - application.service.pipeline-run-manager
@@ -63,6 +85,14 @@ project-lifecycle-management:
         provenance: extracted
         locations:
           - file: services/project_manager.py
+    motivation:
+      supports-goals:
+        - motivation.goal.automate-sdlc
+        - motivation.goal.enable-scalability
+      governed-by-principles:
+        - motivation.principle.github-as-source-of-truth
+      satisfies-requirements:
+        - motivation.requirement.github-projects-integration
     application:
       realized-by:
         - application.service.github-project-manager

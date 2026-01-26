@@ -1,0 +1,26 @@
+test-fixtures:
+  id: testing.test-infrastructure.test-fixtures
+  name: Test Fixtures and Mocks
+  type: test-infrastructure
+  documentation: Test infrastructure including GitHub mocks, agent mocks, parser
+    mocks, and test utilities
+  properties:
+    provides: fixtures,mocks,utilities
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: tests/conftest.py
+performance-tests:
+  id: testing.test-infrastructure.performance-tests
+  name: Performance Test Suite
+  type: test-infrastructure
+  documentation: Performance and load testing infrastructure for measuring system
+    throughput and latency
+  properties:
+    test_type: performance
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: tests/integration/test_performance.py

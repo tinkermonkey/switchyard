@@ -1,5 +1,5 @@
 redis:
-  id: datastore.datastore.redis
+  id: data-store.datastore.redis
   name: Redis In-Memory Store
   type: datastore
   documentation: In-memory key-value store for task queue, pipeline locks, active
@@ -11,7 +11,7 @@ redis:
         - data_model.schema.pipeline-checkpoint
         - data_model.schema.pipeline-run
 elasticsearch:
-  id: datastore.datastore.elasticsearch
+  id: data-store.datastore.elasticsearch
   name: Elasticsearch Search Engine
   type: datastore
   documentation: Search and analytics engine for metrics, logs, events, pattern
@@ -22,7 +22,7 @@ elasticsearch:
         - data_model.schema.task-metrics
         - data_model.schema.pipeline-run
 yaml-config-store:
-  id: datastore.datastore.yaml-config-store
+  id: data-store.datastore.yaml-config-store
   name: YAML Configuration Store
   type: datastore
   documentation: File-based configuration store for foundation configs, project
@@ -34,8 +34,134 @@ yaml-config-store:
         - data_model.schema.agent-config
         - data_model.schema.github-state
 json-metrics-backup:
-  id: datastore.datastore.json-metrics-backup
+  id: data-store.datastore.json-metrics-backup
   name: JSON Metrics Backup
   type: datastore
   documentation: JSONL file-based backup storage for metrics fallback when
     Elasticsearch is unavailable
+redis-orchestrator-event-stream:
+  id: data-store.datastore.redis-orchestrator-event-stream
+  name: Redis Orchestrator Event Stream
+  type: datastore
+  documentation: Redis stream for real-time observability events, pipeline
+    execution tracking, and agent lifecycle monitoring
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/observability.py
+redis-task-queues:
+  id: data-store.datastore.redis-task-queues
+  name: Redis Task Queues
+  type: datastore
+  documentation: Priority-based task queues using Redis lists for high, medium,
+    and low priority task scheduling
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: task_queue/task_manager.py
+redis-task-metadata:
+  id: data-store.datastore.redis-task-metadata
+  name: Redis Task Metadata
+  type: datastore
+  documentation: Individual task state and metadata storage using Redis hashes for
+    task lifecycle management
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: task_queue/task_manager.py
+redis-pipeline-mappings:
+  id: data-store.datastore.redis-pipeline-mappings
+  name: Redis Pipeline Mappings
+  type: datastore
+  documentation: Issue number to pipeline run ID mapping using Redis hash for
+    tracking pipeline execution
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/pipeline_run.py
+redis-circuit-breaker-state:
+  id: data-store.datastore.redis-circuit-breaker-state
+  name: Redis Circuit Breaker State
+  type: datastore
+  documentation: Circuit breaker state persistence using Redis hashes for fault
+    tolerance management
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/circuit_breaker.py
+elasticsearch-pipeline-runs-index:
+  id: data-store.datastore.elasticsearch-pipeline-runs-index
+  name: Elasticsearch Pipeline Runs Index
+  type: datastore
+  documentation: Time-series index for pipeline execution tracking with daily rotation pattern
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/pipeline_run.py
+elasticsearch-decision-events-index:
+  id: data-store.datastore.elasticsearch-decision-events-index
+  name: Elasticsearch Decision Events Index
+  type: datastore
+  documentation: Decision event logs for analytics with daily rotation pattern
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: monitoring/decision_analytics.py
+elasticsearch-agent-events-index:
+  id: data-store.datastore.elasticsearch-agent-events-index
+  name: Elasticsearch Agent Events Index
+  type: datastore
+  documentation: Agent lifecycle event tracking with daily rotation pattern
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/observability.py
+elasticsearch-claude-streams-index:
+  id: data-store.datastore.elasticsearch-claude-streams-index
+  name: Elasticsearch Claude Streams Index
+  type: datastore
+  documentation: Claude API stream logs for debugging with daily rotation pattern
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: claude/claude_integration.py
+elasticsearch-task-metrics-index:
+  id: data-store.datastore.elasticsearch-task-metrics-index
+  name: Elasticsearch Task Metrics Index
+  type: datastore
+  documentation: Task execution metrics time-series with daily rotation pattern
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: monitoring/metrics.py
+elasticsearch-quality-metrics-index:
+  id: data-store.datastore.elasticsearch-quality-metrics-index
+  name: Elasticsearch Quality Metrics Index
+  type: datastore
+  documentation: Quality scores and assessment metrics with daily rotation pattern
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: monitoring/metrics.py

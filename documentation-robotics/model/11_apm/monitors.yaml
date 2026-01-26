@@ -12,3 +12,12 @@ observability-manager:
         locations:
           - file: monitoring/observability.py
             symbol: ObservabilityManager
+    crossLayerRelationships:
+      monitors:
+        - application.service.worker-pool-manager
+        - application.service.pipeline-run-manager
+      uses:
+        - datastore.datastore.redis
+        - datastore.datastore.elasticsearch
+      aligned-with:
+        - application.service.observability-manager

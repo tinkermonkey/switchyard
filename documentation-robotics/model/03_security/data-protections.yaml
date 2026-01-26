@@ -23,3 +23,17 @@ webhook-signature-verification:
         locations:
           - file: .env.example
             symbol: GITHUB_WEBHOOK_SECRET
+secret-management:
+  id: security.data-protection.secret-management
+  name: Environment Secret Management
+  type: data-protection
+  documentation: Centralized secret management using Pydantic SecretStr for API
+    keys, tokens, and credentials
+  properties:
+    secrets_managed: api_keys,tokens,credentials,private_keys
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: config/environment.py
+            symbol: Environment

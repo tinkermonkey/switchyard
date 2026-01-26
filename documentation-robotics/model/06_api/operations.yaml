@@ -10,7 +10,10 @@ health-check:
         provenance: extracted
         locations:
           - file: monitoring/observability.py
+            symbol: health_check
     crossLayerRelationships:
+      exposed-by:
+        - application.service.observability-manager
       returns:
         - data_model.schema.health-check
 list-active-agents:
@@ -24,6 +27,10 @@ list-active-agents:
         provenance: extracted
         locations:
           - file: monitoring/observability.py
+            symbol: list_active_agents
+    crossLayerRelationships:
+      exposed-by:
+        - application.service.observability-manager
 kill-agent:
   id: api.operation.kill-agent
   name: Kill Agent Container
@@ -35,6 +42,10 @@ kill-agent:
         provenance: extracted
         locations:
           - file: monitoring/observability.py
+            symbol: kill_agent
+    crossLayerRelationships:
+      realizedBy:
+        - application.service.observability-server
 get-execution-history:
   id: api.operation.get-execution-history
   name: Get Execution History
@@ -46,6 +57,10 @@ get-execution-history:
         provenance: extracted
         locations:
           - file: monitoring/observability.py
+            symbol: get_execution_history
+    crossLayerRelationships:
+      exposed-by:
+        - application.service.observability-manager
 get-claude-logs:
   id: api.operation.get-claude-logs
   name: Get Claude Logs
@@ -57,6 +72,10 @@ get-claude-logs:
         provenance: extracted
         locations:
           - file: monitoring/observability.py
+            symbol: get_claude_logs
+    crossLayerRelationships:
+      exposed-by:
+        - application.service.observability-manager
 get-current-pipeline:
   id: api.operation.get-current-pipeline
   name: Get Current Pipeline State
@@ -68,6 +87,12 @@ get-current-pipeline:
         provenance: extracted
         locations:
           - file: monitoring/observability.py
+            symbol: get_current_pipeline
+    crossLayerRelationships:
+      produces:
+        - data_model.schema.pipeline-state
+      realizedBy:
+        - application.service.observability-server
 get-pipeline-events:
   id: api.operation.get-pipeline-events
   name: Get Pipeline Run Events
@@ -122,8 +147,10 @@ create-review-filter:
         locations:
           - file: monitoring/observability.py
     crossLayerRelationships:
-      accepts:
+      consumes:
         - data_model.schema.review-filter
+      realizedBy:
+        - application.service.observability-server
 update-review-filter:
   id: api.operation.update-review-filter
   name: Update Review Filter
@@ -136,8 +163,10 @@ update-review-filter:
         locations:
           - file: monitoring/observability.py
     crossLayerRelationships:
-      accepts:
+      consumes:
         - data_model.schema.review-filter
+      realizedBy:
+        - application.service.observability-server
 delete-review-filter:
   id: api.operation.delete-review-filter
   name: Delete Review Filter
@@ -149,6 +178,9 @@ delete-review-filter:
         provenance: extracted
         locations:
           - file: monitoring/observability.py
+    crossLayerRelationships:
+      realizedBy:
+        - application.service.observability-server
 get-circuit-breakers:
   id: api.operation.get-circuit-breakers
   name: Get Circuit Breakers State
@@ -160,6 +192,12 @@ get-circuit-breakers:
         provenance: extracted
         locations:
           - file: monitoring/observability.py
+            symbol: get_circuit_breakers
+    crossLayerRelationships:
+      produces:
+        - data_model.schema.circuit-breaker-state
+      realizedBy:
+        - application.service.observability-server
 list-projects:
   id: api.operation.list-projects
   name: List Projects
@@ -171,3 +209,680 @@ list-projects:
         provenance: extracted
         locations:
           - file: monitoring/observability.py
+            symbol: list_projects
+    crossLayerRelationships:
+      exposed-by:
+        - application.service.github-project-manager
+get-failure-signatures:
+  id: api.operation.get-failure-signatures
+  name: Get Failure Signatures
+  type: operation
+  documentation: GET /api/medic/failure-signatures - Retrieve list of Docker
+    failure signatures with filtering by status, severity, and date range for
+    failure overview dashboard
+  properties:
+    method: GET
+    path: /api/medic/failure-signatures
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/observability_server.py
+            symbol: get_failure_signatures
+get-failure-signature-details:
+  id: api.operation.get-failure-signature-details
+  name: Get Failure Signature Details
+  type: operation
+  documentation: GET /api/medic/failure-signatures/{fingerprint_id} - Retrieve
+    detailed information for specific failure signature including occurrence
+    history, sample logs, and investigation status
+  properties:
+    method: GET
+    path: /api/medic/failure-signatures/{fingerprint_id}
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/observability_server.py
+            symbol: get_failure_signature_details
+update-failure-signature-status:
+  id: api.operation.update-failure-signature-status
+  name: Update Failure Signature Status
+  type: operation
+  documentation: PUT /api/medic/failure-signatures/{fingerprint_id}/status -
+    Update failure signature status (new, acknowledged, resolved, ignored) for
+    manual triage workflow
+  properties:
+    method: PUT
+    path: /api/medic/failure-signatures/{fingerprint_id}/status
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/observability_server.py
+            symbol: update_failure_signature_status
+get-medic-stats:
+  id: api.operation.get-medic-stats
+  name: Get Medic Statistics
+  type: operation
+  documentation: GET /api/medic/stats - Retrieve aggregate Medic statistics
+    including total failures, active investigations, resolution rates, and
+    severity distribution for monitoring dashboard
+  properties:
+    method: GET
+    path: /api/medic/stats
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/observability_server.py
+            symbol: get_medic_stats
+get-investigations:
+  id: api.operation.get-investigations
+  name: Get Investigations
+  type: operation
+  documentation: GET /api/medic/investigations - Retrieve list of active and
+    completed investigations with status filtering for investigation tracking
+    dashboard
+  properties:
+    method: GET
+    path: /api/medic/investigations
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/observability_server.py
+            symbol: get_investigations
+start-investigation:
+  id: api.operation.start-investigation
+  name: Start Investigation
+  type: operation
+  documentation: POST /api/medic/investigations/{fingerprint_id} - Trigger
+    automated investigation for failure signature using Claude Code agent to
+    analyze root cause and generate fix recommendations
+  properties:
+    method: POST
+    path: /api/medic/investigations/{fingerprint_id}
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/observability_server.py
+            symbol: start_investigation
+get-investigation-diagnosis:
+  id: api.operation.get-investigation-diagnosis
+  name: Get Investigation Diagnosis
+  type: operation
+  documentation: GET /api/medic/investigations/{fingerprint_id}/diagnosis -
+    Retrieve diagnosis.md output from investigation containing root cause
+    analysis and technical explanation
+  properties:
+    method: GET
+    path: /api/medic/investigations/{fingerprint_id}/diagnosis
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/observability_server.py
+            symbol: get_investigation_diagnosis
+get-investigation-fix-plan:
+  id: api.operation.get-investigation-fix-plan
+  name: Get Investigation Fix Plan
+  type: operation
+  documentation: GET /api/medic/investigations/{fingerprint_id}/fix-plan -
+    Retrieve fix_plan.md output from investigation containing actionable
+    recommendations and code changes to resolve failure
+  properties:
+    method: GET
+    path: /api/medic/investigations/{fingerprint_id}/fix-plan
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/observability_server.py
+            symbol: get_investigation_fix_plan
+get-active-agents:
+  id: api.operation.get-active-agents
+  name: Get Active Agents
+  type: operation
+  documentation: Returns list of currently running agent containers with status and metrics
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/observability_server.py
+            symbol: active_agents
+    crossLayerRelationships:
+      produces:
+        - data-model.object-schema.execution-record
+      realizedBy:
+        - application.service.observability-server
+post-test-pubsub:
+  id: api.operation.post-test-pubsub
+  name: Test PubSub (POST /debug/test-pubsub)
+  type: operation
+  documentation: Test endpoint for PubSub messaging system
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/observability_server.py
+            symbol: test_pubsub
+post-kill-agent:
+  id: api.operation.post-kill-agent
+  name: Kill Agent Container (POST /agents/kill/<name>)
+  type: operation
+  documentation: Forcefully stops a running agent container by name
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/observability_server.py
+            symbol: kill_agent
+get-health:
+  id: api.operation.get-health
+  name: Health Check (GET /health)
+  type: operation
+  documentation: Returns system health status including Redis, GitHub, and Docker connectivity
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/observability_server.py
+            symbol: health
+    crossLayerRelationships:
+      produces:
+        - data_model.schema.health-check-response
+      realizedBy:
+        - application.service.observability-server
+get-history:
+  id: api.operation.get-history
+  name: Get Agent History (GET /history)
+  type: operation
+  documentation: Returns agent execution history with filtering options
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/observability_server.py
+            symbol: history
+    crossLayerRelationships:
+      produces:
+        - data-model.object-schema.execution-record
+      realizedBy:
+        - application.service.observability-server
+get-claude-logs-history:
+  id: api.operation.get-claude-logs-history
+  name: Get Claude Logs History (GET /claude-logs-history)
+  type: operation
+  documentation: Returns Claude CLI execution logs with filtering and pagination
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/observability_server.py
+            symbol: claude_logs_history
+    crossLayerRelationships:
+      produces:
+        - data-model.object-schema.execution-record
+      realizedBy:
+        - application.service.observability-server
+get-pipeline-run-events:
+  id: api.operation.get-pipeline-run-events
+  name: Get Pipeline Run Events (GET /pipeline-run-events)
+  type: operation
+  documentation: Returns events for a specific pipeline run with chronological ordering
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/observability_server.py
+            symbol: pipeline_run_events
+    crossLayerRelationships:
+      produces:
+        - data_model.schema.pipeline-run
+      realizedBy:
+        - application.service.observability-server
+post-kill-pipeline-run:
+  id: api.operation.post-kill-pipeline-run
+  name: Kill Pipeline Run (POST /pipeline-runs/<id>/kill)
+  type: operation
+  documentation: Forcefully terminates a running pipeline execution
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/observability_server.py
+            symbol: kill_pipeline_run
+get-active-pipeline-runs:
+  id: api.operation.get-active-pipeline-runs
+  name: Get Active Pipeline Runs (GET /active-pipeline-runs)
+  type: operation
+  documentation: Returns list of currently executing pipelines with progress
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/observability_server.py
+            symbol: active_pipeline_runs
+    crossLayerRelationships:
+      produces:
+        - data_model.schema.pipeline-run
+      realizedBy:
+        - application.service.observability-server
+get-active-agents-api:
+  id: api.operation.get-active-agents-api
+  name: Get Active Agents API (GET /api/active-agents)
+  type: operation
+  documentation: Returns active agents with extended details for UI
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/observability_server.py
+            symbol: get_active_agents
+get-completed-pipeline-runs:
+  id: api.operation.get-completed-pipeline-runs
+  name: Get Completed Pipeline Runs (GET /completed-pipeline-runs)
+  type: operation
+  documentation: Returns list of completed pipeline runs with outcomes
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/observability_server.py
+            symbol: completed_pipeline_runs
+get-agent-execution:
+  id: api.operation.get-agent-execution
+  name: Get Agent Execution (GET /api/agent-execution/<id>)
+  type: operation
+  documentation: Returns detailed execution information for specific agent run
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/observability_server.py
+            symbol: get_agent_execution
+get-review-filters:
+  id: api.operation.get-review-filters
+  name: Get Review Filters (GET /api/review-filters)
+  type: operation
+  documentation: Returns list of configured review filters
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/observability_server.py
+            symbol: get_review_filters
+    crossLayerRelationships:
+      produces:
+        - data_model.schema.review-filter
+      realizedBy:
+        - application.service.observability-server
+post-create-review-filter:
+  id: api.operation.post-create-review-filter
+  name: Create Review Filter (POST /api/review-filters)
+  type: operation
+  documentation: Creates a new review filter configuration
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/observability_server.py
+            symbol: create_review_filter
+put-update-review-filter:
+  id: api.operation.put-update-review-filter
+  name: Update Review Filter (PUT /api/review-filters/<id>)
+  type: operation
+  documentation: Updates an existing review filter configuration
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/observability_server.py
+            symbol: update_review_filter
+post-toggle-review-filter:
+  id: api.operation.post-toggle-review-filter
+  name: Toggle Review Filter (POST /api/review-filters/<id>/toggle)
+  type: operation
+  documentation: Enables or disables a review filter
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/observability_server.py
+            symbol: toggle_review_filter
+get-review-filter-agents:
+  id: api.operation.get-review-filter-agents
+  name: Get Review Filter Agents (GET /api/review-filters/agents)
+  type: operation
+  documentation: Returns list of agents available for review filtering
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/observability_server.py
+            symbol: get_review_filter_agents
+get-review-outcomes:
+  id: api.operation.get-review-outcomes
+  name: Get Review Outcomes (GET /api/review-outcomes)
+  type: operation
+  documentation: Returns review outcomes with filtering and pagination
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/observability_server.py
+            symbol: get_review_outcomes
+post-reset-claude-circuit:
+  id: api.operation.post-reset-claude-circuit
+  name: Reset Claude Circuit Breaker (POST /api/circuit-breakers/claude-code/reset)
+  type: operation
+  documentation: Manually resets the Claude Code circuit breaker
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/observability_server.py
+            symbol: reset_claude_circuit_breaker
+post-reset-agent-circuit:
+  id: api.operation.post-reset-agent-circuit
+  name: Reset Agent Circuit Breaker (POST /api/circuit-breakers/agent/<name>/reset)
+  type: operation
+  documentation: Manually resets a specific agent's circuit breaker
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/observability_server.py
+            symbol: reset_agent_circuit_breaker
+post-reset-github-circuit:
+  id: api.operation.post-reset-github-circuit
+  name: Reset GitHub Circuit Breaker (POST /api/circuit-breakers/github-api/reset)
+  type: operation
+  documentation: Manually resets the GitHub API circuit breaker
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/observability_server.py
+            symbol: reset_github_circuit_breaker
+get-github-api-status:
+  id: api.operation.get-github-api-status
+  name: Get GitHub API Status (GET /api/github-api-status)
+  type: operation
+  documentation: Returns GitHub API rate limit and health status
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/observability_server.py
+            symbol: get_github_api_status
+get-projects:
+  id: api.operation.get-projects
+  name: Get Projects (GET /api/projects)
+  type: operation
+  documentation: Returns list of configured projects with status
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/observability_server.py
+            symbol: get_projects
+    crossLayerRelationships:
+      produces:
+        - data_model.schema.github-state
+      realizedBy:
+        - application.service.observability-server
+post-release-pipeline-lock:
+  id: api.operation.post-release-pipeline-lock
+  name: Release Pipeline Lock (POST
+    /api/projects/<project>/pipelines/<board>/release-lock)
+  type: operation
+  documentation: Manually releases a pipeline lock for a specific board
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/observability_server.py
+            symbol: release_pipeline_lock
+post-reconcile-state:
+  id: api.operation.post-reconcile-state
+  name: Reconcile State (POST /api/reconcile-state)
+  type: operation
+  documentation: Triggers reconciliation of GitHub project board state
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/observability_server.py
+            symbol: reconcile_state
+get-workflow-config:
+  id: api.operation.get-workflow-config
+  name: Get Workflow Config (GET /api/workflow-config/<project>/<board>)
+  type: operation
+  documentation: Returns workflow configuration for a specific project board
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/observability_server.py
+            symbol: get_workflow_config
+get-repair-cycle-containers:
+  id: api.operation.get-repair-cycle-containers
+  name: Get Repair Cycle Containers (GET /api/repair-cycle-containers)
+  type: operation
+  documentation: Returns list of active repair cycle containers
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/observability_server.py
+            symbol: get_repair_cycle_containers
+get-repair-checkpoint:
+  id: api.operation.get-repair-checkpoint
+  name: Get Repair Checkpoint (GET
+    /api/repair-cycle-containers/<project>/<issue>/checkpoint)
+  type: operation
+  documentation: Returns checkpoint state for a repair cycle
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/observability_server.py
+            symbol: get_repair_cycle_checkpoint
+get-repair-logs:
+  id: api.operation.get-repair-logs
+  name: Get Repair Logs (GET /api/repair-cycle-containers/<project>/<issue>/logs)
+  type: operation
+  documentation: Returns logs for a repair cycle container
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/observability_server.py
+            symbol: get_repair_cycle_logs
+post-kill-repair-cycle:
+  id: api.operation.post-kill-repair-cycle
+  name: Kill Repair Cycle (POST /api/repair-cycle-containers/<project>/<issue>/kill)
+  type: operation
+  documentation: Forcefully terminates a repair cycle container
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/observability_server.py
+            symbol: kill_repair_cycle_container
+get-pipeline-queue:
+  id: api.operation.get-pipeline-queue
+  name: Get Pipeline Queue (GET /api/pipeline-queue/<project>/<board>)
+  type: operation
+  documentation: Returns queued issues for a specific pipeline board
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/observability_server.py
+            symbol: get_pipeline_queue
+    crossLayerRelationships:
+      produces:
+        - data-model.object-schema.task
+      realizedBy:
+        - application.service.observability-server
+get-pipeline-locks:
+  id: api.operation.get-pipeline-locks
+  name: Get Pipeline Locks (GET /api/pipeline-locks)
+  type: operation
+  documentation: Returns all active pipeline locks across projects
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/observability_server.py
+            symbol: get_pipeline_locks
+    crossLayerRelationships:
+      produces:
+        - data-model.object-schema.pipeline-lock
+      realizedBy:
+        - application.service.observability-server
+post-refresh-pipeline-queue:
+  id: api.operation.post-refresh-pipeline-queue
+  name: Refresh Pipeline Queue (POST /api/pipeline-queue/<project>/<board>/refresh)
+  type: operation
+  documentation: Manually refreshes the pipeline queue for a board
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/observability_server.py
+            symbol: refresh_pipeline_queue
+get-blocked-issues:
+  id: api.operation.get-blocked-issues
+  name: Get Blocked Issues (GET /api/blocked-issues)
+  type: operation
+  documentation: Returns list of blocked issues across all projects
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/observability_server.py
+            symbol: get_blocked_issues
+get-medic-failure-signatures:
+  id: api.operation.get-medic-failure-signatures
+  name: Get Medic Failure Signatures (GET /api/medic/failure-signatures)
+  type: operation
+  documentation: Returns failure signatures detected by medic system
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/observability_server.py
+            symbol: get_failure_signatures
+get-medic-signature-detail:
+  id: api.operation.get-medic-signature-detail
+  name: Get Medic Signature Detail (GET /api/medic/failure-signatures/<id>)
+  type: operation
+  documentation: Returns detailed information for a specific failure signature
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/observability_server.py
+            symbol: get_failure_signature
+delete-medic-signature:
+  id: api.operation.delete-medic-signature
+  name: Delete Medic Signature (DELETE /api/medic/failure-signatures/<id>)
+  type: operation
+  documentation: Deletes a failure signature
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/observability_server.py
+            symbol: delete_failure_signature
+get-medic-signature-occurrences:
+  id: api.operation.get-medic-signature-occurrences
+  name: Get Signature Occurrences (GET
+    /api/medic/failure-signatures/<id>/occurrences)
+  type: operation
+  documentation: Returns occurrences of a specific failure signature
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/observability_server.py
+            symbol: get_failure_signature_occurrences
+put-medic-signature-status:
+  id: api.operation.put-medic-signature-status
+  name: Update Signature Status (PUT /api/medic/failure-signatures/<id>/status)
+  type: operation
+  documentation: Updates the status of a failure signature
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/observability_server.py
+            symbol: update_failure_signature_status
+get-medic-investigations:
+  id: api.operation.get-medic-investigations
+  name: Get Medic Investigations (GET /api/medic/investigations)
+  type: operation
+  documentation: Returns list of active medic investigations
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/observability_server.py
+            symbol: get_investigations
+post-create-investigation:
+  id: api.operation.post-create-investigation
+  name: Create Investigation (POST /api/medic/investigations/<id>)
+  type: operation
+  documentation: Creates a new medic investigation for a failure signature
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: services/observability_server.py
+            symbol: create_investigation

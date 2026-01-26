@@ -24,6 +24,13 @@ active-agents-list:
         locations:
           - file: web_ui/src/components/ActiveAgents.jsx
             symbol: ActiveAgents
+    crossLayerRelationships:
+      consumes:
+        - api.operation.list-active-agents
+        - api.operation.kill-agent
+    consumesAPIs:
+      - api.operation.list-active-agents
+      - api.operation.kill-agent
 projects-list:
   id: ux.component.projects-list
   name: Projects List View
@@ -37,6 +44,11 @@ projects-list:
         locations:
           - file: web_ui/src/components/Projects.jsx
             symbol: Projects
+    crossLayerRelationships:
+      consumes:
+        - api.operation.list-projects
+    consumesAPIs:
+      - api.operation.list-projects
 pipelines-status:
   id: ux.component.pipelines-status
   name: Pipeline Status Display
@@ -50,6 +62,13 @@ pipelines-status:
         locations:
           - file: web_ui/src/components/PipelinesStatus.jsx
             symbol: PipelinesStatus
+    crossLayerRelationships:
+      consumes:
+        - api.operation.get-current-pipeline
+        - api.operation.get-active-pipelines
+    consumesAPIs:
+      - api.operation.get-current-pipeline
+      - api.operation.get-active-pipeline-runs
 live-logs:
   id: ux.component.live-logs
   name: Live Claude Logs Viewer
@@ -63,6 +82,9 @@ live-logs:
         locations:
           - file: web_ui/src/components/LiveLogs.jsx
             symbol: LiveLogs
+    crossLayerRelationships:
+      consumes:
+        - api.operation.get-claude-logs
 event-timeline:
   id: ux.component.event-timeline
   name: Agent Event Timeline
@@ -76,6 +98,9 @@ event-timeline:
         locations:
           - file: web_ui/src/components/EventTimeline.jsx
             symbol: EventTimeline
+    crossLayerRelationships:
+      consumes:
+        - api.operation.get-execution-history
 pipeline-event-log:
   id: ux.component.pipeline-event-log
   name: Pipeline Run Event Log
@@ -94,6 +119,8 @@ pipeline-event-log:
       - technology.framework.react
       - technology.library.socket-io
       - technology.library.xyflow
+    consumesAPIs:
+      - api.operation.get-pipeline-events
 project-card:
   id: ux.component.project-card
   name: Project Card
@@ -214,3 +241,352 @@ modal:
         locations:
           - file: web_ui/src/components/Modal.jsx
             symbol: Modal
+dashboard:
+  id: ux.component.dashboard
+  name: Dashboard Component
+  type: component
+  documentation: Main dashboard container orchestrating Header, NavigationTabs,
+    AgentState, LiveLogs, and EventTimeline
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: web_ui/src/components/Dashboard.jsx
+            symbol: Dashboard
+agent-state:
+  id: ux.component.agent-state
+  name: Agent State Component
+  type: component
+  documentation: Displays active agents with project grouping and control actions
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: web_ui/src/components/AgentState.jsx
+            symbol: AgentState
+active-agents:
+  id: ux.component.active-agents
+  name: Active Agents Component
+  type: component
+  documentation: Displays list of currently running agents with status
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: web_ui/src/components/ActiveAgents.jsx
+            symbol: ActiveAgents
+active-fixes:
+  id: ux.component.active-fixes
+  name: Active Fixes Component
+  type: component
+  documentation: Shows active repair cycle fixes in progress
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: web_ui/src/components/ActiveFixes.jsx
+            symbol: ActiveFixes
+active-investigations:
+  id: ux.component.active-investigations
+  name: Active Investigations Component
+  type: component
+  documentation: Shows active medic investigations in progress
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: web_ui/src/components/ActiveInvestigations.jsx
+            symbol: ActiveInvestigations
+header-box:
+  id: ux.component.header-box
+  name: Header Box Component
+  type: component
+  documentation: Reusable header card container for stats and metrics
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: web_ui/src/components/HeaderBox.jsx
+            symbol: HeaderBox
+header-stats-card:
+  id: ux.component.header-stats-card
+  name: Header Stats Card Component
+  type: component
+  documentation: Individual stat card for header metrics
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: web_ui/src/components/HeaderStatsCard.jsx
+            symbol: HeaderStatsCard
+header-claude-usage:
+  id: ux.component.header-claude-usage
+  name: Header Claude Usage Component
+  type: component
+  documentation: Displays Claude API usage stats (tokens, latency)
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: web_ui/src/components/HeaderClaudeUsage.jsx
+            symbol: HeaderClaudeUsage
+stats-cards:
+  id: ux.component.stats-cards
+  name: Stats Cards Component
+  type: component
+  documentation: Grid of statistics cards for dashboard metrics
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: web_ui/src/components/StatsCards.jsx
+            symbol: StatsCards
+claude-medic:
+  id: ux.component.claude-medic
+  name: Claude Medic Component
+  type: component
+  documentation: Claude Medic integration component for AI-powered failure analysis
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: web_ui/src/components/ClaudeMedic.jsx
+            symbol: ClaudeMedic
+medic:
+  id: ux.component.medic
+  name: Medic Component
+  type: component
+  documentation: Medic system integration component for failure pattern detection
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: web_ui/src/components/Medic.jsx
+            symbol: Medic
+medic-dashboard:
+  id: ux.component.medic-dashboard
+  name: Medic Dashboard Component
+  type: component
+  documentation: Medic dashboard showing failure signatures and investigations
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: web_ui/src/components/MedicDashboard.jsx
+            symbol: MedicDashboard
+confirmation-modal:
+  id: ux.component.confirmation-modal
+  name: Confirmation Modal Component
+  type: component
+  documentation: Reusable confirmation dialog for destructive actions
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: web_ui/src/components/ConfirmationModal.jsx
+            symbol: ConfirmationModal
+toast:
+  id: ux.component.toast
+  name: Toast Component
+  type: component
+  documentation: Toast notification component for user feedback messages
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: web_ui/src/components/Toast.jsx
+            symbol: Toast
+failure-signature-list:
+  id: ux.component.failure-signature-list
+  name: Failure Signature List Component
+  type: component
+  documentation: Lists detected failure signatures with filtering and sorting
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: web_ui/src/components/FailureSignatureList.jsx
+            symbol: FailureSignatureList
+failure-signature-detail:
+  id: ux.component.failure-signature-detail
+  name: Failure Signature Detail Component
+  type: component
+  documentation: Detailed view of a failure signature with occurrences and investigation
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: web_ui/src/components/FailureSignatureDetail.jsx
+            symbol: FailureSignatureDetail
+investigation-report:
+  id: ux.component.investigation-report
+  name: Investigation Report Component
+  type: component
+  documentation: Displays investigation findings and recommendations
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: web_ui/src/components/InvestigationReport.jsx
+            symbol: InvestigationReport
+repair-cycle-containers:
+  id: ux.component.repair-cycle-containers
+  name: Repair Cycle Containers Component
+  type: component
+  documentation: Displays repair cycle container instances with status
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: web_ui/src/components/RepairCycleContainers.jsx
+            symbol: RepairCycleContainers
+repair-cycle-status:
+  id: ux.component.repair-cycle-status
+  name: Repair Cycle Status Component
+  type: component
+  documentation: Shows repair cycle execution status and progress
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: web_ui/src/components/RepairCycleStatus.jsx
+            symbol: RepairCycleStatus
+review-learning:
+  id: ux.component.review-learning
+  name: Review Learning Component
+  type: component
+  documentation: Displays review learning insights and patterns
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: web_ui/src/components/ReviewLearning.jsx
+            symbol: ReviewLearning
+cycle-bounding-node:
+  id: ux.component.cycle-bounding-node
+  name: Cycle Bounding Node Component
+  type: component
+  documentation: Visual node for cycle detection in graph visualizations
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: web_ui/src/components/CycleBoundingNode.jsx
+            symbol: CycleBoundingNode
+claude-medic-dashboard:
+  id: ux.component.claude-medic-dashboard
+  name: Claude Medic Dashboard Component
+  type: component
+  documentation: Main Claude Medic dashboard showing AI-detected clusters and patterns
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: web_ui/src/components/claude-medic/ClaudeMedicDashboard.jsx
+            symbol: ClaudeMedicDashboard
+claude-advisor-panel:
+  id: ux.component.claude-advisor-panel
+  name: Claude Advisor Panel Component
+  type: component
+  documentation: Panel showing Claude's recommendations for failure resolution
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: web_ui/src/components/claude-medic/ClaudeAdvisorPanel.jsx
+            symbol: ClaudeAdvisorPanel
+claude-cluster-view:
+  id: ux.component.claude-cluster-view
+  name: Claude Cluster View Component
+  type: component
+  documentation: Visualizes failure clusters detected by Claude AI
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: web_ui/src/components/claude-medic/ClaudeClusterView.jsx
+            symbol: ClaudeClusterView
+claude-diagnosis:
+  id: ux.component.claude-diagnosis
+  name: Claude Diagnosis Component
+  type: component
+  documentation: Displays Claude's diagnostic analysis of failures
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: web_ui/src/components/claude-medic/ClaudeDiagnosis.jsx
+            symbol: ClaudeDiagnosis
+claude-failure-signature-list:
+  id: ux.component.claude-failure-signature-list
+  name: Claude Failure Signature List Component
+  type: component
+  documentation: Lists AI-detected failure signatures with clustering
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: web_ui/src/components/claude-medic/ClaudeFailureSignatureList.jsx
+            symbol: ClaudeFailureSignatureList
+claude-recommendations:
+  id: ux.component.claude-recommendations
+  name: Claude Recommendations Component
+  type: component
+  documentation: Shows Claude's recommended actions and fixes
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: web_ui/src/components/claude-medic/ClaudeRecommendations.jsx
+            symbol: ClaudeRecommendations
+claude-signature-detail:
+  id: ux.component.claude-signature-detail
+  name: Claude Signature Detail Component
+  type: component
+  documentation: Detailed view of AI-detected signature with analysis
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: web_ui/src/components/claude-medic/ClaudeSignatureDetail.jsx
+            symbol: ClaudeSignatureDetail
+project-filter:
+  id: ux.component.project-filter
+  name: Project Filter Component
+  type: component
+  documentation: Dropdown filter for selecting projects
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: web_ui/src/components/claude-medic/ProjectFilter.jsx
+            symbol: ProjectFilter

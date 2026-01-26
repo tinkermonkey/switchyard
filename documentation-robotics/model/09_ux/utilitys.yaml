@@ -1,0 +1,106 @@
+api-client:
+  id: ux.utility.api-client
+  name: API Client Utility
+  type: utility
+  documentation: Base API client with request handling and error management
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: web_ui/src/services/api.js
+            symbol: ApiClient
+agent-api:
+  id: ux.utility.agent-api
+  name: Agent API Service
+  type: utility
+  documentation: API service for agent operations (list, kill)
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: web_ui/src/services/agentApi.js
+            symbol: agentApi
+project-api:
+  id: ux.utility.project-api
+  name: Project API Service
+  type: utility
+  documentation: API service for project data operations
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: web_ui/src/services/projectApi.js
+            symbol: projectApi
+system-api:
+  id: ux.utility.system-api
+  name: System API Service
+  type: utility
+  documentation: API service for system health and circuit breakers
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: web_ui/src/services/systemApi.js
+            symbol: systemApi
+review-api:
+  id: ux.utility.review-api
+  name: Review API Service
+  type: utility
+  documentation: API service for review learning data
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: web_ui/src/services/reviewApi.js
+            symbol: reviewApi
+polling:
+  id: ux.utility.polling
+  name: Polling Utility
+  type: utility
+  documentation: Configurable polling utility with interval management
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: web_ui/src/utils/polling.js
+            symbol: startPolling
+state-helpers:
+  id: ux.utility.state-helpers
+  name: State Helpers Utility
+  type: utility
+  documentation: Helper functions for state transformations and filtering
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: web_ui/src/utils/stateHelpers.js
+            symbol: getUnhealthyComponents
+event-merging:
+  id: ux.utility.event-merging
+  name: Event Merging Utility
+  type: utility
+  documentation: Utility for merging and deduplicating event streams
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: web_ui/src/utils/eventMerging.js
+cycle-layout:
+  id: ux.utility.cycle-layout
+  name: Cycle Layout Utility
+  type: utility
+  documentation: Graph layout utility for cycle detection visualization
+  properties:
+    source:
+      reference:
+        provenance: extracted
+        locations:
+          - file: web_ui/src/utils/cycleLayout.js
