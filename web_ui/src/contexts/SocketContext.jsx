@@ -8,7 +8,6 @@ export function SocketProvider({ children }) {
   const [connected, setConnected] = useState(false)
   const [events, setEvents] = useState([])
   const [logs, setLogs] = useState([])
-  const [medicEvents, setMedicEvents] = useState([])
   const [stats, setStats] = useState({
     totalEvents: 0,
     activeTasks: 0,
@@ -127,93 +126,6 @@ export function SocketProvider({ children }) {
       setLogs(prev => [...prev, data].slice(-200))
     })
 
-    // Medic event listeners
-    socketInstance.on('medic_signature_created', (event) => {
-      console.log('[SocketContext] Received medic_signature_created:', event)
-      setMedicEvents(prev => [{ ...event, event_type: 'signature_created' }, ...prev].slice(0, 100))
-    })
-
-    socketInstance.on('medic_signature_updated', (event) => {
-      console.log('[SocketContext] Received medic_signature_updated:', event)
-      setMedicEvents(prev => [{ ...event, event_type: 'signature_updated' }, ...prev].slice(0, 100))
-    })
-
-    socketInstance.on('medic_signature_trending', (event) => {
-      console.log('[SocketContext] Received medic_signature_trending:', event)
-      setMedicEvents(prev => [{ ...event, event_type: 'signature_trending' }, ...prev].slice(0, 100))
-    })
-
-    socketInstance.on('medic_signature_resolved', (event) => {
-      console.log('[SocketContext] Received medic_signature_resolved:', event)
-      setMedicEvents(prev => [{ ...event, event_type: 'signature_resolved' }, ...prev].slice(0, 100))
-    })
-
-    socketInstance.on('medic_investigation_queued', (event) => {
-      console.log('[SocketContext] Received medic_investigation_queued:', event)
-      const enrichedEvent = {
-        ...event,
-        event_type: 'investigation_queued',
-        fingerprint_id: event.task_id || event.data?.fingerprint_id
-      }
-      setMedicEvents(prev => [enrichedEvent, ...prev].slice(0, 100))
-    })
-
-    socketInstance.on('medic_investigation_started', (event) => {
-      console.log('[SocketContext] Received medic_investigation_started:', event)
-      const enrichedEvent = {
-        ...event,
-        event_type: 'investigation_started',
-        fingerprint_id: event.task_id || event.data?.fingerprint_id
-      }
-      setMedicEvents(prev => [enrichedEvent, ...prev].slice(0, 100))
-    })
-
-    socketInstance.on('medic_investigation_completed', (event) => {
-      console.log('[SocketContext] Received medic_investigation_completed:', event)
-      const enrichedEvent = {
-        ...event,
-        event_type: 'investigation_completed',
-        fingerprint_id: event.task_id || event.data?.fingerprint_id
-      }
-      setMedicEvents(prev => [enrichedEvent, ...prev].slice(0, 100))
-    })
-
-    socketInstance.on('medic_investigation_failed', (event) => {
-      console.log('[SocketContext] Received medic_investigation_failed:', event)
-      const enrichedEvent = {
-        ...event,
-        event_type: 'investigation_failed',
-        fingerprint_id: event.task_id || event.data?.fingerprint_id
-      }
-      setMedicEvents(prev => [enrichedEvent, ...prev].slice(0, 100))
-    })
-
-    // Claude Medic event listeners
-    socketInstance.on('medic_claude_signature_created', (event) => {
-      console.log('[SocketContext] Received medic_claude_signature_created:', event)
-      setMedicEvents(prev => [{ ...event, event_type: 'claude_signature_created' }, ...prev].slice(0, 100))
-    })
-
-    socketInstance.on('medic_claude_signature_updated', (event) => {
-      console.log('[SocketContext] Received medic_claude_signature_updated:', event)
-      setMedicEvents(prev => [{ ...event, event_type: 'claude_signature_updated' }, ...prev].slice(0, 100))
-    })
-
-    socketInstance.on('medic_claude_signature_trending', (event) => {
-      console.log('[SocketContext] Received medic_claude_signature_trending:', event)
-      setMedicEvents(prev => [{ ...event, event_type: 'claude_signature_trending' }, ...prev].slice(0, 100))
-    })
-
-    socketInstance.on('medic_claude_cluster_detected', (event) => {
-      console.log('[SocketContext] Received medic_claude_cluster_detected:', event)
-      setMedicEvents(prev => [{ ...event, event_type: 'claude_cluster_detected' }, ...prev].slice(0, 100))
-    })
-
-    socketInstance.on('medic_claude_investigation_completed', (event) => {
-      console.log('[SocketContext] Received medic_claude_investigation_completed:', event)
-      setMedicEvents(prev => [{ ...event, event_type: 'claude_investigation_completed' }, ...prev].slice(0, 100))
-    })
-
     setSocket(socketInstance)
 
     return () => {
@@ -250,7 +162,6 @@ export function SocketProvider({ children }) {
 
   const clearEvents = () => setEvents([])
   const clearLogs = () => setLogs([])
-  const clearMedicEvents = () => setMedicEvents([])
 
   return (
     <SocketContext.Provider value={{
@@ -258,11 +169,9 @@ export function SocketProvider({ children }) {
       connected,
       events,
       logs,
-      medicEvents,
       stats,
       clearEvents,
-      clearLogs,
-      clearMedicEvents
+      clearLogs
     }}>
       {children}
     </SocketContext.Provider>

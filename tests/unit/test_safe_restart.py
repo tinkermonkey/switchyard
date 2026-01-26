@@ -12,35 +12,26 @@ sys.modules['redis'] = MagicMock()
 # Mock services modules
 sys.modules['services'] = MagicMock()
 sys.modules['services.agent_container_recovery'] = MagicMock()
-sys.modules['services.medic'] = MagicMock()
-sys.modules['services.medic.claude_investigation_queue'] = MagicMock()
-sys.modules['services.medic.claude_report_manager'] = MagicMock()
 
 from scripts.safe_restart import check_safety
 
 class TestSafeRestart(unittest.TestCase):
 
     @patch('scripts.safe_restart.get_agent_container_recovery')
-    @patch('scripts.safe_restart.ClaudeInvestigationQueue')
     @patch('scripts.safe_restart.redis.Redis')
-    def test_check_safety_safe(self, mock_redis, mock_queue_cls, mock_recovery_getter):
+    def test_check_safety_safe(self, mock_redis, mock_recovery_getter):
         # Setup mocks for a SAFE condition
         mock_recovery = MagicMock()
         mock_recovery.get_running_repair_cycle_containers.return_value = [] # No running repair cycles
         mock_recovery_getter.return_value = mock_recovery
-
-        mock_queue = MagicMock()
-        mock_queue.get_active.return_value = [] # No active investigations
-        mock_queue_cls.return_value = mock_queue
 
         # Test
         is_safe = check_safety("test-container")
         self.assertTrue(is_safe)
 
     @patch('scripts.safe_restart.get_agent_container_recovery')
-    @patch('scripts.safe_restart.ClaudeInvestigationQueue')
     @patch('scripts.safe_restart.redis.Redis')
-    def test_check_safety_unsafe_repair_cycle(self, mock_redis, mock_queue_cls, mock_recovery_getter):
+    def test_check_safety_unsafe_repair_cycle(self, mock_redis, mock_recovery_getter):
         # Setup mocks for UNSAFE condition (active repair cycle)
         mock_recovery = MagicMock()
         mock_recovery.get_running_repair_cycle_containers.return_value = [
@@ -48,10 +39,6 @@ class TestSafeRestart(unittest.TestCase):
         ]
         mock_recovery.parse_repair_cycle_container_name.return_value = {'project': 'test-project'}
         mock_recovery_getter.return_value = mock_recovery
-
-        mock_queue = MagicMock()
-        mock_queue.get_active.return_value = []
-        mock_queue_cls.return_value = mock_queue
 
         # Test
         is_safe = check_safety("repair-cycle-container-1")

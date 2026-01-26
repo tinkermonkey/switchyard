@@ -90,7 +90,6 @@ services:
       - ./:/app
       - ..:/workspace  # Mount workspace read-write for Advisor agent execution
       - /var/run/docker.sock:/var/run/docker.sock
-      - ./medic:/medic:ro  # Mount medic reports directory read-only
       - ./.claude-config:/home/orchestrator/.config/claude:ro  # MCP config
     environment:
       - REDIS_URL=redis://redis:6379
@@ -184,72 +183,6 @@ services:
       retries: 5
       start_period: 60s
 
-  medic:
-    build: .
-    volumes:
-      - ./:/app
-      - ..:/workspace  # Access to orchestrator workspace for projects
-      - /var/run/docker.sock:/var/run/docker.sock  # Docker CLI access
-      - ./medic:/medic  # Investigation reports directory (inside clauditoreum/)
-      - ./.claude-config:/home/orchestrator/.config/claude:ro  # MCP config
-      - ~/.ssh/id_ed25519:/home/orchestrator/.ssh/id_ed25519:ro  # SSH keys for git
-      - ~/.gitconfig:/home/orchestrator/.gitconfig  # Git config
-    environment:
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
-      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
-      - ELASTICSEARCH_URL=http://elasticsearch:9200
-      - WORKSPACE_ROOT=/workspace/clauditoreum
-      - MEDIC_DIR=/medic
-      - LOG_LEVEL=${LOG_LEVEL:-INFO}
-      - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN:-}
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
-      - GITHUB_TOKEN=${GITHUB_TOKEN}
-      - MEDIC_SIGNATURE_RETENTION_DAYS=${MEDIC_SIGNATURE_RETENTION_DAYS:-7}
-    depends_on:
-      redis:
-        condition: service_started
-      elasticsearch:
-        condition: service_healthy
-    networks:
-      - orchestrator-net
-    working_dir: /app
-    command: ["python", "-m", "services.medic.main"]
-    restart: unless-stopped
-
-  fix-orchestrator:
-    build:
-      context: .
-      args:
-        DOCKER_GID: "${DOCKER_GID:-984}"
-    container_name: fix-orchestrator
-    volumes:
-      - ./:/app                                    # Orchestrator code
-      - ..:/workspace                              # Workspace root
-      - /var/run/docker.sock:/var/run/docker.sock  # Docker-in-Docker
-      - ~/.ssh/id_ed25519:/home/orchestrator/.ssh/id_ed25519:ro
-      - ~/.gitconfig:/home/orchestrator/.gitconfig
-      - ~/.orchestrator:/home/orchestrator/.orchestrator
-      - ./.claude-config:/home/orchestrator/.config/claude
-      - ./medic:/medic                             # Medic reports and fix plans
-    environment:
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
-      - WORKSPACE_ROOT=/workspace/clauditoreum
-      - MEDIC_DIR=/medic
-      - LOG_LEVEL=${LOG_LEVEL:-INFO}
-      - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN}
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
-    depends_on:
-      - redis
-    restart: unless-stopped
-    networks:
-      - orchestrator-net
-    working_dir: /app
-    command: ["python", "-m", "services.fix_orchestrator.main"]
-
-
-
 
 #  pattern-ingestion:
 #    build: .
@@ -335,7 +268,6 @@ services:
 volumes:
   redis_data:
   elasticsearch_data:
-  medic-reports:  # Persistent storage for investigation reports
 
 networks:
   orchestrator-net:

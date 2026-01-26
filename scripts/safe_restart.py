@@ -21,8 +21,6 @@ sys.path.append(str(Path(__file__).parent.parent))
 
 try:
     from services.agent_container_recovery import get_agent_container_recovery
-    from services.medic.claude_investigation_queue import ClaudeInvestigationQueue
-    from services.medic.claude_report_manager import ClaudeReportManager
 except ImportError:
     # Allow script to be imported for testing even if services aren't available
     pass
@@ -62,23 +60,6 @@ def check_safety(container_name: str) -> bool:
             if info and info['project'] in container_name:
                  logger.warning(f"UNSAFE: Container {container_name} matches project of active repair cycle {rc['name']}")
                  return False
-
-        # Check active Claude investigations
-        claude_queue = ClaudeInvestigationQueue(redis_client)
-        active_investigations = claude_queue.get_active()
-        
-        if active_investigations:
-            # We don't easily know which container an investigation is using, 
-            # but usually they run on host or ephemeral containers.
-            # If we are restarting a project container, we should check if any investigation is for that project.
-            report_manager = ClaudeReportManager()
-            
-            for fingerprint_id in active_investigations:
-                summary = report_manager.get_investigation_summary(fingerprint_id)
-                project = summary.get('project')
-                if project and project in container_name:
-                    logger.warning(f"UNSAFE: Container {container_name} matches project of active investigation {fingerprint_id}")
-                    return False
 
         return True
 

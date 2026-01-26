@@ -61,7 +61,7 @@ function PipelineRunDebugView() {
   const [loadingCompleted, setLoadingCompleted] = useState(false)
   const [loadingEvents, setLoadingEvents] = useState(false)
   const [selectedTab, setSelectedTab] = useState('active')
-  const [completedOffset, setCompletedOffset] = useState(0)
+  const [completedLoadedCount, setCompletedLoadedCount] = useState(0)  // Track total loaded
   const [hasMoreCompleted, setHasMoreCompleted] = useState(true)
   const [showKillModal, setShowKillModal] = useState(false)
   const completedLimit = 10
@@ -72,6 +72,7 @@ function PipelineRunDebugView() {
   const selectedTabRef = useRef(selectedTab)
   const isFetchingActiveRef = useRef(false)
   const isFetchingCompletedRef = useRef(false)
+  const completedLoadedCountRef = useRef(0)
 
   // Refs for scroll position preservation
   const activeListScrollRef = useRef(null)
@@ -87,6 +88,10 @@ function PipelineRunDebugView() {
   useEffect(() => {
     selectedTabRef.current = selectedTab
   }, [selectedTab])
+
+  useEffect(() => {
+    completedLoadedCountRef.current = completedLoadedCount
+  }, [completedLoadedCount])
 
   // Continuously save scroll position to handle updates
   useEffect(() => {
@@ -189,7 +194,7 @@ function PipelineRunDebugView() {
   }, [])
   
   // Fetch completed pipeline runs with pagination - no dependencies to avoid circular re-creation
-  const fetchCompletedPipelineRuns = useCallback(async (offset = 0, append = false) => {
+  const fetchCompletedPipelineRuns = useCallback(async (offset = 0, append = false, customLimit = null) => {
     // Guard against concurrent fetches
     if (isFetchingCompletedRef.current) {
       console.log('[PipelineRunDebug] Skipping completed fetch - already in progress')
@@ -199,22 +204,33 @@ function PipelineRunDebugView() {
     try {
       isFetchingCompletedRef.current = true
       setLoadingCompleted(true)
-      const response = await fetch(`/completed-pipeline-runs?limit=${completedLimit}&offset=${offset}`)
+
+      const limit = customLimit || completedLimit
+      const response = await fetch(`/completed-pipeline-runs?limit=${limit}&offset=${offset}`)
       const data = await response.json()
 
       if (data.success) {
         //console.log('[PipelineRunDebug] Fetched completed pipeline runs:', data.runs.length)
 
+        // Track if this is initial load
+        let isInitialLoad = false
+
         // Use functional update to avoid dependency on completedPipelineRuns
         setCompletedPipelineRuns(currentCompleted => {
-          // Append new runs if loading more, or replace if refreshing
-          const combinedRuns = append ? [...currentCompleted, ...data.runs] : data.runs
+          // Check if this is initial load (no current data)
+          isInitialLoad = currentCompleted.length === 0 && data.runs.length > 0
 
-          // Use stable merge to preserve object references
-          const mergedRuns = mergeArrayByIdStable(
-            append ? currentCompleted : [],
-            combinedRuns
-          )
+          // Strategy: Always use mergeArrayByIdStable with current state for deduplication
+          let mergedRuns
+
+          if (append) {
+            // Appending new page: combine current with new, then deduplicate
+            const combined = [...currentCompleted, ...data.runs]
+            mergedRuns = mergeArrayByIdStable(currentCompleted, combined)
+          } else {
+            // Refreshing: merge new data with existing (updates in-place)
+            mergedRuns = mergeArrayByIdStable(currentCompleted, data.runs)
+          }
 
           // Update selectedPipelineRun if it exists in the completed runs
           setSelectedPipelineRun(currentSelected => {
@@ -225,7 +241,7 @@ function PipelineRunDebugView() {
                 return updatedRun
               }
               return currentSelected
-            } else if (data.runs.length > 0 && selectedTabRef.current === 'completed') {
+            } else if (mergedRuns.length > 0 && selectedTabRef.current === 'completed') {
               // Auto-select first completed run if on completed tab and none selected
               return mergedRuns[0]
             }
@@ -235,7 +251,18 @@ function PipelineRunDebugView() {
           return mergedRuns
         })
 
-        setHasMoreCompleted(data.runs.length === completedLimit)
+        // Update pagination state
+        if (append) {
+          setCompletedLoadedCount(prev => prev + data.runs.length)
+          setHasMoreCompleted(data.runs.length === completedLimit)
+        } else if (isInitialLoad) {
+          // Initial load: set count to number of items fetched
+          setCompletedLoadedCount(data.runs.length)
+          setHasMoreCompleted(data.runs.length === completedLimit)
+        } else {
+          // Refresh: preserve count, just check hasMore
+          setHasMoreCompleted(prev => prev)  // Keep current value
+        }
       }
     } catch (error) {
       console.error('Error fetching completed pipeline runs:', error)
@@ -247,10 +274,9 @@ function PipelineRunDebugView() {
   
   // Load more completed runs
   const loadMoreCompleted = useCallback(() => {
-    const newOffset = completedOffset + completedLimit
-    setCompletedOffset(newOffset)
-    fetchCompletedPipelineRuns(newOffset, true)
-  }, [completedOffset, completedLimit, fetchCompletedPipelineRuns])
+    // Use completedLoadedCount instead of completedOffset
+    fetchCompletedPipelineRuns(completedLoadedCount, true)
+  }, [completedLoadedCount, fetchCompletedPipelineRuns])
   
   // Fetch events for selected pipeline run
   const fetchPipelineRunEvents = useCallback(async (pipelineRunId) => {
@@ -288,7 +314,7 @@ function PipelineRunDebugView() {
   useEffect(() => {
     fetchActivePipelineRuns(true) // Pass true for initial load
     fetchCompletedPipelineRuns(0, false)
-  }, [])
+  }, [fetchActivePipelineRuns, fetchCompletedPipelineRuns])
 
   // Periodic refresh to keep data up-to-date
   useEffect(() => {
@@ -296,21 +322,25 @@ function PipelineRunDebugView() {
       //console.log('[PipelineRunDebug] Periodic refresh')
       fetchActivePipelineRuns(false) // Background refresh, no loading spinner
       // Use ref to check current tab without adding dependency
-      if (selectedTabRef.current === 'completed') {
-        fetchCompletedPipelineRuns(0, false)
+      if (selectedTabRef.current === 'completed' && completedLoadedCountRef.current > 0) {
+        // Refresh all loaded pages to update their data
+        const itemsToRefresh = Math.max(completedLoadedCountRef.current, completedLimit)
+        fetchCompletedPipelineRuns(0, false, itemsToRefresh)
       }
     }, 10000) // Refresh every 10 seconds
 
     return () => clearInterval(intervalId)
     // Callbacks are now stable (no dependencies), so only depend on them
-  }, [fetchActivePipelineRuns, fetchCompletedPipelineRuns])
+  }, [fetchActivePipelineRuns, fetchCompletedPipelineRuns, completedLimit])
   
   // Fetch data when tab changes
   useEffect(() => {
-    if (selectedTab === 'completed' && completedPipelineRuns.length === 0) {
-      fetchCompletedPipelineRuns(0, false)
+    if (selectedTab === 'completed') {
+      if (completedPipelineRuns.length === 0) {
+        fetchCompletedPipelineRuns(0, false)
+      }
     }
-  }, [selectedTab])
+  }, [selectedTab, completedPipelineRuns.length, fetchCompletedPipelineRuns])
   
   // Load events when pipeline run selected
   useEffect(() => {

@@ -29,30 +29,6 @@ export default function NavigationTabs() {
         Pipeline Run Debug
       </Link>
       <Link
-        to="/medic"
-        activeProps={{
-          className: "px-4 py-2 bg-gh-accent-emphasis border border-gh-accent-primary rounded-md hover:bg-gh-accent-primary transition-colors text-sm text-white"
-        }}
-        inactiveProps={{
-          className: "px-4 py-2 bg-gh-canvas-subtle border border-gh-border rounded-md hover:bg-gh-border-muted transition-colors text-sm"
-        }}
-      >
-        <Stethoscope className="inline w-4 h-4 mr-2" />
-        Medic
-      </Link>
-      <Link
-        to="/claude-medic"
-        activeProps={{
-          className: "px-4 py-2 bg-gh-accent-emphasis border border-gh-accent-primary rounded-md hover:bg-gh-accent-primary transition-colors text-sm text-white"
-        }}
-        inactiveProps={{
-          className: "px-4 py-2 bg-gh-canvas-subtle border border-gh-border rounded-md hover:bg-gh-border-muted transition-colors text-sm"
-        }}
-      >
-        <Code2 className="inline w-4 h-4 mr-2" />
-        Claude Medic
-      </Link>
-      <Link
         to="/projects"
         activeProps={{
           className: "px-4 py-2 bg-gh-accent-emphasis border border-gh-accent-primary rounded-md hover:bg-gh-accent-primary transition-colors text-sm text-white"

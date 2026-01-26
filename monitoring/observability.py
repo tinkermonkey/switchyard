@@ -197,30 +197,6 @@ class EventType(Enum):
     BRANCH_STALE_DETECTED = "branch_stale_detected"
     BRANCH_SELECTION_ESCALATED = "branch_selection_escalated"
 
-    # Medic Events (Failure Detection & Investigation)
-    MEDIC_SIGNATURE_CREATED = "medic_signature_created"
-    MEDIC_SIGNATURE_UPDATED = "medic_signature_updated"
-    MEDIC_SIGNATURE_TRENDING = "medic_signature_trending"
-    MEDIC_SIGNATURE_RESOLVED = "medic_signature_resolved"
-    MEDIC_INVESTIGATION_QUEUED = "medic_investigation_queued"
-    MEDIC_INVESTIGATION_STARTED = "medic_investigation_started"
-    MEDIC_INVESTIGATION_COMPLETED = "medic_investigation_completed"
-    MEDIC_INVESTIGATION_FAILED = "medic_investigation_failed"
-
-    # Claude Medic events
-    MEDIC_CLAUDE_SIGNATURE_CREATED = "medic_claude_signature_created"
-    MEDIC_CLAUDE_SIGNATURE_UPDATED = "medic_claude_signature_updated"
-    MEDIC_CLAUDE_SIGNATURE_TRENDING = "medic_claude_signature_trending"
-    MEDIC_CLAUDE_CLUSTER_DETECTED = "medic_claude_cluster_detected"
-    MEDIC_CLAUDE_INVESTIGATION_STARTED = "medic_claude_investigation_started"
-    MEDIC_CLAUDE_INVESTIGATION_COMPLETED = "medic_claude_investigation_completed"
-    MEDIC_CLAUDE_INVESTIGATION_STALLED = "medic_claude_investigation_stalled"
-
-    # Medic Fix events
-    MEDIC_FIX_STARTED = "medic_fix_started"
-    MEDIC_FIX_COMPLETED = "medic_fix_completed"
-    MEDIC_FIX_FAILED = "medic_fix_failed"
-
 @dataclass
 class ObservabilityEvent:
     """Structured event for agent observability"""
