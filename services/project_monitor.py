@@ -518,18 +518,19 @@ class ProjectMonitor:
         """
         try:
             from config.manager import config_manager
+            from config.state_manager import state_manager
             import asyncio
-            
+
             # Get project config
             project_config = config_manager.get_project_config(project_name)
-            
+
             # Find the board state
-            board_state = None
-            for pipeline in project_config.pipelines:
-                if pipeline.board_name == board_name:
-                    board_state = self.board_state.get(f"{project_name}_{board_name}")
-                    break
-            
+            project_state = state_manager.load_project_state(project_name)
+            if not project_state:
+                logger.debug(f"No project state found for {project_name}")
+                return None
+
+            board_state = project_state.boards.get(board_name)
             if not board_state:
                 logger.debug(f"No board state found for {project_name}/{board_name}")
                 return None
