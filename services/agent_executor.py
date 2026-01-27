@@ -521,8 +521,29 @@ class AgentExecutor:
                     f"Agent {agent_name} blocked by Claude Code circuit breaker after {duration_ms:.0f}ms. "
                     f"Not counting as agent failure. Pipeline will resume when tokens reset."
                 )
-                # Don't record execution outcome - the execution was blocked, not failed
-                # The work remains in_progress and will be retried when the breaker closes
+
+                # Record execution outcome as 'blocked' to enable automatic recovery
+                # Bug fix: Previously left in 'in_progress' which caused stuck issues
+                if 'issue_number' in task_context:
+                    from services.work_execution_state import work_execution_tracker
+                    column = task_context.get('column', 'unknown')
+
+                    work_execution_tracker.record_execution_outcome(
+                        issue_number=task_context['issue_number'],
+                        column=column,
+                        agent=agent_name,
+                        outcome='blocked',
+                        project_name=project_name,
+                        error=error_message
+                    )
+                    logger.info(
+                        f"Recorded 'blocked' outcome for issue #{task_context['issue_number']} "
+                        f"to enable automatic retry when circuit breaker closes"
+                    )
+                else:
+                    logger.warning(
+                        f"Cannot record blocked outcome for {agent_name}: missing issue_number in task_context"
+                    )
             else:
                 # Normal agent failure - emit event and record outcome
                 self.obs.emit_agent_completed(

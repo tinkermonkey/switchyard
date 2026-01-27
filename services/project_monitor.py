@@ -1700,8 +1700,8 @@ class ProjectMonitor:
                     was_programmatic = work_execution_tracker.was_recent_programmatic_change(
                         project_name=project_name,
                         issue_number=issue_number,
-                        to_status=status,
-                        time_window_seconds=60
+                        to_status=status
+                        # time_window_seconds defaults to env var PROGRAMMATIC_CHANGE_WINDOW_SECONDS or 60
                     )
                     trigger_source = 'pipeline_progression' if was_programmatic else 'manual'
 
@@ -1725,10 +1725,38 @@ class ProjectMonitor:
                     )
 
                     if not should_execute:
-                        already_handled = True  # Work was already executed
-                        logger.info(
-                            f"Skipping {agent} on issue #{issue_number} in {status}: {reason}"
-                        )
+                        # Check if this is a circuit breaker block that can now be retried
+                        if reason == 'work_already_in_progress':
+                            is_blocked = work_execution_tracker.is_blocked_by_circuit_breaker(
+                                project_name, issue_number
+                            )
+
+                            if is_blocked:
+                                # Check if circuit breaker is now closed
+                                from claude.circuit_breaker import claude_circuit_breaker
+                                if not claude_circuit_breaker.is_open():
+                                    logger.info(
+                                        f"Circuit breaker recovered for issue #{issue_number} - "
+                                        f"allowing retry of previously blocked work"
+                                    )
+                                    should_execute = True
+                                    reason = "circuit_breaker_recovered"
+                                    already_handled = False
+                                else:
+                                    logger.debug(
+                                        f"Issue #{issue_number} still blocked by circuit breaker "
+                                        f"(breaker still open)"
+                                    )
+                                    already_handled = True
+                            else:
+                                already_handled = True
+                        else:
+                            already_handled = True
+
+                        if already_handled:
+                            logger.info(
+                                f"Skipping {agent} on issue #{issue_number} in {status}: {reason}"
+                            )
 
                     # For backward compatibility, also check comment signatures for discussions
                     already_processed = False
@@ -2061,6 +2089,31 @@ class ProjectMonitor:
 
                     # If already handled (work executed or resume thread started), don't start fresh work
                     if already_handled:
+                        # CRITICAL: Clean up pipeline run if one was created
+                        # Bug fix: Prevent zombie pipeline runs from blocking queue when work is skipped
+                        if pipeline_run and hasattr(pipeline_run, 'id'):
+                            logger.info(
+                                f"Cleaning up pipeline run {pipeline_run.id} for issue #{issue_number} "
+                                f"(work skipped due to: {reason if 'reason' in locals() else 'already handled'})"
+                            )
+
+                            # End the pipeline run
+                            self.pipeline_run_manager.end_pipeline_run(
+                                project=project_name,
+                                issue_number=issue_number,
+                                reason=f"Skipped: {reason if 'reason' in locals() else 'already handled'}"
+                            )
+
+                            # Release the pipeline lock
+                            from services.pipeline_lock_manager import get_pipeline_lock_manager
+                            lock_manager = get_pipeline_lock_manager()
+                            released = lock_manager.release_lock(project_name, board_name, issue_number)
+
+                            if released:
+                                logger.info(f"Released pipeline lock for issue #{issue_number} after skipping work")
+                            else:
+                                logger.warning(f"Failed to release lock for issue #{issue_number} - may not be held")
+
                         return None
 
                 except Exception as e:

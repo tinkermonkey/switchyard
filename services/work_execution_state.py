@@ -415,6 +415,9 @@ class WorkExecutionStateTracker:
                 )
                 return True
 
+        # Track if any service checks fail (indicates potential initialization issue)
+        check_failures = []
+
         # Check 2: Active review cycles
         try:
             from services.review_cycle import review_cycle_executor
@@ -428,15 +431,24 @@ class WorkExecutionStateTracker:
                     return True
         except (ImportError, AttributeError) as e:
             # Review cycle module may not be available or initialized
-            logger.debug(f"Could not check review cycles: {e}")
-            pass
+            logger.warning(
+                f"Could not check review cycles for {project_name}/#{issue_number}: {e}. "
+                f"This may indicate an initialization issue."
+            )
+            check_failures.append('review_cycle')
 
         # Check 3: Repair cycle containers
-        if self._check_redis_repair_cycle_tracking(project_name, issue_number):
-            logger.debug(
-                f"Active repair cycle container found for {project_name}/#{issue_number}"
+        try:
+            if self._check_redis_repair_cycle_tracking(project_name, issue_number):
+                logger.debug(
+                    f"Active repair cycle container found for {project_name}/#{issue_number}"
+                )
+                return True
+        except Exception as e:
+            logger.warning(
+                f"Could not check repair cycles for {project_name}/#{issue_number}: {e}"
             )
-            return True
+            check_failures.append('repair_cycle')
 
         # Check 4: Conversational feedback loops
         try:
@@ -450,34 +462,91 @@ class WorkExecutionStateTracker:
                     return True
         except (ImportError, AttributeError) as e:
             # Feedback loop module may not be available or initialized
-            logger.debug(f"Could not check feedback loops: {e}")
-            pass
+            logger.warning(
+                f"Could not check feedback loops for {project_name}/#{issue_number}: {e}. "
+                f"This may indicate an initialization issue."
+            )
+            check_failures.append('feedback_loop')
+
+        # Fail-safe: If multiple service checks failed, assume work might be active
+        # to prevent duplicate executions during degraded state
+        if len(check_failures) >= 2:
+            logger.error(
+                f"Multiple service checks failed for {project_name}/#{issue_number}: {check_failures}. "
+                f"Failing safe by assuming active execution to prevent duplicates."
+            )
+            return True
 
         # No active work found
         return False
+
+    def is_blocked_by_circuit_breaker(
+        self,
+        project_name: str,
+        issue_number: int
+    ) -> bool:
+        """
+        Check if the last execution was blocked by circuit breaker.
+
+        This allows the project monitor to detect when a previously blocked
+        execution can be retried (after circuit breaker closes).
+
+        Returns:
+            True if last execution was blocked by circuit breaker, False otherwise
+        """
+        state = self.load_state(project_name, issue_number)
+        history = state.get('execution_history', [])
+
+        if not history:
+            return False
+
+        # Check the most recent execution
+        last_execution = history[-1]
+        outcome = last_execution.get('outcome')
+        error = last_execution.get('error', '')
+
+        # Check if outcome is 'blocked' and error mentions circuit breaker
+        is_blocked = (
+            outcome == 'blocked' and
+            'circuit breaker' in error.lower()
+        )
+
+        if is_blocked:
+            logger.debug(
+                f"Issue #{issue_number} was blocked by circuit breaker: {error}"
+            )
+
+        return is_blocked
 
     def was_recent_programmatic_change(
         self,
         project_name: str,
         issue_number: int,
         to_status: str,
-        time_window_seconds: int = 60
+        time_window_seconds: Optional[int] = None
     ) -> bool:
         """
         Check if a status change to the given status was recently made programmatically.
-        
+
         This helps avoid duplicate event emission when the project monitor detects
         a status change that was already emitted by the pipeline progression service.
-        
+
         Args:
             project_name: Project name
             issue_number: Issue number
             to_status: Target status to check
-            time_window_seconds: Time window in seconds to consider "recent" (default: 60)
-        
+            time_window_seconds: Time window in seconds to consider "recent"
+                                If None, reads from env var PROGRAMMATIC_CHANGE_WINDOW_SECONDS
+                                with fallback to 60 seconds
+
         Returns:
             True if a programmatic status change to this status was made within the time window
         """
+        # Allow configurable time window via environment variable
+        if time_window_seconds is None:
+            import os
+            time_window_seconds = int(os.environ.get('PROGRAMMATIC_CHANGE_WINDOW_SECONDS', '60'))
+            logger.debug(f"Using programmatic change window: {time_window_seconds}s")
         state = self.load_state(project_name, issue_number)
         
         # Check status_changes for recent programmatic changes
