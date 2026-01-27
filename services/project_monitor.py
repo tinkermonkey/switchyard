@@ -2549,8 +2549,8 @@ class ProjectMonitor:
                 )
                 return
 
-            pr_number = pr_data.get('number')
-            is_draft = pr_data.get('isDraft', True)
+            pr_number = pr_data.get('pr_number')
+            is_draft = pr_data.get('is_draft', True)
 
             # Step 9: Check if PR is already ready (idempotent check for race conditions)
             if not is_draft:
@@ -2589,7 +2589,7 @@ class ProjectMonitor:
                 )
 
                 # Post warning comment to parent issue
-                await github.add_comment(
+                await github.post_comment(
                     parent_issue_number,
                     f"⚠️ **Warning**: All sub-issues have been completed, but the system failed to mark "
                     f"PR #{pr_number} as ready for review. Please manually mark it ready:\n\n"
