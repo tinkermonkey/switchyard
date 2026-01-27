@@ -2089,8 +2089,42 @@ class ProjectMonitor:
 
                     # If already handled (work executed or resume thread started), don't start fresh work
                     if already_handled:
-                        # CRITICAL: Clean up pipeline run if one was created
-                        # Bug fix: Prevent zombie pipeline runs from blocking queue when work is skipped
+                        # NEW: Special handling for work_already_in_progress
+                        # Check if work is TRULY in progress (active run exists) vs stale state
+                        if 'reason' in locals() and reason == 'work_already_in_progress':
+                            # Check if there's an active pipeline run (source of truth)
+                            current_active_run = self.pipeline_run_manager.get_active_pipeline_run(
+                                project_name, issue_number
+                            )
+
+                            if current_active_run and current_active_run.is_active():
+                                # Work truly in progress - container is still working
+                                logger.info(
+                                    f"Pipeline run {current_active_run.id} is active for issue #{issue_number}. "
+                                    f"Skipping duplicate trigger - container still working (likely during recovery)."
+                                )
+                                # DON'T end the pipeline run, DON'T release the lock
+                                # Just return and let the container complete normally
+                                return None
+                            else:
+                                # No active pipeline run - execution state is stale
+                                logger.info(
+                                    f"No active pipeline run found for issue #{issue_number}. "
+                                    f"Execution state shows 'in_progress' but no active run exists - cleaning up stale state."
+                                )
+                                # Clean up the stale execution state (mark as failure)
+                                work_execution_tracker.record_execution_outcome(
+                                    project_name=project_name,
+                                    issue_number=issue_number,
+                                    outcome='failure',
+                                    error='Stale execution state - no active pipeline run found',
+                                    column=status
+                                )
+                                # No pipeline run to end - return early
+                                return None
+
+                        # ORIGINAL LOGIC: For all other skip reasons, clean up pipeline run as before
+                        # (e.g., "already_processed_successfully", "skip_auto_progression_after_success")
                         if pipeline_run and hasattr(pipeline_run, 'id'):
                             logger.info(
                                 f"Cleaning up pipeline run {pipeline_run.id} for issue #{issue_number} "

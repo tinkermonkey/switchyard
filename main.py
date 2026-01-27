@@ -289,29 +289,28 @@ async def main():
 
                         import subprocess
                         try:
-                            # Check for running agent containers for this project and issue
-                            # Format: claude-agent-{project}-*{issue}*
+                            # Check for running agent containers for this issue using Docker labels
+                            # All containers are labeled with org.clauditoreum.issue_number={issue}
                             result = subprocess.run(
-                                ['docker', 'ps', '--filter', f'name=claude-agent-{project_name}-', '--format', '{{.Names}}'],
+                                [
+                                    'docker', 'ps',
+                                    '--filter', f'label=org.clauditoreum.issue_number={lock.locked_by_issue}',
+                                    '--filter', f'label=org.clauditoreum.project={project_name}',
+                                    '--format', '{{.Names}}'
+                                ],
                                 capture_output=True,
                                 text=True,
                                 timeout=5
                             )
 
                             if result.returncode == 0 and result.stdout.strip():
-                                # Check if any container name contains the issue number
+                                # Any output means container(s) exist for this issue
                                 running_containers = result.stdout.strip().split('\n')
-                                for container_name in running_containers:
-                                    # Container naming format includes issue number
-                                    # Example: claude-agent-project-senior_software_engineer_project_SDLC-Execution_142_1767816286_senior_software_engineer_1767816286
-                                    # Check if issue number appears in container name (with underscores as separators)
-                                    if f"_{lock.locked_by_issue}_" in container_name or container_name.endswith(f"_{lock.locked_by_issue}"):
-                                        logger.info(
-                                            f"Found running container {container_name} for issue #{lock.locked_by_issue} "
-                                            f"- skipping re-trigger (container still active)"
-                                        )
-                                        should_retrigger = False
-                                        break
+                                logger.info(
+                                    f"Found {len(running_containers)} running container(s) for issue #{lock.locked_by_issue}: "
+                                    f"{', '.join(running_containers)} - skipping re-trigger (container still active)"
+                                )
+                                should_retrigger = False
 
                             # Also check for running repair cycle containers
                             if should_retrigger:
