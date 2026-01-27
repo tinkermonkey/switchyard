@@ -305,7 +305,7 @@ AGENT_REGISTRY = {
 **Key Classes**:
 - `RepairCycleStage`: Pipeline stage for repair cycles
 - `RepairTestRunConfig`: Test execution configuration
-- `RepairTestType`: Enum (UNIT, INTEGRATION, E2E, LINT)
+- `test_type`: String defining test type (e.g., "unit", "integration", "e2e", "pre-commit", "regression")
 
 **Execution Flow**:
 1. Run tests

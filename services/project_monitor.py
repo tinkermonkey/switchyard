@@ -3911,7 +3911,7 @@ The automated test-fix-validate cycle has failed and requires manual interventio
             import asyncio
             import threading
             import subprocess
-            from pipeline.repair_cycle import RepairCycleStage, RepairTestRunConfig, RepairTestType
+            from pipeline.repair_cycle import RepairCycleStage, RepairTestRunConfig
 
             # CRITICAL: Check if a repair cycle container is already running for this issue
             # This prevents duplicate containers when recovery reconnects to an existing container
@@ -3996,9 +3996,9 @@ The automated test-fix-validate cycle has failed and requires manual interventio
             # Load test configurations from project config
             testing_config = project_config.testing or {}
             test_configs = []
-            
+
             for test_type_config in testing_config.get('types', []):
-                test_type = RepairTestType(test_type_config['type'])
+                test_type = test_type_config['type']
                 test_configs.append(RepairTestRunConfig(
                     test_type=test_type,
                     timeout=test_type_config.get('timeout', 600),

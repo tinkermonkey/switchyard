@@ -14,8 +14,7 @@ from pipeline.repair_cycle import (
     RepairTestResult,
     RepairTestFailure,
     RepairTestWarning,
-    CycleResult,
-    RepairTestType
+    CycleResult
 )
 
 
@@ -27,7 +26,7 @@ from pipeline.repair_cycle import (
 def unit_test_config():
     """Basic unit test configuration"""
     return RepairTestRunConfig(
-        test_type=RepairTestType.UNIT,
+        test_type="unit",
         command="pytest tests/unit/ -v --json-report",
         timeout=600,
         max_iterations=5,
@@ -40,7 +39,7 @@ def unit_test_config():
 def integration_test_config():
     """Basic integration test configuration"""
     return RepairTestRunConfig(
-        test_type=RepairTestType.INTEGRATION,
+        test_type="integration",
         command="pytest tests/integration/ -v --json-report",
         timeout=900,
         max_iterations=3,
@@ -80,7 +79,7 @@ def context_with_observability():
 def passing_test_result():
     """Test result with all tests passing"""
     return RepairTestResult(
-        test_type=RepairTestType.UNIT,
+        test_type="unit",
         iteration=1,
         passed=10,
         failed=0,
@@ -96,7 +95,7 @@ def passing_test_result():
 def failing_test_result():
     """Test result with failures"""
     return RepairTestResult(
-        test_type=RepairTestType.UNIT,
+        test_type="unit",
         iteration=1,
         passed=8,
         failed=2,
@@ -128,7 +127,7 @@ def failing_test_result():
 def test_result_with_warnings():
     """Test result with warnings"""
     return RepairTestResult(
-        test_type=RepairTestType.UNIT,
+        test_type="unit",
         iteration=1,
         passed=10,
         failed=0,
@@ -163,11 +162,11 @@ class TestTestRunConfig:
     def test_creates_with_required_fields(self):
         """Test creating config with required fields"""
         config = RepairTestRunConfig(
-            test_type=RepairTestType.UNIT,
+            test_type="unit",
             command="pytest tests/unit/"
         )
         
-        assert config.test_type == RepairTestType.UNIT
+        assert config.test_type == "unit"
         assert config.command == "pytest tests/unit/"
         assert config.timeout == 600  # Default
         assert config.max_iterations == 5  # Default
@@ -176,7 +175,7 @@ class TestTestRunConfig:
     def test_creates_with_custom_values(self):
         """Test creating config with custom values"""
         config = RepairTestRunConfig(
-            test_type=RepairTestType.E2E,
+            test_type="e2e",
             command="pytest tests/e2e/",
             timeout=1800,
             max_iterations=2,
@@ -244,7 +243,7 @@ class TestCycleResult:
     def test_to_dict_successful_cycle(self, passing_test_result):
         """Test converting successful cycle to dict"""
         cycle_result = CycleResult(
-            test_type=RepairTestType.UNIT,
+            test_type="unit",
             passed=True,
             iterations=2,
             final_result=passing_test_result,
@@ -266,7 +265,7 @@ class TestCycleResult:
     def test_to_dict_failed_cycle(self):
         """Test converting failed cycle to dict"""
         cycle_result = CycleResult(
-            test_type=RepairTestType.INTEGRATION,
+            test_type="integration",
             passed=False,
             iterations=5,
             final_result=None,
@@ -540,7 +539,7 @@ class TestWarningHandling:
     ):
         """Test that warnings are skipped when review_warnings=False"""
         config = RepairTestRunConfig(
-            test_type=RepairTestType.INTEGRATION,
+            test_type="integration",
             command="pytest tests/integration/",
             review_warnings=False  # Disabled
         )
@@ -650,7 +649,7 @@ class TestCheckpointing:
             if iteration_count >= 5:
                 # Return passing on 5th iteration
                 return RepairTestResult(
-                    test_type=RepairTestType.UNIT,
+                    test_type="unit",
                     iteration=iteration_count,
                     passed=10,
                     failed=0,
@@ -693,8 +692,8 @@ class TestConfigIntegration:
         """Test creating RepairCycleStage from config data"""
         # This would be tested in integration tests with actual config manager
         # Here we just verify the expected structure
-        from pipeline.repair_cycle import RepairTestType, RepairTestRunConfig
-        
+        from pipeline.repair_cycle import RepairTestRunConfig
+
         # Simulate config loading
         config_data = {
             'type': 'unit',
@@ -704,16 +703,16 @@ class TestConfigIntegration:
             'review_warnings': True,
             'max_file_iterations': 3
         }
-        
+
         test_config = RepairTestRunConfig(
-            test_type=RepairTestType(config_data['type']),
+            test_type=config_data['type'],
             command=config_data['command'],
             timeout=config_data['timeout'],
             max_iterations=config_data['max_iterations'],
             review_warnings=config_data['review_warnings'],
             max_file_iterations=config_data['max_file_iterations']
         )
-        
-        assert test_config.test_type == RepairTestType.UNIT
+
+        assert test_config.test_type == "unit"
         assert test_config.command == 'pytest tests/unit/'
         assert test_config.max_iterations == 5

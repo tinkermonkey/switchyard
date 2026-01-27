@@ -594,7 +594,7 @@ repair-test-type:
         provenance: extracted
         locations:
           - file: pipeline/repair_cycle.py
-            symbol: RepairTestType
+            note: test_type is now a string (e.g., "unit", "integration", "e2e", "pre-commit", "regression")
 repair-test-run-config:
   id: data-model.object-schema.repair-test-run-config
   name: Repair Test Run Configuration

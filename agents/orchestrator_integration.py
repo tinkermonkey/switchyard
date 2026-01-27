@@ -146,18 +146,18 @@ def create_stage_from_config(stage_config, project_name: str) -> PipelineStage:
         Instantiated PipelineStage (AgentStage or RepairCycleStage)
     """
     from config.manager import config_manager
-    from pipeline.repair_cycle import RepairCycleStage, RepairTestRunConfig, RepairTestType
-    
+    from pipeline.repair_cycle import RepairCycleStage, RepairTestRunConfig
+
     # Check if this is a repair cycle stage
     if hasattr(stage_config, 'stage_type') and stage_config.stage_type == 'repair_cycle':
         # Load testing configuration from project
         project_config = config_manager.get_project_config(project_name)
         testing_config = project_config.testing or {}
-        
+
         # Build RepairTestRunConfig list from project config
         test_configs = []
         for test_type_config in testing_config.get('types', []):
-            test_type = RepairTestType(test_type_config['type'])
+            test_type = test_type_config['type']
             test_configs.append(RepairTestRunConfig(
                 test_type=test_type,
                 timeout=test_type_config.get('timeout', 600),

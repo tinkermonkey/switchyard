@@ -121,7 +121,7 @@ class RepairCycleRunner:
     def initialize_stage(self) -> bool:
         """Initialize RepairCycleStage with config from context"""
         try:
-            from pipeline.repair_cycle import RepairCycleStage, RepairTestRunConfig, RepairTestType
+            from pipeline.repair_cycle import RepairCycleStage, RepairTestRunConfig
             from pipeline.repair_cycle_checkpoint import RepairCycleCheckpoint
 
             # Initialize checkpoint manager with project and issue info
@@ -136,7 +136,7 @@ class RepairCycleRunner:
             # Load test configs from context
             test_configs = []
             for tc in self.context.get('test_configs', []):
-                test_type = RepairTestType(tc['test_type'])
+                test_type = tc['test_type']
                 test_configs.append(RepairTestRunConfig(
                     test_type=test_type,
                     timeout=tc.get('timeout', 600),

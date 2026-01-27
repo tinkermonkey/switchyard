@@ -20,7 +20,7 @@ Architecture:
 Usage:
     test_configs = [
         RepairTestRunConfig(
-            test_type=RepairTestType.UNIT,
+            test_type="unit",
             timeout=600,
             max_iterations=5,
             review_warnings=True
@@ -41,7 +41,6 @@ import logging
 import asyncio
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass, asdict
-from enum import Enum
 from datetime import datetime
 
 from pipeline.base import PipelineStage
@@ -52,19 +51,11 @@ from monitoring.observability import EventType
 logger = logging.getLogger(__name__)
 
 
-class RepairTestType(Enum):
-    """Supported test types for repair cycles"""
-
-    UNIT = "unit"
-    INTEGRATION = "integration"
-    E2E = "e2e"
-
-
 @dataclass
 class RepairTestRunConfig:
     """Configuration for a single test type run cycle"""
 
-    test_type: RepairTestType
+    test_type: str
     timeout: int = 900  # Timeout in seconds
     max_iterations: int = 5  # Max test-fix-validate iterations
     review_warnings: bool = True  # Whether to review and fix warnings
@@ -92,7 +83,7 @@ class RepairTestWarning:
 class RepairTestResult:
     """Structured test execution results"""
 
-    test_type: RepairTestType
+    test_type: str
     iteration: int
     passed: int
     failed: int
@@ -133,7 +124,7 @@ class RepairTestResult:
 class CycleResult:
     """Result of a complete test-fix cycle for one test type"""
 
-    test_type: RepairTestType
+    test_type: str
     passed: bool
     iterations: int
     final_result: Optional[RepairTestResult]
@@ -145,7 +136,7 @@ class CycleResult:
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for serialization"""
         return {
-            "test_type": self.test_type.value,
+            "test_type": self.test_type,
             "passed": self.passed,
             "iterations": self.iterations,
             "final_result": asdict(self.final_result) if self.final_result else None,
@@ -240,7 +231,7 @@ class RepairCycleStage(PipelineStage):
                 project,
                 {
                     "agent_name": self.agent_name,
-                    "test_types": [tc.test_type.value for tc in self.test_configs],
+                    "test_types": [tc.test_type for tc in self.test_configs],
                     "max_total_agent_calls": self.max_total_agent_calls,
                 },
                 pipeline_run_id=pipeline_run_id,
@@ -253,7 +244,7 @@ class RepairCycleStage(PipelineStage):
             # Track which test type in sequence (1st, 2nd, 3rd)
             for test_type_index, test_config in enumerate(self.test_configs, start=1):
                 logger.info(
-                    f"Starting {test_config.test_type.value} test cycle "
+                    f"Starting {test_config.test_type} test cycle "
                     f"(test type {test_type_index}/{len(self.test_configs)})"
                 )
 
@@ -272,7 +263,7 @@ class RepairCycleStage(PipelineStage):
                         task_id,
                         project,
                         {
-                            "test_type": test_config.test_type.value,
+                            "test_type": test_config.test_type,
                             "test_type_index": test_type_index,
                             "passed": 1 if cycle_result.passed else 0,  # Convert bool to int for ES schema
                             "test_cycle_iterations": cycle_result.iterations,
@@ -290,7 +281,7 @@ class RepairCycleStage(PipelineStage):
                 if not cycle_result.passed:
                     # Fast-fail: if unit tests fail, don't run integration
                     error_message = (
-                        f"{test_config.test_type.value} tests failed after {cycle_result.iterations} iterations"
+                        f"{test_config.test_type} tests failed after {cycle_result.iterations} iterations"
                     )
                     logger.error(error_message)
                     break
@@ -369,7 +360,7 @@ class RepairCycleStage(PipelineStage):
                 task_id,
                 project,
                 {
-                    "test_type": config.test_type.value,
+                    "test_type": config.test_type,
                     "test_type_index": test_type_index,  # Which test type in sequence
                     "total_test_types": len(self.test_configs),  # Total test types to run
                     "max_iterations": config.max_iterations,
@@ -388,7 +379,7 @@ class RepairCycleStage(PipelineStage):
             test_cycle_iteration += 1
             logger.info(
                 f"Test cycle iteration {test_cycle_iteration}/{config.max_iterations} "
-                f"for {config.test_type.value} (test type {test_type_index}/{len(self.test_configs)})"
+                f"for {config.test_type} (test type {test_type_index}/{len(self.test_configs)})"
             )
 
             # Emit iteration started event
@@ -399,7 +390,7 @@ class RepairCycleStage(PipelineStage):
                     task_id,
                     project,
                     {
-                        "test_type": config.test_type.value,
+                        "test_type": config.test_type,
                         "test_type_index": test_type_index,  # Which test type in sequence
                         "test_cycle_iteration": test_cycle_iteration,  # Iteration within this test type
                         "max_test_cycle_iterations": config.max_iterations,
@@ -432,7 +423,7 @@ class RepairCycleStage(PipelineStage):
                         task_id,
                         project,
                         {
-                            "test_type": config.test_type.value,
+                            "test_type": config.test_type,
                             "test_type_index": test_type_index,
                             "passed": 0,  # Convert bool to int for ES schema
                             "test_cycle_iterations": test_cycle_iteration,
@@ -449,7 +440,7 @@ class RepairCycleStage(PipelineStage):
                         task_id,
                         project,
                         {
-                            "test_type": config.test_type.value,
+                            "test_type": config.test_type,
                             "test_type_index": test_type_index,
                             "passed": 0,  # Convert bool to int for ES schema
                             "test_cycle_iterations": test_cycle_iteration,
@@ -486,7 +477,7 @@ class RepairCycleStage(PipelineStage):
                         task_id,
                         project,
                         {
-                            "test_type": config.test_type.value,
+                            "test_type": config.test_type,
                             "test_type_index": test_type_index,
                             "passed": 0,  # Convert bool to int for ES schema
                             "test_cycle_iterations": test_cycle_iteration,
@@ -503,7 +494,7 @@ class RepairCycleStage(PipelineStage):
                         task_id,
                         project,
                         {
-                            "test_type": config.test_type.value,
+                            "test_type": config.test_type,
                             "test_type_index": test_type_index,
                             "passed": 0,  # Convert bool to int for ES schema
                             "test_cycle_iterations": test_cycle_iteration,
@@ -566,7 +557,7 @@ class RepairCycleStage(PipelineStage):
                     task_id,
                     project,
                     {
-                        "test_type": config.test_type.value,
+                        "test_type": config.test_type,
                         "test_type_index": test_type_index,  # Which test type in sequence
                         "test_cycle_iteration": test_cycle_iteration,  # Which iteration of this test type
                         "file_count": len(grouped_failures),
@@ -587,7 +578,7 @@ class RepairCycleStage(PipelineStage):
                     task_id,
                     project,
                     {
-                        "test_type": config.test_type.value,
+                        "test_type": config.test_type,
                         "test_type_index": test_type_index,  # Which test type in sequence
                         "test_cycle_iteration": test_cycle_iteration,  # Which iteration of this test type
                         "files_fixed": fixed_count,
@@ -601,7 +592,7 @@ class RepairCycleStage(PipelineStage):
                 await self._checkpoint(config.test_type, test_cycle_iteration, context)
 
         # Max iterations reached
-        logger.error(f"Max iterations ({config.max_iterations}) reached for " f"{config.test_type.value} tests")
+        logger.error(f"Max iterations ({config.max_iterations}) reached for " f"{config.test_type} tests")
         final_result = await self._run_tests(config, context, test_cycle_iteration, test_type_index)
 
         # Check if tests actually passed, regardless of warnings
@@ -640,7 +631,7 @@ class RepairCycleStage(PipelineStage):
         Returns:
             RepairTestResult with parsed test output
         """
-        logger.info(f"Running {config.test_type.value} tests (test cycle iteration {test_cycle_iteration}/{config.max_iterations}, test type {test_type_index})")
+        logger.info(f"Running {config.test_type} tests (test cycle iteration {test_cycle_iteration}/{config.max_iterations}, test type {test_type_index})")
 
         # Get observability manager
         obs = context.get("observability")
@@ -656,7 +647,7 @@ class RepairCycleStage(PipelineStage):
                 f"{task_id}_test_iter{test_cycle_iteration}",
                 project,
                 {
-                    "test_type": config.test_type.value,
+                    "test_type": config.test_type,
                     "test_type_index": test_type_index,  # Which test type in sequence
                     "test_cycle_iteration": test_cycle_iteration,  # Which iteration of this test type
                     "max_test_cycle_iterations": config.max_iterations,
@@ -678,16 +669,16 @@ class RepairCycleStage(PipelineStage):
         task_context = {
             **context,
             "pipeline_run_id": pipeline_run_id,  # Ensure pipeline_run_id flows through
-            "task_description": f"Run {config.test_type.value} tests (test cycle iteration {test_cycle_iteration})",
+            "task_description": f"Run {config.test_type} tests (test cycle iteration {test_cycle_iteration})",
             "timeout": config.timeout,
             # Skip workspace preparation - repair cycle already runs in prepared workspace
             "skip_workspace_prep": True,
             # Clear review_cycle context to avoid iteration count confusion from previous review cycles
             "review_cycle": None,
             # Provide the custom instructions as a 'direct_prompt' so the agent can use it
-            "direct_prompt": f"""Run all {config.test_type.value} tests for this project.
+            "direct_prompt": f"""Run all {config.test_type} tests for this project.
 
-Please identify the appropriate test framework and location for {config.test_type.value} tests.
+Please identify the appropriate test framework and location for {config.test_type} tests.
 
 **IMPORTANT**: When running tests, save the test results to a file in /tmp so that you can refer back to them and so they're not made part of the codebase.
 
@@ -738,7 +729,7 @@ DO NOT include any explanation, markdown formatting, or other text - ONLY the JS
                     agent_name=self.agent_name,
                     project_name=project,
                     task_context=task_context,
-                    task_id_prefix=f"repair_test_{config.test_type.value}_type{test_type_index}_iter{test_cycle_iteration}_attempt{attempt}",
+                    task_id_prefix=f"repair_test_{config.test_type}_type{test_type_index}_iter{test_cycle_iteration}_attempt{attempt}",
                 )
 
                 # Extract result text from agent output
@@ -814,7 +805,7 @@ DO NOT include any explanation, markdown formatting, or other text - ONLY the JS
                         f"{task_id}_test_iter{test_cycle_iteration}",
                         project,
                         {
-                            "test_type": config.test_type.value,
+                            "test_type": config.test_type,
                             "test_type_index": test_type_index,  # Which test type in sequence
                             "test_cycle_iteration": test_cycle_iteration,  # Which iteration of this test type
                             "max_test_cycle_iterations": config.max_iterations,
@@ -952,7 +943,7 @@ DO NOT include any explanation, markdown formatting, or other text - ONLY the JS
                     {
                         "test_file": test_file,
                         "failure_count": len(failures),
-                        "test_type": config.test_type.value,
+                        "test_type": config.test_type,
                     },
                     pipeline_run_id=pipeline_run_id,
                 )
@@ -1019,7 +1010,7 @@ DO NOT include any explanation, markdown formatting, or other text - ONLY the JS
                         {
                             "test_file": test_file,
                             "failure_count": len(failures),
-                            "test_type": config.test_type.value,
+                            "test_type": config.test_type,
                             "success": True,
                         },
                         pipeline_run_id=pipeline_run_id,
@@ -1038,7 +1029,7 @@ DO NOT include any explanation, markdown formatting, or other text - ONLY the JS
                         {
                             "test_file": test_file,
                             "failure_count": len(failures),
-                            "test_type": config.test_type.value,
+                            "test_type": config.test_type,
                             "error": str(e),
                         },
                         pipeline_run_id=pipeline_run_id,
@@ -1087,7 +1078,7 @@ DO NOT include any explanation, markdown formatting, or other text - ONLY the JS
                     {
                         "source_file": source_file,
                         "warning_count": len(warnings),
-                        "test_type": config.test_type.value,
+                        "test_type": config.test_type,
                         "warnings": [asdict(w) for w in warnings],
                     },
                     pipeline_run_id=pipeline_run_id,
@@ -1154,7 +1145,7 @@ For each warning:
                         {
                             "source_file": source_file,
                             "warning_count": len(warnings),
-                            "test_type": config.test_type.value,
+                            "test_type": config.test_type,
                             "success": True,
                             "warnings": [asdict(w) for w in warnings],
                         },
@@ -1174,7 +1165,7 @@ For each warning:
                         {
                             "source_file": source_file,
                             "warning_count": len(warnings),
-                            "test_type": config.test_type.value,
+                            "test_type": config.test_type,
                             "error": str(e),
                         },
                         pipeline_run_id=pipeline_run_id,
@@ -1252,9 +1243,9 @@ For each warning:
             f"Response preview: {response[:500]}..."
         )
 
-    async def _checkpoint(self, test_type: RepairTestType, test_cycle_iteration: int, context: Dict[str, Any]):
+    async def _checkpoint(self, test_type: str, test_cycle_iteration: int, context: Dict[str, Any]):
         """Save checkpoint for recovery"""
-        logger.info(f"Checkpointing {test_type.value} test cycle at iteration {test_cycle_iteration}")
+        logger.info(f"Checkpointing {test_type} test cycle at iteration {test_cycle_iteration}")
 
         # Get checkpoint manager from context or create one
         from pipeline.repair_cycle_checkpoint import RepairCycleCheckpoint, create_checkpoint_state
@@ -1279,7 +1270,7 @@ For each warning:
             issue_number=context.get('issue_number', 0),
             pipeline_run_id=context.get('pipeline_run_id', 'unknown'),
             stage_name=self.name,
-            test_type=test_type.value,
+            test_type=test_type,
             test_type_index=self.test_configs.index(
                 next(tc for tc in self.test_configs if tc.test_type == test_type)
             ),
