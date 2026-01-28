@@ -98,6 +98,7 @@ export const mergeAgentExecutionEvents = (apiLogs, webSocketEvents, executionDat
   const convertedWebSocketLogs = newWebSocketEvents.map(wsEvent => ({
     timestamp: wsEvent.timestamp,
     agent: wsEvent.agent,
+    task_id: wsEvent.task_id,  // CRITICAL: Must copy task_id for deduplication
     event_type: 'claude_stream',  // WebSocket events don't have event_type at top level
     raw_event: { event: wsEvent.event }  // Use wsEvent.event, not wsEvent.data
   }))
@@ -110,13 +111,30 @@ export const mergeAgentExecutionEvents = (apiLogs, webSocketEvents, executionDat
   // and without deduplication, previously merged events would be re-included
   const seenKeys = new Set()
   const deduplicated = allEvents.filter(log => {
-    // Create unique key from timestamp, agent, task_id, and event_type
-    const taskId = log.task_id || log.agent || 'unknown'
+    // Create unique key from timestamp, agent, task_id, event_type, and event content
+    const taskId = log.task_id || 'notask'
     const eventType = log.event_type || 'unknown'
-    const key = `${log.timestamp}-${log.agent}-${taskId}-${eventType}`
+
+    // Extract event content for better uniqueness
+    const event = log.event || log.raw_event?.event
+    let contentHash = ''
+    if (event) {
+      // Use event type and message ID if available for stronger uniqueness
+      const msgType = event.type || ''
+      const msgId = event.message?.id || ''
+      const msgModel = event.message?.model || ''
+      contentHash = `${msgType}-${msgId}-${msgModel}`
+    }
+
+    const key = `${log.timestamp}-${log.agent}-${taskId}-${eventType}-${contentHash}`
 
     if (seenKeys.has(key)) {
-      console.log('[EventMerging] Filtering duplicate log:', { key, timestamp: log.timestamp })
+      console.log('[EventMerging] Filtering duplicate log:', {
+        key: key.substring(0, 100),
+        timestamp: log.timestamp,
+        agent: log.agent,
+        taskId
+      })
       return false // Skip duplicate
     }
     seenKeys.add(key)

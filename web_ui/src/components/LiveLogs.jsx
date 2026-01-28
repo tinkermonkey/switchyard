@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState, useCallback } from 'react'
+import React, { useEffect, useLayoutEffect, useRef, useState, useCallback } from 'react'
 import { useSocket } from '../contexts/SocketContext'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
@@ -20,6 +20,8 @@ function LiveLogs({
   const containerRef = useRef(null)
   const [autoScroll, setAutoScroll] = useState(true)
   const [selectedLog, setSelectedLog] = useState(null)
+  const scrollPositionRef = useRef(0)
+  const previousLogsLengthRef = useRef(0)
 
   const handleAutoScrollToggle = () => {
     const newValue = !autoScroll
@@ -37,9 +39,35 @@ function LiveLogs({
 
   const timestampFormatter = formatTimestamp || defaultFormatTimestamp
 
+  // Save scroll position on every scroll event
   useEffect(() => {
-    if (autoScroll && containerRef.current) {
-      containerRef.current.scrollTop = containerRef.current.scrollHeight
+    const container = containerRef.current
+    if (!container) return
+
+    const handleScroll = () => {
+      scrollPositionRef.current = container.scrollTop
+    }
+
+    container.addEventListener('scroll', handleScroll, { passive: true })
+    return () => container.removeEventListener('scroll', handleScroll)
+  }, [])
+
+  // Handle scroll behavior when logs change
+  // Use useLayoutEffect to run before browser paint to prevent scroll jumps
+  useLayoutEffect(() => {
+    if (!containerRef.current) return
+
+    const container = containerRef.current
+    const logsChanged = logs.length !== previousLogsLengthRef.current
+    previousLogsLengthRef.current = logs.length
+
+    if (autoScroll) {
+      // Auto-scroll enabled: scroll to bottom
+      container.scrollTop = container.scrollHeight
+    } else if (logsChanged) {
+      // Auto-scroll disabled but logs changed: restore previous position
+      // This prevents the scroll from jumping when new logs are added
+      container.scrollTop = scrollPositionRef.current
     }
   }, [logs, autoScroll])
 
