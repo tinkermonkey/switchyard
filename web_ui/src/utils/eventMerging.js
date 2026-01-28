@@ -102,13 +102,34 @@ export const mergeAgentExecutionEvents = (apiLogs, webSocketEvents, executionDat
     raw_event: { event: wsEvent.event }  // Use wsEvent.event, not wsEvent.data
   }))
   
-  // Merge and sort by timestamp
-  logs = [...logs, ...convertedWebSocketLogs].sort((a, b) => {
+  // Merge arrays
+  const allEvents = [...logs, ...convertedWebSocketLogs]
+
+  // Deduplicate using unique keys to prevent duplicate log entries
+  // This is necessary because merging happens on every WebSocket event,
+  // and without deduplication, previously merged events would be re-included
+  const seenKeys = new Set()
+  const deduplicated = allEvents.filter(log => {
+    // Create unique key from timestamp, agent, task_id, and event_type
+    const taskId = log.task_id || log.agent || 'unknown'
+    const eventType = log.event_type || 'unknown'
+    const key = `${log.timestamp}-${log.agent}-${taskId}-${eventType}`
+
+    if (seenKeys.has(key)) {
+      console.log('[EventMerging] Filtering duplicate log:', { key, timestamp: log.timestamp })
+      return false // Skip duplicate
+    }
+    seenKeys.add(key)
+    return true
+  })
+
+  // Sort by timestamp
+  logs = deduplicated.sort((a, b) => {
     const tsA = normalizeTimestamp(a.timestamp) || 0
     const tsB = normalizeTimestamp(b.timestamp) || 0
     return tsA - tsB
   })
-  
+
   return logs
 }
 

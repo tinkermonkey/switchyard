@@ -1,11 +1,11 @@
-import { useEffect, useRef, useState } from 'react'
+import React, { useEffect, useRef, useState, useCallback } from 'react'
 import { useSocket } from '../contexts/SocketContext'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { Info } from 'lucide-react'
 import Modal from './Modal'
 
-export default function LiveLogs({
+function LiveLogs({
   logs: propLogs,
   title = "Claude Live Logs",
   showClearButton = true,
@@ -89,7 +89,7 @@ export default function LiveLogs({
     )
   }
 
-  const getLogContent = (data) => {
+  const getLogContent = useCallback((data) => {
     // Handle both direct event structure and raw_event wrapper
     const event = data.event || data.raw_event?.event
     if (!event) {
@@ -145,7 +145,7 @@ export default function LiveLogs({
     }
 
     return { logType, logContent, toolData }
-  }
+  }, [])
 
   const getLogTypeColor = (type) => {
     switch (type) {
@@ -198,7 +198,7 @@ export default function LiveLogs({
 
               return (
                 <div
-                  key={idx}
+                  key={`${log.timestamp}-${log.agent}-${idx}`}
                   className="flex gap-3 p-2 border-b border-gh-border-muted hover:bg-gh-canvas transition-colors items-start"
                 >
                   <span className="text-gh-fg-subtle whitespace-nowrap">
@@ -246,3 +246,36 @@ export default function LiveLogs({
     </>
   )
 }
+
+// Custom comparison function for React.memo
+// Only re-render if logs array actually changed or other props changed
+const arePropsEqual = (prevProps, nextProps) => {
+  // If logs length changed, re-render
+  if (prevProps.logs?.length !== nextProps.logs?.length) {
+    return false
+  }
+
+  // If last log changed, re-render (handles new logs being added)
+  if (prevProps.logs?.length > 0 && nextProps.logs?.length > 0) {
+    const prevLastLog = prevProps.logs[prevProps.logs.length - 1]
+    const nextLastLog = nextProps.logs[nextProps.logs.length - 1]
+    if (prevLastLog?.timestamp !== nextLastLog?.timestamp) {
+      return false
+    }
+  }
+
+  // Check other props
+  if (prevProps.title !== nextProps.title ||
+      prevProps.showClearButton !== nextProps.showClearButton ||
+      prevProps.minHeight !== nextProps.minHeight ||
+      prevProps.maxHeight !== nextProps.maxHeight) {
+    return false
+  }
+
+  // Props are equal, skip re-render
+  return true
+}
+
+// Wrap component with React.memo for performance optimization
+// This prevents unnecessary re-renders when parent updates but props haven't changed
+export default React.memo(LiveLogs, arePropsEqual)
