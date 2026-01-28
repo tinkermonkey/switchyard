@@ -1487,9 +1487,36 @@ def get_agent_execution(execution_id):
                 index="claude-streams-*",
                 body=logs_query
             )
-            
+
+            # Deduplicate logs at the API level to prevent duplicate entries
+            # Create unique key from timestamp + event content
+            seen_keys = set()
             for hit in logs_result['hits']['hits']:
                 log_data = hit['_source']
+
+                # Create unique key similar to frontend deduplication
+                timestamp = log_data.get('timestamp', '')
+                agent = log_data.get('agent', '')
+                task_id = log_data.get('task_id', '')
+                event_type = log_data.get('event_type', '')
+
+                # Extract event content for uniqueness
+                event = log_data.get('event') or log_data.get('raw_event', {}).get('event', {})
+                msg_type = event.get('type', '') if isinstance(event, dict) else ''
+                msg_id = ''
+                msg_model = ''
+                if isinstance(event, dict) and isinstance(event.get('message'), dict):
+                    msg_id = event['message'].get('id', '')
+                    msg_model = event['message'].get('model', '')
+
+                content_hash = f"{msg_type}-{msg_id}-{msg_model}"
+                key = f"{timestamp}-{agent}-{task_id}-{event_type}-{content_hash}"
+
+                if key in seen_keys:
+                    logger.debug(f"[API] Filtering duplicate log: {key[:100]}")
+                    continue  # Skip duplicate
+
+                seen_keys.add(key)
                 logs.append(log_data)
         except Exception as e:
             logger.warning(f"Error fetching logs for execution: {e}")
