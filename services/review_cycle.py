@@ -420,7 +420,22 @@ class ReviewCycleExecutor:
                     
                     if is_start or (has_maker_output and cycle_state.current_iteration < cycle_state.max_iterations):
                         logger.info(f"Cycle in initialized state with pending maker output - starting/resuming review loop")
-                        
+
+                        # CRITICAL: Check if agent is already running from recovered container
+                        # This prevents launching duplicate agents after orchestrator restart
+                        from services.work_execution_state import work_execution_tracker
+
+                        if work_execution_tracker.has_active_execution(
+                            cycle_state.project_name,
+                            cycle_state.issue_number
+                        ):
+                            logger.info(
+                                f"Skipping review cycle resume for issue #{cycle_state.issue_number}: "
+                                f"agent already active (likely from recovered container). "
+                                f"Will wait for active execution to complete."
+                            )
+                            continue
+
                         # Fetch necessary context to run the loop
                         try:
                             from config.manager import config_manager
