@@ -158,52 +158,61 @@ class MetricsCollector:
             # ILM requires index names to end with a number (e.g., -000001)
             task_index = "orchestrator-task-metrics-000001"
             task_alias = "orchestrator-task-metrics"
-            
-            if not self.es.indices.exists(index=task_index):
-                self.es.indices.create(
-                    index=task_index,
-                    body={
-                        "aliases": {
-                            task_alias: {
-                                "is_write_index": True
+
+            # Only create initial index if alias doesn't exist yet
+            # (if alias exists, ILM rollover has already created newer indices)
+            if not self.es.indices.exists_alias(name=task_alias):
+                if not self.es.indices.exists(index=task_index):
+                    self.es.indices.create(
+                        index=task_index,
+                        body={
+                            "aliases": {
+                                task_alias: {
+                                    "is_write_index": True
+                                }
                             }
                         }
-                    }
-                )
-                logger.info(f"Created initial write index: {task_index} with alias {task_alias}")
-            elif not self.es.indices.exists_alias(name=task_alias):
-                # Index exists but alias doesn't - add the alias
-                self.es.indices.put_alias(
-                    index=task_index,
-                    name=task_alias,
-                    body={"is_write_index": True}
-                )
-                logger.info(f"Added write alias {task_alias} to existing index {task_index}")
-            
+                    )
+                    logger.info(f"Created initial write index: {task_index} with alias {task_alias}")
+                else:
+                    # Index exists but alias doesn't - add the alias
+                    self.es.indices.put_alias(
+                        index=task_index,
+                        name=task_alias,
+                        body={"is_write_index": True}
+                    )
+                    logger.info(f"Added write alias {task_alias} to existing index {task_index}")
+            else:
+                logger.debug(f"Alias {task_alias} already exists, skipping initial index creation")
+
             # Create quality metrics initial index with alias
             quality_index = "orchestrator-quality-metrics-000001"
             quality_alias = "orchestrator-quality-metrics"
-            
-            if not self.es.indices.exists(index=quality_index):
-                self.es.indices.create(
-                    index=quality_index,
-                    body={
-                        "aliases": {
-                            quality_alias: {
-                                "is_write_index": True
+
+            # Only create initial index if alias doesn't exist yet
+            if not self.es.indices.exists_alias(name=quality_alias):
+                if not self.es.indices.exists(index=quality_index):
+                    self.es.indices.create(
+                        index=quality_index,
+                        body={
+                            "aliases": {
+                                quality_alias: {
+                                    "is_write_index": True
+                                }
                             }
                         }
-                    }
-                )
-                logger.info(f"Created initial write index: {quality_index} with alias {quality_alias}")
-            elif not self.es.indices.exists_alias(name=quality_alias):
-                # Index exists but alias doesn't - add the alias
-                self.es.indices.put_alias(
-                    index=quality_index,
-                    name=quality_alias,
-                    body={"is_write_index": True}
-                )
-                logger.info(f"Added write alias {quality_alias} to existing index {quality_index}")
+                    )
+                    logger.info(f"Created initial write index: {quality_index} with alias {quality_alias}")
+                else:
+                    # Index exists but alias doesn't - add the alias
+                    self.es.indices.put_alias(
+                        index=quality_index,
+                        name=quality_alias,
+                        body={"is_write_index": True}
+                    )
+                    logger.info(f"Added write alias {quality_alias} to existing index {quality_index}")
+            else:
+                logger.debug(f"Alias {quality_alias} already exists, skipping initial index creation")
                 
         except Exception as e:
             logger.warning(f"Failed to create initial indices with aliases: {e}")
