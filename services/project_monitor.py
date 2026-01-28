@@ -49,7 +49,7 @@ def _save_repair_cycle_context(
     serialized_configs = []
     for tc in test_configs:
         serialized_configs.append({
-            'test_type': tc.test_type.value,
+            'test_type': tc.test_type,
             'timeout': tc.timeout,
             'max_iterations': tc.max_iterations,
             'review_warnings': tc.review_warnings,
@@ -4055,7 +4055,7 @@ The automated test-fix-validate cycle has failed and requires manual interventio
 
             logger.info(
                 f"Starting repair cycle for issue #{issue_number} in Docker container "
-                f"(agent: {stage_config.default_agent}, test types: {[tc.test_type.value for tc in test_configs]})"
+                f"(agent: {stage_config.default_agent}, test types: {[tc.test_type for tc in test_configs]})"
             )
 
             # Build context for stage execution
@@ -4160,7 +4160,7 @@ The automated test-fix-validate cycle has failed and requires manual interventio
                 comment_text = f"""## 🔧 Starting Repair Cycle (Testing)
 
 **Agent**: {stage_config.default_agent.replace('_', ' ').title()}
-**Test Types**: {', '.join([tc.test_type.value for tc in test_configs])}
+**Test Types**: {', '.join([tc.test_type for tc in test_configs])}
 **Max Iterations**: {max_total_agent_calls}
 **Container**: Isolated Docker container{branch_info}
 
@@ -4749,127 +4749,24 @@ _Repair cycle initiated by Claude Code Orchestrator_
 
     def _reconcile_stale_state(self):
         """
-        Clean up stale/inconsistent state before processing issues.
+        Placeholder for state reconciliation.
 
-        Ensures each failsafe cycle starts with clean state.
-        This makes the system 'eventually correct' - any inconsistencies
-        will be cleaned up within 30-60 seconds (next failsafe cycle).
+        NOTE: The automatic 2-hour stale lock cleanup has been removed because it could not
+        distinguish between legitimate stuck states (container crashes) and orchestrator bugs
+        that require manual intervention. This was causing cascading failures where multiple
+        issues would hit the same orchestrator bug and pile up instead of blocking the pipeline
+        until the bug was fixed.
 
-        Cleans:
-        1. Stale locks (> 2 hours old, no active work)
-        2. Orphaned execution states (marked 'in_progress' but no container)
-        3. Pipeline run inconsistencies (marked 'active' but completed)
+        Lock cleanup now only happens:
+        1. At orchestrator startup via _reconcile_active_runs() - cleans up from previous run
+        2. When pipeline runs end normally via end_pipeline_run() - releases locks automatically
+        3. Manual intervention via observability API - for stuck cases requiring human judgment
 
-        Safety:
-        - Only clean obvious inconsistencies
-        - Never clean locks < 2 hours old (could be legitimately slow)
-        - Verify no active container before cleaning execution state
-        - Log all corrections for audit
+        For future enhancements, proper state tracking (lock_reason, orchestrator_failure status)
+        would be needed to safely distinguish cases where automatic cleanup is appropriate.
         """
-        from services.pipeline_lock_manager import get_pipeline_lock_manager
-        from services.work_execution_state import work_execution_tracker
-        from datetime import datetime, timedelta, timezone
-        import subprocess
-
-        try:
-            lock_manager = get_pipeline_lock_manager()
-            stale_threshold = datetime.now(timezone.utc) - timedelta(hours=2)
-
-            # Track cleanup counts for metrics
-            stale_locks_cleaned = 0
-            orphaned_states_cleaned = 0
-
-            # Get all locks
-            all_locks = lock_manager.get_all_locks()
-
-            for lock in all_locks:
-                try:
-                    # Parse lock acquired time
-                    lock_acquired_at = datetime.fromisoformat(
-                        lock.lock_acquired_at.replace('Z', '+00:00')
-                    )
-
-                    # Check if lock is stale (> 2 hours old)
-                    if lock_acquired_at < stale_threshold:
-                        # Verify no active container for this issue
-                        project_name = lock.project
-                        issue_number = lock.locked_by_issue
-
-                        # Check for active execution
-                        has_active = work_execution_tracker.has_active_execution(
-                            project_name, issue_number
-                        )
-
-                        if has_active:
-                            # Active work exists - don't clean lock
-                            logger.debug(
-                                f"Stale lock for {project_name}/#{issue_number} has active work, keeping lock"
-                            )
-                            continue
-
-                        # Check for running Docker container
-                        container_patterns = [
-                            f"agent-{project_name}-{issue_number}",
-                            f"repair-cycle-{project_name}-{issue_number}"
-                        ]
-
-                        container_running = False
-                        for pattern in container_patterns:
-                            result = subprocess.run(
-                                ['docker', 'ps', '--filter', f'name={pattern}', '--format', '{{.Names}}'],
-                                capture_output=True,
-                                text=True,
-                                timeout=5
-                            )
-                            if result.stdout.strip():
-                                container_running = True
-                                break
-
-                        if container_running:
-                            logger.debug(
-                                f"Stale lock for {project_name}/#{issue_number} has running container, keeping lock"
-                            )
-                            continue
-
-                        # No active work - clean stale lock
-                        logger.warning(
-                            f"🧹 RECONCILIATION: Cleaning stale lock for {project_name}/{lock.board} "
-                            f"issue #{issue_number} (age: {datetime.now(timezone.utc) - lock_acquired_at})"
-                        )
-
-                        lock_manager.release_lock(project_name, lock.board, issue_number)
-                        stale_locks_cleaned += 1
-
-                except Exception as e:
-                    logger.error(f"Error checking lock {lock}: {e}")
-                    continue
-
-            # Log reconciliation summary
-            if stale_locks_cleaned > 0 or orphaned_states_cleaned > 0:
-                logger.info(
-                    f"🧹 RECONCILIATION SUMMARY: Cleaned {stale_locks_cleaned} stale locks, "
-                    f"{orphaned_states_cleaned} orphaned states"
-                )
-
-                # Record metrics (if metrics system available)
-                try:
-                    from monitoring.metrics import get_metrics_client
-                    metrics = get_metrics_client()
-                    metrics.record_metric(
-                        'failsafe.reconciliation_stale_locks_cleaned',
-                        stale_locks_cleaned
-                    )
-                    metrics.record_metric(
-                        'failsafe.reconciliation_orphaned_states_cleaned',
-                        orphaned_states_cleaned
-                    )
-                except Exception:
-                    pass  # Metrics not critical, continue
-
-        except Exception as e:
-            logger.error(f"Error during state reconciliation: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
+        # No automatic cleanup during runtime - see docstring for reasoning
+        pass
 
     def _find_stalled_issues_for_pipeline(self, project_name: str, board_name: str):
         """
