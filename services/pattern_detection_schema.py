@@ -215,7 +215,7 @@ CLAUDE_STREAMS_MAPPING = {
             "tool_params_text": {"type": "text", "analyzer": "standard"},
             "success": {"type": "boolean"},
             "error_message": {"type": "text", "fields": {"keyword": {"type": "keyword", "ignore_above": 512}}},
-            "raw_event": {"type": "object", "enabled": True},  # Enable full event indexing
+            "raw_event": {"type": "object", "enabled": False},  # Store without indexing nested structure
             "pipeline_run_id": {"type": "keyword"}  # Link to pipeline run
         }
     },
