@@ -1717,7 +1717,8 @@ class DockerAgentRunner:
         project: str,
         issue_number: int,
         agent: str,
-        task_id: str
+        task_id: str,
+        column: str = 'unknown'
     ):
         """
         Reconnect to a running container after orchestrator restart.
@@ -1731,13 +1732,14 @@ class DockerAgentRunner:
             issue_number: Issue number
             agent: Agent name
             task_id: Task ID
+            column: Column name from execution history for proper state matching (default: 'unknown')
         """
         logger.info(f"Reconnecting to container {container_name}")
 
         # Spawn daemon thread to monitor container until exit
         monitoring_thread = threading.Thread(
             target=self._monitor_recovered_container,
-            args=(container_name, project, issue_number, agent, task_id),
+            args=(container_name, project, issue_number, agent, task_id, column),
             daemon=True
         )
         monitoring_thread.start()
@@ -1750,7 +1752,8 @@ class DockerAgentRunner:
         project: str,
         issue_number: int,
         agent: str,
-        task_id: str
+        task_id: str,
+        column: str = 'unknown'
     ):
         """
         Monitor a recovered container until it exits.
@@ -1764,6 +1767,7 @@ class DockerAgentRunner:
             issue_number: Issue number
             agent: Agent name
             task_id: Task ID
+            column: Column name for proper execution state matching (default: 'unknown')
         """
         try:
             logger.info(
@@ -1870,7 +1874,8 @@ class DockerAgentRunner:
                     agent=agent,
                     task_id=task_id,
                     exit_code=exit_code,
-                    output=output
+                    output=output,
+                    column=column
                 )
             else:
                 logger.error(
@@ -1881,7 +1886,7 @@ class DockerAgentRunner:
                 from services.work_execution_state import work_execution_tracker
                 work_execution_tracker.record_execution_outcome(
                     issue_number=issue_number,
-                    column='unknown',
+                    column=column,  # Use actual column instead of 'unknown'
                     agent=agent,
                     outcome='failed',
                     project_name=project,
@@ -1903,7 +1908,8 @@ class DockerAgentRunner:
         agent: str,
         task_id: str,
         exit_code: int,
-        output: str
+        output: str,
+        column: str = 'unknown'
     ):
         """
         Process completion of a recovered container.
@@ -1919,6 +1925,7 @@ class DockerAgentRunner:
             task_id: Task ID
             exit_code: Container exit code
             output: Agent output
+            column: Column name for proper execution state matching (default: 'unknown')
         """
         try:
             logger.info(
@@ -1964,7 +1971,7 @@ class DockerAgentRunner:
 
             work_execution_tracker.record_execution_outcome(
                 issue_number=issue_number,
-                column='unknown',  # We don't know which column anymore
+                column=column,  # Use actual column from execution history
                 agent=agent,
                 outcome=outcome,
                 project_name=project,

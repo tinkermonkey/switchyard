@@ -498,11 +498,15 @@ class AgentContainerRecovery:
                 if issue_number:
                     container_info['issue_number'] = str(issue_number)
 
-                # Get started_at from execution history if available
+                # Get started_at and column from execution history if available
+                column = 'unknown'  # Default if no execution history
                 if issue_number:
                     execution = self.check_execution_history(project, issue_number)
-                    if execution and 'timestamp' in execution:
-                        container_info['started_at'] = execution['timestamp']
+                    if execution:
+                        if 'timestamp' in execution:
+                            container_info['started_at'] = execution['timestamp']
+                        # Extract column to pass through recovery chain
+                        column = execution.get('column', 'unknown')
 
                 self.redis.hset(f'agent:container:{container_name}', mapping=container_info)
                 self.redis.expire(f'agent:container:{container_name}', 7200)
@@ -517,7 +521,8 @@ class AgentContainerRecovery:
                         project=project,
                         issue_number=issue_number,
                         agent=agent,
-                        task_id=task_id
+                        task_id=task_id,
+                        column=column  # Pass column for proper execution state matching
                     )
                     logger.info(f"✓ Recovered container with monitoring: {container_name}")
                 else:
