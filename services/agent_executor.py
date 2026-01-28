@@ -481,6 +481,8 @@ class AgentExecutor:
 
             # Record successful execution outcome
             # CRITICAL: Always try to record outcome to prevent stuck "in_progress" states
+            # Note: docker_runner also records outcome (for early recording before result processing)
+            # We check if it's already recorded to avoid double-recording errors
             if 'issue_number' in task_context:
                 from services.work_execution_state import work_execution_tracker
                 column = task_context.get('column', 'unknown')
@@ -492,13 +494,33 @@ class AgentExecutor:
                         f"(agent={agent_name}, project={project_name}). This may indicate a bug in task creation."
                     )
 
-                work_execution_tracker.record_execution_outcome(
-                    issue_number=task_context['issue_number'],
-                    column=column,
-                    agent=agent_name,
-                    outcome='success',
-                    project_name=project_name
-                )
+                # Check if docker_runner already recorded the outcome
+                # This prevents double-recording errors introduced by commit 0cd006a
+                # which fixed column matching (causing both recordings to target the same execution)
+                state = work_execution_tracker.load_state(project_name, task_context['issue_number'])
+                already_recorded = False
+
+                for execution in reversed(state.get('execution_history', [])):
+                    if (execution.get('column') == column and
+                        execution.get('agent') == agent_name and
+                        execution.get('outcome') in ['success', 'failure']):
+                        # Found a recent completed execution for this agent/column
+                        # docker_runner must have already recorded it
+                        already_recorded = True
+                        logger.debug(
+                            f"Execution outcome already recorded by docker_runner for "
+                            f"{project_name}/#{task_context['issue_number']} {agent_name} in {column}"
+                        )
+                        break
+
+                if not already_recorded:
+                    work_execution_tracker.record_execution_outcome(
+                        issue_number=task_context['issue_number'],
+                        column=column,
+                        agent=agent_name,
+                        outcome='success',
+                        project_name=project_name
+                    )
             else:
                 # Log warning if we can't record outcome due to missing context
                 logger.warning(
@@ -552,6 +574,8 @@ class AgentExecutor:
 
                 # Record failed execution outcome
                 # CRITICAL: Always try to record outcome to prevent stuck "in_progress" states
+                # Note: docker_runner also records outcome (for early recording before result processing)
+                # We check if it's already recorded to avoid double-recording errors
                 if 'issue_number' in task_context:
                     from services.work_execution_state import work_execution_tracker
                     column = task_context.get('column', 'unknown')
@@ -563,14 +587,33 @@ class AgentExecutor:
                             f"(agent={agent_name}, project={project_name}). This may indicate a bug in task creation."
                         )
 
-                    work_execution_tracker.record_execution_outcome(
-                        issue_number=task_context['issue_number'],
-                        column=column,
-                        agent=agent_name,
-                        outcome='failure',
-                        project_name=project_name,
-                        error=str(e)
-                    )
+                    # Check if docker_runner already recorded the outcome
+                    # This prevents double-recording errors introduced by commit 0cd006a
+                    state = work_execution_tracker.load_state(project_name, task_context['issue_number'])
+                    already_recorded = False
+
+                    for execution in reversed(state.get('execution_history', [])):
+                        if (execution.get('column') == column and
+                            execution.get('agent') == agent_name and
+                            execution.get('outcome') in ['success', 'failure']):
+                            # Found a recent completed execution for this agent/column
+                            # docker_runner must have already recorded it
+                            already_recorded = True
+                            logger.debug(
+                                f"Execution outcome already recorded by docker_runner for "
+                                f"{project_name}/#{task_context['issue_number']} {agent_name} in {column}"
+                            )
+                            break
+
+                    if not already_recorded:
+                        work_execution_tracker.record_execution_outcome(
+                            issue_number=task_context['issue_number'],
+                            column=column,
+                            agent=agent_name,
+                            outcome='failure',
+                            project_name=project_name,
+                            error=str(e)
+                        )
                 else:
                     # Log warning if we can't record outcome due to missing context
                     logger.warning(
