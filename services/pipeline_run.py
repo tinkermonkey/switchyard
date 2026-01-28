@@ -477,6 +477,54 @@ class PipelineRunManager:
                 board=board
             )
 
+    def get_pipeline_run(self, pipeline_run_id: str) -> Optional['PipelineRun']:
+        """
+        Get a pipeline run by ID from Redis or Elasticsearch.
+
+        This method is used to recover pipeline runs that may have been
+        created before a restart, checking both Redis (for recent runs)
+        and Elasticsearch (for older runs).
+
+        Args:
+            pipeline_run_id: The ID of the pipeline run to retrieve
+
+        Returns:
+            PipelineRun if found, None otherwise
+        """
+        # Try Redis first (fast path for recent runs < 2 hours old)
+        redis_key = f"orchestrator:pipeline_run:{pipeline_run_id}"
+        try:
+            run_data = self.redis.get(redis_key)
+            if run_data:
+                return PipelineRun(**json.loads(run_data))
+        except Exception as e:
+            logger.error(f"Failed to query Redis for pipeline run {pipeline_run_id}: {e}")
+
+        # Fallback to Elasticsearch (slow path, for runs > 2 hours old)
+        if self.es:
+            try:
+                result = self.es.search(
+                    index="pipeline-runs-*",
+                    body={
+                        "query": {
+                            "bool": {
+                                "must": [
+                                    {"term": {"id": pipeline_run_id}}
+                                ]
+                            }
+                        },
+                        "size": 1
+                    }
+                )
+
+                if result['hits']['total']['value'] > 0:
+                    hit = result['hits']['hits'][0]['_source']
+                    return PipelineRun(**hit)
+            except Exception as e:
+                logger.error(f"Failed to query Elasticsearch for pipeline run {pipeline_run_id}: {e}")
+
+        return None
+
     def ensure_pipeline_run_for_task(
         self,
         project: str,
@@ -961,7 +1009,37 @@ class PipelineRunManager:
                         )
                         kept_active_count += 1
                         continue
-                    
+
+                    # CRITICAL: Skip issues with active feedback loops
+                    # These are long-running conversational sessions that should keep their pipeline runs
+                    try:
+                        from services.human_feedback_loop import human_feedback_loop_executor
+
+                        if issue_number in human_feedback_loop_executor.active_loops:
+                            logger.info(
+                                f"Skipping cleanup for pipeline run {pipeline_run_id[:8]}... - "
+                                f"active feedback loop exists for {project} issue #{issue_number}"
+                            )
+                            kept_active_count += 1
+                            continue
+                    except Exception as e:
+                        # During testing or if module not available, skip this check
+                        logger.debug(f"Could not check active feedback loops: {e}")
+
+                    # Also check Redis lock for conversational loops (backup check)
+                    lock_key = f"orchestrator:conversational_loop:{project}:{issue_number}"
+                    try:
+                        if self.redis.exists(lock_key):
+                            logger.info(
+                                f"Skipping cleanup for pipeline run {pipeline_run_id[:8]}... - "
+                                f"conversational loop lock exists for {project} issue #{issue_number}"
+                            )
+                            kept_active_count += 1
+                            continue
+                    except Exception as e:
+                        # During testing or if Redis not available, skip this check
+                        logger.debug(f"Could not check conversational loop lock: {e}")
+
                     # Get project config
                     project_config = config_manager.get_project_config(project)
                     if not project_config:

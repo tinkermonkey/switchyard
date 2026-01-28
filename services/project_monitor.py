@@ -1860,6 +1860,7 @@ class ProjectMonitor:
 
                                     # Resume thread is monitoring - don't start fresh work
                                     already_handled = True
+                                    reason = "review_cycle_resumed"
 
                                 except Exception as e:
                                     logger.error(f"Failed to start review cycle resume thread: {e}")
@@ -1998,6 +1999,7 @@ class ProjectMonitor:
 
                                     # Resume thread is monitoring - don't start fresh work
                                     already_handled = True
+                                    reason = "feedback_loop_resumed"
 
                                 except Exception as e:
                                     logger.error(f"Failed to start conversational feedback loop thread: {e}")
@@ -2155,17 +2157,29 @@ class ProjectMonitor:
 
                         # ORIGINAL LOGIC: For all other skip reasons, clean up pipeline run as before
                         # (e.g., "already_processed_successfully", "skip_auto_progression_after_success")
+
+                        # CRITICAL: For feedback loop and review cycle resumes, keep the pipeline run active
+                        # These loops will use this pipeline_run_id for event tracking
+                        current_reason = reason if 'reason' in locals() else 'already handled'
+
+                        if current_reason in ("feedback_loop_resumed", "review_cycle_resumed"):
+                            logger.info(
+                                f"Pipeline run {pipeline_run.id if pipeline_run and hasattr(pipeline_run, 'id') else 'N/A'} "
+                                f"remains active for resumed {current_reason.replace('_', ' ')} on issue #{issue_number}"
+                            )
+                            return None
+
                         if pipeline_run and hasattr(pipeline_run, 'id'):
                             logger.info(
                                 f"Cleaning up pipeline run {pipeline_run.id} for issue #{issue_number} "
-                                f"(work skipped due to: {reason if 'reason' in locals() else 'already handled'})"
+                                f"(work skipped due to: {current_reason})"
                             )
 
                             # End the pipeline run
                             self.pipeline_run_manager.end_pipeline_run(
                                 project=project_name,
                                 issue_number=issue_number,
-                                reason=f"Skipped: {reason if 'reason' in locals() else 'already handled'}"
+                                reason=f"Skipped: {current_reason}"
                             )
 
                             # Release the pipeline lock
