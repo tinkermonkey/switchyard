@@ -54,10 +54,10 @@ class ScheduledTasksService:
             replace_existing=True
         )
 
-        # Schedule orphaned container cleanup - every 15 minutes
+        # Schedule orphaned container cleanup - every 20 minutes
         self.scheduler.add_job(
             self._cleanup_orphaned_containers,
-            trigger=CronTrigger(minute='*/15'),
+            trigger=CronTrigger(minute='*/20'),
             id='cleanup_orphaned_containers',
             name='Cleanup orphaned agent container tracking keys',
             replace_existing=True
@@ -81,10 +81,10 @@ class ScheduledTasksService:
             replace_existing=True
         )
 
-        # Schedule empty output detection - every 10 minutes
+        # Schedule empty output detection - every 15 minutes
         self.scheduler.add_job(
             self._detect_empty_outputs,
-            trigger=CronTrigger(minute='*/10'),
+            trigger=CronTrigger(minute='*/15'),
             id='detect_empty_outputs',
             name='Detect and retry executions with empty outputs',
             replace_existing=True
@@ -96,10 +96,10 @@ class ScheduledTasksService:
         logger.info("- Orphaned branch cleanup: Daily at 2 AM")
         logger.info("- Review learning pipeline: Daily at 3 AM")
         logger.info("- Stale branch checks: Daily at 9 AM")
-        logger.info("- Orphaned container cleanup: Every 15 minutes")
+        logger.info("- Orphaned container cleanup: Every 20 minutes")
         logger.info("- Docker state reconciliation: Every 5 minutes")
         logger.info("- Queue state reconciliation: Every 10 minutes")
-        logger.info("- Empty output detection: Every 10 minutes")
+        logger.info("- Empty output detection: Every 15 minutes")
 
     def stop(self):
         """Stop the scheduler"""
