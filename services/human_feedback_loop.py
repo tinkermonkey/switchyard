@@ -72,6 +72,27 @@ class HumanFeedbackLoopExecutor:
         self.active_loops = {}  # Track active loops by issue number
         self._initialized = False
 
+    def _update_loop_heartbeat(self, project_name: str, issue_number: int) -> None:
+        """
+        Update heartbeat timestamp for active feedback loop.
+
+        Used for monitoring loop health and detecting stuck loops.
+        Heartbeat is stored in Redis with a 5-minute TTL (10x poll interval for safety margin).
+        """
+        heartbeat_key = f"orchestrator:feedback_loop:heartbeat:{project_name}:{issue_number}"
+
+        try:
+            import redis
+            redis_client = redis.Redis(host='redis', port=6379, decode_responses=True)
+            redis_client.setex(
+                heartbeat_key,
+                300,  # 5 minute TTL (10x poll interval for safety margin)
+                datetime.utcnow().isoformat()
+            )
+        except Exception as e:
+            # Don't fail the loop if heartbeat update fails - it's just for monitoring
+            logger.warning(f"Failed to update feedback loop heartbeat for {project_name}#{issue_number}: {e}")
+
     async def initialize(self):
         """Initialize executor and clean up stale locks from previous orchestrator runs"""
         if self._initialized:
@@ -436,6 +457,14 @@ class HumanFeedbackLoopExecutor:
             except Exception as e:
                 logger.error(f"Failed to release distributed lock for issue #{issue_number}: {e}")
 
+            # Clean up heartbeat key
+            try:
+                heartbeat_key = f"orchestrator:feedback_loop:heartbeat:{project_name}:{issue_number}"
+                redis_client.delete(heartbeat_key)
+                logger.debug(f"Deleted heartbeat key: {heartbeat_key}")
+            except Exception as e:
+                logger.warning(f"Failed to delete heartbeat key for issue #{issue_number}: {e}")
+
     async def _conversational_loop(
         self,
         state: HumanFeedbackState,
@@ -558,6 +587,9 @@ class HumanFeedbackLoopExecutor:
         while True:
             await asyncio.sleep(poll_interval)
             poll_count += 1
+
+            # Update heartbeat in Redis for monitoring/stuck loop detection
+            self._update_loop_heartbeat(state.project_name, state.issue_number)
 
             # DEBUG: Log that we are polling
             if poll_count % 2 == 0:  # Log every minute

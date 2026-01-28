@@ -286,6 +286,8 @@ async def main():
                         # CRITICAL: Check if any container is ACTUALLY RUNNING for this issue
                         # Use Docker ps as source of truth (not Redis which can have stale data)
                         should_retrigger = True
+                        has_agent_container = False
+                        has_repair_container = False
 
                         import subprocess
                         try:
@@ -310,6 +312,7 @@ async def main():
                                     f"Found {len(running_containers)} running container(s) for issue #{lock.locked_by_issue}: "
                                     f"{', '.join(running_containers)} - skipping re-trigger (container still active)"
                                 )
+                                has_agent_container = True
                                 should_retrigger = False
 
                             # Also check for running repair cycle containers
@@ -326,12 +329,27 @@ async def main():
                                         f"Found running repair cycle container for issue #{lock.locked_by_issue} "
                                         f"- skipping re-trigger (container still active)"
                                     )
+                                    has_repair_container = True
                                     should_retrigger = False
                         except Exception as e:
                             logger.warning(f"Error checking Docker for running containers: {e}")
                             # If we can't check Docker, err on the side of retriggering
 
-                        # Re-trigger agent only if no container is running
+                        # Check for ALL types of active work (containers + loops + review cycles)
+                        # This prevents re-triggering work that's running as async tasks (like feedback loops)
+                        if should_retrigger:
+                            has_active_work = work_execution_tracker.has_active_execution(
+                                project_name=project_name,
+                                issue_number=lock.locked_by_issue
+                            )
+                            if has_active_work:
+                                logger.debug(
+                                    f"Skipping re-trigger for issue #{lock.locked_by_issue} - "
+                                    f"active work detected (non-container execution)"
+                                )
+                                should_retrigger = False
+
+                        # Re-trigger agent only if no active work is running
                         # (May have been interrupted mid-execution during restart)
                         if should_retrigger:
                             try:

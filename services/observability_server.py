@@ -1306,6 +1306,87 @@ def get_completed_pipeline_runs():
             'runs': []
         }), 500
 
+@app.route('/api/feedback-loops/active')
+def get_active_feedback_loops():
+    """
+    Get all active feedback loops with health status.
+
+    Returns information about feedback loops that are currently monitoring
+    for human feedback, including their health status based on heartbeat tracking.
+    """
+    try:
+        from services.human_feedback_loop import human_feedback_loop_executor
+        from datetime import datetime, timedelta
+        import redis
+
+        redis_client = redis.Redis(host='redis', port=6379, decode_responses=True)
+
+        active_loops = []
+
+        # Get all active loops from in-memory state
+        for issue_number, loop_state in human_feedback_loop_executor.active_loops.items():
+            # Get heartbeat timestamp from Redis
+            heartbeat_key = f"orchestrator:feedback_loop:heartbeat:{loop_state.project_name}:{issue_number}"
+            last_heartbeat_str = redis_client.get(heartbeat_key)
+
+            # Calculate health status based on heartbeat age
+            health = "unknown"
+            last_heartbeat = None
+            heartbeat_age_seconds = None
+
+            if last_heartbeat_str:
+                try:
+                    last_heartbeat = datetime.fromisoformat(last_heartbeat_str)
+                    heartbeat_age = datetime.utcnow() - last_heartbeat
+                    heartbeat_age_seconds = heartbeat_age.total_seconds()
+
+                    # Health thresholds (poll interval is 30s)
+                    if heartbeat_age_seconds < 120:  # < 2 minutes (4x poll interval)
+                        health = "healthy"
+                    elif heartbeat_age_seconds < 600:  # < 10 minutes (20x poll interval)
+                        health = "stale"
+                    else:  # >= 10 minutes
+                        health = "stuck"
+                except ValueError:
+                    health = "unknown"
+            else:
+                # No heartbeat found (may be new loop that hasn't polled yet)
+                health = "unknown"
+
+            active_loops.append({
+                "issue_number": issue_number,
+                "project": loop_state.project_name,
+                "agent": loop_state.agent,
+                "workspace_type": loop_state.workspace_type,
+                "discussion_id": loop_state.discussion_id,
+                "pipeline_run_id": loop_state.pipeline_run_id,
+                "started_at": loop_state.created_at,
+                "last_heartbeat": last_heartbeat.isoformat() if last_heartbeat else None,
+                "heartbeat_age_seconds": heartbeat_age_seconds,
+                "current_iteration": loop_state.current_iteration,
+                "health": health
+            })
+
+        # Sort by health (stuck first, then stale, then healthy)
+        health_priority = {"stuck": 0, "stale": 1, "unknown": 2, "healthy": 3}
+        active_loops.sort(key=lambda x: (health_priority.get(x["health"], 99), x["project"], x["issue_number"]))
+
+        return jsonify({
+            'success': True,
+            'active_loops': active_loops,
+            'count': len(active_loops)
+        })
+
+    except Exception as e:
+        logger.error(f"Error fetching active feedback loops: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return jsonify({
+            'success': False,
+            'error': str(e),
+            'active_loops': []
+        }), 500
+
 @app.route('/api/agent-execution/<execution_id>')
 def get_agent_execution(execution_id):
     """Get details for a specific agent execution"""
