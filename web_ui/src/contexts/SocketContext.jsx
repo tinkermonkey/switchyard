@@ -123,7 +123,27 @@ export function SocketProvider({ children }) {
         hasEvent: !!data.event
       })
       */
-      setLogs(prev => [...prev, data].slice(-200))
+      setLogs(prev => {
+        // Deduplicate: check if this event already exists
+        // Use timestamp + agent + event content for uniqueness
+        const newEventKey = `${data.timestamp}-${data.agent}-${data.event?.type}-${data.event?.message?.id}`
+
+        const isDuplicate = prev.some(existing => {
+          const existingKey = `${existing.timestamp}-${existing.agent}-${existing.event?.type}-${existing.event?.message?.id}`
+          return existingKey === newEventKey
+        })
+
+        if (isDuplicate) {
+          console.log('[SocketContext] 🚫 Dropping duplicate claude_stream_event:', {
+            timestamp: data.timestamp,
+            agent: data.agent,
+            messageId: data.event?.message?.id?.substring(0, 20)
+          })
+          return prev  // Don't add duplicate
+        }
+
+        return [...prev, data].slice(-200)
+      })
     })
 
     setSocket(socketInstance)
