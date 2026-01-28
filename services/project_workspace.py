@@ -157,23 +157,13 @@ class ProjectWorkspaceManager:
             )
 
             current_branch = result.stdout.strip()
+            logger.info(f"Repository is on branch: {current_branch}")
 
-            # If not on desired branch, checkout
-            if current_branch != branch:
-                logger.info(f"Switching from {current_branch} to {branch}")
-                result = subprocess.run(
-                    ['git', 'checkout', branch],
-                    cwd=repo_dir,
-                    capture_output=True,
-                    text=True,
-                    timeout=30
-                )
-
-                if result.returncode != 0:
-                    logger.warning(f"Git checkout failed: {result.stderr}")
-                    return
-
-            # Pull latest changes
+            # Pull latest changes for whatever branch is currently checked out
+            # Note: We don't force a branch switch here because:
+            # 1. Agents always prepare the correct branch when they launch
+            # 2. Forcing to default branch can destroy state and cause timing issues
+            # 3. Projects may legitimately be on feature branches between agent runs
             result = subprocess.run(
                 ['git', 'pull', '--ff-only'],
                 cwd=repo_dir,
