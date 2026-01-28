@@ -134,11 +134,6 @@ export function SocketProvider({ children }) {
         })
 
         if (isDuplicate) {
-          console.log('[SocketContext] 🚫 Dropping duplicate claude_stream_event:', {
-            timestamp: data.timestamp,
-            agent: data.agent,
-            messageId: data.event?.message?.id?.substring(0, 20)
-          })
           return prev  // Don't add duplicate
         }
 

@@ -1911,6 +1911,42 @@ class ProjectMonitor:
                                                 human_feedback_loop_executor.initialize()
                                             )
 
+                                            # Load persisted session for continuity across restarts
+                                            from services.conversational_session_state import conversational_session_state
+                                            persisted_session = conversational_session_state.load_session(
+                                                project_name=project_name,
+                                                issue_number=issue_number,
+                                                max_age_hours=24
+                                            )
+
+                                            # Attempt to recover pipeline run from persisted session
+                                            recovered_pipeline_run_id = None
+                                            if persisted_session and persisted_session.pipeline_run_id:
+                                                # Check if old pipeline run still exists and is active
+                                                old_run = self.pipeline_run_manager.get_pipeline_run(
+                                                    persisted_session.pipeline_run_id
+                                                )
+                                                if old_run and old_run.status == 'active':
+                                                    # Reuse existing active pipeline run
+                                                    recovered_pipeline_run_id = persisted_session.pipeline_run_id
+                                                    logger.info(
+                                                        f"Recovered active pipeline run {recovered_pipeline_run_id} "
+                                                        f"for feedback loop #{issue_number}"
+                                                    )
+                                                elif old_run:
+                                                    logger.info(
+                                                        f"Found pipeline run {persisted_session.pipeline_run_id} but status is "
+                                                        f"{old_run.status}, will create new one"
+                                                    )
+                                                else:
+                                                    logger.info(
+                                                        f"Pipeline run {persisted_session.pipeline_run_id} not found "
+                                                        f"(likely expired from Redis), will create new one"
+                                                    )
+
+                                            # If no recovered run, use the current pipeline_run (created at line 1646)
+                                            final_pipeline_run_id = recovered_pipeline_run_id or pipeline_run.id
+
                                             # Just start monitoring - no initial execution needed
                                             from services.human_feedback_loop import HumanFeedbackState
 
@@ -1922,16 +1958,10 @@ class ProjectMonitor:
                                                 board_name=board_name,
                                                 workspace_type=workspace_type,
                                                 discussion_id=discussion_id,
-                                                pipeline_run_id=pipeline_run.id
+                                                pipeline_run_id=final_pipeline_run_id
                                             )
 
-                                            # Load persisted session_id for continuity across restarts
-                                            from services.conversational_session_state import conversational_session_state
-                                            persisted_session = conversational_session_state.load_session(
-                                                project_name=project_name,
-                                                issue_number=issue_number,
-                                                max_age_hours=24
-                                            )
+                                            # Restore session_id if available
                                             if persisted_session:
                                                 state.claude_session_id = persisted_session.session_id
                                                 logger.info(f"Restored Claude Code session for #{issue_number}: {state.claude_session_id}")

@@ -106,22 +106,10 @@ export const mergeAgentExecutionEvents = (apiLogs, webSocketEvents, executionDat
   // Merge arrays
   const allEvents = [...logs, ...convertedWebSocketLogs]
 
-  console.log('[EventMerging] Before deduplication:', {
-    totalEvents: allEvents.length,
-    apiLogs: logs.length,
-    convertedWS: convertedWebSocketLogs.length,
-    sampleKeys: allEvents.slice(0, 3).map(log => {
-      const event = log.event || log.raw_event?.event
-      const msgId = event?.message?.id || 'no-id'
-      return `${log.timestamp}-${msgId.substring(0, 20)}`
-    })
-  })
-
   // Deduplicate using unique keys to prevent duplicate log entries
-  // This is necessary because merging happens on every WebSocket event,
-  // and without deduplication, previously merged events would be re-included
+  // This provides defense-in-depth even though the root cause (Elasticsearch mapping) is fixed
   const seenKeys = new Set()
-  const deduplicated = allEvents.filter((log, index) => {
+  const deduplicated = allEvents.filter((log) => {
     // CRITICAL: Normalize timestamp to number for consistent key generation
     // Timestamps can be ISO strings or Unix timestamps - normalize to Unix timestamp
     const normalizedTs = normalizeTimestamp(log.timestamp)
@@ -143,38 +131,11 @@ export const mergeAgentExecutionEvents = (apiLogs, webSocketEvents, executionDat
     // Use normalized timestamp and logAgent in key for consistency
     const key = `${normalizedTs}-${logAgent}-${logTaskId}-${eventType}-${contentHash}`
 
-    // Debug first few items
-    if (index < 3) {
-      console.log(`[EventMerging] Key ${index}:`, {
-        key: key.substring(0, 120),
-        normalizedTs,
-        rawTimestamp: log.timestamp,
-        logAgent,
-        logTaskId: logTaskId.substring(0, 50),
-        eventType,
-        contentHash: contentHash.substring(0, 50)
-      })
-    }
-
     if (seenKeys.has(key)) {
-      console.log('[EventMerging] 🚫 Filtering duplicate log:', {
-        key: key.substring(0, 100),
-        normalizedTs,
-        rawTimestamp: log.timestamp,
-        logAgent,
-        logTaskId: logTaskId.substring(0, 50),
-        contentHash: contentHash.substring(0, 50)
-      })
       return false // Skip duplicate
     }
     seenKeys.add(key)
     return true
-  })
-
-  console.log('[EventMerging] After deduplication:', {
-    before: allEvents.length,
-    after: deduplicated.length,
-    removed: allEvents.length - deduplicated.length
   })
 
   // Sort by timestamp

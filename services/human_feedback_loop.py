@@ -876,7 +876,8 @@ class HumanFeedbackLoopExecutor:
                 issue_number=state.issue_number,
                 session_id=state.claude_session_id,
                 agent=state.agent,
-                workspace_type=state.workspace_type
+                workspace_type=state.workspace_type,
+                pipeline_run_id=state.pipeline_run_id
             )
         else:
             # Update last_interaction timestamp even if no new session_id

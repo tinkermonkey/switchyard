@@ -24,7 +24,8 @@ class ConversationalSessionState:
         agent: str,
         project_name: str,
         last_interaction: str,
-        workspace_type: str = 'issues'
+        workspace_type: str = 'issues',
+        pipeline_run_id: str = None
     ):
         self.session_id = session_id
         self.issue_number = issue_number
@@ -32,6 +33,7 @@ class ConversationalSessionState:
         self.project_name = project_name
         self.last_interaction = last_interaction
         self.workspace_type = workspace_type
+        self.pipeline_run_id = pipeline_run_id
 
 
 class ConversationalSessionStateManager:
@@ -61,7 +63,8 @@ class ConversationalSessionStateManager:
         issue_number: int,
         session_id: str,
         agent: str,
-        workspace_type: str = 'issues'
+        workspace_type: str = 'issues',
+        pipeline_run_id: str = None
     ):
         """
         Save or update a conversational session state
@@ -72,6 +75,7 @@ class ConversationalSessionStateManager:
             session_id: Claude Code session ID
             agent: Agent name
             workspace_type: 'issues' or 'discussions'
+            pipeline_run_id: Pipeline run ID for this session
         """
         state_file = self.get_state_file(project_name, issue_number)
 
@@ -81,6 +85,7 @@ class ConversationalSessionStateManager:
             'agent': agent,
             'project_name': project_name,
             'workspace_type': workspace_type,
+            'pipeline_run_id': pipeline_run_id,
             'last_interaction': datetime.now(timezone.utc).isoformat(),
             'updated_at': datetime.now(timezone.utc).isoformat()
         }
@@ -143,7 +148,8 @@ class ConversationalSessionStateManager:
                 agent=state['agent'],
                 project_name=state['project_name'],
                 last_interaction=state['last_interaction'],
-                workspace_type=state.get('workspace_type', 'issues')
+                workspace_type=state.get('workspace_type', 'issues'),
+                pipeline_run_id=state.get('pipeline_run_id')
             )
 
         except Exception as e:
@@ -216,7 +222,8 @@ class ConversationalSessionStateManager:
                     agent=state['agent'],
                     project_name=state['project_name'],
                     last_interaction=state['last_interaction'],
-                    workspace_type=state.get('workspace_type', 'issues')
+                    workspace_type=state.get('workspace_type', 'issues'),
+                    pipeline_run_id=state.get('pipeline_run_id')
                 )
             except Exception as e:
                 logger.error(f"Failed to load session from {state_file}: {e}")
