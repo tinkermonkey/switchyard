@@ -319,28 +319,19 @@ Make sure to:
         """
         sub_issues = []
 
-        # Find the sub-issues section
-        section_match = re.search(
-            r'## Sub-Issues to Create\s*\n(.*?)(?=\n## |\Z)',
-            markdown,
-            re.DOTALL | re.IGNORECASE
-        )
+        # Extract the sub-issues section using code-fence-aware parsing.
+        # The previous regex approach failed when ## headers appeared inside
+        # code blocks (e.g., changelog examples), prematurely truncating the section.
+        section_content = self._extract_sub_issues_section(markdown)
 
-        if not section_match:
+        if not section_content:
             logger.warning("No 'Sub-Issues to Create' section found in output")
             return sub_issues
 
-        section_content = section_match.group(1)
+        # Split by phase markers using code-fence-aware parsing
+        phases = self._split_phases(section_content)
 
-        # Split by phase markers (### Phase N...)
-        # Relaxed pattern: Allow optional colon, hyphen, or just space
-        # Also handle the lookahead for the next phase more flexibly
-        phase_pattern = r'### (Phase \d+.*?)\n(.*?)(?=\n### Phase \d+|\Z)'
-        phase_matches = re.finditer(phase_pattern, section_content, re.DOTALL | re.IGNORECASE)
-
-        for phase_match in phase_matches:
-            phase_title = phase_match.group(1).strip()
-            phase_content = phase_match.group(2).strip()
+        for phase_title, phase_content in phases:
 
             # Extract fields - capture full content including formatting
             title = self._extract_field(phase_content, 'Title', default=phase_title)
@@ -398,6 +389,85 @@ Make sure to:
 
         logger.info(f"Parsed {len(sub_issues)} sub-issues from output")
         return sub_issues
+
+    @staticmethod
+    def _is_code_fence(line: str) -> bool:
+        """Check if a line is a code fence boundary (``` or ~~~)."""
+        stripped = line.strip()
+        return stripped.startswith('```') or stripped.startswith('~~~')
+
+    def _extract_sub_issues_section(self, markdown: str) -> str:
+        """
+        Extract the 'Sub-Issues to Create' section content from markdown.
+
+        Walks line-by-line tracking code fence state so that ## headers inside
+        fenced code blocks (e.g., changelog examples) do not prematurely
+        terminate the section.
+        """
+        lines = markdown.split('\n')
+        in_code_fence = False
+        section_start = None
+
+        for i, line in enumerate(lines):
+            if self._is_code_fence(line):
+                in_code_fence = not in_code_fence
+                continue
+
+            if in_code_fence:
+                continue
+
+            if section_start is None:
+                # Look for the target section header
+                if re.match(r'^##\s+Sub-Issues to Create', line, re.IGNORECASE):
+                    section_start = i + 1
+            else:
+                # Next H2 header outside a code fence ends the section.
+                # ^##\s+ matches "## X" but NOT "### X" (third char would be #, not space).
+                if re.match(r'^##\s+', line):
+                    return '\n'.join(lines[section_start:i])
+
+        if section_start is not None:
+            return '\n'.join(lines[section_start:])
+        return ''
+
+    def _split_phases(self, section_content: str) -> list:
+        """
+        Split section content into phases by ``### Phase N`` headers.
+
+        Uses the same code-fence-aware line walking as _extract_sub_issues_section
+        so that ### Phase headers inside code blocks are not treated as boundaries.
+
+        Returns:
+            List of (phase_title, phase_content) tuples.
+        """
+        lines = section_content.split('\n')
+        in_code_fence = False
+        phases = []
+        current_title = None
+        current_start = None
+
+        for i, line in enumerate(lines):
+            if self._is_code_fence(line):
+                in_code_fence = not in_code_fence
+                continue
+
+            if in_code_fence:
+                continue
+
+            phase_match = re.match(r'^###\s+(Phase\s+\d+.*)', line, re.IGNORECASE)
+            if phase_match:
+                if current_title is not None:
+                    content = '\n'.join(lines[current_start:i]).strip()
+                    phases.append((current_title, content))
+                current_title = phase_match.group(1).strip()
+                current_start = i + 1
+
+        # Capture the last phase
+        if current_title is not None:
+            content = '\n'.join(lines[current_start:]).strip()
+            phases.append((current_title, content))
+
+        return phases
 
     def _extract_field(self, content: str, field_name: str, default: str = '') -> str:
         """
