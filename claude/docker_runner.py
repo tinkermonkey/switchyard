@@ -560,11 +560,14 @@ class DockerAgentRunner:
         ])
 
         # Add optional labels if available
-        issue_number = context.get('issue_number')
+        # Note: issue_number and pipeline_run_id live inside the nested task_context
+        # (context['context']), not at the top level. Check both for backwards compatibility.
+        task_context = context.get('context', {})
+        issue_number = task_context.get('issue_number') or context.get('issue_number')
         if issue_number:
             cmd.extend(['--label', f'org.clauditoreum.issue_number={issue_number}'])
-            
-        pipeline_run_id = context.get('pipeline_run_id')
+
+        pipeline_run_id = task_context.get('pipeline_run_id') or context.get('pipeline_run_id')
         if pipeline_run_id:
             cmd.extend(['--label', f'org.clauditoreum.pipeline_run_id={pipeline_run_id}'])
 
@@ -685,14 +688,17 @@ class DockerAgentRunner:
         else:
             logger.warning("No authentication token found - agent will likely fail")
 
-        # NEW: Redis connection info for direct container writes (container-side Redis communication)
+        # Redis connection info for direct container writes (container-side Redis communication)
+        # Note: issue_number lives inside nested task_context, not top-level context
+        task_ctx = context.get('context', {})
+        resolved_issue_number = task_ctx.get('issue_number') or context.get('issue_number', 'unknown')
         cmd.extend([
             '-e', 'REDIS_HOST=redis',
             '-e', 'REDIS_PORT=6379',
             '-e', f'AGENT={agent}',
             '-e', f'TASK_ID={context.get("task_id", "unknown")}',
             '-e', f'PROJECT={context.get("project", "unknown")}',
-            '-e', f'ISSUE_NUMBER={context.get("issue_number", "unknown")}',
+            '-e', f'ISSUE_NUMBER={resolved_issue_number}',
         ])
 
         # Special handling for dev_environment_setup agent: mount Docker socket for image building
