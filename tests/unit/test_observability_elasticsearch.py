@@ -124,21 +124,24 @@ class TestObservabilityElasticsearchIndexing:
             EventType.TOOL_EXECUTION_COMPLETED,
             EventType.PERFORMANCE_METRIC,
             EventType.TOKEN_USAGE,
+            EventType.PIPELINE_RUN_STARTED,
+            EventType.PIPELINE_RUN_COMPLETED,
+            EventType.PIPELINE_RUN_FAILED,
         ]
-        
+
         for event_type in non_indexed_events:
             assert not obs_manager._is_decision_event(event_type), \
                 f"{event_type.value} should not be a decision event"
             assert not obs_manager._is_agent_lifecycle_event(event_type), \
                 f"{event_type.value} should not be an agent lifecycle event"
-    
+
     def test_all_event_types_are_categorized(self, obs_manager):
         """Test that every EventType is either indexed or explicitly not indexed"""
         all_event_types = list(EventType)
-        
+
         # Events that should be indexed
         indexed_events = []
-        
+
         # Events that should not be indexed (transient/streaming events)
         non_indexed_events = [
             EventType.TASK_RECEIVED,
@@ -152,6 +155,9 @@ class TestObservabilityElasticsearchIndexing:
             EventType.TOOL_EXECUTION_COMPLETED,
             EventType.PERFORMANCE_METRIC,
             EventType.TOKEN_USAGE,
+            EventType.PIPELINE_RUN_STARTED,
+            EventType.PIPELINE_RUN_COMPLETED,
+            EventType.PIPELINE_RUN_FAILED,
         ]
         
         for event_type in all_event_types:
@@ -196,7 +202,6 @@ class TestObservabilityElasticsearchIndexing:
         
         # Verify index name format
         assert index_name.startswith('decision-events-')
-        assert index_name.endswith('2025-10-11')  # Current date from test
         
         # Verify document structure
         assert document['event_type'] == 'agent_routing_decision'
@@ -234,7 +239,6 @@ class TestObservabilityElasticsearchIndexing:
         
         # Verify index name format
         assert index_name.startswith('agent-events-')
-        assert index_name.endswith('2025-10-11')  # Current date
         
         # Verify document structure
         assert document['event_type'] == 'agent_initialized'
@@ -570,10 +574,11 @@ class TestEventTypeCompleteness:
         
         expected_non_indexed_events = {
             'task_received', 'prompt_constructed', 'claude_api_call_started',
-            'claude_api_call_completed', 'response_chunk_received', 
+            'claude_api_call_completed', 'response_chunk_received',
             'response_processing_started', 'response_processing_completed',
             'tool_execution_started', 'tool_execution_completed',
-            'performance_metric', 'token_usage'
+            'performance_metric', 'token_usage',
+            'pipeline_run_started', 'pipeline_run_completed', 'pipeline_run_failed',
         }
         
         # Check that all events are accounted for

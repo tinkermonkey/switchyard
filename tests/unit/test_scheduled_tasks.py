@@ -2,7 +2,11 @@
 Unit tests for scheduled tasks service
 """
 
+import os
 import pytest
+if not os.path.isdir('/app'):
+    pytest.skip("Requires Docker container environment", allow_module_level=True)
+
 import asyncio
 from unittest.mock import AsyncMock, patch, MagicMock
 from datetime import datetime

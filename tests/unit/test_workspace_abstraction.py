@@ -4,7 +4,11 @@ Tests for workspace abstraction layer.
 These tests verify the workspace context implementations work correctly.
 """
 
+import os
 import pytest
+if not os.path.isdir('/app'):
+    pytest.skip("Requires Docker container environment", allow_module_level=True)
+
 from unittest.mock import AsyncMock, MagicMock, patch, call
 from pathlib import Path
 

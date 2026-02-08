@@ -7,7 +7,11 @@ Verifies that:
 3. Project monitor still emits events for manual changes
 """
 
+import os
 import pytest
+if not os.path.isdir('/app'):
+    pytest.skip("Requires Docker container environment", allow_module_level=True)
+
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 import tempfile

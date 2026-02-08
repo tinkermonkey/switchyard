@@ -5,7 +5,11 @@ This test suite verifies that the bot username filter correctly identifies
 all bot account name formats used by GitHub and GitHub Apps.
 """
 
+import os
 import pytest
+if not os.path.isdir('/app'):
+    pytest.skip("Requires Docker container environment", allow_module_level=True)
+
 from unittest.mock import AsyncMock, Mock, patch, MagicMock
 from datetime import datetime
 

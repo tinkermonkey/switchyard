@@ -44,12 +44,6 @@ class AutoCommitService:
             return False
 
         try:
-            # Check if there are changes to commit
-            has_changes = self._check_for_changes(project_dir)
-            if not has_changes:
-                logger.info(f"No changes to commit for {project} after {agent} execution")
-                return True  # Not an error, just no changes
-
             # Ensure we're on a feature branch (not main/master)
             current_branch = self._get_current_branch(project_dir)
             if current_branch in ['main', 'master']:
@@ -59,25 +53,30 @@ class AutoCommitService:
                 logger.error(f"Auto-commit REFUSED to create emergency branch - this would bypass parent/sub-issue logic")
                 return False
 
-            # Stage all changes
-            self._stage_changes(project_dir)
+            # Check if there are changes to commit
+            has_changes = self._check_for_changes(project_dir)
 
-            # Create commit message
-            if custom_message:
-                commit_message = custom_message
+            if has_changes:
+                # Stage all changes
+                self._stage_changes(project_dir)
+
+                # Create commit message
+                if custom_message:
+                    commit_message = custom_message
+                else:
+                    commit_message = self._generate_commit_message(agent, task_id, issue_number)
+
+                # Commit
+                success = self._commit(project_dir, commit_message)
+                if not success:
+                    logger.error("Failed to commit changes")
+                    return False
+
+                logger.info(f"Successfully committed changes for {project} (agent: {agent})")
             else:
-                commit_message = self._generate_commit_message(agent, task_id, issue_number)
+                logger.info(f"No changes to commit for {project} after {agent} execution")
 
-            # Commit
-            success = self._commit(project_dir, commit_message)
-            if not success:
-                logger.error("Failed to commit changes")
-                return False
-
-            logger.info(f"Successfully committed changes for {project} (agent: {agent})")
-
-            # Push branch to remote
-            current_branch = self._get_current_branch(project_dir)
+            # Always push branch to remote (even if no new commits, there may be unpushed commits)
             if current_branch and current_branch not in ['main', 'master']:
                 push_success = self._push_branch(project_dir, current_branch)
                 if push_success:

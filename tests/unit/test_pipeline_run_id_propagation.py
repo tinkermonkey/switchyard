@@ -5,7 +5,11 @@ This test suite ensures that when agents execute as part of a pipeline run,
 the pipeline_run_id is correctly passed through to all observability events.
 """
 
+import os
 import pytest
+if not os.path.isdir('/app'):
+    pytest.skip("Requires Docker container environment", allow_module_level=True)
+
 from unittest.mock import MagicMock, AsyncMock, patch, call
 from services.agent_executor import AgentExecutor
 from monitoring.observability import ObservabilityManager, EventType

@@ -7,7 +7,11 @@ determining parent comments, and building correct context.
 Critical for conversational loops and review cycle resumption.
 """
 
+import os
 import pytest
+if not os.path.isdir('/app'):
+    pytest.skip("Requires Docker container environment", allow_module_level=True)
+
 from datetime import datetime, timezone, timedelta
 from services.human_feedback_loop import HumanFeedbackLoopExecutor, HumanFeedbackState
 

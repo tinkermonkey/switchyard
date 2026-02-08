@@ -14,6 +14,11 @@ from services.github_api_client import get_github_client
 
 logger = logging.getLogger(__name__)
 
+# GitHub's hard limit is 65,536 characters per comment body.
+# Use a buffer to account for any encoding overhead.
+GITHUB_MAX_COMMENT_LENGTH = 65000
+
+
 class GitHubIntegration:
     """Handles GitHub API interactions for agent collaboration"""
 
@@ -46,26 +51,102 @@ class GitHubIntegration:
 
         return env
 
+    @staticmethod
+    def _split_oversized_comment(comment: str, max_length: int = GITHUB_MAX_COMMENT_LENGTH) -> List[str]:
+        """
+        Split a comment into chunks that fit within GitHub's character limit.
+
+        Tries to break at the last newline before the limit to avoid mid-line splits.
+        Adds part headers and continuation footers to multi-part comments.
+
+        Returns a single-element list if the comment fits within the limit.
+        """
+        if len(comment) <= max_length:
+            return [comment]
+
+        chunks = []
+        remaining = comment
+
+        while remaining:
+            if len(remaining) <= max_length:
+                chunks.append(remaining)
+                break
+
+            # Reserve space for the part header/footer we'll add later.
+            # Header: "**(Part N/M)**\n\n" — estimate ~20 chars
+            # Footer: "\n\n---\n*Continued in next comment...*" — 37 chars
+            overhead = 60
+            effective_limit = max(max_length - overhead, max_length // 2)
+
+            # Find the last newline before the effective limit
+            split_pos = remaining.rfind('\n', 0, effective_limit)
+
+            if split_pos <= 0:
+                # No newline found; hard-split at the effective limit
+                split_pos = effective_limit
+
+            chunks.append(remaining[:split_pos])
+            remaining = remaining[split_pos:].lstrip('\n')
+
+        # If we only ended up with one chunk after all, just return it
+        if len(chunks) == 1:
+            return chunks
+
+        # Add part headers and continuation footers
+        total = len(chunks)
+        result = []
+        for i, chunk in enumerate(chunks):
+            part_num = i + 1
+            header = f"**(Part {part_num}/{total})**\n\n"
+            if part_num < total:
+                footer = "\n\n---\n*Continued in next comment...*"
+                result.append(header + chunk + footer)
+            else:
+                result.append(header + chunk)
+
+        return result
+
     async def post_issue_comment(self, issue_number: int, comment: str, repo: Optional[str] = None) -> Dict[str, Any]:
-        """Post a comment to a GitHub issue using REST API with rate limiting"""
+        """Post a comment to a GitHub issue using REST API with rate limiting.
+
+        If the comment exceeds GitHub's character limit, it is automatically
+        split into multiple sequential comments.
+        """
         try:
             repo_name = repo or self.repo_name
             endpoint = f"/repos/{self.github_org}/{repo_name}/issues/{issue_number}/comments"
-            
-            success, response = get_github_client().rest(
-                method='POST',
-                endpoint=endpoint,
-                data={'body': comment}
-            )
-            
-            if not success:
-                logger.error(f"Failed to post issue comment: {response}")
-                return {'success': False, 'error': response.get('error', 'Unknown error')}
-            
+
+            chunks = self._split_oversized_comment(comment)
+            if len(chunks) > 1:
+                logger.warning(
+                    f"Comment for issue #{issue_number} exceeds GitHub limit "
+                    f"({len(comment)} chars). Splitting into {len(chunks)} parts."
+                )
+
+            first_result = None
+            for i, chunk in enumerate(chunks):
+                success, response = get_github_client().rest(
+                    method='POST',
+                    endpoint=endpoint,
+                    data={'body': chunk}
+                )
+
+                if not success:
+                    logger.error(f"Failed to post issue comment (part {i+1}/{len(chunks)}): {response}")
+                    # If the first chunk failed, report failure
+                    if first_result is None:
+                        return {'success': False, 'error': response.get('error', 'Unknown error')}
+                    # If a later chunk failed, still return success for the first
+                    logger.warning(f"Partial post: {i}/{len(chunks)} parts posted for issue #{issue_number}")
+                    break
+
+                if first_result is None:
+                    first_result = response
+
             return {
                 'success': True,
-                'html_url': response.get('html_url'),
-                'id': response.get('id')
+                'html_url': first_result.get('html_url'),
+                'id': first_result.get('id')
             }
 
         except Exception as e:
@@ -73,26 +154,45 @@ class GitHubIntegration:
             return {'success': False, 'error': str(e)}
 
     async def post_pr_comment(self, pr_number: int, comment: str, repo: Optional[str] = None) -> Dict[str, Any]:
-        """Post a comment to a GitHub pull request using REST API with rate limiting"""
+        """Post a comment to a GitHub pull request using REST API with rate limiting.
+
+        If the comment exceeds GitHub's character limit, it is automatically
+        split into multiple sequential comments.
+        """
         try:
             repo_name = repo or self.repo_name
             # PR comments are posted to issues endpoint (PRs are issues in GitHub API)
             endpoint = f"/repos/{self.github_org}/{repo_name}/issues/{pr_number}/comments"
-            
-            success, response = get_github_client().rest(
-                method='POST',
-                endpoint=endpoint,
-                data={'body': comment}
-            )
-            
-            if not success:
-                logger.error(f"Failed to post PR comment: {response}")
-                return {'success': False, 'error': response.get('error', 'Unknown error')}
-            
+
+            chunks = self._split_oversized_comment(comment)
+            if len(chunks) > 1:
+                logger.warning(
+                    f"Comment for PR #{pr_number} exceeds GitHub limit "
+                    f"({len(comment)} chars). Splitting into {len(chunks)} parts."
+                )
+
+            first_result = None
+            for i, chunk in enumerate(chunks):
+                success, response = get_github_client().rest(
+                    method='POST',
+                    endpoint=endpoint,
+                    data={'body': chunk}
+                )
+
+                if not success:
+                    logger.error(f"Failed to post PR comment (part {i+1}/{len(chunks)}): {response}")
+                    if first_result is None:
+                        return {'success': False, 'error': response.get('error', 'Unknown error')}
+                    logger.warning(f"Partial post: {i}/{len(chunks)} parts posted for PR #{pr_number}")
+                    break
+
+                if first_result is None:
+                    first_result = response
+
             return {
                 'success': True,
-                'html_url': response.get('html_url'),
-                'id': response.get('id')
+                'html_url': first_result.get('html_url'),
+                'id': first_result.get('id')
             }
 
         except Exception as e:
@@ -522,7 +622,12 @@ class GitHubIntegration:
 
     async def _post_discussion_comment(self, context: Dict[str, Any], comment: str,
                                       reply_to_id: Optional[str] = None) -> Dict[str, Any]:
-        """Post comment to a GitHub Discussion"""
+        """Post comment to a GitHub Discussion.
+
+        If the comment exceeds GitHub's character limit, it is automatically
+        split into multiple sequential comments. Only the first chunk uses
+        reply_to_id for threading; subsequent chunks are top-level comments.
+        """
         try:
             from services.github_discussions import GitHubDiscussions
 
@@ -531,23 +636,43 @@ class GitHubIntegration:
                 logger.error("No discussion_id in context for discussion post")
                 return {'success': False, 'error': 'No discussion_id'}
 
-            discussions = GitHubDiscussions()
-            comment_id = discussions.add_discussion_comment(
-                discussion_id=discussion_id,
-                body=comment,
-                reply_to_id=reply_to_id
-            )
+            chunks = self._split_oversized_comment(comment)
+            if len(chunks) > 1:
+                logger.warning(
+                    f"Comment for discussion {discussion_id} exceeds GitHub limit "
+                    f"({len(comment)} chars). Splitting into {len(chunks)} parts."
+                )
 
-            if comment_id:
-                logger.info(f"Posted comment to discussion {discussion_id}")
-                return {
-                    'success': True,
-                    'comment_id': comment_id,
-                    'workspace_type': 'discussions'
-                }
-            else:
-                logger.error(f"Failed to post to discussion {discussion_id}")
-                return {'success': False, 'error': 'API call failed'}
+            discussions = GitHubDiscussions()
+            first_comment_id = None
+
+            for i, chunk in enumerate(chunks):
+                # Only the first chunk is a threaded reply; subsequent chunks
+                # are top-level comments on the discussion.
+                current_reply_to = reply_to_id if i == 0 else None
+
+                comment_id = discussions.add_discussion_comment(
+                    discussion_id=discussion_id,
+                    body=chunk,
+                    reply_to_id=current_reply_to
+                )
+
+                if comment_id:
+                    if first_comment_id is None:
+                        first_comment_id = comment_id
+                else:
+                    logger.error(f"Failed to post discussion comment (part {i+1}/{len(chunks)})")
+                    if first_comment_id is None:
+                        return {'success': False, 'error': 'API call failed'}
+                    logger.warning(f"Partial post: {i}/{len(chunks)} parts posted for discussion {discussion_id}")
+                    break
+
+            logger.info(f"Posted comment to discussion {discussion_id}")
+            return {
+                'success': True,
+                'comment_id': first_comment_id,
+                'workspace_type': 'discussions'
+            }
 
         except Exception as e:
             logger.error(f"Error posting discussion comment: {e}")
