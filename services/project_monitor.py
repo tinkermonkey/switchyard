@@ -2674,10 +2674,235 @@ class ProjectMonitor:
                     f"```\ngh pr ready {pr_number}\n```"
                 )
 
+            # Step 12: Advance parent on Planning board for PR review
+            await self._advance_parent_for_pr_review(
+                project_name, parent_issue_number, project_config
+            )
+
         except Exception as e:
             logger.error(f"Error checking PR ready on issue exit for #{issue_number}: {e}")
             import traceback
             logger.error(traceback.format_exc())
+
+    async def _advance_parent_for_pr_review(
+        self,
+        project_name: str,
+        parent_issue_number: int,
+        project_config
+    ):
+        """
+        Advance parent issue on Planning board for PR review.
+
+        If parent is in "In Development": move to "In Review" (triggers PR review agent via polling)
+        If parent is already in "In Review": directly enqueue PR review agent (re-review after fixes)
+        """
+        try:
+            from config.state_manager import state_manager
+            from state_management.pr_review_state_manager import pr_review_state_manager
+
+            # Find Planning board
+            project_state = state_manager.load_project_state(project_name)
+            if not project_state:
+                logger.warning(f"No project state for {project_name}, skipping Planning board advance")
+                return
+
+            planning_board_name = None
+            planning_board = None
+            for board_name, board in project_state.boards.items():
+                if 'planning' in board_name.lower():
+                    planning_board_name = board_name
+                    planning_board = board
+                    break
+
+            if not planning_board:
+                logger.debug(f"No Planning board found for {project_name}, skipping")
+                return
+
+            # Get parent's current column on the Planning board
+            current_column = self._get_parent_column_on_board(
+                project_name, planning_board, parent_issue_number, project_config
+            )
+
+            if not current_column:
+                logger.debug(
+                    f"Parent #{parent_issue_number} not found on Planning board, skipping"
+                )
+                return
+
+            logger.info(
+                f"Parent #{parent_issue_number} is in '{current_column}' on Planning board"
+            )
+
+            if current_column == "In Development":
+                # Move to "In Review" - the polling will detect the column change
+                # and trigger the PR review agent normally
+                from services.pipeline_progression import PipelineProgression
+                task_queue = self.task_queue
+
+                progression = PipelineProgression(task_queue)
+                success = progression.move_issue_to_column(
+                    project_name, planning_board_name, parent_issue_number,
+                    "In Review", trigger='all_subtasks_completed'
+                )
+                if success:
+                    logger.info(
+                        f"Moved parent #{parent_issue_number} from 'In Development' to 'In Review' "
+                        f"on Planning board"
+                    )
+                else:
+                    logger.error(f"Failed to move parent #{parent_issue_number} to 'In Review'")
+
+            elif current_column == "In Review":
+                # Already in review - check cycle count and directly enqueue PR review agent
+                review_count = pr_review_state_manager.get_review_count(
+                    project_name, parent_issue_number
+                )
+
+                if review_count >= 3:
+                    logger.info(
+                        f"Review cycle limit reached for #{parent_issue_number}, "
+                        f"not re-triggering PR review"
+                    )
+                    # Post comment about cycle limit
+                    from services.github_integration import GitHubIntegration
+                    github = GitHubIntegration(
+                        repo_owner=project_config.github['org'],
+                        repo_name=project_config.github['repo']
+                    )
+                    await github.post_comment(
+                        parent_issue_number,
+                        f"All sub-issues completed again, but the maximum PR review cycle limit (3) "
+                        f"has been reached. Further review should be performed manually."
+                    )
+                    return
+
+                # Directly enqueue a task for pr_review_agent
+                logger.info(
+                    f"Re-triggering PR review for #{parent_issue_number} "
+                    f"(cycle {review_count + 1}/3)"
+                )
+
+                repo = f"{project_config.github['org']}/{project_config.github['repo']}"
+
+                # Get issue data
+                from services.github_integration import GitHubIntegration
+                github = GitHubIntegration(
+                    repo_owner=project_config.github['org'],
+                    repo_name=project_config.github['repo']
+                )
+                issue_data = await github.get_issue(parent_issue_number)
+
+                task_context = {
+                    'project': project_name,
+                    'board': planning_board_name,
+                    'repository': repo,
+                    'issue_number': parent_issue_number,
+                    'issue': issue_data or {},
+                    'column': 'In Review',
+                    'trigger': 'project_monitor',
+                    'workspace_type': 'discussions',
+                    'timestamp': utc_isoformat()
+                }
+
+                from task_queue.task_manager import Task, TaskPriority
+                import time
+
+                task = Task(
+                    id=f"pr_review_agent_{project_name}_{planning_board_name}_{parent_issue_number}_{int(time.time())}",
+                    agent="pr_review_agent",
+                    project=project_name,
+                    priority=TaskPriority.MEDIUM,
+                    context=task_context,
+                    created_at=utc_isoformat()
+                )
+
+                from services.work_execution_state import work_execution_tracker
+                work_execution_tracker.record_execution_start(
+                    issue_number=parent_issue_number,
+                    column='In Review',
+                    agent='pr_review_agent',
+                    trigger_source='re_review',
+                    project_name=project_name
+                )
+
+                self.decision_events.emit_task_queued(
+                    agent='pr_review_agent',
+                    project=project_name,
+                    issue_number=parent_issue_number,
+                    board=planning_board_name,
+                    priority='MEDIUM',
+                    reason=f"Re-triggering PR review for #{parent_issue_number} after sub-issues completed (cycle {review_count + 1})",
+                    pipeline_run_id=None
+                )
+
+                self.task_queue.enqueue(task)
+                logger.info(
+                    f"Enqueued PR review agent for #{parent_issue_number} (re-review cycle)"
+                )
+
+            else:
+                logger.debug(
+                    f"Parent #{parent_issue_number} is in '{current_column}', "
+                    f"not advancing for PR review"
+                )
+
+        except Exception as e:
+            logger.error(
+                f"Failed to advance parent #{parent_issue_number} for PR review: {e}",
+                exc_info=True
+            )
+
+    def _get_parent_column_on_board(
+        self,
+        project_name: str,
+        board,
+        issue_number: int,
+        project_config
+    ) -> Optional[str]:
+        """Query GitHub to find what column an issue is in on a specific board."""
+        try:
+            import subprocess
+            import json
+
+            github_org = project_config.github['org']
+            github_repo = project_config.github['repo']
+
+            query = f'''{{
+                repository(owner: "{github_org}", name: "{github_repo}") {{
+                    issue(number: {issue_number}) {{
+                        projectItems(first: 10) {{
+                            nodes {{
+                                project {{ number }}
+                                fieldValueByName(name: "Status") {{
+                                    ... on ProjectV2ItemFieldSingleSelectValue {{
+                                        name
+                                    }}
+                                }}
+                            }}
+                        }}
+                    }}
+                }}
+            }}'''
+
+            result = subprocess.run(
+                ['gh', 'api', 'graphql', '-f', f'query={query}'],
+                capture_output=True, text=True, check=True, timeout=30
+            )
+            data = json.loads(result.stdout)
+
+            items = data.get('data', {}).get('repository', {}).get('issue', {}).get('projectItems', {}).get('nodes', [])
+
+            for item in items:
+                if item.get('project', {}).get('number') == board.project_number:
+                    field_value = item.get('fieldValueByName')
+                    if field_value:
+                        return field_value.get('name')
+
+            return None
+
+        except Exception as e:
+            logger.error(f"Failed to get column for issue #{issue_number}: {e}")
+            return None
 
     def get_issue_column_sync(self, project_name: str, board_name: str, issue_number: int) -> Optional[str]:
         """

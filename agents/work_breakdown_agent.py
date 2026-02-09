@@ -129,6 +129,10 @@ class WorkBreakdownAgent(AnalysisAgent):
                     # Store created issue info in context
                     context['created_sub_issues'] = created_issues
                     logger.info(f"Created {len(created_issues)} sub-issues for {project_name}")
+
+                    # Auto-advance parent from "Work Breakdown" to "In Development"
+                    if created_issues:
+                        self._advance_parent_to_in_development(task_context, project_name)
                 else:
                     logger.warning("No sub-issues parsed from agent output")
 
@@ -138,6 +142,127 @@ class WorkBreakdownAgent(AnalysisAgent):
                 context['sub_issue_creation_error'] = str(e)
 
         return context
+
+    def _advance_parent_to_in_development(self, task_context: Dict[str, Any], project_name: str):
+        """
+        Move the parent issue from 'Work Breakdown' to 'In Development' on the Planning board.
+
+        Called after successful sub-issue creation so the parent enters the tracking phase.
+        """
+        try:
+            import subprocess as sp
+
+            # Determine parent issue number
+            workspace_type = task_context.get('workspace_type', 'issues')
+            parent_issue_number = None
+
+            if workspace_type == 'discussions':
+                discussion_id = task_context.get('discussion_id')
+                if discussion_id:
+                    github_state = self.state_manager.load_project_state(project_name)
+                    if github_state and github_state.discussion_issue_links:
+                        parent_issue_number = github_state.discussion_issue_links.get(discussion_id)
+            else:
+                parent_issue_number = task_context.get('issue_number')
+
+            if not parent_issue_number:
+                logger.warning("Could not determine parent issue number for auto-advance")
+                return
+
+            parent_issue_number = int(parent_issue_number)
+
+            # Find the Planning board
+            github_state = self.state_manager.load_project_state(project_name)
+            if not github_state:
+                logger.warning(f"No GitHub state for {project_name}, skipping auto-advance")
+                return
+
+            planning_board = None
+            planning_board_name = None
+            for board_name, board in github_state.boards.items():
+                if 'planning' in board_name.lower():
+                    planning_board = board
+                    planning_board_name = board_name
+                    break
+
+            if not planning_board:
+                logger.warning("Planning board not found, skipping auto-advance")
+                return
+
+            # Find "In Development" column
+            in_dev_column = None
+            for column in planning_board.columns:
+                if column.name == "In Development":
+                    in_dev_column = column
+                    break
+
+            if not in_dev_column:
+                logger.warning("'In Development' column not found on Planning board")
+                return
+
+            # Get project config for org/repo
+            project_config = self.config_manager.get_project_config(project_name)
+            github_config = project_config.github
+
+            # Find the project item ID for the parent issue on the Planning board
+            query = f'''{{
+                repository(owner: "{github_config['org']}", name: "{github_config['repo']}") {{
+                    issue(number: {parent_issue_number}) {{
+                        projectItems(first: 10) {{
+                            nodes {{
+                                id
+                                project {{ number }}
+                            }}
+                        }}
+                    }}
+                }}
+            }}'''
+
+            result = sp.run(
+                ['gh', 'api', 'graphql', '-f', f'query={query}'],
+                capture_output=True, text=True, check=True
+            )
+            data = json.loads(result.stdout)
+            items = data['data']['repository']['issue']['projectItems']['nodes']
+
+            item_id = None
+            for item in items:
+                if item['project']['number'] == planning_board.project_number:
+                    item_id = item['id']
+                    break
+
+            if not item_id:
+                logger.warning(f"Parent #{parent_issue_number} not found on Planning board")
+                return
+
+            # Set status to "In Development"
+            mutation = f'''
+            mutation {{
+                updateProjectV2ItemFieldValue(
+                    input: {{
+                        projectId: "{planning_board.project_id}"
+                        itemId: "{item_id}"
+                        fieldId: "{planning_board.status_field_id}"
+                        value: {{ singleSelectOptionId: "{in_dev_column.id}" }}
+                    }}
+                ) {{
+                    projectV2Item {{ id }}
+                }}
+            }}
+            '''
+
+            sp.run(
+                ['gh', 'api', 'graphql', '-f', f'query={mutation}'],
+                capture_output=True, text=True, check=True
+            )
+
+            logger.info(
+                f"Auto-advanced parent #{parent_issue_number} to 'In Development' "
+                f"on Planning board after sub-issue creation"
+            )
+
+        except Exception as e:
+            logger.error(f"Failed to auto-advance parent to 'In Development': {e}", exc_info=True)
 
     def _should_manage_sub_issues(self, task_context: Dict[str, Any]) -> bool:
         """Determine if this execution should manage sub-issues"""

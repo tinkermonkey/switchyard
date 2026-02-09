@@ -98,7 +98,21 @@ workflow_templates:
           - trigger: "all_subtasks_completed"
             action: "move_to_column"
             parameters:
-              target_column: "Documentation"
+              target_column: "In Review"
+
+      - name: "In Review"
+        stage_mapping: "pr_review"
+        agent: "pr_review_agent"
+        description: "Automated PR review and requirements verification"
+        automation_rules:
+          - trigger: "item_moved_to_column"
+            action: "assign_label"
+            parameters:
+              labels: ["stage:pr-review"]
+          - trigger: "item_moved_to_column"
+            action: "start_pipeline_stage"
+            parameters:
+              stage: "pr_review"
 
       - name: "Documentation"
         stage_mapping: "documentation"
@@ -353,6 +367,9 @@ stage_labels:
   - name: "stage:environment-verification"
     color: "cfd3d7"
     description: "Environment verification stage"
+  - name: "stage:pr-review"
+    color: "cfd3d7"
+    description: "PR review stage"
   - name: "status:in-development"
     color: "fbca04"
     description: "Epic in development - tracking sub-issues"

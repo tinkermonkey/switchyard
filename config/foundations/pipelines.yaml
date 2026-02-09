@@ -42,6 +42,15 @@ pipeline_templates:
         retries: 2
         review_required: false
 
+      - stage: "pr_review"
+        name: "PR Review & Requirements Verification"
+        required_capabilities: ["code_review", "pr_analysis", "requirements_verification"]
+        default_agent: "pr_review_agent"
+        inputs_from: ["work_breakdown"]
+        timeout: 3600
+        retries: 2
+        review_required: false
+
       - stage: "documentation"
         name: "Epic Documentation"
         required_capabilities: ["technical_writing", "documentation_creation"]

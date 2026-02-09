@@ -1,0 +1,834 @@
+"""
+PR Review Agent - Automated PR review and requirements verification
+
+This agent runs after all sub-issues complete their SDLC pipelines.
+It performs two phases:
+
+Phase 1: PR Code Review
+  - Uses /pr-review-toolkit:review-pr skill to review the accumulated PR
+  - Creates GitHub issues grouped by severity
+
+Phase 2: Context Verification (up to 4 separate Claude Code calls)
+  - Verifies implementation against parent issue requirements
+  - Verifies against idea researcher, business analyst, and architect outputs
+  - Creates issues for any gaps found
+
+Review cycle management:
+  - Cycles 1-2: Create issues and move to Development for resolution
+  - Cycle 3: Create issues but leave in Backlog, post summary on parent
+  - Beyond cycle 3: Skip execution entirely
+"""
+
+from typing import Dict, Any, List, Optional
+from agents.base_analysis_agent import AnalysisAgent
+from config.manager import ConfigManager
+from config.state_manager import GitHubStateManager
+from state_management.pr_review_state_manager import pr_review_state_manager
+from claude.claude_integration import run_claude_code
+import logging
+import json
+import re
+import subprocess
+
+logger = logging.getLogger(__name__)
+
+MAX_REVIEW_CYCLES = 3
+
+
+class PRReviewAgent(AnalysisAgent):
+    """
+    PR Review Agent for automated code review and requirements verification.
+
+    Unlike standard maker agents, this agent:
+    1. Makes multiple Claude Code calls (up to 5)
+    2. Creates GitHub issues for findings
+    3. Manages review cycle limits
+    """
+
+    def __init__(self, agent_config: Dict[str, Any] = None):
+        super().__init__("pr_review_agent", agent_config=agent_config)
+        self.config_manager = ConfigManager()
+        self.state_manager = GitHubStateManager()
+
+    @property
+    def agent_display_name(self) -> str:
+        return "PR Review Specialist"
+
+    @property
+    def agent_role_description(self) -> str:
+        return """I perform automated PR code review and verify implementations against original requirements, creating actionable issues for any gaps found."""
+
+    @property
+    def output_sections(self) -> List[str]:
+        return [
+            "PR Code Review",
+            "Requirements Verification",
+            "Issues Created",
+            "Review Summary"
+        ]
+
+    def get_initial_guidelines(self) -> str:
+        return ""
+
+    def get_quality_standards(self) -> str:
+        return ""
+
+    # ==================================================================================
+    # MAIN EXECUTION - Custom multi-phase logic
+    # ==================================================================================
+
+    async def execute(self, context: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Execute PR review with multi-phase analysis and issue creation.
+
+        Overrides the standard execute() entirely with custom logic.
+        """
+        task_context = context.get('context', {})
+        project_name = task_context.get('project', 'unknown')
+        issue_number = task_context.get('issue_number')
+
+        # Resolve parent issue number
+        parent_issue_number = self._resolve_parent_issue_number(task_context, project_name)
+        if not parent_issue_number:
+            logger.error("Could not determine parent issue number for PR review")
+            context['markdown_analysis'] = "## PR Review Failed\n\nCould not determine parent issue number."
+            return context
+
+        logger.info(f"PR Review Agent executing for parent issue #{parent_issue_number} in {project_name}")
+
+        # Check cycle limit
+        review_count = pr_review_state_manager.get_review_count(project_name, parent_issue_number)
+        if review_count >= MAX_REVIEW_CYCLES:
+            logger.info(f"Review cycle limit ({MAX_REVIEW_CYCLES}) reached for #{parent_issue_number}, skipping")
+            context['markdown_analysis'] = (
+                f"## PR Review Skipped\n\n"
+                f"Maximum review cycles ({MAX_REVIEW_CYCLES}) reached for issue #{parent_issue_number}. "
+                f"No further automated reviews will be performed."
+            )
+            return context
+
+        current_cycle = review_count + 1
+        logger.info(f"Starting review cycle {current_cycle}/{MAX_REVIEW_CYCLES} for #{parent_issue_number}")
+
+        # Get project config
+        project_config = self.config_manager.get_project_config(project_name)
+        github_config = project_config.github
+        repo = f"{github_config['org']}/{github_config['repo']}"
+        repo_url = f"https://github.com/{github_config['org']}/{github_config['repo']}"
+
+        # Find the PR for this parent issue
+        pr_url = await self._find_pr_url(github_config, parent_issue_number)
+        if not pr_url:
+            logger.warning(f"No PR found for parent issue #{parent_issue_number}")
+            context['markdown_analysis'] = (
+                f"## PR Review Skipped\n\n"
+                f"No open PR found for parent issue #{parent_issue_number}."
+            )
+            return context
+
+        # Load context from discussion (agent outputs)
+        discussion_outputs = self._load_discussion_outputs(project_name, parent_issue_number)
+
+        # Get parent issue body
+        parent_issue_body = self._get_parent_issue_body(repo, parent_issue_number)
+
+        # Prepare enhanced context for Claude Code calls
+        enhanced_context = context.copy()
+        if self.agent_config and 'agent_config' in self.agent_config:
+            enhanced_context['agent_config'] = self.agent_config['agent_config']
+        if self.agent_config and 'mcp_servers' in self.agent_config:
+            enhanced_context['mcp_servers'] = self.agent_config['mcp_servers']
+
+        all_created_issues = []
+        review_summary_parts = []
+
+        # ---- Phase 1: PR Code Review ----
+        logger.info(f"Phase 1: Running PR code review for {pr_url}")
+        try:
+            pr_review_prompt = self._build_pr_review_prompt(pr_url)
+            pr_review_result = await run_claude_code(pr_review_prompt, enhanced_context)
+
+            pr_review_text = pr_review_result.get('result', '') if isinstance(pr_review_result, dict) else str(pr_review_result)
+            review_issues = self._parse_review_findings(pr_review_text, "PR Code Review")
+            review_summary_parts.append(f"### PR Code Review\n\n{pr_review_text}")
+
+            if review_issues:
+                created = await self._create_review_issues(
+                    review_issues, repo, github_config, parent_issue_number, project_name
+                )
+                all_created_issues.extend(created)
+                logger.info(f"Phase 1: Created {len(created)} issues from PR review")
+            else:
+                logger.info("Phase 1: No issues found in PR review")
+        except Exception as e:
+            logger.error(f"Phase 1 PR review failed: {e}", exc_info=True)
+            review_summary_parts.append(f"### PR Code Review\n\nFailed: {e}")
+
+        # ---- Phase 2: Context Verification ----
+        context_checks = [
+            ("Parent Issue Requirements", parent_issue_body),
+            ("Idea Researcher Output", discussion_outputs.get('idea_researcher')),
+            ("Business Analyst Output", discussion_outputs.get('business_analyst')),
+            ("Software Architect Output", discussion_outputs.get('software_architect')),
+        ]
+
+        for check_name, check_content in context_checks:
+            if not check_content:
+                logger.info(f"Skipping {check_name} verification (no content)")
+                continue
+
+            logger.info(f"Phase 2: Verifying against {check_name}")
+            try:
+                verification_prompt = self._build_verification_prompt(
+                    pr_url, check_name, check_content
+                )
+                verification_result = await run_claude_code(verification_prompt, enhanced_context)
+
+                verification_text = verification_result.get('result', '') if isinstance(verification_result, dict) else str(verification_result)
+                gap_issues = self._parse_review_findings(verification_text, check_name)
+                review_summary_parts.append(f"### {check_name} Verification\n\n{verification_text}")
+
+                if gap_issues:
+                    created = await self._create_review_issues(
+                        gap_issues, repo, github_config, parent_issue_number, project_name
+                    )
+                    all_created_issues.extend(created)
+                    logger.info(f"Created {len(created)} issues from {check_name} verification")
+                else:
+                    logger.info(f"No gaps found in {check_name} verification")
+            except Exception as e:
+                logger.error(f"{check_name} verification failed: {e}", exc_info=True)
+                review_summary_parts.append(f"### {check_name} Verification\n\nFailed: {e}")
+
+        # ---- Post-review actions ----
+        created_issue_numbers = [int(i['number']) for i in all_created_issues]
+
+        if all_created_issues:
+            # Record review cycle
+            pr_review_state_manager.increment_review_count(
+                project_name, parent_issue_number, created_issue_numbers
+            )
+
+            if current_cycle < MAX_REVIEW_CYCLES:
+                # Cycles 1-2: Move issues from Backlog to Development
+                await self._move_issues_to_development(
+                    all_created_issues, project_name, github_config
+                )
+                logger.info(f"Moved {len(all_created_issues)} review issues to Development")
+            else:
+                # Cycle 3: Leave in Backlog, post summary comment
+                summary_comment = self._build_cycle_limit_comment(
+                    current_cycle, all_created_issues
+                )
+                self._post_comment_on_issue(repo, parent_issue_number, summary_comment)
+                logger.info(f"Cycle {current_cycle} (limit): left issues in Backlog, posted summary")
+        else:
+            # Clean pass - advance parent to Documentation
+            logger.info(f"Clean pass for #{parent_issue_number}, advancing to Documentation")
+            pr_review_state_manager.increment_review_count(
+                project_name, parent_issue_number, []
+            )
+            self._advance_parent_to_documentation(project_name, parent_issue_number)
+
+        # Build final summary for GitHub comment
+        issues_summary = ""
+        if all_created_issues:
+            issues_list = "\n".join(
+                f"- #{i['number']}: {i['title']}" for i in all_created_issues
+            )
+            issues_summary = f"\n\n### Issues Created\n\n{issues_list}"
+
+        context['markdown_analysis'] = (
+            f"## PR Review - Cycle {current_cycle}/{MAX_REVIEW_CYCLES}\n\n"
+            f"**PR**: {pr_url}\n"
+            f"**Parent Issue**: #{parent_issue_number}\n"
+            f"**Issues Found**: {len(all_created_issues)}\n"
+            + issues_summary + "\n\n"
+            + "\n\n---\n\n".join(review_summary_parts)
+        )
+
+        context['created_review_issues'] = all_created_issues
+        return context
+
+    # ==================================================================================
+    # PARENT ISSUE RESOLUTION
+    # ==================================================================================
+
+    def _resolve_parent_issue_number(self, task_context: Dict[str, Any], project_name: str) -> Optional[int]:
+        """Resolve the parent issue number from task context."""
+        # Direct issue number
+        issue_number = task_context.get('issue_number')
+        if issue_number:
+            return int(issue_number)
+
+        # From nested task_context
+        nested = task_context.get('task_context', {})
+        if nested and nested.get('issue_number'):
+            return int(nested['issue_number'])
+
+        return None
+
+    # ==================================================================================
+    # PR URL LOOKUP
+    # ==================================================================================
+
+    async def _find_pr_url(self, github_config: Dict, parent_issue_number: int) -> Optional[str]:
+        """Find the PR URL for a parent issue using feature branch manager."""
+        try:
+            from services.feature_branch_manager import feature_branch_manager
+            from services.github_integration import GitHubIntegration
+
+            github = GitHubIntegration(
+                repo_owner=github_config['org'],
+                repo_name=github_config['repo']
+            )
+
+            project_name = github_config.get('repo', '')  # Use repo as project name for branch lookup
+
+            # Try to find feature branch state
+            # Need to iterate possible project names since github_config doesn't directly have it
+            feature_branch = None
+            for proj_name in self.state_manager.list_managed_projects():
+                fb = feature_branch_manager.get_feature_branch_state(proj_name, parent_issue_number)
+                if fb:
+                    feature_branch = fb
+                    break
+
+            if not feature_branch:
+                logger.warning(f"No feature branch found for #{parent_issue_number}")
+                return None
+
+            pr_data = await github.find_pr_by_branch(feature_branch.branch_name)
+            if pr_data:
+                pr_number = pr_data.get('pr_number')
+                return f"https://github.com/{github_config['org']}/{github_config['repo']}/pull/{pr_number}"
+
+            return None
+        except Exception as e:
+            logger.error(f"Failed to find PR for #{parent_issue_number}: {e}")
+            return None
+
+    # ==================================================================================
+    # DISCUSSION OUTPUT LOADING
+    # ==================================================================================
+
+    def _load_discussion_outputs(self, project_name: str, parent_issue_number: int) -> Dict[str, str]:
+        """Load agent outputs from the discussion linked to the parent issue."""
+        outputs = {}
+
+        discussion_id = self.state_manager.get_discussion_for_issue(project_name, parent_issue_number)
+        if not discussion_id:
+            logger.info(f"No discussion found for #{parent_issue_number}")
+            return outputs
+
+        try:
+            from services.github_app import github_app
+
+            query = """
+            query($discussionId: ID!) {
+              node(id: $discussionId) {
+                ... on Discussion {
+                  comments(last: 50) {
+                    nodes {
+                      body
+                      replies(last: 50) {
+                        nodes {
+                          body
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+            """
+
+            result = github_app.graphql_request(query, {'discussionId': discussion_id})
+            if not result or 'node' not in result or not result['node']:
+                return outputs
+
+            comments = result['node']['comments']['nodes']
+
+            # Agent signature pattern: _Processed by the X agent_
+            agent_map = {
+                'idea_researcher': 'idea researcher',
+                'business_analyst': 'business analyst',
+                'software_architect': 'software architect',
+            }
+
+            all_bodies = []
+            for comment in comments:
+                all_bodies.append(comment.get('body', ''))
+                for reply in comment.get('replies', {}).get('nodes', []):
+                    all_bodies.append(reply.get('body', ''))
+
+            for body in all_bodies:
+                for key, signature in agent_map.items():
+                    if f'_Processed by the {signature} agent_' in body.lower() or \
+                       f'_Processed by the {signature} agent_' in body:
+                        # Keep the most recent output for each agent
+                        outputs[key] = body
+
+        except Exception as e:
+            logger.error(f"Failed to load discussion outputs: {e}", exc_info=True)
+
+        logger.info(f"Loaded discussion outputs for agents: {list(outputs.keys())}")
+        return outputs
+
+    def _get_parent_issue_body(self, repo: str, issue_number: int) -> str:
+        """Get the body of the parent issue."""
+        try:
+            result = subprocess.run(
+                ['gh', 'issue', 'view', str(issue_number), '-R', repo, '--json', 'body'],
+                capture_output=True, text=True, check=True
+            )
+            data = json.loads(result.stdout)
+            return data.get('body', '')
+        except Exception as e:
+            logger.error(f"Failed to get parent issue body: {e}")
+            return ''
+
+    # ==================================================================================
+    # PROMPT BUILDERS
+    # ==================================================================================
+
+    def _build_pr_review_prompt(self, pr_url: str) -> str:
+        return f"""
+You are a PR Review Specialist. Review the following pull request for code quality issues.
+
+Use the /pr-review-toolkit:review-pr skill to review this PR: {pr_url}
+
+After running the review, organize your findings into severity levels.
+
+## Output Format
+
+Structure your findings EXACTLY like this:
+
+```
+## PR Review Findings
+
+### Critical Issues
+- **[Finding Title]**: [Description of the critical issue and what needs to change]
+
+### High Priority Issues
+- **[Finding Title]**: [Description]
+
+### Medium Priority Issues
+- **[Finding Title]**: [Description]
+
+### Low Priority / Nice-to-Have
+- **[Finding Title]**: [Description]
+
+### Clean Areas
+- [Areas that passed review with no issues]
+```
+
+If there are NO issues at any severity level, write "None found" under that heading.
+If the PR looks good overall, state that clearly.
+"""
+
+    def _build_verification_prompt(self, pr_url: str, context_name: str, context_content: str) -> str:
+        # Truncate very long context to avoid prompt bloat
+        max_context_len = 15000
+        if len(context_content) > max_context_len:
+            context_content = context_content[:max_context_len] + "\n\n[... truncated ...]"
+
+        return f"""
+You are a Requirements Verification Specialist. Your job is to verify that a PR's implementation
+fully addresses the requirements from a specific context source.
+
+## PR to Verify
+{pr_url}
+
+Review the PR diff to understand what was implemented.
+
+## Context Source: {context_name}
+
+The following is the original context that should be fully addressed by the PR:
+
+---
+{context_content}
+---
+
+## Your Task
+
+1. Read the PR diff carefully
+2. Compare against the context source above
+3. Identify any requirements, specifications, or design decisions from the context that are:
+   - NOT implemented in the PR
+   - Partially implemented (missing aspects)
+   - Implemented differently than specified (potential deviation)
+
+## Output Format
+
+Structure your findings EXACTLY like this:
+
+```
+## {context_name} Verification
+
+### Gaps Found
+- **[Gap Title]**: [What was specified vs what was implemented or missing]
+
+### Deviations
+- **[Deviation Title]**: [What was specified vs what was actually done]
+
+### Verified
+- [Requirements that were correctly implemented]
+```
+
+If all requirements are met, write "All requirements verified - no gaps found" and list what was verified.
+"""
+
+    # ==================================================================================
+    # FINDING PARSING
+    # ==================================================================================
+
+    def _parse_review_findings(self, output: str, source: str) -> List[Dict[str, Any]]:
+        """
+        Parse review output into structured findings grouped by severity.
+
+        Returns a list of issue specs, one per severity level that has findings.
+        """
+        issues = []
+
+        # Parse severity sections
+        severity_sections = {
+            'Critical': self._extract_section_items(output, 'Critical Issues'),
+            'High': self._extract_section_items(output, 'High Priority Issues'),
+            'Medium': self._extract_section_items(output, 'Medium Priority Issues'),
+            'Low': self._extract_section_items(output, 'Low Priority / Nice-to-Have'),
+        }
+
+        # Parse gap/deviation sections (from context verification)
+        gaps = self._extract_section_items(output, 'Gaps Found')
+        deviations = self._extract_section_items(output, 'Deviations')
+
+        # Create one issue per severity with findings
+        for severity, items in severity_sections.items():
+            if items and not self._is_none_found(items):
+                issues.append({
+                    'title': f"[PR Review] {severity} issues from {source}",
+                    'body': self._format_issue_body(severity, items, source),
+                    'severity': severity.lower(),
+                })
+
+        # Create issues for gaps and deviations
+        if gaps and not self._is_none_found(gaps):
+            issues.append({
+                'title': f"[PR Review] Implementation gaps - {source}",
+                'body': self._format_issue_body("Gap", gaps, source),
+                'severity': 'high',
+            })
+
+        if deviations and not self._is_none_found(deviations):
+            issues.append({
+                'title': f"[PR Review] Implementation deviations - {source}",
+                'body': self._format_issue_body("Deviation", deviations, source),
+                'severity': 'medium',
+            })
+
+        return issues
+
+    def _extract_section_items(self, text: str, section_name: str) -> str:
+        """Extract content under a ### section heading."""
+        pattern = rf'###\s+{re.escape(section_name)}\s*\n(.*?)(?=\n###|\Z)'
+        match = re.search(pattern, text, re.DOTALL)
+        if match:
+            return match.group(1).strip()
+        return ''
+
+    def _is_none_found(self, content: str) -> bool:
+        """Check if the section content indicates no findings."""
+        lower = content.lower().strip()
+        return lower in ('none found', 'none', 'n/a', 'none found.', '-  none found',
+                         '- none found', 'no issues found', 'all requirements verified')
+
+    def _format_issue_body(self, severity: str, items: str, source: str) -> str:
+        return (
+            f"## {severity} Findings\n\n"
+            f"**Source**: {source}\n\n"
+            f"{items}\n\n"
+            f"---\n"
+            f"_Created by PR Review Agent_"
+        )
+
+    # ==================================================================================
+    # ISSUE CREATION (reuses work_breakdown_agent pattern)
+    # ==================================================================================
+
+    async def _create_review_issues(
+        self,
+        issue_specs: List[Dict[str, Any]],
+        repo: str,
+        github_config: Dict,
+        parent_issue_number: int,
+        project_name: str
+    ) -> List[Dict[str, Any]]:
+        """Create GitHub issues for review findings and link as sub-issues."""
+        github_state = self.state_manager.load_project_state(project_name)
+        if not github_state:
+            logger.error(f"No GitHub state for {project_name}")
+            return []
+
+        # Find SDLC board
+        sdlc_board = None
+        for board_name, board in github_state.boards.items():
+            if 'sdlc' in board_name.lower() or board_name == 'SDLC Execution':
+                sdlc_board = board
+                break
+
+        if not sdlc_board:
+            logger.error(f"SDLC board not found for {project_name}")
+            return []
+
+        # Find Backlog column
+        backlog_column = None
+        for column in sdlc_board.columns:
+            if column.name.lower() == 'backlog':
+                backlog_column = column
+                break
+
+        if not backlog_column:
+            logger.error("Backlog column not found in SDLC board")
+            return []
+
+        # Get parent issue node ID
+        parent_issue_id = None
+        try:
+            result = subprocess.run(
+                ['gh', 'issue', 'view', str(parent_issue_number), '-R', repo, '--json', 'id'],
+                capture_output=True, text=True, check=True
+            )
+            parent_issue_id = json.loads(result.stdout)['id']
+        except Exception as e:
+            logger.error(f"Failed to get parent issue ID: {e}")
+
+        created_issues = []
+
+        for spec in issue_specs:
+            try:
+                # Create the issue
+                result = subprocess.run(
+                    ['gh', 'issue', 'create', '-R', repo,
+                     '--title', spec['title'],
+                     '--body', spec['body']],
+                    capture_output=True, text=True, check=True
+                )
+                issue_url = result.stdout.strip()
+                url_match = re.search(r'/issues/(\d+)$', issue_url)
+                if not url_match:
+                    logger.error(f"Could not extract issue number from URL: {issue_url}")
+                    continue
+
+                issue_number = url_match.group(1)
+
+                # Get node ID
+                view_result = subprocess.run(
+                    ['gh', 'issue', 'view', issue_number, '-R', repo,
+                     '--json', 'id,number,url'],
+                    capture_output=True, text=True, check=True
+                )
+                issue_data = json.loads(view_result.stdout)
+                issue_id = issue_data['id']
+
+                # Add to SDLC board
+                subprocess.run(
+                    ['gh', 'project', 'item-add', str(sdlc_board.project_number),
+                     '--owner', github_config['org'],
+                     '--url', issue_url],
+                    capture_output=True, text=True, check=True
+                )
+
+                # Set status to Backlog
+                self._set_issue_status_on_board(
+                    issue_number, repo, github_config, sdlc_board, backlog_column
+                )
+
+                # Link as sub-issue to parent
+                if parent_issue_id:
+                    self._link_sub_issue(parent_issue_id, issue_id, issue_number, parent_issue_number)
+
+                created_issues.append({
+                    'number': issue_number,
+                    'url': issue_url,
+                    'title': spec['title'],
+                    'severity': spec.get('severity', 'medium'),
+                })
+
+                logger.info(f"Created review issue #{issue_number}: {spec['title']}")
+
+            except Exception as e:
+                logger.error(f"Failed to create review issue '{spec['title']}': {e}", exc_info=True)
+
+        return created_issues
+
+    def _set_issue_status_on_board(self, issue_number: str, repo: str,
+                                    github_config: Dict, board, column):
+        """Set an issue's status on a project board."""
+        try:
+            query = f'''{{
+                repository(owner: "{github_config['org']}", name: "{github_config['repo']}") {{
+                    issue(number: {issue_number}) {{
+                        projectItems(first: 10) {{
+                            nodes {{
+                                id
+                                project {{ number }}
+                            }}
+                        }}
+                    }}
+                }}
+            }}'''
+
+            result = subprocess.run(
+                ['gh', 'api', 'graphql', '-f', f'query={query}'],
+                capture_output=True, text=True, check=True
+            )
+            data = json.loads(result.stdout)
+            items = data['data']['repository']['issue']['projectItems']['nodes']
+
+            item_id = None
+            for item in items:
+                if item['project']['number'] == board.project_number:
+                    item_id = item['id']
+                    break
+
+            if item_id and board.status_field_id:
+                mutation = f'''
+                mutation {{
+                    updateProjectV2ItemFieldValue(
+                        input: {{
+                            projectId: "{board.project_id}"
+                            itemId: "{item_id}"
+                            fieldId: "{board.status_field_id}"
+                            value: {{ singleSelectOptionId: "{column.id}" }}
+                        }}
+                    ) {{
+                        projectV2Item {{ id }}
+                    }}
+                }}
+                '''
+                subprocess.run(
+                    ['gh', 'api', 'graphql', '-f', f'query={mutation}'],
+                    capture_output=True, text=True, check=True
+                )
+                logger.info(f"Set issue #{issue_number} to {column.name} on board")
+        except Exception as e:
+            logger.error(f"Failed to set status for issue #{issue_number}: {e}")
+
+    def _link_sub_issue(self, parent_issue_id: str, child_issue_id: str,
+                        child_number: str, parent_number: int):
+        """Link a child issue as sub-issue of parent."""
+        try:
+            mutation = f"""
+            mutation {{
+              addSubIssue(input: {{
+                issueId: "{parent_issue_id}",
+                subIssueId: "{child_issue_id}"
+              }}) {{
+                issue {{ title }}
+                subIssue {{ title }}
+              }}
+            }}
+            """
+            subprocess.run(
+                ['gh', 'api', 'graphql',
+                 '-H', 'GraphQL-Features: sub_issues',
+                 '-f', f'query={mutation}'],
+                capture_output=True, text=True, check=True
+            )
+            logger.info(f"Linked #{child_number} as sub-issue of #{parent_number}")
+        except Exception as e:
+            logger.error(f"Failed to link #{child_number} as sub-issue: {e}")
+
+    # ==================================================================================
+    # POST-REVIEW ACTIONS
+    # ==================================================================================
+
+    async def _move_issues_to_development(
+        self,
+        issues: List[Dict[str, Any]],
+        project_name: str,
+        github_config: Dict
+    ):
+        """Move created review issues from Backlog to Development on SDLC board."""
+        github_state = self.state_manager.load_project_state(project_name)
+        if not github_state:
+            return
+
+        sdlc_board = None
+        for board_name, board in github_state.boards.items():
+            if 'sdlc' in board_name.lower() or board_name == 'SDLC Execution':
+                sdlc_board = board
+                break
+
+        if not sdlc_board:
+            return
+
+        dev_column = None
+        for column in sdlc_board.columns:
+            if column.name.lower() == 'development':
+                dev_column = column
+                break
+
+        if not dev_column:
+            logger.warning("Development column not found in SDLC board")
+            return
+
+        repo = f"{github_config['org']}/{github_config['repo']}"
+        for issue in issues:
+            self._set_issue_status_on_board(
+                issue['number'], repo, github_config, sdlc_board, dev_column
+            )
+
+    def _advance_parent_to_documentation(self, project_name: str, parent_issue_number: int):
+        """Advance the parent issue from 'In Review' to 'Documentation' on the Planning board."""
+        try:
+            from services.pipeline_progression import PipelineProgression
+            from task_queue.task_manager import TaskQueue
+
+            task_queue = TaskQueue()
+            progression = PipelineProgression(task_queue)
+
+            # Find the Planning board name
+            github_state = self.state_manager.load_project_state(project_name)
+            if not github_state:
+                return
+
+            planning_board = None
+            for board_name, board in github_state.boards.items():
+                if 'planning' in board_name.lower():
+                    planning_board = board_name
+                    break
+
+            if planning_board:
+                success = progression.move_issue_to_column(
+                    project_name, planning_board, parent_issue_number,
+                    "Documentation", trigger='pr_review_clean_pass'
+                )
+                if success:
+                    logger.info(f"Advanced #{parent_issue_number} to Documentation (clean pass)")
+                else:
+                    logger.error(f"Failed to advance #{parent_issue_number} to Documentation")
+        except Exception as e:
+            logger.error(f"Failed to advance parent to Documentation: {e}", exc_info=True)
+
+    def _build_cycle_limit_comment(self, cycle: int, issues: List[Dict]) -> str:
+        """Build a comment for when the cycle limit is reached."""
+        issues_list = "\n".join(f"- #{i['number']}: {i['title']}" for i in issues)
+        return (
+            f"## PR Review - Cycle {cycle}/{MAX_REVIEW_CYCLES} (Final)\n\n"
+            f"This is the final automated review cycle. The following issues were identified "
+            f"but will remain in Backlog for manual triage:\n\n"
+            f"{issues_list}\n\n"
+            f"Further review and resolution should be handled manually."
+        )
+
+    def _post_comment_on_issue(self, repo: str, issue_number: int, comment: str):
+        """Post a comment on a GitHub issue."""
+        try:
+            subprocess.run(
+                ['gh', 'issue', 'comment', str(issue_number), '-R', repo, '--body', comment],
+                capture_output=True, text=True, check=True
+            )
+        except Exception as e:
+            logger.error(f"Failed to post comment on #{issue_number}: {e}")
