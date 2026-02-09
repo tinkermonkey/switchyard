@@ -344,7 +344,9 @@ def build_projects_v2_query(owner_login: str, project_number: int) -> Optional[s
 
 
 # Board query cache for deduplicating identical GraphQL board queries
+import threading
 _board_query_cache: Dict[tuple, tuple] = {}  # (owner, project_number) -> (timestamp, data)
+_board_query_cache_lock = threading.Lock()
 _board_query_cache_ttl = 15  # seconds
 
 
@@ -352,9 +354,11 @@ def execute_board_query_cached(owner: str, project_number: int) -> Optional[dict
     """
     Execute a board query with short-TTL caching to deduplicate identical queries.
 
-    Multiple callers (ProjectMonitor.get_project_items, PipelineQueueManager.get_issues_in_column_order,
-    force_sync_with_github) all execute the same GraphQL board query. This function ensures
-    only one actual API call is made per board per TTL window.
+    Multiple callers (ProjectMonitor.get_project_items, PipelineQueueManager.get_issues_in_column_order)
+    execute the same GraphQL board query. This function ensures only one actual API call is made
+    per board per TTL window.
+
+    Includes a single retry on transient failures.
 
     Args:
         owner: GitHub owner login
@@ -366,12 +370,13 @@ def execute_board_query_cached(owner: str, project_number: int) -> Optional[dict
     cache_key = (owner, project_number)
     now = time.time()
 
-    # Check cache
-    if cache_key in _board_query_cache:
-        cached_time, cached_data = _board_query_cache[cache_key]
-        if now - cached_time < _board_query_cache_ttl:
-            logger.debug(f"Board query cache hit for {owner}/project#{project_number}")
-            return cached_data
+    # Check cache (thread-safe)
+    with _board_query_cache_lock:
+        if cache_key in _board_query_cache:
+            cached_time, cached_data = _board_query_cache[cache_key]
+            if now - cached_time < _board_query_cache_ttl:
+                logger.debug(f"Board query cache hit for {owner}/project#{project_number}")
+                return cached_data
 
     # Cache miss — execute query
     query = build_projects_v2_query(owner, project_number)
@@ -380,17 +385,22 @@ def execute_board_query_cached(owner: str, project_number: int) -> Optional[dict
 
     from services.github_api_client import get_github_client
     github_client = get_github_client()
-    success, data = github_client.graphql(query)
 
-    if not success:
-        logger.warning(f"Board query failed for {owner}/project#{project_number}: {data}")
-        # Do NOT cache failures
-        return None
+    # Single retry on transient failure
+    for attempt in range(2):
+        success, data = github_client.graphql(query)
+        if success:
+            with _board_query_cache_lock:
+                _board_query_cache[cache_key] = (time.time(), data)
+            logger.debug(f"Board query cache miss for {owner}/project#{project_number}, cached result")
+            return data
 
-    # Cache successful result
-    _board_query_cache[cache_key] = (now, data)
-    logger.debug(f"Board query cache miss for {owner}/project#{project_number}, cached result")
-    return data
+        if attempt == 0:
+            logger.debug(f"Board query failed for {owner}/project#{project_number}, retrying once...")
+            time.sleep(2)
+
+    logger.warning(f"Board query failed for {owner}/project#{project_number} after retry: {data}")
+    return None
 
 
 @retry_on_timeout()

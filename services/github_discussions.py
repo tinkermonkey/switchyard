@@ -209,12 +209,16 @@ class GitHubDiscussions:
         logger.error(f"Failed to add comment to discussion {discussion_id}. Result: {result}")
         return None
 
+    # Valid GitHub node ID pattern (base64-encoded, alphanumeric + underscore + hyphen + equals)
+    _NODE_ID_PATTERN = __import__('re').compile(r'^[A-Za-z0-9_=\-]+$')
+    _BATCH_SIZE = 50  # Max discussions per GraphQL query
+
     def get_discussions_updated_at(self, discussion_ids: List[str]) -> Dict[str, Optional[str]]:
         """
         Batch-fetch updatedAt timestamps for multiple discussions in a single GraphQL call.
 
         Uses aliased node() lookups to fetch all timestamps at once instead of
-        one API call per discussion.
+        one API call per discussion. Batches in chunks of 50 to avoid oversized queries.
 
         Args:
             discussion_ids: List of discussion node IDs
@@ -225,6 +229,23 @@ class GitHubDiscussions:
         if not discussion_ids:
             return {}
 
+        # Validate all IDs to prevent GraphQL injection
+        for did in discussion_ids:
+            if not self._NODE_ID_PATTERN.match(did):
+                logger.error(f"Invalid discussion node ID format: {did!r}, skipping batch query")
+                return {did: None for did in discussion_ids}
+
+        # Process in batches to avoid oversized queries
+        updated_at_map = {}
+        for batch_start in range(0, len(discussion_ids), self._BATCH_SIZE):
+            batch = discussion_ids[batch_start:batch_start + self._BATCH_SIZE]
+            batch_result = self._fetch_updated_at_batch(batch)
+            updated_at_map.update(batch_result)
+
+        return updated_at_map
+
+    def _fetch_updated_at_batch(self, discussion_ids: List[str]) -> Dict[str, Optional[str]]:
+        """Fetch updatedAt for a single batch of discussion IDs."""
         # Build aliased query: { d0: node(id: "...") { ... on Discussion { id updatedAt } } ... }
         fragments = []
         for i, did in enumerate(discussion_ids):

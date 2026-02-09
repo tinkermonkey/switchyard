@@ -419,7 +419,7 @@ class ProjectMonitor:
         self._idle_backoff_threshold = 4  # Start backoff after this many idle cycles
 
     def get_project_items(self, project_owner: str, project_number: int) -> List[ProjectItem]:
-        """Query GitHub Projects v2 API to get current project items (excludes closed issues).
+        """Query GitHub Projects v2 API to get current project items.
 
         Uses execute_board_query_cached() for automatic short-TTL caching and deduplication
         with other callers (PipelineQueueManager, force_sync_with_github).
@@ -438,6 +438,7 @@ class ProjectMonitor:
         # Use cached board query (deduplicates with PipelineQueueManager and force_sync)
         data = execute_board_query_cached(project_owner, project_number)
         if data is None:
+            logger.warning(f"Board query returned no data for {project_owner}/project#{project_number}")
             return []
 
         try:
@@ -453,10 +454,6 @@ class ProjectMonitor:
                 content = node.get('content')
                 if not content:  # Skip draft items
                     continue
-
-                # Include closed issues so we can detect moves to Done/Exit columns and release locks
-                # trigger_agent_for_status will handle skipping agent execution for closed issues
-                issue_state = content.get('state', '').upper()
 
                 # Find status field
                 status = "No Status"
@@ -478,7 +475,7 @@ class ProjectMonitor:
 
             return items
 
-        except Exception as e:
+        except (KeyError, TypeError) as e:
             logger.error(f"Failed to parse board query response for {project_owner}/project#{project_number}: {e}")
             return []
 
@@ -6491,8 +6488,8 @@ Moving to implementation phase.
     def monitor_discussions(self, project_name: str, board_name: str, org: str, repo: str):
         """Monitor discussions for activity and feedback.
 
-        Uses batch updatedAt query to check all linked discussions in a single API call
-        instead of one call per discussion.
+        Uses batch updatedAt query to check staleness of all linked discussions in a single
+        API call, then only fetches full details for recently-updated discussions.
         """
         try:
             from config.state_manager import state_manager
@@ -6504,7 +6501,7 @@ Moving to implementation phase.
                 return
 
             from datetime import datetime, timedelta, timezone
-            since = datetime.now(timezone.utc) - timedelta(seconds=self.poll_interval * 2)
+            since = datetime.now(timezone.utc) - timedelta(seconds=self._current_poll_interval * 2)
 
             # Build mapping of discussion_id -> issue_number for all linked discussions
             links = dict(project_state.issue_discussion_links)

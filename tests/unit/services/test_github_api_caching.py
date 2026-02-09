@@ -96,7 +96,7 @@ class TestBoardQueryCache:
         _board_query_cache.clear()
 
     def test_failure_not_cached(self):
-        """Failed API calls should not be cached"""
+        """Failed API calls should not be cached (even after retry)"""
         from services.github_owner_utils import (
             execute_board_query_cached,
             _board_query_cache,
@@ -108,11 +108,38 @@ class TestBoardQueryCache:
         mock_client.graphql.return_value = (False, 'error')
 
         with patch('services.github_owner_utils.build_projects_v2_query', return_value='query {}'), \
-             patch('services.github_owner_utils.get_github_client', return_value=mock_client):
+             patch('services.github_owner_utils.get_github_client', return_value=mock_client), \
+             patch('services.github_owner_utils.time.sleep'):  # Skip retry delay
 
             result = execute_board_query_cached('test-owner', 1)
             assert result is None
             assert ('test-owner', 1) not in _board_query_cache
+            # Should have retried once (2 total attempts)
+            assert mock_client.graphql.call_count == 2
+
+        _board_query_cache.clear()
+
+    def test_retry_succeeds_on_second_attempt(self):
+        """Should return data if retry succeeds"""
+        from services.github_owner_utils import (
+            execute_board_query_cached,
+            _board_query_cache,
+        )
+
+        _board_query_cache.clear()
+
+        mock_data = {'user': {'projectV2': {'items': {'nodes': []}}}}
+        mock_client = Mock()
+        mock_client.graphql.side_effect = [(False, 'transient error'), (True, mock_data)]
+
+        with patch('services.github_owner_utils.build_projects_v2_query', return_value='query {}'), \
+             patch('services.github_owner_utils.get_github_client', return_value=mock_client), \
+             patch('services.github_owner_utils.time.sleep'):  # Skip retry delay
+
+            result = execute_board_query_cached('test-owner', 1)
+            assert result == mock_data
+            assert mock_client.graphql.call_count == 2
+            assert ('test-owner', 1) in _board_query_cache
 
         _board_query_cache.clear()
 
@@ -198,6 +225,38 @@ class TestBatchDiscussionUpdatedAt:
 
         result = discussions.get_discussions_updated_at(['D_1', 'D_2'])
         assert result == {'D_1': None, 'D_2': None}
+
+    def test_invalid_node_id_rejected(self):
+        """IDs with injection characters should be rejected"""
+        discussions = GitHubDiscussions.__new__(GitHubDiscussions)
+        discussions.app = Mock()
+        discussions.client = Mock()
+
+        # Attempt injection via malformed ID
+        result = discussions.get_discussions_updated_at(['D_1', '") { malicious } d99: node(id: "X'])
+
+        # All should return None, no API call made
+        assert all(v is None for v in result.values())
+        discussions.client.graphql.assert_not_called()
+
+    def test_batching_large_lists(self):
+        """Lists > 50 should be split into multiple batches"""
+        discussions = GitHubDiscussions.__new__(GitHubDiscussions)
+        discussions.app = Mock()
+        discussions.app.enabled = False
+        discussions.client = Mock()
+
+        ids = [f'D_{i}' for i in range(75)]
+
+        # Return valid data for each batch
+        batch1_result = {f'd{i}': {'id': f'D_{i}', 'updatedAt': '2025-01-01T00:00:00Z'} for i in range(50)}
+        batch2_result = {f'd{i}': {'id': f'D_{50+i}', 'updatedAt': '2025-01-02T00:00:00Z'} for i in range(25)}
+        discussions.client.graphql.side_effect = [(True, batch1_result), (True, batch2_result)]
+
+        result = discussions.get_discussions_updated_at(ids)
+
+        assert len(result) == 75
+        assert discussions.client.graphql.call_count == 2
 
 
 class TestFailsafeCachedItems:
