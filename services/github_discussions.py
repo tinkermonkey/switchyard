@@ -209,6 +209,48 @@ class GitHubDiscussions:
         logger.error(f"Failed to add comment to discussion {discussion_id}. Result: {result}")
         return None
 
+    def get_discussions_updated_at(self, discussion_ids: List[str]) -> Dict[str, Optional[str]]:
+        """
+        Batch-fetch updatedAt timestamps for multiple discussions in a single GraphQL call.
+
+        Uses aliased node() lookups to fetch all timestamps at once instead of
+        one API call per discussion.
+
+        Args:
+            discussion_ids: List of discussion node IDs
+
+        Returns:
+            Dict mapping discussion_id to updatedAt string, or None if discussion was deleted/not found
+        """
+        if not discussion_ids:
+            return {}
+
+        # Build aliased query: { d0: node(id: "...") { ... on Discussion { id updatedAt } } ... }
+        fragments = []
+        for i, did in enumerate(discussion_ids):
+            fragments.append(
+                f'd{i}: node(id: "{did}") {{ ... on Discussion {{ id updatedAt }} }}'
+            )
+
+        query = "{ " + " ".join(fragments) + " }"
+
+        result = self._execute_graphql(query)
+        if not result:
+            logger.warning("Batch discussion updatedAt query failed, returning empty results")
+            return {did: None for did in discussion_ids}
+
+        # Map results back to discussion IDs
+        updated_at_map = {}
+        for i, did in enumerate(discussion_ids):
+            alias = f'd{i}'
+            node_data = result.get(alias)
+            if node_data and 'updatedAt' in node_data:
+                updated_at_map[did] = node_data['updatedAt']
+            else:
+                updated_at_map[did] = None
+
+        return updated_at_map
+
     def get_discussion(self, discussion_id: str) -> Optional[Dict]:
         """Get discussion details by node ID"""
         query = """

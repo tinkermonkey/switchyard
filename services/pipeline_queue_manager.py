@@ -172,8 +172,7 @@ class PipelineQueueManager:
         try:
             from config.manager import config_manager
             from config.state_manager import state_manager
-            from services.github_api_client import get_github_client
-            from services.github_owner_utils import build_projects_v2_query, get_owner_type
+            from services.github_owner_utils import execute_board_query_cached, get_owner_type
 
             # Get project config
             project_config = config_manager.get_project_config(self.project_name)
@@ -191,24 +190,16 @@ class PipelineQueueManager:
                 )
                 return []
 
-            # Build GraphQL query
-            query = build_projects_v2_query(
+            # Execute cached board query
+            data = execute_board_query_cached(
                 project_config.github['org'],
                 board_state.project_number
             )
 
-            if query is None:
+            if data is None:
                 logger.error(
-                    f"Cannot build query for {project_config.github['org']}"
+                    f"Board query failed for {project_config.github['org']}/project#{board_state.project_number}"
                 )
-                return []
-
-            # Execute query
-            github_client = get_github_client()
-            success, data = github_client.graphql(query)
-
-            if not success:
-                logger.error(f"GraphQL query failed: {data}")
                 return []
 
             # Extract project data based on owner type

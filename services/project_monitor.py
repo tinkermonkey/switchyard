@@ -411,18 +411,21 @@ class ProjectMonitor:
         else:
             self.poll_interval = 30
 
+        # Adaptive polling: backoff when idle, reset on activity
+        self._base_poll_interval = self.poll_interval
+        self._current_poll_interval = self.poll_interval
+        self._idle_cycles = 0
+        self._max_poll_interval = 60
+        self._idle_backoff_threshold = 4  # Start backoff after this many idle cycles
+
     def get_project_items(self, project_owner: str, project_number: int) -> List[ProjectItem]:
-        """Query GitHub Projects v2 API to get current project items (excludes closed issues)"""
-        from services.github_owner_utils import build_projects_v2_query, get_owner_type
+        """Query GitHub Projects v2 API to get current project items (excludes closed issues).
+
+        Uses execute_board_query_cached() for automatic short-TTL caching and deduplication
+        with other callers (PipelineQueueManager, force_sync_with_github).
+        """
+        from services.github_owner_utils import execute_board_query_cached, get_owner_type
         from services.github_api_client import get_github_client
-        import time
-        
-        # Build the correct query based on owner type
-        query = build_projects_v2_query(project_owner, project_number)
-        
-        if query is None:
-            logger.error(f"Cannot query project items - unable to determine owner type for '{project_owner}'")
-            return []
 
         # Check if circuit breaker is already open - if so, don't waste time retrying
         github_client = get_github_client()
@@ -432,77 +435,52 @@ class ProjectMonitor:
                 logger.debug(f"Circuit breaker is open for {time_until:.0f}s, skipping project item query")
             return []
 
-        # Retry up to 3 times with exponential backoff for transient errors
-        max_retries = 3
-        retry_delay = 1  # Start with 1 second
-        
-        for attempt in range(max_retries):
-            try:
-                github_client = get_github_client()
-                
-                # Check again before each attempt (in case breaker opened during a previous call)
-                if github_client.breaker.is_open():
-                    logger.debug(f"Circuit breaker opened during retry loop, stopping retries")
-                    return []
-                
-                success, data = github_client.graphql(query)
+        # Use cached board query (deduplicates with PipelineQueueManager and force_sync)
+        data = execute_board_query_cached(project_owner, project_number)
+        if data is None:
+            return []
 
-                if not success:
-                    logger.warning(f"GraphQL query failed (attempt {attempt + 1}/{max_retries}): {data}")
-                    if attempt < max_retries - 1:
-                        logger.info(f"Retrying in {retry_delay} seconds...")
-                        time.sleep(retry_delay)
-                        retry_delay *= 2  # Exponential backoff
+        try:
+            # Get project data from the correct path based on owner type
+            owner_type = get_owner_type(project_owner)
+            if owner_type == 'user':
+                project_data = data['user']['projectV2']
+            else:  # organization
+                project_data = data['organization']['projectV2']
+
+            items = []
+            for node in project_data['items']['nodes']:
+                content = node.get('content')
+                if not content:  # Skip draft items
                     continue
-                
-                # Get project data from the correct path based on owner type
-                owner_type = get_owner_type(project_owner)
-                if owner_type == 'user':
-                    project_data = data['user']['projectV2']
-                else:  # organization
-                    project_data = data['organization']['projectV2']
 
-                items = []
-                for node in project_data['items']['nodes']:
-                    content = node.get('content')
-                    if not content:  # Skip draft items
-                        continue
+                # Include closed issues so we can detect moves to Done/Exit columns and release locks
+                # trigger_agent_for_status will handle skipping agent execution for closed issues
+                issue_state = content.get('state', '').upper()
 
-                    # Include closed issues so we can detect moves to Done/Exit columns and release locks
-                    # trigger_agent_for_status will handle skipping agent execution for closed issues
-                    issue_state = content.get('state', '').upper()
+                # Find status field
+                status = "No Status"
+                for field_value in node['fieldValues']['nodes']:
+                    if field_value and field_value.get('field', {}).get('name') == 'Status':
+                        status = field_value.get('name', 'No Status')
+                        break
 
-                    # Find status field
-                    status = "No Status"
-                    for field_value in node['fieldValues']['nodes']:
-                        if field_value and field_value.get('field', {}).get('name') == 'Status':
-                            status = field_value.get('name', 'No Status')
-                            break
+                item = ProjectItem(
+                    item_id=node['id'],
+                    content_id=content['id'],
+                    issue_number=content['number'],
+                    title=content['title'],
+                    status=status,
+                    repository=content['repository']['name'],
+                    last_updated=content['updatedAt']
+                )
+                items.append(item)
 
-                    item = ProjectItem(
-                        item_id=node['id'],
-                        content_id=content['id'],
-                        issue_number=content['number'],
-                        title=content['title'],
-                        status=status,
-                        repository=content['repository']['name'],
-                        last_updated=content['updatedAt']
-                    )
-                    items.append(item)
+            return items
 
-                return items
-
-            except Exception as e:
-                logger.warning(f"GraphQL query failed (attempt {attempt + 1}/{max_retries}): {e}")
-                if attempt < max_retries - 1:
-                    logger.info(f"Retrying in {retry_delay} seconds...")
-                    time.sleep(retry_delay)
-                    retry_delay *= 2  # Exponential backoff
-                else:
-                    logger.error("Max retries exceeded for GraphQL query")
-                    return []
-
-        return []  # Should never reach here, but just in case
+        except Exception as e:
+            logger.error(f"Failed to parse board query response for {project_owner}/project#{project_number}: {e}")
+            return []
 
     async def get_issue_column_async(self, project_name: str, board_name: str, issue_number: int) -> Optional[str]:
         """
@@ -5038,7 +5016,8 @@ _Repair cycle initiated by Claude Code Orchestrator_
         # No automatic cleanup during runtime - see docstring for reasoning
         pass
 
-    def _find_stalled_issues_for_pipeline(self, project_name: str, board_name: str):
+    def _find_stalled_issues_for_pipeline(self, project_name: str, board_name: str,
+                                            cached_items: List[ProjectItem] = None):
         """
         Find issues that appear stalled (in action column but no active work).
 
@@ -5047,6 +5026,11 @@ _Repair cycle initiated by Claude Code Orchestrator_
         2. Have no active pipeline run OR have failed pipeline run
         3. Are NOT in the waiting queue (handled by main failsafe)
         4. Last activity > 2 minutes ago (grace period for agent startup)
+
+        Args:
+            project_name: Project name
+            board_name: Board name
+            cached_items: Pre-fetched board items from the main poll loop (avoids duplicate API call)
 
         Returns:
             List of stalled issue dicts with: issue_number, column, last_activity_at
@@ -5077,19 +5061,20 @@ _Repair cycle initiated by Claude Code Orchestrator_
             workflow_template = config_manager.get_workflow_template(pipeline_config.workflow)
             exit_columns = {col.name for col in workflow_template.columns if col.type == 'exit'}
 
-            # Get board state
-            from config.state_manager import state_manager
-            project_state = state_manager.load_project_state(project_name)
-            if not project_state:
-                return []
+            # Use cached items if provided, otherwise fetch from GitHub
+            if cached_items is not None:
+                current_items = cached_items
+            else:
+                from config.state_manager import state_manager
+                project_state = state_manager.load_project_state(project_name)
+                if not project_state:
+                    return []
 
-            board_state = project_state.boards.get(board_name)
-            if not board_state:
-                return []
+                board_state = project_state.boards.get(board_name)
+                if not board_state:
+                    return []
 
-            # Get current items from GitHub
-            github_client = get_github_client()
-            current_items = self.get_project_items(project_config.github['org'], board_state.project_number)
+                current_items = self.get_project_items(project_config.github['org'], board_state.project_number)
 
             if not current_items:
                 return []
@@ -5180,7 +5165,7 @@ _Repair cycle initiated by Claude Code Orchestrator_
 
         return stalled_issues
 
-    def _check_and_process_waiting_issues_failsafe(self):
+    def _check_and_process_waiting_issues_failsafe(self, poll_cycle_items: Dict[tuple, List[ProjectItem]] = None):
         """
         Failsafe mechanism to catch cases where waiting issues aren't being processed.
 
@@ -5194,6 +5179,10 @@ _Repair cycle initiated by Claude Code Orchestrator_
         The failsafe checks each pipeline for:
         - Scenario 1 (existing): Pipeline unlocked + waiting issues → process next waiting
         - Scenario 2 (NEW): Pipeline unlocked + stalled issues → retry stalled issue
+
+        Args:
+            poll_cycle_items: Pre-fetched items from the main poll loop, keyed by
+                (project_name, board_name). Avoids duplicate get_project_items() calls.
 
         Safety: Uses same lock acquisition as normal flow - prevents duplicate launches.
         Lock acquisition is atomic in Redis - only ONE process can acquire successfully.
@@ -5239,8 +5228,11 @@ _Repair cycle initiated by Claude Code Orchestrator_
                             # SCENARIO 2: No waiting issues - check for stalled operations (NEW)
                             logger.debug(f"⚡ FAILSAFE: No waiting issues for {project_name}/{pipeline.board_name}, checking for stalled operations...")
 
+                            # Pass cached items from main poll loop to avoid duplicate API call
+                            cached = poll_cycle_items.get((project_name, pipeline.board_name)) if poll_cycle_items else None
                             stalled_issues = self._find_stalled_issues_for_pipeline(
-                                project_name, pipeline.board_name
+                                project_name, pipeline.board_name,
+                                cached_items=cached
                             )
 
                             if not stalled_issues:
@@ -5513,6 +5505,10 @@ _Repair cycle initiated by Claude Code Orchestrator_
                     # This prevents duplicate dispatches when rescan was triggered recently
                     was_breaker_open = False
                 
+                # Collect items fetched during this poll cycle for reuse by failsafe
+                poll_cycle_items = {}
+                cycle_had_changes = False
+
                 # Get all configured visible projects (exclude hidden/test projects)
                 for project_name in self.config_manager.list_visible_projects():
                     project_config = self.config_manager.get_project_config(project_name)
@@ -5544,12 +5540,16 @@ _Repair cycle initiated by Claude Code Orchestrator_
                         # Get current project items
                         current_items = self.get_project_items(project_config.github['org'], board_state.project_number)
 
+                        # Store for failsafe reuse (even if empty — avoids re-fetch)
+                        poll_cycle_items[(project_name, pipeline.board_name)] = current_items
+
                         if current_items:
                             # Detect changes (use board-specific key for state tracking)
                             board_key = f"{project_name}_{pipeline.board_name}"
                             changes = self.detect_changes(board_key, current_items)
 
                             if changes:
+                                cycle_had_changes = True
                                 logger.info(f"Detected {len(changes)} changes in {project_name}/{pipeline.board_name}")
                                 # Process changes with new system
                                 self.process_board_changes(changes, project_name, pipeline.board_name)
@@ -5579,10 +5579,22 @@ _Repair cycle initiated by Claude Code Orchestrator_
                 # FAILSAFE: Check for waiting issues that haven't been processed
                 # This catches edge cases where pipeline lock is released but next issue isn't triggered
                 logger.debug("Running queue processing failsafe check...")
-                self._check_and_process_waiting_issues_failsafe()
+                self._check_and_process_waiting_issues_failsafe(poll_cycle_items=poll_cycle_items)
 
-                logger.debug(f"Sleeping for {self.poll_interval} seconds...")
-                time.sleep(self.poll_interval)
+                # Adaptive polling: backoff when idle, reset on activity
+                if cycle_had_changes:
+                    self._idle_cycles = 0
+                    self._current_poll_interval = self._base_poll_interval
+                else:
+                    self._idle_cycles += 1
+                    if self._idle_cycles > self._idle_backoff_threshold:
+                        self._current_poll_interval = min(
+                            self._current_poll_interval * 1.5,
+                            self._max_poll_interval
+                        )
+
+                logger.debug(f"Sleeping for {self._current_poll_interval:.0f}s (idle cycles: {self._idle_cycles})...")
+                time.sleep(self._current_poll_interval)
 
             except KeyboardInterrupt:
                 logger.info("Project monitor stopped")
@@ -6477,7 +6489,11 @@ Moving to implementation phase.
         return '\n'.join(parts)
 
     def monitor_discussions(self, project_name: str, board_name: str, org: str, repo: str):
-        """Monitor discussions for activity and feedback"""
+        """Monitor discussions for activity and feedback.
+
+        Uses batch updatedAt query to check all linked discussions in a single API call
+        instead of one call per discussion.
+        """
         try:
             from config.state_manager import state_manager
 
@@ -6487,28 +6503,35 @@ Moving to implementation phase.
                 logger.debug(f"No discussions linked for {project_name}")
                 return
 
-            # Get recent discussions (updated in last poll interval * 2)
             from datetime import datetime, timedelta, timezone
             since = datetime.now(timezone.utc) - timedelta(seconds=self.poll_interval * 2)
 
-            # Check each linked discussion for new activity
-            for issue_number, discussion_id in list(project_state.issue_discussion_links.items()):
+            # Build mapping of discussion_id -> issue_number for all linked discussions
+            links = dict(project_state.issue_discussion_links)
+            discussion_ids = list(links.values())
+            issue_by_discussion = {did: inum for inum, did in links.items()}
+
+            # Batch-fetch updatedAt timestamps in a single API call
+            updated_at_map = self.discussions.get_discussions_updated_at(discussion_ids)
+
+            for discussion_id, updated_at_str in updated_at_map.items():
+                issue_number = issue_by_discussion.get(discussion_id)
+                if issue_number is None:
+                    continue
+
                 try:
-                    # Get discussion details
-                    discussion = self.discussions.get_discussion(discussion_id)
-                    if not discussion:
+                    if updated_at_str is None:
                         # Discussion was deleted - remove from state
-                        from config.state_manager import state_manager
                         logger.info(f"Discussion {discussion_id} for issue #{issue_number} no longer exists, removing from state")
                         state_manager.unlink_issue_discussion(project_name, int(issue_number))
                         continue
 
                     # Check if discussion has been updated recently
-                    updated_at = datetime.fromisoformat(discussion['updatedAt'].replace('Z', '+00:00'))
+                    updated_at = datetime.fromisoformat(updated_at_str.replace('Z', '+00:00'))
                     if updated_at < since:
                         continue  # No recent activity
 
-                    logger.debug(f"Checking discussion #{discussion.get('number')} for new activity")
+                    logger.debug(f"Discussion {discussion_id} for issue #{issue_number} has recent activity")
 
                     # Check for feedback in discussion comments
                     self.check_for_feedback_in_discussion(

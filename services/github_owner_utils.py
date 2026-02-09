@@ -12,7 +12,7 @@ import logging
 import time
 import redis
 import asyncio
-from typing import Literal, Optional
+from typing import Dict, Literal, Optional
 from functools import lru_cache, wraps
 from services.circuit_breaker import CircuitBreaker, CircuitBreakerOpen
 
@@ -341,6 +341,56 @@ def build_projects_v2_query(owner_login: str, project_number: int) -> Optional[s
         }}'''
     
     return query
+
+
+# Board query cache for deduplicating identical GraphQL board queries
+_board_query_cache: Dict[tuple, tuple] = {}  # (owner, project_number) -> (timestamp, data)
+_board_query_cache_ttl = 15  # seconds
+
+
+def execute_board_query_cached(owner: str, project_number: int) -> Optional[dict]:
+    """
+    Execute a board query with short-TTL caching to deduplicate identical queries.
+
+    Multiple callers (ProjectMonitor.get_project_items, PipelineQueueManager.get_issues_in_column_order,
+    force_sync_with_github) all execute the same GraphQL board query. This function ensures
+    only one actual API call is made per board per TTL window.
+
+    Args:
+        owner: GitHub owner login
+        project_number: Project number
+
+    Returns:
+        Raw GraphQL response data dict, or None on failure
+    """
+    cache_key = (owner, project_number)
+    now = time.time()
+
+    # Check cache
+    if cache_key in _board_query_cache:
+        cached_time, cached_data = _board_query_cache[cache_key]
+        if now - cached_time < _board_query_cache_ttl:
+            logger.debug(f"Board query cache hit for {owner}/project#{project_number}")
+            return cached_data
+
+    # Cache miss — execute query
+    query = build_projects_v2_query(owner, project_number)
+    if query is None:
+        return None
+
+    from services.github_api_client import get_github_client
+    github_client = get_github_client()
+    success, data = github_client.graphql(query)
+
+    if not success:
+        logger.warning(f"Board query failed for {owner}/project#{project_number}: {data}")
+        # Do NOT cache failures
+        return None
+
+    # Cache successful result
+    _board_query_cache[cache_key] = (now, data)
+    logger.debug(f"Board query cache miss for {owner}/project#{project_number}, cached result")
+    return data
 
 
 @retry_on_timeout()
