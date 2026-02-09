@@ -5,7 +5,11 @@ Tests complete flows combining GitHub monitoring, agent routing,
 review cycles, and pipeline progression.
 """
 
+import os
 import pytest
+if not os.path.isdir('/app'):
+    pytest.skip("Requires Docker container environment", allow_module_level=True)
+
 from unittest.mock import Mock, patch, AsyncMock
 from datetime import datetime, timezone
 from tests.unit.orchestrator.mocks import MockGitHubAPI, MockAgentExecutor, MockReviewParser

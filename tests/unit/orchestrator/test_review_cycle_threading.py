@@ -6,7 +6,11 @@ including pipeline run creation, thread safety, and proper closure
 variable capture.
 """
 
+import os
 import pytest
+if not os.path.isdir('/app'):
+    pytest.skip("Requires Docker container environment", allow_module_level=True)
+
 import asyncio
 import threading
 import time

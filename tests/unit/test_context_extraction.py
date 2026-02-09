@@ -6,9 +6,13 @@ context for a reviewer: the previous agent's last comment + threaded replies,
 without including previous iterations or unrelated comments.
 """
 
+import os
+import pytest
+if not os.path.isdir('/app'):
+    pytest.skip("Requires Docker container environment", allow_module_level=True)
+
 import json
 import logging
-import pytest
 from pathlib import Path
 
 logger = logging.getLogger(__name__)

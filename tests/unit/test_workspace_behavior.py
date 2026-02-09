@@ -4,7 +4,11 @@ Simplified test suite documenting workspace-specific behavior.
 These tests MUST pass before and after the workspace abstraction refactor.
 """
 
+import os
 import pytest
+if not os.path.isdir('/app'):
+    pytest.skip("Requires Docker container environment", allow_module_level=True)
+
 from unittest.mock import AsyncMock, MagicMock, patch
 
 

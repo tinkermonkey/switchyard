@@ -91,6 +91,28 @@ class TestObservabilityElasticsearchIndexing:
             EventType.BRANCH_CONFLICT_DETECTED,
             EventType.BRANCH_STALE_DETECTED,
             EventType.BRANCH_SELECTION_ESCALATED,
+            # Result Resilience
+            EventType.RESULT_PERSISTENCE_FAILED,
+            EventType.FALLBACK_STORAGE_USED,
+            EventType.OUTPUT_VALIDATION_FAILED,
+            EventType.EMPTY_OUTPUT_DETECTED,
+            EventType.CONTAINER_RESULT_RECOVERED,
+            # Repair Cycle
+            EventType.REPAIR_CYCLE_STARTED,
+            EventType.REPAIR_CYCLE_ITERATION,
+            EventType.REPAIR_CYCLE_TEST_CYCLE_STARTED,
+            EventType.REPAIR_CYCLE_TEST_CYCLE_COMPLETED,
+            EventType.REPAIR_CYCLE_TEST_EXECUTION_STARTED,
+            EventType.REPAIR_CYCLE_TEST_EXECUTION_COMPLETED,
+            EventType.REPAIR_CYCLE_FIX_CYCLE_STARTED,
+            EventType.REPAIR_CYCLE_FIX_CYCLE_COMPLETED,
+            EventType.REPAIR_CYCLE_FILE_FIX_STARTED,
+            EventType.REPAIR_CYCLE_FILE_FIX_COMPLETED,
+            EventType.REPAIR_CYCLE_FILE_FIX_FAILED,
+            EventType.REPAIR_CYCLE_WARNING_REVIEW_STARTED,
+            EventType.REPAIR_CYCLE_WARNING_REVIEW_COMPLETED,
+            EventType.REPAIR_CYCLE_WARNING_REVIEW_FAILED,
+            EventType.REPAIR_CYCLE_COMPLETED,
         ]
         
         for event_type in decision_events:
@@ -127,6 +149,11 @@ class TestObservabilityElasticsearchIndexing:
             EventType.PIPELINE_RUN_STARTED,
             EventType.PIPELINE_RUN_COMPLETED,
             EventType.PIPELINE_RUN_FAILED,
+            EventType.REPAIR_CYCLE_CONTAINER_STARTED,
+            EventType.REPAIR_CYCLE_CONTAINER_CHECKPOINT_UPDATED,
+            EventType.REPAIR_CYCLE_CONTAINER_RECOVERED,
+            EventType.REPAIR_CYCLE_CONTAINER_KILLED,
+            EventType.REPAIR_CYCLE_CONTAINER_COMPLETED,
         ]
 
         for event_type in non_indexed_events:
@@ -158,6 +185,11 @@ class TestObservabilityElasticsearchIndexing:
             EventType.PIPELINE_RUN_STARTED,
             EventType.PIPELINE_RUN_COMPLETED,
             EventType.PIPELINE_RUN_FAILED,
+            EventType.REPAIR_CYCLE_CONTAINER_STARTED,
+            EventType.REPAIR_CYCLE_CONTAINER_CHECKPOINT_UPDATED,
+            EventType.REPAIR_CYCLE_CONTAINER_RECOVERED,
+            EventType.REPAIR_CYCLE_CONTAINER_KILLED,
+            EventType.REPAIR_CYCLE_CONTAINER_COMPLETED,
         ]
         
         for event_type in all_event_types:
@@ -566,6 +598,15 @@ class TestEventTypeCompleteness:
             'task_queued', 'task_dequeued', 'task_priority_changed', 'task_cancelled',
             'branch_selected', 'branch_created', 'branch_reused', 'branch_conflict_detected',
             'branch_stale_detected', 'branch_selection_escalated',
+            'result_persistence_failed', 'fallback_storage_used',
+            'output_validation_failed', 'empty_output_detected', 'container_result_recovered',
+            'repair_cycle_started', 'repair_cycle_iteration',
+            'repair_cycle_test_cycle_started', 'repair_cycle_test_cycle_completed',
+            'repair_cycle_test_execution_started', 'repair_cycle_test_execution_completed',
+            'repair_cycle_fix_cycle_started', 'repair_cycle_fix_cycle_completed',
+            'repair_cycle_file_fix_started', 'repair_cycle_file_fix_completed', 'repair_cycle_file_fix_failed',
+            'repair_cycle_warning_review_started', 'repair_cycle_warning_review_completed',
+            'repair_cycle_warning_review_failed', 'repair_cycle_completed',
         }
         
         expected_lifecycle_events = {
@@ -579,6 +620,9 @@ class TestEventTypeCompleteness:
             'tool_execution_started', 'tool_execution_completed',
             'performance_metric', 'token_usage',
             'pipeline_run_started', 'pipeline_run_completed', 'pipeline_run_failed',
+            'repair_cycle_container_started', 'repair_cycle_container_checkpoint_updated',
+            'repair_cycle_container_recovered', 'repair_cycle_container_killed',
+            'repair_cycle_container_completed',
         }
         
         # Check that all events are accounted for

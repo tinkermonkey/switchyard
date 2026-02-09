@@ -6,7 +6,11 @@ with emphasis on code-fence-aware boundary detection — the fix for the bug whe
 ## headers inside markdown code blocks prematurely truncated section extraction.
 """
 
+import os
 import pytest
+if not os.path.isdir('/app'):
+    pytest.skip("Requires Docker container environment", allow_module_level=True)
+
 from unittest.mock import patch, MagicMock
 
 

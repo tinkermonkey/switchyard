@@ -4,7 +4,11 @@ Unit tests for pipeline progression (auto-promotion)
 Tests automatic promotion of issues through pipeline stages.
 """
 
+import os
 import pytest
+if not os.path.isdir('/app'):
+    pytest.skip("Requires Docker container environment", allow_module_level=True)
+
 from unittest.mock import Mock, patch, MagicMock
 from tests.unit.orchestrator.mocks import MockGitHubAPI
 from tests.unit.orchestrator.conftest import create_test_issue

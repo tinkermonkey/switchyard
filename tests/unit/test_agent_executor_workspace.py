@@ -4,7 +4,11 @@ Tests for AgentExecutor with workspace abstraction integration.
 These tests verify that AgentExecutor correctly uses workspace contexts.
 """
 
+import os
 import pytest
+if not os.path.isdir('/app'):
+    pytest.skip("Requires Docker container environment", allow_module_level=True)
+
 from unittest.mock import AsyncMock, MagicMock, patch
 
 

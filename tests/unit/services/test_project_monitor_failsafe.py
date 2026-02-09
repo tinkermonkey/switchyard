@@ -1,7 +1,11 @@
 """
 Unit tests for ProjectMonitor queue processing failsafe mechanism
 """
+import os
 import pytest
+if not os.path.isdir('/app'):
+    pytest.skip("Requires Docker container environment", allow_module_level=True)
+
 from unittest.mock import Mock, MagicMock, patch, call
 from services.project_monitor import ProjectMonitor
 from config.manager import ConfigManager

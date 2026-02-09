@@ -4,7 +4,11 @@ Unit tests for orchestrator agent routing
 Tests the agent selection and routing logic without actually executing agents.
 """
 
+import os
 import pytest
+if not os.path.isdir('/app'):
+    pytest.skip("Requires Docker container environment", allow_module_level=True)
+
 from unittest.mock import Mock, patch, AsyncMock
 from tests.unit.orchestrator.mocks import MockGitHubAPI, MockAgentExecutor
 from tests.unit.orchestrator.conftest import create_test_issue, configure_agent_results

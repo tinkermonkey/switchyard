@@ -6,7 +6,11 @@ operations. They must pass BEFORE refactoring and AFTER refactoring to
 ensure backward compatibility.
 """
 
+import os
 import pytest
+if not os.path.isdir('/app'):
+    pytest.skip("Requires Docker container environment", allow_module_level=True)
+
 from unittest.mock import AsyncMock, MagicMock, patch, call
 from pathlib import Path
 

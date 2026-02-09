@@ -4,7 +4,11 @@ Unit tests for GitHub monitoring
 Tests the GitHub polling and issue status change detection logic.
 """
 
+import os
 import pytest
+if not os.path.isdir('/app'):
+    pytest.skip("Requires Docker container environment", allow_module_level=True)
+
 from unittest.mock import Mock, patch, call
 from datetime import datetime, timezone
 from tests.unit.orchestrator.mocks import MockGitHubAPI

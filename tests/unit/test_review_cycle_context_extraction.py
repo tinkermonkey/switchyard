@@ -9,7 +9,11 @@ Regression test for bug where iteration 3 reviewer received its own
 previous output instead of the maker's revision.
 """
 
+import os
 import pytest
+if not os.path.isdir('/app'):
+    pytest.skip("Requires Docker container environment", allow_module_level=True)
+
 from datetime import datetime
 from services.review_cycle import ReviewCycleExecutor, ReviewCycleState
 

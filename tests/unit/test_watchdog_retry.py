@@ -8,9 +8,12 @@ Tests:
 - GitHub output verification
 """
 
-import pytest
-import yaml
 import os
+import pytest
+if not os.path.isdir('/app'):
+    pytest.skip("Requires Docker container environment", allow_module_level=True)
+
+import yaml
 from unittest.mock import MagicMock, patch, mock_open
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
