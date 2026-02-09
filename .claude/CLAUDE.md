@@ -23,7 +23,7 @@ This is the Claude Code Agent Orchestrator - an autonomous AI development system
 - **Queue**: Redis (with in-memory fallback)
 - **Search/Analytics**: Elasticsearch 9.0
 - **GitHub**: GraphQL API, REST API, GitHub CLI
-- **Claude**: Anthropic Claude API (Sonnet 4.5, Opus 4)
+- **Claude**: Anthropic Claude API (Opus 4.5, Sonnet 4.5, Haiku 4.5)
 - **Docker**: Container orchestration for agent isolation
 
 ### Key Components
@@ -35,7 +35,7 @@ This is the Claude Code Agent Orchestrator - an autonomous AI development system
 
 **Agent System** (`agents/`)
 - Specialized agents for different SDLC stages
-- Base classes: `MakerAgent` (creates output), `PipelineStage` (reviews/validates)
+- Base classes: `PipelineStage` (base), `MakerAgent` (creates output), `AnalysisAgent` (analysis-only, extends MakerAgent)
 - Three execution modes: Initial, Revision, Question (conversational)
 - Docker-in-Docker execution with workspace mounting
 
@@ -62,6 +62,7 @@ This is the Claude Code Agent Orchestrator - an autonomous AI development system
 - Checkpointing for pipeline recovery
 - Git state tracking
 - Conversation history for multi-turn interactions
+- PR review cycle tracking (`PRReviewStateManager`)
 
 **Debug Scripts** (`scripts/`)
 - Utilities for maintenance tasks (branch cleanup, state inspection)
@@ -105,7 +106,7 @@ volumes:
 
 ### Foundational Layer (`config/foundations/`)
 
-**agents.yaml**: Defines 14 specialized agents with capabilities, timeouts, Docker requirements
+**agents.yaml**: Defines 13 agents with capabilities, timeouts, Docker requirements (11 registered in `AGENT_REGISTRY`)
 - `requires_dev_container: true` - Needs project dependencies
 - `requires_docker: true` - Must run in Docker
 - `makes_code_changes: true` - Modifies codebase
@@ -142,6 +143,7 @@ project:
 
 Auto-managed runtime state (DO NOT edit manually):
 - `github_state.yaml` - Board IDs, column IDs, sync status
+- `pr_review_state.yaml` - PR review cycle counts and history
 
 Note: Dev container state is tracked separately in `state/dev_containers/`
 
@@ -294,17 +296,20 @@ docker system prune -a
 
 1. Create agent class in `agents/<agent_name>_agent.py`:
 ```python
+# Use MakerAgent for agents that create output (code, docs)
+# Use AnalysisAgent for analysis-only agents (review, breakdown, PR review)
 from agents.base_maker_agent import MakerAgent
+from agents.base_analysis_agent import AnalysisAgent
 
-class CustomAgent(MakerAgent):
+class CustomAgent(MakerAgent):  # or AnalysisAgent
     @property
     def agent_display_name(self) -> str:
         return "Custom Agent"
-    
+
     @property
     def agent_role_description(self) -> str:
         return "Brief role description"
-    
+
     @property
     def output_sections(self) -> List[str]:
         return ["section1", "section2"]
@@ -592,10 +597,10 @@ See `scripts/DIAGNOSTIC_SCRIPTS.md` for complete documentation, examples, and co
 
 ```
 clauditoreum/
-├── agents/                      # 14 specialized AI agents
-│   ├── base_maker_agent.py     # Base class for maker agents
-│   ├── business_analyst_agent.py
-│   ├── senior_software_engineer_agent.py
+├── agents/                      # 11 registered AI agents
+│   ├── base_maker_agent.py     # MakerAgent base class
+│   ├── base_analysis_agent.py  # AnalysisAgent base class
+│   ├── pr_review_agent.py      # PR review with requirements verification
 │   └── ...
 ├── config/                      # Configuration system
 │   ├── foundations/            # Agent, pipeline, workflow definitions
@@ -609,7 +614,7 @@ clauditoreum/
 │   ├── project_monitor.py      # Board polling
 │   ├── git_workflow_manager.py # Git automation
 │   └── ...
-├── state_management/           # Checkpointing and recovery
+├── state_management/           # Checkpointing, recovery, PR review state
 ├── task_queue/                 # Redis task queue
 ├── claude/                     # Claude integration
 │   ├── claude_integration.py  # Claude API wrapper
