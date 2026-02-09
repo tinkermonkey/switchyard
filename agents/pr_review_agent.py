@@ -114,8 +114,6 @@ class PRReviewAgent(AnalysisAgent):
         project_config = self.config_manager.get_project_config(project_name)
         github_config = project_config.github
         repo = f"{github_config['org']}/{github_config['repo']}"
-        repo_url = f"https://github.com/{github_config['org']}/{github_config['repo']}"
-
         # Find the PR for this parent issue
         pr_url = await self._find_pr_url(github_config, parent_issue_number)
         if not pr_url:
@@ -283,8 +281,6 @@ class PRReviewAgent(AnalysisAgent):
                 repo_name=github_config['repo']
             )
 
-            project_name = github_config.get('repo', '')  # Use repo as project name for branch lookup
-
             # Try to find feature branch state
             # Need to iterate possible project names since github_config doesn't directly have it
             feature_branch = None
@@ -305,7 +301,7 @@ class PRReviewAgent(AnalysisAgent):
 
             return None
         except Exception as e:
-            logger.error(f"Failed to find PR for #{parent_issue_number}: {e}")
+            logger.error(f"Failed to find PR for #{parent_issue_number}: {e}", exc_info=True)
             return None
 
     # ==================================================================================
@@ -350,11 +346,8 @@ class PRReviewAgent(AnalysisAgent):
             comments = result['node']['comments']['nodes']
 
             # Agent signature pattern: _Processed by the X agent_
-            agent_map = {
-                'idea_researcher': 'idea researcher',
-                'business_analyst': 'business analyst',
-                'software_architect': 'software architect',
-            }
+            # Signatures use underscore-separated names (e.g., "idea_researcher")
+            agent_keys = ['idea_researcher', 'business_analyst', 'software_architect']
 
             all_bodies = []
             for comment in comments:
@@ -363,9 +356,8 @@ class PRReviewAgent(AnalysisAgent):
                     all_bodies.append(reply.get('body', ''))
 
             for body in all_bodies:
-                for key, signature in agent_map.items():
-                    if f'_Processed by the {signature} agent_' in body.lower() or \
-                       f'_Processed by the {signature} agent_' in body:
+                for key in agent_keys:
+                    if f'_Processed by the {key} agent_' in body:
                         # Keep the most recent output for each agent
                         outputs[key] = body
 
@@ -380,12 +372,12 @@ class PRReviewAgent(AnalysisAgent):
         try:
             result = subprocess.run(
                 ['gh', 'issue', 'view', str(issue_number), '-R', repo, '--json', 'body'],
-                capture_output=True, text=True, check=True
+                capture_output=True, text=True, check=True, timeout=30
             )
             data = json.loads(result.stdout)
             return data.get('body', '')
         except Exception as e:
-            logger.error(f"Failed to get parent issue body: {e}")
+            logger.error(f"Failed to get parent issue body: {e}", exc_info=True)
             return ''
 
     # ==================================================================================
@@ -553,7 +545,7 @@ If all requirements are met, write "All requirements verified - no gaps found" a
         )
 
     # ==================================================================================
-    # ISSUE CREATION (reuses work_breakdown_agent pattern)
+    # ISSUE CREATION - similar pattern to work_breakdown_agent
     # ==================================================================================
 
     async def _create_review_issues(
@@ -597,11 +589,11 @@ If all requirements are met, write "All requirements verified - no gaps found" a
         try:
             result = subprocess.run(
                 ['gh', 'issue', 'view', str(parent_issue_number), '-R', repo, '--json', 'id'],
-                capture_output=True, text=True, check=True
+                capture_output=True, text=True, check=True, timeout=30
             )
             parent_issue_id = json.loads(result.stdout)['id']
         except Exception as e:
-            logger.error(f"Failed to get parent issue ID: {e}")
+            logger.error(f"Failed to get parent issue ID: {e}", exc_info=True)
 
         created_issues = []
 
@@ -612,7 +604,7 @@ If all requirements are met, write "All requirements verified - no gaps found" a
                     ['gh', 'issue', 'create', '-R', repo,
                      '--title', spec['title'],
                      '--body', spec['body']],
-                    capture_output=True, text=True, check=True
+                    capture_output=True, text=True, check=True, timeout=30
                 )
                 issue_url = result.stdout.strip()
                 url_match = re.search(r'/issues/(\d+)$', issue_url)
@@ -626,7 +618,7 @@ If all requirements are met, write "All requirements verified - no gaps found" a
                 view_result = subprocess.run(
                     ['gh', 'issue', 'view', issue_number, '-R', repo,
                      '--json', 'id,number,url'],
-                    capture_output=True, text=True, check=True
+                    capture_output=True, text=True, check=True, timeout=30
                 )
                 issue_data = json.loads(view_result.stdout)
                 issue_id = issue_data['id']
@@ -636,7 +628,7 @@ If all requirements are met, write "All requirements verified - no gaps found" a
                     ['gh', 'project', 'item-add', str(sdlc_board.project_number),
                      '--owner', github_config['org'],
                      '--url', issue_url],
-                    capture_output=True, text=True, check=True
+                    capture_output=True, text=True, check=True, timeout=30
                 )
 
                 # Set status to Backlog
@@ -681,7 +673,7 @@ If all requirements are met, write "All requirements verified - no gaps found" a
 
             result = subprocess.run(
                 ['gh', 'api', 'graphql', '-f', f'query={query}'],
-                capture_output=True, text=True, check=True
+                capture_output=True, text=True, check=True, timeout=30
             )
             data = json.loads(result.stdout)
             items = data['data']['repository']['issue']['projectItems']['nodes']
@@ -692,6 +684,12 @@ If all requirements are met, write "All requirements verified - no gaps found" a
                     item_id = item['id']
                     break
 
+            if not item_id:
+                logger.warning(f"Issue #{issue_number} not found on board (project #{board.project_number})")
+                return
+            if not board.status_field_id:
+                logger.warning(f"No status_field_id for board, cannot set status for #{issue_number}")
+                return
             if item_id and board.status_field_id:
                 mutation = f'''
                 mutation {{
@@ -709,11 +707,11 @@ If all requirements are met, write "All requirements verified - no gaps found" a
                 '''
                 subprocess.run(
                     ['gh', 'api', 'graphql', '-f', f'query={mutation}'],
-                    capture_output=True, text=True, check=True
+                    capture_output=True, text=True, check=True, timeout=30
                 )
                 logger.info(f"Set issue #{issue_number} to {column.name} on board")
         except Exception as e:
-            logger.error(f"Failed to set status for issue #{issue_number}: {e}")
+            logger.error(f"Failed to set status for issue #{issue_number}: {e}", exc_info=True)
 
     def _link_sub_issue(self, parent_issue_id: str, child_issue_id: str,
                         child_number: str, parent_number: int):
@@ -734,11 +732,11 @@ If all requirements are met, write "All requirements verified - no gaps found" a
                 ['gh', 'api', 'graphql',
                  '-H', 'GraphQL-Features: sub_issues',
                  '-f', f'query={mutation}'],
-                capture_output=True, text=True, check=True
+                capture_output=True, text=True, check=True, timeout=30
             )
             logger.info(f"Linked #{child_number} as sub-issue of #{parent_number}")
         except Exception as e:
-            logger.error(f"Failed to link #{child_number} as sub-issue: {e}")
+            logger.error(f"Failed to link #{child_number} as sub-issue: {e}", exc_info=True)
 
     # ==================================================================================
     # POST-REVIEW ACTIONS
@@ -753,6 +751,7 @@ If all requirements are met, write "All requirements verified - no gaps found" a
         """Move created review issues from Backlog to Development on SDLC board."""
         github_state = self.state_manager.load_project_state(project_name)
         if not github_state:
+            logger.warning(f"No GitHub state for {project_name}, cannot move issues to Development")
             return
 
         sdlc_board = None
@@ -762,6 +761,7 @@ If all requirements are met, write "All requirements verified - no gaps found" a
                 break
 
         if not sdlc_board:
+            logger.warning(f"SDLC board not found for {project_name}, cannot move issues to Development")
             return
 
         dev_column = None
@@ -792,6 +792,7 @@ If all requirements are met, write "All requirements verified - no gaps found" a
             # Find the Planning board name
             github_state = self.state_manager.load_project_state(project_name)
             if not github_state:
+                logger.warning(f"No GitHub state for {project_name}, cannot advance to Documentation")
                 return
 
             planning_board = None
@@ -809,6 +810,8 @@ If all requirements are met, write "All requirements verified - no gaps found" a
                     logger.info(f"Advanced #{parent_issue_number} to Documentation (clean pass)")
                 else:
                     logger.error(f"Failed to advance #{parent_issue_number} to Documentation")
+            else:
+                logger.warning(f"Planning board not found for {project_name}, cannot advance to Documentation")
         except Exception as e:
             logger.error(f"Failed to advance parent to Documentation: {e}", exc_info=True)
 
@@ -828,7 +831,7 @@ If all requirements are met, write "All requirements verified - no gaps found" a
         try:
             subprocess.run(
                 ['gh', 'issue', 'comment', str(issue_number), '-R', repo, '--body', comment],
-                capture_output=True, text=True, check=True
+                capture_output=True, text=True, check=True, timeout=30
             )
         except Exception as e:
-            logger.error(f"Failed to post comment on #{issue_number}: {e}")
+            logger.error(f"Failed to post comment on #{issue_number}: {e}", exc_info=True)

@@ -3,14 +3,33 @@ Unit tests for PR Review Agent
 
 Tests recommendation parsing, severity grouping, context gap detection,
 cycle limit enforcement, and clean pass detection.
+
+These tests mock the agent's dependencies so they can run outside Docker.
 """
 
-import os
-import pytest
-if not os.path.isdir('/app'):
-    pytest.skip("Requires Docker container environment", allow_module_level=True)
-
+import sys
 from unittest.mock import patch, MagicMock
+import pytest
+
+
+# Pre-mock modules that fail outside Docker (DevContainerStateManager
+# creates /app/state/dev_containers at module level)
+_can_import = True
+try:
+    # Only pre-mock if not already imported (i.e., not running in Docker)
+    if 'services.dev_container_state' not in sys.modules:
+        sys.modules['services.dev_container_state'] = MagicMock()
+
+    with patch('agents.pr_review_agent.ConfigManager'), \
+         patch('agents.pr_review_agent.GitHubStateManager'):
+        from agents.pr_review_agent import PRReviewAgent
+except Exception:
+    _can_import = False
+
+pytestmark = pytest.mark.skipif(
+    not _can_import,
+    reason="Cannot import PRReviewAgent (requires Docker container environment)"
+)
 
 
 @pytest.fixture
@@ -18,7 +37,6 @@ def agent():
     """Create a PRReviewAgent with mocked dependencies."""
     with patch('agents.pr_review_agent.ConfigManager'), \
          patch('agents.pr_review_agent.GitHubStateManager'):
-        from agents.pr_review_agent import PRReviewAgent
         return PRReviewAgent()
 
 
@@ -227,3 +245,77 @@ class TestCycleLimitComment:
     def test_mentions_manual_triage(self, agent):
         comment = agent._build_cycle_limit_comment(3, [{'number': '101', 'title': 'Bug'}])
         assert "manual" in comment.lower()
+
+
+class TestResolveParentIssueNumber:
+    """Test parent issue number resolution from task context."""
+
+    def test_resolves_from_direct_issue_number(self, agent):
+        result = agent._resolve_parent_issue_number({'issue_number': 42}, 'project')
+        assert result == 42
+
+    def test_resolves_from_string_issue_number(self, agent):
+        result = agent._resolve_parent_issue_number({'issue_number': '42'}, 'project')
+        assert result == 42
+        assert isinstance(result, int)
+
+    def test_resolves_from_nested_task_context(self, agent):
+        result = agent._resolve_parent_issue_number(
+            {'task_context': {'issue_number': 42}}, 'project'
+        )
+        assert result == 42
+
+    def test_returns_none_when_no_issue_number(self, agent):
+        result = agent._resolve_parent_issue_number({}, 'project')
+        assert result is None
+
+    def test_returns_none_for_empty_nested_context(self, agent):
+        result = agent._resolve_parent_issue_number({'task_context': {}}, 'project')
+        assert result is None
+
+
+class TestExecuteEarlyReturns:
+    """Test execute() early-return paths (no parent issue, cycle limit, no PR)."""
+
+    @pytest.mark.asyncio
+    async def test_returns_early_when_no_parent_issue(self, agent):
+        context = {'context': {}}
+        result = await agent.execute(context)
+        assert "Failed" in result['markdown_analysis']
+        assert "parent issue" in result['markdown_analysis'].lower()
+
+    @pytest.mark.asyncio
+    async def test_returns_early_when_cycle_limit_reached(self, agent):
+        with patch('agents.pr_review_agent.pr_review_state_manager') as mock_state:
+            mock_state.get_review_count.return_value = 3
+            context = {'context': {'issue_number': 42, 'project': 'test-project'}}
+            result = await agent.execute(context)
+            assert "Skipped" in result['markdown_analysis']
+            assert "Maximum review cycles" in result['markdown_analysis']
+
+    @pytest.mark.asyncio
+    async def test_returns_early_when_no_pr_found(self, agent):
+        with patch('agents.pr_review_agent.pr_review_state_manager') as mock_state, \
+             patch.object(agent, '_find_pr_url', return_value=None), \
+             patch.object(agent, 'config_manager') as mock_config:
+            mock_state.get_review_count.return_value = 0
+            mock_config.get_project_config.return_value = MagicMock(
+                github={'org': 'test-org', 'repo': 'test-repo'}
+            )
+            context = {'context': {'issue_number': 42, 'project': 'test-project'}}
+            result = await agent.execute(context)
+            assert "Skipped" in result['markdown_analysis']
+            assert "No open PR" in result['markdown_analysis']
+
+
+class TestFormatIssueBody:
+    """Test issue body formatting."""
+
+    def test_includes_source_attribution(self, agent):
+        body = agent._format_issue_body("Critical", "- Bug found", "PR Code Review")
+        assert "PR Code Review" in body
+        assert "PR Review Agent" in body
+
+    def test_includes_severity_heading(self, agent):
+        body = agent._format_issue_body("High", "- Missing check", "Test Source")
+        assert "## High Findings" in body

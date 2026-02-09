@@ -2758,9 +2758,10 @@ class ProjectMonitor:
                     project_name, parent_issue_number
                 )
 
-                if review_count >= 3:
+                from agents.pr_review_agent import MAX_REVIEW_CYCLES
+                if review_count >= MAX_REVIEW_CYCLES:
                     logger.info(
-                        f"Review cycle limit reached for #{parent_issue_number}, "
+                        f"Review cycle limit ({MAX_REVIEW_CYCLES}) reached for #{parent_issue_number}, "
                         f"not re-triggering PR review"
                     )
                     # Post comment about cycle limit
@@ -2771,7 +2772,7 @@ class ProjectMonitor:
                     )
                     await github.post_comment(
                         parent_issue_number,
-                        f"All sub-issues completed again, but the maximum PR review cycle limit (3) "
+                        f"All sub-issues completed again, but the maximum PR review cycle limit ({MAX_REVIEW_CYCLES}) "
                         f"has been reached. Further review should be performed manually."
                     )
                     return
@@ -2779,7 +2780,7 @@ class ProjectMonitor:
                 # Directly enqueue a task for pr_review_agent
                 logger.info(
                     f"Re-triggering PR review for #{parent_issue_number} "
-                    f"(cycle {review_count + 1}/3)"
+                    f"(cycle {review_count + 1}/{MAX_REVIEW_CYCLES})"
                 )
 
                 repo = f"{project_config.github['org']}/{project_config.github['repo']}"

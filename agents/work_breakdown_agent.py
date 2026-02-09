@@ -220,7 +220,7 @@ class WorkBreakdownAgent(AnalysisAgent):
 
             result = sp.run(
                 ['gh', 'api', 'graphql', '-f', f'query={query}'],
-                capture_output=True, text=True, check=True
+                capture_output=True, text=True, check=True, timeout=30
             )
             data = json.loads(result.stdout)
             items = data['data']['repository']['issue']['projectItems']['nodes']
@@ -253,7 +253,7 @@ class WorkBreakdownAgent(AnalysisAgent):
 
             sp.run(
                 ['gh', 'api', 'graphql', '-f', f'query={mutation}'],
-                capture_output=True, text=True, check=True
+                capture_output=True, text=True, check=True, timeout=30
             )
 
             logger.info(

@@ -117,3 +117,12 @@ class TestStatePersistenceFormat:
         assert manager.get_review_count("project-b", 1) == 1
         assert manager.get_review_history("project-a", 1)[0]["issues_created"] == [101]
         assert manager.get_review_history("project-b", 1)[0]["issues_created"] == [201]
+
+    def test_raises_on_corrupted_state_file(self, manager, tmp_state_dir):
+        """Corrupted YAML should raise, not silently reset the cycle counter."""
+        state_file = tmp_state_dir / "corrupt-project" / "pr_review_state.yaml"
+        state_file.parent.mkdir(parents=True, exist_ok=True)
+        state_file.write_text(": invalid: yaml: {{[")
+
+        with pytest.raises(Exception):
+            manager.get_review_count("corrupt-project", 42)

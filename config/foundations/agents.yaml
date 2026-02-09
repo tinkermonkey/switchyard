@@ -211,7 +211,7 @@ agents:
   pr_review_agent:
     description: "Automated PR review with requirements verification"
     model: "claude-opus-4-5-20251101"
-    timeout: 3600  # 60 minutes for up to 5 Docker container runs
+    timeout: 3600  # 60 minutes for up to 5 Claude Code calls
     retries: 2
     makes_code_changes: false
     filesystem_write_allowed: false

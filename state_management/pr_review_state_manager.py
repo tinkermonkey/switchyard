@@ -9,7 +9,7 @@ import yaml
 import logging
 from pathlib import Path
 from typing import Dict, Any, List, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 
@@ -39,9 +39,12 @@ class PRReviewStateManager:
             with open(state_file, 'r') as f:
                 data = yaml.safe_load(f)
             return data or {"pr_reviews": {}}
+        except yaml.YAMLError as e:
+            logger.error(f"Corrupted PR review state for {project_name}: {e}", exc_info=True)
+            raise
         except Exception as e:
-            logger.error(f"Failed to load PR review state for {project_name}: {e}")
-            return {"pr_reviews": {}}
+            logger.error(f"Failed to load PR review state for {project_name}: {e}", exc_info=True)
+            raise
 
     def _save_state(self, project_name: str, data: Dict[str, Any]):
         state_file = self._get_state_file(project_name)
@@ -74,7 +77,7 @@ class PRReviewStateManager:
         })
 
         issue_data["review_count"] = issue_data.get("review_count", 0) + 1
-        now = datetime.utcnow().isoformat() + "Z"
+        now = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
         issue_data["last_review_at"] = now
         issue_data.setdefault("iterations", []).append({
             "iteration": issue_data["review_count"],
