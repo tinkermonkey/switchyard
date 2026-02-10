@@ -308,6 +308,70 @@ class TestExecuteEarlyReturns:
             assert "No open PR" in result['markdown_analysis']
 
 
+class TestReturnParentToDevelopment:
+    """Test moving parent issue back to 'In Development' when PR review finds issues."""
+
+    def test_moves_parent_to_in_development(self, agent):
+        """Verifies move_issue_to_column called with correct args."""
+        mock_board = MagicMock()
+        mock_state = MagicMock()
+        mock_state.boards = {'Planning & Design': mock_board}
+        agent.state_manager.load_project_state.return_value = mock_state
+
+        with patch('services.pipeline_progression.PipelineProgression') as MockProgression, \
+             patch('task_queue.task_manager.TaskQueue'):
+            mock_progression = MockProgression.return_value
+            mock_progression.move_issue_to_column.return_value = True
+
+            agent._return_parent_to_development('test-project', 42)
+
+            mock_progression.move_issue_to_column.assert_called_once_with(
+                'test-project', 'Planning & Design', 42,
+                'In Development', trigger='pr_review_issues_found'
+            )
+
+    def test_handles_missing_github_state(self, agent):
+        """Should log warning and return gracefully when no GitHub state."""
+        agent.state_manager.load_project_state.return_value = None
+
+        # Should not raise
+        agent._return_parent_to_development('test-project', 42)
+
+    def test_handles_missing_planning_board(self, agent):
+        """Should log warning and not attempt move when no Planning board found."""
+        mock_state = MagicMock()
+        mock_state.boards = {'SDLC Execution': MagicMock()}
+        agent.state_manager.load_project_state.return_value = mock_state
+
+        with patch('services.pipeline_progression.PipelineProgression') as MockProgression, \
+             patch('task_queue.task_manager.TaskQueue'):
+            mock_progression = MockProgression.return_value
+            agent._return_parent_to_development('test-project', 42)
+            mock_progression.move_issue_to_column.assert_not_called()
+
+    def test_handles_move_failure_gracefully(self, agent):
+        """Should log error but not raise when move fails."""
+        mock_board = MagicMock()
+        mock_state = MagicMock()
+        mock_state.boards = {'Planning & Design': mock_board}
+        agent.state_manager.load_project_state.return_value = mock_state
+
+        with patch('services.pipeline_progression.PipelineProgression') as MockProgression, \
+             patch('task_queue.task_manager.TaskQueue'):
+            mock_progression = MockProgression.return_value
+            mock_progression.move_issue_to_column.return_value = False
+
+            # Should not raise
+            agent._return_parent_to_development('test-project', 42)
+
+    def test_handles_exception_gracefully(self, agent):
+        """Should catch exceptions and not propagate them."""
+        agent.state_manager.load_project_state.side_effect = RuntimeError("state error")
+
+        # Should not raise
+        agent._return_parent_to_development('test-project', 42)
+
+
 class TestFormatIssueBody:
     """Test issue body formatting."""
 

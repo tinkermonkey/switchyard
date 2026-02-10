@@ -2750,7 +2750,12 @@ class ProjectMonitor:
                     logger.error(f"Failed to move parent #{parent_issue_number} to 'In Review'")
 
             elif current_column == "In Review":
-                # Already in review - check cycle count and directly enqueue PR review agent
+                # Fallback for edge cases: The PR review agent now moves the parent back
+                # to "In Development" when issues are found, so the normal re-review path
+                # is: child issues complete → all_subtasks_completed → Case 1 above.
+                # This branch handles cases where the parent is still in "In Review"
+                # (e.g., race condition, manual column move, or state inconsistency).
+                # Check cycle count and directly enqueue PR review agent
                 review_count = pr_review_state_manager.get_review_count(
                     project_name, parent_issue_number
                 )

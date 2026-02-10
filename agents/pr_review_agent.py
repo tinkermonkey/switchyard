@@ -213,6 +213,10 @@ class PRReviewAgent(AnalysisAgent):
                     all_created_issues, project_name, github_config
                 )
                 logger.info(f"Moved {len(all_created_issues)} review issues to Development")
+                # Move parent back to "In Development" on Planning board so that
+                # when all child fix-issues complete, the all_subtasks_completed
+                # automation naturally moves it back to "In Review" for re-review
+                self._return_parent_to_development(project_name, parent_issue_number)
             else:
                 # Cycle 3: Leave in Backlog, post summary comment
                 summary_comment = self._build_cycle_limit_comment(
@@ -814,6 +818,45 @@ If all requirements are met, write "All requirements verified - no gaps found" a
                 logger.warning(f"Planning board not found for {project_name}, cannot advance to Documentation")
         except Exception as e:
             logger.error(f"Failed to advance parent to Documentation: {e}", exc_info=True)
+
+    def _return_parent_to_development(self, project_name: str, parent_issue_number: int):
+        """Move the parent issue from 'In Review' back to 'In Development' on the Planning board.
+
+        Called when PR review finds issues (cycles 1-2). This enables the natural
+        re-review cycle: child fix-issues complete → all_subtasks_completed automation
+        moves parent back to 'In Review' → project monitor triggers PR review agent.
+        """
+        try:
+            from services.pipeline_progression import PipelineProgression
+            from task_queue.task_manager import TaskQueue
+
+            task_queue = TaskQueue()
+            progression = PipelineProgression(task_queue)
+
+            github_state = self.state_manager.load_project_state(project_name)
+            if not github_state:
+                logger.warning(f"No GitHub state for {project_name}, cannot return parent to In Development")
+                return
+
+            planning_board = None
+            for board_name, board in github_state.boards.items():
+                if 'planning' in board_name.lower():
+                    planning_board = board_name
+                    break
+
+            if planning_board:
+                success = progression.move_issue_to_column(
+                    project_name, planning_board, parent_issue_number,
+                    "In Development", trigger='pr_review_issues_found'
+                )
+                if success:
+                    logger.info(f"Returned #{parent_issue_number} to In Development (issues found)")
+                else:
+                    logger.error(f"Failed to return #{parent_issue_number} to In Development")
+            else:
+                logger.warning(f"Planning board not found for {project_name}, cannot return parent to In Development")
+        except Exception as e:
+            logger.error(f"Failed to return parent to In Development: {e}", exc_info=True)
 
     def _build_cycle_limit_comment(self, cycle: int, issues: List[Dict]) -> str:
         """Build a comment for when the cycle limit is reached."""
