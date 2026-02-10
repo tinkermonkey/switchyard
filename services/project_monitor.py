@@ -1553,16 +1553,17 @@ class ProjectMonitor:
                         # or a queued issue that never executed
 
                         # Check if current column's agent actually executed and completed
-                        last_execution = work_execution_tracker.get_last_execution(
-                            project_name=project_name,
-                            issue_number=issue_number
-                        )
-
                         current_column_agent = self._get_agent_for_status(project_name, board_name, status)
 
+                        last_execution = work_execution_tracker.get_last_execution(
+                            project_name=project_name,
+                            issue_number=issue_number,
+                            column=status,
+                            agent=current_column_agent
+                        ) if current_column_agent else None
+
                         if last_execution and \
-                           last_execution.get('agent') == current_column_agent and \
-                           last_execution.get('success') == True:
+                           last_execution.get('outcome') == 'success':
                             # Previous stage completed - this is legitimate workflow progression
                             pipeline_queue.mark_issue_active(issue_number)
                             logger.info(
