@@ -1153,6 +1153,89 @@ class WorkExecutionStateTracker:
             logger.error(f"Error checking GitHub output for {project_name}/#{issue_number}: {e}")
             return False  # Can't verify, mark as no output to be safe
 
+    def _try_recover_result_from_redis(self, project_name, issue_number, agent, column, execution):
+        """
+        Check Redis for a persisted agent result before marking execution as failed.
+
+        The docker-claude-wrapper.py writes final results to Redis
+        (agent_result:{project}:{issue_number}:{task_id}) with a 2-hour TTL
+        before the container exits. When the orchestrator restarts and the
+        container is gone (due to --rm), the result may still be in Redis.
+
+        Returns True if a result was recovered (execution dict is updated in place),
+        False otherwise.
+        """
+        try:
+            import redis
+            import json
+
+            redis_client = redis.Redis(host='redis', port=6379, decode_responses=True)
+
+            # Scan for any result keys for this project/issue
+            pattern = f"agent_result:{project_name}:{issue_number}:*"
+            result_keys = list(redis_client.scan_iter(match=pattern, count=100))
+
+            if not result_keys:
+                return False
+
+            # Use the most recent result (last key found)
+            # If multiple keys exist, they're for different task_ids — use any valid one
+            for redis_key in result_keys:
+                try:
+                    result_json = redis_client.get(redis_key)
+                    if not result_json:
+                        continue
+
+                    result_data = json.loads(result_json)
+
+                    # Verify the result matches the agent we're looking for
+                    result_agent = result_data.get('agent', '')
+                    if result_agent and result_agent != agent:
+                        continue
+
+                    exit_code = result_data.get('exit_code')
+
+                    if exit_code == 0:
+                        execution['outcome'] = 'success'
+                        logger.info(
+                            f"Recovered successful result from Redis for "
+                            f"{project_name}/#{issue_number} {agent} in {column} "
+                            f"(key: {redis_key})"
+                        )
+                    else:
+                        execution['outcome'] = 'failure'
+                        output = result_data.get('output', '')
+                        # Truncate output for error message
+                        error_snippet = output[-500:] if len(output) > 500 else output
+                        execution['error'] = (
+                            f"Agent exited with code {exit_code}. "
+                            f"Result recovered from Redis after container exited. "
+                            f"Output tail: {error_snippet}"
+                        )
+                        logger.warning(
+                            f"Recovered failed result from Redis for "
+                            f"{project_name}/#{issue_number} {agent} in {column} "
+                            f"(exit_code={exit_code}, key: {redis_key})"
+                        )
+
+                    # Delete the key after processing to prevent reprocessing
+                    redis_client.delete(redis_key)
+
+                    return True
+
+                except (json.JSONDecodeError, TypeError) as e:
+                    logger.warning(f"Failed to parse Redis result at {redis_key}: {e}")
+                    continue
+
+            return False
+
+        except ImportError:
+            logger.debug("Redis not available for result recovery")
+            return False
+        except Exception as e:
+            logger.warning(f"Failed to check Redis for persisted result: {e}")
+            return False
+
     def cleanup_stuck_in_progress_states(self):
         """
         Clean up execution states that are stuck as 'in_progress'.
@@ -1322,8 +1405,17 @@ class WorkExecutionStateTracker:
                                     logger.warning(f"Failed to clean up orphaned Redis keys: {e}")
 
                             if not has_running_container:
-                                # No container found - agent may have finished or been killed
-                                # Mark as failed since we can't verify success
+                                # Before marking as failure, check if the container completed
+                                # and persisted its result to Redis (written by docker-claude-wrapper.py)
+                                recovered = self._try_recover_result_from_redis(
+                                    project_name, issue_number, agent, column, execution
+                                )
+                                if recovered:
+                                    modified = True
+                                    cleaned_count += 1
+                                    continue
+
+                                # No container AND no Redis result — truly lost execution
                                 execution['outcome'] = 'failure'
                                 execution['error'] = (
                                     'Agent execution interrupted. Container no longer exists and execution '
