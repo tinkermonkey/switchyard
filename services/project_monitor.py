@@ -2414,8 +2414,8 @@ class ProjectMonitor:
                 from services.review_cycle import review_cycle_executor
                 if issue_number in review_cycle_executor.active_cycles:
                     del review_cycle_executor.active_cycles[issue_number]
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"Failed to clean up review cycle for issue #{issue_number} during exit-column handling: {e}")
 
             # Clear signal so issue can be re-triggered if moved back
             signal.clear(project_name, issue_number)

@@ -51,7 +51,8 @@ class CancellationSignal:
                 import redis
                 self._redis = redis.Redis(host='redis', port=6379, decode_responses=True)
                 self._redis.ping()
-            except Exception:
+            except Exception as e:
+                logger.warning(f"Redis unavailable for cancellation signals (in-memory fallback active): {e}")
                 self._redis = None
         return self._redis
 
@@ -144,12 +145,15 @@ def kill_containers_for_issue(project: str, issue_number: int) -> int:
                     container_name = data.get('container_name', key.split(':')[-1])
                     logger.info(f"Killing container {container_name} for {project}/#{issue_number} (found via Redis)")
                     try:
-                        subprocess.run(
+                        result = subprocess.run(
                             ['docker', 'rm', '-f', container_name],
                             capture_output=True, text=True, timeout=10
                         )
-                        redis_client.delete(key)
-                        killed += 1
+                        if result.returncode == 0:
+                            redis_client.delete(key)
+                            killed += 1
+                        else:
+                            logger.warning(f"docker rm -f failed for {container_name} (exit {result.returncode}): {result.stderr.strip()}")
                     except Exception as e:
                         logger.warning(f"Failed to kill container {container_name}: {e}")
             except Exception as e:
@@ -161,12 +165,15 @@ def kill_containers_for_issue(project: str, issue_number: int) -> int:
                 container_name = redis_client.get(key)
                 if container_name:
                     logger.info(f"Killing repair cycle container {container_name} for {project}/#{issue_number}")
-                    subprocess.run(
+                    result = subprocess.run(
                         ['docker', 'rm', '-f', container_name],
                         capture_output=True, text=True, timeout=10
                     )
-                    redis_client.delete(key)
-                    killed += 1
+                    if result.returncode == 0:
+                        redis_client.delete(key)
+                        killed += 1
+                    else:
+                        logger.warning(f"docker rm -f failed for repair container {container_name} (exit {result.returncode}): {result.stderr.strip()}")
             except Exception as e:
                 logger.warning(f"Error killing repair cycle container: {e}")
 
@@ -182,18 +189,23 @@ def kill_containers_for_issue(project: str, issue_number: int) -> int:
             capture_output=True, text=True, timeout=10
         )
 
-        if result.returncode == 0 and result.stdout.strip():
+        if result.returncode != 0:
+            logger.warning(f"docker ps failed (exit {result.returncode}): {result.stderr.strip()}")
+        elif result.stdout.strip():
             container_ids = result.stdout.strip().split('\n')
             for container_id in container_ids:
                 container_id = container_id.strip()
                 if container_id:
                     logger.info(f"Killing container {container_id} for {project}/#{issue_number} (found via Docker labels)")
                     try:
-                        subprocess.run(
+                        result = subprocess.run(
                             ['docker', 'rm', '-f', container_id],
                             capture_output=True, text=True, timeout=10
                         )
-                        killed += 1
+                        if result.returncode == 0:
+                            killed += 1
+                        else:
+                            logger.warning(f"docker rm -f failed for {container_id} (exit {result.returncode}): {result.stderr.strip()}")
                     except Exception as e:
                         logger.warning(f"Failed to kill container {container_id}: {e}")
     except Exception as e:
@@ -212,6 +224,7 @@ def cancel_issue_work(project: str, issue_number: int, reason: str) -> None:
     4. Mark in-progress executions as cancelled
     """
     logger.warning(f"CANCELLING work for {project}/#{issue_number}: {reason}")
+    steps_failed = []
 
     # 1. Set cancellation signal (must be first — stops retry loops)
     signal = get_cancellation_signal()
@@ -227,6 +240,7 @@ def cancel_issue_work(project: str, issue_number: int, reason: str) -> None:
             del review_cycle_executor.active_cycles[issue_number]
             logger.info(f"Removed active review cycle for issue #{issue_number}")
     except Exception as e:
+        steps_failed.append(f"review_cycle_cleanup: {e}")
         logger.warning(f"Failed to remove active review cycle: {e}")
 
     # 4. Mark in-progress executions as cancelled
@@ -248,6 +262,10 @@ def cancel_issue_work(project: str, issue_number: int, reason: str) -> None:
                 )
                 logger.info(f"Marked execution as cancelled: {agent} in {column}")
     except Exception as e:
+        steps_failed.append(f"execution_state_update: {e}")
         logger.warning(f"Failed to mark executions as cancelled: {e}")
 
-    logger.info(f"Cancellation complete for {project}/#{issue_number}")
+    if steps_failed:
+        logger.warning(f"Cancellation partially complete for {project}/#{issue_number} (failed: {', '.join(steps_failed)})")
+    else:
+        logger.info(f"Cancellation complete for {project}/#{issue_number}")

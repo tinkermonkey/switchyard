@@ -212,8 +212,8 @@ def kill_agent(container_name):
             try:
                 redis_client = redis.Redis(host='redis', port=6379, decode_responses=True)
                 redis_client.delete(f'agent:container:{container_name}')
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"Failed to clean up Redis tracking key for killed container {container_name}: {e}")
 
             return jsonify({
                 'success': True,
