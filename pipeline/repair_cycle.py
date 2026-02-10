@@ -46,6 +46,7 @@ from datetime import datetime
 from pipeline.base import PipelineStage
 from monitoring.timestamp_utils import utc_now, utc_isoformat, to_utc_isoformat
 from monitoring.observability import EventType
+from services.cancellation import CancellationError
 
 
 logger = logging.getLogger(__name__)
@@ -375,7 +376,20 @@ class RepairCycleStage(PipelineStage):
         files_fixed = 0
         warnings_reviewed = 0
 
+        from services.cancellation import get_cancellation_signal
+        issue_number = context.get('issue_number')
+
         while test_cycle_iteration < config.max_iterations:
+            # Check for cancellation before starting new iteration
+            if issue_number and get_cancellation_signal().is_cancelled(project, issue_number):
+                logger.warning(f"Pipeline run cancelled for {project}/#{issue_number}, stopping repair cycle")
+                return CycleResult(
+                    test_type=config.test_type, passed=False,
+                    iterations=test_cycle_iteration, final_result=None,
+                    error="Pipeline run ended externally",
+                    files_fixed=files_fixed, warnings_reviewed=warnings_reviewed,
+                )
+
             test_cycle_iteration += 1
             logger.info(
                 f"Test cycle iteration {test_cycle_iteration}/{config.max_iterations} "
@@ -820,6 +834,8 @@ DO NOT include any explanation, markdown formatting, or other text - ONLY the JS
                 
                 return test_result
 
+            except CancellationError:
+                raise  # Never retry cancellations
             except ValueError as e:
                 # JSON parsing failure - this is an infrastructure issue, not a test failure
                 error_msg = str(e)
@@ -1016,6 +1032,8 @@ DO NOT include any explanation, markdown formatting, or other text - ONLY the JS
                         pipeline_run_id=pipeline_run_id,
                     )
 
+            except CancellationError:
+                raise  # Never retry cancellations
             except Exception as e:
                 logger.error(f"Failed to fix failures in {test_file}: {e}", exc_info=True)
                 
@@ -1152,6 +1170,8 @@ For each warning:
                         pipeline_run_id=pipeline_run_id,
                     )
 
+            except CancellationError:
+                raise  # Never retry cancellations
             except Exception as e:
                 logger.error(f"Failed to review warnings in {source_file}: {e}", exc_info=True)
                 

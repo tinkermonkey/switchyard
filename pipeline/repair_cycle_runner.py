@@ -45,6 +45,7 @@ import signal
 from pathlib import Path
 from typing import Dict, Any, Optional
 from datetime import datetime
+from services.cancellation import CancellationError
 
 # Setup logging (initially just to stdout, file handler added after parsing args)
 logging.basicConfig(
@@ -223,6 +224,9 @@ class RepairCycleRunner:
         except asyncio.CancelledError:
             logger.warning("Repair cycle cancelled")
             return {'overall_success': False, 'error': 'cancelled'}
+        except CancellationError:
+            logger.warning("Repair cycle cancelled by pipeline run lifecycle")
+            return {'overall_success': False, 'error': 'Pipeline run ended externally'}
         except Exception as e:
             logger.error(f"Repair cycle execution failed: {e}", exc_info=True)
             return {'overall_success': False, 'error': str(e)}
@@ -332,6 +336,9 @@ class RepairCycleRunner:
         except KeyboardInterrupt:
             logger.warning("Interrupted by user")
             return 4
+        except CancellationError:
+            logger.warning("Repair cycle cancelled by pipeline lifecycle")
+            return 4  # Exit code for cancelled
         except Exception as e:
             logger.error(f"Unexpected error: {e}", exc_info=True)
             return 2

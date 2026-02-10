@@ -551,6 +551,13 @@ class PipelineRunManager:
             Pipeline run ID if successful, None if failed
         """
         try:
+            # Clear any stale cancellation signal from a previous pipeline run
+            try:
+                from services.cancellation import get_cancellation_signal
+                get_cancellation_signal().clear(project, issue_number)
+            except Exception as e:
+                logger.warning(f"Failed to clear stale cancellation signal: {e}")
+
             # Extract issue metadata
             if issue_data:
                 issue_title = issue_data.get('title', f'Issue #{issue_number}')
@@ -614,6 +621,16 @@ class PipelineRunManager:
         # Mark as completed
         pipeline_run.ended_at = datetime.utcnow().isoformat() + 'Z'
         pipeline_run.status = "completed"
+
+        # Set cancellation signal so in-flight repair cycles stop
+        try:
+            from services.cancellation import get_cancellation_signal
+            get_cancellation_signal().cancel(
+                project, issue_number,
+                f"Pipeline run ended: {reason or 'completed'}"
+            )
+        except Exception as e:
+            logger.warning(f"Failed to set cancellation signal on pipeline end: {e}")
 
         # Emit pipeline completion event BEFORE updating Redis
         # This ensures observability matches state transitions

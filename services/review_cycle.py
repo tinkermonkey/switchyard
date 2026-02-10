@@ -488,6 +488,17 @@ class ReviewCycleExecutor:
                         f"Checking if work completed..."
                     )
 
+                    # Check if agent is already running (from recovered container)
+                    from services.work_execution_state import work_execution_tracker
+                    if work_execution_tracker.has_active_execution(
+                        cycle_state.project_name, cycle_state.issue_number
+                    ):
+                        logger.info(
+                            f"Skipping resume for issue #{cycle_state.issue_number}: "
+                            f"agent already active (likely from recovered container)"
+                        )
+                        continue
+
                     # If reviewer was working, check if there's a review output for this iteration
                     if (cycle_state.status == 'reviewer_working' and
                         cycle_state.review_outputs and

@@ -2017,6 +2017,14 @@ class DockerAgentRunner:
                             None
                         )
 
+                        if current_column and getattr(current_column, 'type', None) == 'review':
+                            logger.info(
+                                f"Skipping auto-advance for recovered container: "
+                                f"column '{column}' is a review cycle column. "
+                                f"Review cycle will handle progression."
+                            )
+                            break  # Skip auto-advance, review cycle owns progression
+
                         if current_column and getattr(current_column, 'auto_advance_on_approval', False):
                             current_index = workflow_template.columns.index(current_column)
                             if current_index + 1 < len(workflow_template.columns):
