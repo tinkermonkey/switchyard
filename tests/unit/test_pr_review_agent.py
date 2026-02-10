@@ -285,13 +285,32 @@ class TestExecuteEarlyReturns:
         assert "parent issue" in result['markdown_analysis'].lower()
 
     @pytest.mark.asyncio
-    async def test_returns_early_when_cycle_limit_reached(self, agent):
+    async def test_raises_when_cycle_limit_reached(self, agent):
         with patch('agents.pr_review_agent.pr_review_state_manager') as mock_state:
             mock_state.get_review_count.return_value = 3
             context = {'context': {'issue_number': 42, 'project': 'test-project'}}
+            with pytest.raises(RuntimeError, match="Review cycle limit"):
+                await agent.execute(context)
+
+    @pytest.mark.asyncio
+    async def test_manual_trigger_resets_cycle_count(self, agent):
+        with patch('agents.pr_review_agent.pr_review_state_manager') as mock_state, \
+             patch.object(agent, '_find_pr_url', return_value=None), \
+             patch.object(agent, 'config_manager') as mock_config:
+            mock_state.get_review_count.return_value = 3
+            mock_config.get_project_config.return_value = MagicMock(
+                github={'org': 'test-org', 'repo': 'test-repo'}
+            )
+            context = {'context': {
+                'issue_number': 42,
+                'project': 'test-project',
+                'trigger_source': 'manual',
+            }}
+            # Should NOT raise — manual trigger resets cycle count
             result = await agent.execute(context)
-            assert "Skipped" in result['markdown_analysis']
-            assert "Maximum review cycles" in result['markdown_analysis']
+            mock_state.reset_review_count.assert_called_once_with('test-project', 42)
+            # Proceeds past cycle limit, but exits at "no PR found"
+            assert "No open PR" in result['markdown_analysis']
 
     @pytest.mark.asyncio
     async def test_returns_early_when_no_pr_found(self, agent):

@@ -92,6 +92,27 @@ class PRReviewStateManager:
             f"({len(created_issues)} issues created)"
         )
 
+    def reset_review_count(self, project_name: str, parent_issue_number: int):
+        """Reset the review cycle count for a parent issue.
+
+        Called when a manual review is triggered so the cycle limit
+        no longer blocks execution.  Previous iteration history is
+        preserved for auditability.
+        """
+        data = self._load_state(project_name)
+        reviews = data.get("pr_reviews", {})
+        issue_data = reviews.get(parent_issue_number)
+        if not issue_data:
+            return
+
+        old_count = issue_data.get("review_count", 0)
+        issue_data["review_count"] = 0
+        self._save_state(project_name, data)
+        logger.info(
+            f"Reset review count for {project_name} #{parent_issue_number} "
+            f"(was {old_count}, now 0)"
+        )
+
     def get_review_history(self, project_name: str, parent_issue_number: int) -> List[Dict]:
         """Get full review history for a parent issue."""
         data = self._load_state(project_name)

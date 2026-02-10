@@ -96,16 +96,26 @@ class PRReviewAgent(AnalysisAgent):
 
         logger.info(f"PR Review Agent executing for parent issue #{parent_issue_number} in {project_name}")
 
-        # Check cycle limit
+        # Manual triggers reset the cycle count so the review can proceed
+        trigger_source = task_context.get('trigger_source', '')
         review_count = pr_review_state_manager.get_review_count(project_name, parent_issue_number)
-        if review_count >= MAX_REVIEW_CYCLES:
-            logger.info(f"Review cycle limit ({MAX_REVIEW_CYCLES}) reached for #{parent_issue_number}, skipping")
-            context['markdown_analysis'] = (
-                f"## PR Review Skipped\n\n"
-                f"Maximum review cycles ({MAX_REVIEW_CYCLES}) reached for issue #{parent_issue_number}. "
-                f"No further automated reviews will be performed."
+        if trigger_source == 'manual' and review_count >= MAX_REVIEW_CYCLES:
+            logger.info(
+                f"Manual trigger detected for #{parent_issue_number} with review_count={review_count} — "
+                f"resetting cycle count"
             )
-            return context
+            pr_review_state_manager.reset_review_count(project_name, parent_issue_number)
+            review_count = 0
+
+        # Check cycle limit
+        if review_count >= MAX_REVIEW_CYCLES:
+            msg = (
+                f"Review cycle limit ({MAX_REVIEW_CYCLES}) reached for #{parent_issue_number}. "
+                f"No further automated reviews will be performed. "
+                f"Manually move the issue to 'In Review' to reset the cycle count and trigger a new review."
+            )
+            logger.warning(f"Review cycle limit reached for #{parent_issue_number}, failing")
+            raise RuntimeError(msg)
 
         current_cycle = review_count + 1
         logger.info(f"Starting review cycle {current_cycle}/{MAX_REVIEW_CYCLES} for #{parent_issue_number}")

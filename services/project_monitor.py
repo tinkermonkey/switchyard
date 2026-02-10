@@ -2254,6 +2254,7 @@ class ProjectMonitor:
                     'previous_stage_output': previous_stage_context,  # Include previous agent's work
                     'column': status,
                     'trigger': 'project_monitor',
+                    'trigger_source': trigger_source,
                     'workspace_type': workspace_type,
                     'pipeline_run_id': pipeline_run.id,  # Include pipeline run ID
                     'timestamp': utc_isoformat()
