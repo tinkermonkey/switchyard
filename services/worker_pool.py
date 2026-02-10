@@ -125,6 +125,15 @@ class TaskWorker:
                                     self.tasks_failed += 1
                                     break
 
+                                # NonRetryableAgentError: permanent failure — don't retry
+                                from agents.non_retryable import NonRetryableAgentError
+                                if isinstance(e, NonRetryableAgentError):
+                                    duration = time.time() - start_time
+                                    logger.warning(f"[Worker {self.worker_id}] Task {task.id} non-retryable failure: {e}")
+                                    self.metrics.record_task_complete(task.agent, duration, success=False)
+                                    self.tasks_failed += 1
+                                    break
+
                                 # Check if we should retry
                                 if attempt <= max_retries:
                                     logger.warning(

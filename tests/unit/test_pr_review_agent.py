@@ -286,10 +286,11 @@ class TestExecuteEarlyReturns:
 
     @pytest.mark.asyncio
     async def test_raises_when_cycle_limit_reached(self, agent):
+        from agents.non_retryable import NonRetryableAgentError
         with patch('agents.pr_review_agent.pr_review_state_manager') as mock_state:
             mock_state.get_review_count.return_value = 3
             context = {'context': {'issue_number': 42, 'project': 'test-project'}}
-            with pytest.raises(RuntimeError, match="Review cycle limit"):
+            with pytest.raises(NonRetryableAgentError, match="Review cycle limit"):
                 await agent.execute(context)
 
     @pytest.mark.asyncio
@@ -311,6 +312,37 @@ class TestExecuteEarlyReturns:
             mock_state.reset_review_count.assert_called_once_with('test-project', 42)
             # Proceeds past cycle limit, but exits at "no PR found"
             assert "No open PR" in result['markdown_analysis']
+
+    @pytest.mark.asyncio
+    async def test_manual_trigger_below_limit_does_not_reset(self, agent):
+        with patch('agents.pr_review_agent.pr_review_state_manager') as mock_state, \
+             patch.object(agent, '_find_pr_url', return_value=None), \
+             patch.object(agent, 'config_manager') as mock_config:
+            mock_state.get_review_count.return_value = 1  # below limit
+            mock_config.get_project_config.return_value = MagicMock(
+                github={'org': 'test-org', 'repo': 'test-repo'}
+            )
+            context = {'context': {
+                'issue_number': 42,
+                'project': 'test-project',
+                'trigger_source': 'manual',
+            }}
+            await agent.execute(context)
+            mock_state.reset_review_count.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_pipeline_progression_at_limit_raises(self, agent):
+        from agents.non_retryable import NonRetryableAgentError
+        with patch('agents.pr_review_agent.pr_review_state_manager') as mock_state:
+            mock_state.get_review_count.return_value = 3
+            context = {'context': {
+                'issue_number': 42,
+                'project': 'test-project',
+                'trigger_source': 'pipeline_progression',
+            }}
+            with pytest.raises(NonRetryableAgentError, match="Review cycle limit"):
+                await agent.execute(context)
+            mock_state.reset_review_count.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_returns_early_when_no_pr_found(self, agent):

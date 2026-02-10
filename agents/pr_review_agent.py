@@ -16,10 +16,11 @@ Phase 2: Context Verification (up to 4 separate Claude Code calls)
 Review cycle management:
   - Cycles 1-2: Create issues and move to Development for resolution
   - Cycle 3: Create issues but leave in Backlog, post summary on parent
-  - Beyond cycle 3: Skip execution entirely
+  - Beyond cycle 3: Fail with NonRetryableAgentError (manual trigger resets count)
 """
 
 from typing import Dict, Any, List, Optional
+from agents.non_retryable import NonRetryableAgentError
 from agents.base_analysis_agent import AnalysisAgent
 from config.manager import ConfigManager
 from config.state_manager import GitHubStateManager
@@ -115,7 +116,7 @@ class PRReviewAgent(AnalysisAgent):
                 f"Manually move the issue to 'In Review' to reset the cycle count and trigger a new review."
             )
             logger.warning(f"Review cycle limit reached for #{parent_issue_number}, failing")
-            raise RuntimeError(msg)
+            raise NonRetryableAgentError(msg)
 
         current_cycle = review_count + 1
         logger.info(f"Starting review cycle {current_cycle}/{MAX_REVIEW_CYCLES} for #{parent_issue_number}")

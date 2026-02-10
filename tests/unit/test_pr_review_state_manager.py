@@ -118,6 +118,40 @@ class TestStatePersistenceFormat:
         assert manager.get_review_history("project-a", 1)[0]["issues_created"] == [101]
         assert manager.get_review_history("project-b", 1)[0]["issues_created"] == [201]
 
+class TestResetReviewCount:
+    def test_resets_count_to_zero(self, manager):
+        manager.increment_review_count("my-project", 42, [101])
+        manager.increment_review_count("my-project", 42, [102])
+        assert manager.get_review_count("my-project", 42) == 2
+
+        manager.reset_review_count("my-project", 42)
+        assert manager.get_review_count("my-project", 42) == 0
+
+    def test_preserves_iteration_history(self, manager):
+        manager.increment_review_count("my-project", 42, [101])
+        manager.increment_review_count("my-project", 42, [102, 103])
+        manager.reset_review_count("my-project", 42)
+
+        history = manager.get_review_history("my-project", 42)
+        assert len(history) == 2
+        assert history[0]["issues_created"] == [101]
+        assert history[1]["issues_created"] == [102, 103]
+
+    def test_noop_for_unknown_issue(self, manager):
+        """Should not raise or create state for an issue that has no review history."""
+        manager.reset_review_count("my-project", 999)
+        assert manager.get_review_count("my-project", 999) == 0
+
+    def test_persists_across_reloads(self, manager, tmp_state_dir):
+        manager.increment_review_count("my-project", 42, [101])
+        manager.increment_review_count("my-project", 42, [102])
+        manager.reset_review_count("my-project", 42)
+
+        manager2 = PRReviewStateManager(state_root=str(tmp_state_dir))
+        assert manager2.get_review_count("my-project", 42) == 0
+        assert len(manager2.get_review_history("my-project", 42)) == 2
+
+
     def test_raises_on_corrupted_state_file(self, manager, tmp_state_dir):
         """Corrupted YAML should raise, not silently reset the cycle counter."""
         state_file = tmp_state_dir / "corrupt-project" / "pr_review_state.yaml"

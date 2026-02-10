@@ -103,6 +103,9 @@ class PRReviewStateManager:
         reviews = data.get("pr_reviews", {})
         issue_data = reviews.get(parent_issue_number)
         if not issue_data:
+            logger.debug(
+                f"No review state for {project_name} #{parent_issue_number}, nothing to reset"
+            )
             return
 
         old_count = issue_data.get("review_count", 0)

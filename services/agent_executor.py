@@ -351,6 +351,12 @@ class AgentExecutor:
                         logger.info(f"Agent {agent_name} cancelled: {e}")
                         raise
 
+                    # NonRetryableAgentError: permanent failure — skip retries
+                    from agents.non_retryable import NonRetryableAgentError
+                    if isinstance(e, NonRetryableAgentError):
+                        logger.warning(f"Agent {agent_name} hit non-retryable error: {e}")
+                        raise
+
                     # Check if this is a Claude Code breaker failure (systemic issue)
                     error_message = str(e)
                     is_claude_breaker_failure = "Claude Code circuit breaker is OPEN" in error_message

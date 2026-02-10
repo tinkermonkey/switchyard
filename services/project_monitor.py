@@ -2800,6 +2800,7 @@ class ProjectMonitor:
                     'issue': issue_data or {},
                     'column': 'In Review',
                     'trigger': 'project_monitor',
+                    'trigger_source': 'pipeline_progression',
                     'workspace_type': 'discussions',
                     'timestamp': utc_isoformat()
                 }
