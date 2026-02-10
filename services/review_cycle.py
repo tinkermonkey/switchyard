@@ -627,9 +627,6 @@ class ReviewCycleExecutor:
                 # Reuse existing cycle - do NOT append maker output or reset state
                 cycle_state = existing_cycle
                 
-                # Store workflow columns for next column lookup
-                self.workflow_columns = workflow_columns
-                
                 # Continue directly to executing the review loop
                 # The existing state already has the maker outputs and iteration tracking
                 try:
@@ -739,8 +736,6 @@ class ReviewCycleExecutor:
 
         # Track active cycle
         self.active_cycles[issue_number] = cycle_state
-        self.workflow_columns = workflow_columns  # Store for next column lookup
-
         # Save initial state to disk
         cycle_state.status = 'maker_working'
         self._save_cycle_state(cycle_state)
@@ -1094,7 +1089,7 @@ class ReviewCycleExecutor:
                 await self._analyze_review_cycle_outcomes(cycle_state)
 
                 if column.auto_advance_on_approval:
-                    next_column = self._get_next_column_name(column)
+                    next_column = self._get_next_column_name(column, cycle_state.project_name, cycle_state.board_name)
                     logger.info(f"Review cycle completed, advancing to {next_column}")
 
                 logger.info(f"Review cycle completed successfully for issue #{cycle_state.issue_number}")
@@ -1323,7 +1318,7 @@ class ReviewCycleExecutor:
                 if review_result.status == ReviewStatus.APPROVED:
                     logger.info("Review already approved - advancing to next column")
                     if column.auto_advance_on_approval:
-                        next_column = self._get_next_column_name(column)
+                        next_column = self._get_next_column_name(column, project_name, board_name)
                         return next_column, True
                     else:
                         return column.name, True
@@ -1366,7 +1361,6 @@ class ReviewCycleExecutor:
 
                     # Register in active cycles
                     self.active_cycles[issue_number] = cycle_state
-                    self.workflow_columns = workflow_columns
                     self._save_cycle_state(cycle_state)
 
                     logger.info(f"Resuming review cycle - iteration {iteration + 1}/{cycle_state.max_iterations}")
@@ -1454,7 +1448,7 @@ class ReviewCycleExecutor:
                         f"Review approved after human feedback in iteration {iteration}"
                     )
                     if column.auto_advance_on_approval:
-                        next_column = self._get_next_column_name(column)
+                        next_column = self._get_next_column_name(column, project_name, board_name)
                         return next_column, True
                     else:
                         return column.name, True
@@ -1473,7 +1467,6 @@ class ReviewCycleExecutor:
 
                     # Register in active cycles
                     self.active_cycles[issue_number] = cycle_state
-                    self.workflow_columns = workflow_columns
 
                     # Continue the review loop from current iteration
                     next_column, cycle_complete = await self._execute_review_loop(
@@ -1535,7 +1528,6 @@ class ReviewCycleExecutor:
 
                 # Register in active cycles and save state
                 self.active_cycles[issue_number] = cycle_state
-                self.workflow_columns = workflow_columns
                 self._save_cycle_state(cycle_state)
 
                 logger.info(
@@ -1728,7 +1720,7 @@ class ReviewCycleExecutor:
                 # The review cycle only approves individual code changes, not the entire PR.
 
                 if column.auto_advance_on_approval:
-                    next_column = self._get_next_column_name(column)
+                    next_column = self._get_next_column_name(column, cycle_state.project_name, cycle_state.board_name)
                     return ReviewStatus.APPROVED, next_column
                 else:
                     # Stay in review column
@@ -2561,26 +2553,31 @@ _Escalated by Claude Code Orchestrator_
             f"{cycle_state.current_iteration}/{cycle_state.max_iterations}"
         )
 
-    def _get_next_column_name(self, current_column: WorkflowColumn) -> str:
+    def _get_next_column_name(self, current_column: WorkflowColumn, project_name: str, board_name: str) -> str:
         """Determine next column name after approval"""
-        if not hasattr(self, 'workflow_columns') or not self.workflow_columns:
-            logger.warning("No workflow columns available, cannot determine next column")
+        from config.manager import config_manager
+
+        try:
+            workflow_template = config_manager.get_project_workflow(project_name, board_name)
+            workflow_columns = workflow_template.columns
+        except Exception as e:
+            logger.warning(f"Could not load workflow columns for {project_name}/{board_name}: {e}")
             return current_column.name
 
         # Find current column index
         current_index = -1
-        for i, col in enumerate(self.workflow_columns):
+        for i, col in enumerate(workflow_columns):
             if col.name == current_column.name:
                 current_index = i
                 break
 
         if current_index == -1:
-            logger.warning(f"Current column {current_column.name} not found in workflow")
+            logger.warning(f"Current column {current_column.name} not found in workflow for {project_name}/{board_name}")
             return current_column.name
 
         # Get next column
-        if current_index + 1 < len(self.workflow_columns):
-            next_col = self.workflow_columns[current_index + 1]
+        if current_index + 1 < len(workflow_columns):
+            next_col = workflow_columns[current_index + 1]
             logger.info(f"Next column after {current_column.name}: {next_col.name}")
             return next_col.name
         else:
