@@ -304,6 +304,15 @@ class AgentExecutor:
                     if attempt > 1:
                         logger.info(f"Retry attempt {attempt}/{max_attempts} for agent {agent_name}")
 
+                    # Check cancellation signal BEFORE circuit breaker — ensures cancelled
+                    # work never touches the circuit breaker at all
+                    if 'issue_number' in task_context:
+                        from services.cancellation import get_cancellation_signal, CancellationError
+                        if get_cancellation_signal().is_cancelled(project_name, task_context['issue_number']):
+                            raise CancellationError(
+                                f"Work cancelled for {project_name}/#{task_context['issue_number']}"
+                            )
+
                     # Check Claude Code circuit breaker before attempting execution
                     # If it's open, we should not attempt execution or count failures against the agent
                     from monitoring.claude_code_breaker import get_breaker
@@ -336,6 +345,12 @@ class AgentExecutor:
                     break
 
                 except Exception as e:
+                    # CancellationError: deliberate stop — never retry, never trip circuit breaker
+                    from services.cancellation import CancellationError
+                    if isinstance(e, CancellationError):
+                        logger.info(f"Agent {agent_name} cancelled: {e}")
+                        raise
+
                     # Check if this is a Claude Code breaker failure (systemic issue)
                     error_message = str(e)
                     is_claude_breaker_failure = "Claude Code circuit breaker is OPEN" in error_message
@@ -503,7 +518,7 @@ class AgentExecutor:
                 for execution in reversed(state.get('execution_history', [])):
                     if (execution.get('column') == column and
                         execution.get('agent') == agent_name and
-                        execution.get('outcome') in ['success', 'failure']):
+                        execution.get('outcome') in ['success', 'failure', 'cancelled']):
                         # Found a recent completed execution for this agent/column
                         # docker_runner must have already recorded it
                         already_recorded = True
@@ -533,6 +548,13 @@ class AgentExecutor:
 
         except Exception as e:
             duration_ms = (time.time() - start_time) * 1000
+
+            # CancellationError: deliberate stop — cancel_issue_work() already recorded outcome
+            from services.cancellation import CancellationError
+            if isinstance(e, CancellationError):
+                logger.info(f"Agent {agent_name} cancelled after {duration_ms:.0f}ms: {e}")
+                raise
+
             error_message = str(e)
             is_claude_breaker_failure = "Claude Code circuit breaker is OPEN" in error_message
 
@@ -595,7 +617,7 @@ class AgentExecutor:
                     for execution in reversed(state.get('execution_history', [])):
                         if (execution.get('column') == column and
                             execution.get('agent') == agent_name and
-                            execution.get('outcome') in ['success', 'failure']):
+                            execution.get('outcome') in ['success', 'failure', 'cancelled']):
                             # Found a recent completed execution for this agent/column
                             # docker_runner must have already recorded it
                             already_recorded = True

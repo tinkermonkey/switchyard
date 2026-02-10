@@ -740,7 +740,7 @@ class PipelineQueueManager:
 
                 last_exec = state['execution_history'][-1]
 
-                if last_exec.get('outcome') == 'failure':
+                if last_exec.get('outcome') in ('failure', 'cancelled'):
                     # Verify no container is running
                     try:
                         result = subprocess.run(

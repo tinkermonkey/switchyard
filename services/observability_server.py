@@ -168,7 +168,36 @@ def kill_agent(container_name):
     try:
         logger.warning(f"KILL SWITCH ACTIVATED for container: {container_name}")
 
-        # Stop the container immediately
+        # Try to get project/issue from Redis before killing, so we can set cancellation signal
+        project = None
+        issue_number = None
+        try:
+            redis_client = redis.Redis(host='redis', port=6379, decode_responses=True)
+            data = redis_client.hgetall(f'agent:container:{container_name}')
+            if data:
+                project = data.get('project')
+                issue_str = data.get('issue_number', '')
+                if issue_str and issue_str != 'unknown':
+                    issue_number = int(issue_str)
+        except Exception as e:
+            logger.warning(f"Could not read container metadata from Redis: {e}")
+
+        # If we have project/issue, use full cancellation flow
+        if project and issue_number:
+            from services.cancellation import cancel_issue_work, get_cancellation_signal
+            cancel_issue_work(project, issue_number, f"Agent killed via Web UI (container: {container_name})")
+            # Clear signal so user can re-trigger work by moving the card
+            get_cancellation_signal().clear(project, issue_number)
+
+            return jsonify({
+                'success': True,
+                'message': f'Container {container_name} stopped and work cancelled for {project}/#{issue_number}',
+                'container_name': container_name,
+                'project': project,
+                'issue_number': issue_number
+            }), 200
+
+        # Fallback: kill just this container (no project/issue context)
         result = subprocess.run(
             ['docker', 'rm', '-f', container_name],
             capture_output=True,
@@ -180,8 +209,11 @@ def kill_agent(container_name):
             logger.info(f"Successfully killed container: {container_name}")
 
             # Remove from Redis tracking
-            redis_client = redis.Redis(host='redis', port=6379, decode_responses=True)
-            redis_client.delete(f'agent:container:{container_name}')
+            try:
+                redis_client = redis.Redis(host='redis', port=6379, decode_responses=True)
+                redis_client.delete(f'agent:container:{container_name}')
+            except Exception:
+                pass
 
             return jsonify({
                 'success': True,
@@ -945,18 +977,22 @@ def kill_pipeline_run(pipeline_run_id):
             
         project = pipeline_run.project
         issue_number = pipeline_run.issue_number
-        
-        # 1. End the pipeline run
+
+        # 1. Set cancellation signal FIRST to block any re-dispatch during lock release
+        from services.cancellation import cancel_issue_work, get_cancellation_signal
+        get_cancellation_signal().cancel(project, issue_number, "Pipeline run killed via Web UI")
+
+        # 2. End the pipeline run (releases lock — safe because signal is already set)
         success = pipeline_run_manager.end_pipeline_run(
             project=project,
             issue_number=issue_number,
             reason="Killed by user via Web UI"
         )
-        
+
         if not success:
             # It might have been already ended, but we should still clean up execution state
             logger.warning(f"Pipeline run {pipeline_run_id} was not active in Redis, forcing update in Elasticsearch")
-            
+
             # Force update in Elasticsearch using the run details we fetched earlier
             # This handles "zombie" runs that exist in ES but not in Redis
             try:
@@ -967,51 +1003,16 @@ def kill_pipeline_run(pipeline_run_id):
                 success = True # Mark as success since we updated ES
             except Exception as e:
                 logger.error(f"Failed to force update pipeline run in ES: {e}")
-            
-        # 2. Force fail any in-progress execution state to release locks
-        # We need to find if there's an in-progress state
-        execution_history = work_execution_tracker.get_execution_history(project, issue_number)
-        
-        cleaned_up_execution = False
-        for execution in reversed(execution_history):
-            if execution.get('outcome') == 'in_progress':
-                agent = execution.get('agent')
-                column = execution.get('column')
-                
-                logger.info(f"Force-failing in-progress execution for {project}/#{issue_number} ({agent})")
-                
-                work_execution_tracker.record_execution_outcome(
-                    issue_number=issue_number,
-                    column=column,
-                    agent=agent,
-                    outcome='failure',
-                    project_name=project,
-                    error='Pipeline run killed by user'
-                )
-                cleaned_up_execution = True
-                
-        # 3. Attempt to kill any running containers associated with this run
-        # This is a best-effort cleanup
-        try:
-            import subprocess
-            # Find containers for this project/issue
-            # We look for agent containers and repair cycle containers
-            
-            # Agent containers: claude-agent-{project}-{task_id}
-            # We can't easily match task_id to run_id without more queries, 
-            # but we can check active agents endpoint logic
-            
-            # For now, let's just rely on the state cleanup. 
-            # The zombie reaper or next health check might clean up orphaned containers,
-            # or the user can use the specific "Kill Agent" button if they see a stuck container.
-            pass
-        except Exception as e:
-            logger.warning(f"Error cleaning up containers for killed run: {e}")
+
+        # 3. Full cleanup (containers, review cycles, execution state)
+        cancel_issue_work(project, issue_number, "Pipeline run killed via Web UI")
+
+        # 4. Clear signal so user can re-trigger work by moving the card
+        get_cancellation_signal().clear(project, issue_number)
 
         return jsonify({
             'success': True,
-            'message': f'Pipeline run {pipeline_run_id} killed',
-            'cleaned_execution_state': cleaned_up_execution
+            'message': f'Pipeline run {pipeline_run_id} killed and work cancelled for {project}/#{issue_number}'
         })
         
     except Exception as e:

@@ -24,7 +24,7 @@ class ExecutionRecord:
     column: str
     agent: str
     timestamp: str
-    outcome: str  # 'success', 'failure', 'blocked', 'in_progress'
+    outcome: str  # 'success', 'failure', 'blocked', 'cancelled', 'in_progress'
     trigger_source: str  # 'manual_move', 'pipeline_progression', 'webhook'
     error: Optional[str] = None
 
@@ -302,8 +302,8 @@ class WorkExecutionStateTracker:
                 )
                 return True, "manual_rework_detected"
 
-        # Case 3: Previous execution failed or was blocked
-        if last_execution['outcome'] in ['failure', 'blocked']:
+        # Case 3: Previous execution failed, was blocked, or was cancelled
+        if last_execution['outcome'] in ['failure', 'blocked', 'cancelled']:
             logger.debug(
                 f"Should execute {agent} on {project_name}/#{issue_number}: "
                 f"retry_after_{last_execution['outcome']}"

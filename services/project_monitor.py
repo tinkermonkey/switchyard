@@ -1699,6 +1699,13 @@ class ProjectMonitor:
                         project_name=project_name
                     )
 
+                    # Block re-trigger of cancelled issues while signal is still active
+                    if should_execute and reason.startswith('retry_after_cancelled'):
+                        from services.cancellation import get_cancellation_signal
+                        if get_cancellation_signal().is_cancelled(project_name, issue_number):
+                            logger.debug(f"Skipping cancelled issue #{issue_number} in {project_name}")
+                            already_handled = True
+
                     if not should_execute:
                         # Check if this is a circuit breaker block that can now be retried
                         if reason == 'work_already_in_progress':
@@ -2397,6 +2404,21 @@ class ProjectMonitor:
             )
             if ended:
                 logger.info(f"Ended pipeline run for issue #{issue_number} (reached '{exit_column}')")
+
+            # Clean up review cycle state (but don't force-kill containers — they exit naturally with --rm)
+            from services.cancellation import get_cancellation_signal
+            signal = get_cancellation_signal()
+            signal.cancel(project_name, issue_number, f"Issue reached exit column '{exit_column}'")
+
+            try:
+                from services.review_cycle import review_cycle_executor
+                if issue_number in review_cycle_executor.active_cycles:
+                    del review_cycle_executor.active_cycles[issue_number]
+            except Exception:
+                pass
+
+            # Clear signal so issue can be re-triggered if moved back
+            signal.clear(project_name, issue_number)
 
             # Process next waiting issue
             next_issue = pipeline_queue.get_next_waiting_issue()
@@ -3356,45 +3378,50 @@ _Review cycle initiated by Claude Code Orchestrator_
                             logger.error(traceback.format_exc())
 
                 except Exception as e:
-                    logger.error(f"Error in review cycle thread: {e}")
-                    import traceback
-                    logger.error(traceback.format_exc())
+                    # CancellationError: deliberate stop — log as info, don't emit error events
+                    from services.cancellation import CancellationError
+                    if isinstance(e, CancellationError):
+                        logger.info(f"Review cycle cancelled for issue #{issue_number}")
+                    else:
+                        logger.error(f"Error in review cycle thread: {e}")
+                        import traceback
+                        logger.error(traceback.format_exc())
 
-                    # EMIT ERROR EVENT for UI visibility
-                    try:
-                        from monitoring.decision_events import DecisionEventEmitter
-                        from monitoring.observability import get_observability_manager
+                        # EMIT ERROR EVENT for UI visibility
+                        try:
+                            from monitoring.decision_events import DecisionEventEmitter
+                            from monitoring.observability import get_observability_manager
 
-                        decision_emitter = DecisionEventEmitter(get_observability_manager())
+                            decision_emitter = DecisionEventEmitter(get_observability_manager())
 
-                        context = {
-                            'thread': 'review_cycle_thread',
-                            'issue_number': issue_number if 'issue_number' in locals() else None,
-                            'project': project_name if 'project_name' in locals() else None,
-                            'board': pipeline_config.board_name if 'pipeline_config' in locals() and pipeline_config else None
-                        }
+                            context = {
+                                'thread': 'review_cycle_thread',
+                                'issue_number': issue_number if 'issue_number' in locals() else None,
+                                'project': project_name if 'project_name' in locals() else None,
+                                'board': pipeline_config.board_name if 'pipeline_config' in locals() and pipeline_config else None
+                            }
 
-                        # Try to get pipeline_run_id if we have issue_number and project_name
-                        pipeline_run_id = None
-                        if 'issue_number' in locals() and issue_number and 'project_name' in locals() and project_name:
-                            try:
-                                from services.pipeline_run import get_pipeline_run_manager
-                                prm = get_pipeline_run_manager()
-                                pipeline_run_id = prm.get_active_run_id(project_name, issue_number)
-                            except Exception:
-                                pass  # pipeline_run_id will remain None
+                            # Try to get pipeline_run_id if we have issue_number and project_name
+                            pipeline_run_id = None
+                            if 'issue_number' in locals() and issue_number and 'project_name' in locals() and project_name:
+                                try:
+                                    from services.pipeline_run import get_pipeline_run_manager
+                                    prm = get_pipeline_run_manager()
+                                    pipeline_run_id = prm.get_active_run_id(project_name, issue_number)
+                                except Exception:
+                                    pass  # pipeline_run_id will remain None
 
-                        decision_emitter.emit_error_decision(
-                            error_type="review_cycle_thread_failure",
-                            error_message=str(e),
-                            context=context,
-                            recovery_action="Review cycle thread terminated, pipeline lock retained",
-                            success=False,
-                            project=context.get('project', 'unknown'),
-                            pipeline_run_id=pipeline_run_id
-                        )
-                    except Exception as emit_error:
-                        logger.error(f"Failed to emit thread error event: {emit_error}", exc_info=True)
+                            decision_emitter.emit_error_decision(
+                                error_type="review_cycle_thread_failure",
+                                error_message=str(e),
+                                context=context,
+                                recovery_action="Review cycle thread terminated, pipeline lock retained",
+                                success=False,
+                                project=context.get('project', 'unknown'),
+                                pipeline_run_id=pipeline_run_id
+                            )
+                        except Exception as emit_error:
+                            logger.error(f"Failed to emit thread error event: {emit_error}", exc_info=True)
 
                 finally:
                     # Always close the event loop to prevent resource leak
@@ -5087,6 +5114,10 @@ _Repair cycle initiated by Claude Code Orchestrator_
             # Grace period: 2 minutes (allows agent startup time)
             grace_period = datetime.now(timezone.utc) - timedelta(minutes=2)
 
+            # Get cancellation signal to exclude cancelled issues
+            from services.cancellation import get_cancellation_signal
+            cancellation_signal = get_cancellation_signal()
+
             for item in current_items:
                 try:
                     issue_number = item.issue_number
@@ -5098,6 +5129,10 @@ _Repair cycle initiated by Claude Code Orchestrator_
 
                     # Skip issues in waiting queue (handled by main failsafe)
                     if issue_number in waiting_issues:
+                        continue
+
+                    # Skip cancelled issues (deliberate stop, not stalled)
+                    if cancellation_signal.is_cancelled(project_name, issue_number):
                         continue
 
                     # Check if issue has active execution
@@ -5286,6 +5321,20 @@ _Repair cycle initiated by Claude Code Orchestrator_
                             )
 
                         if current_column:
+                            # Check cancellation signal before triggering
+                            from services.cancellation import get_cancellation_signal
+                            if get_cancellation_signal().is_cancelled(project_name, issue_number):
+                                logger.info(
+                                    f"⚡ FAILSAFE: Skipping cancelled issue #{issue_number} "
+                                    f"in {project_name}/{pipeline.board_name}"
+                                )
+                                if not is_stalled:
+                                    pipeline_queue.remove_issue_from_queue(issue_number)
+                                lock_manager.release_lock(
+                                    project_name, pipeline.board_name, issue_number
+                                )
+                                continue
+
                             logger.info(
                                 f"⚡ FAILSAFE: Triggering agent for issue "
                                 f"#{issue_number} in column '{current_column}'"

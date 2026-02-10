@@ -773,6 +773,14 @@ class ReviewCycleExecutor:
             return next_column, True
 
         except Exception as e:
+            # CancellationError: deliberate stop — clean up silently without posting error comment
+            from services.cancellation import CancellationError
+            if isinstance(e, CancellationError):
+                logger.info(f"Review cycle cancelled for issue #{issue_number}: {e}")
+                if issue_number in self.active_cycles:
+                    del self.active_cycles[issue_number]
+                raise
+
             logger.error(f"Review cycle failed for issue #{issue_number}: {e}")
 
             # EMIT ERROR EVENT for UI visibility
@@ -1569,6 +1577,14 @@ class ReviewCycleExecutor:
         """
 
         while cycle_state.current_iteration < cycle_state.max_iterations:
+            # Check cancellation before each iteration
+            from services.cancellation import get_cancellation_signal, CancellationError
+            if get_cancellation_signal().is_cancelled(cycle_state.project_name, cycle_state.issue_number):
+                logger.info(f"Review cycle cancelled for issue #{cycle_state.issue_number}")
+                raise CancellationError(
+                    f"Review cycle cancelled for {cycle_state.project_name}/#{cycle_state.issue_number}"
+                )
+
             cycle_state.current_iteration += 1
             iteration = cycle_state.current_iteration
 
@@ -1576,7 +1592,7 @@ class ReviewCycleExecutor:
                 f"Review cycle iteration {iteration}/{cycle_state.max_iterations} "
                 f"for issue #{cycle_state.issue_number}"
             )
-            
+
             # EMIT DECISION EVENT: Review cycle iteration
             self.decision_events.emit_review_cycle_decision(
                 issue_number=cycle_state.issue_number,
@@ -2196,6 +2212,14 @@ class ReviewCycleExecutor:
         """Execute agent using centralized executor (ensures observability)"""
         from services.agent_executor import get_agent_executor
         from services.work_execution_state import work_execution_tracker
+        from services.cancellation import get_cancellation_signal, CancellationError
+
+        # Check cancellation before launching agent
+        issue_number = task_context.get('issue_number')
+        if issue_number and get_cancellation_signal().is_cancelled(project_name, issue_number):
+            raise CancellationError(
+                f"Agent {agent_name} not launched: work cancelled for {project_name}/#{issue_number}"
+            )
 
         logger.info(f"Executing {agent_name} directly for review cycle")
 

@@ -116,6 +116,15 @@ class TaskWorker:
                                 break # Success, exit retry loop
 
                             except Exception as e:
+                                # CancellationError: deliberate stop — don't retry
+                                from services.cancellation import CancellationError
+                                if isinstance(e, CancellationError):
+                                    logger.info(f"[Worker {self.worker_id}] Task {task.id} cancelled: {e}")
+                                    duration = time.time() - start_time
+                                    self.metrics.record_task_complete(task.agent, duration, success=False)
+                                    self.tasks_failed += 1
+                                    break
+
                                 # Check if we should retry
                                 if attempt <= max_retries:
                                     logger.warning(

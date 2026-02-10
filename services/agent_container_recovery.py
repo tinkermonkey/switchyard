@@ -293,24 +293,25 @@ class AgentContainerRecovery:
         except Exception as e:
             logger.error(f"Failed to kill container {container_name}: {e}")
     
-    def cleanup_execution_state(self, project: str, issue_number: int, agent: str, reason: str):
+    def cleanup_execution_state(self, project: str, issue_number: int, agent: str, reason: str, outcome: str = 'failed'):
         """
-        Mark execution state as failed due to orchestrator restart
-        
+        Mark execution state due to orchestrator restart or cancellation.
+
         Args:
             project: Project name
             issue_number: Issue number
             agent: Agent name
             reason: Reason for cleanup (e.g., "orchestrator_restart")
+            outcome: Execution outcome ('failed' or 'cancelled')
         """
         try:
             from services.work_execution_state import work_execution_tracker
-            
+
             work_execution_tracker.record_execution_outcome(
                 issue_number=issue_number,
                 column='unknown',  # We don't know which column
                 agent=agent,
-                outcome='failed',
+                outcome=outcome,
                 project_name=project,
                 error=reason
             )
@@ -422,6 +423,23 @@ class AgentContainerRecovery:
                                     logger.info(f"Found issue number {issue_number} in Redis for container {container_name}")
                     except Exception as e:
                         logger.debug(f"Could not get Redis data for container: {e}")
+
+                # If we have issue_number, check cancellation signal first
+                if issue_number:
+                    from services.cancellation import get_cancellation_signal
+                    if get_cancellation_signal().is_cancelled(project, issue_number):
+                        logger.info(
+                            f"Container {container_name} belongs to cancelled issue "
+                            f"{project}/#{issue_number}, killing it"
+                        )
+                        self.kill_container(container_name, container_id)
+                        self.cleanup_execution_state(
+                            project, issue_number, agent,
+                            "Container killed during recovery: issue was cancelled",
+                            outcome='cancelled'
+                        )
+                        killed += 1
+                        continue
 
                 # If we have issue_number, validate against execution history
                 if issue_number:
