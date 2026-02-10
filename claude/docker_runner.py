@@ -2004,7 +2004,7 @@ class DockerAgentRunner:
             )
 
             # Clean up container tracking
-            self.unregister_active_container(container_name)
+            self._unregister_active_container(container_name)
 
             # Try to remove container (may already be removed by --rm)
             try:
