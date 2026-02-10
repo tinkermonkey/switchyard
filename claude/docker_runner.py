@@ -2003,6 +2003,58 @@ class DockerAgentRunner:
                 f"{project}/#{issue_number} {agent} → {outcome}"
             )
 
+            # Auto-advance to next column if successful and column has auto_advance_on_approval
+            if exit_code == 0 and column != 'unknown':
+                try:
+                    # Find the pipeline and workflow for this column
+                    for pipeline in project_config.pipelines:
+                        workflow_template = config_manager.get_workflow_template(pipeline.workflow)
+                        if not workflow_template:
+                            continue
+
+                        current_column = next(
+                            (c for c in workflow_template.columns if c.name == column),
+                            None
+                        )
+
+                        if current_column and getattr(current_column, 'auto_advance_on_approval', False):
+                            current_index = workflow_template.columns.index(current_column)
+                            if current_index + 1 < len(workflow_template.columns):
+                                next_column = workflow_template.columns[current_index + 1]
+
+                                logger.info(
+                                    f"Auto-advancing recovered container issue #{issue_number} "
+                                    f"from {column} to {next_column.name}"
+                                )
+
+                                from services.pipeline_progression import PipelineProgression
+                                from task_queue.task_manager import TaskQueue
+
+                                task_queue = TaskQueue()
+                                progression_service = PipelineProgression(task_queue)
+
+                                moved = progression_service.move_issue_to_column(
+                                    project_name=project,
+                                    board_name=pipeline.board_name,
+                                    issue_number=issue_number,
+                                    target_column=next_column.name,
+                                    trigger='recovered_container_auto_advance'
+                                )
+
+                                if moved:
+                                    logger.info(
+                                        f"Successfully auto-advanced issue #{issue_number} to {next_column.name}"
+                                    )
+                                else:
+                                    logger.warning(
+                                        f"Failed to auto-advance issue #{issue_number} to {next_column.name}"
+                                    )
+                            break  # Found the column's pipeline, stop searching
+                except Exception as e:
+                    logger.error(f"Error during recovered container auto-advancement: {e}")
+                    import traceback
+                    logger.error(traceback.format_exc())
+
             # Clean up container tracking
             self._unregister_active_container(container_name)
 
