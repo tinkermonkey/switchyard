@@ -593,10 +593,8 @@ class WorkExecutionStateTracker:
             import redis
             redis_client = redis.Redis(host='redis', port=6379, decode_responses=True)
             
-            # Get all agent container tracking keys
-            agent_keys = redis_client.keys('agent:container:*')
-            
-            for key in agent_keys:
+            # Cursor-based scan (non-blocking, unlike keys())
+            for key in redis_client.scan_iter(match='agent:container:*', count=100):
                 try:
                     container_info = redis_client.hgetall(key)
                     if (container_info.get('project') == project and
@@ -613,6 +611,69 @@ class WorkExecutionStateTracker:
             logger.error(f"Error checking Redis tracking: {e}")
             return False
     
+    def _repair_missing_redis_tracking(self, project: str, issue_number: int, agent: str, container_names: list):
+        """
+        Repair missing Redis tracking keys by reading Docker container labels.
+
+        When a container exists in Docker but has no Redis tracking key, this method
+        inspects the container to extract metadata from labels and re-registers it.
+        """
+        import subprocess
+
+        for container_name in container_names:
+            try:
+                # Extract container ID and labels via docker inspect
+                inspect_result = subprocess.run(
+                    ['docker', 'inspect', '--format',
+                     '{{.Id}}|{{index .Config.Labels "org.clauditoreum.agent"}}|'
+                     '{{index .Config.Labels "org.clauditoreum.project"}}|'
+                     '{{index .Config.Labels "org.clauditoreum.task_id"}}|'
+                     '{{index .Config.Labels "org.clauditoreum.issue_number"}}|'
+                     '{{index .Config.Labels "org.clauditoreum.pipeline_run_id"}}',
+                     container_name],
+                    capture_output=True,
+                    text=True,
+                    timeout=5
+                )
+
+                if inspect_result.returncode != 0:
+                    logger.warning(f"Failed to inspect container {container_name}: {inspect_result.stderr}")
+                    continue
+
+                parts = inspect_result.stdout.strip().split('|')
+                container_id = parts[0] if len(parts) > 0 else ''
+                label_agent = parts[1] if len(parts) > 1 and parts[1] else agent
+                label_project = parts[2] if len(parts) > 2 and parts[2] else project
+                label_task_id = parts[3] if len(parts) > 3 and parts[3] else 'unknown'
+                label_issue = parts[4] if len(parts) > 4 and parts[4] else str(issue_number)
+                label_pipeline_run_id = parts[5] if len(parts) > 5 and parts[5] else ''
+
+                from datetime import datetime
+                container_info = {
+                    'container_name': container_name,
+                    'container_id': container_id,
+                    'agent': label_agent,
+                    'project': label_project,
+                    'task_id': label_task_id,
+                    'started_at': datetime.now().isoformat(),
+                    'issue_number': label_issue,
+                    'pipeline_run_id': label_pipeline_run_id,
+                    'repaired': 'true'
+                }
+
+                import redis
+                redis_client = redis.Redis(host='redis', port=6379, decode_responses=True)
+                redis_client.hset(f'agent:container:{container_name}', mapping=container_info)
+                redis_client.expire(f'agent:container:{container_name}', 7200)
+
+                logger.info(
+                    f"REPAIRED Redis tracking for container {container_name} "
+                    f"(agent={label_agent}, project={label_project}, issue=#{label_issue})"
+                )
+
+            except Exception as e:
+                logger.warning(f"Failed to repair Redis tracking for container {container_name}: {e}")
+
     def _check_redis_repair_cycle_tracking(self, project: str, issue_number: int) -> bool:
         """
         Check if there's a Redis tracking key for an active repair cycle container.
@@ -1194,25 +1255,27 @@ class WorkExecutionStateTracker:
                             # Method 1: Check if Docker container is running
                             # Use specific prefix pattern to avoid false positives from other projects
                             # Agent container naming: claude-agent-{project}-{task_id}
-                            result = subprocess.run(
+                            agent_ps_result = subprocess.run(
                                 ['docker', 'ps', '--filter', f'name=claude-agent-{project_name}-',
                                  '--format', '{{.Names}}'],
                                 capture_output=True,
                                 text=True,
                                 timeout=5
                             )
-                            has_agent_container = bool(result.stdout.strip())
+                            agent_container_names = [n for n in agent_ps_result.stdout.strip().split('\n') if n]
+                            has_agent_container = bool(agent_container_names)
 
                             # Also check for RUNNING repair cycle containers (format: repair-cycle-{project}-{issue}-{run_id})
                             # Important: Use 'docker ps' not 'docker ps -a' to only find running containers
-                            result = subprocess.run(
+                            repair_ps_result = subprocess.run(
                                 ['docker', 'ps', '--filter', f'name=repair-cycle-{project_name}-{issue_number}',
                                  '--format', '{{.Names}}'],
                                 capture_output=True,
                                 text=True,
                                 timeout=5
                             )
-                            has_repair_cycle_container = bool(result.stdout.strip())
+                            repair_container_names = [n for n in repair_ps_result.stdout.strip().split('\n') if n]
+                            has_repair_cycle_container = bool(repair_container_names)
 
                             has_docker_container = has_agent_container or has_repair_cycle_container
 
@@ -1230,9 +1293,13 @@ class WorkExecutionStateTracker:
                             has_running_container = has_docker_container
 
                             if has_docker_container and not has_redis_tracking:
+                                all_container_names = agent_container_names + repair_container_names
                                 logger.warning(
                                     f"Container exists in Docker but not in Redis tracking for "
-                                    f"{project_name}/#{issue_number} {agent}"
+                                    f"{project_name}/#{issue_number} {agent} - attempting repair"
+                                )
+                                self._repair_missing_redis_tracking(
+                                    project_name, issue_number, agent, all_container_names
                                 )
                             elif has_redis_tracking and not has_docker_container:
                                 logger.warning(

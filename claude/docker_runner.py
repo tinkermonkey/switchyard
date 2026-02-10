@@ -26,6 +26,19 @@ class DockerAgentRunner:
         # Docker Compose prefixes network names with project directory name
         self.network_name = network_name
         self._host_workspace_path = None  # Cache for host workspace path detection
+        self._redis = None  # Lazy Redis connection (shared across register/unregister/persist calls)
+
+    def _get_redis(self):
+        """Lazy Redis connection (tolerates Redis being unavailable)."""
+        if self._redis is None:
+            try:
+                import redis
+                self._redis = redis.Redis(host='redis', port=6379, decode_responses=True)
+                self._redis.ping()
+            except Exception as e:
+                logger.warning(f"Redis unavailable for container tracking: {e}")
+                self._redis = None
+        return self._redis
 
     @staticmethod
     def _detect_host_workspace_path() -> str:
@@ -1080,9 +1093,6 @@ class DockerAgentRunner:
         task_id = context.get('task_id', 'unknown')
         project = context.get('project', 'unknown')
 
-        # Track active container in Redis for kill switch
-        self._register_active_container(container_name, agent, project, task_id, context)
-
         # Emit events
         if obs:
             import time
@@ -1102,6 +1112,10 @@ class DockerAgentRunner:
             
             container_id = launch_result.stdout.strip()
             logger.info(f"Launched detached container: {container_id[:12]}")
+
+            # Track active container in Redis for kill switch
+            # Registration happens AFTER docker run succeeds so we have the real container_id
+            self._register_active_container(container_name, agent, project, task_id, context, container_id=container_id)
 
             # Stream logs from the detached container
             # This allows the orchestrator to restart without killing the container
@@ -1534,64 +1548,62 @@ class DockerAgentRunner:
 
             raise
 
-    def _register_active_container(self, container_name: str, agent: str, project: str, task_id: str, context: Dict[str, Any]):
-        """Register an active container in Redis for tracking and kill switch"""
-        try:
-            import redis
-            from datetime import datetime
+    def _register_active_container(self, container_name: str, agent: str, project: str, task_id: str, context: Dict[str, Any], container_id: str = None):
+        """Register an active container in Redis for tracking and kill switch.
 
-            redis_client = redis.Redis(host='redis', port=6379, decode_responses=True)
+        Retries up to 3 times with backoff to handle transient Redis failures.
+        The container_id is passed directly from docker run output.
+        """
+        import time
+        from datetime import datetime
 
-            # Store container info
-            # Note: agent_executor nests task_context in context['context']
-            task_context = context.get('context', {})
+        # Note: agent_executor nests task_context in context['context']
+        task_context = context.get('context', {})
 
-            # Get container ID from running container (with retry since container might not be fully started)
-            container_id = None
-            for attempt in range(3):
-                try:
-                    result = subprocess.run(
-                        ['docker', 'ps', '--filter', f'name={container_name}', '--format', '{{.ID}}'],
-                        capture_output=True, text=True, timeout=5
+        container_info = {
+            'container_name': container_name,
+            'container_id': container_id or '',
+            'agent': agent,
+            'project': project,
+            'task_id': task_id,
+            'started_at': datetime.now().isoformat(),
+            # Try nested context first, then top-level (for backwards compatibility)
+            'issue_number': str(task_context.get('issue_number') or context.get('issue_number', 'unknown')),
+            'pipeline_run_id': task_context.get('pipeline_run_id') or context.get('pipeline_run_id', '')
+        }
+
+        backoff_times = [0.5, 1.0]
+        for attempt in range(3):
+            try:
+                redis_client = self._get_redis()
+                if redis_client is None:
+                    raise ConnectionError("Redis unavailable")
+
+                redis_client.hset(f'agent:container:{container_name}', mapping=container_info)
+                redis_client.expire(f'agent:container:{container_name}', 7200)
+
+                logger.info(f"Registered active container: {container_name} (agent={agent}, project={project}, id={container_id})")
+                return
+
+            except Exception as e:
+                if attempt < 2:
+                    logger.warning(f"Failed to register container in Redis (attempt {attempt+1}/3): {e}")
+                    # Force reconnection on next attempt
+                    self._redis = None
+                    time.sleep(backoff_times[attempt])
+                else:
+                    logger.error(
+                        f"Container {container_name} is running but UNTRACKED after 3 attempts: {e}. "
+                        f"The stuck execution checker will attempt repair."
                     )
-                    if result.returncode == 0 and result.stdout.strip():
-                        container_id = result.stdout.strip()
-                        break
-                    # Container not found yet, wait briefly
-                    if attempt < 2:
-                        import time
-                        time.sleep(0.5)
-                except Exception as e:
-                    logger.debug(f"Could not get container ID (attempt {attempt+1}): {e}")
-
-            container_info = {
-                'container_name': container_name,
-                'container_id': container_id or '',
-                'agent': agent,
-                'project': project,
-                'task_id': task_id,
-                'started_at': datetime.now().isoformat(),
-                # Try nested context first, then top-level (for backwards compatibility)
-                'issue_number': str(task_context.get('issue_number') or context.get('issue_number', 'unknown')),
-                'pipeline_run_id': task_context.get('pipeline_run_id') or context.get('pipeline_run_id', '')  # Track pipeline association
-            }
-
-            # Store in Redis with 2 hour expiry (safety cleanup)
-            redis_client.hset(f'agent:container:{container_name}', mapping=container_info)
-            redis_client.expire(f'agent:container:{container_name}', 7200)
-
-            logger.info(f"Registered active container: {container_name} (agent={agent}, project={project}, id={container_id})")
-
-        except Exception as e:
-            logger.warning(f"Failed to register container in Redis: {e}")
 
     def _unregister_active_container(self, container_name: str):
         """Remove container from active tracking"""
         try:
-            import redis
-            redis_client = redis.Redis(host='redis', port=6379, decode_responses=True)
-            redis_client.delete(f'agent:container:{container_name}')
-            logger.info(f"Unregistered container: {container_name}")
+            redis_client = self._get_redis()
+            if redis_client:
+                redis_client.delete(f'agent:container:{container_name}')
+                logger.info(f"Unregistered container: {container_name}")
         except Exception as e:
             logger.warning(f"Failed to unregister container from Redis: {e}")
 
@@ -1689,11 +1701,13 @@ class DockerAgentRunner:
             output: Agent output (stdout/stderr combined)
         """
         try:
-            import redis
             import json
             from datetime import datetime, timezone
 
-            redis_client = redis.Redis(host='redis', port=6379, decode_responses=True)
+            redis_client = self._get_redis()
+            if redis_client is None:
+                logger.warning("Failed to persist agent result to Redis: Redis unavailable")
+                return
 
             result = {
                 'container_name': container_name,
