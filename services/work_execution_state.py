@@ -1447,6 +1447,26 @@ class WorkExecutionStateTracker:
                                         'or the orchestrator was restarted before outcome could be recorded.'
                                     )
 
+                                    # Special handling for dev_environment_verifier agent
+                                    # BUG FIX: Synchronize dev container state when verification container dies
+                                    if agent == 'dev_environment_verifier':
+                                        try:
+                                            from services.dev_container_state import dev_container_state, DevContainerStatus
+                                            logger.info(
+                                                f"Stuck dev_environment_verifier detected for {project_name}, "
+                                                f"resetting dev container state to UNVERIFIED"
+                                            )
+                                            dev_container_state.set_status(
+                                                project_name=project_name,
+                                                status=DevContainerStatus.UNVERIFIED,
+                                                error_message="Verification container died before completion"
+                                            )
+                                        except Exception as e:
+                                            logger.error(
+                                                f"Failed to update dev container state for {project_name}: {e}",
+                                                exc_info=True
+                                            )
+
                                 modified = True
                                 cleaned_count += 1
 
@@ -1461,6 +1481,29 @@ class WorkExecutionStateTracker:
                                         f"{project_name}/#{issue_number} {agent} in {column}. "
                                         f"Pipeline requires manual card movement to advance."
                                     )
+
+                                    # Verify dev container state consistency for dev_environment_verifier
+                                    # The agent should have already set state to VERIFIED before exiting
+                                    if agent == 'dev_environment_verifier':
+                                        try:
+                                            from services.dev_container_state import dev_container_state, DevContainerStatus
+                                            current_status = dev_container_state.get_status(project_name)
+                                            if current_status != DevContainerStatus.VERIFIED:
+                                                logger.warning(
+                                                    f"Dev environment verifier succeeded for {project_name} but "
+                                                    f"state is {current_status.value}, expected VERIFIED. "
+                                                    f"Correcting state now."
+                                                )
+                                                dev_container_state.set_status(
+                                                    project_name=project_name,
+                                                    status=DevContainerStatus.VERIFIED,
+                                                    image_name=f"{project_name}-agent:latest"
+                                                )
+                                        except Exception as e:
+                                            logger.error(
+                                                f"Failed to verify dev container state for {project_name}: {e}",
+                                                exc_info=True
+                                            )
 
                                     try:
                                         from monitoring.decision_events import DecisionEventEmitter
@@ -1505,6 +1548,31 @@ class WorkExecutionStateTracker:
                                         f"({'recovered from Redis' if recovered else 'no container found, outcome not recorded'}). "
                                         f"Pipeline is now blocked - manual intervention required."
                                     )
+
+                                    # Special handling for dev_environment_verifier agent failures
+                                    # BUG FIX: Synchronize dev container state when verification fails
+                                    # This handles both: (1) recovered-from-Redis failures, (2) non-recovered failures
+                                    # Note: Non-recovered failures already handled above at line ~1460, but
+                                    # this ensures recovered failures also update the state
+                                    if agent == 'dev_environment_verifier' and recovered:
+                                        try:
+                                            from services.dev_container_state import dev_container_state, DevContainerStatus
+                                            logger.info(
+                                                f"Dev environment verification failed for {project_name} "
+                                                f"(recovered from Redis with failure), marking as BLOCKED"
+                                            )
+                                            # Extract error from execution for context
+                                            error_msg = execution.get('error', 'Verification failed')[:200]
+                                            dev_container_state.set_status(
+                                                project_name=project_name,
+                                                status=DevContainerStatus.BLOCKED,
+                                                error_message=error_msg
+                                            )
+                                        except Exception as e:
+                                            logger.error(
+                                                f"Failed to update dev container state for {project_name}: {e}",
+                                                exc_info=True
+                                            )
 
                                     # CRITICAL CHANGE: DO NOT call end_pipeline_run()
                                     #
