@@ -2628,51 +2628,46 @@ class ProjectMonitor:
             pr_number = pr_data.get('pr_number')
             is_draft = pr_data.get('is_draft', True)
 
-            # Step 9: Check if PR is already ready (idempotent check for race conditions)
-            if not is_draft:
-                logger.debug(f"PR #{pr_number} is already marked ready, skipping")
-                return
+            # Step 9: Mark PR as ready if still draft
+            if is_draft:
+                logger.info(f"PR #{pr_number} is currently draft, marking as ready for review...")
 
-            logger.info(f"PR #{pr_number} is currently draft, marking as ready for review...")
+                success = await github.mark_pr_ready(pr_number)
 
-            # Step 10: Mark PR as ready for review
-            success = await github.mark_pr_ready(pr_number)
+                if success:
+                    feature_branch.pr_number = pr_number
+                    feature_branch.pr_status = "ready"
+                    feature_branch_manager.save_feature_branch_state(project_name, feature_branch)
 
-            if success:
-                # Update cache with PR status (cache-only, no file persistence)
-                feature_branch.pr_number = pr_number
-                feature_branch.pr_status = "ready"
-                feature_branch_manager.save_feature_branch_state(project_name, feature_branch)
+                    logger.info(
+                        f"✓ Successfully marked PR #{pr_number} as ready for review "
+                        f"(triggered by issue #{issue_number} completing)"
+                    )
 
-                logger.info(
-                    f"✓ Successfully marked PR #{pr_number} as ready for review "
-                    f"(triggered by issue #{issue_number} completing)"
-                )
+                    pr_url = pr_data.get('url') or f"https://github.com/{project_config.github['org']}/{project_config.github['repo']}/pull/{pr_number}"
+                    await feature_branch_manager.post_feature_completion_comment(
+                        github,
+                        parent_issue_number,
+                        pr_url
+                    )
 
-                # Step 11: Post completion comment to parent issue
-                pr_url = pr_data.get('url') or f"https://github.com/{project_config.github['org']}/{project_config.github['repo']}/pull/{pr_number}"
-                await feature_branch_manager.post_feature_completion_comment(
-                    github,
-                    parent_issue_number,
-                    pr_url
-                )
+                    logger.info(f"✓ Posted completion comment to parent issue #{parent_issue_number}")
+                else:
+                    logger.error(
+                        f"✗ FAILED to mark PR #{pr_number} as ready for review. "
+                        f"GitHub API call failed. Manual intervention required."
+                    )
 
-                logger.info(f"✓ Posted completion comment to parent issue #{parent_issue_number}")
+                    await github.post_comment(
+                        parent_issue_number,
+                        f"⚠️ **Warning**: All sub-issues have been completed, but the system failed to mark "
+                        f"PR #{pr_number} as ready for review. Please manually mark it ready:\n\n"
+                        f"```\ngh pr ready {pr_number}\n```"
+                    )
             else:
-                logger.error(
-                    f"✗ FAILED to mark PR #{pr_number} as ready for review. "
-                    f"GitHub API call failed. Manual intervention required."
-                )
+                logger.info(f"PR #{pr_number} already marked ready, skipping draft→ready transition")
 
-                # Post warning comment to parent issue
-                await github.post_comment(
-                    parent_issue_number,
-                    f"⚠️ **Warning**: All sub-issues have been completed, but the system failed to mark "
-                    f"PR #{pr_number} as ready for review. Please manually mark it ready:\n\n"
-                    f"```\ngh pr ready {pr_number}\n```"
-                )
-
-            # Step 12: Advance parent on Planning board for PR review
+            # Step 10: Advance parent on Planning board for PR review
             await self._advance_parent_for_pr_review(
                 project_name, parent_issue_number, project_config
             )
