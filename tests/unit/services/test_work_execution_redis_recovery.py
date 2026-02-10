@@ -235,3 +235,117 @@ class TestTryRecoverResultFromRedis:
         # Error should contain the tail of the output (last 500 chars)
         assert len(execution['error']) < len(long_output) + 200
         assert execution['error'].endswith('x' * 500)
+
+    def test_skips_result_with_missing_agent_field(self, tmp_path):
+        """When the Redis result has no agent field, it is not matched (strict matching)."""
+        tracker = self._make_tracker(tmp_path)
+        execution = self._make_execution()
+
+        result_data = {
+            'project': 'myproject',
+            'issue_number': 42,
+            # no 'agent' key at all
+            'task_id': 'abc123',
+            'exit_code': 0,
+            'output': 'Done.',
+            'completed_at': '2025-01-01T00:05:00+00:00',
+            'recovered': False,
+        }
+
+        mock_redis = MagicMock()
+        mock_redis.scan_iter.return_value = iter(['agent_result:myproject:42:abc123'])
+        mock_redis.get.return_value = json.dumps(result_data)
+
+        with patch('redis.Redis', return_value=mock_redis):
+            recovered = tracker._try_recover_result_from_redis(
+                'myproject', 42, 'software_engineer', 'In Development', execution
+            )
+
+        assert recovered is False
+        assert execution['outcome'] == 'in_progress'  # unchanged
+
+    def test_skips_result_with_no_exit_code(self, tmp_path):
+        """When the Redis result has no exit_code, it is skipped (cannot determine outcome)."""
+        tracker = self._make_tracker(tmp_path)
+        execution = self._make_execution()
+
+        result_data = {
+            'project': 'myproject',
+            'issue_number': 42,
+            'agent': 'software_engineer',
+            'task_id': 'abc123',
+            # no 'exit_code' key
+            'output': 'Something happened.',
+            'completed_at': '2025-01-01T00:05:00+00:00',
+            'recovered': False,
+        }
+
+        mock_redis = MagicMock()
+        mock_redis.scan_iter.return_value = iter(['agent_result:myproject:42:abc123'])
+        mock_redis.get.return_value = json.dumps(result_data)
+
+        with patch('redis.Redis', return_value=mock_redis):
+            recovered = tracker._try_recover_result_from_redis(
+                'myproject', 42, 'software_engineer', 'In Development', execution
+            )
+
+        assert recovered is False
+        assert execution['outcome'] == 'in_progress'  # unchanged
+
+    def test_returns_true_even_if_delete_fails(self, tmp_path):
+        """When delete() raises, the method still returns True with the correct outcome."""
+        tracker = self._make_tracker(tmp_path)
+        execution = self._make_execution()
+
+        result_data = {
+            'project': 'myproject',
+            'issue_number': 42,
+            'agent': 'software_engineer',
+            'task_id': 'abc123',
+            'exit_code': 0,
+            'output': 'All good.',
+            'completed_at': '2025-01-01T00:05:00+00:00',
+            'recovered': False,
+        }
+
+        mock_redis = MagicMock()
+        mock_redis.scan_iter.return_value = iter(['agent_result:myproject:42:abc123'])
+        mock_redis.get.return_value = json.dumps(result_data)
+        mock_redis.delete.side_effect = ConnectionError("Redis went away")
+
+        with patch('redis.Redis', return_value=mock_redis):
+            recovered = tracker._try_recover_result_from_redis(
+                'myproject', 42, 'software_engineer', 'In Development', execution
+            )
+
+        assert recovered is True
+        assert execution['outcome'] == 'success'
+
+    def test_handles_null_output_in_result(self, tmp_path):
+        """When the Redis result has output: null, it doesn't crash."""
+        tracker = self._make_tracker(tmp_path)
+        execution = self._make_execution()
+
+        result_data = {
+            'project': 'myproject',
+            'issue_number': 42,
+            'agent': 'software_engineer',
+            'task_id': 'abc123',
+            'exit_code': 1,
+            'output': None,  # null in JSON
+            'completed_at': '2025-01-01T00:05:00+00:00',
+            'recovered': False,
+        }
+
+        mock_redis = MagicMock()
+        mock_redis.scan_iter.return_value = iter(['agent_result:myproject:42:abc123'])
+        mock_redis.get.return_value = json.dumps(result_data)
+
+        with patch('redis.Redis', return_value=mock_redis):
+            recovered = tracker._try_recover_result_from_redis(
+                'myproject', 42, 'software_engineer', 'In Development', execution
+            )
+
+        assert recovered is True
+        assert execution['outcome'] == 'failure'
+        assert 'exited with code 1' in execution['error']

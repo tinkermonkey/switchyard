@@ -1169,7 +1169,10 @@ class WorkExecutionStateTracker:
             import redis
             import json
 
-            redis_client = redis.Redis(host='redis', port=6379, decode_responses=True)
+            redis_client = redis.Redis(
+                host='redis', port=6379, decode_responses=True,
+                socket_timeout=5, socket_connect_timeout=5
+            )
 
             # Scan for any result keys for this project/issue
             pattern = f"agent_result:{project_name}:{issue_number}:*"
@@ -1178,8 +1181,8 @@ class WorkExecutionStateTracker:
             if not result_keys:
                 return False
 
-            # Use the most recent result (last key found)
-            # If multiple keys exist, they're for different task_ids — use any valid one
+            # Iterate through result keys (arbitrary order from SCAN).
+            # If multiple keys exist, they're for different task_ids — use first valid match.
             for redis_key in result_keys:
                 try:
                     result_json = redis_client.get(redis_key)
@@ -1188,12 +1191,19 @@ class WorkExecutionStateTracker:
 
                     result_data = json.loads(result_json)
 
-                    # Verify the result matches the agent we're looking for
-                    result_agent = result_data.get('agent', '')
-                    if result_agent and result_agent != agent:
+                    # Strict agent match — skip results for different agents.
+                    # A missing agent field is treated as a non-match to prevent
+                    # cross-agent contamination.
+                    if result_data.get('agent') != agent:
                         continue
 
                     exit_code = result_data.get('exit_code')
+                    if exit_code is None:
+                        logger.warning(
+                            f"Redis result at {redis_key} has no exit_code field, "
+                            f"cannot determine outcome — skipping recovery"
+                        )
+                        continue
 
                     if exit_code == 0:
                         execution['outcome'] = 'success'
@@ -1204,7 +1214,7 @@ class WorkExecutionStateTracker:
                         )
                     else:
                         execution['outcome'] = 'failure'
-                        output = result_data.get('output', '')
+                        output = result_data.get('output', '') or ''
                         # Truncate output for error message
                         error_snippet = output[-500:] if len(output) > 500 else output
                         execution['error'] = (
@@ -1218,8 +1228,17 @@ class WorkExecutionStateTracker:
                             f"(exit_code={exit_code}, key: {redis_key})"
                         )
 
-                    # Delete the key after processing to prevent reprocessing
-                    redis_client.delete(redis_key)
+                    # Delete the key after processing to prevent reprocessing.
+                    # Wrapped in its own try/except so a delete failure doesn't
+                    # cause the outer except to return False after we already
+                    # mutated the execution dict.
+                    try:
+                        redis_client.delete(redis_key)
+                    except Exception as del_err:
+                        logger.warning(
+                            f"Failed to delete recovered Redis key {redis_key}: {del_err}. "
+                            f"Key will expire via TTL or be reprocessed next cycle."
+                        )
 
                     return True
 
@@ -1233,7 +1252,15 @@ class WorkExecutionStateTracker:
             logger.debug("Redis not available for result recovery")
             return False
         except Exception as e:
-            logger.warning(f"Failed to check Redis for persisted result: {e}")
+            # Distinguish expected connection failures from unexpected bugs
+            if isinstance(e, OSError):
+                logger.warning(f"Redis unavailable for result recovery: {e}")
+            else:
+                logger.error(
+                    f"Unexpected error during Redis result recovery for "
+                    f"{project_name}/#{issue_number} {agent}: {e}",
+                    exc_info=True
+                )
             return False
 
     def cleanup_stuck_in_progress_states(self):
@@ -1410,99 +1437,149 @@ class WorkExecutionStateTracker:
                                 recovered = self._try_recover_result_from_redis(
                                     project_name, issue_number, agent, column, execution
                                 )
-                                if recovered:
-                                    modified = True
-                                    cleaned_count += 1
-                                    continue
 
-                                # No container AND no Redis result — truly lost execution
-                                execution['outcome'] = 'failure'
-                                execution['error'] = (
-                                    'Agent execution interrupted. Container no longer exists and execution '
-                                    'state was not updated. This may indicate the agent crashed, was killed, '
-                                    'or the orchestrator was restarted before outcome could be recorded.'
-                                )
+                                if not recovered:
+                                    # No container AND no Redis result — truly lost execution
+                                    execution['outcome'] = 'failure'
+                                    execution['error'] = (
+                                        'Agent execution interrupted. Container no longer exists and execution '
+                                        'state was not updated. This may indicate the agent crashed, was killed, '
+                                        'or the orchestrator was restarted before outcome could be recorded.'
+                                    )
+
                                 modified = True
                                 cleaned_count += 1
 
-                                logger.warning(
-                                    f"Marked stuck execution as failed: {project_name}/#{issue_number} "
-                                    f"{agent} in {column} (no container found, outcome not recorded). "
-                                    f"Pipeline is now blocked - manual intervention required."
-                                )
-
-                                # CRITICAL CHANGE: DO NOT call end_pipeline_run()
-                                #
-                                # Previous behavior (REMOVED): Called end_pipeline_run() which:
-                                # - Released the pipeline lock
-                                # - Processed the next waiting issue in queue
-                                # - This caused issues to be skipped on failure (violated FIFO ordering)
-                                #
-                                # New behavior: DO NOT end the pipeline run when agent fails:
-                                # - Pipeline run remains active (keeps the lock)
-                                # - Failed issue blocks the queue (enforces FIFO ordering)
-                                # - Requires manual intervention to unblock:
-                                #   * Move issue to Backlog (releases lock, allows retry)
-                                #   * Move to non-trigger column (releases lock, skips issue)
-                                #   * Close issue (releases lock, abandons work)
-                                #
-                                # Emit comprehensive failure events for UX visibility
-                                try:
-                                    from monitoring.decision_events import DecisionEventEmitter
-                                    from monitoring.observability import get_observability_manager, EventType
-                                    from services.pipeline_run import get_pipeline_run_manager
-
-                                    obs = get_observability_manager()
-                                    decision_events = DecisionEventEmitter(obs)
-                                    pipeline_run_mgr = get_pipeline_run_manager()
-                                    active_run = pipeline_run_mgr.get_active_pipeline_run(project_name, issue_number)
-
-                                    # Emit error decision event with blocking context
-                                    decision_events.emit_error_decision(
-                                        error_type='ExecutionContainerLost',
-                                        error_message=execution['error'],
-                                        context={
-                                            'project': project_name,
-                                            'issue_number': issue_number,
-                                            'agent': agent,
-                                            'column': column,
-                                            'timestamp': timestamp,
-                                            'blocking_pipeline': True,  # Indicate this blocks pipeline
-                                            'lock_held': True  # Issue still holds the lock
-                                        },
-                                        recovery_action='manual_intervention_required',
-                                        success=False,
-                                        project=project_name,
-                                        pipeline_run_id=active_run.id if active_run else None
+                                # Emit events based on recovered outcome for UX visibility
+                                if execution['outcome'] == 'success':
+                                    # Agent completed successfully but result was only recovered
+                                    # from Redis after restart. The normal result-processing chain
+                                    # (posting output to GitHub, triggering progression) was skipped.
+                                    # Pipeline requires manual card movement to advance.
+                                    logger.info(
+                                        f"Recovered successful execution from Redis: "
+                                        f"{project_name}/#{issue_number} {agent} in {column}. "
+                                        f"Pipeline requires manual card movement to advance."
                                     )
 
-                                    # Emit specific pipeline blocked event
-                                    if active_run:
-                                        obs.emit(
-                                            EventType.PIPELINE_RUN_FAILED,
-                                            "pipeline_lifecycle",
-                                            active_run.id,
-                                            project_name,
-                                            {
-                                                "pipeline_run_id": active_run.id,
-                                                "issue_number": issue_number,
-                                                "board": active_run.board,
-                                                "reason": "agent_execution_failed",
-                                                "error": execution['error'],
-                                                "blocking_pipeline": True,
-                                                "requires_manual_intervention": True
+                                    try:
+                                        from monitoring.decision_events import DecisionEventEmitter
+                                        from monitoring.observability import get_observability_manager
+                                        from services.pipeline_run import get_pipeline_run_manager
+
+                                        obs = get_observability_manager()
+                                        decision_events = DecisionEventEmitter(obs)
+                                        pipeline_run_mgr = get_pipeline_run_manager()
+                                        active_run = pipeline_run_mgr.get_active_pipeline_run(project_name, issue_number)
+
+                                        decision_events.emit_error_decision(
+                                            error_type='ExecutionRecoveredFromRedis',
+                                            error_message=(
+                                                f'Agent {agent} completed successfully but result was '
+                                                f'recovered from Redis after orchestrator restart. '
+                                                f'Pipeline requires manual card movement to advance.'
+                                            ),
+                                            context={
+                                                'project': project_name,
+                                                'issue_number': issue_number,
+                                                'agent': agent,
+                                                'column': column,
+                                                'timestamp': timestamp,
+                                                'recovered_from_redis': True,
+                                                'blocking_pipeline': True,
+                                                'lock_held': True,
                                             },
-                                            pipeline_run_id=active_run.id
+                                            recovery_action='manual_progression_required',
+                                            success=True,
+                                            project=project_name,
+                                            pipeline_run_id=active_run.id if active_run else None
+                                        )
+                                    except Exception as e:
+                                        logger.error(f"Failed to emit recovery events: {e}", exc_info=True)
+                                else:
+                                    # Failure path — applies to both recovered-from-Redis failures
+                                    # and truly lost executions where no result was found
+                                    logger.warning(
+                                        f"Marked stuck execution as failed: {project_name}/#{issue_number} "
+                                        f"{agent} in {column} "
+                                        f"({'recovered from Redis' if recovered else 'no container found, outcome not recorded'}). "
+                                        f"Pipeline is now blocked - manual intervention required."
+                                    )
+
+                                    # CRITICAL CHANGE: DO NOT call end_pipeline_run()
+                                    #
+                                    # Previous behavior (REMOVED): Called end_pipeline_run() which:
+                                    # - Released the pipeline lock
+                                    # - Processed the next waiting issue in queue
+                                    # - This caused issues to be skipped on failure (violated FIFO ordering)
+                                    #
+                                    # New behavior: DO NOT end the pipeline run when agent fails:
+                                    # - Pipeline run remains active (keeps the lock)
+                                    # - Failed issue blocks the queue (enforces FIFO ordering)
+                                    # - Requires manual intervention to unblock:
+                                    #   * Move issue to Backlog (releases lock, allows retry)
+                                    #   * Move to non-trigger column (releases lock, skips issue)
+                                    #   * Close issue (releases lock, abandons work)
+                                    #
+                                    # Emit comprehensive failure events for UX visibility
+                                    try:
+                                        from monitoring.decision_events import DecisionEventEmitter
+                                        from monitoring.observability import get_observability_manager, EventType
+                                        from services.pipeline_run import get_pipeline_run_manager
+
+                                        obs = get_observability_manager()
+                                        decision_events = DecisionEventEmitter(obs)
+                                        pipeline_run_mgr = get_pipeline_run_manager()
+                                        active_run = pipeline_run_mgr.get_active_pipeline_run(project_name, issue_number)
+
+                                        # Emit error decision event with blocking context
+                                        decision_events.emit_error_decision(
+                                            error_type='ExecutionContainerLost',
+                                            error_message=execution['error'],
+                                            context={
+                                                'project': project_name,
+                                                'issue_number': issue_number,
+                                                'agent': agent,
+                                                'column': column,
+                                                'timestamp': timestamp,
+                                                'recovered_from_redis': recovered,
+                                                'blocking_pipeline': True,
+                                                'lock_held': True,
+                                            },
+                                            recovery_action='manual_intervention_required',
+                                            success=False,
+                                            project=project_name,
+                                            pipeline_run_id=active_run.id if active_run else None
                                         )
 
-                                    logger.info(
-                                        f"Emitted failure events for {project_name}/#{issue_number}. "
-                                        f"UX should display: 'Pipeline blocked - manual intervention required'"
-                                    )
+                                        # Emit specific pipeline blocked event
+                                        if active_run:
+                                            obs.emit(
+                                                EventType.PIPELINE_RUN_FAILED,
+                                                "pipeline_lifecycle",
+                                                active_run.id,
+                                                project_name,
+                                                {
+                                                    "pipeline_run_id": active_run.id,
+                                                    "issue_number": issue_number,
+                                                    "board": active_run.board,
+                                                    "reason": "agent_execution_failed",
+                                                    "error": execution['error'],
+                                                    "blocking_pipeline": True,
+                                                    "requires_manual_intervention": True,
+                                                    "recovered_from_redis": recovered,
+                                                },
+                                                pipeline_run_id=active_run.id
+                                            )
 
-                                except Exception as e:
-                                    logger.error(f"Failed to emit execution failure events: {e}", exc_info=True)
-                                    # Continue anyway - the execution state is still marked as failed
+                                        logger.info(
+                                            f"Emitted failure events for {project_name}/#{issue_number}. "
+                                            f"UX should display: 'Pipeline blocked - manual intervention required'"
+                                        )
+
+                                    except Exception as e:
+                                        logger.error(f"Failed to emit execution failure events: {e}", exc_info=True)
+                                        # Continue anyway - the execution state is still marked as failed
                             else:
                                 logger.info(
                                     f"Agent container still running for {project_name}/#{issue_number}, "
