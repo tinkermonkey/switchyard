@@ -3018,6 +3018,9 @@ class ProjectMonitor:
             import asyncio
             from services.human_feedback_loop import human_feedback_loop_executor
 
+            # Signal any existing feedback loop for this issue to stop
+            human_feedback_loop_executor.request_stop(project_name, issue_number)
+
             # Get issue details
             issue_data = self.get_issue_details(repository, issue_number, project_config.github['org'])
 

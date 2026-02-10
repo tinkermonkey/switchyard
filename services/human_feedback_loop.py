@@ -11,6 +11,7 @@ import asyncio
 import logging
 import re
 import subprocess
+import threading
 from typing import Dict, Any, Optional, Tuple
 from datetime import datetime
 from config.manager import WorkflowColumn
@@ -71,6 +72,7 @@ class HumanFeedbackLoopExecutor:
         # Don't initialize GitHubIntegration here - create it per-loop with proper repo context
         self.active_loops = {}  # Track active loops by issue number
         self._initialized = False
+        self._stop_events: Dict[str, threading.Event] = {}  # Active stop signals keyed by "project:issue"
 
     def _update_loop_heartbeat(self, project_name: str, issue_number: int) -> None:
         """
@@ -233,6 +235,9 @@ class HumanFeedbackLoopExecutor:
         - Idempotent: Safe to call multiple times for same issue
         """
         try:
+            # Signal the running loop thread to stop
+            self.request_stop(project_name, issue_number)
+
             # Clean up in-memory state
             if issue_number in self.active_loops:
                 state = self.active_loops[issue_number]
@@ -271,6 +276,20 @@ class HumanFeedbackLoopExecutor:
                 exc_info=True
             )
             return False
+
+    def request_stop(self, project_name: str, issue_number: int) -> bool:
+        """Signal an active feedback loop to stop. Thread-safe."""
+        stop_key = f"{project_name}:{issue_number}"
+        event = self._stop_events.get(stop_key)
+        if event:
+            event.set()
+            logger.info(f"Sent stop signal to feedback loop for {project_name}#{issue_number}")
+            return True
+        logger.debug(
+            f"No active stop event for {project_name}#{issue_number} "
+            f"(loop may not have started yet or already exited)"
+        )
+        return False
 
     async def start_loop(
         self,
@@ -482,6 +501,11 @@ class HumanFeedbackLoopExecutor:
         poll_interval = 30  # Check every 30 seconds
         poll_count = 0
 
+        # Register stop event so external callers can signal this loop to exit
+        stop_key = f"{state.project_name}:{state.issue_number}"
+        stop_event = threading.Event()
+        self._stop_events[stop_key] = stop_event
+
         logger.info(
             f"Monitoring discussion {state.discussion_id} for human feedback "
             f"(will poll indefinitely until card moves to different column)"
@@ -584,143 +608,187 @@ class HumanFeedbackLoopExecutor:
             import traceback
             logger.error(traceback.format_exc())
 
-        while True:
-            await asyncio.sleep(poll_interval)
-            poll_count += 1
-
-            # Update heartbeat in Redis for monitoring/stuck loop detection
-            self._update_loop_heartbeat(state.project_name, state.issue_number)
-
-            # DEBUG: Log that we are polling
-            if poll_count % 2 == 0:  # Log every minute
-                logger.debug(f"Polling for feedback on discussion {state.discussion_id} (iteration {poll_count})")
-
-            # Check for human feedback
+        # Check if stop was requested during initial feedback processing
+        if stop_event.is_set():
+            logger.info(
+                f"Stop signal received for issue #{state.issue_number} during initial processing. "
+                f"Exiting feedback loop."
+            )
             try:
-                human_feedback = await self._get_human_feedback_since_last_agent(
-                    state,
-                    org
-                )
-            except Exception as e:
-                logger.error(f"Error checking for feedback: {e}")
-                import traceback
-                logger.error(traceback.format_exc())
-                human_feedback = None
-
-            if human_feedback:
-                logger.info(f"Human feedback detected from {human_feedback['author']}")
-                state.current_iteration += 1
-
-                # Emit decision event for feedback detection
-                from monitoring.decision_events import DecisionEventEmitter
-                from monitoring.observability import get_observability_manager
-                
-                obs = get_observability_manager()
-                decision_events = DecisionEventEmitter(obs)
-                
-                # Determine the mode that will be used based on context that will be built
-                # Question mode: threaded conversation with parent comment context
-                # Revision mode: feedback without thread history (top-level or no parent)
-                has_parent_comment = 'parent_comment' in human_feedback and human_feedback['parent_comment'] is not None
-                predicted_mode = 'question' if has_parent_comment else 'revision'
-                
-                # Build action description with mode info
-                action_description = f"route_to_agent_{state.agent}_in_{predicted_mode}_mode"
-                
-                decision_events.emit_feedback_detected(
+                decision_events.emit_feedback_listening_stopped(
                     issue_number=state.issue_number,
                     project=state.project_name,
                     board=state.board_name,
-                    feedback_source='discussion_reply' if state.workspace_type == 'discussions' else 'issue_comment',
-                    feedback_content=human_feedback.get('body', ''),
-                    target_agent=state.agent,
-                    action_taken=action_description,
-                    workspace_type=state.workspace_type,
-                    discussion_id=state.discussion_id,
+                    agent=state.agent,
+                    reason="Stop signal received (issue progressed to next column)",
+                    feedback_received=state.current_iteration > 0,
                     pipeline_run_id=state.pipeline_run_id
                 )
-
-                # Execute agent with human feedback (pass full dict with author)
-                await self._execute_agent(
-                    state,
-                    column,
-                    issue_data,
-                    None,  # No previous stage output
-                    org,
-                    is_initial=False,
-                    human_feedback=human_feedback
-                )
-
-                # FIX #3: Mark comment as processed to prevent duplicate responses
-                comment_id = human_feedback.get('comment_id')
-                if comment_id:
-                    state.processed_comment_ids.add(comment_id)
-                    logger.info(f"✅ Marked comment {comment_id} as processed")
-
-                logger.debug("Agent responded to feedback, continuing to monitor")
-
-            # Log progress every 5 minutes
-            if poll_count % 10 == 0:  # Every 10 polls = 5 minutes
-                logger.debug(
-                    f"Still monitoring for feedback "
-                    f"(polls: {poll_count}, iterations: {state.current_iteration})"
-                )
-
-            # Check if card has moved to a different column
-            # This would indicate human intervention or workflow progression
-            try:
-                from services.project_monitor import ProjectMonitor
-                monitor = ProjectMonitor()
-                
-                # Get current column for this issue
-                current_column = await monitor.get_issue_column_async(
-                    state.project_name,
-                    state.board_name,
-                    state.issue_number
-                )
-                
-                # If issue has moved to a different column, or to Backlog, stop monitoring
-                if current_column and current_column != column.name:
-                    logger.info(
-                        f"Issue #{state.issue_number} moved from '{column.name}' to '{current_column}'. "
-                        f"Stopping feedback monitoring."
-                    )
-
-                    # Emit feedback listening stopped event
-                    decision_events.emit_feedback_listening_stopped(
-                        issue_number=state.issue_number,
-                        project=state.project_name,
-                        board=state.board_name,
-                        agent=state.agent,
-                        reason=f"Card moved from '{column.name}' to '{current_column}'",
-                        feedback_received=state.current_iteration > 0,
-                        pipeline_run_id=state.pipeline_run_id
-                    )
-
-                    return (None, True)  # Exit the loop
-                
-                # Special case: If issue is in Backlog (no agent), stop monitoring
-                if current_column and current_column.lower() == 'backlog':
-                    logger.info(
-                        f"Issue #{state.issue_number} is in Backlog column. "
-                        f"Stopping feedback monitoring."
-                    )
-
-                    # Emit feedback listening stopped event
-                    decision_events.emit_feedback_listening_stopped(
-                        issue_number=state.issue_number,
-                        project=state.project_name,
-                        board=state.board_name,
-                        agent=state.agent,
-                        reason="Card moved to Backlog",
-                        feedback_received=state.current_iteration > 0,
-                        pipeline_run_id=state.pipeline_run_id
-                    )
-
-                    return (None, True)  # Exit the loop
-                    
             except Exception as e:
-                logger.debug(f"Could not check current column (will continue monitoring): {e}")
+                logger.warning(f"Failed to emit feedback_listening_stopped event: {e}")
+            return (None, True)
+
+        try:
+            while True:
+                # Sleep with 1-second granularity so stop signals are detected quickly
+                for _ in range(poll_interval):
+                    if stop_event.is_set():
+                        logger.info(
+                            f"Stop signal received for issue #{state.issue_number}. "
+                            f"Exiting feedback loop."
+                        )
+                        try:
+                            decision_events.emit_feedback_listening_stopped(
+                                issue_number=state.issue_number,
+                                project=state.project_name,
+                                board=state.board_name,
+                                agent=state.agent,
+                                reason="Stop signal received (issue progressed to next column)",
+                                feedback_received=state.current_iteration > 0,
+                                pipeline_run_id=state.pipeline_run_id
+                            )
+                        except Exception as e:
+                            logger.warning(f"Failed to emit feedback_listening_stopped event: {e}")
+                        return (None, True)
+                    await asyncio.sleep(1)
+
+                poll_count += 1
+
+                # Update heartbeat in Redis for monitoring/stuck loop detection
+                self._update_loop_heartbeat(state.project_name, state.issue_number)
+
+                # DEBUG: Log that we are polling
+                if poll_count % 2 == 0:  # Log every minute
+                    logger.debug(f"Polling for feedback on discussion {state.discussion_id} (iteration {poll_count})")
+
+                # Check for human feedback
+                try:
+                    human_feedback = await self._get_human_feedback_since_last_agent(
+                        state,
+                        org
+                    )
+                except Exception as e:
+                    logger.error(f"Error checking for feedback: {e}")
+                    import traceback
+                    logger.error(traceback.format_exc())
+                    human_feedback = None
+
+                if human_feedback:
+                    logger.info(f"Human feedback detected from {human_feedback['author']}")
+                    state.current_iteration += 1
+
+                    # Emit decision event for feedback detection
+                    from monitoring.decision_events import DecisionEventEmitter
+                    from monitoring.observability import get_observability_manager
+
+                    obs = get_observability_manager()
+                    decision_events = DecisionEventEmitter(obs)
+
+                    # Determine the mode that will be used based on context that will be built
+                    # Question mode: threaded conversation with parent comment context
+                    # Revision mode: feedback without thread history (top-level or no parent)
+                    has_parent_comment = 'parent_comment' in human_feedback and human_feedback['parent_comment'] is not None
+                    predicted_mode = 'question' if has_parent_comment else 'revision'
+
+                    # Build action description with mode info
+                    action_description = f"route_to_agent_{state.agent}_in_{predicted_mode}_mode"
+
+                    decision_events.emit_feedback_detected(
+                        issue_number=state.issue_number,
+                        project=state.project_name,
+                        board=state.board_name,
+                        feedback_source='discussion_reply' if state.workspace_type == 'discussions' else 'issue_comment',
+                        feedback_content=human_feedback.get('body', ''),
+                        target_agent=state.agent,
+                        action_taken=action_description,
+                        workspace_type=state.workspace_type,
+                        discussion_id=state.discussion_id,
+                        pipeline_run_id=state.pipeline_run_id
+                    )
+
+                    # Execute agent with human feedback (pass full dict with author)
+                    await self._execute_agent(
+                        state,
+                        column,
+                        issue_data,
+                        None,  # No previous stage output
+                        org,
+                        is_initial=False,
+                        human_feedback=human_feedback
+                    )
+
+                    # FIX #3: Mark comment as processed to prevent duplicate responses
+                    comment_id = human_feedback.get('comment_id')
+                    if comment_id:
+                        state.processed_comment_ids.add(comment_id)
+                        logger.info(f"✅ Marked comment {comment_id} as processed")
+
+                    logger.debug("Agent responded to feedback, continuing to monitor")
+
+                # Log progress every 5 minutes
+                if poll_count % 10 == 0:  # Every 10 polls = 5 minutes
+                    logger.debug(
+                        f"Still monitoring for feedback "
+                        f"(polls: {poll_count}, iterations: {state.current_iteration})"
+                    )
+
+                # Check if card has moved to a different column
+                # This would indicate human intervention or workflow progression
+                try:
+                    from services.project_monitor import ProjectMonitor
+                    monitor = ProjectMonitor()
+
+                    # Get current column for this issue
+                    current_column = await monitor.get_issue_column_async(
+                        state.project_name,
+                        state.board_name,
+                        state.issue_number
+                    )
+
+                    # If issue has moved to a different column, or to Backlog, stop monitoring
+                    if current_column and current_column != column.name:
+                        logger.info(
+                            f"Issue #{state.issue_number} moved from '{column.name}' to '{current_column}'. "
+                            f"Stopping feedback monitoring."
+                        )
+
+                        # Emit feedback listening stopped event
+                        decision_events.emit_feedback_listening_stopped(
+                            issue_number=state.issue_number,
+                            project=state.project_name,
+                            board=state.board_name,
+                            agent=state.agent,
+                            reason=f"Card moved from '{column.name}' to '{current_column}'",
+                            feedback_received=state.current_iteration > 0,
+                            pipeline_run_id=state.pipeline_run_id
+                        )
+
+                        return (None, True)  # Exit the loop
+
+                    # Special case: If issue is in Backlog (no agent), stop monitoring
+                    if current_column and current_column.lower() == 'backlog':
+                        logger.info(
+                            f"Issue #{state.issue_number} is in Backlog column. "
+                            f"Stopping feedback monitoring."
+                        )
+
+                        # Emit feedback listening stopped event
+                        decision_events.emit_feedback_listening_stopped(
+                            issue_number=state.issue_number,
+                            project=state.project_name,
+                            board=state.board_name,
+                            agent=state.agent,
+                            reason="Card moved to Backlog",
+                            feedback_received=state.current_iteration > 0,
+                            pipeline_run_id=state.pipeline_run_id
+                        )
+
+                        return (None, True)  # Exit the loop
+
+                except Exception as e:
+                    logger.warning(f"Could not check current column for issue #{state.issue_number}: {e}")
+        finally:
+            self._stop_events.pop(stop_key, None)
 
     async def _execute_agent(
         self,
