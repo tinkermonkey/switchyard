@@ -243,6 +243,7 @@ def queue_dev_env_setup(project_name: str, task_queue, dry_run: bool = False) ->
             },
             'issue_number': 0,
             'board': 'Environment Support',  # Use environment support board
+            'project': project_name,
             'repository': project_name,
             'automated_setup': True,
             'use_docker': False,  # CRITICAL: Must be False for setup agent

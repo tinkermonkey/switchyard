@@ -547,18 +547,21 @@ class AgentExecutor:
                         f"(agent={agent_name}, project={project_name}). This may indicate a bug in task creation."
                     )
 
-                # Check if docker_runner already recorded the outcome
-                # This prevents double-recording errors introduced by commit 0cd006a
-                # which fixed column matching (causing both recordings to target the same execution)
+                # Check if docker_runner already recorded the outcome for the CURRENT execution.
+                # Walk history backwards: if we hit an in_progress entry for this agent/column,
+                # that's our execution and it hasn't been recorded yet. Only skip if a terminal
+                # outcome appears BEFORE (i.e. more recent than) any in_progress entry.
                 state = work_execution_tracker.load_state(project_name, task_context['issue_number'])
                 already_recorded = False
 
                 for execution in reversed(state.get('execution_history', [])):
-                    if (execution.get('column') == column and
-                        execution.get('agent') == agent_name and
-                        execution.get('outcome') in ['success', 'failure', 'cancelled']):
-                        # Found a recent completed execution for this agent/column
-                        # docker_runner must have already recorded it
+                    if execution.get('column') != column or execution.get('agent') != agent_name:
+                        continue
+                    if execution.get('outcome') == 'in_progress':
+                        # Found our current execution — it hasn't been recorded yet
+                        break
+                    if execution.get('outcome') in ['success', 'failure', 'cancelled']:
+                        # docker_runner already recorded the outcome for this execution
                         already_recorded = True
                         logger.debug(
                             f"Execution outcome already recorded by docker_runner for "
@@ -648,17 +651,18 @@ class AgentExecutor:
                             f"(agent={agent_name}, project={project_name}). This may indicate a bug in task creation."
                         )
 
-                    # Check if docker_runner already recorded the outcome
-                    # This prevents double-recording errors introduced by commit 0cd006a
+                    # Check if docker_runner already recorded the outcome for the CURRENT execution.
+                    # Walk history backwards: if we hit an in_progress entry for this agent/column,
+                    # that's our execution and it hasn't been recorded yet.
                     state = work_execution_tracker.load_state(project_name, task_context['issue_number'])
                     already_recorded = False
 
                     for execution in reversed(state.get('execution_history', [])):
-                        if (execution.get('column') == column and
-                            execution.get('agent') == agent_name and
-                            execution.get('outcome') in ['success', 'failure', 'cancelled']):
-                            # Found a recent completed execution for this agent/column
-                            # docker_runner must have already recorded it
+                        if execution.get('column') != column or execution.get('agent') != agent_name:
+                            continue
+                        if execution.get('outcome') == 'in_progress':
+                            break
+                        if execution.get('outcome') in ['success', 'failure', 'cancelled']:
                             already_recorded = True
                             logger.debug(
                                 f"Execution outcome already recorded by docker_runner for "
@@ -1255,6 +1259,7 @@ class AgentExecutor:
                     'issue_number': task_context.get('issue_number', 0),
                     'board': task_context.get('board', 'system'),
                     'column': verifier_column,  # Pass the column so auto-advance works
+                    'project': project_name,
                     'repository': project_name,
                     'automated_setup': True,
                     'auto_triggered': True,

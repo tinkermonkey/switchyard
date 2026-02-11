@@ -108,6 +108,7 @@ async def queue_dev_environment_setup(project: str, logger):
                 },
                 'issue_number': 0,
                 'board': 'system',
+                'project': project,
                 'repository': project,
                 'automated_setup': True,
                 'auto_triggered': True,

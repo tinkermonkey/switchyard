@@ -444,6 +444,7 @@ async def main():
                     },
                     'issue_number': 0,
                     'board': 'system',  # System-initiated task
+                    'project': project_name,
                     'repository': project_name,
                     'automated_setup': True,  # Flag to indicate this is automated setup
                     'skip_workspace_prep': True,  # System task — no feature branch needed

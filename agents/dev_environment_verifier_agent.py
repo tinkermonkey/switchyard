@@ -24,7 +24,7 @@ class DevEnvironmentVerifierAgent(PipelineStage):
         # Extract from nested task context
         task_context = context.get('context', {})
         issue = task_context.get('issue', {})
-        project_name = task_context.get('project', 'unknown')
+        project_name = task_context.get('project') or context.get('project', 'unknown')
 
         # Get the previous stage output (from dev_environment_setup)
         previous_stage = task_context.get('previous_stage_output', '')
