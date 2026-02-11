@@ -316,9 +316,9 @@ def main():
                         help=f'Age threshold for MEDIUM priority tasks in seconds (default: 3600)')
     parser.add_argument('--low-threshold', type=int,
                         help=f'Age threshold for LOW priority tasks in seconds (default: 14400)')
-    parser.add_argument('--redis-host', default='localhost',
-                        help='Redis host (default: localhost)')
-    parser.add_argument('--redis-port', type=int, default=6379,
+    parser.add_argument('--redis-host', default=os.environ.get('REDIS_HOST', 'redis'),
+                        help='Redis host (default: from REDIS_HOST env or "redis")')
+    parser.add_argument('--redis-port', type=int, default=int(os.environ.get('REDIS_PORT', '6379')),
                         help='Redis port (default: 6379)')
 
     args = parser.parse_args()

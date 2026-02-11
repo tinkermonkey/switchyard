@@ -342,9 +342,9 @@ def main():
                         help='Verify checkpoint can be used for recovery')
     parser.add_argument('--checkpoints-dir', default='orchestrator_data/state/checkpoints',
                         help='Checkpoints directory (default: orchestrator_data/state/checkpoints)')
-    parser.add_argument('--es-host', default='localhost',
-                        help='Elasticsearch host (default: localhost)')
-    parser.add_argument('--es-port', type=int, default=9200,
+    parser.add_argument('--es-host', default=os.environ.get('ELASTICSEARCH_HOST', 'elasticsearch'),
+                        help='Elasticsearch host (default: from ELASTICSEARCH_HOST env or "elasticsearch")')
+    parser.add_argument('--es-port', type=int, default=int(os.environ.get('ELASTICSEARCH_PORT', '9200')),
                         help='Elasticsearch port (default: 9200)')
 
     args = parser.parse_args()

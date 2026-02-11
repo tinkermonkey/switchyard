@@ -312,13 +312,13 @@ def main():
                         help='Show verbose output including full event details')
     parser.add_argument('--json', action='store_true',
                         help='Output as JSON instead of formatted text')
-    parser.add_argument('--redis-host', default='localhost',
-                        help='Redis host (default: localhost)')
-    parser.add_argument('--redis-port', type=int, default=6379,
+    parser.add_argument('--redis-host', default=os.environ.get('REDIS_HOST', 'redis'),
+                        help='Redis host (default: from REDIS_HOST env or "redis")')
+    parser.add_argument('--redis-port', type=int, default=int(os.environ.get('REDIS_PORT', '6379')),
                         help='Redis port (default: 6379)')
-    parser.add_argument('--es-host', default='localhost',
-                        help='Elasticsearch host (default: localhost)')
-    parser.add_argument('--es-port', type=int, default=9200,
+    parser.add_argument('--es-host', default=os.environ.get('ELASTICSEARCH_HOST', 'elasticsearch'),
+                        help='Elasticsearch host (default: from ELASTICSEARCH_HOST env or "elasticsearch")')
+    parser.add_argument('--es-port', type=int, default=int(os.environ.get('ELASTICSEARCH_PORT', '9200')),
                         help='Elasticsearch port (default: 9200)')
 
     args = parser.parse_args()
