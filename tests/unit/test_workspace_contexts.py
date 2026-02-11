@@ -114,7 +114,7 @@ class TestIssuesWorkspaceContext:
                     agent_name='test_agent',
                     project_name='test-project',
                     task_context=task_context,
-                    task_id_prefix='test-123'
+                    execution_type='test'
                 )
 
                 # Verify finalization was called
@@ -156,7 +156,7 @@ class TestIssuesWorkspaceContext:
                     agent_name='test_agent',
                     project_name='test-project',
                     task_context=task_context,
-                    task_id_prefix='test-123'
+                    execution_type='test'
                 )
 
                 # Verify workspace manager was called for project directory
@@ -201,7 +201,7 @@ class TestDiscussionsWorkspaceContext:
                     agent_name='business_analyst',
                     project_name='test-project',
                     task_context=task_context,
-                    task_id_prefix='test-88'
+                    execution_type='test'
                 )
 
                 # Verify feature branch preparation was NOT called
@@ -242,7 +242,7 @@ class TestDiscussionsWorkspaceContext:
                     agent_name='business_analyst',
                     project_name='test-project',
                     task_context=task_context,
-                    task_id_prefix='test-88'
+                    execution_type='test'
                 )
 
                 # Verify finalization was NOT called (the bug we're fixing!)
@@ -336,7 +336,7 @@ class TestWorkspaceContextBehaviorEquivalence:
                     agent_name='test_agent',
                     project_name='test-project',
                     task_context=task_context,
-                    task_id_prefix=f'test-{workspace_type}'
+                    execution_type='test'
                 )
 
                 assert result['status'] == 'success'
@@ -386,7 +386,7 @@ class TestWorkspaceContextBehaviorEquivalence:
                         agent_name='test_agent',
                         project_name='test-project',
                         task_context=task_context,
-                        task_id_prefix=f'test-{workspace_type}'
+                        execution_type='test'
                     )
 
                     prepare_called = mock_fbm.prepare_feature_branch.call_count

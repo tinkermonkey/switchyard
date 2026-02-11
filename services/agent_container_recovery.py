@@ -139,73 +139,71 @@ class AgentContainerRecovery:
     
     def parse_container_name(self, container_name: str) -> Optional[Dict[str, str]]:
         """
-        Parse agent container name to extract metadata
+        Parse agent container name to extract metadata.
 
-        ACTUAL container name format: claude-agent-{project}-{task_id}
-        Where task_id is: {task_id_prefix}_{agent}_{timestamp}
+        Container name format: claude-agent-{project}-{task_id}
 
-        For example:
-        - claude-agent-what_am_i_watching-review_cycle_senior_software_engineer_1762082586
-        - claude-agent-project_name-task_business_analyst_1234567890
-
-        The task_id always ends with a numeric timestamp and contains underscores (not hyphens).
-        The project may contain hyphens (e.g., "my-project-name").
+        New format (UUID): task_id is a UUID like "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+        Old format (structured): task_id is "{prefix}_{agent}_{timestamp}"
 
         Args:
             container_name: Container name
 
         Returns:
-            Dict with project, agent, task_id components, or None if invalid format
+            Dict with project, task_id, container_name (agent extracted only for old format)
         """
+        import re
+
         if not container_name.startswith('claude-agent-'):
             return None
 
         # Try to match against known projects first for reliability
-        # This handles cases where project names contain hyphens, which breaks simple splitting
         try:
             from config.manager import config_manager
             projects = config_manager.list_projects()
-            
-            # Sort by length descending to match longest project name first 
-            # (e.g. match 'my-project-v2' before 'my-project')
+
+            # Sort by length descending to match longest project name first
             projects.sort(key=len, reverse=True)
-            
+
             for project in projects:
                 prefix = f"claude-agent-{project}-"
                 if container_name.startswith(prefix):
-                    # Found matching project!
                     task_id = container_name[len(prefix):]
-                    
-                    # Validate task_id format: should have at least 2 underscores and end with numeric timestamp
-                    task_parts = task_id.split('_')
-                    
-                    # Note: task_id might contain hyphens if project/board names have hyphens
-                    # But it must use underscores as primary separators
-                    
-                    if len(task_parts) >= 3 and task_parts[-1].isdigit():
-                        timestamp = task_parts[-1]
-                        # The agent is typically the last word(s) before timestamp
-                        agent = '_'.join(task_parts[:-1])
-                        
-                        logger.debug(f"Parsed container {container_name} using known project '{project}'")
-                        return {
-                            'agent': agent,
-                            'project': project,
-                            'task_id': task_id,
-                            'timestamp': timestamp,
-                            'container_name': container_name
-                        }
+
+                    logger.debug(f"Parsed container {container_name} using known project '{project}'")
+                    return {
+                        'project': project,
+                        'task_id': task_id,
+                        'container_name': container_name
+                    }
         except Exception as e:
             logger.warning(f"Error matching container against known projects: {e}")
 
-        # Fallback to heuristic splitting if project matching failed
-        # Remove prefix: claude-agent-
+        # Fallback heuristic for when project matching fails
         remainder = container_name.replace('claude-agent-', '', 1)
 
-        # Find the LAST hyphen - everything after it is the task_id
-        # The task_id contains underscores, not hyphens, so the last hyphen separates project from task_id
-        last_hyphen_idx = remainder.rfind('-')
+        # Check if the remainder contains a UUID (new format)
+        # UUIDs have the pattern: 8-4-4-4-12 hex chars
+        uuid_pattern = re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
+        uuid_match = uuid_pattern.search(remainder)
 
+        if uuid_match:
+            # New format: everything before the UUID (minus trailing hyphen) is the project
+            uuid_start = uuid_match.start()
+            if uuid_start > 0 and remainder[uuid_start - 1] == '-':
+                project = remainder[:uuid_start - 1]
+            else:
+                project = remainder[:uuid_start]
+            task_id = uuid_match.group(0)
+
+            return {
+                'project': project,
+                'task_id': task_id,
+                'container_name': container_name
+            }
+
+        # Old format fallback: last hyphen separates project from task_id
+        last_hyphen_idx = remainder.rfind('-')
         if last_hyphen_idx == -1:
             logger.warning(f"No hyphen found in container name after prefix: {container_name}")
             return None
@@ -213,33 +211,9 @@ class AgentContainerRecovery:
         project = remainder[:last_hyphen_idx]
         task_id = remainder[last_hyphen_idx + 1:]
 
-        # Validate task_id format: should have at least 2 underscores and end with numeric timestamp
-        task_parts = task_id.split('_')
-
-        if len(task_parts) < 3:
-            logger.warning(f"Task ID has too few parts (expected at least 3): {task_id}")
-            return None
-
-        # Last part should be numeric timestamp
-        if not task_parts[-1].isdigit():
-            logger.warning(f"Task ID does not end with numeric timestamp: {task_id}")
-            return None
-
-        # Extract agent name (everything except the last part which is timestamp)
-        # The agent name might be multiple words joined by underscores (e.g., "senior_software_engineer")
-        # Format is: {task_id_prefix}_{agent_parts...}_{timestamp}
-        timestamp = task_parts[-1]
-
-        # The agent is typically the last word(s) before timestamp
-        # We can't reliably determine where task_id_prefix ends and agent begins
-        # So we'll extract what we can and use the full task_id
-        agent = '_'.join(task_parts[:-1])  # Everything except timestamp
-
         return {
-            'agent': agent,
             'project': project,
             'task_id': task_id,
-            'timestamp': timestamp,
             'container_name': container_name
         }
     
@@ -348,21 +322,26 @@ class AgentContainerRecovery:
             labels_str = container.get('labels', '')
 
             try:
-                # Skip agent containers that are part of repair cycles
-                # These are managed by the repair cycle container itself
-                if 'repair_' in container_name or 'repair-' in container_name:
-                    logger.debug(
-                        f"Skipping {container_name} - managed by repair cycle container"
-                    )
-                    continue
-
-                # Parse labels to get metadata
+                # Parse labels FIRST to get metadata (needed for repair cycle detection)
                 labels = {}
                 if labels_str:
                     for part in labels_str.split(','):
                         if '=' in part:
                             k, v = part.split('=', 1)
                             labels[k.strip()] = v.strip()
+
+                # Skip agent containers that are part of repair cycles
+                # Check execution_type label first, fall back to container name for old-format containers
+                label_execution_type = labels.get('org.clauditoreum.execution_type', '')
+                is_repair = label_execution_type.startswith('repair_') or (
+                    not label_execution_type and ('repair_' in container_name or 'repair-' in container_name)
+                )
+                if is_repair:
+                    logger.debug(
+                        f"Skipping {container_name} - managed by repair cycle container "
+                        f"(execution_type={label_execution_type or 'detected from name'})"
+                    )
+                    continue
 
                 # Try to get metadata from labels first
                 project = labels.get('org.clauditoreum.project')
@@ -391,8 +370,9 @@ class AgentContainerRecovery:
                     continue
 
                 project = metadata['project']
-                agent = metadata['agent']
                 task_id = metadata['task_id']
+                # Agent comes from labels (most reliable), metadata, or Redis
+                agent = labels.get('org.clauditoreum.agent', '') or metadata.get('agent', '')
 
                 # Try to get additional metadata from Redis (if still available after restart)
                 redis_key = f'agent:container:{container_name}'
@@ -414,6 +394,11 @@ class AgentContainerRecovery:
                             if 'project' in redis_data and redis_data['project']:
                                 project = redis_data['project']
                                 logger.debug(f"Using project '{project}' from Redis for container {container_name}")
+
+                            # Use agent from Redis if not already set from labels
+                            if not agent and redis_data.get('agent'):
+                                agent = redis_data['agent']
+                                logger.debug(f"Using agent '{agent}' from Redis for container {container_name}")
 
                             # Get issue number
                             if 'issue_number' in redis_data:
@@ -461,12 +446,12 @@ class AgentContainerRecovery:
                         continue
 
                     # Check if execution matches the container
-                    # Note: execution['agent'] might have full underscores while our parsed agent is simplified
-                    # So we check if parsed agent is contained in execution agent
+                    # Use agent from labels (most reliable) or fall back to Redis/parsed data
+                    agent_from_label = labels.get('org.clauditoreum.agent', '')
                     exec_agent = execution.get('agent', '')
-                    if exec_agent and exec_agent not in agent and agent not in exec_agent:
+                    if agent_from_label and exec_agent and agent_from_label != exec_agent:
                         logger.warning(
-                            f"Container {container_name} agent mismatch (container: {agent}, history: {exec_agent}), killing it"
+                            f"Container {container_name} agent mismatch (label: {agent_from_label}, history: {exec_agent}), killing it"
                         )
                         self.kill_container(container_name, container_id)
                         self.cleanup_execution_state(project, issue_number, agent, "agent_mismatch")

@@ -5,6 +5,7 @@ This module provides the integration between the main orchestrator and the agent
 replacing the legacy agent_stages.py with a proper factory-based approach.
 """
 
+import uuid
 from typing import Dict, Any
 from datetime import datetime
 from pipeline.base import PipelineStage
@@ -95,7 +96,7 @@ async def queue_dev_environment_setup(project: str, logger):
         task_queue = TaskQueue(use_redis=True)
 
         task = Task(
-            id=f"auto_dev_env_setup_{project}_{int(datetime.now().timestamp())}",
+            id=str(uuid.uuid4()),
             agent="dev_environment_setup",
             project=project,
             priority=TaskPriority.HIGH,
@@ -110,6 +111,7 @@ async def queue_dev_environment_setup(project: str, logger):
                 'repository': project,
                 'automated_setup': True,
                 'auto_triggered': True,
+                'skip_workspace_prep': True,  # System task — no feature branch needed
                 'use_docker': False  # Run locally in orchestrator environment
             },
             created_at=datetime.now().isoformat()
@@ -391,7 +393,7 @@ async def process_task_integrated(task, state_manager, logger):
         agent_name=task.agent,
         project_name=task.project,
         task_context=task.context,
-        task_id_prefix=task.id  # Use actual task ID from queue
+        execution_type="task_queue"
     )
 
     # Auto-commit handled by FeatureBranchManager in AgentExecutor

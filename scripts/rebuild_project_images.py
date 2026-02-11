@@ -37,6 +37,7 @@ import logging
 import os
 import subprocess
 import sys
+import uuid
 from datetime import datetime
 from pathlib import Path
 
@@ -220,8 +221,7 @@ def queue_dev_env_setup(project_name: str, task_queue, dry_run: bool = False) ->
     # Import task queue dependencies
     _import_task_queue()
 
-    timestamp = int(datetime.now().timestamp())
-    task_id = f"manual_dev_env_setup_{project_name}_{timestamp}"
+    task_id = str(uuid.uuid4())
 
     if dry_run:
         logger.info(f"[DRY RUN] Would queue dev_environment_setup for {project_name} (task_id: {task_id})")

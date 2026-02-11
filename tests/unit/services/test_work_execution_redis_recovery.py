@@ -349,3 +349,300 @@ class TestTryRecoverResultFromRedis:
         assert recovered is True
         assert execution['outcome'] == 'failure'
         assert 'exited with code 1' in execution['error']
+
+
+class TestTaskIdBasedRecovery:
+    """Tests for task_id-based exact Redis key lookup in recovery."""
+
+    def _make_tracker(self, tmp_path):
+        cls = _import_tracker_class(tmp_path)
+        return cls(state_dir=tmp_path)
+
+    def _make_execution(self, task_id=None, timestamp='2025-01-01T12:00:00+00:00'):
+        execution = {
+            'column': 'In Development',
+            'agent': 'software_engineer',
+            'timestamp': timestamp,
+            'outcome': 'in_progress',
+            'trigger_source': 'pipeline_progression',
+        }
+        if task_id:
+            execution['task_id'] = task_id
+        return execution
+
+    def test_exact_match_by_task_id(self, tmp_path):
+        """When execution has task_id, uses exact key lookup and recovers result."""
+        tracker = self._make_tracker(tmp_path)
+        execution = self._make_execution(task_id='task_sw_eng_1234567890')
+
+        result_data = {
+            'agent': 'software_engineer',
+            'exit_code': 0,
+            'output': 'All changes applied.',
+            'completed_at': '2025-01-01T12:05:00+00:00',
+        }
+
+        mock_redis = MagicMock()
+        mock_redis.get.return_value = json.dumps(result_data)
+
+        with patch('redis.Redis', return_value=mock_redis):
+            recovered = tracker._try_recover_result_from_redis(
+                'myproject', 42, 'software_engineer', 'In Development', execution
+            )
+
+        assert recovered is True
+        assert execution['outcome'] == 'success'
+        # Should use exact key, NOT scan_iter
+        mock_redis.get.assert_called_once_with(
+            'agent_result:myproject:42:task_sw_eng_1234567890'
+        )
+        mock_redis.scan_iter.assert_not_called()
+        mock_redis.delete.assert_called_once_with(
+            'agent_result:myproject:42:task_sw_eng_1234567890'
+        )
+
+    def test_no_result_for_task_id_returns_false(self, tmp_path):
+        """When execution has task_id but no matching Redis key, returns False immediately."""
+        tracker = self._make_tracker(tmp_path)
+        execution = self._make_execution(task_id='task_sw_eng_1234567890')
+
+        mock_redis = MagicMock()
+        mock_redis.get.return_value = None  # No result at exact key
+
+        with patch('redis.Redis', return_value=mock_redis):
+            recovered = tracker._try_recover_result_from_redis(
+                'myproject', 42, 'software_engineer', 'In Development', execution
+            )
+
+        assert recovered is False
+        assert execution['outcome'] == 'in_progress'  # unchanged
+        # Should NOT fall back to scan
+        mock_redis.scan_iter.assert_not_called()
+
+    def test_agent_mismatch_on_exact_key(self, tmp_path):
+        """When exact key exists but agent doesn't match, returns False."""
+        tracker = self._make_tracker(tmp_path)
+        execution = self._make_execution(task_id='task_sw_eng_1234567890')
+
+        result_data = {
+            'agent': 'code_reviewer',  # Different agent
+            'exit_code': 0,
+            'output': 'Review done.',
+            'completed_at': '2025-01-01T12:05:00+00:00',
+        }
+
+        mock_redis = MagicMock()
+        mock_redis.get.return_value = json.dumps(result_data)
+
+        with patch('redis.Redis', return_value=mock_redis):
+            recovered = tracker._try_recover_result_from_redis(
+                'myproject', 42, 'software_engineer', 'In Development', execution
+            )
+
+        assert recovered is False
+        assert execution['outcome'] == 'in_progress'  # unchanged
+
+    def test_exact_key_malformed_json(self, tmp_path):
+        """When exact key contains malformed JSON, returns False without crashing."""
+        tracker = self._make_tracker(tmp_path)
+        execution = self._make_execution(task_id='task_sw_eng_1234567890')
+
+        mock_redis = MagicMock()
+        mock_redis.get.return_value = 'not valid json{'
+
+        with patch('redis.Redis', return_value=mock_redis):
+            recovered = tracker._try_recover_result_from_redis(
+                'myproject', 42, 'software_engineer', 'In Development', execution
+            )
+
+        assert recovered is False
+        assert execution['outcome'] == 'in_progress'  # unchanged
+        mock_redis.scan_iter.assert_not_called()
+
+    def test_fallback_rejects_unparseable_timestamps(self, tmp_path):
+        """When timestamps are present but malformed, rejects result to be safe."""
+        tracker = self._make_tracker(tmp_path)
+        execution = self._make_execution(timestamp='not-a-timestamp')
+
+        result_data = {
+            'agent': 'software_engineer',
+            'exit_code': 0,
+            'output': 'Done.',
+            'completed_at': 'also-not-a-timestamp',
+        }
+
+        mock_redis = MagicMock()
+        mock_redis.scan_iter.return_value = iter(['agent_result:myproject:42:abc123'])
+        mock_redis.get.return_value = json.dumps(result_data)
+
+        with patch('redis.Redis', return_value=mock_redis):
+            recovered = tracker._try_recover_result_from_redis(
+                'myproject', 42, 'software_engineer', 'In Development', execution
+            )
+
+        assert recovered is False
+        assert execution['outcome'] == 'in_progress'  # rejected due to unparseable timestamps
+
+    def test_fallback_rejects_stale_result(self, tmp_path):
+        """Without task_id, falls back to scan and rejects results completed before execution started."""
+        tracker = self._make_tracker(tmp_path)
+        # Execution started at 13:08
+        execution = self._make_execution(timestamp='2025-01-01T13:08:00+00:00')
+
+        # Result completed at 11:30 (from earlier execution)
+        result_data = {
+            'agent': 'software_engineer',
+            'exit_code': 0,
+            'output': 'Old result from earlier run.',
+            'completed_at': '2025-01-01T11:30:00+00:00',
+        }
+
+        mock_redis = MagicMock()
+        mock_redis.scan_iter.return_value = iter(['agent_result:myproject:42:old_task_123'])
+        mock_redis.get.return_value = json.dumps(result_data)
+
+        with patch('redis.Redis', return_value=mock_redis):
+            recovered = tracker._try_recover_result_from_redis(
+                'myproject', 42, 'software_engineer', 'In Development', execution
+            )
+
+        assert recovered is False
+        assert execution['outcome'] == 'in_progress'  # unchanged — stale result rejected
+
+    def test_fallback_accepts_valid_result(self, tmp_path):
+        """Without task_id, falls back to scan and accepts results completed after execution started."""
+        tracker = self._make_tracker(tmp_path)
+        # Execution started at 13:08
+        execution = self._make_execution(timestamp='2025-01-01T13:08:00+00:00')
+
+        # Result completed at 13:15 (after execution started)
+        result_data = {
+            'agent': 'software_engineer',
+            'exit_code': 0,
+            'output': 'Valid result.',
+            'completed_at': '2025-01-01T13:15:00+00:00',
+        }
+
+        mock_redis = MagicMock()
+        mock_redis.scan_iter.return_value = iter(['agent_result:myproject:42:new_task_456'])
+        mock_redis.get.return_value = json.dumps(result_data)
+
+        with patch('redis.Redis', return_value=mock_redis):
+            recovered = tracker._try_recover_result_from_redis(
+                'myproject', 42, 'software_engineer', 'In Development', execution
+            )
+
+        assert recovered is True
+        assert execution['outcome'] == 'success'
+
+    def test_fallback_accepts_result_without_timestamps(self, tmp_path):
+        """Without task_id and without timestamps, accepts result for backward compatibility."""
+        tracker = self._make_tracker(tmp_path)
+        execution = self._make_execution()
+        # Remove timestamp from execution
+        del execution['timestamp']
+
+        result_data = {
+            'agent': 'software_engineer',
+            'exit_code': 0,
+            'output': 'Done.',
+            # No completed_at field
+        }
+
+        mock_redis = MagicMock()
+        mock_redis.scan_iter.return_value = iter(['agent_result:myproject:42:abc123'])
+        mock_redis.get.return_value = json.dumps(result_data)
+
+        with patch('redis.Redis', return_value=mock_redis):
+            recovered = tracker._try_recover_result_from_redis(
+                'myproject', 42, 'software_engineer', 'In Development', execution
+            )
+
+        assert recovered is True
+        assert execution['outcome'] == 'success'
+
+
+class TestStampExecutionTaskId:
+    """Tests for stamp_execution_task_id()."""
+
+    def _make_tracker(self, tmp_path):
+        cls = _import_tracker_class(tmp_path)
+        return cls(state_dir=tmp_path)
+
+    def test_stamps_task_id_on_matching_execution(self, tmp_path):
+        """Finds the correct in_progress execution and adds task_id field."""
+        tracker = self._make_tracker(tmp_path)
+
+        # Create an in_progress execution
+        tracker.record_execution_start(
+            issue_number=42,
+            column='In Development',
+            agent='software_engineer',
+            trigger_source='pipeline_progression',
+            project_name='myproject'
+        )
+
+        # Stamp task_id
+        tracker.stamp_execution_task_id(
+            'myproject', 42, 'software_engineer', 'In Development',
+            'task_sw_eng_1234567890'
+        )
+
+        # Verify
+        state = tracker.load_state('myproject', 42)
+        last_exec = state['execution_history'][-1]
+        assert last_exec['task_id'] == 'task_sw_eng_1234567890'
+        assert last_exec['outcome'] == 'in_progress'
+        assert last_exec['agent'] == 'software_engineer'
+
+    def test_noop_when_no_matching_execution(self, tmp_path):
+        """Does not crash or modify state when no matching execution exists."""
+        tracker = self._make_tracker(tmp_path)
+
+        # Create execution for different agent
+        tracker.record_execution_start(
+            issue_number=42,
+            column='In Development',
+            agent='code_reviewer',
+            trigger_source='pipeline_progression',
+            project_name='myproject'
+        )
+
+        # Try to stamp for non-matching agent — should not crash
+        tracker.stamp_execution_task_id(
+            'myproject', 42, 'software_engineer', 'In Development',
+            'task_sw_eng_1234567890'
+        )
+
+        # Verify original execution is untouched
+        state = tracker.load_state('myproject', 42)
+        last_exec = state['execution_history'][-1]
+        assert 'task_id' not in last_exec
+        assert last_exec['agent'] == 'code_reviewer'
+
+
+class TestDevEnvironmentSetupContext:
+    """Tests for dev_environment_setup task context flags."""
+
+    def test_skip_workspace_prep_in_context(self):
+        """Verify queue_dev_environment_setup() task includes skip_workspace_prep flag."""
+        from services.dev_container_state import DevContainerStatus
+
+        mock_queue_instance = MagicMock()
+
+        with patch('task_queue.task_manager.TaskQueue', return_value=mock_queue_instance), \
+             patch('services.dev_container_state.dev_container_state') as mock_state:
+
+            mock_state.get_status.return_value = DevContainerStatus.UNVERIFIED
+
+            import asyncio
+            from agents.orchestrator_integration import queue_dev_environment_setup
+
+            mock_logger = MagicMock()
+            asyncio.run(queue_dev_environment_setup('myproject', mock_logger))
+
+            # Get the task that was enqueued
+            enqueued_task = mock_queue_instance.enqueue.call_args[0][0]
+            assert enqueued_task.context['skip_workspace_prep'] is True
+            assert enqueued_task.context['use_docker'] is False
+            assert enqueued_task.context['issue_number'] == 0

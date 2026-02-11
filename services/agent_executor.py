@@ -12,6 +12,7 @@ import logging
 import time
 import json
 import asyncio
+import uuid
 from typing import Dict, Any, Optional
 from datetime import datetime, timezone
 from pathlib import Path
@@ -39,7 +40,7 @@ class AgentExecutor:
         agent_name: str,
         project_name: str,
         task_context: Dict[str, Any],
-        task_id_prefix: str = "task"
+        execution_type: str = "standard"
     ) -> Any:
         """
         Execute an agent with full observability support.
@@ -58,18 +59,40 @@ class AgentExecutor:
             agent_name: Name of the agent to execute (e.g., 'business_analyst')
             project_name: Name of the project
             task_context: The task context (issue data, discussion data, etc.)
-            task_id_prefix: Prefix for generating task ID (e.g., 'review_cycle', 'conversational')
+            execution_type: Classification of this execution (e.g., 'review_cycle', 'conversational', 'repair_test')
 
         Returns:
             Agent execution result
         """
-        # Generate unique task ID
-        task_id = f"{task_id_prefix}_{agent_name}_{int(utc_now().timestamp())}"
+        # Generate opaque UUID task ID
+        task_id = str(uuid.uuid4())
+
+        # Store execution_type in task_context for downstream propagation
+        # (Docker labels, observability events, Redis tracking)
+        task_context['execution_type'] = execution_type
 
         logger.info(f"Executing agent {agent_name} for project {project_name} (task_id: {task_id})")
 
+        # Stamp task_id onto the in_progress execution record so restart
+        # recovery can match this exact execution's Redis result.
+        # Best-effort: failure here must not prevent agent execution.
+        if 'issue_number' in task_context:
+            try:
+                from services.work_execution_state import work_execution_tracker
+                work_execution_tracker.stamp_execution_task_id(
+                    project_name, task_context['issue_number'],
+                    agent_name, task_context.get('column', 'unknown'), task_id
+                )
+            except Exception as stamp_err:
+                logger.warning(
+                    f"Failed to stamp task_id on execution for "
+                    f"{project_name}/#{task_context['issue_number']}: {stamp_err}. "
+                    f"Recovery will fall back to wildcard scan if needed."
+                )
+
         # Emit task received event
-        self.obs.emit_task_received(agent_name, task_id, project_name, task_context)
+        self.obs.emit_task_received(agent_name, task_id, project_name, task_context,
+                                    execution_type=execution_type)
 
         # Extract pipeline_run_id from task_context for stream callback
         pipeline_run_id = task_context.get('pipeline_run_id')
@@ -269,7 +292,8 @@ class AgentExecutor:
         # This returns the agent_execution_id for tracking this specific execution
         agent_config = agent_stage.agent_config or {}
         agent_execution_id = self.obs.emit_agent_initialized(
-            agent_name, task_id, project_name, agent_config, branch_name, container_name, pipeline_run_id
+            agent_name, task_id, project_name, agent_config, branch_name, container_name, pipeline_run_id,
+            execution_type=execution_type
         )
         
         logger.info(f"Agent execution started with ID: {agent_execution_id}")
@@ -650,6 +674,22 @@ class AgentExecutor:
                     )
 
                 logger.error(f"Agent {agent_name} failed after {duration_ms:.0f}ms: {e}")
+
+                # Reset dev container state on setup failure so it can be retried.
+                # Only for actual failures — circuit breaker blocks are temporary and
+                # the agent never ran, so the state should remain IN_PROGRESS.
+                if agent_name == 'dev_environment_setup':
+                    try:
+                        from services.dev_container_state import dev_container_state, DevContainerStatus
+                        dev_container_state.set_status(
+                            project_name, DevContainerStatus.UNVERIFIED,
+                            error_message=f"Setup failed: {str(e)[:200]}"
+                        )
+                        logger.info(
+                            f"Reset dev container state to UNVERIFIED for {project_name} after setup failure"
+                        )
+                    except Exception as state_err:
+                        logger.error(f"Failed to reset dev container state for {project_name}: {state_err}")
 
             raise
 
@@ -1193,7 +1233,7 @@ class AgentExecutor:
 
             # Create verifier task with reference to setup output
             task = Task(
-                id=f"auto_dev_env_verify_{project_name}_{int(utc_now().timestamp())}",
+                id=str(uuid.uuid4()),
                 agent="dev_environment_verifier",
                 project=project_name,
                 priority=TaskPriority.HIGH,

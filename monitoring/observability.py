@@ -216,6 +216,7 @@ class ObservabilityEvent:
     task_id: str
     project: str
     data: Dict[str, Any]
+    execution_type: str = ""
 
     def to_json(self) -> str:
         """Serialize to JSON for Redis pub/sub"""
@@ -396,7 +397,8 @@ class ObservabilityManager:
         return event_type in lifecycle_events
 
     def emit(self, event_type: EventType, agent: str, task_id: str,
-             project: str, data: Dict[str, Any], pipeline_run_id: Optional[str] = None):
+             project: str, data: Dict[str, Any], pipeline_run_id: Optional[str] = None,
+             execution_type: str = ""):
         """Emit an observability event"""
         if not self.enabled:
             return
@@ -413,7 +415,8 @@ class ObservabilityManager:
                 agent=agent,
                 task_id=task_id,
                 project=project,
-                data=data
+                data=data,
+                execution_type=execution_type
             )
 
             event_json = event.to_json()
@@ -437,7 +440,7 @@ class ObservabilityManager:
                 try:
                     # Create index name based on current date
                     index_name = f"decision-events-{utc_now().strftime('%Y-%m-%d')}"
-                    
+
                     # Prepare document for Elasticsearch
                     doc = {
                         'timestamp': event.timestamp,
@@ -447,6 +450,7 @@ class ObservabilityManager:
                         'task_id': task_id,
                         'project': project,
                         'pipeline_run_id': pipeline_run_id,
+                        'execution_type': execution_type,
                         **data  # Flatten data into document
                     }
 
@@ -467,7 +471,7 @@ class ObservabilityManager:
                 try:
                     # Create index name based on current date
                     index_name = f"agent-events-{utc_now().strftime('%Y-%m-%d')}"
-                    
+
                     # Prepare document for Elasticsearch
                     doc = {
                         'timestamp': event.timestamp,
@@ -477,6 +481,7 @@ class ObservabilityManager:
                         'task_id': task_id,
                         'project': project,
                         'pipeline_run_id': pipeline_run_id,
+                        'execution_type': execution_type,
                         **data  # Flatten data into document
                     }
                     
@@ -494,23 +499,25 @@ class ObservabilityManager:
             logger.error(f"Failed to emit observability event: {e}")
 
     def emit_task_received(self, agent: str, task_id: str, project: str,
-                          context: Dict[str, Any], pipeline_run_id: Optional[str] = None):
+                          context: Dict[str, Any], pipeline_run_id: Optional[str] = None,
+                          execution_type: str = ""):
         """Emit task received event"""
         self.emit(EventType.TASK_RECEIVED, agent, task_id, project, {
             'context_keys': list(context.keys()),
             'issue_number': context.get('issue_number'),
             'board': context.get('board'),
             'trigger': context.get('trigger')
-        }, pipeline_run_id=pipeline_run_id)
+        }, pipeline_run_id=pipeline_run_id, execution_type=execution_type)
 
     def emit_agent_initialized(self, agent: str, task_id: str, project: str,
                               config: Dict[str, Any], branch_name: Optional[str] = None,
                               container_name: Optional[str] = None,
-                              pipeline_run_id: Optional[str] = None):
+                              pipeline_run_id: Optional[str] = None,
+                              execution_type: str = ""):
         """Emit agent initialized event"""
         # Generate unique agent execution ID for tracking this specific execution
         agent_execution_id = str(uuid.uuid4())
-        
+
         data = {
             'agent_execution_id': agent_execution_id,
             'model': config.get('model'),
@@ -523,7 +530,8 @@ class ObservabilityManager:
         if container_name:
             data['container_name'] = container_name
 
-        self.emit(EventType.AGENT_INITIALIZED, agent, task_id, project, data, pipeline_run_id)
+        self.emit(EventType.AGENT_INITIALIZED, agent, task_id, project, data, pipeline_run_id,
+                  execution_type=execution_type)
         
         # Return the execution ID so caller can use it for subsequent events
         return agent_execution_id

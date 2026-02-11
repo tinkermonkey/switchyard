@@ -930,7 +930,7 @@ class HumanFeedbackLoopExecutor:
             agent_name=state.agent,
             project_name=state.project_name,
             task_context=context,
-            task_id_prefix="conversational"
+            execution_type="conversational"
         )
 
         # Extract and store session_id for continuity

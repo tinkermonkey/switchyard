@@ -5,6 +5,7 @@ import time
 import json
 import subprocess
 import logging
+import uuid
 from datetime import datetime
 from typing import Dict, Any, List, Optional
 from dataclasses import dataclass
@@ -2265,7 +2266,7 @@ class ProjectMonitor:
                     task_context['discussion_id'] = discussion_id
 
                 task = Task(
-                    id=f"{agent}_{project_name}_{board_name}_{issue_number}_{int(time.time())}",
+                    id=str(uuid.uuid4()),
                     agent=agent,
                     project=project_name,
                     priority=TaskPriority.MEDIUM,
@@ -2867,7 +2868,7 @@ class ProjectMonitor:
                 import time
 
                 task = Task(
-                    id=f"pr_review_agent_{project_name}_{planning_board_name}_{parent_issue_number}_{int(time.time())}",
+                    id=str(uuid.uuid4()),
                     agent="pr_review_agent",
                     project=project_name,
                     priority=TaskPriority.MEDIUM,
@@ -3748,7 +3749,7 @@ _Review cycle initiated by Claude Code Orchestrator_
 
                                                 # Use self.task_queue that was passed to ProjectMonitor during initialization
                                                 task = Task(
-                                                    id=f"{agent}_{project_name}_{board_name}_{next_issue['issue_number']}_{int(time.time())}",
+                                                    id=str(uuid.uuid4()),
                                                     agent=agent,
                                                     project=project_name,
                                                     priority=TaskPriority.MEDIUM,
@@ -6054,7 +6055,7 @@ _Repair cycle initiated by Claude Code Orchestrator_
             }
 
             task = Task(
-                id=f"{agent}_feedback_{project_name}_{board_name}_{issue_number}_{int(time.time())}",
+                id=str(uuid.uuid4()),
                 agent=agent,
                 project=project_name,
                 priority=TaskPriority.HIGH,  # Feedback gets high priority
@@ -7270,7 +7271,7 @@ Moving to implementation phase.
 
             from task_queue.task_manager import Task, TaskPriority
             task = Task(
-                id=f"{agent}_feedback_{project_name}_{board_name}_{issue_number}_{int(time.time())}",
+                id=str(uuid.uuid4()),
                 agent=agent,
                 project=project_name,
                 priority=TaskPriority.HIGH,

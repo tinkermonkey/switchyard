@@ -743,7 +743,7 @@ DO NOT include any explanation, markdown formatting, or other text - ONLY the JS
                     agent_name=self.agent_name,
                     project_name=project,
                     task_context=task_context,
-                    task_id_prefix=f"repair_test_{config.test_type}_type{test_type_index}_iter{test_cycle_iteration}_attempt{attempt}",
+                    execution_type="repair_test",
                 )
 
                 # Extract result text from agent output
@@ -1010,7 +1010,7 @@ DO NOT include any explanation, markdown formatting, or other text - ONLY the JS
                     agent_name=self.agent_name,
                     project_name=project,
                     task_context=task_context,
-                    task_id_prefix=f"repair_fix_{self._sanitize_filename(test_file)}",
+                    execution_type="repair_fix",
                 )
 
                 logger.info(f"Fixed failures in {test_file}")
@@ -1147,7 +1147,7 @@ For each warning:
                     agent_name=self.agent_name,
                     project_name=project,
                     task_context=task_context,
-                    task_id_prefix=f"repair_warn_{self._sanitize_filename(source_file)}",
+                    execution_type="repair_warning",
                 )
 
                 logger.info(f"Reviewed warnings in {source_file}")

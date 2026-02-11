@@ -10,6 +10,7 @@ Handles automatic progression of issues through pipeline stages:
 import subprocess
 import json
 import logging
+import uuid
 from typing import Optional, Dict, Any
 from config.manager import config_manager
 from config.state_manager import state_manager
@@ -440,7 +441,7 @@ class PipelineProgression:
                         }
 
                         task = Task(
-                            id=f"{agent}_{project_name}_{board_name}_{next_issue['issue_number']}_{int(time.time())}",
+                            id=str(uuid.uuid4()),
                             agent=agent,
                             project=project_name,
                             priority=TaskPriority.MEDIUM,
@@ -565,7 +566,7 @@ class PipelineProgression:
             }
 
             task = Task(
-                id=f"{next_agent}_{project_name}_{board_name}_{issue_number}_{int(time.time())}",
+                id=str(uuid.uuid4()),
                 agent=next_agent,
                 project=project_name,
                 priority=TaskPriority.MEDIUM,

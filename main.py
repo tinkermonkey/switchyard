@@ -4,6 +4,7 @@ import time
 import signal
 import os
 import logging
+import uuid
 from pathlib import Path
 from elasticsearch import Elasticsearch
 from elasticsearch.exceptions import ConnectionError as ESConnectionError
@@ -431,7 +432,7 @@ async def main():
             logger.info(f"Queuing dev_environment_setup task for {project_name}")
 
             task = Task(
-                id=f"dev_env_setup_{project_name}_{int(utc_now().timestamp())}",
+                id=str(uuid.uuid4()),
                 agent="dev_environment_setup",
                 project=project_name,
                 priority=TaskPriority.HIGH,  # High priority for initial setup

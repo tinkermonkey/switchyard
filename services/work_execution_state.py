@@ -168,6 +168,30 @@ class WorkExecutionStateTracker:
             f"{agent} in {column} (trigger: {trigger_source})"
         )
 
+    def stamp_execution_task_id(self, project_name, issue_number, agent, column, task_id):
+        """Stamp the execution-level task_id onto the current in_progress execution.
+
+        Called by agent_executor after generating the task_id, which happens
+        after record_execution_start() has already created the in_progress entry.
+        This task_id matches the Redis key suffix in agent_result:{project}:{issue}:{task_id}.
+        """
+        state = self.load_state(project_name, issue_number)
+        for execution in reversed(state['execution_history']):
+            if (execution.get('outcome') == 'in_progress' and
+                execution.get('agent') == agent and
+                execution.get('column') == column):
+                execution['task_id'] = task_id
+                self.save_state(project_name, issue_number, state)
+                logger.debug(
+                    f"Stamped task_id={task_id} on execution for "
+                    f"{project_name}/#{issue_number} {agent} in {column}"
+                )
+                return
+        logger.warning(
+            f"No matching in_progress execution found to stamp task_id={task_id} "
+            f"for {project_name}/#{issue_number} {agent} in {column}"
+        )
+
     def record_execution_outcome(
         self,
         issue_number: int,
@@ -1162,6 +1186,10 @@ class WorkExecutionStateTracker:
         before the container exits. When the orchestrator restarts and the
         container is gone (due to --rm), the result may still be in Redis.
 
+        Two recovery strategies:
+        1. Primary: Exact key lookup when execution has a stamped task_id (O(1), no ambiguity)
+        2. Fallback: Wildcard scan with timestamp validation for old records without task_id
+
         Returns True if a result was recovered (execution dict is updated in place),
         False otherwise.
         """
@@ -1174,15 +1202,46 @@ class WorkExecutionStateTracker:
                 socket_timeout=5, socket_connect_timeout=5
             )
 
-            # Scan for any result keys for this project/issue
+            # Primary: exact key lookup when task_id is stamped on the execution
+            execution_task_id = execution.get('task_id')
+            if execution_task_id:
+                exact_key = f"agent_result:{project_name}:{issue_number}:{execution_task_id}"
+                result_json = redis_client.get(exact_key)
+                if result_json:
+                    try:
+                        result_data = json.loads(result_json)
+                    except (json.JSONDecodeError, TypeError) as e:
+                        logger.warning(f"Failed to parse Redis result at {exact_key}: {e}")
+                        return False
+
+                    if result_data.get('agent') != agent:
+                        logger.warning(
+                            f"Redis result at {exact_key} has agent={result_data.get('agent')}, "
+                            f"expected {agent} — skipping recovery"
+                        )
+                        return False
+
+                    recovered = self._apply_redis_result(
+                        execution, result_data, exact_key, project_name,
+                        issue_number, agent, column, redis_client
+                    )
+                    return recovered
+
+                # No result for this specific execution — it never produced output
+                logger.debug(
+                    f"No Redis result for exact key {exact_key} — "
+                    f"execution never completed or result already expired"
+                )
+                return False
+
+            # Fallback: wildcard scan for old execution records without task_id
+            # Add timestamp validation to prevent cross-execution contamination
             pattern = f"agent_result:{project_name}:{issue_number}:*"
             result_keys = list(redis_client.scan_iter(match=pattern, count=100))
 
             if not result_keys:
                 return False
 
-            # Iterate through result keys (arbitrary order from SCAN).
-            # If multiple keys exist, they're for different task_ids — use first valid match.
             for redis_key in result_keys:
                 try:
                     result_json = redis_client.get(redis_key)
@@ -1191,56 +1250,42 @@ class WorkExecutionStateTracker:
 
                     result_data = json.loads(result_json)
 
-                    # Strict agent match — skip results for different agents.
-                    # A missing agent field is treated as a non-match to prevent
-                    # cross-agent contamination.
+                    # Strict agent match
                     if result_data.get('agent') != agent:
                         continue
 
-                    exit_code = result_data.get('exit_code')
-                    if exit_code is None:
-                        logger.warning(
-                            f"Redis result at {redis_key} has no exit_code field, "
-                            f"cannot determine outcome — skipping recovery"
-                        )
-                        continue
+                    # Timestamp validation: reject results from earlier executions
+                    execution_timestamp = execution.get('timestamp')
+                    completed_at = result_data.get('completed_at')
+                    if execution_timestamp and completed_at:
+                        try:
+                            exec_dt = datetime.fromisoformat(
+                                execution_timestamp.replace('Z', '+00:00')
+                            )
+                            completed_dt = datetime.fromisoformat(
+                                completed_at.replace('Z', '+00:00')
+                            )
+                            if completed_dt < exec_dt:
+                                logger.info(
+                                    f"Skipping stale Redis result at {redis_key}: "
+                                    f"completed_at={completed_at} < execution_timestamp={execution_timestamp}"
+                                )
+                                continue
+                        except (ValueError, TypeError) as e:
+                            logger.warning(
+                                f"Unparseable timestamps for {redis_key}: "
+                                f"execution_timestamp={execution_timestamp!r}, "
+                                f"completed_at={completed_at!r}: {e}. "
+                                f"Skipping result to prevent cross-execution contamination."
+                            )
+                            continue
 
-                    if exit_code == 0:
-                        execution['outcome'] = 'success'
-                        logger.info(
-                            f"Recovered successful result from Redis for "
-                            f"{project_name}/#{issue_number} {agent} in {column} "
-                            f"(key: {redis_key})"
-                        )
-                    else:
-                        execution['outcome'] = 'failure'
-                        output = result_data.get('output', '') or ''
-                        # Truncate output for error message
-                        error_snippet = output[-500:] if len(output) > 500 else output
-                        execution['error'] = (
-                            f"Agent exited with code {exit_code}. "
-                            f"Result recovered from Redis after container exited. "
-                            f"Output tail: {error_snippet}"
-                        )
-                        logger.warning(
-                            f"Recovered failed result from Redis for "
-                            f"{project_name}/#{issue_number} {agent} in {column} "
-                            f"(exit_code={exit_code}, key: {redis_key})"
-                        )
-
-                    # Delete the key after processing to prevent reprocessing.
-                    # Wrapped in its own try/except so a delete failure doesn't
-                    # cause the outer except to return False after we already
-                    # mutated the execution dict.
-                    try:
-                        redis_client.delete(redis_key)
-                    except Exception as del_err:
-                        logger.warning(
-                            f"Failed to delete recovered Redis key {redis_key}: {del_err}. "
-                            f"Key will expire via TTL or be reprocessed next cycle."
-                        )
-
-                    return True
+                    recovered = self._apply_redis_result(
+                        execution, result_data, redis_key, project_name,
+                        issue_number, agent, column, redis_client
+                    )
+                    if recovered:
+                        return True
 
                 except (json.JSONDecodeError, TypeError) as e:
                     logger.warning(f"Failed to parse Redis result at {redis_key}: {e}")
@@ -1262,6 +1307,56 @@ class WorkExecutionStateTracker:
                     exc_info=True
                 )
             return False
+
+    def _apply_redis_result(self, execution, result_data, redis_key, project_name,
+                            issue_number, agent, column, redis_client):
+        """
+        Apply a recovered Redis result to an execution record.
+
+        Shared by both exact-key and wildcard-scan recovery paths.
+        Returns True if result was applied, False if it was skipped.
+        """
+        exit_code = result_data.get('exit_code')
+        if exit_code is None:
+            logger.warning(
+                f"Redis result at {redis_key} has no exit_code field, "
+                f"cannot determine outcome — skipping recovery"
+            )
+            return False
+
+        if exit_code == 0:
+            execution['outcome'] = 'success'
+            logger.info(
+                f"Recovered successful result from Redis for "
+                f"{project_name}/#{issue_number} {agent} in {column} "
+                f"(key: {redis_key})"
+            )
+        else:
+            execution['outcome'] = 'failure'
+            output = result_data.get('output', '') or ''
+            # Truncate output for error message
+            error_snippet = output[-500:] if len(output) > 500 else output
+            execution['error'] = (
+                f"Agent exited with code {exit_code}. "
+                f"Result recovered from Redis after container exited. "
+                f"Output tail: {error_snippet}"
+            )
+            logger.warning(
+                f"Recovered failed result from Redis for "
+                f"{project_name}/#{issue_number} {agent} in {column} "
+                f"(exit_code={exit_code}, key: {redis_key})"
+            )
+
+        # Delete the key after processing to prevent reprocessing.
+        try:
+            redis_client.delete(redis_key)
+        except Exception as del_err:
+            logger.warning(
+                f"Failed to delete recovered Redis key {redis_key}: {del_err}. "
+                f"Key will expire via TTL or be reprocessed next cycle."
+            )
+
+        return True
 
     def cleanup_stuck_in_progress_states(self):
         """
@@ -1467,6 +1562,26 @@ class WorkExecutionStateTracker:
                                                 exc_info=True
                                             )
 
+                                    # Special handling for dev_environment_setup agent
+                                    # Reset to UNVERIFIED so setup can be retried automatically
+                                    if agent == 'dev_environment_setup':
+                                        try:
+                                            from services.dev_container_state import dev_container_state, DevContainerStatus
+                                            logger.info(
+                                                f"Stuck dev_environment_setup detected for {project_name}, "
+                                                f"resetting dev container state to UNVERIFIED"
+                                            )
+                                            dev_container_state.set_status(
+                                                project_name=project_name,
+                                                status=DevContainerStatus.UNVERIFIED,
+                                                error_message="Setup container died before completion"
+                                            )
+                                        except Exception as e:
+                                            logger.error(
+                                                f"Failed to update dev container state for {project_name}: {e}",
+                                                exc_info=True
+                                            )
+
                                 modified = True
                                 cleaned_count += 1
 
@@ -1566,6 +1681,27 @@ class WorkExecutionStateTracker:
                                             dev_container_state.set_status(
                                                 project_name=project_name,
                                                 status=DevContainerStatus.BLOCKED,
+                                                error_message=error_msg
+                                            )
+                                        except Exception as e:
+                                            logger.error(
+                                                f"Failed to update dev container state for {project_name}: {e}",
+                                                exc_info=True
+                                            )
+
+                                    # Special handling for dev_environment_setup agent failures
+                                    # Reset to UNVERIFIED so setup can be retried automatically
+                                    if agent == 'dev_environment_setup':
+                                        try:
+                                            from services.dev_container_state import dev_container_state, DevContainerStatus
+                                            logger.info(
+                                                f"Dev environment setup failed for {project_name}, "
+                                                f"resetting dev container state to UNVERIFIED"
+                                            )
+                                            error_msg = execution.get('error', 'Setup failed')[:200]
+                                            dev_container_state.set_status(
+                                                project_name=project_name,
+                                                status=DevContainerStatus.UNVERIFIED,
                                                 error_message=error_msg
                                             )
                                         except Exception as e:

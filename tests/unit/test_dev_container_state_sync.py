@@ -269,6 +269,77 @@ class TestDevContainerStateSync:
         status = dev_container_mgr.get_status(project_name)
         assert status == DevContainerStatus.VERIFIED
 
+    def test_stuck_setup_resets_dev_container_state(
+        self,
+        execution_tracker,
+        dev_container_mgr,
+        temp_dirs
+    ):
+        """
+        Test that when cleanup detects a stuck dev_environment_setup,
+        it resets the dev container state to UNVERIFIED (not BLOCKED),
+        so setup can be automatically retried.
+        """
+        project_name = "test-project"
+        issue_number = 46
+        agent = "dev_environment_setup"
+        column = "Setup"
+
+        # Setup: Create stuck execution state
+        execution_tracker.record_execution_start(
+            issue_number=issue_number,
+            column=column,
+            agent=agent,
+            trigger_source='manual',
+            project_name=project_name
+        )
+
+        # Setup: Set dev container state to IN_PROGRESS
+        dev_container_mgr.set_status(
+            project_name=project_name,
+            status=DevContainerStatus.IN_PROGRESS,
+            image_name=f"{project_name}-agent:latest"
+        )
+
+        # Verify initial state
+        assert dev_container_mgr.get_status(project_name) == DevContainerStatus.IN_PROGRESS
+
+        # Mock subprocess to simulate no running containers
+        with patch('subprocess.run') as mock_run:
+            mock_run.return_value = Mock(
+                returncode=0,
+                stdout='',
+                stderr=''
+            )
+
+            # Mock Redis to simulate no tracking keys and no results
+            with patch('redis.Redis') as mock_redis:
+                mock_redis_client = MagicMock()
+                mock_redis.return_value = mock_redis_client
+
+                mock_redis_client.scan_iter.return_value = []
+                mock_redis_client.exists.return_value = False
+                mock_redis_client.keys.return_value = []
+                mock_redis_client.lrange.return_value = []
+
+                # Patch the module-level singleton
+                with patch('services.dev_container_state.dev_container_state', dev_container_mgr):
+                    execution_tracker.cleanup_stuck_in_progress_states()
+
+        # Verify: Work execution state should be marked as failure
+        last_exec = execution_tracker.get_last_execution(
+            project_name=project_name,
+            issue_number=issue_number,
+            column=column,
+            agent=agent
+        )
+        assert last_exec is not None
+        assert last_exec['outcome'] == 'failure'
+
+        # Verify: Dev container state should be reset to UNVERIFIED (not BLOCKED)
+        status = dev_container_mgr.get_status(project_name)
+        assert status == DevContainerStatus.UNVERIFIED
+
     def test_non_verifier_agent_does_not_affect_dev_container_state(
         self,
         execution_tracker,

@@ -2254,7 +2254,7 @@ class ReviewCycleExecutor:
             agent_name=agent_name,
             project_name=project_name,
             task_context=task_context,
-            task_id_prefix="review_cycle"
+            execution_type="review_cycle"
         )
 
     def _emit_review_cycle_error(
