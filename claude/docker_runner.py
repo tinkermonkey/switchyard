@@ -619,17 +619,11 @@ class DockerAgentRunner:
         ])
         logger.info(f"Mounting wrapper: {wrapper_host_path} -> /app/scripts/docker-claude-wrapper.py")
 
-        # Mount entire .claude directory as tmpfs
-        # This allows Claude Code to create any subdirectories it needs (todos, debug, etc.)
-        # while still overlaying shared resources (agents, commands, skills) on top
-        cmd.extend([
-            '--tmpfs', '/home/orchestrator/.claude:rw,exec,uid=1000,gid=1000,size=100m',
-        ])
-        logger.info("Mounting tmpfs for entire .claude directory (allows todos, debug, etc.)")
-
         # Mount shared Claude Code library (read-only)
-        # Mount individual subdirectories so Claude Code can still write to .claude/debug and other dirs
-        # This makes shared agents, commands, and skills available to all containers at user scope
+        # Plugins and base agents are baked into the Docker image via Dockerfile.
+        # These bind mounts overlay additional shared resources on top of the image contents.
+        # Claude Code runtime state (todos, debug, etc.) writes to the container's writable layer,
+        # which is cleaned up automatically since containers run with --rm.
         shared_claude_base_host = f'{host_workspace}/clauditoreum/config/shared_claude/.claude'
 
         # Check if shared Claude directory exists before mounting
@@ -1136,12 +1130,13 @@ class DockerAgentRunner:
             input_tokens = 0
             output_tokens = 0
             session_id = None
+            tools_used_tracking = []  # Track tools used without mutating input context
 
             # Read both stdout and stderr using threads
             import threading
 
             def read_stream(stream, is_stderr):
-                nonlocal session_id, input_tokens, output_tokens
+                nonlocal session_id, input_tokens, output_tokens, tools_used_tracking
                 for line in iter(stream.readline, ''):
                     if not line:
                         break
@@ -1194,11 +1189,9 @@ class DockerAgentRunner:
                             tool_name = event.get('name', 'unknown')
                             logger.info(f"[Claude] Using tool: {tool_name}")
 
-                            # Track in context for validation
-                            if 'tools_used' not in context:
-                                context['tools_used'] = []
+                            # Track tools used in execution-specific list (don't mutate input context)
                             from monitoring.timestamp_utils import utc_isoformat
-                            context['tools_used'].append({
+                            tools_used_tracking.append({
                                 'name': tool_name,
                                 'timestamp': utc_isoformat()
                             })
@@ -1392,11 +1385,12 @@ class DockerAgentRunner:
                     context['claude_session_id'] = session_id
 
                 # Return result with tools_used metadata for validation
+                # Use execution-specific tracking (not from input context)
                 return {
                     'success': True,
                     'result': result_text,
                     'session_id': session_id,
-                    'tools_used': context.get('tools_used', [])
+                    'tools_used': tools_used_tracking
                 }
             else:
                 stderr_text = ''.join(stderr_parts)

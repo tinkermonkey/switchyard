@@ -200,21 +200,28 @@ class PRReviewAgent(AnalysisAgent):
                 logger.error(error_msg)
 
                 # Post comment to GitHub explaining the issue
-                from services.github_integration import GitHubIntegration
-                github = GitHubIntegration(
-                    repo_owner=github_config['org'],
-                    repo_name=github_config['repo']
-                )
-                await github.post_comment(
-                    parent_issue_number,
-                    f"⚠️ **PR Review Incomplete**\n\n"
-                    f"The PR review skill was not invoked during automated review. "
-                    f"This may indicate:\n"
-                    f"- The PR URL is inaccessible to the review tool\n"
-                    f"- Claude chose to provide a direct response instead\n"
-                    f"- The skill configuration needs attention\n\n"
-                    f"**Action Required**: Manual PR review recommended."
-                )
+                # Wrap in try-except so GitHub API failures don't mask the validation error
+                try:
+                    from services.github_integration import GitHubIntegration
+                    github = GitHubIntegration(
+                        repo_owner=github_config['org'],
+                        repo_name=github_config['repo']
+                    )
+                    await github.post_comment(
+                        parent_issue_number,
+                        f"⚠️ **PR Review Incomplete**\n\n"
+                        f"The PR review skill was not invoked during automated review. "
+                        f"This may indicate:\n"
+                        f"- The PR URL is inaccessible to the review tool\n"
+                        f"- Claude chose to provide a direct response instead\n"
+                        f"- The skill configuration needs attention\n\n"
+                        f"**Action Required**: Manual PR review recommended."
+                    )
+                except Exception as comment_error:
+                    logger.warning(
+                        f"Failed to post skill validation comment to GitHub: {comment_error}. "
+                        f"Continuing with validation error."
+                    )
 
                 # Raise exception to mark phase as failed (triggers inconclusive path)
                 raise Exception(

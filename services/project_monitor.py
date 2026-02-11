@@ -2732,6 +2732,37 @@ class ProjectMonitor:
                 # DEFENSIVE: Check if parent has any open sub-issues before auto-advancing
                 # This prevents race condition where PR review agent just moved parent back
                 # to "In Development" and is creating new review issues
+
+                # FIRST: Check if PR review ran recently (within last 3 minutes)
+                # This prevents race condition where PR review is still creating sub-issues
+                from state_management.pr_review_state_manager import pr_review_state_manager
+                from datetime import datetime, timezone
+
+                last_review_timestamp = pr_review_state_manager.get_last_review_timestamp(
+                    project_name, parent_issue_number
+                )
+
+                if last_review_timestamp:
+                    try:
+                        last_review_time = datetime.fromisoformat(
+                            last_review_timestamp.replace('Z', '+00:00')
+                        )
+                        time_since_review = (
+                            datetime.now(timezone.utc) - last_review_time
+                        ).total_seconds()
+
+                        # Wait 3 minutes (180 seconds) after PR review before auto-advancing
+                        # This gives PR review agent time to create all sub-issues
+                        if time_since_review < 180:
+                            logger.info(
+                                f"PR review ran {time_since_review:.0f}s ago for #{parent_issue_number}. "
+                                f"Waiting {180 - time_since_review:.0f}s before auto-advance to avoid race condition."
+                            )
+                            return
+                    except (ValueError, TypeError) as e:
+                        logger.warning(f"Failed to parse last review timestamp: {e}")
+
+                # SECOND: Check for open sub-issues
                 from services.github_integration import GitHubIntegration
                 from services.feature_branch_manager import feature_branch_manager
 

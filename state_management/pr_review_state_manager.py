@@ -122,6 +122,17 @@ class PRReviewStateManager:
         issue_data = data.get("pr_reviews", {}).get(parent_issue_number, {})
         return issue_data.get("iterations", [])
 
+    def get_last_review_timestamp(self, project_name: str, parent_issue_number: int) -> str:
+        """
+        Get the timestamp of the last PR review for a parent issue.
+
+        Returns:
+            ISO timestamp string of last review, or None if no review history exists
+        """
+        data = self._load_state(project_name)
+        issue_data = data.get("pr_reviews", {}).get(parent_issue_number, {})
+        return issue_data.get("last_review_at")
+
 
 # Global instance
 pr_review_state_manager = PRReviewStateManager()
