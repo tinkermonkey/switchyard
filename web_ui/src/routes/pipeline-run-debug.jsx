@@ -833,6 +833,7 @@ function PipelineRunDebugView() {
                   <Link
                     to="/agent-execution/$executionId"
                     params={{ executionId: latestAgentExecutionId }}
+                    search={{ autoAdvance: true }}
                     className="inline-flex items-center gap-2 px-4 py-2 bg-gh-canvas border border-gh-border rounded-md hover:bg-gh-border-muted transition-colors text-sm"
                   >
                     <span>View Latest Agent Execution</span>

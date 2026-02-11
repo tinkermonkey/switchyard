@@ -20,6 +20,7 @@ import RepairCycleStatus from '../components/RepairCycleStatus'
 
 function AgentExecutionView() {
   const { executionId } = Route.useParams()
+  const searchParams = Route.useSearch()
   const navigate = useNavigate()
   const { logs: allLogs } = useSocket()
   const [executionData, setExecutionData] = useState(null)
@@ -36,7 +37,7 @@ function AgentExecutionView() {
   const [pipelineRunId, setPipelineRunId] = useState(null)
   const [pipelineExecutions, setPipelineExecutions] = useState([])
   const [pipelineEvents, setPipelineEvents] = useState([])
-  const [autoAdvance, setAutoAdvance] = useState(true)
+  const [autoAdvance, setAutoAdvance] = useState(searchParams.autoAdvance ?? false)
   const [loadingExecutions, setLoadingExecutions] = useState(false)
 
   // Refs to prevent concurrent fetches and track state
@@ -213,7 +214,11 @@ function AgentExecutionView() {
       // Only auto-advance if we're not already viewing the latest execution
       if (latestExecution.execution_id !== executionId) {
         console.log('[AgentExecution] Auto-advancing to latest execution:', latestExecution.execution_id)
-        navigate({ to: '/agent-execution/$executionId', params: { executionId: latestExecution.execution_id } })
+        navigate({
+          to: '/agent-execution/$executionId',
+          params: { executionId: latestExecution.execution_id },
+          search: { autoAdvance }
+        })
       }
     }
 
@@ -226,7 +231,11 @@ function AgentExecutionView() {
     if (currentExecutionIndex > 0) {
       setAutoAdvance(false)
       const prevExecution = pipelineExecutions[currentExecutionIndex - 1]
-      navigate({ to: '/agent-execution/$executionId', params: { executionId: prevExecution.execution_id } })
+      navigate({
+        to: '/agent-execution/$executionId',
+        params: { executionId: prevExecution.execution_id },
+        search: { autoAdvance: false }
+      })
     }
   }, [currentExecutionIndex, pipelineExecutions, navigate])
 
@@ -234,7 +243,11 @@ function AgentExecutionView() {
     if (currentExecutionIndex < pipelineExecutions.length - 1) {
       setAutoAdvance(false)
       const nextExecution = pipelineExecutions[currentExecutionIndex + 1]
-      navigate({ to: '/agent-execution/$executionId', params: { executionId: nextExecution.execution_id } })
+      navigate({
+        to: '/agent-execution/$executionId',
+        params: { executionId: nextExecution.execution_id },
+        search: { autoAdvance: false }
+      })
     }
   }, [currentExecutionIndex, pipelineExecutions, navigate])
 
@@ -244,7 +257,11 @@ function AgentExecutionView() {
     if (checked && pipelineExecutions.length > 0) {
       const latestExecution = pipelineExecutions[pipelineExecutions.length - 1]
       if (latestExecution.execution_id !== executionId) {
-        navigate({ to: '/agent-execution/$executionId', params: { executionId: latestExecution.execution_id } })
+        navigate({
+          to: '/agent-execution/$executionId',
+          params: { executionId: latestExecution.execution_id },
+          search: { autoAdvance: true }
+        })
       }
     }
   }, [pipelineExecutions, executionId, navigate])
@@ -1166,4 +1183,9 @@ function AgentExecutionView() {
 
 export const Route = createFileRoute('/agent-execution/$executionId')({
   component: AgentExecutionView,
+  validateSearch: (search) => {
+    return {
+      autoAdvance: search.autoAdvance === true || search.autoAdvance === 'true'
+    }
+  },
 })

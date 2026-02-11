@@ -1,7 +1,8 @@
 import { useState, useEffect, useMemo, memo } from 'react'
+import { Link } from '@tanstack/react-router'
 import { useSocket } from '../contexts/SocketContext'
-import { 
-  Activity, AlertCircle, CheckCircle, XCircle, GitBranch, MessageSquare, 
+import {
+  Activity, AlertCircle, CheckCircle, XCircle, GitBranch, MessageSquare,
   PlayCircle, RotateCcw, AlertTriangle, Users, FileCode, Clock, ExternalLink
 } from 'lucide-react'
 
@@ -76,13 +77,14 @@ const AgentInitializedEvent = memo(({ event, onIconClick }) => {
       {agentExecutionId && (
         <div className="text-xs mt-1 flex items-center gap-2">
           <span>Execution ID: <span className="font-mono">{agentExecutionId.substring(0, 16)}...</span></span>
-          <a 
-            href={`/agent-execution/${agentExecutionId}`}
-            rel="noopener noreferrer"
+          <Link
+            to="/agent-execution/$executionId"
+            params={{ executionId: agentExecutionId }}
+            search={{ autoAdvance: false }}
             className="text-gh-accent-fg hover:underline inline-flex items-center gap-1"
           >
             View Details <ExternalLink className="w-3 h-3" />
-          </a>
+          </Link>
         </div>
       )}
     </PipelineRunEventLogEvent>
