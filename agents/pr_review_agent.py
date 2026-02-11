@@ -41,11 +41,11 @@ MAX_REVIEW_CYCLES = 3
 _NONE_FOUND_PATTERNS = [
     re.compile(r'^\s*[-*]?\s*["\']?\s*none\s+found\b', re.IGNORECASE),
     re.compile(r'^\s*[-*]?\s*(none|n/?a)\s*\.?\s*$', re.IGNORECASE),
-    re.compile(r'\bno\s+(issues?|gaps?|deviations?|findings?|critical\s+issues?|problems?)\s+found\b', re.IGNORECASE),
-    re.compile(r'\ball\s+requirements\s+(verified|met|satisfied)\b', re.IGNORECASE),
-    re.compile(r'\b(already|previously)\s+(resolved|addressed|fixed|corrected|handled)\b', re.IGNORECASE),
-    re.compile(r'\bno\s+actionable\b', re.IGNORECASE),
-    re.compile(r'\b(clean\s+pass|no\s+concerns?)\b', re.IGNORECASE),
+    re.compile(r'^\s*[-*]?\s*no\s+(issues?|gaps?|deviations?|findings?|critical\s+issues?|problems?)\s+found\b', re.IGNORECASE | re.MULTILINE),
+    re.compile(r'^\s*[-*]?\s*all\s+requirements\s+(verified|met|satisfied)\b', re.IGNORECASE | re.MULTILINE),
+    re.compile(r'^\s*[-*]?\s*(already|previously)\s+(resolved|addressed|fixed|corrected|handled)\b', re.IGNORECASE | re.MULTILINE),
+    re.compile(r'^\s*[-*]?\s*no\s+actionable\b', re.IGNORECASE | re.MULTILINE),
+    re.compile(r'^\s*[-*]?\s*(clean\s+pass|no\s+concerns?)\b', re.IGNORECASE | re.MULTILINE),
 ]
 
 # Structured finding pattern: bullet with bold title followed by colon.
@@ -530,45 +530,27 @@ If all requirements are met, write "All requirements verified - no gaps found" a
 
         # Create one issue per severity with findings
         for severity, items in severity_sections.items():
-            if items and not self._is_none_found(items):
-                if self._has_actionable_findings(items):
-                    issues.append({
-                        'title': f"[PR Review] {severity} issues from {source}",
-                        'body': self._format_issue_body(severity, items, source),
-                        'severity': severity.lower(),
-                    })
-                else:
-                    logger.warning(
-                        f"PR review false-positive prevented: {severity} section from {source} "
-                        f"has content but no structured findings: {items[:120]}"
-                    )
+            if self._is_actionable_section(items, severity, source):
+                issues.append({
+                    'title': f"[PR Review] {severity} issues from {source}",
+                    'body': self._format_issue_body(severity, items, source),
+                    'severity': severity.lower(),
+                })
 
         # Create issues for gaps and deviations
-        if gaps and not self._is_none_found(gaps):
-            if self._has_actionable_findings(gaps):
-                issues.append({
-                    'title': f"[PR Review] Implementation gaps - {source}",
-                    'body': self._format_issue_body("Gap", gaps, source),
-                    'severity': 'high',
-                })
-            else:
-                logger.warning(
-                    f"PR review false-positive prevented: Gaps section from {source} "
-                    f"has content but no structured findings: {gaps[:120]}"
-                )
+        if self._is_actionable_section(gaps, "Gaps", source):
+            issues.append({
+                'title': f"[PR Review] Implementation gaps - {source}",
+                'body': self._format_issue_body("Gap", gaps, source),
+                'severity': 'high',
+            })
 
-        if deviations and not self._is_none_found(deviations):
-            if self._has_actionable_findings(deviations):
-                issues.append({
-                    'title': f"[PR Review] Implementation deviations - {source}",
-                    'body': self._format_issue_body("Deviation", deviations, source),
-                    'severity': 'medium',
-                })
-            else:
-                logger.warning(
-                    f"PR review false-positive prevented: Deviations section from {source} "
-                    f"has content but no structured findings: {deviations[:120]}"
-                )
+        if self._is_actionable_section(deviations, "Deviations", source):
+            issues.append({
+                'title': f"[PR Review] Implementation deviations - {source}",
+                'body': self._format_issue_body("Deviation", deviations, source),
+                'severity': 'medium',
+            })
 
         return issues
 
@@ -596,6 +578,29 @@ If all requirements are met, write "All requirements verified - no gaps found" a
         against false positives when _is_none_found() misses a variant.
         """
         return bool(_ACTIONABLE_FINDING_PATTERN.search(content))
+
+    def _is_actionable_section(self, content: str, label: str, source: str) -> bool:
+        """Determine whether a review section contains actionable findings.
+
+        Checks _has_actionable_findings() first so that structured findings
+        are never silently suppressed, even if the text also contains
+        'none found'-like phrases (e.g., describing previously resolved issues).
+        """
+        if not content:
+            return False
+        if self._has_actionable_findings(content):
+            if self._is_none_found(content):
+                logger.info(
+                    f"PR review {label} section from {source} contains both none-found "
+                    f"language and structured findings — creating issue"
+                )
+            return True
+        if not self._is_none_found(content):
+            logger.warning(
+                f"PR review false-positive prevented: {label} section from {source} "
+                f"has content but no structured findings: {content[:200]}"
+            )
+        return False
 
     def _format_issue_body(self, severity: str, items: str, source: str) -> str:
         return (

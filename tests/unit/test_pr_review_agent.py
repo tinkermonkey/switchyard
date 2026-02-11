@@ -173,12 +173,19 @@ class TestIsNoneFound:
         ) is True
 
     def test_detects_already_resolved_language(self, agent):
+        # Only matches when "already/previously" appears at line-start
+        assert agent._is_none_found(
+            "Already resolved during the development phase"
+        ) is True
+        assert agent._is_none_found(
+            "Previously addressed in earlier commits"
+        ) is True
+
+    def test_already_resolved_mid_sentence_not_matched(self, agent):
+        """Mid-sentence 'already resolved' must not match (could be inside a finding)."""
         assert agent._is_none_found(
             "Issues were already resolved during the development phase"
-        ) is True
-        assert agent._is_none_found(
-            "All items previously addressed in earlier commits"
-        ) is True
+        ) is False
 
     def test_detects_clean_pass_language(self, agent):
         assert agent._is_none_found("Clean pass - no issues to report") is True
@@ -201,6 +208,18 @@ class TestIsNoneFound:
     def test_does_not_false_positive_on_none_substring(self, agent):
         """'None of these are blocking' contains 'none' but is real content."""
         assert agent._is_none_found("None of these are blocking but they should be fixed") is False
+
+    def test_does_not_match_phrases_inside_finding_descriptions(self, agent):
+        """Anchored patterns must not match when the phrase is inside a finding."""
+        assert agent._is_none_found(
+            "- **Previously Resolved Bug Returned**: The fix for #123 was reverted"
+        ) is False
+        assert agent._is_none_found(
+            "- **No Concern For Security**: Endpoint exposes user data without auth"
+        ) is False
+        assert agent._is_none_found(
+            "- **No Actionable Error Messages**: API returns generic 500s"
+        ) is False
 
     def test_rejects_actual_content(self, agent):
         assert agent._is_none_found("- **Bug**: Something is broken") is False
@@ -603,3 +622,75 @@ No deviations found
         titles = [f['title'] for f in findings]
         assert any('gaps' in t.lower() for t in titles)
         assert any('deviations' in t.lower() for t in titles)
+
+    def test_unstructured_prose_prevented_by_actionable_check(self, agent):
+        """Content that passes _is_none_found but fails _has_actionable_findings."""
+        output = """
+### Critical Issues
+The code has some potential concerns around error handling that may warrant attention in future iterations.
+
+### High Priority Issues
+None found
+
+### Medium Priority Issues
+None found
+
+### Low Priority / Nice-to-Have
+None found
+"""
+        findings = agent._parse_review_findings(output, "PR Code Review")
+        assert len(findings) == 0
+
+    def test_structured_findings_not_suppressed_by_none_found_phrases(self, agent):
+        """Real findings describing previously-resolved items must still create issues."""
+        output = """
+### Critical Issues
+- **Previously Resolved Bug Returned**: The fix for #123 was reverted by this PR
+
+### High Priority Issues
+None found
+
+### Medium Priority Issues
+None found
+
+### Low Priority / Nice-to-Have
+None found
+"""
+        findings = agent._parse_review_findings(output, "PR Code Review")
+        assert len(findings) == 1
+        assert findings[0]['severity'] == 'critical'
+
+    def test_mixed_content_with_finding_and_none_language(self, agent):
+        """A real finding followed by 'no issues found' text should still create an issue."""
+        output = """
+### Critical Issues
+- **SQL Injection**: User input not sanitized
+No other issues found in this module
+
+### High Priority Issues
+None found
+
+### Medium Priority Issues
+None found
+
+### Low Priority / Nice-to-Have
+None found
+"""
+        findings = agent._parse_review_findings(output, "PR Code Review")
+        assert len(findings) == 1
+        assert findings[0]['severity'] == 'critical'
+
+    def test_gaps_unstructured_prose_prevented(self, agent):
+        """Gaps with prose but no structured findings should not create issues."""
+        output = """
+### Gaps Found
+The implementation covers the core requirements well, though there are minor areas that could benefit from additional polish.
+
+### Deviations
+The overall approach aligns with the architectural design with some minor stylistic differences.
+
+### Verified
+- Core authentication flow
+"""
+        findings = agent._parse_review_findings(output, "Software Architect Output")
+        assert len(findings) == 0
