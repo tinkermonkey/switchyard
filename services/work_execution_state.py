@@ -1543,19 +1543,29 @@ class WorkExecutionStateTracker:
                                     )
 
                                     # Special handling for dev_environment_verifier agent
-                                    # BUG FIX: Synchronize dev container state when verification container dies
+                                    # Only reset to UNVERIFIED if the current state is NOT already VERIFIED.
+                                    # A later verifier execution may have already succeeded, in which case
+                                    # this stuck record is from a superseded execution and should not clobber
+                                    # the verified state.
                                     if agent == 'dev_environment_verifier':
                                         try:
                                             from services.dev_container_state import dev_container_state, DevContainerStatus
-                                            logger.info(
-                                                f"Stuck dev_environment_verifier detected for {project_name}, "
-                                                f"resetting dev container state to UNVERIFIED"
-                                            )
-                                            dev_container_state.set_status(
-                                                project_name=project_name,
-                                                status=DevContainerStatus.UNVERIFIED,
-                                                error_message="Verification container died before completion"
-                                            )
+                                            current_status = dev_container_state.get_status(project_name)
+                                            if current_status == DevContainerStatus.VERIFIED:
+                                                logger.info(
+                                                    f"Stuck dev_environment_verifier detected for {project_name}, "
+                                                    f"but dev container is already VERIFIED — skipping reset"
+                                                )
+                                            else:
+                                                logger.info(
+                                                    f"Stuck dev_environment_verifier detected for {project_name}, "
+                                                    f"resetting dev container state to UNVERIFIED"
+                                                )
+                                                dev_container_state.set_status(
+                                                    project_name=project_name,
+                                                    status=DevContainerStatus.UNVERIFIED,
+                                                    error_message="Verification container died before completion"
+                                                )
                                         except Exception as e:
                                             logger.error(
                                                 f"Failed to update dev container state for {project_name}: {e}",
@@ -1563,19 +1573,26 @@ class WorkExecutionStateTracker:
                                             )
 
                                     # Special handling for dev_environment_setup agent
-                                    # Reset to UNVERIFIED so setup can be retried automatically
+                                    # Only reset if not already VERIFIED (a verifier may have already confirmed).
                                     if agent == 'dev_environment_setup':
                                         try:
                                             from services.dev_container_state import dev_container_state, DevContainerStatus
-                                            logger.info(
-                                                f"Stuck dev_environment_setup detected for {project_name}, "
-                                                f"resetting dev container state to UNVERIFIED"
-                                            )
-                                            dev_container_state.set_status(
-                                                project_name=project_name,
-                                                status=DevContainerStatus.UNVERIFIED,
-                                                error_message="Setup container died before completion"
-                                            )
+                                            current_status = dev_container_state.get_status(project_name)
+                                            if current_status == DevContainerStatus.VERIFIED:
+                                                logger.info(
+                                                    f"Stuck dev_environment_setup detected for {project_name}, "
+                                                    f"but dev container is already VERIFIED — skipping reset"
+                                                )
+                                            else:
+                                                logger.info(
+                                                    f"Stuck dev_environment_setup detected for {project_name}, "
+                                                    f"resetting dev container state to UNVERIFIED"
+                                                )
+                                                dev_container_state.set_status(
+                                                    project_name=project_name,
+                                                    status=DevContainerStatus.UNVERIFIED,
+                                                    error_message="Setup container died before completion"
+                                                )
                                         except Exception as e:
                                             logger.error(
                                                 f"Failed to update dev container state for {project_name}: {e}",
