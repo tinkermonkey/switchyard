@@ -560,8 +560,8 @@ class AgentExecutor:
                     if execution.get('outcome') == 'in_progress':
                         # Found our current execution — it hasn't been recorded yet
                         break
-                    if execution.get('outcome') in ['success', 'failure', 'cancelled']:
-                        # docker_runner already recorded the outcome for this execution
+                    if execution.get('outcome') in ['success', 'failure', 'cancelled', 'blocked']:
+                        # Terminal outcome already recorded for this execution
                         already_recorded = True
                         logger.debug(
                             f"Execution outcome already recorded by docker_runner for "
@@ -662,7 +662,7 @@ class AgentExecutor:
                             continue
                         if execution.get('outcome') == 'in_progress':
                             break
-                        if execution.get('outcome') in ['success', 'failure', 'cancelled']:
+                        if execution.get('outcome') in ['success', 'failure', 'cancelled', 'blocked']:
                             already_recorded = True
                             logger.debug(
                                 f"Execution outcome already recorded by docker_runner for "
