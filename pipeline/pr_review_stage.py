@@ -19,6 +19,9 @@ from config.manager import ConfigManager
 from config.state_manager import GitHubStateManager
 from state_management.pr_review_state_manager import pr_review_state_manager
 from agents.non_retryable import NonRetryableAgentError
+from monitoring.timestamp_utils import utc_now, utc_isoformat
+from monitoring.observability import EventType
+from services.cancellation import get_cancellation_signal
 
 logger = logging.getLogger(__name__)
 
@@ -68,13 +71,23 @@ class PRReviewStage(PipelineStage):
         name: str = "pr_review",
         pr_review_agent: str = "pr_code_reviewer",
         requirements_verifier_agent: str = "requirements_verifier",
+        max_agent_calls: int = 20,
         **kwargs
     ):
         super().__init__(name, **kwargs)
+
+        # Validate required parameters
+        if not pr_review_agent or not requirements_verifier_agent:
+            raise ValueError("pr_review_agent and requirements_verifier_agent are required")
+
         self.pr_review_agent = pr_review_agent
         self.requirements_verifier_agent = requirements_verifier_agent
         self.config_manager = ConfigManager()
         self.state_manager = GitHubStateManager()
+
+        # Circuit breaker for cost control
+        self.max_agent_calls = max_agent_calls
+        self._agent_call_count = 0
 
     async def execute(self, context: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -83,9 +96,17 @@ class PRReviewStage(PipelineStage):
         This method runs in the orchestrator process (not Docker).
         It orchestrates multiple agent invocations, each running in Docker.
         """
+        # Reset circuit breaker counter for this execution
+        self._agent_call_count = 0
+
+        # Get observability manager
+        obs = context.get("observability")
+        start_time = utc_now()
+
         task_context = context.get('context', {})
         project_name = task_context.get('project', 'unknown')
         issue_number = task_context.get('issue_number')
+        pipeline_run_id = context.get("pipeline_run_id")
 
         # Resolve parent issue number
         parent_issue_number = self._resolve_parent_issue_number(task_context, project_name)
@@ -94,260 +115,451 @@ class PRReviewStage(PipelineStage):
             context['markdown_analysis'] = "## PR Review Failed\n\nCould not determine parent issue number."
             return context
 
+        task_id = context.get("task_id", f"pr_review_{parent_issue_number}")
+
+        # Emit task received
+        if obs:
+            obs.emit_task_received("pr_review_stage", task_id, project_name, context, pipeline_run_id)
+
         logger.info(f"PR Review Stage executing for parent issue #{parent_issue_number} in {project_name}")
 
-        # Check review cycle count
-        trigger_source = task_context.get('trigger_source', '')
-        review_count = pr_review_state_manager.get_review_count(project_name, parent_issue_number)
-
-        if trigger_source == 'manual' and review_count >= MAX_REVIEW_CYCLES:
-            logger.info(f"Manual trigger - resetting review cycle count")
-            pr_review_state_manager.reset_review_count(project_name, parent_issue_number)
-            review_count = 0
-
-        if review_count >= MAX_REVIEW_CYCLES:
-            msg = f"Review cycle limit ({MAX_REVIEW_CYCLES}) reached for #{parent_issue_number}"
-            logger.warning(msg)
-            raise NonRetryableAgentError(msg)
-
-        current_cycle = review_count + 1
-        logger.info(f"Starting review cycle {current_cycle}/{MAX_REVIEW_CYCLES}")
-
-        # Get project config
-        project_config = self.config_manager.get_project_config(project_name)
-        github_config = project_config.github
-        repo = f"{github_config['org']}/{github_config['repo']}"
-
-        # Find PR for this parent issue
-        pr_url = await self._find_pr_url(github_config, parent_issue_number)
-        if not pr_url:
-            raise NonRetryableAgentError(
-                f"No PR found for parent issue #{parent_issue_number} in {repo}"
+        # Record execution start for state tracking
+        if issue_number and 'column' in task_context:
+            from services.work_execution_state import work_execution_tracker
+            work_execution_tracker.record_execution_start(
+                project_name, issue_number, task_context['column'], "pr_review_stage"
             )
 
-        # Get AgentExecutor (for launching Docker containers)
-        agent_executor = get_agent_executor()
-
-        all_created_issues = []
-        review_summary_parts = []
-        review_found_issues = False
-        phases_attempted = 0
-        phases_completed = 0
-
-        # ---- Phase 1: PR Code Review ----
-        logger.info(f"Phase 1: Running PR code review for {pr_url}")
-        phases_attempted += 1
         try:
-            # Build prompt for pr_code_reviewer
-            pr_review_prompt = self._build_pr_review_prompt(pr_url)
+            # Check review cycle count
+            trigger_source = task_context.get('trigger_source', '')
+            review_count = pr_review_state_manager.get_review_count(project_name, parent_issue_number)
 
-            # Launch pr_code_reviewer in Docker (via AgentExecutor)
-            pr_review_result = await agent_executor.execute_agent(
-                agent_name=self.pr_review_agent,
-                project_name=project_name,
-                task_context={
-                    **task_context,
-                    'pr_url': pr_url,
-                    'phase': 'code_review',
-                    'direct_prompt': pr_review_prompt,
-                    # IMPORTANT: Don't skip workspace prep - agent needs project code
-                    'skip_workspace_prep': False,
-                },
-                execution_type="pr_review_phase1"
-            )
+            if trigger_source == 'manual' and review_count >= MAX_REVIEW_CYCLES:
+                logger.info(f"Manual trigger - resetting review cycle count")
+                pr_review_state_manager.reset_review_count(project_name, parent_issue_number)
+                review_count = 0
 
-            # Parse findings
-            pr_review_text = pr_review_result.get('markdown_analysis', '')
-            review_issues = self._parse_review_findings(pr_review_text, "PR Code Review")
-            review_summary_parts.append(f"### PR Code Review\n\n{pr_review_text}")
-            phases_completed += 1
+            if review_count >= MAX_REVIEW_CYCLES:
+                msg = f"Review cycle limit ({MAX_REVIEW_CYCLES}) reached for #{parent_issue_number}"
+                logger.warning(msg)
+                raise NonRetryableAgentError(msg)
 
-            if review_issues:
-                review_found_issues = True
-                created = await self._create_review_issues(
-                    review_issues, repo, github_config, parent_issue_number, project_name
+            current_cycle = review_count + 1
+            logger.info(f"Starting review cycle {current_cycle}/{MAX_REVIEW_CYCLES}")
+
+            # Get project config
+            project_config = self.config_manager.get_project_config(project_name)
+            github_config = project_config.github
+            repo = f"{github_config['org']}/{github_config['repo']}"
+
+            # Find PR for this parent issue
+            pr_url = await self._find_pr_url(github_config, parent_issue_number)
+            if not pr_url:
+                raise NonRetryableAgentError(
+                    f"No PR found for parent issue #{parent_issue_number} in {repo}"
                 )
-                all_created_issues.extend(created)
-                logger.info(f"Phase 1: Created {len(created)} issues from PR review")
-            else:
-                logger.info("Phase 1: No issues found in PR review")
 
-        except Exception as e:
-            logger.error(f"Phase 1 PR review failed: {e}", exc_info=True)
-            review_summary_parts.append(f"### PR Code Review\n\nFailed: {e}")
+            # Emit agent initialized
+            if obs:
+                obs.emit_agent_initialized("pr_review_stage", task_id, project_name, {
+                    "parent_issue": parent_issue_number,
+                    "pr_url": pr_url,
+                    "review_cycle": current_cycle,
+                    "max_cycles": MAX_REVIEW_CYCLES,
+                }, pipeline_run_id)
 
-        # ---- Phase 2: Context Verification ----
-        # Load context from discussion and parent issue
-        discussion_outputs = self._load_discussion_outputs(project_name, parent_issue_number)
-        parent_issue_body = self._get_parent_issue_body(repo, parent_issue_number)
+            # Get AgentExecutor (for launching Docker containers)
+            agent_executor = get_agent_executor()
 
-        context_checks = [
-            ("Parent Issue Requirements", parent_issue_body),
-            ("Idea Researcher Output", discussion_outputs.get('idea_researcher')),
-            ("Business Analyst Output", discussion_outputs.get('business_analyst')),
-            ("Software Architect Output", discussion_outputs.get('software_architect')),
-        ]
+            all_created_issues = []
+            review_summary_parts = []
+            review_found_issues = False
+            phases_attempted = 0
+            phases_completed = 0
 
-        for check_name, check_content in context_checks:
-            if not check_content:
-                logger.info(f"Skipping {check_name} verification (no content)")
-                continue
+            # ---- Phase 1: PR Code Review ----
+            # Check for cancellation
+            if issue_number and get_cancellation_signal().is_cancelled(project_name, issue_number):
+                logger.warning(f"PR review cancelled for {project_name}/#{issue_number}")
+                context['markdown_analysis'] = "## PR Review Cancelled\n\nPipeline run ended externally."
+                return context
 
-            logger.info(f"Phase 2: Verifying against {check_name}")
+            # Check circuit breaker
+            if self._agent_call_count >= self.max_agent_calls:
+                logger.error(f"Circuit breaker triggered: {self._agent_call_count} >= {self.max_agent_calls}")
+                context['markdown_analysis'] = "## PR Review Failed\n\nCircuit breaker triggered (max agent calls reached)."
+                return context
+
+            logger.info(f"Phase 1: Running PR code review for {pr_url}")
+            phase1_start = utc_now()
             phases_attempted += 1
-            try:
-                # Build verification prompt
-                verification_prompt = self._build_verification_prompt(
-                    pr_url, check_name, check_content
-                )
 
-                # Launch requirements_verifier in Docker (via AgentExecutor)
-                verification_result = await agent_executor.execute_agent(
-                    agent_name=self.requirements_verifier_agent,
+            # Emit phase started event
+            if obs:
+                obs.emit(EventType.PR_REVIEW_PHASE_STARTED, "pr_review_stage", task_id, project_name, {
+                    "phase": 1,
+                    "phase_name": "PR Code Review",
+                    "agent": self.pr_review_agent,
+                }, pipeline_run_id)
+
+            try:
+                self._agent_call_count += 1
+                # Build prompt for pr_code_reviewer
+                pr_review_prompt = self._build_pr_review_prompt(pr_url)
+
+                # Launch pr_code_reviewer in Docker (via AgentExecutor)
+                pr_review_result = await agent_executor.execute_agent(
+                    agent_name=self.pr_review_agent,
                     project_name=project_name,
                     task_context={
                         **task_context,
                         'pr_url': pr_url,
-                        'check_name': check_name,
-                        'check_content': check_content,
-                        'phase': 'requirements_verification',
-                        'direct_prompt': verification_prompt,
+                        'phase': 'code_review',
+                        'direct_prompt': pr_review_prompt,
                         # IMPORTANT: Don't skip workspace prep - agent needs project code
                         'skip_workspace_prep': False,
                     },
-                    execution_type="pr_review_phase2"
+                    execution_type="pr_review_phase1"
                 )
 
                 # Parse findings
-                verification_text = verification_result.get('markdown_analysis', '')
-                gap_issues = self._parse_review_findings(verification_text, check_name)
-                review_summary_parts.append(f"### {check_name} Verification\n\n{verification_text}")
+                pr_review_text = pr_review_result.get('markdown_analysis', '')
+                review_issues = self._parse_review_findings(pr_review_text, "PR Code Review")
+                review_summary_parts.append(f"### PR Code Review\n\n{pr_review_text}")
                 phases_completed += 1
 
-                if gap_issues:
+                phase1_duration = (utc_now() - phase1_start).total_seconds()
+                logger.info(f"Phase 1 completed in {phase1_duration:.1f}s")
+
+                if review_issues:
                     review_found_issues = True
                     created = await self._create_review_issues(
-                        gap_issues, repo, github_config, parent_issue_number, project_name
+                        review_issues, repo, github_config, parent_issue_number, project_name
                     )
                     all_created_issues.extend(created)
-                    logger.info(f"Created {len(created)} issues from {check_name} verification")
+                    logger.info(f"Phase 1: Created {len(created)} issues from PR review")
                 else:
-                    logger.info(f"No gaps found in {check_name} verification")
+                    logger.info("Phase 1: No issues found in PR review")
+
+                # Emit phase completed event
+                if obs:
+                    obs.emit(EventType.PR_REVIEW_PHASE_COMPLETED, "pr_review_stage", task_id, project_name, {
+                        "phase": 1,
+                        "phase_name": "PR Code Review",
+                        "success": True,
+                        "issues_found": len(review_issues),
+                        "duration_seconds": phase1_duration,
+                    }, pipeline_run_id)
 
             except Exception as e:
-                logger.error(f"{check_name} verification failed: {e}", exc_info=True)
-                review_summary_parts.append(f"### {check_name} Verification\n\nFailed: {e}")
+                logger.error(f"Phase 1 PR review failed: {e}", exc_info=True)
+                review_summary_parts.append(f"### PR Code Review\n\nFailed: {e}")
 
-        # ---- Phase 3: CI Status Check ----
-        # This runs locally (no Docker) using gh CLI
-        logger.info(f"Phase 3: Checking CI status for {pr_url}")
-        phases_attempted += 1
-        try:
-            failures, pending = self._check_ci_status(pr_url, repo)
-            phases_completed += 1
+                # Emit phase failed event
+                if obs:
+                    phase1_duration = (utc_now() - phase1_start).total_seconds()
+                    obs.emit(EventType.PR_REVIEW_PHASE_COMPLETED, "pr_review_stage", task_id, project_name, {
+                        "phase": 1,
+                        "phase_name": "PR Code Review",
+                        "success": False,
+                        "error": str(e),
+                        "duration_seconds": phase1_duration,
+                    }, pipeline_run_id)
 
-            if failures:
-                review_found_issues = True
-                ci_issue_spec = self._build_ci_failure_issue(failures, pr_url)
-                created = await self._create_review_issues(
-                    [ci_issue_spec], repo, github_config, parent_issue_number, project_name
+            # ---- Phase 2: Context Verification ----
+            # Load context from discussion and parent issue
+            discussion_outputs = self._load_discussion_outputs(project_name, parent_issue_number)
+            parent_issue_body = self._get_parent_issue_body(repo, parent_issue_number)
+
+            context_checks = [
+                ("Parent Issue Requirements", parent_issue_body),
+                ("Idea Researcher Output", discussion_outputs.get('idea_researcher')),
+                ("Business Analyst Output", discussion_outputs.get('business_analyst')),
+                ("Software Architect Output", discussion_outputs.get('software_architect')),
+            ]
+
+            phase2_index = 0
+            for check_name, check_content in context_checks:
+                if not check_content:
+                    logger.info(f"Skipping {check_name} verification (no content)")
+                    continue
+
+                # Check for cancellation before each verification
+                if issue_number and get_cancellation_signal().is_cancelled(project_name, issue_number):
+                    logger.warning(f"PR review cancelled for {project_name}/#{issue_number}")
+                    context['markdown_analysis'] = "## PR Review Cancelled\n\nPipeline run ended externally."
+                    return context
+
+                # Check circuit breaker before each verification
+                if self._agent_call_count >= self.max_agent_calls:
+                    logger.error(f"Circuit breaker triggered: {self._agent_call_count} >= {self.max_agent_calls}")
+                    context['markdown_analysis'] = "## PR Review Failed\n\nCircuit breaker triggered (max agent calls reached)."
+                    return context
+
+                phase2_index += 1
+                logger.info(f"Phase 2.{phase2_index}: Verifying against {check_name}")
+                phase2_start = utc_now()
+                phases_attempted += 1
+
+                # Emit phase started event
+                if obs:
+                    obs.emit(EventType.PR_REVIEW_PHASE_STARTED, "pr_review_stage", task_id, project_name, {
+                        "phase": 2,
+                        "sub_phase": phase2_index,
+                        "phase_name": f"Context Verification: {check_name}",
+                        "agent": self.requirements_verifier_agent,
+                    }, pipeline_run_id)
+
+                try:
+                    self._agent_call_count += 1
+                    # Build verification prompt
+                    verification_prompt = self._build_verification_prompt(
+                        pr_url, check_name, check_content
+                    )
+
+                    # Launch requirements_verifier in Docker (via AgentExecutor)
+                    verification_result = await agent_executor.execute_agent(
+                        agent_name=self.requirements_verifier_agent,
+                        project_name=project_name,
+                        task_context={
+                            **task_context,
+                            'pr_url': pr_url,
+                            'check_name': check_name,
+                            'check_content': check_content,
+                            'phase': 'requirements_verification',
+                            'direct_prompt': verification_prompt,
+                            # IMPORTANT: Don't skip workspace prep - agent needs project code
+                            'skip_workspace_prep': False,
+                        },
+                        execution_type="pr_review_phase2"
+                    )
+
+                    # Parse findings
+                    verification_text = verification_result.get('markdown_analysis', '')
+                    gap_issues = self._parse_review_findings(verification_text, check_name)
+                    review_summary_parts.append(f"### {check_name} Verification\n\n{verification_text}")
+                    phases_completed += 1
+
+                    phase2_duration = (utc_now() - phase2_start).total_seconds()
+                    logger.info(f"Phase 2.{phase2_index} completed in {phase2_duration:.1f}s")
+
+                    if gap_issues:
+                        review_found_issues = True
+                        created = await self._create_review_issues(
+                            gap_issues, repo, github_config, parent_issue_number, project_name
+                        )
+                        all_created_issues.extend(created)
+                        logger.info(f"Created {len(created)} issues from {check_name} verification")
+                    else:
+                        logger.info(f"No gaps found in {check_name} verification")
+
+                    # Emit phase completed event
+                    if obs:
+                        obs.emit(EventType.PR_REVIEW_PHASE_COMPLETED, "pr_review_stage", task_id, project_name, {
+                            "phase": 2,
+                            "sub_phase": phase2_index,
+                            "phase_name": f"Context Verification: {check_name}",
+                            "success": True,
+                            "issues_found": len(gap_issues),
+                            "duration_seconds": phase2_duration,
+                        }, pipeline_run_id)
+
+                except Exception as e:
+                    logger.error(f"{check_name} verification failed: {e}", exc_info=True)
+                    review_summary_parts.append(f"### {check_name} Verification\n\nFailed: {e}")
+
+                    # Emit phase failed event
+                    if obs:
+                        phase2_duration = (utc_now() - phase2_start).total_seconds()
+                        obs.emit(EventType.PR_REVIEW_PHASE_COMPLETED, "pr_review_stage", task_id, project_name, {
+                            "phase": 2,
+                            "sub_phase": phase2_index,
+                            "phase_name": f"Context Verification: {check_name}",
+                            "success": False,
+                            "error": str(e),
+                            "duration_seconds": phase2_duration,
+                        }, pipeline_run_id)
+
+            # ---- Phase 3: CI Status Check ----
+            # Check for cancellation
+            if issue_number and get_cancellation_signal().is_cancelled(project_name, issue_number):
+                logger.warning(f"PR review cancelled for {project_name}/#{issue_number}")
+                context['markdown_analysis'] = "## PR Review Cancelled\n\nPipeline run ended externally."
+                return context
+
+            # This runs locally (no Docker) using gh CLI
+            logger.info(f"Phase 3: Checking CI status for {pr_url}")
+            phase3_start = utc_now()
+            phases_attempted += 1
+
+            # Emit phase started event
+            if obs:
+                obs.emit(EventType.PR_REVIEW_PHASE_STARTED, "pr_review_stage", task_id, project_name, {
+                    "phase": 3,
+                    "phase_name": "CI Status Check",
+                    "agent": "local_gh_cli",
+                }, pipeline_run_id)
+
+            try:
+                failures, pending = self._check_ci_status(pr_url, repo)
+                phases_completed += 1
+
+                phase3_duration = (utc_now() - phase3_start).total_seconds()
+                logger.info(f"Phase 3 completed in {phase3_duration:.1f}s")
+
+                if failures:
+                    review_found_issues = True
+                    ci_issue_spec = self._build_ci_failure_issue(failures, pr_url)
+                    created = await self._create_review_issues(
+                        [ci_issue_spec], repo, github_config, parent_issue_number, project_name
+                    )
+                    all_created_issues.extend(created)
+                    logger.info(f"Phase 3: {len(failures)} CI checks failing, created {len(created)} issues")
+                    review_summary_parts.append(
+                        f"### CI Status\n\n{len(failures)} failing check(s):\n\n"
+                        + self._format_ci_table(failures)
+                    )
+                elif pending:
+                    logger.warning(f"Phase 3: {len(pending)} CI checks still pending")
+                    review_summary_parts.append(
+                        f"### CI Status\n\n{len(pending)} check(s) still pending:\n\n"
+                        + self._format_ci_table(pending)
+                    )
+                else:
+                    logger.info("Phase 3: All CI checks passed")
+                    review_summary_parts.append("### CI Status\n\nAll CI checks passed.")
+
+                # Emit phase completed event
+                if obs:
+                    obs.emit(EventType.PR_REVIEW_PHASE_COMPLETED, "pr_review_stage", task_id, project_name, {
+                        "phase": 3,
+                        "phase_name": "CI Status Check",
+                        "success": True,
+                        "failures_found": len(failures),
+                        "pending_count": len(pending),
+                        "duration_seconds": phase3_duration,
+                    }, pipeline_run_id)
+
+            except Exception as e:
+                logger.error(f"Phase 3 CI status check failed: {e}", exc_info=True)
+                review_summary_parts.append(f"### CI Status\n\nFailed: {e}")
+
+                # Emit phase failed event
+                if obs:
+                    phase3_duration = (utc_now() - phase3_start).total_seconds()
+                    obs.emit(EventType.PR_REVIEW_PHASE_COMPLETED, "pr_review_stage", task_id, project_name, {
+                        "phase": 3,
+                        "phase_name": "CI Status Check",
+                        "success": False,
+                        "error": str(e),
+                        "duration_seconds": phase3_duration,
+                    }, pipeline_run_id)
+
+            # ---- Post-review decision ----
+            created_issue_numbers = [int(i['number']) for i in all_created_issues]
+            manual_progression_made = False
+
+            if phases_completed == 0:
+                # All phases failed - inconclusive
+                logger.error(f"All review phases failed for #{parent_issue_number}")
+                pr_review_state_manager.increment_review_count(project_name, parent_issue_number, [])
+
+            elif phases_completed < phases_attempted and not review_found_issues:
+                # Some phases failed, no issues found - inconclusive
+                logger.warning(
+                    f"Only {phases_completed}/{phases_attempted} phases completed "
+                    f"for #{parent_issue_number}. Treating as inconclusive."
                 )
-                all_created_issues.extend(created)
-                logger.info(f"Phase 3: {len(failures)} CI checks failing, created {len(created)} issues")
-                review_summary_parts.append(
-                    f"### CI Status\n\n{len(failures)} failing check(s):\n\n"
-                    + self._format_ci_table(failures)
+                pr_review_state_manager.increment_review_count(project_name, parent_issue_number, [])
+
+            elif review_found_issues:
+                # Issues found - return to development
+                pr_review_state_manager.increment_review_count(
+                    project_name, parent_issue_number, created_issue_numbers
                 )
-            elif pending:
-                logger.warning(f"Phase 3: {len(pending)} CI checks still pending")
-                review_summary_parts.append(
-                    f"### CI Status\n\n{len(pending)} check(s) still pending:\n\n"
-                    + self._format_ci_table(pending)
-                )
+
+                if current_cycle < MAX_REVIEW_CYCLES:
+                    if all_created_issues:
+                        await self._move_issues_to_development(
+                            all_created_issues, project_name, github_config
+                        )
+                    self._return_parent_to_development(project_name, parent_issue_number)
+                    manual_progression_made = True
+                else:
+                    if all_created_issues:
+                        summary_comment = self._build_cycle_limit_comment(
+                            current_cycle, all_created_issues
+                        )
+                        self._post_comment_on_issue(repo, parent_issue_number, summary_comment)
+
             else:
-                logger.info("Phase 3: All CI checks passed")
-                review_summary_parts.append("### CI Status\n\nAll CI checks passed.")
+                # Clean pass - advance to documentation
+                logger.info(f"Clean pass for #{parent_issue_number}, advancing to Documentation")
+                pr_review_state_manager.increment_review_count(project_name, parent_issue_number, [])
+                self._advance_parent_to_documentation(project_name, parent_issue_number)
+                manual_progression_made = True
+
+            # Build final summary
+            issues_summary = ""
+            if all_created_issues:
+                issues_list = "\n".join(f"- #{i['number']}: {i['title']}" for i in all_created_issues)
+                issues_summary = f"\n\n### Issues Created\n\n{issues_list}"
+
+            if phases_completed == 0:
+                review_outcome = "Inconclusive (all phases failed)"
+            elif phases_completed < phases_attempted and not review_found_issues:
+                review_outcome = f"Inconclusive ({phases_completed}/{phases_attempted} phases completed)"
+            elif review_found_issues:
+                review_outcome = "Issues found"
+            else:
+                review_outcome = "Clean pass"
+
+            context['markdown_analysis'] = (
+                f"## PR Review - Cycle {current_cycle}/{MAX_REVIEW_CYCLES}\n\n"
+                f"**PR**: {pr_url}\n"
+                f"**Parent Issue**: #{parent_issue_number}\n"
+                f"**Outcome**: {review_outcome}\n"
+                f"**Issues Created**: {len(all_created_issues)}\n"
+                + issues_summary + "\n\n"
+                + "\n\n---\n\n".join(review_summary_parts)
+            )
+
+            context['created_review_issues'] = all_created_issues
+
+            # Set manual progression flag to prevent auto-advancement
+            if manual_progression_made:
+                context['manual_progression_made'] = True
+
+            # Emit agent completed event
+            end_time = utc_now()
+            duration_ms = (end_time - start_time).total_seconds() * 1000
+
+            if obs:
+                obs.emit_agent_completed("pr_review_stage", task_id, project_name, duration_ms,
+                                       True, pipeline_run_id=pipeline_run_id,
+                                       agent_call_count=self._agent_call_count,
+                                       phases_completed=phases_completed,
+                                       phases_attempted=phases_attempted,
+                                       issues_created=len(all_created_issues))
+
+            return context
 
         except Exception as e:
-            logger.error(f"Phase 3 CI status check failed: {e}", exc_info=True)
-            review_summary_parts.append(f"### CI Status\n\nFailed: {e}")
+            logger.exception(f"PR review stage failed: {e}")
 
-        # ---- Post-review decision ----
-        created_issue_numbers = [int(i['number']) for i in all_created_issues]
-        manual_progression_made = False
+            # Emit failure event
+            end_time = utc_now()
+            duration_ms = (end_time - start_time).total_seconds() * 1000
 
-        if phases_completed == 0:
-            # All phases failed - inconclusive
-            logger.error(f"All review phases failed for #{parent_issue_number}")
-            pr_review_state_manager.increment_review_count(project_name, parent_issue_number, [])
+            if obs:
+                obs.emit_agent_completed("pr_review_stage", task_id, project_name,
+                                        duration_ms, False, error=str(e),
+                                        pipeline_run_id=pipeline_run_id,
+                                        agent_call_count=self._agent_call_count)
 
-        elif phases_completed < phases_attempted and not review_found_issues:
-            # Some phases failed, no issues found - inconclusive
-            logger.warning(
-                f"Only {phases_completed}/{phases_attempted} phases completed "
-                f"for #{parent_issue_number}. Treating as inconclusive."
-            )
-            pr_review_state_manager.increment_review_count(project_name, parent_issue_number, [])
-
-        elif review_found_issues:
-            # Issues found - return to development
-            pr_review_state_manager.increment_review_count(
-                project_name, parent_issue_number, created_issue_numbers
-            )
-
-            if current_cycle < MAX_REVIEW_CYCLES:
-                if all_created_issues:
-                    await self._move_issues_to_development(
-                        all_created_issues, project_name, github_config
-                    )
-                self._return_parent_to_development(project_name, parent_issue_number)
-                manual_progression_made = True
-            else:
-                if all_created_issues:
-                    summary_comment = self._build_cycle_limit_comment(
-                        current_cycle, all_created_issues
-                    )
-                    self._post_comment_on_issue(repo, parent_issue_number, summary_comment)
-
-        else:
-            # Clean pass - advance to documentation
-            logger.info(f"Clean pass for #{parent_issue_number}, advancing to Documentation")
-            pr_review_state_manager.increment_review_count(project_name, parent_issue_number, [])
-            self._advance_parent_to_documentation(project_name, parent_issue_number)
-            manual_progression_made = True
-
-        # Build final summary
-        issues_summary = ""
-        if all_created_issues:
-            issues_list = "\n".join(f"- #{i['number']}: {i['title']}" for i in all_created_issues)
-            issues_summary = f"\n\n### Issues Created\n\n{issues_list}"
-
-        if phases_completed == 0:
-            review_outcome = "Inconclusive (all phases failed)"
-        elif phases_completed < phases_attempted and not review_found_issues:
-            review_outcome = f"Inconclusive ({phases_completed}/{phases_attempted} phases completed)"
-        elif review_found_issues:
-            review_outcome = "Issues found"
-        else:
-            review_outcome = "Clean pass"
-
-        context['markdown_analysis'] = (
-            f"## PR Review - Cycle {current_cycle}/{MAX_REVIEW_CYCLES}\n\n"
-            f"**PR**: {pr_url}\n"
-            f"**Parent Issue**: #{parent_issue_number}\n"
-            f"**Outcome**: {review_outcome}\n"
-            f"**Issues Created**: {len(all_created_issues)}\n"
-            + issues_summary + "\n\n"
-            + "\n\n---\n\n".join(review_summary_parts)
-        )
-
-        context['created_review_issues'] = all_created_issues
-
-        # Set manual progression flag to prevent auto-advancement
-        if manual_progression_made:
-            context['manual_progression_made'] = True
-
-        return context
+            # Re-raise to let orchestrator handle
+            raise
 
     # ==================================================================================
     # HELPER METHODS (copied from pr_review_agent.py)

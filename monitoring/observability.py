@@ -164,13 +164,19 @@ class EventType(Enum):
     REPAIR_CYCLE_WARNING_REVIEW_COMPLETED = "repair_cycle_warning_review_completed"
     REPAIR_CYCLE_WARNING_REVIEW_FAILED = "repair_cycle_warning_review_failed"
     REPAIR_CYCLE_COMPLETED = "repair_cycle_completed"
-    
+
     # Repair Cycle Container Lifecycle
     REPAIR_CYCLE_CONTAINER_STARTED = "repair_cycle_container_started"
     REPAIR_CYCLE_CONTAINER_CHECKPOINT_UPDATED = "repair_cycle_container_checkpoint_updated"
     REPAIR_CYCLE_CONTAINER_RECOVERED = "repair_cycle_container_recovered"
     REPAIR_CYCLE_CONTAINER_KILLED = "repair_cycle_container_killed"
     REPAIR_CYCLE_CONTAINER_COMPLETED = "repair_cycle_container_completed"
+
+    # PR Review Stage Management
+    PR_REVIEW_STAGE_STARTED = "pr_review_stage_started"
+    PR_REVIEW_PHASE_STARTED = "pr_review_phase_started"
+    PR_REVIEW_PHASE_COMPLETED = "pr_review_phase_completed"
+    PR_REVIEW_STAGE_COMPLETED = "pr_review_stage_completed"
     
     # Conversational Loop Routing
     CONVERSATIONAL_LOOP_STARTED = "conversational_loop_started"
