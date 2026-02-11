@@ -450,6 +450,13 @@ class PipelineRunManager:
                     except Exception as e:
                         logger.error(f"Error checking/ending old pipeline runs in Elasticsearch: {e}")
                 
+                # Clear any stale cancellation signal from a previous pipeline run
+                try:
+                    from services.cancellation import get_cancellation_signal
+                    get_cancellation_signal().clear(project, issue_number)
+                except Exception as e:
+                    logger.warning(f"Failed to clear stale cancellation signal: {e}")
+
                 # Create new run
                 return self.create_pipeline_run(
                     issue_number=issue_number,
@@ -469,6 +476,11 @@ class PipelineRunManager:
             # If we can't get lock and no existing run, proceed with creation anyway
             # This is a best-effort fallback
             logger.warning("Proceeding with pipeline run creation without lock")
+            try:
+                from services.cancellation import get_cancellation_signal
+                get_cancellation_signal().clear(project, issue_number)
+            except Exception as e:
+                logger.warning(f"Failed to clear stale cancellation signal: {e}")
             return self.create_pipeline_run(
                 issue_number=issue_number,
                 issue_title=issue_title,
