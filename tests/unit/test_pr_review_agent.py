@@ -68,6 +68,43 @@ class TestParseReviewFindings:
         assert 'medium' in severities
         assert 'low' in severities
 
+    def test_parses_numbered_bullet_format(self, agent):
+        """NEW: Numbered bullets should be parsed correctly"""
+        output = """
+## PR Review Findings
+
+### Critical Issues
+1. **SQL Injection**: User input passed directly to query
+2. **XSS Vulnerability**: Unescaped output rendered to HTML
+
+### High Priority Issues
+None found
+"""
+        findings = agent._parse_review_findings(output, "PR Code Review")
+        assert len(findings) == 1
+        assert findings[0]['severity'] == 'critical'
+        # Body should contain both findings
+        assert 'SQL Injection' in findings[0]['body']
+        assert 'XSS Vulnerability' in findings[0]['body']
+
+    def test_parses_mixed_format_findings(self, agent):
+        """NEW: Mix of bullet styles should all be detected"""
+        output = """
+## PR Review Findings
+
+### Critical Issues
+1. **SQL Injection**: Numbered bullet format
+- **XSS Risk**: Dash bullet format
+* **Auth Missing**: Asterisk bullet format
+**Direct Bold**: No bullet format
+
+### High Priority Issues
+None found
+"""
+        findings = agent._parse_review_findings(output, "PR Code Review")
+        assert len(findings) == 1
+        assert findings[0]['severity'] == 'critical'
+
     def test_skips_none_found_sections(self, agent):
         output = """
 ### Critical Issues
@@ -530,6 +567,30 @@ class TestHasActionableFindings:
     def test_rejects_unstructured_bullets(self, agent):
         content = '- Some plain bullet without bold title format'
         assert agent._has_actionable_findings(content) is False
+
+    def test_detects_numbered_bullet_format(self, agent):
+        """NEW: Support numbered bullets like '1. **Title**: desc'"""
+        content = '1. **Missing Auth**: No authentication on admin endpoint'
+        assert agent._has_actionable_findings(content) is True
+
+    def test_detects_multiple_numbered_bullets(self, agent):
+        """NEW: Support multiple numbered findings"""
+        content = (
+            '1. **SQL Injection**: User input not sanitized\n'
+            '2. **XSS Risk**: User input rendered without escaping\n'
+            '3. **Missing Auth**: No authentication'
+        )
+        assert agent._has_actionable_findings(content) is True
+
+    def test_detects_no_bullet_format(self, agent):
+        """NEW: Support format without bullet like '**Title**: desc'"""
+        content = '**Unused Import**: `os` imported but not used'
+        assert agent._has_actionable_findings(content) is True
+
+    def test_detects_no_colon_format(self, agent):
+        """NEW: Support format without colon like '- **Title** desc'"""
+        content = '- **Variable Naming** Consider renaming `x` to something more descriptive'
+        assert agent._has_actionable_findings(content) is True
 
 
 class TestFalsePositivePrevention:

@@ -1,40 +1,24 @@
 """
-PR Review Agent - Automated PR review and requirements verification
+PR Review Pipeline Stage
 
-This agent runs after all sub-issues complete their SDLC pipelines.
-It performs three phases:
+Multi-phase PR review orchestration that runs in orchestrator process.
+Launches Docker containers for code review and verification phases.
 
-Phase 1: PR Code Review
-  - Uses /pr-review-toolkit:review-pr skill to review the accumulated PR
-  - Creates GitHub issues grouped by severity
-
-Phase 2: Context Verification (up to 4 separate Claude Code calls)
-  - Verifies implementation against parent issue requirements
-  - Verifies against idea researcher, business analyst, and architect outputs
-  - Creates issues for any gaps found
-
-Phase 3: CI Status Check
-  - Checks CI check status via `gh pr checks`
-  - Creates issues for any failing CI checks
-  - Pending checks are noted but do not block a clean pass
-
-Review cycle management:
-  - Cycles 1-2: Create issues and move to Development for resolution
-  - Cycle 3: Create issues but leave in Backlog, post summary on parent
-  - Beyond cycle 3: Fail with NonRetryableAgentError (manual trigger resets count)
+Similar to RepairCycleStage architecture - orchestrates multiple agent
+invocations without running in Docker itself.
 """
 
-from typing import Dict, Any, List, Optional
-from agents.non_retryable import NonRetryableAgentError
-from agents.base_analysis_agent import AnalysisAgent
+import logging
+import subprocess
+import json
+import re
+from typing import Dict, Any, List, Optional, Tuple
+from pipeline.base import PipelineStage
+from services.agent_executor import get_agent_executor
 from config.manager import ConfigManager
 from config.state_manager import GitHubStateManager
 from state_management.pr_review_state_manager import pr_review_state_manager
-from claude.claude_integration import run_claude_code
-import logging
-import json
-import re
-import subprocess
+from agents.non_retryable import NonRetryableAgentError
 
 logger = logging.getLogger(__name__)
 
@@ -54,10 +38,6 @@ _NONE_FOUND_PATTERNS = [
 ]
 
 # Structured finding patterns: Support multiple valid finding formats
-# - Bullet with bold title: - **Title**: desc
-# - Numbered bullet: 1. **Title**: desc
-# - No bullet: **Title**: desc
-# - No colon: - **Title** desc
 _ACTIONABLE_FINDING_PATTERNS = [
     re.compile(r'^\s*[-*]\s+\*\*[^*]+\*\*\s*:', re.MULTILINE),     # - **Title**: desc
     re.compile(r'^\s*\d+\.\s+\*\*[^*]+\*\*\s*:', re.MULTILINE),   # 1. **Title**: desc
@@ -66,54 +46,42 @@ _ACTIONABLE_FINDING_PATTERNS = [
 ]
 
 
-class PRReviewAgent(AnalysisAgent):
+class PRReviewStage(PipelineStage):
     """
-    PR Review Agent for automated code review and requirements verification.
+    PR Review orchestration stage.
 
-    Unlike standard maker agents, this agent:
-    1. Makes multiple Claude Code calls (up to 5)
-    2. Creates GitHub issues for findings
-    3. Manages review cycle limits
+    Runs in orchestrator (not Docker) and launches containers for:
+    - Phase 1: PR code review (pr_code_reviewer agent)
+    - Phase 2: Requirements verification (requirements_verifier agent, up to 4x)
+    - Phase 3: CI status check (local gh CLI, no Docker)
+
+    The stage itself has access to:
+    - Project directories via workspace_manager
+    - GitHub CLI (gh)
+    - All orchestrator services
+
+    Agents launched by this stage run in Docker with project code mounted.
     """
 
-    def __init__(self, agent_config: Dict[str, Any] = None):
-        super().__init__("pr_review_agent", agent_config=agent_config)
+    def __init__(
+        self,
+        name: str = "pr_review",
+        pr_review_agent: str = "pr_code_reviewer",
+        requirements_verifier_agent: str = "requirements_verifier",
+        **kwargs
+    ):
+        super().__init__(name, **kwargs)
+        self.pr_review_agent = pr_review_agent
+        self.requirements_verifier_agent = requirements_verifier_agent
         self.config_manager = ConfigManager()
         self.state_manager = GitHubStateManager()
 
-    @property
-    def agent_display_name(self) -> str:
-        return "PR Review Specialist"
-
-    @property
-    def agent_role_description(self) -> str:
-        return """I perform automated PR code review and verify implementations against original requirements, creating actionable issues for any gaps found."""
-
-    @property
-    def output_sections(self) -> List[str]:
-        return [
-            "PR Code Review",
-            "Requirements Verification",
-            "CI Status",
-            "Issues Created",
-            "Review Summary"
-        ]
-
-    def get_initial_guidelines(self) -> str:
-        return ""
-
-    def get_quality_standards(self) -> str:
-        return ""
-
-    # ==================================================================================
-    # MAIN EXECUTION - Custom multi-phase logic
-    # ==================================================================================
-
     async def execute(self, context: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Execute PR review with multi-phase analysis and issue creation.
+        Execute multi-phase PR review.
 
-        Overrides the standard execute() entirely with custom logic.
+        This method runs in the orchestrator process (not Docker).
+        It orchestrates multiple agent invocations, each running in Docker.
         """
         task_context = context.get('context', {})
         project_name = task_context.get('project', 'unknown')
@@ -126,94 +94,76 @@ class PRReviewAgent(AnalysisAgent):
             context['markdown_analysis'] = "## PR Review Failed\n\nCould not determine parent issue number."
             return context
 
-        logger.info(f"PR Review Agent executing for parent issue #{parent_issue_number} in {project_name}")
+        logger.info(f"PR Review Stage executing for parent issue #{parent_issue_number} in {project_name}")
 
-        # Manual triggers reset the cycle count so the review can proceed
+        # Check review cycle count
         trigger_source = task_context.get('trigger_source', '')
         review_count = pr_review_state_manager.get_review_count(project_name, parent_issue_number)
+
         if trigger_source == 'manual' and review_count >= MAX_REVIEW_CYCLES:
-            logger.info(
-                f"Manual trigger detected for #{parent_issue_number} with review_count={review_count} — "
-                f"resetting cycle count"
-            )
+            logger.info(f"Manual trigger - resetting review cycle count")
             pr_review_state_manager.reset_review_count(project_name, parent_issue_number)
             review_count = 0
 
-        # Check cycle limit
         if review_count >= MAX_REVIEW_CYCLES:
-            msg = (
-                f"Review cycle limit ({MAX_REVIEW_CYCLES}) reached for #{parent_issue_number}. "
-                f"No further automated reviews will be performed. "
-                f"Manually move the issue to 'In Review' to reset the cycle count and trigger a new review."
-            )
-            logger.warning(f"Review cycle limit reached for #{parent_issue_number}, failing")
+            msg = f"Review cycle limit ({MAX_REVIEW_CYCLES}) reached for #{parent_issue_number}"
+            logger.warning(msg)
             raise NonRetryableAgentError(msg)
 
         current_cycle = review_count + 1
-        logger.info(f"Starting review cycle {current_cycle}/{MAX_REVIEW_CYCLES} for #{parent_issue_number}")
+        logger.info(f"Starting review cycle {current_cycle}/{MAX_REVIEW_CYCLES}")
 
         # Get project config
         project_config = self.config_manager.get_project_config(project_name)
         github_config = project_config.github
         repo = f"{github_config['org']}/{github_config['repo']}"
-        # Find the PR for this parent issue
+
+        # Find PR for this parent issue
         pr_url = await self._find_pr_url(github_config, parent_issue_number)
         if not pr_url:
             raise NonRetryableAgentError(
-                f"No PR found for parent issue #{parent_issue_number} in "
-                f"{github_config['org']}/{github_config['repo']}. "
-                f"Cannot perform PR review without an open PR."
+                f"No PR found for parent issue #{parent_issue_number} in {repo}"
             )
 
-        # Load context from discussion (agent outputs)
-        discussion_outputs = self._load_discussion_outputs(project_name, parent_issue_number)
-
-        # Get parent issue body
-        parent_issue_body = self._get_parent_issue_body(repo, parent_issue_number)
-
-        # Prepare enhanced context for Claude Code calls
-        enhanced_context = context.copy()
-        if self.agent_config and 'agent_config' in self.agent_config:
-            enhanced_context['agent_config'] = self.agent_config['agent_config']
-        if self.agent_config and 'mcp_servers' in self.agent_config:
-            enhanced_context['mcp_servers'] = self.agent_config['mcp_servers']
+        # Get AgentExecutor (for launching Docker containers)
+        agent_executor = get_agent_executor()
 
         all_created_issues = []
         review_summary_parts = []
-        review_found_issues = False  # True if any phase found issues (before creation)
-        phases_attempted = 0  # Phases that were attempted (not skipped)
-        phases_completed = 0  # Phases that completed without exception
+        review_found_issues = False
+        phases_attempted = 0
+        phases_completed = 0
 
         # ---- Phase 1: PR Code Review ----
         logger.info(f"Phase 1: Running PR code review for {pr_url}")
         phases_attempted += 1
         try:
+            # Build prompt for pr_code_reviewer
             pr_review_prompt = self._build_pr_review_prompt(pr_url)
-            pr_review_result = await run_claude_code(pr_review_prompt, enhanced_context)
 
-            # Log whether the skill was used, but don't fail if validation is uncertain
-            tools_used = pr_review_result.get('tools_used', []) if isinstance(pr_review_result, dict) else []
-            skill_invoked = any(
-                'pr-review-toolkit' in tool.get('name', '') or 'Skill' in tool.get('name', '')
-                for tool in tools_used
+            # Launch pr_code_reviewer in Docker (via AgentExecutor)
+            pr_review_result = await agent_executor.execute_agent(
+                agent_name=self.pr_review_agent,
+                project_name=project_name,
+                task_context={
+                    **task_context,
+                    'pr_url': pr_url,
+                    'phase': 'code_review',
+                    'direct_prompt': pr_review_prompt,
+                    # IMPORTANT: Don't skip workspace prep - agent needs project code
+                    'skip_workspace_prep': False,
+                },
+                execution_type="pr_review_phase1"
             )
-            if skill_invoked:
-                logger.info(f"PR review skill was successfully invoked for {pr_url}")
-            else:
-                logger.warning(
-                    f"Could not confirm skill invocation for {pr_url} via tools_used. "
-                    f"Proceeding with output parsing validation."
-                )
 
-            # Continue with normal processing...
-            pr_review_text = pr_review_result.get('result', '') if isinstance(pr_review_result, dict) else str(pr_review_result)
+            # Parse findings
+            pr_review_text = pr_review_result.get('markdown_analysis', '')
             review_issues = self._parse_review_findings(pr_review_text, "PR Code Review")
             review_summary_parts.append(f"### PR Code Review\n\n{pr_review_text}")
             phases_completed += 1
-            if review_issues:
-                review_found_issues = True
 
             if review_issues:
+                review_found_issues = True
                 created = await self._create_review_issues(
                     review_issues, repo, github_config, parent_issue_number, project_name
                 )
@@ -221,11 +171,16 @@ class PRReviewAgent(AnalysisAgent):
                 logger.info(f"Phase 1: Created {len(created)} issues from PR review")
             else:
                 logger.info("Phase 1: No issues found in PR review")
+
         except Exception as e:
             logger.error(f"Phase 1 PR review failed: {e}", exc_info=True)
             review_summary_parts.append(f"### PR Code Review\n\nFailed: {e}")
 
         # ---- Phase 2: Context Verification ----
+        # Load context from discussion and parent issue
+        discussion_outputs = self._load_discussion_outputs(project_name, parent_issue_number)
+        parent_issue_body = self._get_parent_issue_body(repo, parent_issue_number)
+
         context_checks = [
             ("Parent Issue Requirements", parent_issue_body),
             ("Idea Researcher Output", discussion_outputs.get('idea_researcher')),
@@ -241,19 +196,36 @@ class PRReviewAgent(AnalysisAgent):
             logger.info(f"Phase 2: Verifying against {check_name}")
             phases_attempted += 1
             try:
+                # Build verification prompt
                 verification_prompt = self._build_verification_prompt(
                     pr_url, check_name, check_content
                 )
-                verification_result = await run_claude_code(verification_prompt, enhanced_context)
 
-                verification_text = verification_result.get('result', '') if isinstance(verification_result, dict) else str(verification_result)
+                # Launch requirements_verifier in Docker (via AgentExecutor)
+                verification_result = await agent_executor.execute_agent(
+                    agent_name=self.requirements_verifier_agent,
+                    project_name=project_name,
+                    task_context={
+                        **task_context,
+                        'pr_url': pr_url,
+                        'check_name': check_name,
+                        'check_content': check_content,
+                        'phase': 'requirements_verification',
+                        'direct_prompt': verification_prompt,
+                        # IMPORTANT: Don't skip workspace prep - agent needs project code
+                        'skip_workspace_prep': False,
+                    },
+                    execution_type="pr_review_phase2"
+                )
+
+                # Parse findings
+                verification_text = verification_result.get('markdown_analysis', '')
                 gap_issues = self._parse_review_findings(verification_text, check_name)
                 review_summary_parts.append(f"### {check_name} Verification\n\n{verification_text}")
                 phases_completed += 1
-                if gap_issues:
-                    review_found_issues = True
 
                 if gap_issues:
+                    review_found_issues = True
                     created = await self._create_review_issues(
                         gap_issues, repo, github_config, parent_issue_number, project_name
                     )
@@ -261,11 +233,13 @@ class PRReviewAgent(AnalysisAgent):
                     logger.info(f"Created {len(created)} issues from {check_name} verification")
                 else:
                     logger.info(f"No gaps found in {check_name} verification")
+
             except Exception as e:
                 logger.error(f"{check_name} verification failed: {e}", exc_info=True)
                 review_summary_parts.append(f"### {check_name} Verification\n\nFailed: {e}")
 
         # ---- Phase 3: CI Status Check ----
+        # This runs locally (no Docker) using gh CLI
         logger.info(f"Phase 3: Checking CI status for {pr_url}")
         phases_attempted += 1
         try:
@@ -287,87 +261,65 @@ class PRReviewAgent(AnalysisAgent):
             elif pending:
                 logger.warning(f"Phase 3: {len(pending)} CI checks still pending")
                 review_summary_parts.append(
-                    f"### CI Status\n\n{len(pending)} check(s) still pending (not treated as failure):\n\n"
+                    f"### CI Status\n\n{len(pending)} check(s) still pending:\n\n"
                     + self._format_ci_table(pending)
                 )
             else:
                 logger.info("Phase 3: All CI checks passed")
                 review_summary_parts.append("### CI Status\n\nAll CI checks passed.")
+
         except Exception as e:
             logger.error(f"Phase 3 CI status check failed: {e}", exc_info=True)
             review_summary_parts.append(f"### CI Status\n\nFailed: {e}")
 
-        # ---- Post-review actions ----
+        # ---- Post-review decision ----
         created_issue_numbers = [int(i['number']) for i in all_created_issues]
-
-        # Track whether we make a manual progression (for orchestrator)
         manual_progression_made = False
 
         if phases_completed == 0:
-            # ALL phases threw exceptions — inconclusive, do NOT advance
-            logger.error(
-                f"All review phases failed for #{parent_issue_number}. "
-                f"Leaving issue in current column (no advancement)."
-            )
-            pr_review_state_manager.increment_review_count(
-                project_name, parent_issue_number, []
-            )
-            # No progression made
+            # All phases failed - inconclusive
+            logger.error(f"All review phases failed for #{parent_issue_number}")
+            pr_review_state_manager.increment_review_count(project_name, parent_issue_number, [])
+
         elif phases_completed < phases_attempted and not review_found_issues:
-            # Some phases failed, surviving phases found nothing — inconclusive.
-            # Don't advance to Documentation since the failed phases may have
-            # caught issues we couldn't see.
+            # Some phases failed, no issues found - inconclusive
             logger.warning(
-                f"Only {phases_completed}/{phases_attempted} review phases completed "
-                f"for #{parent_issue_number}. Treating as inconclusive (no advancement)."
+                f"Only {phases_completed}/{phases_attempted} phases completed "
+                f"for #{parent_issue_number}. Treating as inconclusive."
             )
-            pr_review_state_manager.increment_review_count(
-                project_name, parent_issue_number, []
-            )
-            # No progression made
+            pr_review_state_manager.increment_review_count(project_name, parent_issue_number, [])
+
         elif review_found_issues:
-            # Found issues (regardless of whether GitHub issue creation succeeded)
+            # Issues found - return to development
             pr_review_state_manager.increment_review_count(
                 project_name, parent_issue_number, created_issue_numbers
             )
-
-            if not all_created_issues:
-                logger.warning(
-                    f"Review found issues for #{parent_issue_number} but failed to create "
-                    f"GitHub issues. Returning parent to In Development anyway."
-                )
 
             if current_cycle < MAX_REVIEW_CYCLES:
                 if all_created_issues:
                     await self._move_issues_to_development(
                         all_created_issues, project_name, github_config
                     )
-                    logger.info(f"Moved {len(all_created_issues)} review issues to Development")
                 self._return_parent_to_development(project_name, parent_issue_number)
-                manual_progression_made = True  # Moved to "In Development"
+                manual_progression_made = True
             else:
                 if all_created_issues:
                     summary_comment = self._build_cycle_limit_comment(
                         current_cycle, all_created_issues
                     )
                     self._post_comment_on_issue(repo, parent_issue_number, summary_comment)
-                logger.info(f"Cycle {current_cycle} (limit): left issues in Backlog, posted summary")
-                # No progression at cycle limit
-        else:
-            # Clean pass — all completed phases found nothing
-            logger.info(f"Clean pass for #{parent_issue_number}, advancing to Documentation")
-            pr_review_state_manager.increment_review_count(
-                project_name, parent_issue_number, []
-            )
-            self._advance_parent_to_documentation(project_name, parent_issue_number)
-            manual_progression_made = True  # Moved to "Documentation"
 
-        # Build final summary for GitHub comment
+        else:
+            # Clean pass - advance to documentation
+            logger.info(f"Clean pass for #{parent_issue_number}, advancing to Documentation")
+            pr_review_state_manager.increment_review_count(project_name, parent_issue_number, [])
+            self._advance_parent_to_documentation(project_name, parent_issue_number)
+            manual_progression_made = True
+
+        # Build final summary
         issues_summary = ""
         if all_created_issues:
-            issues_list = "\n".join(
-                f"- #{i['number']}: {i['title']}" for i in all_created_issues
-            )
+            issues_list = "\n".join(f"- #{i['number']}: {i['title']}" for i in all_created_issues)
             issues_summary = f"\n\n### Issues Created\n\n{issues_list}"
 
         if phases_completed == 0:
@@ -391,35 +343,27 @@ class PRReviewAgent(AnalysisAgent):
 
         context['created_review_issues'] = all_created_issues
 
-        # CRITICAL: Prevent auto-advancement after manual progression
-        # Only set this flag if we actually moved the issue (to Development or Documentation)
-        # Do NOT set if review was inconclusive or at cycle limit
+        # Set manual progression flag to prevent auto-advancement
         if manual_progression_made:
             context['manual_progression_made'] = True
 
         return context
 
     # ==================================================================================
-    # PARENT ISSUE RESOLUTION
+    # HELPER METHODS (copied from pr_review_agent.py)
     # ==================================================================================
 
     def _resolve_parent_issue_number(self, task_context: Dict[str, Any], project_name: str) -> Optional[int]:
         """Resolve the parent issue number from task context."""
-        # Direct issue number
         issue_number = task_context.get('issue_number')
         if issue_number:
             return int(issue_number)
 
-        # From nested task_context
         nested = task_context.get('task_context', {})
         if nested and nested.get('issue_number'):
             return int(nested['issue_number'])
 
         return None
-
-    # ==================================================================================
-    # PR URL LOOKUP
-    # ==================================================================================
 
     async def _find_pr_url(self, github_config: Dict, parent_issue_number: int) -> Optional[str]:
         """Find the PR URL for a parent issue using gh CLI directly."""
@@ -446,10 +390,6 @@ class PRReviewAgent(AnalysisAgent):
         except Exception as e:
             logger.error(f"Failed to find PR for #{parent_issue_number}: {e}", exc_info=True)
             return None
-
-    # ==================================================================================
-    # DISCUSSION OUTPUT LOADING
-    # ==================================================================================
 
     def _load_discussion_outputs(self, project_name: str, parent_issue_number: int) -> Dict[str, str]:
         """Load agent outputs from the discussion linked to the parent issue."""
@@ -488,8 +428,6 @@ class PRReviewAgent(AnalysisAgent):
 
             comments = result['node']['comments']['nodes']
 
-            # Agent signature pattern: _Processed by the X agent_
-            # Signatures use underscore-separated names (e.g., "idea_researcher")
             agent_keys = ['idea_researcher', 'business_analyst', 'software_architect']
 
             all_bodies = []
@@ -501,7 +439,6 @@ class PRReviewAgent(AnalysisAgent):
             for body in all_bodies:
                 for key in agent_keys:
                     if f'_Processed by the {key} agent_' in body:
-                        # Keep the most recent output for each agent
                         outputs[key] = body
 
         except Exception as e:
@@ -523,21 +460,8 @@ class PRReviewAgent(AnalysisAgent):
             logger.error(f"Failed to get parent issue body: {e}", exc_info=True)
             return ''
 
-    # ==================================================================================
-    # CI STATUS CHECK
-    # ==================================================================================
-
     def _check_ci_status(self, pr_url: str, repo: str) -> tuple:
-        """Check CI check status for a PR.
-
-        Returns (failures, pending) where each is a list of check dicts
-        with keys: name, state, bucket, description, link.
-
-        Exit codes from `gh pr checks`:
-          0 = all checks passed
-          1 = one or more checks failed
-          8 = checks still pending (no failures)
-        """
+        """Check CI check status for a PR. Returns (failures, pending)."""
         match = re.search(r'/pull/(\d+)$', pr_url)
         if not match:
             raise ValueError(f"Could not extract PR number from URL: {pr_url}")
@@ -582,7 +506,7 @@ class PRReviewAgent(AnalysisAgent):
             f"The following CI checks are failing:\n\n"
             f"{table}\n\n"
             f"---\n"
-            f"_Created by PR Review Agent_"
+            f"_Created by PR Review Stage_"
         )
         return {
             'title': '[PR Review] CI check failures',
@@ -601,10 +525,6 @@ class PRReviewAgent(AnalysisAgent):
             details = f"[View]({link})" if link else description
             lines.append(f"| {name} | {state} | {details} |")
         return "\n".join(lines)
-
-    # ==================================================================================
-    # PROMPT BUILDERS
-    # ==================================================================================
 
     def _build_pr_review_prompt(self, pr_url: str) -> str:
         return f"""
@@ -645,7 +565,6 @@ If the PR looks good overall, state that clearly in a separate summary paragraph
 """
 
     def _build_verification_prompt(self, pr_url: str, context_name: str, context_content: str) -> str:
-        # Truncate very long context to avoid prompt bloat
         max_context_len = 15000
         if len(context_content) > max_context_len:
             context_content = context_content[:max_context_len] + "\n\n[... truncated ...]"
@@ -697,19 +616,10 @@ Under "### Gaps Found" and "### Deviations", write ONLY "None found" if there ar
 If all requirements are met, write "All requirements verified - no gaps found" and list what was verified.
 """
 
-    # ==================================================================================
-    # FINDING PARSING
-    # ==================================================================================
-
     def _parse_review_findings(self, output: str, source: str) -> List[Dict[str, Any]]:
-        """
-        Parse review output into structured findings grouped by severity.
-
-        Returns a list of issue specs, one per severity level that has findings.
-        """
+        """Parse review output into structured findings grouped by severity."""
         issues = []
 
-        # Parse severity sections
         severity_sections = {
             'Critical': self._extract_section_items(output, 'Critical Issues'),
             'High': self._extract_section_items(output, 'High Priority Issues'),
@@ -717,11 +627,9 @@ If all requirements are met, write "All requirements verified - no gaps found" a
             'Low': self._extract_section_items(output, 'Low Priority / Nice-to-Have'),
         }
 
-        # Parse gap/deviation sections (from context verification)
         gaps = self._extract_section_items(output, 'Gaps Found')
         deviations = self._extract_section_items(output, 'Deviations')
 
-        # Create one issue per severity with findings
         for severity, items in severity_sections.items():
             if self._is_actionable_section(items, severity, source):
                 issues.append({
@@ -730,7 +638,6 @@ If all requirements are met, write "All requirements verified - no gaps found" a
                     'severity': severity.lower(),
                 })
 
-        # Create issues for gaps and deviations
         if self._is_actionable_section(gaps, "Gaps", source):
             issues.append({
                 'title': f"[PR Review] Implementation gaps - {source}",
@@ -756,34 +663,15 @@ If all requirements are met, write "All requirements verified - no gaps found" a
         return ''
 
     def _is_none_found(self, content: str) -> bool:
-        """Check if the section content indicates no findings.
-
-        Uses regex patterns to detect "none found" variants even when Claude
-        appends explanatory text (e.g., 'None found - issues were already resolved').
-        """
+        """Check if the section content indicates no findings."""
         return any(p.search(content) for p in _NONE_FOUND_PATTERNS)
 
     def _has_actionable_findings(self, content: str) -> bool:
-        """Check if content contains at least one structured finding.
-
-        Validates that the section has findings in any of the supported formats:
-        - Bullet with bold title: - **Title**: desc
-        - Numbered bullet: 1. **Title**: desc
-        - No bullet: **Title**: desc
-        - No colon: - **Title** desc
-
-        This acts as defense-in-depth against false positives when
-        _is_none_found() misses a variant.
-        """
+        """Check if content contains at least one structured finding."""
         return any(pattern.search(content) for pattern in _ACTIONABLE_FINDING_PATTERNS)
 
     def _is_actionable_section(self, content: str, label: str, source: str) -> bool:
-        """Determine whether a review section contains actionable findings.
-
-        Checks _has_actionable_findings() first so that structured findings
-        are never silently suppressed, even if the text also contains
-        'none found'-like phrases (e.g., describing previously resolved issues).
-        """
+        """Determine whether a review section contains actionable findings."""
         if not content:
             return False
         if self._has_actionable_findings(content):
@@ -806,12 +694,8 @@ If all requirements are met, write "All requirements verified - no gaps found" a
             f"**Source**: {source}\n\n"
             f"{items}\n\n"
             f"---\n"
-            f"_Created by PR Review Agent_"
+            f"_Created by PR Review Stage_"
         )
-
-    # ==================================================================================
-    # ISSUE CREATION - similar pattern to work_breakdown_agent
-    # ==================================================================================
 
     async def _create_review_issues(
         self,
@@ -1003,10 +887,6 @@ If all requirements are met, write "All requirements verified - no gaps found" a
         except Exception as e:
             logger.error(f"Failed to link #{child_number} as sub-issue: {e}", exc_info=True)
 
-    # ==================================================================================
-    # POST-REVIEW ACTIONS
-    # ==================================================================================
-
     async def _move_issues_to_development(
         self,
         issues: List[Dict[str, Any]],
@@ -1054,7 +934,6 @@ If all requirements are met, write "All requirements verified - no gaps found" a
             task_queue = TaskQueue()
             progression = PipelineProgression(task_queue)
 
-            # Find the Planning board name
             github_state = self.state_manager.load_project_state(project_name)
             if not github_state:
                 logger.warning(f"No GitHub state for {project_name}, cannot advance to Documentation")
@@ -1081,12 +960,7 @@ If all requirements are met, write "All requirements verified - no gaps found" a
             logger.error(f"Failed to advance parent to Documentation: {e}", exc_info=True)
 
     def _return_parent_to_development(self, project_name: str, parent_issue_number: int):
-        """Move the parent issue from 'In Review' back to 'In Development' on the Planning board.
-
-        Called when PR review finds issues (cycles 1-2). This enables the natural
-        re-review cycle: child fix-issues complete → all_subtasks_completed automation
-        moves parent back to 'In Review' → project monitor triggers PR review agent.
-        """
+        """Move the parent issue from 'In Review' back to 'In Development' on the Planning board."""
         try:
             from services.pipeline_progression import PipelineProgression
             from task_queue.task_manager import TaskQueue

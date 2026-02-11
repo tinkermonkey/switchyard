@@ -44,11 +44,12 @@ pipeline_templates:
 
       - stage: "pr_review"
         name: "PR Review & Requirements Verification"
+        stage_type: "pr_review"  # NEW: Signals PRReviewStage (runs in orchestrator, launches agents via AgentExecutor)
         required_capabilities: ["code_review", "pr_analysis", "requirements_verification"]
-        default_agent: "pr_review_agent"
+        default_agent: "pr_code_reviewer"  # Primary agent for Phase 1
         inputs_from: ["work_breakdown"]
-        timeout: 3600
-        retries: 2
+        timeout: 3600  # 60 minutes for all phases
+        retries: 1
         review_required: false
 
   environment_support:

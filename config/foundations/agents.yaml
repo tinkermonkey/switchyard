@@ -228,6 +228,42 @@ agents:
     mcp_servers:
       - context7
 
+  pr_code_reviewer:
+    description: "PR code quality review using pr-review-toolkit skill"
+    model: "claude-opus-4-5-20251101"
+    timeout: 600  # 10 minutes for PR review
+    retries: 2
+    makes_code_changes: false
+    filesystem_write_allowed: false
+    requires_dev_container: true   # IMPORTANT: Needs project code for PR review
+    requires_docker: true           # IMPORTANT: Runs in Docker (called by PRReviewStage)
+    capabilities:
+      - code_review
+      - pr_analysis
+    tools_enabled:
+      - file_operations
+      - git_integration
+    mcp_servers:
+      - context7
+
+  requirements_verifier:
+    description: "Verify PR against requirements and context"
+    model: "claude-sonnet-4-5-20250929"
+    timeout: 300  # 5 minutes per verification
+    retries: 2
+    makes_code_changes: false
+    filesystem_write_allowed: false
+    requires_dev_container: true   # IMPORTANT: Needs project code to fetch PR diff
+    requires_docker: true           # IMPORTANT: Runs in Docker (called by PRReviewStage)
+    capabilities:
+      - requirements_verification
+      - gap_analysis
+    tools_enabled:
+      - file_operations
+      - git_integration
+    mcp_servers:
+      - context7
+
   test_agent:
     description: "Test agent for integration testing and CI/CD verification"
     model: "claude-haiku-4-5-20251001"

@@ -167,57 +167,76 @@ class AgentStage(PipelineStage):
 def create_stage_from_config(stage_config, project_name: str) -> PipelineStage:
     """
     Create a pipeline stage from configuration.
-    
-    Determines whether to create a standard AgentStage or a RepairCycleStage
+
+    Determines whether to create a standard AgentStage, RepairCycleStage, or PRReviewStage
     based on the stage_type field.
-    
+
     Args:
         stage_config: PipelineStage configuration from config manager
         project_name: Project name for loading test configurations
-        
+
     Returns:
-        Instantiated PipelineStage (AgentStage or RepairCycleStage)
+        Instantiated PipelineStage (AgentStage, RepairCycleStage, or PRReviewStage)
     """
     from config.manager import config_manager
     from pipeline.repair_cycle import RepairCycleStage, RepairTestRunConfig
+    from pipeline.pr_review_stage import PRReviewStage
+    import logging
 
-    # Check if this is a repair cycle stage
-    if hasattr(stage_config, 'stage_type') and stage_config.stage_type == 'repair_cycle':
-        # Load testing configuration from project
-        project_config = config_manager.get_project_config(project_name)
-        testing_config = project_config.testing or {}
+    logger = logging.getLogger(__name__)
 
-        # Build RepairTestRunConfig list from project config
-        test_configs = []
-        for test_type_config in testing_config.get('types', []):
-            test_type = test_type_config['type']
-            test_configs.append(RepairTestRunConfig(
-                test_type=test_type,
-                timeout=test_type_config.get('timeout', 600),
-                max_iterations=test_type_config.get('max_iterations', 5),
-                review_warnings=test_type_config.get('review_warnings', True),
-                max_file_iterations=test_type_config.get('max_file_iterations', 3)
-            ))
-        
-        # Get global settings
-        max_total_agent_calls = stage_config.max_total_agent_calls or 100
-        checkpoint_interval = stage_config.checkpoint_interval or 5
-        
-        # Create RepairCycleStage
-        return RepairCycleStage(
-            name=stage_config.name,
-            test_configs=test_configs,
-            agent_name=stage_config.default_agent,
-            max_total_agent_calls=max_total_agent_calls,
-            checkpoint_interval=checkpoint_interval
-        )
-    else:
-        # Standard agent stage
-        agent_config = config_manager.get_project_agent_config(
-            project_name,
-            stage_config.default_agent
-        )
-        return AgentStage(stage_config.default_agent, agent_config)
+    # Check if this is a specialized pipeline stage
+    if hasattr(stage_config, 'stage_type') and stage_config.stage_type:
+
+        if stage_config.stage_type == 'repair_cycle':
+            # Load testing configuration from project
+            project_config = config_manager.get_project_config(project_name)
+            testing_config = project_config.testing or {}
+
+            # Build RepairTestRunConfig list from project config
+            test_configs = []
+            for test_type_config in testing_config.get('types', []):
+                test_type = test_type_config['type']
+                test_configs.append(RepairTestRunConfig(
+                    test_type=test_type,
+                    timeout=test_type_config.get('timeout', 600),
+                    max_iterations=test_type_config.get('max_iterations', 5),
+                    review_warnings=test_type_config.get('review_warnings', True),
+                    max_file_iterations=test_type_config.get('max_file_iterations', 3)
+                ))
+
+            # Get global settings
+            max_total_agent_calls = stage_config.max_total_agent_calls or 100
+            checkpoint_interval = stage_config.checkpoint_interval or 5
+
+            # Create RepairCycleStage
+            return RepairCycleStage(
+                name=stage_config.name,
+                test_configs=test_configs,
+                agent_name=stage_config.default_agent,
+                max_total_agent_calls=max_total_agent_calls,
+                checkpoint_interval=checkpoint_interval
+            )
+
+        elif stage_config.stage_type == 'pr_review':
+            # Create PRReviewStage
+            logger.info(f"Creating PRReviewStage for {stage_config.name}")
+            return PRReviewStage(
+                name=stage_config.name,
+                pr_review_agent=stage_config.default_agent,  # pr_code_reviewer
+                requirements_verifier_agent="requirements_verifier"
+            )
+
+        else:
+            logger.warning(f"Unknown stage_type: {stage_config.stage_type}")
+            # Fall through to standard agent stage
+
+    # Standard agent stage
+    agent_config = config_manager.get_project_agent_config(
+        project_name,
+        stage_config.default_agent
+    )
+    return AgentStage(stage_config.default_agent, agent_config)
 
 
 def create_agent_pipeline(agent_names: list, state_manager: StateManager) -> SequentialPipeline:
@@ -401,8 +420,16 @@ async def process_task_integrated(task, state_manager, logger):
     # This ensures commits are properly associated with parent/sub-issue branches
 
     # Auto-advance to next column if configured
+    # CRITICAL: Skip auto-advancement if agent made manual progression
+    manual_progression_made = result.get('manual_progression_made', False)
+    if manual_progression_made:
+        logger.info(
+            f"Skipping auto-advancement for issue #{issue_number}: "
+            f"agent made manual progression during execution"
+        )
+
     current_column_name = task_context.get('column')
-    if current_column_name and issue_number:
+    if current_column_name and issue_number and not manual_progression_made:
         try:
             # Get workflow configuration
             from config.state_manager import state_manager
