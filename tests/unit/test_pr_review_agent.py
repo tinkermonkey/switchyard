@@ -873,3 +873,174 @@ class TestExecutePostReviewDecision:
             mock_advance.assert_called_once_with('test-project', 42)
             mock_return.assert_not_called()
             assert "Clean pass" in result['markdown_analysis']
+
+    @pytest.mark.asyncio
+    async def test_phase1_clean_phase2_throws_is_inconclusive(self, agent):
+        """HIGH fix: Phase 1 clean but Phase 2 exceptions should NOT advance to Documentation."""
+        def claude_side_effect(prompt, ctx):
+            # Phase 1 (PR review) succeeds clean
+            if 'PR Review Specialist' in prompt:
+                return _clean_review_output()
+            # Phase 2 (verification) throws
+            raise RuntimeError("Claude API timeout")
+
+        with patch('agents.pr_review_agent.pr_review_state_manager') as mock_state, \
+             patch('agents.pr_review_agent.run_claude_code', side_effect=claude_side_effect), \
+             patch.object(agent, '_find_pr_url', return_value='https://github.com/o/r/pull/1'), \
+             patch.object(agent, '_load_discussion_outputs', return_value={
+                 'idea_researcher': 'some output',
+             }), \
+             patch.object(agent, '_get_parent_issue_body', return_value='requirements here'), \
+             patch.object(agent, '_advance_parent_to_documentation') as mock_advance, \
+             patch.object(agent, '_return_parent_to_development') as mock_return, \
+             patch.object(agent, 'config_manager') as mock_config:
+            mock_state.get_review_count.return_value = 0
+            mock_config.get_project_config.return_value = MagicMock(
+                github={'org': 'o', 'repo': 'r'}
+            )
+
+            result = await agent.execute(_make_execute_context())
+
+            # Must NOT advance — Phase 2 checks failed, review is incomplete
+            mock_advance.assert_not_called()
+            mock_return.assert_not_called()
+            assert "Inconclusive" in result['markdown_analysis']
+            assert "1/" in result['markdown_analysis']  # shows completed/attempted
+
+    @pytest.mark.asyncio
+    async def test_phase1_throws_phase2_finds_issues_returns_to_development(self, agent):
+        """When Phase 1 fails but Phase 2 finds issues, parent returns to Development."""
+        def claude_side_effect(prompt, ctx):
+            # Phase 1 (PR review) throws
+            if 'PR Review Specialist' in prompt:
+                raise RuntimeError("boom")
+            # Phase 2 (verification) finds issues
+            return _issues_found_output()
+
+        created_issue = [{'number': '99', 'url': 'u', 'title': 't', 'severity': 'critical'}]
+
+        with patch('agents.pr_review_agent.pr_review_state_manager') as mock_state, \
+             patch('agents.pr_review_agent.run_claude_code', side_effect=claude_side_effect), \
+             patch.object(agent, '_find_pr_url', return_value='https://github.com/o/r/pull/1'), \
+             patch.object(agent, '_load_discussion_outputs', return_value={}), \
+             patch.object(agent, '_get_parent_issue_body', return_value='requirements'), \
+             patch.object(agent, '_create_review_issues', return_value=created_issue), \
+             patch.object(agent, '_move_issues_to_development') as mock_move, \
+             patch.object(agent, '_return_parent_to_development') as mock_return, \
+             patch.object(agent, '_advance_parent_to_documentation') as mock_advance, \
+             patch.object(agent, 'config_manager') as mock_config:
+            mock_state.get_review_count.return_value = 0
+            mock_config.get_project_config.return_value = MagicMock(
+                github={'org': 'o', 'repo': 'r'}
+            )
+
+            result = await agent.execute(_make_execute_context())
+
+            # Issues found by Phase 2 should return to development despite Phase 1 failure
+            mock_return.assert_called_once_with('test-project', 42)
+            mock_advance.assert_not_called()
+            assert "Issues found" in result['markdown_analysis']
+
+    @pytest.mark.asyncio
+    async def test_phase2_findings_return_to_development(self, agent):
+        """Phase 2 context verification findings trigger return to Development."""
+        call_count = 0
+
+        def claude_side_effect(prompt, ctx):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                # Phase 1: clean
+                return _clean_review_output()
+            else:
+                # Phase 2: finds gaps
+                return {
+                    'result': """
+### Gaps Found
+- **Missing Pagination**: API returns all results instead of paginated response
+
+### Deviations
+None found
+
+### Verified
+- Auth flow works
+"""
+                }
+
+        created_issue = [{'number': '55', 'url': 'u', 'title': 't', 'severity': 'high'}]
+
+        with patch('agents.pr_review_agent.pr_review_state_manager') as mock_state, \
+             patch('agents.pr_review_agent.run_claude_code', side_effect=claude_side_effect), \
+             patch.object(agent, '_find_pr_url', return_value='https://github.com/o/r/pull/1'), \
+             patch.object(agent, '_load_discussion_outputs', return_value={
+                 'business_analyst': 'analyst output here',
+             }), \
+             patch.object(agent, '_get_parent_issue_body', return_value=''), \
+             patch.object(agent, '_create_review_issues', return_value=created_issue), \
+             patch.object(agent, '_move_issues_to_development') as mock_move, \
+             patch.object(agent, '_return_parent_to_development') as mock_return, \
+             patch.object(agent, '_advance_parent_to_documentation') as mock_advance, \
+             patch.object(agent, 'config_manager') as mock_config:
+            mock_state.get_review_count.return_value = 0
+            mock_config.get_project_config.return_value = MagicMock(
+                github={'org': 'o', 'repo': 'r'}
+            )
+
+            result = await agent.execute(_make_execute_context())
+
+            mock_return.assert_called_once_with('test-project', 42)
+            mock_advance.assert_not_called()
+            assert "Issues found" in result['markdown_analysis']
+
+    @pytest.mark.asyncio
+    async def test_cycle_limit_with_issues_does_not_return_to_development(self, agent):
+        """At cycle 3, issues found should NOT return parent to Development."""
+        created_issue = [{'number': '99', 'url': 'u', 'title': 't', 'severity': 'critical'}]
+
+        with patch('agents.pr_review_agent.pr_review_state_manager') as mock_state, \
+             patch('agents.pr_review_agent.run_claude_code', return_value=_issues_found_output()), \
+             patch.object(agent, '_find_pr_url', return_value='https://github.com/o/r/pull/1'), \
+             patch.object(agent, '_load_discussion_outputs', return_value={}), \
+             patch.object(agent, '_get_parent_issue_body', return_value='body'), \
+             patch.object(agent, '_create_review_issues', return_value=created_issue), \
+             patch.object(agent, '_move_issues_to_development') as mock_move, \
+             patch.object(agent, '_return_parent_to_development') as mock_return, \
+             patch.object(agent, '_advance_parent_to_documentation') as mock_advance, \
+             patch.object(agent, '_post_comment_on_issue') as mock_comment, \
+             patch.object(agent, 'config_manager') as mock_config:
+            mock_state.get_review_count.return_value = 2  # cycle 3 = limit
+            mock_config.get_project_config.return_value = MagicMock(
+                github={'org': 'o', 'repo': 'r'}
+            )
+
+            await agent.execute(_make_execute_context())
+
+            mock_return.assert_not_called()
+            mock_advance.assert_not_called()
+            mock_move.assert_not_called()
+            mock_comment.assert_called_once()  # summary posted on parent
+
+    @pytest.mark.asyncio
+    async def test_cycle_limit_with_creation_failure_does_not_advance(self, agent):
+        """At cycle 3, issues found but creation fails — no advance, no comment."""
+        with patch('agents.pr_review_agent.pr_review_state_manager') as mock_state, \
+             patch('agents.pr_review_agent.run_claude_code', return_value=_issues_found_output()), \
+             patch.object(agent, '_find_pr_url', return_value='https://github.com/o/r/pull/1'), \
+             patch.object(agent, '_load_discussion_outputs', return_value={}), \
+             patch.object(agent, '_get_parent_issue_body', return_value='body'), \
+             patch.object(agent, '_create_review_issues', return_value=[]), \
+             patch.object(agent, '_return_parent_to_development') as mock_return, \
+             patch.object(agent, '_advance_parent_to_documentation') as mock_advance, \
+             patch.object(agent, '_post_comment_on_issue') as mock_comment, \
+             patch.object(agent, 'config_manager') as mock_config:
+            mock_state.get_review_count.return_value = 2  # cycle 3 = limit
+            mock_config.get_project_config.return_value = MagicMock(
+                github={'org': 'o', 'repo': 'r'}
+            )
+
+            await agent.execute(_make_execute_context())
+
+            mock_return.assert_not_called()
+            mock_advance.assert_not_called()
+            # No issues to list, so no comment posted
+            mock_comment.assert_not_called()

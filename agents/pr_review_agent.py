@@ -168,10 +168,12 @@ class PRReviewAgent(AnalysisAgent):
         all_created_issues = []
         review_summary_parts = []
         review_found_issues = False  # True if any phase found issues (before creation)
+        phases_attempted = 0  # Phases that were attempted (not skipped)
         phases_completed = 0  # Phases that completed without exception
 
         # ---- Phase 1: PR Code Review ----
         logger.info(f"Phase 1: Running PR code review for {pr_url}")
+        phases_attempted += 1
         try:
             pr_review_prompt = self._build_pr_review_prompt(pr_url)
             pr_review_result = await run_claude_code(pr_review_prompt, enhanced_context)
@@ -209,6 +211,7 @@ class PRReviewAgent(AnalysisAgent):
                 continue
 
             logger.info(f"Phase 2: Verifying against {check_name}")
+            phases_attempted += 1
             try:
                 verification_prompt = self._build_verification_prompt(
                     pr_url, check_name, check_content
@@ -242,6 +245,17 @@ class PRReviewAgent(AnalysisAgent):
             logger.error(
                 f"All review phases failed for #{parent_issue_number}. "
                 f"Leaving issue in current column (no advancement)."
+            )
+            pr_review_state_manager.increment_review_count(
+                project_name, parent_issue_number, []
+            )
+        elif phases_completed < phases_attempted and not review_found_issues:
+            # Some phases failed, surviving phases found nothing — inconclusive.
+            # Don't advance to Documentation since the failed phases may have
+            # caught issues we couldn't see.
+            logger.warning(
+                f"Only {phases_completed}/{phases_attempted} review phases completed "
+                f"for #{parent_issue_number}. Treating as inconclusive (no advancement)."
             )
             pr_review_state_manager.increment_review_count(
                 project_name, parent_issue_number, []
@@ -288,9 +302,14 @@ class PRReviewAgent(AnalysisAgent):
             )
             issues_summary = f"\n\n### Issues Created\n\n{issues_list}"
 
-        review_outcome = "Inconclusive (all phases failed)" if phases_completed == 0 else (
-            "Issues found" if review_found_issues else "Clean pass"
-        )
+        if phases_completed == 0:
+            review_outcome = "Inconclusive (all phases failed)"
+        elif phases_completed < phases_attempted and not review_found_issues:
+            review_outcome = f"Inconclusive ({phases_completed}/{phases_attempted} phases completed)"
+        elif review_found_issues:
+            review_outcome = "Issues found"
+        else:
+            review_outcome = "Clean pass"
 
         context['markdown_analysis'] = (
             f"## PR Review - Cycle {current_cycle}/{MAX_REVIEW_CYCLES}\n\n"
