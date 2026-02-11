@@ -164,15 +164,38 @@ function PipelineRunDebugView() {
   }, [selectedTab])
 
   // Restore scroll position after render (before paint)
+  // Using both useLayoutEffect and requestAnimationFrame for robustness
   useLayoutEffect(() => {
-    if (activeListScrollRef.current && savedActiveScrollPos.current > 0) {
-      activeListScrollRef.current.scrollTop = savedActiveScrollPos.current
+    const scrollEl = activeListScrollRef.current
+    const savedPos = savedActiveScrollPos.current
+
+    if (scrollEl && savedPos >= 0) {
+      // Immediate restoration
+      scrollEl.scrollTop = savedPos
+
+      // Fallback with requestAnimationFrame in case layout shifts
+      requestAnimationFrame(() => {
+        if (scrollEl && scrollEl.scrollTop !== savedPos) {
+          scrollEl.scrollTop = savedPos
+        }
+      })
     }
   }, [activePipelineRuns])
 
   useLayoutEffect(() => {
-    if (completedListScrollRef.current && savedCompletedScrollPos.current > 0) {
-      completedListScrollRef.current.scrollTop = savedCompletedScrollPos.current
+    const scrollEl = completedListScrollRef.current
+    const savedPos = savedCompletedScrollPos.current
+
+    if (scrollEl && savedPos >= 0) {
+      // Immediate restoration
+      scrollEl.scrollTop = savedPos
+
+      // Fallback with requestAnimationFrame in case layout shifts
+      requestAnimationFrame(() => {
+        if (scrollEl && scrollEl.scrollTop !== savedPos) {
+          scrollEl.scrollTop = savedPos
+        }
+      })
     }
   }, [completedPipelineRuns])
 
@@ -636,7 +659,7 @@ function PipelineRunDebugView() {
   // Determine if currently in conversational loop
   const isConversational = useMemo(() => {
     if (!mergedEvents || mergedEvents.length === 0) return false
-    
+
     // Sort events by timestamp descending (newest first) to find latest status
     const sortedEvents = [...mergedEvents].sort((a, b) => {
       const tA = new Date(a.timestamp).getTime()
@@ -654,6 +677,30 @@ function PipelineRunDebugView() {
     }
     return false
   }, [mergedEvents])
+
+  // Memoize the active runs list rendering to prevent unnecessary re-renders
+  const activeRunsList = useMemo(() => {
+    return activePipelineRuns.map(run => (
+      <PipelineRunItem
+        key={run.id}
+        run={run}
+        isSelected={selectedPipelineRun?.id === run.id}
+        onClick={() => handleSelectRun(run)}
+      />
+    ))
+  }, [activePipelineRuns, selectedPipelineRun, handleSelectRun])
+
+  // Memoize the completed runs list rendering to prevent unnecessary re-renders
+  const completedRunsList = useMemo(() => {
+    return completedPipelineRuns.map(run => (
+      <PipelineRunItem
+        key={run.id}
+        run={run}
+        isSelected={selectedPipelineRun?.id === run.id}
+        onClick={() => handleSelectRun(run)}
+      />
+    ))
+  }, [completedPipelineRuns, selectedPipelineRun, handleSelectRun])
 
   return (
     <div className="min-h-screen p-5 bg-gh-canvas text-gh-fg">
@@ -716,14 +763,7 @@ function PipelineRunDebugView() {
                   className="space-y-2 max-h-[70vh] overflow-y-auto overscroll-contain"
                   style={{ scrollBehavior: 'auto' }}
                 >
-                  {activePipelineRuns.map(run => (
-                    <PipelineRunItem
-                      key={run.id}
-                      run={run}
-                      isSelected={selectedPipelineRun?.id === run.id}
-                      onClick={() => handleSelectRun(run)}
-                    />
-                  ))}
+                  {activeRunsList}
                 </div>
               )}
             </>
@@ -746,14 +786,7 @@ function PipelineRunDebugView() {
                     className="space-y-2 max-h-[70vh] overflow-y-auto overscroll-contain"
                     style={{ scrollBehavior: 'auto' }}
                   >
-                    {completedPipelineRuns.map(run => (
-                      <PipelineRunItem
-                        key={run.id}
-                        run={run}
-                        isSelected={selectedPipelineRun?.id === run.id}
-                        onClick={() => handleSelectRun(run)}
-                      />
-                    ))}
+                    {completedRunsList}
                   </div>
 
                   {/* Load More Button */}

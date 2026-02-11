@@ -450,12 +450,16 @@ class PipelineRunManager:
                     except Exception as e:
                         logger.error(f"Error checking/ending old pipeline runs in Elasticsearch: {e}")
                 
-                # Clear any stale cancellation signal from a previous pipeline run
+                # Clear any stale cancellation signal from a previous pipeline run.
+                # clear() handles its own Redis errors; this outer catch guards against import failures.
                 try:
                     from services.cancellation import get_cancellation_signal
                     get_cancellation_signal().clear(project, issue_number)
                 except Exception as e:
-                    logger.warning(f"Failed to clear stale cancellation signal: {e}")
+                    logger.error(
+                        f"Failed to clear stale cancellation signal for {project} issue #{issue_number}: {e}. "
+                        f"Agents dispatched for this pipeline run may be immediately cancelled."
+                    )
 
                 # Create new run
                 return self.create_pipeline_run(
@@ -480,7 +484,10 @@ class PipelineRunManager:
                 from services.cancellation import get_cancellation_signal
                 get_cancellation_signal().clear(project, issue_number)
             except Exception as e:
-                logger.warning(f"Failed to clear stale cancellation signal: {e}")
+                logger.error(
+                    f"Failed to clear stale cancellation signal for {project} issue #{issue_number}: {e}. "
+                    f"Agents dispatched for this pipeline run may be immediately cancelled."
+                )
             return self.create_pipeline_run(
                 issue_number=issue_number,
                 issue_title=issue_title,
