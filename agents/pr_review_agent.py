@@ -167,6 +167,8 @@ class PRReviewAgent(AnalysisAgent):
 
         all_created_issues = []
         review_summary_parts = []
+        review_found_issues = False  # True if any phase found issues (before creation)
+        phases_completed = 0  # Phases that completed without exception
 
         # ---- Phase 1: PR Code Review ----
         logger.info(f"Phase 1: Running PR code review for {pr_url}")
@@ -177,6 +179,9 @@ class PRReviewAgent(AnalysisAgent):
             pr_review_text = pr_review_result.get('result', '') if isinstance(pr_review_result, dict) else str(pr_review_result)
             review_issues = self._parse_review_findings(pr_review_text, "PR Code Review")
             review_summary_parts.append(f"### PR Code Review\n\n{pr_review_text}")
+            phases_completed += 1
+            if review_issues:
+                review_found_issues = True
 
             if review_issues:
                 created = await self._create_review_issues(
@@ -213,6 +218,9 @@ class PRReviewAgent(AnalysisAgent):
                 verification_text = verification_result.get('result', '') if isinstance(verification_result, dict) else str(verification_result)
                 gap_issues = self._parse_review_findings(verification_text, check_name)
                 review_summary_parts.append(f"### {check_name} Verification\n\n{verification_text}")
+                phases_completed += 1
+                if gap_issues:
+                    review_found_issues = True
 
                 if gap_issues:
                     created = await self._create_review_issues(
@@ -229,31 +237,43 @@ class PRReviewAgent(AnalysisAgent):
         # ---- Post-review actions ----
         created_issue_numbers = [int(i['number']) for i in all_created_issues]
 
-        if all_created_issues:
-            # Record review cycle
+        if phases_completed == 0:
+            # ALL phases threw exceptions — inconclusive, do NOT advance
+            logger.error(
+                f"All review phases failed for #{parent_issue_number}. "
+                f"Leaving issue in current column (no advancement)."
+            )
+            pr_review_state_manager.increment_review_count(
+                project_name, parent_issue_number, []
+            )
+        elif review_found_issues:
+            # Found issues (regardless of whether GitHub issue creation succeeded)
             pr_review_state_manager.increment_review_count(
                 project_name, parent_issue_number, created_issue_numbers
             )
 
-            if current_cycle < MAX_REVIEW_CYCLES:
-                # Cycles 1-2: Move issues from Backlog to Development
-                await self._move_issues_to_development(
-                    all_created_issues, project_name, github_config
+            if not all_created_issues:
+                logger.warning(
+                    f"Review found issues for #{parent_issue_number} but failed to create "
+                    f"GitHub issues. Returning parent to In Development anyway."
                 )
-                logger.info(f"Moved {len(all_created_issues)} review issues to Development")
-                # Move parent back to "In Development" on Planning board so that
-                # when all child fix-issues complete, the all_subtasks_completed
-                # automation naturally moves it back to "In Review" for re-review
+
+            if current_cycle < MAX_REVIEW_CYCLES:
+                if all_created_issues:
+                    await self._move_issues_to_development(
+                        all_created_issues, project_name, github_config
+                    )
+                    logger.info(f"Moved {len(all_created_issues)} review issues to Development")
                 self._return_parent_to_development(project_name, parent_issue_number)
             else:
-                # Cycle 3: Leave in Backlog, post summary comment
-                summary_comment = self._build_cycle_limit_comment(
-                    current_cycle, all_created_issues
-                )
-                self._post_comment_on_issue(repo, parent_issue_number, summary_comment)
+                if all_created_issues:
+                    summary_comment = self._build_cycle_limit_comment(
+                        current_cycle, all_created_issues
+                    )
+                    self._post_comment_on_issue(repo, parent_issue_number, summary_comment)
                 logger.info(f"Cycle {current_cycle} (limit): left issues in Backlog, posted summary")
         else:
-            # Clean pass - advance parent to Documentation
+            # Clean pass — all completed phases found nothing
             logger.info(f"Clean pass for #{parent_issue_number}, advancing to Documentation")
             pr_review_state_manager.increment_review_count(
                 project_name, parent_issue_number, []
@@ -268,11 +288,16 @@ class PRReviewAgent(AnalysisAgent):
             )
             issues_summary = f"\n\n### Issues Created\n\n{issues_list}"
 
+        review_outcome = "Inconclusive (all phases failed)" if phases_completed == 0 else (
+            "Issues found" if review_found_issues else "Clean pass"
+        )
+
         context['markdown_analysis'] = (
             f"## PR Review - Cycle {current_cycle}/{MAX_REVIEW_CYCLES}\n\n"
             f"**PR**: {pr_url}\n"
             f"**Parent Issue**: #{parent_issue_number}\n"
-            f"**Issues Found**: {len(all_created_issues)}\n"
+            f"**Outcome**: {review_outcome}\n"
+            f"**Issues Created**: {len(all_created_issues)}\n"
             + issues_summary + "\n\n"
             + "\n\n---\n\n".join(review_summary_parts)
         )
