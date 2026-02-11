@@ -1466,7 +1466,7 @@ class DockerAgentRunner:
                     except Exception as outcome_error:
                         logger.error(f"Failed to record outcome in docker_runner: {outcome_error}", exc_info=True)
 
-                raise Exception(f"Agent execution failed (exit_code={exit_code}): {stderr_excerpt}")
+                self._raise_for_failed_exit_code(exit_code, stderr_excerpt)
 
         except Exception as e:
             logger.error(f"Agent execution error: {e}")
@@ -1601,6 +1601,20 @@ class DockerAgentRunner:
             logger.debug(f"Cleaned up container {container_name}")
         except Exception as e:
             logger.warning(f"Failed to cleanup container {container_name}: {e}")
+
+    def _raise_for_failed_exit_code(self, exit_code: int, stderr_excerpt: str):
+        """Raise appropriate exception for a non-zero exit code.
+
+        SIGKILL (137) and SIGTERM (143) raise NonRetryableAgentError since the
+        container was deliberately terminated (e.g., user killed via Web UI or
+        OOM killer) and retrying will not help.
+        """
+        if exit_code in (137, 143):
+            from agents.non_retryable import NonRetryableAgentError
+            raise NonRetryableAgentError(
+                f"Agent container was terminated by signal (exit_code={exit_code}): {stderr_excerpt}"
+            )
+        raise Exception(f"Agent execution failed (exit_code={exit_code}): {stderr_excerpt}")
 
     def _validate_result(self, exit_code: int, result_text: str, container_name: str) -> tuple:
         """

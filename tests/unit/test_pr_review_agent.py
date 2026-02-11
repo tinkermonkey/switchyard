@@ -352,6 +352,7 @@ class TestExecuteEarlyReturns:
 
     @pytest.mark.asyncio
     async def test_manual_trigger_resets_cycle_count(self, agent):
+        from agents.non_retryable import NonRetryableAgentError
         with patch('agents.pr_review_agent.pr_review_state_manager') as mock_state, \
              patch.object(agent, '_find_pr_url', return_value=None), \
              patch.object(agent, 'config_manager') as mock_config:
@@ -364,14 +365,15 @@ class TestExecuteEarlyReturns:
                 'project': 'test-project',
                 'trigger_source': 'manual',
             }}
-            # Should NOT raise — manual trigger resets cycle count
-            result = await agent.execute(context)
+            # Should NOT raise cycle limit — manual trigger resets cycle count
+            # But SHOULD raise NonRetryableAgentError for no PR found
+            with pytest.raises(NonRetryableAgentError, match="No PR found"):
+                await agent.execute(context)
             mock_state.reset_review_count.assert_called_once_with('test-project', 42)
-            # Proceeds past cycle limit, but exits at "no PR found"
-            assert "No open PR" in result['markdown_analysis']
 
     @pytest.mark.asyncio
     async def test_manual_trigger_below_limit_does_not_reset(self, agent):
+        from agents.non_retryable import NonRetryableAgentError
         with patch('agents.pr_review_agent.pr_review_state_manager') as mock_state, \
              patch.object(agent, '_find_pr_url', return_value=None), \
              patch.object(agent, 'config_manager') as mock_config:
@@ -384,7 +386,8 @@ class TestExecuteEarlyReturns:
                 'project': 'test-project',
                 'trigger_source': 'manual',
             }}
-            await agent.execute(context)
+            with pytest.raises(NonRetryableAgentError, match="No PR found"):
+                await agent.execute(context)
             mock_state.reset_review_count.assert_not_called()
 
     @pytest.mark.asyncio
@@ -402,7 +405,8 @@ class TestExecuteEarlyReturns:
             mock_state.reset_review_count.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_returns_early_when_no_pr_found(self, agent):
+    async def test_raises_when_no_pr_found(self, agent):
+        from agents.non_retryable import NonRetryableAgentError
         with patch('agents.pr_review_agent.pr_review_state_manager') as mock_state, \
              patch.object(agent, '_find_pr_url', return_value=None), \
              patch.object(agent, 'config_manager') as mock_config:
@@ -411,9 +415,8 @@ class TestExecuteEarlyReturns:
                 github={'org': 'test-org', 'repo': 'test-repo'}
             )
             context = {'context': {'issue_number': 42, 'project': 'test-project'}}
-            result = await agent.execute(context)
-            assert "Skipped" in result['markdown_analysis']
-            assert "No open PR" in result['markdown_analysis']
+            with pytest.raises(NonRetryableAgentError, match="No PR found"):
+                await agent.execute(context)
 
 
 class TestReturnParentToDevelopment:
@@ -1353,3 +1356,77 @@ class TestFormatCiTable:
         lines = table.strip().split('\n')
         # Header + separator + 2 data rows
         assert len(lines) == 4
+
+
+class TestFindPrUrl:
+    """Test _find_pr_url() method that uses gh pr list."""
+
+    @pytest.mark.asyncio
+    async def test_finds_matching_pr(self, agent):
+        """Should return PR URL when a PR matches the branch prefix."""
+        prs_json = json.dumps([
+            {'number': 100, 'url': 'https://github.com/org/repo/pull/100',
+             'headRefName': 'feature/issue-42-add-login'},
+            {'number': 101, 'url': 'https://github.com/org/repo/pull/101',
+             'headRefName': 'feature/issue-99-other'},
+        ])
+        mock_result = MagicMock(returncode=0, stdout=prs_json, stderr='')
+
+        with patch('agents.pr_review_agent.subprocess.run', return_value=mock_result):
+            url = await agent._find_pr_url({'org': 'org', 'repo': 'repo'}, 42)
+
+        assert url == 'https://github.com/org/repo/pull/100'
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_no_match(self, agent):
+        """Should return None when no PR matches the branch prefix."""
+        prs_json = json.dumps([
+            {'number': 101, 'url': 'https://github.com/org/repo/pull/101',
+             'headRefName': 'feature/issue-99-other'},
+        ])
+        mock_result = MagicMock(returncode=0, stdout=prs_json, stderr='')
+
+        with patch('agents.pr_review_agent.subprocess.run', return_value=mock_result):
+            url = await agent._find_pr_url({'org': 'org', 'repo': 'repo'}, 42)
+
+        assert url is None
+
+    @pytest.mark.asyncio
+    async def test_returns_none_on_empty_pr_list(self, agent):
+        """Should return None when gh pr list returns empty list."""
+        mock_result = MagicMock(returncode=0, stdout='[]', stderr='')
+
+        with patch('agents.pr_review_agent.subprocess.run', return_value=mock_result):
+            url = await agent._find_pr_url({'org': 'org', 'repo': 'repo'}, 42)
+
+        assert url is None
+
+    @pytest.mark.asyncio
+    async def test_returns_none_on_gh_cli_failure(self, agent):
+        """Should return None (not raise) when gh CLI fails."""
+        with patch('agents.pr_review_agent.subprocess.run', side_effect=OSError("gh not found")):
+            url = await agent._find_pr_url({'org': 'org', 'repo': 'repo'}, 42)
+
+        assert url is None
+
+    @pytest.mark.asyncio
+    async def test_returns_none_on_nonzero_exit(self, agent):
+        """Should return None when gh returns non-zero exit code."""
+        mock_result = MagicMock(returncode=1, stdout='', stderr='auth required')
+
+        with patch('agents.pr_review_agent.subprocess.run', return_value=mock_result):
+            url = await agent._find_pr_url({'org': 'org', 'repo': 'repo'}, 42)
+
+        assert url is None
+
+    @pytest.mark.asyncio
+    async def test_uses_correct_branch_prefix(self, agent):
+        """Should search for branches starting with feature/issue-{number}-."""
+        mock_result = MagicMock(returncode=0, stdout='[]', stderr='')
+
+        with patch('agents.pr_review_agent.subprocess.run', return_value=mock_result) as mock_run:
+            await agent._find_pr_url({'org': 'myorg', 'repo': 'myrepo'}, 249)
+
+        args = mock_run.call_args[0][0]
+        assert '-R' in args
+        assert 'myorg/myrepo' in args

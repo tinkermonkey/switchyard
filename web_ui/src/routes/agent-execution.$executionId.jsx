@@ -861,7 +861,9 @@ function AgentExecutionView() {
 
                 {/* Right side - Current Tasks */}
                 <div className="flex-[3] min-w-0">
-                  <RepairCycleStatus events={mergedPipelineEvents} />
+                  {executionData.trigger_source?.startsWith('repair_cycle') && (
+                    <RepairCycleStatus events={mergedPipelineEvents} />
+                  )}
                   <div className="bg-gh-canvas rounded-md border border-gh-border p-3">
                     <div className="mb-3">
                       <div className="flex items-center justify-between mb-1">
@@ -1091,7 +1093,9 @@ function AgentExecutionView() {
 
               {/* Right column - 30% width */}
               <div className="flex-[3] min-w-0">
-                <RepairCycleStatus events={mergedPipelineEvents} />
+                {executionData.trigger_source?.startsWith('repair_cycle') && (
+                  <RepairCycleStatus events={mergedPipelineEvents} />
+                )}
                 <div className="bg-gh-canvas rounded-md border border-gh-border p-3">
                   <div className="mb-3">
                     <div className="flex items-center justify-between mb-1">

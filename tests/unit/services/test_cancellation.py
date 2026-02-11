@@ -300,7 +300,7 @@ class TestWorkExecutionStateCancelled:
 
 
 class TestSignalClearingAfterKill:
-    """Test that cancellation signals are cleared after Web UI kills (Fix #1)."""
+    """Test that cancellation signals behave correctly after Web UI kills."""
 
     def test_signal_cleared_after_cancel_issue_work(self):
         """After cancel_issue_work + clear, the issue should not be cancelled."""
@@ -314,6 +314,40 @@ class TestSignalClearingAfterKill:
 
         signal.clear("proj", 42)
         assert not signal.is_cancelled("proj", 42)
+
+    @patch('services.cancellation.kill_containers_for_issue')
+    @patch('services.cancellation.get_cancellation_signal')
+    def test_cancel_issue_work_leaves_signal_set(self, mock_get_signal, mock_kill):
+        """cancel_issue_work must leave the signal set (not clear it).
+
+        The kill endpoint used to call cancel + clear in sequence, which meant
+        retry loops never saw the cancellation. Now the signal stays set until
+        a new pipeline run clears it.
+        """
+        from services.cancellation import cancel_issue_work
+
+        mock_signal = MagicMock()
+        mock_get_signal.return_value = mock_signal
+        mock_kill.return_value = 0
+
+        mock_rce = MagicMock()
+        mock_rce.active_cycles = {}
+        mock_wet = MagicMock()
+        mock_wet.get_execution_history.return_value = []
+
+        mock_we_module = MagicMock()
+        mock_we_module.work_execution_tracker = mock_wet
+
+        with patch.dict('sys.modules', {
+            'services.review_cycle': MagicMock(review_cycle_executor=mock_rce),
+            'services.work_execution_state': mock_we_module,
+        }):
+            cancel_issue_work("proj", 42, "killed via Web UI")
+
+        # Signal must be set...
+        mock_signal.cancel.assert_called_once_with("proj", 42, "killed via Web UI")
+        # ...and NOT cleared
+        mock_signal.clear.assert_not_called()
 
     def test_cancel_is_idempotent(self):
         """Calling cancel() twice with the signal already set is harmless (Fix #4)."""

@@ -184,10 +184,8 @@ def kill_agent(container_name):
 
         # If we have project/issue, use full cancellation flow
         if project and issue_number:
-            from services.cancellation import cancel_issue_work, get_cancellation_signal
+            from services.cancellation import cancel_issue_work
             cancel_issue_work(project, issue_number, f"Agent killed via Web UI (container: {container_name})")
-            # Clear signal so user can re-trigger work by moving the card
-            get_cancellation_signal().clear(project, issue_number)
 
             return jsonify({
                 'success': True,
@@ -1007,9 +1005,6 @@ def kill_pipeline_run(pipeline_run_id):
         # 3. Full cleanup (containers, review cycles, execution state)
         cancel_issue_work(project, issue_number, "Pipeline run killed via Web UI")
 
-        # 4. Clear signal so user can re-trigger work by moving the card
-        get_cancellation_signal().clear(project, issue_number)
-
         return jsonify({
             'success': True,
             'message': f'Pipeline run {pipeline_run_id} killed and work cancelled for {project}/#{issue_number}'
@@ -1456,13 +1451,13 @@ def get_agent_execution(execution_id):
             'status': 'running',
             'duration': None
         }
-        
+
         # Add end information if found
         if end_result['hits']['total']['value'] > 0:
             end_event = end_result['hits']['hits'][0]['_source']
             execution['ended_at'] = end_event['timestamp']
             execution['status'] = 'completed' if end_event['event_type'] == 'agent_completed' else 'failed'
-            
+
             # Calculate duration
             try:
                 from datetime import datetime
@@ -1471,6 +1466,54 @@ def get_agent_execution(execution_id):
                 execution['duration'] = (end - start).total_seconds()
             except Exception as e:
                 logger.warning(f"Error calculating execution duration: {e}")
+
+        # Add trigger_source from execution state if available
+        trigger_source = None
+        pipeline_run_id = execution.get('pipeline_run_id')
+        if pipeline_run_id:
+            try:
+                # Get issue_number from pipeline run
+                from services.pipeline_run import get_pipeline_run_manager
+                pipeline_run_manager = get_pipeline_run_manager()
+                pipeline_run = pipeline_run_manager.get_pipeline_run_by_id(pipeline_run_id)
+
+                if pipeline_run and hasattr(pipeline_run, 'issue_number'):
+                    issue_number = pipeline_run.issue_number
+
+                    # Query execution history for this issue
+                    from services.work_execution_state import work_execution_tracker
+                    history = work_execution_tracker.get_execution_history(
+                        project_name=execution['project'],
+                        issue_number=issue_number
+                    )
+
+                    # Find matching execution by task_id (most reliable)
+                    task_id = execution['task_id']
+                    agent_name = execution['agent']
+                    started_at = execution['started_at']
+
+                    for exec_record in history:
+                        # First try to match by task_id (most reliable)
+                        if exec_record.get('task_id') == task_id:
+                            trigger_source = exec_record.get('trigger_source')
+                            break
+                        # Fallback: match by agent name and approximate timestamp
+                        if exec_record.get('agent') == agent_name:
+                            exec_ts = exec_record.get('timestamp')
+                            if exec_ts:
+                                try:
+                                    exec_time = datetime.fromisoformat(exec_ts.replace('Z', '+00:00'))
+                                    start_time = datetime.fromisoformat(started_at.replace('Z', '+00:00'))
+                                    # Match if within 5 seconds
+                                    if abs((exec_time - start_time).total_seconds()) < 5:
+                                        trigger_source = exec_record.get('trigger_source')
+                                        break
+                                except Exception:
+                                    pass
+            except Exception as e:
+                logger.warning(f"Failed to fetch trigger_source for execution {execution_id}: {e}")
+
+        execution['trigger_source'] = trigger_source
         
         # Fetch Claude logs for this execution
         logs = []

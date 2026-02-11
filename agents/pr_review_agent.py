@@ -151,12 +151,11 @@ class PRReviewAgent(AnalysisAgent):
         # Find the PR for this parent issue
         pr_url = await self._find_pr_url(github_config, parent_issue_number)
         if not pr_url:
-            logger.warning(f"No PR found for parent issue #{parent_issue_number}")
-            context['markdown_analysis'] = (
-                f"## PR Review Skipped\n\n"
-                f"No open PR found for parent issue #{parent_issue_number}."
+            raise NonRetryableAgentError(
+                f"No PR found for parent issue #{parent_issue_number} in "
+                f"{github_config['org']}/{github_config['repo']}. "
+                f"Cannot perform PR review without an open PR."
             )
-            return context
 
         # Load context from discussion (agent outputs)
         discussion_outputs = self._load_discussion_outputs(project_name, parent_issue_number)
@@ -430,34 +429,26 @@ class PRReviewAgent(AnalysisAgent):
     # ==================================================================================
 
     async def _find_pr_url(self, github_config: Dict, parent_issue_number: int) -> Optional[str]:
-        """Find the PR URL for a parent issue using feature branch manager."""
+        """Find the PR URL for a parent issue using gh CLI directly."""
+        repo = f"{github_config['org']}/{github_config['repo']}"
+        branch_prefix = f'feature/issue-{parent_issue_number}-'
+
         try:
-            from services.feature_branch_manager import feature_branch_manager
-            from services.github_integration import GitHubIntegration
-
-            github = GitHubIntegration(
-                repo_owner=github_config['org'],
-                repo_name=github_config['repo']
+            result = subprocess.run(
+                ['gh', 'pr', 'list', '-R', repo,
+                 '--state', 'open',
+                 '--json', 'number,url,headRefName',
+                 '--limit', '100'],
+                capture_output=True, text=True, timeout=30
             )
+            if result.returncode == 0 and result.stdout.strip():
+                prs = json.loads(result.stdout)
+                for pr in prs:
+                    if pr.get('headRefName', '').startswith(branch_prefix):
+                        logger.info(f"Found PR #{pr['number']} for parent #{parent_issue_number} (branch: {pr['headRefName']})")
+                        return pr['url']
 
-            # Try to find feature branch state
-            # Need to iterate possible project names since github_config doesn't directly have it
-            feature_branch = None
-            for proj_name in self.state_manager.list_managed_projects():
-                fb = feature_branch_manager.get_feature_branch_state(proj_name, parent_issue_number)
-                if fb:
-                    feature_branch = fb
-                    break
-
-            if not feature_branch:
-                logger.warning(f"No feature branch found for #{parent_issue_number}")
-                return None
-
-            pr_data = await github.find_pr_by_branch(feature_branch.branch_name)
-            if pr_data:
-                pr_number = pr_data.get('pr_number')
-                return f"https://github.com/{github_config['org']}/{github_config['repo']}/pull/{pr_number}"
-
+            logger.warning(f"No open PR found with branch prefix '{branch_prefix}' in {repo}")
             return None
         except Exception as e:
             logger.error(f"Failed to find PR for #{parent_issue_number}: {e}", exc_info=True)

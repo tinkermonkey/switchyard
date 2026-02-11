@@ -244,6 +244,50 @@ class TestFallbackResultRetrieval:
         pass
 
 
+class TestSignalTerminationHandling:
+    """Test that SIGKILL (137) and SIGTERM (143) raise NonRetryableAgentError."""
+
+    def _get_non_retryable_class(self):
+        """Import NonRetryableAgentError without triggering agents/__init__.py."""
+        import sys
+        if 'services.dev_container_state' not in sys.modules:
+            sys.modules['services.dev_container_state'] = MagicMock()
+        from agents.non_retryable import NonRetryableAgentError
+        return NonRetryableAgentError
+
+    def test_exit_code_137_raises_non_retryable(self):
+        """Exit code 137 (SIGKILL) should raise NonRetryableAgentError, not plain Exception."""
+        NonRetryableAgentError = self._get_non_retryable_class()
+        runner = DockerAgentRunner()
+
+        with pytest.raises(NonRetryableAgentError, match="terminated by signal.*exit_code=137"):
+            runner._raise_for_failed_exit_code(137, "killed")
+
+    def test_exit_code_143_raises_non_retryable(self):
+        """Exit code 143 (SIGTERM) should raise NonRetryableAgentError, not plain Exception."""
+        NonRetryableAgentError = self._get_non_retryable_class()
+        runner = DockerAgentRunner()
+
+        with pytest.raises(NonRetryableAgentError, match="terminated by signal.*exit_code=143"):
+            runner._raise_for_failed_exit_code(143, "terminated")
+
+    def test_exit_code_1_raises_plain_exception(self):
+        """Exit code 1 (generic failure) should raise plain Exception, allowing retries."""
+        NonRetryableAgentError = self._get_non_retryable_class()
+        runner = DockerAgentRunner()
+
+        with pytest.raises(Exception, match="Agent execution failed.*exit_code=1") as exc_info:
+            runner._raise_for_failed_exit_code(1, "some error")
+        assert not isinstance(exc_info.value, NonRetryableAgentError)
+
+    def test_exit_code_2_raises_plain_exception(self):
+        """Exit code 2 (misuse) should raise plain Exception."""
+        runner = DockerAgentRunner()
+
+        with pytest.raises(Exception, match="Agent execution failed.*exit_code=2"):
+            runner._raise_for_failed_exit_code(2, "bad args")
+
+
 class TestValidationIntegrationWithWorkflow:
     """Test validation integrates correctly with execution workflow"""
 
