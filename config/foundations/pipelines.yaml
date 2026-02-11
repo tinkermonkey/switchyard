@@ -51,18 +51,6 @@ pipeline_templates:
         retries: 2
         review_required: false
 
-      - stage: "documentation"
-        name: "Epic Documentation"
-        required_capabilities: ["technical_writing", "documentation_creation"]
-        default_agent: "technical_writer"
-        inputs_from: ["business_analyst", "software_architect"]
-        timeout: 300
-        retries: 2
-        review_required: true
-        reviewer_agent: "documentation_editor"
-        reviewer_timeout: 300
-        reviewer_retries: 2
-
   environment_support:
     name: "Development Environment Support"
     description: "Environment configuration, Dockerfile fixes, and dependency troubleshooting"

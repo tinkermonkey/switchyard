@@ -114,39 +114,6 @@ workflow_templates:
             parameters:
               stage: "pr_review"
 
-      - name: "Documentation"
-        stage_mapping: "documentation"
-        agent: "technical_writer"
-        description: "Generate comprehensive epic documentation"
-        automation_rules:
-          - trigger: "item_moved_to_column"
-            action: "assign_label"
-            parameters:
-              labels: ["stage:documentation"]
-          - trigger: "item_moved_to_column"
-            action: "start_pipeline_stage"
-            parameters:
-              stage: "documentation"
-
-      - name: "Documentation Review"
-        type: "review"
-        stage_mapping: "documentation_review"
-        agent: "documentation_editor"
-        maker_agent: "technical_writer"
-        max_iterations: 3
-        auto_advance_on_approval: true
-        escalate_on_blocked: true
-        description: "Documentation review and editing"
-        automation_rules:
-          - trigger: "item_moved_to_column"
-            action: "assign_label"
-            parameters:
-              labels: ["stage:documentation-review"]
-          - trigger: "item_moved_to_column"
-            action: "start_review_cycle"
-            parameters:
-              stage: "documentation"
-
       - name: "Done"
         stage_mapping: null
         agent: null
@@ -355,12 +322,6 @@ stage_labels:
   - name: "stage:staging"
     color: "cfd3d7"
     description: "Staging stage"
-  - name: "stage:documentation"
-    color: "cfd3d7"
-    description: "Documentation stage"
-  - name: "stage:documentation-review"
-    color: "cfd3d7"
-    description: "Documentation review stage"
   - name: "stage:environment-setup"
     color: "cfd3d7"
     description: "Environment setup stage"
