@@ -343,7 +343,7 @@ class DockerAgentRunner:
         # Always use stdin for passing prompts (avoids command-line length limits and escaping issues)
         use_stdin = True
 
-        docker_cmd = self._build_docker_command(
+        docker_cmd, image_name = self._build_docker_command(
             container_name=container_name,
             project_dir=project_dir,
             mcp_config_path=mcp_config_path,
@@ -360,6 +360,7 @@ class DockerAgentRunner:
                 stream_callback=stream_callback,
                 context=context,
                 project_dir=project_dir,
+                image_name=image_name,
                 mcp_config_path=mcp_config_path
             )
 
@@ -509,7 +510,7 @@ class DockerAgentRunner:
         mcp_config_path: Optional[str],
         context: Dict[str, Any],
         use_stdin: bool = False
-    ) -> list:
+    ) -> tuple[list, str]:
         """Build the docker run command"""
 
         agent = context.get('agent', 'unknown')
@@ -705,7 +706,7 @@ class DockerAgentRunner:
         logger.info(f"Using Docker image: {image_name} for agent {agent}")
         cmd.append(image_name)
 
-        return cmd
+        return cmd, image_name
 
     def _get_image_for_agent(self, agent: str, project: str) -> str:
         """
@@ -842,6 +843,7 @@ class DockerAgentRunner:
         stream_callback: Optional[Callable],
         context: Dict[str, Any],
         project_dir: Path,
+        image_name: str,
         mcp_config_path: Optional[str] = None
     ) -> str:
         """Execute Claude Code inside the container"""
@@ -998,10 +1000,12 @@ class DockerAgentRunner:
         task_id = context.get('task_id', 'unknown')
         project = context.get('project', 'unknown')
 
+        # Initialize timing (always needed, even if obs is None)
+        import time
+        api_start_time = time.time()
+
         # Emit events
         if obs:
-            import time
-            api_start_time = time.time()
             obs.emit_claude_call_started(agent, task_id, project, claude_model)
             obs.emit_container_launch_started(agent, task_id, project, container_name, image_name)
 
