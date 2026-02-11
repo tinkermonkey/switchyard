@@ -327,10 +327,13 @@ Files: {context.get('files', [])}
 
                 api_duration_ms = (time.time() - api_start_time) * 1000
 
-                # Emit completion event
+                # Check success before emitting completion event
+                success = process.returncode == 0
+
+                # Emit completion event with accurate success flag
                 if obs:
                     obs.emit_claude_call_completed(agent, task_id, project, api_duration_ms,
-                                                   input_tokens, output_tokens)
+                                                   input_tokens, output_tokens, success=success)
 
                 if process.returncode == 0:
                     result_text = ''.join(result_parts)

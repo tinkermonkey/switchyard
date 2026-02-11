@@ -136,12 +136,17 @@ async def main():
         root_logger.addHandler(console)
 
         # Also add file handler to root logger so ALL logs go to file (not just "orchestrator" logger)
-        log_dir = Path("orchestrator_data/logs")
-        log_dir.mkdir(parents=True, exist_ok=True)
-        file_handler = logging.FileHandler(log_dir / 'orchestrator_orchestrator.log')
-        file_handler.setLevel(logging.INFO)
-        file_handler.setFormatter(json_formatter)
-        root_logger.addHandler(file_handler)
+        try:
+            log_dir = Path("orchestrator_data/logs")
+            log_dir.mkdir(parents=True, exist_ok=True)
+            file_handler = logging.FileHandler(log_dir / 'orchestrator_all.log')
+            file_handler.setLevel(logging.INFO)
+            file_handler.setFormatter(json_formatter)
+            root_logger.addHandler(file_handler)
+        except Exception as e:
+            # Log to console if file logging setup fails
+            console.warning(f"Failed to setup file logging: {e}")
+            console.warning("Continuing with console logging only")
 
     root_logger.info("=== Orchestrator starting up ===")
     root_logger.info("Zombie process reaper enabled (SIGCHLD handler registered)")

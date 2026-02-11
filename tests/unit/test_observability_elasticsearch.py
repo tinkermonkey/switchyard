@@ -139,6 +139,13 @@ class TestObservabilityElasticsearchIndexing:
             EventType.PROMPT_CONSTRUCTED,
             EventType.CLAUDE_API_CALL_STARTED,
             EventType.CLAUDE_API_CALL_COMPLETED,
+            EventType.CLAUDE_API_CALL_FAILED,
+            EventType.CONTAINER_LAUNCH_STARTED,
+            EventType.CONTAINER_LAUNCH_SUCCEEDED,
+            EventType.CONTAINER_LAUNCH_FAILED,
+            EventType.CONTAINER_EXECUTION_STARTED,
+            EventType.CONTAINER_EXECUTION_COMPLETED,
+            EventType.CONTAINER_EXECUTION_FAILED,
             EventType.RESPONSE_CHUNK_RECEIVED,
             EventType.RESPONSE_PROCESSING_STARTED,
             EventType.RESPONSE_PROCESSING_COMPLETED,
@@ -175,6 +182,13 @@ class TestObservabilityElasticsearchIndexing:
             EventType.PROMPT_CONSTRUCTED,
             EventType.CLAUDE_API_CALL_STARTED,
             EventType.CLAUDE_API_CALL_COMPLETED,
+            EventType.CLAUDE_API_CALL_FAILED,
+            EventType.CONTAINER_LAUNCH_STARTED,
+            EventType.CONTAINER_LAUNCH_SUCCEEDED,
+            EventType.CONTAINER_LAUNCH_FAILED,
+            EventType.CONTAINER_EXECUTION_STARTED,
+            EventType.CONTAINER_EXECUTION_COMPLETED,
+            EventType.CONTAINER_EXECUTION_FAILED,
             EventType.RESPONSE_CHUNK_RECEIVED,
             EventType.RESPONSE_PROCESSING_STARTED,
             EventType.RESPONSE_PROCESSING_COMPLETED,
@@ -575,6 +589,244 @@ class TestObservabilityElasticsearchIndexing:
         assert document['success'] is False
         assert document['error'] == "Connection timeout"
 
+    # ========== NEW CONTAINER LIFECYCLE EVENT TESTS ==========
+
+    def test_emit_container_launch_started(self, obs_manager, mock_redis):
+        """Test emit_container_launch_started helper method"""
+        obs_manager.emit_container_launch_started(
+            agent="software_engineer",
+            task_id="test_task",
+            project="test-project",
+            container_name="claude-agent-test-123",
+            image="test-project-agent:latest"
+        )
+
+        # Verify Redis publish (container events not indexed to ES)
+        assert mock_redis.publish.called
+
+        # Verify event data in Redis
+        call_args = mock_redis.publish.call_args
+        event_json = call_args[0][1]
+
+        import json
+        event = json.loads(event_json)
+        assert event['event_type'] == 'container_launch_started'
+        assert event['agent'] == 'software_engineer'
+        assert event['data']['container_name'] == 'claude-agent-test-123'
+        assert event['data']['image'] == 'test-project-agent:latest'
+
+    def test_emit_container_launch_succeeded(self, obs_manager, mock_redis):
+        """Test emit_container_launch_succeeded helper method"""
+        obs_manager.emit_container_launch_succeeded(
+            agent="software_engineer",
+            task_id="test_task",
+            project="test-project",
+            container_name="claude-agent-test-123",
+            container_id="abc123def456"
+        )
+
+        # Verify Redis publish
+        assert mock_redis.publish.called
+
+        # Verify event data
+        call_args = mock_redis.publish.call_args
+        event_json = call_args[0][1]
+
+        import json
+        event = json.loads(event_json)
+        assert event['event_type'] == 'container_launch_succeeded'
+        assert event['data']['container_name'] == 'claude-agent-test-123'
+        assert event['data']['container_id'] == 'abc123def456'
+
+    def test_emit_container_launch_failed(self, obs_manager, mock_redis):
+        """Test emit_container_launch_failed helper method"""
+        obs_manager.emit_container_launch_failed(
+            agent="software_engineer",
+            task_id="test_task",
+            project="test-project",
+            container_name="claude-agent-test-123",
+            error="Image not found: test-project-agent:latest"
+        )
+
+        # Verify Redis publish
+        assert mock_redis.publish.called
+
+        # Verify event data
+        call_args = mock_redis.publish.call_args
+        event_json = call_args[0][1]
+
+        import json
+        event = json.loads(event_json)
+        assert event['event_type'] == 'container_launch_failed'
+        assert event['data']['container_name'] == 'claude-agent-test-123'
+        assert event['data']['error'] == 'Image not found: test-project-agent:latest'
+
+    def test_emit_container_execution_completed(self, obs_manager, mock_redis):
+        """Test emit_container_execution_completed helper method"""
+        obs_manager.emit_container_execution_completed(
+            agent="software_engineer",
+            task_id="test_task",
+            project="test-project",
+            container_name="claude-agent-test-123",
+            exit_code=0,
+            duration_ms=45000.5
+        )
+
+        # Verify Redis publish
+        assert mock_redis.publish.called
+
+        # Verify event data
+        call_args = mock_redis.publish.call_args
+        event_json = call_args[0][1]
+
+        import json
+        event = json.loads(event_json)
+        assert event['event_type'] == 'container_execution_completed'
+        assert event['data']['container_name'] == 'claude-agent-test-123'
+        assert event['data']['exit_code'] == 0
+        assert event['data']['duration_ms'] == 45000.5
+        assert event['data']['success'] is True  # exit_code 0 = success
+
+    def test_emit_container_execution_failed(self, obs_manager, mock_redis):
+        """Test emit_container_execution_failed helper method"""
+        obs_manager.emit_container_execution_failed(
+            agent="software_engineer",
+            task_id="test_task",
+            project="test-project",
+            container_name="claude-agent-test-123",
+            exit_code=1,
+            error="Command failed: npm test",
+            duration_ms=5000.0
+        )
+
+        # Verify Redis publish
+        assert mock_redis.publish.called
+
+        # Verify event data
+        call_args = mock_redis.publish.call_args
+        event_json = call_args[0][1]
+
+        import json
+        event = json.loads(event_json)
+        assert event['event_type'] == 'container_execution_failed'
+        assert event['data']['container_name'] == 'claude-agent-test-123'
+        assert event['data']['exit_code'] == 1
+        assert event['data']['error'] == 'Command failed: npm test'
+        assert event['data']['duration_ms'] == 5000.0
+
+    def test_emit_claude_call_completed_with_success_parameter(self, obs_manager, mock_redis):
+        """Test emit_claude_call_completed with success parameter"""
+        # Test successful call
+        obs_manager.emit_claude_call_completed(
+            agent="software_engineer",
+            task_id="test_task",
+            project="test-project",
+            duration_ms=30000,
+            input_tokens=1000,
+            output_tokens=2000,
+            success=True
+        )
+
+        # Verify event data
+        call_args = mock_redis.publish.call_args
+        event_json = call_args[0][1]
+
+        import json
+        event = json.loads(event_json)
+        assert event['event_type'] == 'claude_api_call_completed'
+        assert event['data']['duration_ms'] == 30000
+        assert event['data']['input_tokens'] == 1000
+        assert event['data']['output_tokens'] == 2000
+        assert event['data']['total_tokens'] == 3000
+        assert event['data']['success'] is True
+
+    def test_emit_claude_call_completed_with_failure(self, obs_manager, mock_redis):
+        """Test emit_claude_call_completed with success=False"""
+        obs_manager.emit_claude_call_completed(
+            agent="software_engineer",
+            task_id="test_task",
+            project="test-project",
+            duration_ms=5000,
+            input_tokens=500,
+            output_tokens=0,
+            success=False
+        )
+
+        # Verify event data
+        call_args = mock_redis.publish.call_args
+        event_json = call_args[0][1]
+
+        import json
+        event = json.loads(event_json)
+        assert event['event_type'] == 'claude_api_call_completed'
+        assert event['data']['success'] is False
+        assert event['data']['output_tokens'] == 0
+
+    def test_emit_claude_call_completed_defaults_to_success(self, obs_manager, mock_redis):
+        """Test emit_claude_call_completed defaults success to True"""
+        # Call without success parameter
+        obs_manager.emit_claude_call_completed(
+            agent="software_engineer",
+            task_id="test_task",
+            project="test-project",
+            duration_ms=30000,
+            input_tokens=1000,
+            output_tokens=2000
+        )
+
+        # Verify success defaults to True
+        call_args = mock_redis.publish.call_args
+        event_json = call_args[0][1]
+
+        import json
+        event = json.loads(event_json)
+        assert event['data']['success'] is True
+
+    def test_emit_claude_call_failed(self, obs_manager, mock_redis):
+        """Test emit_claude_call_failed helper method"""
+        obs_manager.emit_claude_call_failed(
+            agent="software_engineer",
+            task_id="test_task",
+            project="test-project",
+            duration_ms=2000,
+            error="Rate limit exceeded",
+            exit_code=1
+        )
+
+        # Verify Redis publish
+        assert mock_redis.publish.called
+
+        # Verify event data
+        call_args = mock_redis.publish.call_args
+        event_json = call_args[0][1]
+
+        import json
+        event = json.loads(event_json)
+        assert event['event_type'] == 'claude_api_call_failed'
+        assert event['data']['duration_ms'] == 2000
+        assert event['data']['error'] == 'Rate limit exceeded'
+        assert event['data']['exit_code'] == 1
+
+    def test_emit_claude_call_failed_without_exit_code(self, obs_manager, mock_redis):
+        """Test emit_claude_call_failed without exit_code (optional parameter)"""
+        obs_manager.emit_claude_call_failed(
+            agent="software_engineer",
+            task_id="test_task",
+            project="test-project",
+            duration_ms=1500,
+            error="Connection timeout"
+        )
+
+        # Verify event data
+        call_args = mock_redis.publish.call_args
+        event_json = call_args[0][1]
+
+        import json
+        event = json.loads(event_json)
+        assert event['event_type'] == 'claude_api_call_failed'
+        assert event['data']['error'] == 'Connection timeout'
+        assert event['data']['exit_code'] is None
+
 
 class TestEventTypeCompleteness:
     """Test that EventType enum is complete and all events are handled"""
@@ -615,7 +867,10 @@ class TestEventTypeCompleteness:
         
         expected_non_indexed_events = {
             'task_received', 'prompt_constructed', 'claude_api_call_started',
-            'claude_api_call_completed', 'response_chunk_received',
+            'claude_api_call_completed', 'claude_api_call_failed',
+            'container_launch_started', 'container_launch_succeeded', 'container_launch_failed',
+            'container_execution_started', 'container_execution_completed', 'container_execution_failed',
+            'response_chunk_received',
             'response_processing_started', 'response_processing_completed',
             'tool_execution_started', 'tool_execution_completed',
             'performance_metric', 'token_usage',
