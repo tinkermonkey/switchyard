@@ -1189,7 +1189,7 @@ class DockerAgentRunner:
 
                 # Emit container execution failure event
                 if obs:
-                    duration_ms = (time.time() - api_start_time) * 1000 if 'api_start_time' in locals() else 0
+                    duration_ms = (time.time() - api_start_time) * 1000
                     # Extract first error line for event
                     error_preview = stderr_text[:200] if stderr_text else "No error output"
                     obs.emit_container_execution_failed(agent, task_id, project, container_name, exit_code, error_preview, duration_ms)
