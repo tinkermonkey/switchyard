@@ -305,7 +305,7 @@ const ErrorRecoveredEvent = ({ event, onIconClick }) => {
   }
 
   return (
-    <PipelineRunEventLogEvent event={event} onIconClick={onIconClick} icon={CheckCircle} color="bg-green-600">
+    <PipelineRunEventLogEvent event={event} onIconClick={onIconClick} icon={AlertTriangle} color="bg-orange-600">
       <div className="space-y-1">
         <div className="font-semibold">
           {errorType === 'TaskValidationError' ? 'Task Blocked - Recovery Initiated' : `Error Recovered: ${errorType}`}
