@@ -95,6 +95,15 @@ class EventType(Enum):
     PROMPT_CONSTRUCTED = "prompt_constructed"
     CLAUDE_API_CALL_STARTED = "claude_api_call_started"
     CLAUDE_API_CALL_COMPLETED = "claude_api_call_completed"
+    CLAUDE_API_CALL_FAILED = "claude_api_call_failed"
+
+    # Container lifecycle events
+    CONTAINER_LAUNCH_STARTED = "container_launch_started"
+    CONTAINER_LAUNCH_SUCCEEDED = "container_launch_succeeded"
+    CONTAINER_LAUNCH_FAILED = "container_launch_failed"
+    CONTAINER_EXECUTION_STARTED = "container_execution_started"
+    CONTAINER_EXECUTION_COMPLETED = "container_execution_completed"
+    CONTAINER_EXECUTION_FAILED = "container_execution_failed"
 
     # Response events
     RESPONSE_CHUNK_RECEIVED = "response_chunk_received"
@@ -543,13 +552,67 @@ class ObservabilityManager:
 
     def emit_claude_call_completed(self, agent: str, task_id: str, project: str,
                                    duration_ms: float, input_tokens: int,
-                                   output_tokens: int):
+                                   output_tokens: int, success: bool = True):
         """Emit Claude API call completed event"""
         self.emit(EventType.CLAUDE_API_CALL_COMPLETED, agent, task_id, project, {
             'duration_ms': duration_ms,
             'input_tokens': input_tokens,
             'output_tokens': output_tokens,
-            'total_tokens': input_tokens + output_tokens
+            'total_tokens': input_tokens + output_tokens,
+            'success': success
+        })
+
+    def emit_claude_call_failed(self, agent: str, task_id: str, project: str,
+                                duration_ms: float, error: str, exit_code: Optional[int] = None):
+        """Emit Claude API call failed event"""
+        self.emit(EventType.CLAUDE_API_CALL_FAILED, agent, task_id, project, {
+            'duration_ms': duration_ms,
+            'error': error,
+            'exit_code': exit_code
+        })
+
+    def emit_container_launch_started(self, agent: str, task_id: str, project: str,
+                                      container_name: str, image: str):
+        """Emit container launch started event"""
+        self.emit(EventType.CONTAINER_LAUNCH_STARTED, agent, task_id, project, {
+            'container_name': container_name,
+            'image': image
+        })
+
+    def emit_container_launch_succeeded(self, agent: str, task_id: str, project: str,
+                                       container_name: str, container_id: str):
+        """Emit container launch succeeded event"""
+        self.emit(EventType.CONTAINER_LAUNCH_SUCCEEDED, agent, task_id, project, {
+            'container_name': container_name,
+            'container_id': container_id
+        })
+
+    def emit_container_launch_failed(self, agent: str, task_id: str, project: str,
+                                     container_name: str, error: str):
+        """Emit container launch failed event"""
+        self.emit(EventType.CONTAINER_LAUNCH_FAILED, agent, task_id, project, {
+            'container_name': container_name,
+            'error': error
+        })
+
+    def emit_container_execution_completed(self, agent: str, task_id: str, project: str,
+                                          container_name: str, exit_code: int, duration_ms: float):
+        """Emit container execution completed event"""
+        self.emit(EventType.CONTAINER_EXECUTION_COMPLETED, agent, task_id, project, {
+            'container_name': container_name,
+            'exit_code': exit_code,
+            'duration_ms': duration_ms,
+            'success': exit_code == 0
+        })
+
+    def emit_container_execution_failed(self, agent: str, task_id: str, project: str,
+                                       container_name: str, exit_code: int, error: str, duration_ms: float):
+        """Emit container execution failed event"""
+        self.emit(EventType.CONTAINER_EXECUTION_FAILED, agent, task_id, project, {
+            'container_name': container_name,
+            'exit_code': exit_code,
+            'error': error,
+            'duration_ms': duration_ms
         })
 
     def emit_response_chunk(self, agent: str, task_id: str, project: str,

@@ -113,18 +113,35 @@ async def main():
     # Initialize components
     logger = OrchestratorLogger("orchestrator")
 
-    # Configure root logger to ensure all logging works
+    # CRITICAL: Configure root logger so ALL child loggers (agents, claude, etc.) propagate
+    # Without this, agent internal logging (Phase 1, Phase 2, etc.) goes nowhere
     import logging
+    from pythonjsonlogger import jsonlogger
+    from pathlib import Path
+
     root_logger = logging.getLogger()
     root_logger.setLevel(logging.INFO)
+
+    # Use JSON formatter for consistency with OrchestratorLogger
+    json_formatter = jsonlogger.JsonFormatter(
+        fmt='%(asctime)s %(name)s %(levelname)s %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
 
     # Add console handler to root logger if not already present
     if not root_logger.handlers:
         console = logging.StreamHandler()
         console.setLevel(logging.INFO)
-        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-        console.setFormatter(formatter)
+        console.setFormatter(json_formatter)
         root_logger.addHandler(console)
+
+        # Also add file handler to root logger so ALL logs go to file (not just "orchestrator" logger)
+        log_dir = Path("orchestrator_data/logs")
+        log_dir.mkdir(parents=True, exist_ok=True)
+        file_handler = logging.FileHandler(log_dir / 'orchestrator_orchestrator.log')
+        file_handler.setLevel(logging.INFO)
+        file_handler.setFormatter(json_formatter)
+        root_logger.addHandler(file_handler)
 
     root_logger.info("=== Orchestrator starting up ===")
     root_logger.info("Zombie process reaper enabled (SIGCHLD handler registered)")
