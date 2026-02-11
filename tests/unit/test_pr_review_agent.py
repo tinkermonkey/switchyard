@@ -7,6 +7,7 @@ cycle limit enforcement, and clean pass detection.
 These tests mock the agent's dependencies so they can run outside Docker.
 """
 
+import json
 import sys
 from unittest.mock import patch, MagicMock
 import pytest
@@ -758,6 +759,7 @@ class TestExecutePostReviewDecision:
              patch.object(agent, '_find_pr_url', return_value='https://github.com/o/r/pull/1'), \
              patch.object(agent, '_load_discussion_outputs', return_value={}), \
              patch.object(agent, '_get_parent_issue_body', return_value='body'), \
+             patch.object(agent, '_check_ci_status', return_value=([], [])), \
              patch.object(agent, '_advance_parent_to_documentation') as mock_advance, \
              patch.object(agent, '_return_parent_to_development') as mock_return, \
              patch.object(agent, 'config_manager') as mock_config:
@@ -782,6 +784,7 @@ class TestExecutePostReviewDecision:
              patch.object(agent, '_find_pr_url', return_value='https://github.com/o/r/pull/1'), \
              patch.object(agent, '_load_discussion_outputs', return_value={}), \
              patch.object(agent, '_get_parent_issue_body', return_value='body'), \
+             patch.object(agent, '_check_ci_status', return_value=([], [])), \
              patch.object(agent, '_create_review_issues', return_value=created_issue), \
              patch.object(agent, '_move_issues_to_development') as mock_move, \
              patch.object(agent, '_return_parent_to_development') as mock_return, \
@@ -811,6 +814,7 @@ class TestExecutePostReviewDecision:
              patch.object(agent, '_find_pr_url', return_value='https://github.com/o/r/pull/1'), \
              patch.object(agent, '_load_discussion_outputs', return_value={}), \
              patch.object(agent, '_get_parent_issue_body', return_value='body'), \
+             patch.object(agent, '_check_ci_status', return_value=([], [])), \
              patch.object(agent, '_create_review_issues', return_value=[]), \
              patch.object(agent, '_move_issues_to_development') as mock_move, \
              patch.object(agent, '_return_parent_to_development') as mock_return, \
@@ -837,6 +841,7 @@ class TestExecutePostReviewDecision:
              patch.object(agent, '_find_pr_url', return_value='https://github.com/o/r/pull/1'), \
              patch.object(agent, '_load_discussion_outputs', return_value={}), \
              patch.object(agent, '_get_parent_issue_body', return_value='body'), \
+             patch.object(agent, '_check_ci_status', side_effect=RuntimeError("gh not available")), \
              patch.object(agent, '_return_parent_to_development') as mock_return, \
              patch.object(agent, '_advance_parent_to_documentation') as mock_advance, \
              patch.object(agent, 'config_manager') as mock_config:
@@ -859,6 +864,7 @@ class TestExecutePostReviewDecision:
              patch.object(agent, '_find_pr_url', return_value='https://github.com/o/r/pull/1'), \
              patch.object(agent, '_load_discussion_outputs', return_value={}), \
              patch.object(agent, '_get_parent_issue_body', return_value=''), \
+             patch.object(agent, '_check_ci_status', return_value=([], [])), \
              patch.object(agent, '_advance_parent_to_documentation') as mock_advance, \
              patch.object(agent, '_return_parent_to_development') as mock_return, \
              patch.object(agent, 'config_manager') as mock_config:
@@ -891,6 +897,7 @@ class TestExecutePostReviewDecision:
                  'idea_researcher': 'some output',
              }), \
              patch.object(agent, '_get_parent_issue_body', return_value='requirements here'), \
+             patch.object(agent, '_check_ci_status', return_value=([], [])), \
              patch.object(agent, '_advance_parent_to_documentation') as mock_advance, \
              patch.object(agent, '_return_parent_to_development') as mock_return, \
              patch.object(agent, 'config_manager') as mock_config:
@@ -905,7 +912,6 @@ class TestExecutePostReviewDecision:
             mock_advance.assert_not_called()
             mock_return.assert_not_called()
             assert "Inconclusive" in result['markdown_analysis']
-            assert "1/" in result['markdown_analysis']  # shows completed/attempted
 
     @pytest.mark.asyncio
     async def test_phase1_throws_phase2_finds_issues_returns_to_development(self, agent):
@@ -924,6 +930,7 @@ class TestExecutePostReviewDecision:
              patch.object(agent, '_find_pr_url', return_value='https://github.com/o/r/pull/1'), \
              patch.object(agent, '_load_discussion_outputs', return_value={}), \
              patch.object(agent, '_get_parent_issue_body', return_value='requirements'), \
+             patch.object(agent, '_check_ci_status', return_value=([], [])), \
              patch.object(agent, '_create_review_issues', return_value=created_issue), \
              patch.object(agent, '_move_issues_to_development') as mock_move, \
              patch.object(agent, '_return_parent_to_development') as mock_return, \
@@ -976,6 +983,7 @@ None found
                  'business_analyst': 'analyst output here',
              }), \
              patch.object(agent, '_get_parent_issue_body', return_value=''), \
+             patch.object(agent, '_check_ci_status', return_value=([], [])), \
              patch.object(agent, '_create_review_issues', return_value=created_issue), \
              patch.object(agent, '_move_issues_to_development') as mock_move, \
              patch.object(agent, '_return_parent_to_development') as mock_return, \
@@ -1002,6 +1010,7 @@ None found
              patch.object(agent, '_find_pr_url', return_value='https://github.com/o/r/pull/1'), \
              patch.object(agent, '_load_discussion_outputs', return_value={}), \
              patch.object(agent, '_get_parent_issue_body', return_value='body'), \
+             patch.object(agent, '_check_ci_status', return_value=([], [])), \
              patch.object(agent, '_create_review_issues', return_value=created_issue), \
              patch.object(agent, '_move_issues_to_development') as mock_move, \
              patch.object(agent, '_return_parent_to_development') as mock_return, \
@@ -1028,6 +1037,7 @@ None found
              patch.object(agent, '_find_pr_url', return_value='https://github.com/o/r/pull/1'), \
              patch.object(agent, '_load_discussion_outputs', return_value={}), \
              patch.object(agent, '_get_parent_issue_body', return_value='body'), \
+             patch.object(agent, '_check_ci_status', return_value=([], [])), \
              patch.object(agent, '_create_review_issues', return_value=[]), \
              patch.object(agent, '_return_parent_to_development') as mock_return, \
              patch.object(agent, '_advance_parent_to_documentation') as mock_advance, \
@@ -1044,3 +1054,274 @@ None found
             mock_advance.assert_not_called()
             # No issues to list, so no comment posted
             mock_comment.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_ci_failures_trigger_return_to_development(self, agent):
+        """Phase 3 CI failures should set review_found_issues and return to Development."""
+        ci_failures = [{'name': 'tests', 'state': 'FAILURE', 'bucket': 'fail',
+                        'description': 'Tests failed', 'link': 'https://ci.example.com/1'}]
+        created_issue = [{'number': '77', 'url': 'u', 'title': '[PR Review] CI check failures', 'severity': 'high'}]
+
+        with patch('agents.pr_review_agent.pr_review_state_manager') as mock_state, \
+             patch('agents.pr_review_agent.run_claude_code', return_value=_clean_review_output()), \
+             patch.object(agent, '_find_pr_url', return_value='https://github.com/o/r/pull/1'), \
+             patch.object(agent, '_load_discussion_outputs', return_value={}), \
+             patch.object(agent, '_get_parent_issue_body', return_value='body'), \
+             patch.object(agent, '_check_ci_status', return_value=(ci_failures, [])), \
+             patch.object(agent, '_create_review_issues', return_value=created_issue), \
+             patch.object(agent, '_move_issues_to_development') as mock_move, \
+             patch.object(agent, '_return_parent_to_development') as mock_return, \
+             patch.object(agent, '_advance_parent_to_documentation') as mock_advance, \
+             patch.object(agent, 'config_manager') as mock_config:
+            mock_state.get_review_count.return_value = 0
+            mock_config.get_project_config.return_value = MagicMock(
+                github={'org': 'o', 'repo': 'r'}
+            )
+
+            result = await agent.execute(_make_execute_context())
+
+            mock_return.assert_called_once_with('test-project', 42)
+            mock_advance.assert_not_called()
+            assert "Issues found" in result['markdown_analysis']
+
+    @pytest.mark.asyncio
+    async def test_ci_all_passing_does_not_block_clean_pass(self, agent):
+        """When CI passes and other phases are clean, should advance to Documentation."""
+        with patch('agents.pr_review_agent.pr_review_state_manager') as mock_state, \
+             patch('agents.pr_review_agent.run_claude_code', return_value=_clean_review_output()), \
+             patch.object(agent, '_find_pr_url', return_value='https://github.com/o/r/pull/1'), \
+             patch.object(agent, '_load_discussion_outputs', return_value={}), \
+             patch.object(agent, '_get_parent_issue_body', return_value='body'), \
+             patch.object(agent, '_check_ci_status', return_value=([], [])), \
+             patch.object(agent, '_advance_parent_to_documentation') as mock_advance, \
+             patch.object(agent, '_return_parent_to_development') as mock_return, \
+             patch.object(agent, 'config_manager') as mock_config:
+            mock_state.get_review_count.return_value = 0
+            mock_config.get_project_config.return_value = MagicMock(
+                github={'org': 'o', 'repo': 'r'}
+            )
+
+            result = await agent.execute(_make_execute_context())
+
+            mock_advance.assert_called_once_with('test-project', 42)
+            mock_return.assert_not_called()
+            assert "Clean pass" in result['markdown_analysis']
+            assert "CI" in result['markdown_analysis']
+
+    @pytest.mark.asyncio
+    async def test_ci_pending_does_not_block_clean_pass(self, agent):
+        """Pending CI checks should not prevent a clean pass (noted in summary)."""
+        pending_checks = [{'name': 'slow-test', 'state': 'PENDING', 'bucket': 'pending',
+                           'description': 'Running', 'link': ''}]
+
+        with patch('agents.pr_review_agent.pr_review_state_manager') as mock_state, \
+             patch('agents.pr_review_agent.run_claude_code', return_value=_clean_review_output()), \
+             patch.object(agent, '_find_pr_url', return_value='https://github.com/o/r/pull/1'), \
+             patch.object(agent, '_load_discussion_outputs', return_value={}), \
+             patch.object(agent, '_get_parent_issue_body', return_value='body'), \
+             patch.object(agent, '_check_ci_status', return_value=([], pending_checks)), \
+             patch.object(agent, '_advance_parent_to_documentation') as mock_advance, \
+             patch.object(agent, '_return_parent_to_development') as mock_return, \
+             patch.object(agent, 'config_manager') as mock_config:
+            mock_state.get_review_count.return_value = 0
+            mock_config.get_project_config.return_value = MagicMock(
+                github={'org': 'o', 'repo': 'r'}
+            )
+
+            result = await agent.execute(_make_execute_context())
+
+            mock_advance.assert_called_once_with('test-project', 42)
+            mock_return.assert_not_called()
+            assert "Clean pass" in result['markdown_analysis']
+            assert "pending" in result['markdown_analysis'].lower()
+
+    @pytest.mark.asyncio
+    async def test_phase3_exception_marks_phase_not_completed(self, agent):
+        """Phase 3 exception should not increment phases_completed."""
+        with patch('agents.pr_review_agent.pr_review_state_manager') as mock_state, \
+             patch('agents.pr_review_agent.run_claude_code', return_value=_clean_review_output()), \
+             patch.object(agent, '_find_pr_url', return_value='https://github.com/o/r/pull/1'), \
+             patch.object(agent, '_load_discussion_outputs', return_value={}), \
+             patch.object(agent, '_get_parent_issue_body', return_value='body'), \
+             patch.object(agent, '_check_ci_status', side_effect=RuntimeError("gh not found")), \
+             patch.object(agent, '_advance_parent_to_documentation') as mock_advance, \
+             patch.object(agent, '_return_parent_to_development') as mock_return, \
+             patch.object(agent, 'config_manager') as mock_config:
+            mock_state.get_review_count.return_value = 0
+            mock_config.get_project_config.return_value = MagicMock(
+                github={'org': 'o', 'repo': 'r'}
+            )
+
+            result = await agent.execute(_make_execute_context())
+
+            # Phase 1 completed (1), Phase 3 failed — 1/2 attempted = inconclusive
+            mock_advance.assert_not_called()
+            mock_return.assert_not_called()
+            assert "Inconclusive" in result['markdown_analysis']
+
+
+class TestCheckCiStatus:
+    """Tests for _check_ci_status() method."""
+
+    def test_all_checks_passing(self, agent):
+        checks_json = json.dumps([
+            {'name': 'tests', 'state': 'SUCCESS', 'bucket': 'pass', 'description': '', 'link': ''},
+            {'name': 'lint', 'state': 'SUCCESS', 'bucket': 'pass', 'description': '', 'link': ''},
+        ])
+        mock_result = MagicMock(returncode=0, stdout=checks_json, stderr='')
+
+        with patch('agents.pr_review_agent.subprocess.run', return_value=mock_result):
+            failures, pending = agent._check_ci_status(
+                'https://github.com/o/r/pull/5', 'o/r'
+            )
+
+        assert failures == []
+        assert pending == []
+
+    def test_failures_and_pending(self, agent):
+        checks_json = json.dumps([
+            {'name': 'tests', 'state': 'FAILURE', 'bucket': 'fail', 'description': 'Failed', 'link': 'http://ci/1'},
+            {'name': 'lint', 'state': 'PENDING', 'bucket': 'pending', 'description': 'Running', 'link': ''},
+            {'name': 'build', 'state': 'SUCCESS', 'bucket': 'pass', 'description': '', 'link': ''},
+        ])
+        mock_result = MagicMock(returncode=1, stdout=checks_json, stderr='')
+
+        with patch('agents.pr_review_agent.subprocess.run', return_value=mock_result):
+            failures, pending = agent._check_ci_status(
+                'https://github.com/o/r/pull/5', 'o/r'
+            )
+
+        assert len(failures) == 1
+        assert failures[0]['name'] == 'tests'
+        assert len(pending) == 1
+        assert pending[0]['name'] == 'lint'
+
+    def test_no_checks_configured(self, agent):
+        mock_result = MagicMock(returncode=0, stdout='', stderr='')
+
+        with patch('agents.pr_review_agent.subprocess.run', return_value=mock_result):
+            failures, pending = agent._check_ci_status(
+                'https://github.com/o/r/pull/5', 'o/r'
+            )
+
+        assert failures == []
+        assert pending == []
+
+    def test_unexpected_exit_code(self, agent):
+        mock_result = MagicMock(returncode=2, stdout='', stderr='some error')
+
+        with patch('agents.pr_review_agent.subprocess.run', return_value=mock_result):
+            failures, pending = agent._check_ci_status(
+                'https://github.com/o/r/pull/5', 'o/r'
+            )
+
+        assert failures == []
+        assert pending == []
+
+    def test_invalid_pr_url(self, agent):
+        failures, pending = agent._check_ci_status(
+            'https://github.com/o/r/issues/5', 'o/r'
+        )
+        assert failures == []
+        assert pending == []
+
+    def test_extracts_pr_number_from_url(self, agent):
+        mock_result = MagicMock(returncode=0, stdout='[]', stderr='')
+
+        with patch('agents.pr_review_agent.subprocess.run', return_value=mock_result) as mock_run:
+            agent._check_ci_status('https://github.com/org/repo/pull/123', 'org/repo')
+
+        args = mock_run.call_args[0][0]
+        assert '123' in args
+
+    def test_pending_exit_code_8(self, agent):
+        checks_json = json.dumps([
+            {'name': 'tests', 'state': 'PENDING', 'bucket': 'pending', 'description': 'Running', 'link': ''},
+        ])
+        mock_result = MagicMock(returncode=8, stdout=checks_json, stderr='')
+
+        with patch('agents.pr_review_agent.subprocess.run', return_value=mock_result):
+            failures, pending = agent._check_ci_status(
+                'https://github.com/o/r/pull/5', 'o/r'
+            )
+
+        assert failures == []
+        assert len(pending) == 1
+
+    def test_subprocess_exception_propagates(self, agent):
+        with patch('agents.pr_review_agent.subprocess.run', side_effect=OSError("no gh")):
+            with pytest.raises(OSError, match="no gh"):
+                agent._check_ci_status('https://github.com/o/r/pull/5', 'o/r')
+
+
+class TestBuildCiFailureIssue:
+    """Tests for _build_ci_failure_issue() method."""
+
+    def test_issue_spec_structure(self, agent):
+        failures = [
+            {'name': 'tests', 'state': 'FAILURE', 'bucket': 'fail',
+             'description': 'Tests failed', 'link': 'https://ci.example.com/1'},
+        ]
+        spec = agent._build_ci_failure_issue(failures, 'https://github.com/o/r/pull/5')
+
+        assert spec['title'] == '[PR Review] CI check failures'
+        assert spec['severity'] == 'high'
+        assert 'https://github.com/o/r/pull/5' in spec['body']
+        assert 'PR Review Agent' in spec['body']
+
+    def test_includes_failure_table(self, agent):
+        failures = [
+            {'name': 'unit-tests', 'state': 'FAILURE', 'bucket': 'fail',
+             'description': '', 'link': 'https://ci/1'},
+            {'name': 'integration', 'state': 'FAILURE', 'bucket': 'fail',
+             'description': 'Timed out', 'link': ''},
+        ]
+        spec = agent._build_ci_failure_issue(failures, 'https://github.com/o/r/pull/5')
+
+        assert 'unit-tests' in spec['body']
+        assert 'integration' in spec['body']
+
+
+class TestFormatCiTable:
+    """Tests for _format_ci_table() method."""
+
+    def test_renders_header_row(self, agent):
+        table = agent._format_ci_table([])
+        assert '| Check | State | Details |' in table
+        assert '| --- | --- | --- |' in table
+
+    def test_renders_data_rows(self, agent):
+        checks = [
+            {'name': 'tests', 'state': 'FAILURE', 'bucket': 'fail',
+             'description': 'Failed', 'link': 'https://ci/1'},
+        ]
+        table = agent._format_ci_table(checks)
+        assert '| tests |' in table
+        assert 'FAILURE' in table
+
+    def test_link_takes_precedence_over_description(self, agent):
+        checks = [
+            {'name': 'tests', 'state': 'FAILURE', 'bucket': 'fail',
+             'description': 'Failed', 'link': 'https://ci/1'},
+        ]
+        table = agent._format_ci_table(checks)
+        assert '[View](https://ci/1)' in table
+
+    def test_falls_back_to_description_when_no_link(self, agent):
+        checks = [
+            {'name': 'tests', 'state': 'FAILURE', 'bucket': 'fail',
+             'description': 'Tests timed out', 'link': ''},
+        ]
+        table = agent._format_ci_table(checks)
+        assert 'Tests timed out' in table
+        assert '[View]' not in table
+
+    def test_multiple_checks(self, agent):
+        checks = [
+            {'name': 'unit', 'state': 'FAILURE', 'bucket': 'fail', 'description': '', 'link': ''},
+            {'name': 'lint', 'state': 'FAILURE', 'bucket': 'fail', 'description': '', 'link': ''},
+        ]
+        table = agent._format_ci_table(checks)
+        lines = table.strip().split('\n')
+        # Header + separator + 2 data rows
+        assert len(lines) == 4

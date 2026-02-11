@@ -2,7 +2,7 @@
 PR Review Agent - Automated PR review and requirements verification
 
 This agent runs after all sub-issues complete their SDLC pipelines.
-It performs two phases:
+It performs three phases:
 
 Phase 1: PR Code Review
   - Uses /pr-review-toolkit:review-pr skill to review the accumulated PR
@@ -12,6 +12,11 @@ Phase 2: Context Verification (up to 4 separate Claude Code calls)
   - Verifies implementation against parent issue requirements
   - Verifies against idea researcher, business analyst, and architect outputs
   - Creates issues for any gaps found
+
+Phase 3: CI Status Check
+  - Checks CI check status via `gh pr checks`
+  - Creates issues for any failing CI checks
+  - Pending checks are noted but do not block a clean pass
 
 Review cycle management:
   - Cycles 1-2: Create issues and move to Development for resolution
@@ -81,6 +86,7 @@ class PRReviewAgent(AnalysisAgent):
         return [
             "PR Code Review",
             "Requirements Verification",
+            "CI Status",
             "Issues Created",
             "Review Summary"
         ]
@@ -236,6 +242,38 @@ class PRReviewAgent(AnalysisAgent):
             except Exception as e:
                 logger.error(f"{check_name} verification failed: {e}", exc_info=True)
                 review_summary_parts.append(f"### {check_name} Verification\n\nFailed: {e}")
+
+        # ---- Phase 3: CI Status Check ----
+        logger.info(f"Phase 3: Checking CI status for {pr_url}")
+        phases_attempted += 1
+        try:
+            failures, pending = self._check_ci_status(pr_url, repo)
+            phases_completed += 1
+
+            if failures:
+                review_found_issues = True
+                ci_issue_spec = self._build_ci_failure_issue(failures, pr_url)
+                created = await self._create_review_issues(
+                    [ci_issue_spec], repo, github_config, parent_issue_number, project_name
+                )
+                all_created_issues.extend(created)
+                logger.info(f"Phase 3: {len(failures)} CI checks failing, created {len(created)} issues")
+                review_summary_parts.append(
+                    f"### CI Status\n\n{len(failures)} failing check(s):\n\n"
+                    + self._format_ci_table(failures)
+                )
+            elif pending:
+                logger.warning(f"Phase 3: {len(pending)} CI checks still pending")
+                review_summary_parts.append(
+                    f"### CI Status\n\n{len(pending)} check(s) still pending (not treated as failure):\n\n"
+                    + self._format_ci_table(pending)
+                )
+            else:
+                logger.info("Phase 3: All CI checks passed")
+                review_summary_parts.append("### CI Status\n\nAll CI checks passed.")
+        except Exception as e:
+            logger.error(f"Phase 3 CI status check failed: {e}", exc_info=True)
+            review_summary_parts.append(f"### CI Status\n\nFailed: {e}")
 
         # ---- Post-review actions ----
         created_issue_numbers = [int(i['number']) for i in all_created_issues]
@@ -455,6 +493,87 @@ class PRReviewAgent(AnalysisAgent):
         except Exception as e:
             logger.error(f"Failed to get parent issue body: {e}", exc_info=True)
             return ''
+
+    # ==================================================================================
+    # CI STATUS CHECK
+    # ==================================================================================
+
+    def _check_ci_status(self, pr_url: str, repo: str) -> tuple:
+        """Check CI check status for a PR.
+
+        Returns (failures, pending) where each is a list of check dicts
+        with keys: name, state, bucket, description, link.
+
+        Exit codes from `gh pr checks`:
+          0 = all checks passed
+          1 = one or more checks failed
+          8 = checks still pending (no failures)
+        """
+        match = re.search(r'/pull/(\d+)$', pr_url)
+        if not match:
+            logger.warning(f"Could not extract PR number from URL: {pr_url}")
+            return ([], [])
+
+        pr_number = match.group(1)
+
+        try:
+            result = subprocess.run(
+                ['gh', 'pr', 'checks', pr_number, '-R', repo,
+                 '--json', 'name,state,bucket,description,link'],
+                capture_output=True, text=True, timeout=60
+            )
+
+            if result.returncode not in (0, 1, 8):
+                logger.warning(
+                    f"Unexpected exit code {result.returncode} from gh pr checks: "
+                    f"{result.stderr.strip()}"
+                )
+                return ([], [])
+
+            stdout = result.stdout.strip()
+            if not stdout:
+                logger.info("No CI checks configured for this PR")
+                return ([], [])
+
+            checks = json.loads(stdout)
+
+            failures = [c for c in checks if c.get('bucket') == 'fail']
+            pending = [c for c in checks if c.get('bucket') == 'pending']
+
+            return (failures, pending)
+
+        except Exception as e:
+            logger.error(f"Failed to check CI status: {e}", exc_info=True)
+            raise
+
+    def _build_ci_failure_issue(self, failures: list, pr_url: str) -> Dict[str, Any]:
+        """Build an issue spec for CI check failures."""
+        table = self._format_ci_table(failures)
+        body = (
+            f"## CI Check Failures\n\n"
+            f"**PR**: {pr_url}\n\n"
+            f"The following CI checks are failing:\n\n"
+            f"{table}\n\n"
+            f"---\n"
+            f"_Created by PR Review Agent_"
+        )
+        return {
+            'title': '[PR Review] CI check failures',
+            'body': body,
+            'severity': 'high',
+        }
+
+    def _format_ci_table(self, checks: list) -> str:
+        """Render a markdown table for CI check results."""
+        lines = ["| Check | State | Details |", "| --- | --- | --- |"]
+        for check in checks:
+            name = check.get('name', 'Unknown')
+            state = check.get('state', 'unknown')
+            link = check.get('link', '')
+            description = check.get('description', '')
+            details = f"[View]({link})" if link else description
+            lines.append(f"| {name} | {state} | {details} |")
+        return "\n".join(lines)
 
     # ==================================================================================
     # PROMPT BUILDERS
