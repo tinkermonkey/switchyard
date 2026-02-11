@@ -2729,6 +2729,32 @@ class ProjectMonitor:
             )
 
             if current_column == "In Development":
+                # DEFENSIVE: Check if parent has any open sub-issues before auto-advancing
+                # This prevents race condition where PR review agent just moved parent back
+                # to "In Development" and is creating new review issues
+                from services.github_integration import GitHubIntegration
+                from services.feature_branch_manager import feature_branch_manager
+
+                github = GitHubIntegration(
+                    repo_owner=project_config.github['org'],
+                    repo_name=project_config.github['repo']
+                )
+
+                parent_issue_data = await github.get_issue(parent_issue_number)
+                if parent_issue_data:
+                    sub_issues = await feature_branch_manager._get_sub_issues_from_parent(
+                        github, parent_issue_data
+                    )
+
+                    open_sub_issues = [s for s in sub_issues if s.get('state') != 'closed']
+
+                    if open_sub_issues:
+                        logger.info(
+                            f"Parent #{parent_issue_number} has {len(open_sub_issues)} open sub-issues. "
+                            f"Skipping auto-advance to 'In Review' until all sub-issues are complete."
+                        )
+                        return
+
                 # Move to "In Review" - the polling will detect the column change
                 # and trigger the PR review agent normally
                 from services.pipeline_progression import PipelineProgression

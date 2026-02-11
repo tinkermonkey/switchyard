@@ -1194,6 +1194,15 @@ class DockerAgentRunner:
                             tool_name = event.get('name', 'unknown')
                             logger.info(f"[Claude] Using tool: {tool_name}")
 
+                            # Track in context for validation
+                            if 'tools_used' not in context:
+                                context['tools_used'] = []
+                            from monitoring.timestamp_utils import utc_isoformat
+                            context['tools_used'].append({
+                                'name': tool_name,
+                                'timestamp': utc_isoformat()
+                            })
+
                         # Log tool results
                         if event_type == 'tool_result':
                             tool_use_id = event.get('tool_use_id', 'unknown')
@@ -1378,11 +1387,17 @@ class DockerAgentRunner:
                 if breaker and (breaker.is_open() or breaker.is_half_open()):
                     logger.info("🟢 Agent succeeded - closing Claude Code breaker")
                     breaker.close()
-                
+
                 if session_id:
                     context['claude_session_id'] = session_id
 
-                return result_text
+                # Return result with tools_used metadata for validation
+                return {
+                    'success': True,
+                    'result': result_text,
+                    'session_id': session_id,
+                    'tools_used': context.get('tools_used', [])
+                }
             else:
                 stderr_text = ''.join(stderr_parts)
 

@@ -249,7 +249,11 @@ REMEMBER: You MUST execute Python code to update the dev container state. Withou
         result = await run_claude_code(prompt, context)
 
         # Result is the verification review in markdown format
-        review_text = result if isinstance(result, str) else str(result)
+        # Handle both dict format (with tools_used metadata) and legacy string format
+        if isinstance(result, dict):
+            review_text = result.get('result', '')
+        else:
+            review_text = result if isinstance(result, str) else str(result)
 
         # Store the markdown output for GitHub comment
         context['markdown_review'] = review_text

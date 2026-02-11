@@ -184,6 +184,44 @@ class PRReviewAgent(AnalysisAgent):
             pr_review_prompt = self._build_pr_review_prompt(pr_url)
             pr_review_result = await run_claude_code(pr_review_prompt, enhanced_context)
 
+            # VALIDATE that the skill was actually invoked
+            tools_used = pr_review_result.get('tools_used', []) if isinstance(pr_review_result, dict) else []
+            skill_invoked = any(
+                'pr-review-toolkit' in tool.get('name', '')
+                for tool in tools_used
+            )
+
+            if not skill_invoked:
+                # Skill was not invoked - this is a critical issue
+                error_msg = (
+                    f"PR review skill was NOT invoked for {pr_url}. "
+                    f"Claude provided a direct response instead of using the skill."
+                )
+                logger.error(error_msg)
+
+                # Post comment to GitHub explaining the issue
+                from services.github_integration import GitHubIntegration
+                github = GitHubIntegration(
+                    repo_owner=github_config['org'],
+                    repo_name=github_config['repo']
+                )
+                await github.post_comment(
+                    parent_issue_number,
+                    f"⚠️ **PR Review Incomplete**\n\n"
+                    f"The PR review skill was not invoked during automated review. "
+                    f"This may indicate:\n"
+                    f"- The PR URL is inaccessible to the review tool\n"
+                    f"- Claude chose to provide a direct response instead\n"
+                    f"- The skill configuration needs attention\n\n"
+                    f"**Action Required**: Manual PR review recommended."
+                )
+
+                # Raise exception to mark phase as failed (triggers inconclusive path)
+                raise Exception(
+                    f"PR review skill not invoked - cannot validate PR code quality"
+                )
+
+            # Continue with normal processing...
             pr_review_text = pr_review_result.get('result', '') if isinstance(pr_review_result, dict) else str(pr_review_result)
             review_issues = self._parse_review_findings(pr_review_text, "PR Code Review")
             review_summary_parts.append(f"### PR Code Review\n\n{pr_review_text}")
@@ -581,9 +619,12 @@ class PRReviewAgent(AnalysisAgent):
         return f"""
 You are a PR Review Specialist. Review the following pull request for code quality issues.
 
+**CRITICAL**: You MUST use the /pr-review-toolkit:review-pr skill for this task.
+DO NOT provide a manual review - the skill provides comprehensive automated analysis.
+
 Use the /pr-review-toolkit:review-pr skill to review this PR: {pr_url}
 
-After running the review, organize your findings into severity levels.
+After running the review skill, organize your findings into severity levels.
 
 ## Output Format
 
