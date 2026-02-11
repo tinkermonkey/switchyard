@@ -473,14 +473,16 @@ class FeatureBranchManager:
         sub_issues: List[dict],
         project_name: Optional[str] = None,
         workflow_template = None,
-        project_monitor = None
+        project_monitor = None,
+        triggering_issue: Optional[int] = None
     ) -> bool:
         """
         Verify that all sub-issues are complete (closed OR in exit columns).
 
         An issue is considered complete if:
-        1. Its GitHub state is 'closed', OR
-        2. It's currently in a pipeline exit column (Done, Staged, etc.)
+        1. Its GitHub state is 'closed' (case-insensitive), OR
+        2. It is the triggering issue (just moved to exit column), OR
+        3. It's currently in a pipeline exit column (Done, Staged, etc.)
 
         Args:
             github_integration: GitHubIntegration instance
@@ -488,6 +490,8 @@ class FeatureBranchManager:
             project_name: Project name (optional, for exit column check)
             workflow_template: Workflow template with exit columns (optional)
             project_monitor: ProjectMonitor instance (optional, for querying issue columns)
+            triggering_issue: Issue number that just moved to an exit column (optional).
+                Skip re-querying this issue's column to avoid GitHub API eventual consistency lag.
 
         Returns:
             True if all sub-issues are complete, False otherwise
@@ -541,12 +545,21 @@ class FeatureBranchManager:
             issue_number = issue.get('number')
             state = issue.get('state')
 
-            # Check 1: Issue is closed
-            if state == 'closed':
+            # Check 1: Issue is closed (case-insensitive — GitHub GraphQL returns uppercase)
+            if state and state.upper() == 'CLOSED':
                 logger.debug(f"Sub-issue #{issue_number} is closed - treating as complete")
                 continue
 
-            # Check 2: Issue is in an exit column (using pre-fetched data)
+            # Check 2: Issue is the one that just triggered this check (skip API re-query
+            # to avoid GitHub Projects v2 eventual consistency lag)
+            if triggering_issue and issue_number == triggering_issue:
+                logger.info(
+                    f"Sub-issue #{issue_number} is the triggering issue "
+                    f"(just moved to exit column) - treating as complete"
+                )
+                continue
+
+            # Check 3: Issue is in an exit column (using pre-fetched data)
             if issue_number in issue_columns:
                 column_name = issue_columns[issue_number]
                 if column_name in workflow_template.pipeline_exit_columns:
@@ -1745,7 +1758,7 @@ Waiting for human decision...
             else:
                 logger.debug(
                     f"Not all sub-issues complete for parent #{feature_branch.parent_issue} "
-                    f"(complete: {sum(1 for si in actual_sub_issues if si.get('state') == 'closed')}/{len(actual_sub_issues)}) "
+                    f"(complete: {sum(1 for si in actual_sub_issues if si.get('state', '').upper() == 'CLOSED')}/{len(actual_sub_issues)}) "
                     f"- just finalized issue #{issue_number}"
                 )
                 all_complete = False

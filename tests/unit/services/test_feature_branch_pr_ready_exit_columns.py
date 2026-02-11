@@ -434,3 +434,164 @@ async def test_verify_sub_issues_consistent_board_lookup():
     # Should find the board using sdlc/dev heuristic
     assert result == True
     assert project_monitor.get_issue_column_async.call_count == 1
+
+
+# --- Case-insensitive state matching (GitHub GraphQL returns uppercase) ---
+
+@pytest.mark.asyncio
+async def test_verify_sub_issues_uppercase_closed():
+    """GitHub GraphQL returns 'CLOSED' (uppercase) — must be treated as closed."""
+    manager = FeatureBranchManager()
+    github = Mock()
+
+    sub_issues = [
+        {'number': 1, 'state': 'CLOSED'},
+        {'number': 2, 'state': 'CLOSED'},
+    ]
+
+    result = await manager._verify_all_sub_issues_complete(github, sub_issues)
+    assert result is True
+
+
+@pytest.mark.asyncio
+async def test_verify_sub_issues_mixed_case_closed():
+    """Mixed case states from different API sources should all work."""
+    manager = FeatureBranchManager()
+    github = Mock()
+
+    sub_issues = [
+        {'number': 1, 'state': 'closed'},
+        {'number': 2, 'state': 'CLOSED'},
+        {'number': 3, 'state': 'Closed'},
+    ]
+
+    result = await manager._verify_all_sub_issues_complete(github, sub_issues)
+    assert result is True
+
+
+@pytest.mark.asyncio
+async def test_verify_sub_issues_uppercase_open_not_complete():
+    """Uppercase 'OPEN' issues are not complete (without exit column check)."""
+    manager = FeatureBranchManager()
+    github = Mock()
+
+    sub_issues = [
+        {'number': 1, 'state': 'CLOSED'},
+        {'number': 2, 'state': 'OPEN'},
+    ]
+
+    result = await manager._verify_all_sub_issues_complete(github, sub_issues)
+    assert result is False
+
+
+# --- Triggering issue bypass (avoid GitHub API eventual consistency lag) ---
+
+@pytest.mark.asyncio
+async def test_triggering_issue_bypasses_column_check():
+    """The triggering issue should be treated as complete without re-querying its column."""
+    manager = FeatureBranchManager()
+    github = Mock()
+
+    sub_issues = [
+        {'number': 1, 'state': 'CLOSED'},
+        {'number': 2, 'state': 'CLOSED'},
+        {'number': 3, 'state': 'OPEN'},   # Just moved to exit column — the trigger
+    ]
+
+    # No project_monitor needed — triggering_issue bypass should handle #3
+    result = await manager._verify_all_sub_issues_complete(
+        github,
+        sub_issues,
+        triggering_issue=3
+    )
+
+    assert result is True
+
+
+@pytest.mark.asyncio
+async def test_triggering_issue_bypass_with_exit_column_check():
+    """Triggering issue bypassed even when exit column check is available."""
+    manager = FeatureBranchManager()
+    github = Mock()
+
+    sub_issues = [
+        {'number': 1, 'state': 'CLOSED'},
+        {'number': 2, 'state': 'OPEN'},   # In exit column via API
+        {'number': 3, 'state': 'OPEN'},   # The triggering issue — bypass API
+    ]
+
+    workflow_template = Mock()
+    workflow_template.name = 'dev_workflow'
+    workflow_template.pipeline_exit_columns = ['Done', 'Staged']
+
+    project_monitor = AsyncMock()
+
+    async def get_column_side_effect(project, board, issue_num):
+        if issue_num == 2:
+            return 'Staged'
+        # #3 should never be queried because of triggering_issue bypass
+        return None
+
+    project_monitor.get_issue_column_async = AsyncMock(side_effect=get_column_side_effect)
+
+    with patch('config.manager.config_manager') as mock_config:
+        mock_project_config = Mock()
+        mock_pipeline = Mock()
+        mock_pipeline.name = 'SDLC Execution'
+        mock_pipeline.workflow = 'dev_workflow'
+        mock_pipeline.board_name = 'Dev Board'
+        mock_project_config.pipelines = [mock_pipeline]
+        mock_config.get_project_config.return_value = mock_project_config
+
+        result = await manager._verify_all_sub_issues_complete(
+            github,
+            sub_issues,
+            project_name='test-project',
+            workflow_template=workflow_template,
+            project_monitor=project_monitor,
+            triggering_issue=3
+        )
+
+    assert result is True
+
+
+@pytest.mark.asyncio
+async def test_triggering_issue_not_enough_when_others_incomplete():
+    """Triggering issue bypass doesn't help if other issues are incomplete."""
+    manager = FeatureBranchManager()
+    github = Mock()
+
+    sub_issues = [
+        {'number': 1, 'state': 'OPEN'},   # Not closed, not triggering, no exit column check
+        {'number': 2, 'state': 'OPEN'},   # The triggering issue — bypassed
+    ]
+
+    result = await manager._verify_all_sub_issues_complete(
+        github,
+        sub_issues,
+        triggering_issue=2
+    )
+
+    # #1 is still open and not the trigger, so should fail
+    assert result is False
+
+
+@pytest.mark.asyncio
+async def test_triggering_issue_none_has_no_effect():
+    """When triggering_issue is None, no bypass occurs (backwards compatible)."""
+    manager = FeatureBranchManager()
+    github = Mock()
+
+    sub_issues = [
+        {'number': 1, 'state': 'CLOSED'},
+        {'number': 2, 'state': 'OPEN'},
+    ]
+
+    result = await manager._verify_all_sub_issues_complete(
+        github,
+        sub_issues,
+        triggering_issue=None
+    )
+
+    # #2 is open, no bypass — should fail
+    assert result is False

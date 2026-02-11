@@ -2586,11 +2586,12 @@ class ProjectMonitor:
                 actual_sub_issues,
                 project_name=project_name,
                 workflow_template=workflow_template,
-                project_monitor=self
+                project_monitor=self,
+                triggering_issue=issue_number
             )
 
             if not all_complete:
-                closed_count = len([s for s in actual_sub_issues if s.get('state') == 'closed'])
+                closed_count = len([s for s in actual_sub_issues if s.get('state', '').upper() == 'CLOSED'])
                 logger.info(
                     f"Not all sub-issues complete for parent #{parent_issue_number} yet "
                     f"({closed_count}/{len(actual_sub_issues)} closed)"
