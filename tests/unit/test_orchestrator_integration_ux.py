@@ -6,7 +6,6 @@ Tests the enhanced error messaging for TaskValidationError scenarios
 import pytest
 import os
 from unittest.mock import Mock, AsyncMock, patch
-from datetime import datetime
 
 # Skip these tests if not running in Docker (agents module requires Docker)
 if not os.path.exists('/app/state/dev_containers'):
@@ -64,7 +63,9 @@ async def test_validation_error_message_includes_context(mock_task, mock_logger)
         # Import and call process_task_integrated
         from agents.orchestrator_integration import process_task_integrated
 
-        with pytest.raises(Exception) as exc_info:
+        from agents.non_retryable import NonRetryableAgentError
+
+        with pytest.raises(NonRetryableAgentError) as exc_info:
             await process_task_integrated(mock_task, Mock(), mock_logger)
 
         # Verify error message includes helpful context
@@ -104,8 +105,9 @@ async def test_recovery_message_is_actionable(mock_task, mock_logger):
         mock_queue.return_value = AsyncMock()
 
         from agents.orchestrator_integration import process_task_integrated
+        from agents.non_retryable import NonRetryableAgentError
 
-        with pytest.raises(Exception):
+        with pytest.raises(NonRetryableAgentError):
             await process_task_integrated(mock_task, Mock(), mock_logger)
 
         # Verify second call is error_recovered with actionable message
@@ -138,8 +140,9 @@ async def test_in_progress_message_is_clear(mock_task, mock_logger):
         mock_emitter.return_value = mock_decision_emitter
 
         from agents.orchestrator_integration import process_task_integrated
+        from agents.non_retryable import NonRetryableAgentError
 
-        with pytest.raises(Exception) as exc_info:
+        with pytest.raises(NonRetryableAgentError) as exc_info:
             await process_task_integrated(mock_task, Mock(), mock_logger)
 
         # Verify error message mentions in progress
@@ -170,8 +173,9 @@ async def test_blocked_message_includes_troubleshooting(mock_task, mock_logger):
         mock_emitter.return_value = mock_decision_emitter
 
         from agents.orchestrator_integration import process_task_integrated
+        from agents.non_retryable import NonRetryableAgentError
 
-        with pytest.raises(Exception):
+        with pytest.raises(NonRetryableAgentError):
             await process_task_integrated(mock_task, Mock(), mock_logger)
 
         # Verify error message includes file path for troubleshooting

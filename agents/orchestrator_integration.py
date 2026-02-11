@@ -74,7 +74,6 @@ async def queue_dev_environment_setup(project: str, logger):
     """
     from task_queue.task_manager import Task, TaskPriority, TaskQueue
     from services.dev_container_state import dev_container_state, DevContainerStatus
-    from datetime import datetime
 
     # Check if setup is already in progress - avoid duplicate queuing
     current_status = dev_container_state.get_status(project)
@@ -90,33 +89,46 @@ async def queue_dev_environment_setup(project: str, logger):
     )
     logger.info(f"Set dev container status to IN_PROGRESS for {project}")
 
-    logger.info(f"Auto-queuing dev_environment_setup task for {project}")
+    try:
+        logger.info(f"Auto-queuing dev_environment_setup task for {project}")
 
-    task_queue = TaskQueue(use_redis=True)
+        task_queue = TaskQueue(use_redis=True)
 
-    task = Task(
-        id=f"auto_dev_env_setup_{project}_{int(datetime.now().timestamp())}",
-        agent="dev_environment_setup",
-        project=project,
-        priority=TaskPriority.HIGH,
-        context={
-            'issue': {
-                'title': f'Development environment setup for {project}',
-                'body': 'Auto-triggered: Agent requires dev container but it is not verified',
-                'number': 0
+        task = Task(
+            id=f"auto_dev_env_setup_{project}_{int(datetime.now().timestamp())}",
+            agent="dev_environment_setup",
+            project=project,
+            priority=TaskPriority.HIGH,
+            context={
+                'issue': {
+                    'title': f'Development environment setup for {project}',
+                    'body': 'Auto-triggered: Agent requires dev container but it is not verified',
+                    'number': 0
+                },
+                'issue_number': 0,
+                'board': 'system',
+                'repository': project,
+                'automated_setup': True,
+                'auto_triggered': True,
+                'use_docker': False  # Run locally in orchestrator environment
             },
-            'issue_number': 0,
-            'board': 'system',
-            'repository': project,
-            'automated_setup': True,
-            'auto_triggered': True,
-            'use_docker': False  # Run locally in orchestrator environment
-        },
-        created_at=datetime.now().isoformat()
-    )
+            created_at=datetime.now().isoformat()
+        )
 
-    task_queue.enqueue(task)
-    logger.info(f"Auto-queued dev_environment_setup task: {task.id}")
+        task_queue.enqueue(task)
+        logger.info(f"Auto-queued dev_environment_setup task: {task.id}")
+    except Exception as e:
+        # Roll back status to prevent permanent stuck IN_PROGRESS state
+        logger.error(
+            f"Failed to enqueue dev_environment_setup for {project}: {e}. "
+            f"Rolling back status from IN_PROGRESS to UNVERIFIED to allow retry."
+        )
+        dev_container_state.set_status(
+            project,
+            DevContainerStatus.UNVERIFIED,
+            error_message=f"Enqueue failed: {e}"
+        )
+        raise
 
 
 class AgentStage(PipelineStage):
@@ -312,31 +324,51 @@ async def process_task_integrated(task, state_manager, logger):
         
         # Queue dev_environment_setup task if needed
         if validation_result.get('needs_dev_setup'):
-            await queue_dev_environment_setup(task.project, logger)
+            try:
+                await queue_dev_environment_setup(task.project, logger)
 
-            # EMIT DECISION EVENT: Recovery successful
-            recovery_message = (
-                f"Development environment setup has been queued for project '{task.project}'. "
-                f"Task will be retried automatically once the environment is ready."
-            )
-            decision_events.emit_error_decision(
-                error_type='TaskValidationError',
-                error_message=recovery_message,
-                context={
-                    'task_id': task.id,
-                    'agent': task.agent,
-                    'issue_number': issue_number,
-                    'board': board_name,
-                    'auto_queued': True
-                },
-                recovery_action='queue_dev_environment_setup',
-                success=True,
-                project=task.project,
-                pipeline_run_id=pipeline_run_id
-            )
-        
+                # EMIT DECISION EVENT: Recovery successful
+                recovery_message = (
+                    f"Development environment setup has been queued for project '{task.project}'. "
+                    f"Task will be retried automatically once the environment is ready."
+                )
+                decision_events.emit_error_decision(
+                    error_type='TaskValidationError',
+                    error_message=recovery_message,
+                    context={
+                        'task_id': task.id,
+                        'agent': task.agent,
+                        'issue_number': issue_number,
+                        'board': board_name,
+                        'auto_queued': True
+                    },
+                    recovery_action='queue_dev_environment_setup',
+                    success=True,
+                    project=task.project,
+                    pipeline_run_id=pipeline_run_id
+                )
+            except Exception as queue_error:
+                logger.error(
+                    f"Failed to queue dev environment setup for {task.project}: {queue_error}. "
+                    f"Task will be blocked until setup is manually triggered."
+                )
+                decision_events.emit_error_decision(
+                    error_type='DevSetupQueueFailure',
+                    error_message=f"Failed to auto-queue dev environment setup: {queue_error}",
+                    context={
+                        'task_id': task.id,
+                        'agent': task.agent,
+                        'issue_number': issue_number,
+                        'board': board_name
+                    },
+                    recovery_action='manual_intervention_required',
+                    success=False,
+                    project=task.project,
+                    pipeline_run_id=pipeline_run_id
+                )
+
         from agents.non_retryable import NonRetryableAgentError
-        raise NonRetryableAgentError(f"Task blocked: {validation_result['reason']}")
+        raise NonRetryableAgentError(f"Task blocked: {user_message}")
 
     # Record execution start in work execution state
     if 'issue_number' in task_context and 'column' in task_context:
