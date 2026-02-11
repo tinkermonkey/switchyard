@@ -167,12 +167,11 @@ class TestDevContainerStateSync:
                 mock_redis_client = MagicMock()
                 mock_redis.return_value = mock_redis_client
 
-                # No tracking keys
                 mock_redis_client.scan_iter.side_effect = [
-                    # First call: agent result keys (for recovery)
+                    # First call: tracking keys (agent:container:*) — none found
+                    [],
+                    # Second call: result keys (agent_result:*) — found one
                     [f"agent_result:{project_name}:{issue_number}:task123"],
-                    # Second call: tracking keys (none)
-                    []
                 ]
                 mock_redis_client.exists.return_value = False
                 mock_redis_client.keys.return_value = []
@@ -239,12 +238,11 @@ class TestDevContainerStateSync:
                 mock_redis_client = MagicMock()
                 mock_redis.return_value = mock_redis_client
 
-                # No tracking keys
                 mock_redis_client.scan_iter.side_effect = [
-                    # First call: agent result keys (for recovery)
+                    # First call: tracking keys (agent:container:*) — none found
+                    [],
+                    # Second call: result keys (agent_result:*) — found one
                     [f"agent_result:{project_name}:{issue_number}:task123"],
-                    # Second call: tracking keys (none)
-                    []
                 ]
                 mock_redis_client.exists.return_value = False
                 mock_redis_client.keys.return_value = []

@@ -723,7 +723,10 @@ None found
 
 ### Low Priority / Nice-to-Have
 None found
-"""
+""",
+        'tools_used': [
+            {'name': 'pr-review-toolkit:review-pr', 'timestamp': '2025-01-01T00:00:00Z'}
+        ]
     }
 
 
@@ -744,7 +747,10 @@ None found
 
 ### Low Priority / Nice-to-Have
 None found
-"""
+""",
+        'tools_used': [
+            {'name': 'pr-review-toolkit:review-pr', 'timestamp': '2025-01-01T00:00:00Z'}
+        ]
     }
 
 
