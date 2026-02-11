@@ -248,28 +248,82 @@ const ReviewCycleCompletedEvent = ({ event, onIconClick }) => (
 )
 
 // Error Handling Events
-const ErrorEncounteredEvent = ({ event, onIconClick }) => (
-  <PipelineRunEventLogEvent event={event} onIconClick={onIconClick} icon={AlertCircle} color="bg-red-600">
-    <div className="space-y-1">
-      <div>Error encountered: {event?.data?.error_type || event?.error_type}</div>
-      {(event?.data?.error_message || event?.error_message) && (
-        <div className="text-xs text-red-400">{event?.data?.error_message || event.error_message}</div>
-      )}
-      {(event?.data?.decision?.recovery_action || event?.decision?.recovery_action) && (
-        <div className="text-xs mt-1">Recovery: {event?.data?.decision?.recovery_action || event.decision.recovery_action}</div>
-      )}
-    </div>
-  </PipelineRunEventLogEvent>
-)
+const ErrorEncounteredEvent = ({ event, onIconClick }) => {
+  const errorType = event?.data?.error_type || event?.error_type
+  const errorMessage = event?.data?.error_message || event?.error_message
+  const recoveryAction = event?.data?.decision?.recovery_action || event?.decision?.recovery_action
 
-const ErrorRecoveredEvent = ({ event, onIconClick }) => (
-  <PipelineRunEventLogEvent event={event} onIconClick={onIconClick} icon={CheckCircle} color="bg-green-600">
-    <div>Error recovered: {event?.data?.error_type || event?.error_type}</div>
-    {(event?.data?.decision?.recovery_action || event?.decision?.recovery_action) && (
-      <div className="text-xs">{event?.data?.decision?.recovery_action || event.decision.recovery_action}</div>
-    )}
-  </PipelineRunEventLogEvent>
-)
+  // Transform technical error types to user-friendly titles
+  const getErrorTitle = (type) => {
+    if (type === 'TaskValidationError') {
+      return '⚠️ Task Blocked - Prerequisites Missing'
+    }
+    return `Error: ${type}`
+  }
+
+  // Transform recovery actions to user-friendly messages
+  const getRecoveryMessage = (action) => {
+    if (action === 'queue_dev_environment_setup') {
+      return 'Attempting to setup dev environment automatically...'
+    }
+    if (action === 'block_task') {
+      return 'Task blocked until requirements are met'
+    }
+    return action
+  }
+
+  return (
+    <PipelineRunEventLogEvent event={event} onIconClick={onIconClick} icon={AlertCircle} color="bg-red-600">
+      <div className="space-y-1">
+        <div className="font-semibold">{getErrorTitle(errorType)}</div>
+        {errorMessage && (
+          <div className="text-xs bg-red-900/30 border border-red-700/50 rounded px-2 py-1">
+            {errorMessage}
+          </div>
+        )}
+        {recoveryAction && (
+          <div className="text-xs mt-1 text-orange-300">
+            → {getRecoveryMessage(recoveryAction)}
+          </div>
+        )}
+      </div>
+    </PipelineRunEventLogEvent>
+  )
+}
+
+const ErrorRecoveredEvent = ({ event, onIconClick }) => {
+  const errorType = event?.data?.error_type || event?.error_type
+  const errorMessage = event?.data?.error_message || event?.error_message
+  const recoveryAction = event?.data?.decision?.recovery_action || event?.decision?.recovery_action
+
+  // Transform technical recovery actions to user-friendly messages
+  const getRecoveryMessage = (action, error) => {
+    if (action === 'queue_dev_environment_setup') {
+      return '✓ Auto-queued dev environment setup task'
+    }
+    return action
+  }
+
+  return (
+    <PipelineRunEventLogEvent event={event} onIconClick={onIconClick} icon={CheckCircle} color="bg-green-600">
+      <div className="space-y-1">
+        <div className="font-semibold">
+          {errorType === 'TaskValidationError' ? 'Task Blocked - Recovery Initiated' : `Error Recovered: ${errorType}`}
+        </div>
+        {errorMessage && (
+          <div className="text-xs bg-yellow-900/30 border border-yellow-700/50 rounded px-2 py-1">
+            <span className="font-semibold">Issue:</span> {errorMessage}
+          </div>
+        )}
+        {recoveryAction && (
+          <div className="text-xs text-green-400">
+            {getRecoveryMessage(recoveryAction, errorType)}
+          </div>
+        )}
+      </div>
+    </PipelineRunEventLogEvent>
+  )
+}
 
 // Task Queue Events
 const TaskQueuedEvent = ({ event, onIconClick }) => (

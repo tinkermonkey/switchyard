@@ -40,37 +40,55 @@ async def validate_task_can_run(task, logger) -> Dict[str, Any]:
     status = dev_container_state.get_status(task.project)
 
     if status == DevContainerStatus.VERIFIED:
-        return {'can_run': True, 'reason': 'Dev container verified'}
+        return {'can_run': True, 'reason': 'Dev container verified and ready'}
     elif status == DevContainerStatus.IN_PROGRESS:
         return {
             'can_run': False,
-            'reason': 'Dev container setup in progress',
+            'reason': f"Dev container setup currently in progress for '{task.project}'",
             'needs_dev_setup': False
         }
     elif status == DevContainerStatus.BLOCKED:
         return {
             'can_run': False,
-            'reason': 'Dev container setup blocked - manual intervention required',
+            'reason': f"Dev container setup is blocked for '{task.project}'. Check state/dev_containers/{task.project}.yaml for error details",
             'needs_dev_setup': False
         }
     else:  # UNVERIFIED
         return {
             'can_run': False,
-            'reason': 'Dev container not verified',
+            'reason': f"Dev container not yet verified for project '{task.project}'",
             'needs_dev_setup': True
         }
 
 
 async def queue_dev_environment_setup(project: str, logger):
     """
-    Queue a dev_environment_setup task for a project
+    Queue a dev_environment_setup task for a project.
+
+    Idempotent: skips queuing if setup is already IN_PROGRESS.
+    Sets status to IN_PROGRESS before enqueuing to prevent races.
 
     Args:
         project: Project name
         logger: Logger instance
     """
     from task_queue.task_manager import Task, TaskPriority, TaskQueue
+    from services.dev_container_state import dev_container_state, DevContainerStatus
     from datetime import datetime
+
+    # Check if setup is already in progress - avoid duplicate queuing
+    current_status = dev_container_state.get_status(project)
+    if current_status == DevContainerStatus.IN_PROGRESS:
+        logger.info(f"Dev environment setup already in progress for {project}, skipping duplicate queue")
+        return
+
+    # Mark as in-progress BEFORE queuing to prevent races
+    dev_container_state.set_status(
+        project,
+        DevContainerStatus.IN_PROGRESS,
+        image_name=f"{project}-agent:latest"
+    )
+    logger.info(f"Set dev container status to IN_PROGRESS for {project}")
 
     logger.info(f"Auto-queuing dev_environment_setup task for {project}")
 
@@ -261,16 +279,30 @@ async def process_task_integrated(task, state_manager, logger):
     validation_result = await validate_task_can_run(task, logger)
     if not validation_result['can_run']:
         logger.log_warning(f"Task {task.id} blocked: {validation_result['reason']}")
-        
+
+        # Build user-friendly error message
+        base_message = validation_result['reason']
+        if validation_result.get('needs_dev_setup'):
+            user_message = (
+                f"{base_message}. Agent '{task.agent}' requires a Docker development environment. "
+                f"The system will automatically setup the environment and retry this task."
+            )
+        else:
+            user_message = (
+                f"{base_message}. Agent '{task.agent}' cannot execute until this is resolved. "
+                f"Please check the project configuration or wait for setup to complete."
+            )
+
         # EMIT DECISION EVENT: Error encountered
         decision_events.emit_error_decision(
             error_type='TaskValidationError',
-            error_message=validation_result['reason'],
+            error_message=user_message,
             context={
                 'task_id': task.id,
                 'agent': task.agent,
                 'issue_number': issue_number,
-                'board': board_name
+                'board': board_name,
+                'requires_dev_container': True
             },
             recovery_action='queue_dev_environment_setup' if validation_result.get('needs_dev_setup') else 'block_task',
             success=validation_result.get('needs_dev_setup', False),
@@ -281,16 +313,21 @@ async def process_task_integrated(task, state_manager, logger):
         # Queue dev_environment_setup task if needed
         if validation_result.get('needs_dev_setup'):
             await queue_dev_environment_setup(task.project, logger)
-            
+
             # EMIT DECISION EVENT: Recovery successful
+            recovery_message = (
+                f"Development environment setup has been queued for project '{task.project}'. "
+                f"Task will be retried automatically once the environment is ready."
+            )
             decision_events.emit_error_decision(
                 error_type='TaskValidationError',
-                error_message=validation_result['reason'],
+                error_message=recovery_message,
                 context={
                     'task_id': task.id,
                     'agent': task.agent,
                     'issue_number': issue_number,
-                    'board': board_name
+                    'board': board_name,
+                    'auto_queued': True
                 },
                 recovery_action='queue_dev_environment_setup',
                 success=True,
@@ -298,7 +335,8 @@ async def process_task_integrated(task, state_manager, logger):
                 pipeline_run_id=pipeline_run_id
             )
         
-        raise Exception(f"Task blocked: {validation_result['reason']}")
+        from agents.non_retryable import NonRetryableAgentError
+        raise NonRetryableAgentError(f"Task blocked: {validation_result['reason']}")
 
     # Record execution start in work execution state
     if 'issue_number' in task_context and 'column' in task_context:
