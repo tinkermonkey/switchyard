@@ -3163,6 +3163,147 @@ class ProjectMonitor:
             logger.error(traceback.format_exc())
             return None
 
+    def _move_card_with_retry(
+        self,
+        project_name: str,
+        board_name: str,
+        issue_number: int,
+        source_column: str,
+        target_column: str,
+        project_config,
+        repository: str,
+        workspace_type: str,
+        discussion_id: Optional[str],
+        pipeline_run,
+        loop,
+        max_retries: int = 3,
+    ):
+        """Move a card to the next column with retries and error surfacing.
+
+        Retries the move up to max_retries times with exponential backoff.
+        On final failure, emits an error decision event and posts a GitHub
+        comment. Re-raises CancellationError immediately per the cancellation
+        contract.
+        """
+        from services.pipeline_progression import PipelineProgression
+        from services.cancellation import CancellationError
+        progression_service = PipelineProgression(self.task_queue)
+
+        last_error_detail = None
+        for attempt in range(1, max_retries + 1):
+            try:
+                logger.info(
+                    f"Moving issue #{issue_number} from {source_column} to {target_column} "
+                    f"(attempt {attempt}/{max_retries})"
+                )
+                result = progression_service.move_issue_to_column(
+                    project_name=project_name,
+                    board_name=board_name,
+                    issue_number=issue_number,
+                    target_column=target_column,
+                    trigger='review_cycle_completion'
+                )
+                if result:
+                    logger.info(f"Successfully moved issue #{issue_number} to {target_column}")
+                    return True
+                else:
+                    last_error_detail = (
+                        "move_issue_to_column returned False "
+                        "— check pipeline_progression logs for details"
+                    )
+                    logger.warning(
+                        f"move_issue_to_column returned False for issue #{issue_number} "
+                        f"(attempt {attempt}/{max_retries})"
+                    )
+            except CancellationError:
+                raise
+            except Exception as move_error:
+                last_error_detail = str(move_error)
+                logger.warning(
+                    f"move_issue_to_column raised exception for issue #{issue_number} "
+                    f"(attempt {attempt}/{max_retries}): {move_error}",
+                    exc_info=True
+                )
+
+            if attempt < max_retries:
+                wait_time = 5 * (2 ** (attempt - 1))  # 5s, 10s
+                logger.info(f"Retrying card move in {wait_time}s...")
+                time.sleep(wait_time)
+
+        # All retries exhausted
+        error_msg = (
+            f"Failed to move issue #{issue_number} from {source_column} to "
+            f"{target_column} after {max_retries} attempts"
+        )
+        if last_error_detail:
+            error_msg += f". Last error: {last_error_detail}"
+
+        logger.error(
+            f"CRITICAL: {error_msg}. "
+            f"Pipeline lock retained — manual intervention required."
+        )
+
+        # Emit error decision event for UI visibility
+        try:
+            from monitoring.decision_events import DecisionEventEmitter
+            from monitoring.observability import get_observability_manager
+
+            decision_emitter = DecisionEventEmitter(get_observability_manager())
+            decision_emitter.emit_error_decision(
+                error_type="review_cycle_card_move_failure",
+                error_message=error_msg,
+                context={
+                    'thread': 'review_cycle_thread',
+                    'issue_number': issue_number,
+                    'project': project_name,
+                    'board': board_name,
+                    'source_column': source_column,
+                    'target_column': target_column,
+                },
+                recovery_action="Pipeline lock retained — manual intervention required",
+                success=False,
+                project=project_name,
+                pipeline_run_id=pipeline_run.id if pipeline_run else None
+            )
+        except Exception as emit_error:
+            logger.error(f"Failed to emit card move error event: {emit_error}", exc_info=True)
+
+        # Post GitHub comment for user visibility
+        try:
+            from services.github_integration import GitHubIntegration
+            github_for_comment = GitHubIntegration(
+                repo_owner=project_config.github['org'],
+                repo_name=repository
+            )
+            error_context = {
+                'issue_number': issue_number,
+                'repository': repository,
+                'workspace_type': workspace_type,
+                'discussion_id': discussion_id
+            }
+            comment_body = (
+                f"## Card Move Failed\n\n"
+                f"**Issue**: #{issue_number}\n"
+                f"**From**: {source_column}\n"
+                f"**To**: {target_column}\n"
+                f"**Attempts**: {max_retries}\n"
+            )
+            if last_error_detail:
+                comment_body += f"**Last error**: {last_error_detail}\n"
+            comment_body += (
+                f"\nThe review cycle approved the changes, but the card could not be "
+                f"moved to the next column. The pipeline lock is retained — "
+                f"**manual intervention is required** to move the card and release the lock.\n\n"
+                f"---\n_Error reported by Claude Code Orchestrator_\n"
+            )
+            loop.run_until_complete(
+                github_for_comment.post_agent_output(error_context, comment_body)
+            )
+        except Exception as comment_error:
+            logger.error(f"Failed to post card move error comment: {comment_error}", exc_info=True)
+
+        return False
+
     def _start_review_cycle_for_issue(
         self,
         project_name: str,
@@ -3349,111 +3490,19 @@ _Review cycle initiated by Claude Code Orchestrator_
 
                     # Move card to next column if successful and next column specified
                     if success and next_column and next_column != status:
-                        from services.pipeline_progression import PipelineProgression
-                        progression_service = PipelineProgression(self.task_queue)
-
-                        move_succeeded = False
-                        max_move_retries = 3
-                        for attempt in range(1, max_move_retries + 1):
-                            try:
-                                logger.info(
-                                    f"Moving issue #{issue_number} from {status} to {next_column} "
-                                    f"(attempt {attempt}/{max_move_retries})"
-                                )
-                                result = progression_service.move_issue_to_column(
-                                    project_name=project_name,
-                                    board_name=board_name,
-                                    issue_number=issue_number,
-                                    target_column=next_column,
-                                    trigger='review_cycle_completion'
-                                )
-                                if result:
-                                    move_succeeded = True
-                                    logger.info(f"Successfully moved issue #{issue_number} to {next_column}")
-                                    break
-                                else:
-                                    logger.warning(
-                                        f"move_issue_to_column returned False for issue #{issue_number} "
-                                        f"(attempt {attempt}/{max_move_retries})"
-                                    )
-                            except Exception as move_error:
-                                logger.warning(
-                                    f"move_issue_to_column raised exception for issue #{issue_number} "
-                                    f"(attempt {attempt}/{max_move_retries}): {move_error}"
-                                )
-
-                            if attempt < max_move_retries:
-                                wait_time = 5 * (2 ** (attempt - 1))  # 5s, 10s
-                                logger.info(f"Retrying card move in {wait_time}s...")
-                                time.sleep(wait_time)
-
-                        if not move_succeeded:
-                            logger.error(
-                                f"CRITICAL: Failed to move issue #{issue_number} from {status} to "
-                                f"{next_column} after {max_move_retries} attempts. "
-                                f"Pipeline lock retained — manual intervention required."
-                            )
-
-                            # Emit error decision event for UI visibility
-                            try:
-                                from monitoring.decision_events import DecisionEventEmitter
-                                from monitoring.observability import get_observability_manager
-
-                                decision_emitter = DecisionEventEmitter(get_observability_manager())
-                                decision_emitter.emit_error_decision(
-                                    error_type="review_cycle_card_move_failure",
-                                    error_message=(
-                                        f"Failed to move issue #{issue_number} from {status} to "
-                                        f"{next_column} after {max_move_retries} attempts"
-                                    ),
-                                    context={
-                                        'thread': 'review_cycle_thread',
-                                        'issue_number': issue_number,
-                                        'project': project_name,
-                                        'board': board_name,
-                                        'source_column': status,
-                                        'target_column': next_column,
-                                    },
-                                    recovery_action="Pipeline lock retained — manual intervention required",
-                                    success=False,
-                                    project=project_name,
-                                    pipeline_run_id=pipeline_run.id if pipeline_run else None
-                                )
-                            except Exception as emit_error:
-                                logger.error(f"Failed to emit card move error event: {emit_error}", exc_info=True)
-
-                            # Post GitHub comment for user visibility
-                            try:
-                                from services.github_integration import GitHubIntegration
-                                github_for_comment = GitHubIntegration(
-                                    repo_owner=project_config.github['org'],
-                                    repo_name=repository
-                                )
-                                error_context = {
-                                    'issue_number': issue_number,
-                                    'repository': repository,
-                                    'workspace_type': workspace_type,
-                                    'discussion_id': discussion_id
-                                }
-                                loop.run_until_complete(
-                                    github_for_comment.post_agent_output(
-                                        error_context,
-                                        f"""## Card Move Failed
-
-**Issue**: #{issue_number}
-**From**: {status}
-**To**: {next_column}
-**Attempts**: {max_move_retries}
-
-The review cycle approved the changes, but the card could not be moved to the next column. The pipeline lock is retained — **manual intervention is required** to move the card and release the lock.
-
----
-_Error reported by Claude Code Orchestrator_
-"""
-                                    )
-                                )
-                            except Exception as comment_error:
-                                logger.error(f"Failed to post card move error comment: {comment_error}", exc_info=True)
+                        self._move_card_with_retry(
+                            project_name=project_name,
+                            board_name=board_name,
+                            issue_number=issue_number,
+                            source_column=status,
+                            target_column=next_column,
+                            project_config=project_config,
+                            repository=repository,
+                            workspace_type=workspace_type,
+                            discussion_id=discussion_id,
+                            pipeline_run=pipeline_run,
+                            loop=loop,
+                        )
 
                 except Exception as e:
                     # CancellationError: deliberate stop — log as info, don't emit error events
