@@ -14,11 +14,7 @@ import { Route as RepairCyclesRouteImport } from './routes/repair-cycles'
 import { Route as ProjectsRouteImport } from './routes/projects'
 import { Route as PipelineRunDebugRouteImport } from './routes/pipeline-run-debug'
 import { Route as PipelineRunRouteImport } from './routes/pipeline-run'
-import { Route as MedicRouteImport } from './routes/medic'
-import { Route as ClaudeMedicRouteImport } from './routes/claude-medic'
 import { Route as IndexRouteImport } from './routes/index'
-import { Route as MedicDetailFingerprintIdRouteImport } from './routes/medic-detail.$fingerprintId'
-import { Route as ClaudeMedicDetailFingerprintIdRouteImport } from './routes/claude-medic-detail.$fingerprintId'
 import { Route as AgentExecutionExecutionIdRouteImport } from './routes/agent-execution.$executionId'
 
 const ReviewLearningRoute = ReviewLearningRouteImport.update({
@@ -46,33 +42,11 @@ const PipelineRunRoute = PipelineRunRouteImport.update({
   path: '/pipeline-run',
   getParentRoute: () => rootRouteImport,
 } as any)
-const MedicRoute = MedicRouteImport.update({
-  id: '/medic',
-  path: '/medic',
-  getParentRoute: () => rootRouteImport,
-} as any)
-const ClaudeMedicRoute = ClaudeMedicRouteImport.update({
-  id: '/claude-medic',
-  path: '/claude-medic',
-  getParentRoute: () => rootRouteImport,
-} as any)
 const IndexRoute = IndexRouteImport.update({
   id: '/',
   path: '/',
   getParentRoute: () => rootRouteImport,
 } as any)
-const MedicDetailFingerprintIdRoute =
-  MedicDetailFingerprintIdRouteImport.update({
-    id: '/medic-detail/$fingerprintId',
-    path: '/medic-detail/$fingerprintId',
-    getParentRoute: () => rootRouteImport,
-  } as any)
-const ClaudeMedicDetailFingerprintIdRoute =
-  ClaudeMedicDetailFingerprintIdRouteImport.update({
-    id: '/claude-medic-detail/$fingerprintId',
-    path: '/claude-medic-detail/$fingerprintId',
-    getParentRoute: () => rootRouteImport,
-  } as any)
 const AgentExecutionExecutionIdRoute =
   AgentExecutionExecutionIdRouteImport.update({
     id: '/agent-execution/$executionId',
@@ -82,98 +56,70 @@ const AgentExecutionExecutionIdRoute =
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
-  '/claude-medic': typeof ClaudeMedicRoute
-  '/medic': typeof MedicRoute
   '/pipeline-run': typeof PipelineRunRoute
   '/pipeline-run-debug': typeof PipelineRunDebugRoute
   '/projects': typeof ProjectsRoute
   '/repair-cycles': typeof RepairCyclesRoute
   '/review-learning': typeof ReviewLearningRoute
   '/agent-execution/$executionId': typeof AgentExecutionExecutionIdRoute
-  '/claude-medic-detail/$fingerprintId': typeof ClaudeMedicDetailFingerprintIdRoute
-  '/medic-detail/$fingerprintId': typeof MedicDetailFingerprintIdRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
-  '/claude-medic': typeof ClaudeMedicRoute
-  '/medic': typeof MedicRoute
   '/pipeline-run': typeof PipelineRunRoute
   '/pipeline-run-debug': typeof PipelineRunDebugRoute
   '/projects': typeof ProjectsRoute
   '/repair-cycles': typeof RepairCyclesRoute
   '/review-learning': typeof ReviewLearningRoute
   '/agent-execution/$executionId': typeof AgentExecutionExecutionIdRoute
-  '/claude-medic-detail/$fingerprintId': typeof ClaudeMedicDetailFingerprintIdRoute
-  '/medic-detail/$fingerprintId': typeof MedicDetailFingerprintIdRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
-  '/claude-medic': typeof ClaudeMedicRoute
-  '/medic': typeof MedicRoute
   '/pipeline-run': typeof PipelineRunRoute
   '/pipeline-run-debug': typeof PipelineRunDebugRoute
   '/projects': typeof ProjectsRoute
   '/repair-cycles': typeof RepairCyclesRoute
   '/review-learning': typeof ReviewLearningRoute
   '/agent-execution/$executionId': typeof AgentExecutionExecutionIdRoute
-  '/claude-medic-detail/$fingerprintId': typeof ClaudeMedicDetailFingerprintIdRoute
-  '/medic-detail/$fingerprintId': typeof MedicDetailFingerprintIdRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
   fullPaths:
     | '/'
-    | '/claude-medic'
-    | '/medic'
     | '/pipeline-run'
     | '/pipeline-run-debug'
     | '/projects'
     | '/repair-cycles'
     | '/review-learning'
     | '/agent-execution/$executionId'
-    | '/claude-medic-detail/$fingerprintId'
-    | '/medic-detail/$fingerprintId'
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/'
-    | '/claude-medic'
-    | '/medic'
     | '/pipeline-run'
     | '/pipeline-run-debug'
     | '/projects'
     | '/repair-cycles'
     | '/review-learning'
     | '/agent-execution/$executionId'
-    | '/claude-medic-detail/$fingerprintId'
-    | '/medic-detail/$fingerprintId'
   id:
     | '__root__'
     | '/'
-    | '/claude-medic'
-    | '/medic'
     | '/pipeline-run'
     | '/pipeline-run-debug'
     | '/projects'
     | '/repair-cycles'
     | '/review-learning'
     | '/agent-execution/$executionId'
-    | '/claude-medic-detail/$fingerprintId'
-    | '/medic-detail/$fingerprintId'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
-  ClaudeMedicRoute: typeof ClaudeMedicRoute
-  MedicRoute: typeof MedicRoute
   PipelineRunRoute: typeof PipelineRunRoute
   PipelineRunDebugRoute: typeof PipelineRunDebugRoute
   ProjectsRoute: typeof ProjectsRoute
   RepairCyclesRoute: typeof RepairCyclesRoute
   ReviewLearningRoute: typeof ReviewLearningRoute
   AgentExecutionExecutionIdRoute: typeof AgentExecutionExecutionIdRoute
-  ClaudeMedicDetailFingerprintIdRoute: typeof ClaudeMedicDetailFingerprintIdRoute
-  MedicDetailFingerprintIdRoute: typeof MedicDetailFingerprintIdRoute
 }
 
 declare module '@tanstack/react-router' {
@@ -213,39 +159,11 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof PipelineRunRouteImport
       parentRoute: typeof rootRouteImport
     }
-    '/medic': {
-      id: '/medic'
-      path: '/medic'
-      fullPath: '/medic'
-      preLoaderRoute: typeof MedicRouteImport
-      parentRoute: typeof rootRouteImport
-    }
-    '/claude-medic': {
-      id: '/claude-medic'
-      path: '/claude-medic'
-      fullPath: '/claude-medic'
-      preLoaderRoute: typeof ClaudeMedicRouteImport
-      parentRoute: typeof rootRouteImport
-    }
     '/': {
       id: '/'
       path: '/'
       fullPath: '/'
       preLoaderRoute: typeof IndexRouteImport
-      parentRoute: typeof rootRouteImport
-    }
-    '/medic-detail/$fingerprintId': {
-      id: '/medic-detail/$fingerprintId'
-      path: '/medic-detail/$fingerprintId'
-      fullPath: '/medic-detail/$fingerprintId'
-      preLoaderRoute: typeof MedicDetailFingerprintIdRouteImport
-      parentRoute: typeof rootRouteImport
-    }
-    '/claude-medic-detail/$fingerprintId': {
-      id: '/claude-medic-detail/$fingerprintId'
-      path: '/claude-medic-detail/$fingerprintId'
-      fullPath: '/claude-medic-detail/$fingerprintId'
-      preLoaderRoute: typeof ClaudeMedicDetailFingerprintIdRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/agent-execution/$executionId': {
@@ -260,16 +178,12 @@ declare module '@tanstack/react-router' {
 
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
-  ClaudeMedicRoute: ClaudeMedicRoute,
-  MedicRoute: MedicRoute,
   PipelineRunRoute: PipelineRunRoute,
   PipelineRunDebugRoute: PipelineRunDebugRoute,
   ProjectsRoute: ProjectsRoute,
   RepairCyclesRoute: RepairCyclesRoute,
   ReviewLearningRoute: ReviewLearningRoute,
   AgentExecutionExecutionIdRoute: AgentExecutionExecutionIdRoute,
-  ClaudeMedicDetailFingerprintIdRoute: ClaudeMedicDetailFingerprintIdRoute,
-  MedicDetailFingerprintIdRoute: MedicDetailFingerprintIdRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)

@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from 'react'
+import { useState, useEffect, useMemo, memo } from 'react'
 import { useSocket } from '../contexts/SocketContext'
 import { 
   Activity, AlertCircle, CheckCircle, XCircle, GitBranch, MessageSquare, 
@@ -62,7 +62,7 @@ const PipelineRunEventLogEvent = ({ event, children, icon: Icon, color = 'bg-gra
 }
 
 // Agent Lifecycle Events
-const AgentInitializedEvent = ({ event, onIconClick }) => {
+const AgentInitializedEvent = memo(({ event, onIconClick }) => {
   // agent_execution_id can be at top level or in data (for backwards compatibility)
   const agentExecutionId = event.agent_execution_id || event.data?.agent_execution_id
   const taskId = event.task_id || event.data?.task_id
@@ -87,28 +87,28 @@ const AgentInitializedEvent = ({ event, onIconClick }) => {
       )}
     </PipelineRunEventLogEvent>
   )
-}
+})
 
-const AgentCompletedEvent = ({ event, onIconClick }) => (
+const AgentCompletedEvent = memo(({ event, onIconClick }) => (
   <PipelineRunEventLogEvent event={event} onIconClick={onIconClick} icon={CheckCircle} color="bg-green-600">
     <div>Agent completed successfully: <span className="font-mono text-gh-success">{event.agent}</span></div>
     {event?.duration && (
       <div className="text-xs mt-1">Duration: {Math.floor(event.duration / 60)}m {Math.floor(event.duration % 60)}s</div>
     )}
   </PipelineRunEventLogEvent>
-)
+))
 
-const AgentFailedEvent = ({ event, onIconClick }) => (
+const AgentFailedEvent = memo(({ event, onIconClick }) => (
   <PipelineRunEventLogEvent event={event} onIconClick={onIconClick} icon={XCircle} color="bg-red-600">
     <div>Agent failed: <span className="font-mono text-gh-danger">{event.agent}</span></div>
     {event?.error && (
       <div className="text-xs mt-1 text-red-400">{event.error}</div>
     )}
   </PipelineRunEventLogEvent>
-)
+))
 
 // Agent Routing Events
-const AgentRoutingDecisionEvent = ({ event, onIconClick }) => (
+const AgentRoutingDecisionEvent = memo(({ event, onIconClick }) => (
   <PipelineRunEventLogEvent event={event} onIconClick={onIconClick} icon={GitBranch} color="bg-blue-500">
     <div className="space-y-1">
       <div>Selected agent: <span className="font-mono text-gh-accent-fg">{event?.data?.decision?.selected_agent || event?.decision?.selected_agent}</span></div>
@@ -120,9 +120,9 @@ const AgentRoutingDecisionEvent = ({ event, onIconClick }) => (
       )}
     </div>
   </PipelineRunEventLogEvent>
-)
+))
 
-const AgentSelectedEvent = ({ event, onIconClick }) => (
+const AgentSelectedEvent = memo(({ event, onIconClick }) => (
   <PipelineRunEventLogEvent event={event} onIconClick={onIconClick} icon={Users} color="bg-blue-500">
     <div className="space-y-1">
       <div>Agent selected: <span className="font-mono text-gh-accent-fg">{event?.data?.decision?.agent || event?.decision?.agent}</span></div>
@@ -131,10 +131,10 @@ const AgentSelectedEvent = ({ event, onIconClick }) => (
       )}
     </div>
   </PipelineRunEventLogEvent>
-)
+))
 
 // Feedback Events
-const FeedbackDetectedEvent = ({ event, onIconClick }) => (
+const FeedbackDetectedEvent = memo(({ event, onIconClick }) => (
   <PipelineRunEventLogEvent event={event} onIconClick={onIconClick} icon={MessageSquare} color="bg-orange-500">
     <div className="space-y-1">
       <div>Feedback detected from: {event?.data?.inputs?.feedback_source || event?.inputs?.feedback_source}</div>
@@ -146,28 +146,28 @@ const FeedbackDetectedEvent = ({ event, onIconClick }) => (
       )}
     </div>
   </PipelineRunEventLogEvent>
-)
+))
 
-const FeedbackListeningStartedEvent = ({ event, onIconClick }) => (
+const FeedbackListeningStartedEvent = memo(({ event, onIconClick }) => (
   <PipelineRunEventLogEvent event={event} onIconClick={onIconClick} icon={MessageSquare} color="bg-orange-400">
     <div>Started listening for feedback</div>
     {(event?.data?.monitoring_agent || event?.monitoring_agent) && (
       <div className="text-xs">Monitoring agent: {event?.data?.monitoring_agent || event.monitoring_agent}</div>
     )}
   </PipelineRunEventLogEvent>
-)
+))
 
-const FeedbackListeningStoppedEvent = ({ event, onIconClick }) => (
+const FeedbackListeningStoppedEvent = memo(({ event, onIconClick }) => (
   <PipelineRunEventLogEvent event={event} onIconClick={onIconClick} icon={MessageSquare} color="bg-orange-400">
     <div>Stopped listening for feedback</div>
     {(event?.data?.reason || event?.reason) && (
       <div className="text-xs italic">{event?.data?.reason || event.reason}</div>
     )}
   </PipelineRunEventLogEvent>
-)
+))
 
 // Status Progression Events
-const StatusProgressionStartedEvent = ({ event, onIconClick }) => (
+const StatusProgressionStartedEvent = memo(({ event, onIconClick }) => (
   <PipelineRunEventLogEvent event={event} onIconClick={onIconClick} icon={RotateCcw} color="bg-green-500">
     <div className="space-y-1">
       <div>Status progression: {event?.data?.inputs?.from_status || event?.inputs?.from_status} → {event?.data?.decision?.to_status || event?.decision?.to_status}</div>
@@ -176,25 +176,25 @@ const StatusProgressionStartedEvent = ({ event, onIconClick }) => (
       )}
     </div>
   </PipelineRunEventLogEvent>
-)
+))
 
-const StatusProgressionCompletedEvent = ({ event, onIconClick }) => (
+const StatusProgressionCompletedEvent = memo(({ event, onIconClick }) => (
   <PipelineRunEventLogEvent event={event} onIconClick={onIconClick} icon={CheckCircle} color="bg-green-600">
     <div>Status progression completed: {event?.data?.decision?.to_status || event?.decision?.to_status}</div>
   </PipelineRunEventLogEvent>
-)
+))
 
-const StatusProgressionFailedEvent = ({ event, onIconClick }) => (
+const StatusProgressionFailedEvent = memo(({ event, onIconClick }) => (
   <PipelineRunEventLogEvent event={event} onIconClick={onIconClick} icon={XCircle} color="bg-red-600">
     <div>Status progression failed</div>
     {(event?.data?.error || event?.error) && (
       <div className="text-xs mt-1 text-red-400">{event?.data?.error || event.error}</div>
     )}
   </PipelineRunEventLogEvent>
-)
+))
 
 // Review Cycle Events
-const ReviewCycleStartedEvent = ({ event, onIconClick }) => (
+const ReviewCycleStartedEvent = memo(({ event, onIconClick }) => (
   <PipelineRunEventLogEvent event={event} onIconClick={onIconClick} icon={RotateCcw} color="bg-purple-600">
     <div className="space-y-1">
       <div>Review cycle started</div>
@@ -206,49 +206,49 @@ const ReviewCycleStartedEvent = ({ event, onIconClick }) => (
       )}
     </div>
   </PipelineRunEventLogEvent>
-)
+))
 
-const ReviewCycleIterationEvent = ({ event, onIconClick }) => (
+const ReviewCycleIterationEvent = memo(({ event, onIconClick }) => (
   <PipelineRunEventLogEvent event={event} onIconClick={onIconClick} icon={RotateCcw} color="bg-purple-500">
     <div>Review cycle iteration {event?.data?.inputs?.cycle_iteration || event?.inputs?.cycle_iteration || '?'}</div>
     {(event?.data?.reason || event?.reason) && (
       <div className="text-xs italic">{event?.data?.reason || event.reason}</div>
     )}
   </PipelineRunEventLogEvent>
-)
+))
 
-const ReviewCycleMakerSelectedEvent = ({ event, onIconClick }) => (
+const ReviewCycleMakerSelectedEvent = memo(({ event, onIconClick }) => (
   <PipelineRunEventLogEvent event={event} onIconClick={onIconClick} icon={Users} color="bg-purple-500">
     <div>Maker selected: <span className="font-mono">{event?.data?.inputs?.maker_agent || event?.inputs?.maker_agent}</span></div>
   </PipelineRunEventLogEvent>
-)
+))
 
-const ReviewCycleReviewerSelectedEvent = ({ event, onIconClick }) => (
+const ReviewCycleReviewerSelectedEvent = memo(({ event, onIconClick }) => (
   <PipelineRunEventLogEvent event={event} onIconClick={onIconClick} icon={Users} color="bg-purple-500">
     <div>Reviewer selected: <span className="font-mono">{event?.data?.inputs?.reviewer_agent || event?.inputs?.reviewer_agent}</span></div>
   </PipelineRunEventLogEvent>
-)
+))
 
-const ReviewCycleEscalatedEvent = ({ event, onIconClick }) => (
+const ReviewCycleEscalatedEvent = memo(({ event, onIconClick }) => (
   <PipelineRunEventLogEvent event={event} onIconClick={onIconClick} icon={AlertTriangle} color="bg-orange-600">
     <div>Review cycle escalated to human</div>
     {(event?.data?.reason || event?.reason) && (
       <div className="text-xs italic">{event?.data?.reason || event.reason}</div>
     )}
   </PipelineRunEventLogEvent>
-)
+))
 
-const ReviewCycleCompletedEvent = ({ event, onIconClick }) => (
+const ReviewCycleCompletedEvent = memo(({ event, onIconClick }) => (
   <PipelineRunEventLogEvent event={event} onIconClick={onIconClick} icon={CheckCircle} color="bg-purple-700">
     <div>Review cycle completed</div>
     {(event?.data?.inputs?.cycle_iteration || event?.inputs?.cycle_iteration) && (
       <div className="text-xs">Total iterations: {event?.data?.inputs?.cycle_iteration || event.inputs.cycle_iteration}</div>
     )}
   </PipelineRunEventLogEvent>
-)
+))
 
 // Error Handling Events
-const ErrorEncounteredEvent = ({ event, onIconClick }) => {
+const ErrorEncounteredEvent = memo(({ event, onIconClick }) => {
   const errorType = event?.data?.error_type || event?.error_type
   const errorMessage = event?.data?.error_message || event?.error_message
   const recoveryAction = event?.data?.decision?.recovery_action || event?.decision?.recovery_action
@@ -289,9 +289,9 @@ const ErrorEncounteredEvent = ({ event, onIconClick }) => {
       </div>
     </PipelineRunEventLogEvent>
   )
-}
+})
 
-const ErrorRecoveredEvent = ({ event, onIconClick }) => {
+const ErrorRecoveredEvent = memo(({ event, onIconClick }) => {
   const errorType = event?.data?.error_type || event?.error_type
   const errorMessage = event?.data?.error_message || event?.error_message
   const recoveryAction = event?.data?.decision?.recovery_action || event?.decision?.recovery_action
@@ -323,10 +323,10 @@ const ErrorRecoveredEvent = ({ event, onIconClick }) => {
       </div>
     </PipelineRunEventLogEvent>
   )
-}
+})
 
 // Task Queue Events
-const TaskQueuedEvent = ({ event, onIconClick }) => (
+const TaskQueuedEvent = memo(({ event, onIconClick }) => (
   <PipelineRunEventLogEvent event={event} onIconClick={onIconClick} icon={Clock} color="bg-cyan-600">
     <div className="space-y-1">
       <div>Task queued for agent: <span className="font-mono">{event?.agent}</span></div>
@@ -335,16 +335,16 @@ const TaskQueuedEvent = ({ event, onIconClick }) => (
       )}
     </div>
   </PipelineRunEventLogEvent>
-)
+))
 
-const TaskDequeuedEvent = ({ event, onIconClick }) => (
+const TaskDequeuedEvent = memo(({ event, onIconClick }) => (
   <PipelineRunEventLogEvent event={event} onIconClick={onIconClick} icon={PlayCircle} color="bg-cyan-500">
     <div>Task dequeued for execution: <span className="font-mono">{event?.agent}</span></div>
   </PipelineRunEventLogEvent>
-)
+))
 
 // Branch Management Events
-const BranchCreatedEvent = ({ event, onIconClick }) => (
+const BranchCreatedEvent = memo(({ event, onIconClick }) => (
   <PipelineRunEventLogEvent event={event} onIconClick={onIconClick} icon={GitBranch} color="bg-lime-600">
     <div className="space-y-1">
       <div>Branch created: <span className="font-mono">{event?.data?.decision?.branch_name || event?.decision?.branch_name}</span></div>
@@ -353,9 +353,9 @@ const BranchCreatedEvent = ({ event, onIconClick }) => (
       )}
     </div>
   </PipelineRunEventLogEvent>
-)
+))
 
-const BranchReusedEvent = ({ event, onIconClick }) => (
+const BranchReusedEvent = memo(({ event, onIconClick }) => (
   <PipelineRunEventLogEvent event={event} onIconClick={onIconClick} icon={GitBranch} color="bg-lime-500">
     <div className="space-y-1">
       <div>Branch reused: <span className="font-mono">{event?.data?.decision?.branch_name || event?.decision?.branch_name}</span></div>
@@ -364,16 +364,16 @@ const BranchReusedEvent = ({ event, onIconClick }) => (
       )}
     </div>
   </PipelineRunEventLogEvent>
-)
+))
 
 // Conversational Loop Events
-const ConversationalLoopStartedEvent = ({ event, onIconClick }) => (
+const ConversationalLoopStartedEvent = memo(({ event, onIconClick }) => (
   <PipelineRunEventLogEvent event={event} onIconClick={onIconClick} icon={MessageSquare} color="bg-pink-600">
     <div>Conversational loop started with: <span className="font-mono">{event?.data?.agent || event?.agent}</span></div>
   </PipelineRunEventLogEvent>
-)
+))
 
-const ConversationalQuestionRoutedEvent = ({ event, onIconClick }) => (
+const ConversationalQuestionRoutedEvent = memo(({ event, onIconClick }) => (
   <PipelineRunEventLogEvent event={event} onIconClick={onIconClick} icon={MessageSquare} color="bg-pink-500">
     <div className="space-y-1">
       <div>Question routed to: <span className="font-mono">{event?.data?.target_agent || event?.target_agent}</span></div>
@@ -382,10 +382,10 @@ const ConversationalQuestionRoutedEvent = ({ event, onIconClick }) => (
       )}
     </div>
   </PipelineRunEventLogEvent>
-)
+))
 
 // Default/Generic Event
-const GenericEvent = ({ event, onIconClick }) => (
+const GenericEvent = memo(({ event, onIconClick }) => (
   <PipelineRunEventLogEvent event={event} onIconClick={onIconClick} icon={Activity} color="bg-gray-500">
     <div className="space-y-1">
       {(event?.data?.reason || event?.reason) && <div className="text-xs italic">{event?.data?.reason || event.reason}</div>}
@@ -396,7 +396,7 @@ const GenericEvent = ({ event, onIconClick }) => (
       )}
     </div>
   </PipelineRunEventLogEvent>
-)
+))
 
 // Event renderer mapping
 const getEventComponent = (event, onIconClick) => {
@@ -514,7 +514,7 @@ const EventJsonModal = ({ event, onClose }) => {
 }
 
 // Main PipelineRunEventLog component
-export default function PipelineRunEventLog({ pipelineRun, events: initialEvents = [], isActive = false }) {
+function PipelineRunEventLog({ pipelineRun, events: initialEvents = [], isActive = false }) {
   const [events, setEvents] = useState(initialEvents)
   const [selectedEventForModal, setSelectedEventForModal] = useState(null)
   const { events: socketEvents } = useSocket()
@@ -528,17 +528,19 @@ export default function PipelineRunEventLog({ pipelineRun, events: initialEvents
   }
 
   // Update events when new socket events arrive for this pipeline run
+  // Note: This is NOT redundant with parent's mergedEvents - parent provides initial state,
+  // but this component independently subscribes to live updates for active runs
   useEffect(() => {
     if (!isActive || !pipelineRun) return
-    
+
     // Filter socket events for this pipeline run
-    const newEvents = socketEvents.filter(e => 
+    const newEvents = socketEvents.filter(e =>
       e.pipeline_run_id === pipelineRun.id &&
       !events.find(existing => existing.event_id === e.event_id)
     )
-    
+
     if (newEvents.length > 0) {
-      setEvents(prev => [...prev, ...newEvents].sort((a, b) => 
+      setEvents(prev => [...prev, ...newEvents].sort((a, b) =>
         new Date(a.timestamp) - new Date(b.timestamp)
       ))
     }
@@ -600,3 +602,16 @@ export default function PipelineRunEventLog({ pipelineRun, events: initialEvents
     </div>
   )
 }
+
+// Memoized wrapper to prevent unnecessary re-renders
+const PipelineRunEventLogMemoized = memo(PipelineRunEventLog, (prevProps, nextProps) => {
+  // Only re-render if pipeline run ID, events array identity, or isActive changed
+  // Use array identity (===) not length, since parent computes events via useMemo
+  return (
+    prevProps.pipelineRun?.id === nextProps.pipelineRun?.id &&
+    prevProps.events === nextProps.events &&
+    prevProps.isActive === nextProps.isActive
+  )
+})
+
+export default PipelineRunEventLogMemoized

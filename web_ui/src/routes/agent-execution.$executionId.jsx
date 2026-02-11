@@ -613,6 +613,19 @@ function AgentExecutionView() {
         <div className="p-4">
           <div className="grid grid-cols-2 gap-4 mb-4">
             <div className="space-y-2">
+              {pipelineRunId && (
+                <div className="text-sm">
+                  <span className="text-gh-fg-muted">Pipeline Run ID:</span>
+                  <Link
+                    to="/pipeline-run-debug"
+                    search={{ runId: pipelineRunId }}
+                    className="ml-2 font-mono text-xs text-gh-accent-fg hover:underline"
+                    title="View pipeline run in debug view"
+                  >
+                    {pipelineRunId}
+                  </Link>
+                </div>
+              )}
               <div className="text-sm">
                 <span className="text-gh-fg-muted">Execution ID:</span>
                 <span className="ml-2 font-mono text-xs">{executionId}</span>

@@ -1,4 +1,4 @@
-import { createFileRoute, Link } from '@tanstack/react-router'
+import { createFileRoute, Link, useNavigate } from '@tanstack/react-router'
 import { RefreshCw, Activity, CheckCircle, ArrowRight, XCircle, MessageSquare } from 'lucide-react'
 import Header from '../components/Header'
 import NavigationTabs from '../components/NavigationTabs'
@@ -53,6 +53,12 @@ const PipelineRunItem = memo(({ run, isSelected, onClick }) => {
 PipelineRunItem.displayName = 'PipelineRunItem'
 
 function PipelineRunDebugView() {
+  // URL-driven state
+  const navigate = useNavigate()
+  const searchParams = Route.useSearch()
+  const selectedTab = searchParams.tab  // No longer useState
+  const urlRunId = searchParams.runId
+
   const [activePipelineRuns, setActivePipelineRuns] = useState([])
   const [completedPipelineRuns, setCompletedPipelineRuns] = useState([])
   const [selectedPipelineRun, setSelectedPipelineRun] = useState(null)
@@ -60,7 +66,6 @@ function PipelineRunDebugView() {
   const [loading, setLoading] = useState(true)
   const [loadingCompleted, setLoadingCompleted] = useState(false)
   const [loadingEvents, setLoadingEvents] = useState(false)
-  const [selectedTab, setSelectedTab] = useState('active')
   const [completedLoadedCount, setCompletedLoadedCount] = useState(0)  // Track total loaded
   const [hasMoreCompleted, setHasMoreCompleted] = useState(true)
   const [showKillModal, setShowKillModal] = useState(false)
@@ -92,6 +97,37 @@ function PipelineRunDebugView() {
   useEffect(() => {
     completedLoadedCountRef.current = completedLoadedCount
   }, [completedLoadedCount])
+
+  // Navigation helpers for URL state management
+  const updateUrlParams = useCallback((updates, replaceHistory = true) => {
+    navigate({
+      search: (prev) => ({ ...prev, ...updates }),
+      replace: replaceHistory,
+    })
+  }, [navigate])
+
+  const handleTabChange = useCallback((newTab) => {
+    // Check if current selection exists in new tab
+    const newList = newTab === 'active' ? activePipelineRuns : completedPipelineRuns
+    const currentRun = selectedPipelineRunRef.current
+    const runExistsInNewTab = currentRun && newList.find(r => r.id === currentRun.id)
+
+    if (runExistsInNewTab) {
+      // Keep the current selection
+      updateUrlParams({ tab: newTab }, true)
+    } else {
+      // Clear selection when switching tabs - let auto-select pick first run in new tab
+      updateUrlParams({ tab: newTab, runId: undefined }, true)
+    }
+  }, [updateUrlParams, activePipelineRuns, completedPipelineRuns])
+
+  const handleSelectRun = useCallback((run) => {
+    updateUrlParams({ runId: run.id }, false) // Push to history
+  }, [updateUrlParams])
+
+  const handleDeselectRun = useCallback(() => {
+    updateUrlParams({ runId: undefined }, true)
+  }, [updateUrlParams])
 
   // Continuously save scroll position to handle updates
   useEffect(() => {
@@ -140,6 +176,70 @@ function PipelineRunDebugView() {
     }
   }, [completedPipelineRuns])
 
+  // Sync selectedPipelineRun from URL
+  useEffect(() => {
+    if (urlRunId) {
+      const list = selectedTab === 'active' ? activePipelineRuns : completedPipelineRuns
+      const run = list.find(r => r.id === urlRunId)
+
+      if (run) {
+        setSelectedPipelineRun(run)
+      } else {
+        // Check both lists
+        const activeRun = activePipelineRuns.find(r => r.id === urlRunId)
+        const completedRun = completedPipelineRuns.find(r => r.id === urlRunId)
+
+        if (activeRun && selectedTab !== 'active') {
+          setSelectedPipelineRun(activeRun)
+          updateUrlParams({ tab: 'active' }, true)
+        } else if (completedRun && selectedTab !== 'completed') {
+          setSelectedPipelineRun(completedRun)
+          updateUrlParams({ tab: 'completed' }, true)
+        } else {
+          // Not found - clear selection
+          setSelectedPipelineRun(null)
+          handleDeselectRun()
+        }
+      }
+    } else {
+      // Auto-select first run only if none selected (use ref to avoid dependency cycle)
+      const list = selectedTab === 'active' ? activePipelineRuns : completedPipelineRuns
+      if (list.length > 0 && !selectedPipelineRunRef.current) {
+        const firstRun = list[0]
+        setSelectedPipelineRun(firstRun)
+        updateUrlParams({ runId: firstRun.id }, true)
+      } else if (list.length === 0) {
+        setSelectedPipelineRun(null)
+      }
+    }
+  }, [urlRunId, selectedTab, activePipelineRuns, completedPipelineRuns, updateUrlParams, handleDeselectRun])
+
+  // Handle Active→Completed Transition
+  // When viewing an active run that completes, deselect it (stay on active tab)
+  // This prevents confusion about why a completed run is showing in the active list
+  const previousActiveRunIdsRef = useRef(new Set())
+
+  useEffect(() => {
+    if (selectedPipelineRun && selectedTab === 'active' && urlRunId) {
+      const currentActiveIds = new Set(activePipelineRuns.map(r => r.id))
+      const completedIds = new Set(completedPipelineRuns.map(r => r.id))
+
+      const runMovedToCompleted =
+        !currentActiveIds.has(selectedPipelineRun.id) &&
+        completedIds.has(selectedPipelineRun.id) &&
+        previousActiveRunIdsRef.current.has(selectedPipelineRun.id)
+
+      if (runMovedToCompleted) {
+        // Intentionally deselect rather than follow to completed tab
+        // This keeps user on active tab where they can select next active run
+        setSelectedPipelineRun(null)
+        handleDeselectRun()
+      }
+    }
+
+    previousActiveRunIdsRef.current = new Set(activePipelineRuns.map(r => r.id))
+  }, [activePipelineRuns, completedPipelineRuns, selectedPipelineRun, selectedTab, urlRunId, handleDeselectRun])
+
   // Fetch active pipeline runs - no dependencies to avoid circular re-creation
   const fetchActivePipelineRuns = useCallback(async (isInitialLoad = false) => {
     // Guard against concurrent fetches
@@ -165,6 +265,7 @@ function PipelineRunDebugView() {
           const mergedRuns = mergeArrayByIdStable(currentRuns, data.runs)
 
           // Update selectedPipelineRun if it exists in the refreshed data
+          // Note: Auto-selection is handled by URL sync effect, not here
           setSelectedPipelineRun(currentSelected => {
             if (currentSelected) {
               const updatedRun = mergedRuns.find(run => run.id === currentSelected.id)
@@ -172,10 +273,6 @@ function PipelineRunDebugView() {
                 //console.log('[PipelineRunDebug] Updating selected pipeline run with fresh data')
                 return updatedRun
               }
-              return currentSelected
-            } else if (mergedRuns.length > 0) {
-              // Auto-select first run if none selected
-              return mergedRuns[0]
             }
             return currentSelected
           })
@@ -233,6 +330,7 @@ function PipelineRunDebugView() {
           }
 
           // Update selectedPipelineRun if it exists in the completed runs
+          // Note: Auto-selection is handled by URL sync effect, not here
           setSelectedPipelineRun(currentSelected => {
             if (currentSelected) {
               const updatedRun = mergedRuns.find(run => run.id === currentSelected.id)
@@ -240,10 +338,6 @@ function PipelineRunDebugView() {
                 //console.log('[PipelineRunDebug] Updating selected pipeline run from completed list')
                 return updatedRun
               }
-              return currentSelected
-            } else if (mergedRuns.length > 0 && selectedTabRef.current === 'completed') {
-              // Auto-select first completed run if on completed tab and none selected
-              return mergedRuns[0]
             }
             return currentSelected
           })
@@ -349,7 +443,8 @@ function PipelineRunDebugView() {
     }
   }, [selectedPipelineRun, fetchPipelineRunEvents])
   
-  // Track last processed socket event timestamp to prevent duplicate processing
+  // Track processed socket events to prevent duplicate processing
+  const processedEventIdsRef = useRef(new Set())
   const lastProcessedTimestampRef = useRef(0)
 
   // Update on socket events
@@ -357,6 +452,14 @@ function PipelineRunDebugView() {
     if (socketEvents.length > 0) {
       // Get the NEWEST event (first in array since new events are prepended)
       const latestEvent = socketEvents[0]
+
+      // Create unique event ID
+      const eventId = latestEvent.event_id || `${latestEvent.timestamp}_${latestEvent.event_type}`
+
+      // Skip if already processed
+      if (processedEventIdsRef.current.has(eventId)) {
+        return
+      }
 
       // Extract timestamp - handle both Unix timestamp and ISO string
       let eventTimestamp = 0
@@ -376,6 +479,15 @@ function PipelineRunDebugView() {
       // Skip if we've already processed this timestamp
       if (eventTimestamp <= lastProcessedTimestampRef.current) {
         return
+      }
+
+      // Mark as processed
+      processedEventIdsRef.current.add(eventId)
+
+      // Prevent memory leak: keep only last 1000 event IDs
+      if (processedEventIdsRef.current.size > 1000) {
+        const entries = Array.from(processedEventIdsRef.current)
+        processedEventIdsRef.current = new Set(entries.slice(-500))
       }
 
       console.log('[PipelineRunDebug] Processing new socket event:', {
@@ -485,19 +597,19 @@ function PipelineRunDebugView() {
 
   const confirmKillRun = useCallback(async () => {
     if (!selectedPipelineRun) return
-    
+
     try {
       const response = await fetch(`/pipeline-runs/${selectedPipelineRun.id}/kill`, {
         method: 'POST'
       })
       const data = await response.json()
-      
+
       if (data.success) {
         // Refresh lists
         fetchActivePipelineRuns()
         fetchCompletedPipelineRuns(0, false)
         // Switch to completed tab since it's now completed/failed
-        setSelectedTab('completed')
+        handleTabChange('completed')
       } else {
         alert(`Failed to kill run: ${data.error}`)
       }
@@ -505,7 +617,7 @@ function PipelineRunDebugView() {
       console.error('Error killing pipeline run:', error)
       alert('Error killing pipeline run')
     }
-  }, [selectedPipelineRun, fetchActivePipelineRuns, fetchCompletedPipelineRuns])
+  }, [selectedPipelineRun, fetchActivePipelineRuns, fetchCompletedPipelineRuns, handleTabChange])
 
   // Find the most recent agent execution for the selected pipeline run
   const latestAgentExecutionId = useMemo(() => {
@@ -567,7 +679,7 @@ function PipelineRunDebugView() {
           {/* Tabs */}
           <div className="flex gap-2 mb-4 border-b border-gh-border">
             <button
-              onClick={() => setSelectedTab('active')}
+              onClick={() => handleTabChange('active')}
               className={`px-3 py-2 text-sm font-medium border-b-2 transition-colors ${
                 selectedTab === 'active'
                   ? 'border-gh-accent-emphasis text-gh-accent-fg'
@@ -577,7 +689,7 @@ function PipelineRunDebugView() {
               Active
             </button>
             <button
-              onClick={() => setSelectedTab('completed')}
+              onClick={() => handleTabChange('completed')}
               className={`px-3 py-2 text-sm font-medium border-b-2 transition-colors ${
                 selectedTab === 'completed'
                   ? 'border-gh-accent-emphasis text-gh-accent-fg'
@@ -609,7 +721,7 @@ function PipelineRunDebugView() {
                       key={run.id}
                       run={run}
                       isSelected={selectedPipelineRun?.id === run.id}
-                      onClick={() => setSelectedPipelineRun(run)}
+                      onClick={() => handleSelectRun(run)}
                     />
                   ))}
                 </div>
@@ -639,7 +751,7 @@ function PipelineRunDebugView() {
                         key={run.id}
                         run={run}
                         isSelected={selectedPipelineRun?.id === run.id}
-                        onClick={() => setSelectedPipelineRun(run)}
+                        onClick={() => handleSelectRun(run)}
                       />
                     ))}
                   </div>
@@ -738,4 +850,10 @@ function PipelineRunDebugView() {
 
 export const Route = createFileRoute('/pipeline-run-debug')({
   component: PipelineRunDebugView,
+  validateSearch: (search) => {
+    return {
+      runId: typeof search.runId === 'string' ? search.runId : undefined,
+      tab: search.tab === 'completed' ? 'completed' : 'active',
+    }
+  },
 })
