@@ -1085,6 +1085,35 @@ None found
             assert "Issues found" in result['markdown_analysis']
 
     @pytest.mark.asyncio
+    async def test_ci_failures_but_creation_fails_still_returns_to_development(self, agent):
+        """CI failures detected but _create_review_issues returns [] — still returns to Development."""
+        ci_failures = [{'name': 'tests', 'state': 'FAILURE', 'bucket': 'fail',
+                        'description': 'Tests failed', 'link': 'https://ci.example.com/1'}]
+
+        with patch('agents.pr_review_agent.pr_review_state_manager') as mock_state, \
+             patch('agents.pr_review_agent.run_claude_code', return_value=_clean_review_output()), \
+             patch.object(agent, '_find_pr_url', return_value='https://github.com/o/r/pull/1'), \
+             patch.object(agent, '_load_discussion_outputs', return_value={}), \
+             patch.object(agent, '_get_parent_issue_body', return_value='body'), \
+             patch.object(agent, '_check_ci_status', return_value=(ci_failures, [])), \
+             patch.object(agent, '_create_review_issues', return_value=[]), \
+             patch.object(agent, '_move_issues_to_development') as mock_move, \
+             patch.object(agent, '_return_parent_to_development') as mock_return, \
+             patch.object(agent, '_advance_parent_to_documentation') as mock_advance, \
+             patch.object(agent, 'config_manager') as mock_config:
+            mock_state.get_review_count.return_value = 0
+            mock_config.get_project_config.return_value = MagicMock(
+                github={'org': 'o', 'repo': 'r'}
+            )
+
+            result = await agent.execute(_make_execute_context())
+
+            mock_return.assert_called_once_with('test-project', 42)
+            mock_advance.assert_not_called()
+            mock_move.assert_not_called()
+            assert "Issues found" in result['markdown_analysis']
+
+    @pytest.mark.asyncio
     async def test_ci_all_passing_does_not_block_clean_pass(self, agent):
         """When CI passes and other phases are clean, should advance to Documentation."""
         with patch('agents.pr_review_agent.pr_review_state_manager') as mock_state, \
@@ -1207,23 +1236,16 @@ class TestCheckCiStatus:
         assert failures == []
         assert pending == []
 
-    def test_unexpected_exit_code(self, agent):
+    def test_unexpected_exit_code_raises(self, agent):
         mock_result = MagicMock(returncode=2, stdout='', stderr='some error')
 
         with patch('agents.pr_review_agent.subprocess.run', return_value=mock_result):
-            failures, pending = agent._check_ci_status(
-                'https://github.com/o/r/pull/5', 'o/r'
-            )
+            with pytest.raises(RuntimeError, match="Unexpected exit code 2"):
+                agent._check_ci_status('https://github.com/o/r/pull/5', 'o/r')
 
-        assert failures == []
-        assert pending == []
-
-    def test_invalid_pr_url(self, agent):
-        failures, pending = agent._check_ci_status(
-            'https://github.com/o/r/issues/5', 'o/r'
-        )
-        assert failures == []
-        assert pending == []
+    def test_invalid_pr_url_raises(self, agent):
+        with pytest.raises(ValueError, match="Could not extract PR number"):
+            agent._check_ci_status('https://github.com/o/r/issues/5', 'o/r')
 
     def test_extracts_pr_number_from_url(self, agent):
         mock_result = MagicMock(returncode=0, stdout='[]', stderr='')

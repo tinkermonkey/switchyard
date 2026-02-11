@@ -511,8 +511,7 @@ class PRReviewAgent(AnalysisAgent):
         """
         match = re.search(r'/pull/(\d+)$', pr_url)
         if not match:
-            logger.warning(f"Could not extract PR number from URL: {pr_url}")
-            return ([], [])
+            raise ValueError(f"Could not extract PR number from URL: {pr_url}")
 
         pr_number = match.group(1)
 
@@ -524,11 +523,10 @@ class PRReviewAgent(AnalysisAgent):
             )
 
             if result.returncode not in (0, 1, 8):
-                logger.warning(
+                raise RuntimeError(
                     f"Unexpected exit code {result.returncode} from gh pr checks: "
                     f"{result.stderr.strip()}"
                 )
-                return ([], [])
 
             stdout = result.stdout.strip()
             if not stdout:
