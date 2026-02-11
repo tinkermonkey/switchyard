@@ -292,78 +292,47 @@ docker system prune -a
 
 ## Development Workflow
 
-### Adding a New Agent
+### Key Code Paths
 
-1. Create agent class in `agents/<agent_name>_agent.py`:
-```python
-# Use MakerAgent for agents that create output (code, docs)
-# Use AnalysisAgent for analysis-only agents (review, breakdown, PR review)
-from agents.base_maker_agent import MakerAgent
-from agents.base_analysis_agent import AnalysisAgent
+**Issue detection → pipeline execution → agent run → progression:**
+1. `services/project_monitor.py` detects card movement on GitHub board
+2. `pipeline/orchestrator.py` creates pipeline run, iterates through stages
+3. `claude/claude_integration.py` builds prompt, `claude/docker_runner.py` launches container
+4. Agent executes in Docker (`claude-agent-{project}-{task_id}`), output posted to GitHub
+5. `pipeline/progression.py` moves issue to next column
 
-class CustomAgent(MakerAgent):  # or AnalysisAgent
-    @property
-    def agent_display_name(self) -> str:
-        return "Custom Agent"
+### File-to-Concern Mapping
 
-    @property
-    def agent_role_description(self) -> str:
-        return "Brief role description"
+| What you want to change | Where to look |
+|---|---|
+| Agent prompt/instructions | `.claude/agents/<agent-name>.md` |
+| Agent class behavior | `agents/<agent_name>_agent.py` |
+| Agent registration | `agents/__init__.py` (`AGENT_REGISTRY`) |
+| Agent config (model, timeout) | `config/foundations/agents.yaml` |
+| Pipeline stage sequence | `config/foundations/pipelines.yaml` |
+| Board columns & automation | `config/foundations/workflows.yaml` |
+| Review cycle logic | `pipeline/orchestrator.py` (review cycle methods) |
+| Repair cycle logic | `pipeline/orchestrator.py` (repair cycle methods) |
+| Docker container setup | `claude/docker_runner.py` |
+| Event types | `monitoring/observability.py` (`EventType` enum) |
+| ES index schemas | `services/pattern_detection_schema.py` |
+| Column progression | `pipeline/progression.py` (`PipelineProgression`) |
 
-    @property
-    def output_sections(self) -> List[str]:
-        return ["section1", "section2"]
-```
+### Common Modification Recipes
 
-2. Register in `agents/__init__.py`:
-```python
-from .custom_agent import CustomAgent
+**Add a new agent**: Create `agents/<name>_agent.py` (extend `MakerAgent` or `AnalysisAgent`), register in `agents/__init__.py`, add config to `config/foundations/agents.yaml`.
 
-AGENT_REGISTRY = {
-    "custom_agent": CustomAgent,
-}
-```
+**Change agent prompt**: Edit `.claude/agents/<agent-name>.md`. Context is assembled in `claude/claude_integration.py`.
 
-3. Add to `config/foundations/agents.yaml`:
-```yaml
-agents:
-  custom_agent:
-    description: "Agent description"
-    model: "claude-sonnet-4-5-20250929"
-    timeout: 300
-    retries: 2
-    makes_code_changes: false
-    requires_dev_container: false
-    requires_docker: true
-```
+**Add a new event type**: Add to `EventType` enum in `monitoring/observability.py`. If it's a decision event, add to `_is_decision_event()` set in the same file.
 
-### Adding a New Pipeline
+**Modify pipeline flow**: Edit stage sequence in `config/foundations/pipelines.yaml`, update board columns in `config/foundations/workflows.yaml`.
 
-1. Add template to `config/foundations/pipelines.yaml`:
-```yaml
-pipeline_templates:
-  custom_pipeline:
-    name: "Custom Pipeline"
-    stages:
-      - stage: "stage_name"
-        default_agent: "agent_name"
-        review_required: true
-```
+### Testing Patterns
 
-2. Enable in project config `config/projects/<project>.yaml`:
-```yaml
-pipelines:
-  enabled:
-    - template: "custom_pipeline"
-      name: "custom"
-```
-
-### Modifying Agent Behavior
-
-Agents use Claude instructions via `claude/claude_integration.py`:
-- Instructions are in `.claude/agents/<agent-name>.md`
-- Context includes: issue details, previous outputs, review feedback
-- Output posted to GitHub as discussion comment or issue comment
+- **Docker-only imports**: `agents/__init__.py` cannot be imported outside Docker. Tests must mock dependencies or skip with `pytest.skip("Requires Docker container environment", allow_module_level=True)`.
+- **Agent test pattern**: Use `unittest.mock.patch` on agent dependencies, import inside the `with` block. Reference: `tests/unit/agents/test_work_breakdown_parsing.py`.
+- **No Redis/ES locally**: These services only run in Docker Compose. Tests handle gracefully via mocks or skips.
 
 ## GitHub Integration
 
