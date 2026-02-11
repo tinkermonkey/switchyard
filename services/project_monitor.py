@@ -2591,7 +2591,7 @@ class ProjectMonitor:
             )
 
             if not all_complete:
-                closed_count = len([s for s in actual_sub_issues if s.get('state', '').upper() == 'CLOSED'])
+                closed_count = len([s for s in actual_sub_issues if (s.get('state') or '').upper() == 'CLOSED'])
                 logger.info(
                     f"Not all sub-issues complete for parent #{parent_issue_number} yet "
                     f"({closed_count}/{len(actual_sub_issues)} closed)"

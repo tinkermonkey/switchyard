@@ -595,3 +595,44 @@ async def test_triggering_issue_none_has_no_effect():
 
     # #2 is open, no bypass — should fail
     assert result is False
+
+
+@pytest.mark.asyncio
+async def test_triggering_issue_not_in_sub_issues_list():
+    """If triggering_issue doesn't match any sub-issue, it has no effect."""
+    manager = FeatureBranchManager()
+    github = Mock()
+
+    sub_issues = [
+        {'number': 1, 'state': 'CLOSED'},
+        {'number': 2, 'state': 'OPEN'},
+    ]
+
+    result = await manager._verify_all_sub_issues_complete(
+        github,
+        sub_issues,
+        triggering_issue=999
+    )
+
+    # #2 is still open, bypass doesn't match any issue
+    assert result is False
+
+
+@pytest.mark.asyncio
+async def test_verify_sub_issues_state_none():
+    """Sub-issue with state=None should not crash and should be treated as incomplete."""
+    manager = FeatureBranchManager()
+    github = Mock()
+
+    sub_issues = [
+        {'number': 1, 'state': 'CLOSED'},
+        {'number': 2, 'state': None},
+    ]
+
+    result = await manager._verify_all_sub_issues_complete(
+        github,
+        sub_issues
+    )
+
+    # #2 has state=None, not closed — should be incomplete
+    assert result is False

@@ -524,8 +524,13 @@ class FeatureBranchManager:
                         )
                     else:
                         # Batch fetch: Get columns for all sub-issues at once
-                        logger.debug(f"Fetching columns for {len(sub_issues)} sub-issues from board '{board_name}'")
-                        for issue in sub_issues:
+                        # Skip the triggering issue — its column may not be consistent yet
+                        issues_to_fetch = [
+                            i for i in sub_issues
+                            if triggering_issue is None or i.get('number') != triggering_issue
+                        ]
+                        logger.debug(f"Fetching columns for {len(issues_to_fetch)} sub-issues from board '{board_name}'")
+                        for issue in issues_to_fetch:
                             try:
                                 column_name = await project_monitor.get_issue_column_async(
                                     project_name,
@@ -552,7 +557,7 @@ class FeatureBranchManager:
 
             # Check 2: Issue is the one that just triggered this check (skip API re-query
             # to avoid GitHub Projects v2 eventual consistency lag)
-            if triggering_issue and issue_number == triggering_issue:
+            if triggering_issue is not None and issue_number == triggering_issue:
                 logger.info(
                     f"Sub-issue #{issue_number} is the triggering issue "
                     f"(just moved to exit column) - treating as complete"
@@ -1758,7 +1763,7 @@ Waiting for human decision...
             else:
                 logger.debug(
                     f"Not all sub-issues complete for parent #{feature_branch.parent_issue} "
-                    f"(complete: {sum(1 for si in actual_sub_issues if si.get('state', '').upper() == 'CLOSED')}/{len(actual_sub_issues)}) "
+                    f"(complete: {sum(1 for si in actual_sub_issues if (si.get('state') or '').upper() == 'CLOSED')}/{len(actual_sub_issues)}) "
                     f"- just finalized issue #{issue_number}"
                 )
                 all_complete = False
