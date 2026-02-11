@@ -165,6 +165,43 @@ class TestIsNoneFound:
         assert agent._is_none_found("none found") is True
         assert agent._is_none_found("- None found") is True
 
+    def test_detects_none_found_with_trailing_explanation(self, agent):
+        """Exact bug reproduction: 'None found' followed by explanatory text."""
+        assert agent._is_none_found(
+            '"None found" - The PR documentation indicates 3 critical issues '
+            'were already identified and resolved during development'
+        ) is True
+
+    def test_detects_already_resolved_language(self, agent):
+        assert agent._is_none_found(
+            "Issues were already resolved during the development phase"
+        ) is True
+        assert agent._is_none_found(
+            "All items previously addressed in earlier commits"
+        ) is True
+
+    def test_detects_clean_pass_language(self, agent):
+        assert agent._is_none_found("Clean pass - no issues to report") is True
+        assert agent._is_none_found("No concerns with the implementation") is True
+
+    def test_detects_no_issues_found_variants(self, agent):
+        assert agent._is_none_found("No issues found in this section") is True
+        assert agent._is_none_found("No critical issues found") is True
+        assert agent._is_none_found("No gaps found") is True
+        assert agent._is_none_found("No deviations found") is True
+
+    def test_detects_all_requirements_verified(self, agent):
+        assert agent._is_none_found("All requirements verified and implemented correctly") is True
+        assert agent._is_none_found("All requirements met") is True
+        assert agent._is_none_found("All requirements satisfied") is True
+
+    def test_detects_no_actionable(self, agent):
+        assert agent._is_none_found("No actionable items in this review") is True
+
+    def test_does_not_false_positive_on_none_substring(self, agent):
+        """'None of these are blocking' contains 'none' but is real content."""
+        assert agent._is_none_found("None of these are blocking but they should be fixed") is False
+
     def test_rejects_actual_content(self, agent):
         assert agent._is_none_found("- **Bug**: Something is broken") is False
         assert agent._is_none_found("Multiple issues found") is False
@@ -434,3 +471,135 @@ class TestFormatIssueBody:
     def test_includes_severity_heading(self, agent):
         body = agent._format_issue_body("High", "- Missing check", "Test Source")
         assert "## High Findings" in body
+
+
+class TestHasActionableFindings:
+    """Test detection of structured findings in the expected format."""
+
+    def test_detects_bold_title_format(self, agent):
+        content = '- **SQL Injection**: User input not sanitized'
+        assert agent._has_actionable_findings(content) is True
+
+    def test_detects_multiple_findings(self, agent):
+        content = (
+            '- **Missing Auth**: No authentication on admin endpoint\n'
+            '- **XSS Risk**: User input rendered without escaping'
+        )
+        assert agent._has_actionable_findings(content) is True
+
+    def test_detects_asterisk_bullets(self, agent):
+        content = '* **Unused Import**: `os` imported but not used'
+        assert agent._has_actionable_findings(content) is True
+
+    def test_rejects_none_found(self, agent):
+        assert agent._has_actionable_findings("None found") is False
+
+    def test_rejects_plain_text(self, agent):
+        assert agent._has_actionable_findings("The code looks good overall") is False
+
+    def test_rejects_explanatory_text(self, agent):
+        content = (
+            '"None found" - The PR documentation indicates 3 critical issues '
+            'were already identified and resolved during development'
+        )
+        assert agent._has_actionable_findings(content) is False
+
+    def test_rejects_unstructured_bullets(self, agent):
+        content = '- Some plain bullet without bold title format'
+        assert agent._has_actionable_findings(content) is False
+
+
+class TestFalsePositivePrevention:
+    """End-to-end tests for false-positive issue prevention in _parse_review_findings()."""
+
+    def test_exact_bug_scenario_returns_zero_findings(self, agent):
+        """Reproduce the exact bug from issue #355: 'None found' with trailing explanation."""
+        output = """
+## PR Review Findings
+
+### Critical Issues
+"None found" - The PR documentation indicates 3 critical issues were already identified and resolved during development
+
+### High Priority Issues
+None found
+
+### Medium Priority Issues
+None found
+
+### Low Priority / Nice-to-Have
+None found
+"""
+        findings = agent._parse_review_findings(output, "PR Code Review")
+        assert len(findings) == 0
+
+    def test_already_resolved_language_returns_zero_findings(self, agent):
+        output = """
+### Critical Issues
+Issues were previously resolved in earlier commits
+
+### High Priority Issues
+All items already addressed during development
+
+### Medium Priority Issues
+None found
+
+### Low Priority / Nice-to-Have
+None found
+"""
+        findings = agent._parse_review_findings(output, "PR Code Review")
+        assert len(findings) == 0
+
+    def test_real_findings_still_detected(self, agent):
+        """Regression test: real structured findings must still create issues."""
+        output = """
+### Critical Issues
+- **SQL Injection**: User input passed directly to query without sanitization
+
+### High Priority Issues
+- **Missing Auth Check**: The /admin endpoint lacks authentication middleware
+
+### Medium Priority Issues
+None found
+
+### Low Priority / Nice-to-Have
+None found
+"""
+        findings = agent._parse_review_findings(output, "PR Code Review")
+        assert len(findings) == 2
+        severities = [f['severity'] for f in findings]
+        assert 'critical' in severities
+        assert 'high' in severities
+
+    def test_gap_verification_false_positive_prevented(self, agent):
+        """Gaps section with explanatory text but no structured findings."""
+        output = """
+### Gaps Found
+No gaps found - all requirements from the business analyst were fully implemented
+
+### Deviations
+No deviations found
+
+### Verified
+- User authentication flow works correctly
+- API response format matches specification
+"""
+        findings = agent._parse_review_findings(output, "Business Analyst Output")
+        assert len(findings) == 0
+
+    def test_real_gaps_still_detected(self, agent):
+        """Regression test: real gaps must still create issues."""
+        output = """
+### Gaps Found
+- **Missing Pagination**: API returns all results instead of paginated response as specified
+
+### Deviations
+- **Different Auth Method**: Uses session-based auth instead of JWT as designed
+
+### Verified
+- User registration flow works as specified
+"""
+        findings = agent._parse_review_findings(output, "Software Architect Output")
+        assert len(findings) == 2
+        titles = [f['title'] for f in findings]
+        assert any('gaps' in t.lower() for t in titles)
+        assert any('deviations' in t.lower() for t in titles)

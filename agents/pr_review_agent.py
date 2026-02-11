@@ -35,6 +35,23 @@ logger = logging.getLogger(__name__)
 
 MAX_REVIEW_CYCLES = 3
 
+# Patterns that indicate a section has no actionable findings.
+# Used by _is_none_found() to prevent false-positive issue creation when Claude
+# adds explanatory text after "None found" (e.g., "None found - issues were already resolved").
+_NONE_FOUND_PATTERNS = [
+    re.compile(r'^\s*[-*]?\s*["\']?\s*none\s+found\b', re.IGNORECASE),
+    re.compile(r'^\s*[-*]?\s*(none|n/?a)\s*\.?\s*$', re.IGNORECASE),
+    re.compile(r'\bno\s+(issues?|gaps?|deviations?|findings?|critical\s+issues?|problems?)\s+found\b', re.IGNORECASE),
+    re.compile(r'\ball\s+requirements\s+(verified|met|satisfied)\b', re.IGNORECASE),
+    re.compile(r'\b(already|previously)\s+(resolved|addressed|fixed|corrected|handled)\b', re.IGNORECASE),
+    re.compile(r'\bno\s+actionable\b', re.IGNORECASE),
+    re.compile(r'\b(clean\s+pass|no\s+concerns?)\b', re.IGNORECASE),
+]
+
+# Structured finding pattern: bullet with bold title followed by colon.
+# Matches the required output format: - **[Title]**: [Description]
+_ACTIONABLE_FINDING_PATTERN = re.compile(r'^\s*[-*]\s+\*\*[^*]+\*\*\s*:', re.MULTILINE)
+
 
 class PRReviewAgent(AnalysisAgent):
     """
@@ -430,8 +447,8 @@ Structure your findings EXACTLY like this:
 - [Areas that passed review with no issues]
 ```
 
-If there are NO issues at any severity level, write "None found" under that heading.
-If the PR looks good overall, state that clearly.
+If there are NO issues at any severity level, write ONLY "None found" under that heading — do not add any explanation, context, or commentary.
+If the PR looks good overall, state that clearly in a separate summary paragraph.
 """
 
     def _build_verification_prompt(self, pr_url: str, context_name: str, context_content: str) -> str:
@@ -483,6 +500,7 @@ Structure your findings EXACTLY like this:
 - [Requirements that were correctly implemented]
 ```
 
+Under "### Gaps Found" and "### Deviations", write ONLY "None found" if there are none — no additional text.
 If all requirements are met, write "All requirements verified - no gaps found" and list what was verified.
 """
 
@@ -513,26 +531,44 @@ If all requirements are met, write "All requirements verified - no gaps found" a
         # Create one issue per severity with findings
         for severity, items in severity_sections.items():
             if items and not self._is_none_found(items):
-                issues.append({
-                    'title': f"[PR Review] {severity} issues from {source}",
-                    'body': self._format_issue_body(severity, items, source),
-                    'severity': severity.lower(),
-                })
+                if self._has_actionable_findings(items):
+                    issues.append({
+                        'title': f"[PR Review] {severity} issues from {source}",
+                        'body': self._format_issue_body(severity, items, source),
+                        'severity': severity.lower(),
+                    })
+                else:
+                    logger.warning(
+                        f"PR review false-positive prevented: {severity} section from {source} "
+                        f"has content but no structured findings: {items[:120]}"
+                    )
 
         # Create issues for gaps and deviations
         if gaps and not self._is_none_found(gaps):
-            issues.append({
-                'title': f"[PR Review] Implementation gaps - {source}",
-                'body': self._format_issue_body("Gap", gaps, source),
-                'severity': 'high',
-            })
+            if self._has_actionable_findings(gaps):
+                issues.append({
+                    'title': f"[PR Review] Implementation gaps - {source}",
+                    'body': self._format_issue_body("Gap", gaps, source),
+                    'severity': 'high',
+                })
+            else:
+                logger.warning(
+                    f"PR review false-positive prevented: Gaps section from {source} "
+                    f"has content but no structured findings: {gaps[:120]}"
+                )
 
         if deviations and not self._is_none_found(deviations):
-            issues.append({
-                'title': f"[PR Review] Implementation deviations - {source}",
-                'body': self._format_issue_body("Deviation", deviations, source),
-                'severity': 'medium',
-            })
+            if self._has_actionable_findings(deviations):
+                issues.append({
+                    'title': f"[PR Review] Implementation deviations - {source}",
+                    'body': self._format_issue_body("Deviation", deviations, source),
+                    'severity': 'medium',
+                })
+            else:
+                logger.warning(
+                    f"PR review false-positive prevented: Deviations section from {source} "
+                    f"has content but no structured findings: {deviations[:120]}"
+                )
 
         return issues
 
@@ -545,10 +581,21 @@ If all requirements are met, write "All requirements verified - no gaps found" a
         return ''
 
     def _is_none_found(self, content: str) -> bool:
-        """Check if the section content indicates no findings."""
-        lower = content.lower().strip()
-        return lower in ('none found', 'none', 'n/a', 'none found.', '-  none found',
-                         '- none found', 'no issues found', 'all requirements verified')
+        """Check if the section content indicates no findings.
+
+        Uses regex patterns to detect "none found" variants even when Claude
+        appends explanatory text (e.g., 'None found - issues were already resolved').
+        """
+        return any(p.search(content) for p in _NONE_FOUND_PATTERNS)
+
+    def _has_actionable_findings(self, content: str) -> bool:
+        """Check if content contains at least one structured finding.
+
+        Validates that the section has bullet points in the expected
+        '- **[Title]**: [Description]' format. This acts as defense-in-depth
+        against false positives when _is_none_found() misses a variant.
+        """
+        return bool(_ACTIONABLE_FINDING_PATTERN.search(content))
 
     def _format_issue_body(self, severity: str, items: str, source: str) -> str:
         return (
