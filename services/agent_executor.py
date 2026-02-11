@@ -1209,6 +1209,7 @@ class AgentExecutor:
                     'repository': project_name,
                     'automated_setup': True,
                     'auto_triggered': True,
+                    'skip_workspace_prep': True,  # Verifier checks Docker image, no issue branch needed
                     'use_docker': False,  # Verifier also runs locally
                     'previous_stage_output': 'Setup agent completed successfully'
                 },

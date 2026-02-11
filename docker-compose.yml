@@ -39,10 +39,6 @@ services:
       # Mount GitHub App private key directory (optional - accessible by orchestrator user)
       - ~/.orchestrator:/home/orchestrator/.orchestrator
 
-      # Mount Claude Code config directory with MCP server configuration
-      # We use a local .claude-config directory that contains MCP server settings
-      - ./.claude-config:/home/orchestrator/.config/claude
-
       # Share Docker socket for nested containers (rootful Docker)
       - /var/run/docker.sock:/var/run/docker.sock
 
@@ -90,7 +86,6 @@ services:
       - ./:/app
       - ..:/workspace  # Mount workspace read-write for Advisor agent execution
       - /var/run/docker.sock:/var/run/docker.sock
-      - ./.claude-config:/home/orchestrator/.config/claude:ro  # MCP config
     environment:
       - REDIS_URL=redis://redis:6379
       - GITHUB_TOKEN=${GITHUB_TOKEN}

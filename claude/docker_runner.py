@@ -604,42 +604,16 @@ class DockerAgentRunner:
             '-v', f'{host_home}/.gitconfig:/home/orchestrator/.gitconfig',
         ])
 
-        # Mount global Claude config directory (contains MCP server configurations)
-        # This gives agent containers access to Playwright MCP and other global MCP servers
-        claude_config_host_path = f'{host_workspace}/clauditoreum/.claude-config'
-        cmd.extend([
-            '-v', f'{claude_config_host_path}:/home/orchestrator/.config/claude'
-        ])
-        logger.info(f"Mounting Claude config: {claude_config_host_path} -> /home/orchestrator/.config/claude")
-
-        # NEW: Mount Claude Code wrapper script for container-side Redis writes
+        # Mount Claude Code wrapper script for container-side Redis writes
         wrapper_host_path = f'{host_workspace}/clauditoreum/scripts/docker-claude-wrapper.py'
         cmd.extend([
             '-v', f'{wrapper_host_path}:/app/scripts/docker-claude-wrapper.py:ro'
         ])
         logger.info(f"Mounting wrapper: {wrapper_host_path} -> /app/scripts/docker-claude-wrapper.py")
 
-        # Mount shared Claude Code library (read-only)
-        # Plugins and base agents are baked into the Docker image via Dockerfile.
-        # These bind mounts overlay additional shared resources on top of the image contents.
-        # Claude Code runtime state (todos, debug, etc.) writes to the container's writable layer,
-        # which is cleaned up automatically since containers run with --rm.
-        shared_claude_base_host = f'{host_workspace}/clauditoreum/config/shared_claude/.claude'
-
-        # Check if shared Claude directory exists before mounting
-        if Path('/app/config/shared_claude/.claude').exists():
-            # Mount each subdirectory individually (agents, commands, skills)
-            for resource_type in ['agents', 'commands', 'skills']:
-                shared_resource_host = f'{shared_claude_base_host}/{resource_type}'
-                shared_resource_container = f'/home/orchestrator/.claude/{resource_type}'
-
-                if Path(f'/app/config/shared_claude/.claude/{resource_type}').exists():
-                    cmd.extend([
-                        '-v', f'{shared_resource_host}:{shared_resource_container}:ro'
-                    ])
-                    logger.info(f"Mounting shared {resource_type}: {shared_resource_host} -> {shared_resource_container}")
-        else:
-            logger.debug("No shared Claude directory found, skipping mount")
+        # Claude Code plugins, agents, commands, and skills are baked into the Docker image
+        # via the Dockerfile. Runtime state (todos, debug, etc.) writes to the container's
+        # writable layer, which is cleaned up automatically since containers run with --rm.
 
         # Mount MCP config file if provided (task-specific MCP servers)
         # The MCP config is written to a temp location accessible from host
@@ -860,65 +834,6 @@ class DockerAgentRunner:
             logger.warning(f"Failed to detect rate limit from Elasticsearch: {e}")
             return None
 
-    def _setup_shared_claude(self, project_dir: Path) -> None:
-        """
-        Copy shared Claude Code resources (agents, commands, skills) into project's .claude/ directory.
-        This creates a union of project-specific and shared resources.
-
-        Args:
-            project_dir: Project directory path inside container (e.g., /workspace/project-name)
-        """
-        import shutil
-
-        shared_claude_base = Path('/shared_claude/.claude')
-        project_claude_dir = project_dir / '.claude'
-
-        # Ensure project's .claude directory exists
-        project_claude_dir.mkdir(parents=True, exist_ok=True)
-
-        total_copied = 0
-        total_skipped = 0
-
-        # Copy agents, commands, and skills
-        for resource_type in ['agents', 'commands', 'skills']:
-            shared_resource_dir = shared_claude_base / resource_type
-            project_resource_dir = project_claude_dir / resource_type
-
-            if not shared_resource_dir.exists():
-                continue
-
-            # Create project's resource directory
-            project_resource_dir.mkdir(parents=True, exist_ok=True)
-
-            if resource_type == 'skills':
-                # Skills are directories, copy entire skill directories
-                for skill_dir in shared_resource_dir.iterdir():
-                    if skill_dir.is_dir():
-                        dest_skill_dir = project_resource_dir / skill_dir.name
-                        if not dest_skill_dir.exists():
-                            shutil.copytree(skill_dir, dest_skill_dir)
-                            total_copied += 1
-                            logger.debug(f"Copied shared {resource_type}: {skill_dir.name}")
-                        else:
-                            total_skipped += 1
-                            logger.debug(f"Skipping {skill_dir.name} - project-specific version exists")
-            else:
-                # Agents and commands are .md files
-                for resource_file in shared_resource_dir.glob('*.md'):
-                    dest_file = project_resource_dir / resource_file.name
-                    if not dest_file.exists():
-                        shutil.copy2(resource_file, dest_file)
-                        total_copied += 1
-                        logger.debug(f"Copied shared {resource_type}: {resource_file.name}")
-                    else:
-                        total_skipped += 1
-                        logger.debug(f"Skipping {resource_file.name} - project-specific version exists")
-
-        if total_copied > 0:
-            logger.info(f"Shared Claude setup complete: copied {total_copied} resources, skipped {total_skipped} (project-specific)")
-        elif shared_claude_base.exists():
-            logger.debug("All shared resources already present in project")
-
     async def _execute_in_container(
         self,
         docker_cmd: list,
@@ -954,10 +869,6 @@ class DockerAgentRunner:
                 logger.error("FATAL: Container cannot write to workspace - aborting agent launch")
                 raise Exception("Container write access verification failed - agent would not be able to write files")
             logger.info("✓ Pre-launch verification passed: Container has write access")
-
-        # Shared Claude resources are now available via Docker mount to /home/orchestrator/.claude
-        # No need to copy files - Claude Code discovers them automatically at user scope
-        # The _setup_shared_claude() method is deprecated and no longer used
 
         # Build the Claude command to run inside container
         # We use file-based input/output to support detached execution and orchestrator restarts
@@ -1081,7 +992,7 @@ class DockerAgentRunner:
         full_cmd = docker_cmd + ['sh', '-c', shell_cmd]
 
         logger.info(f"Executing detached: docker run -d ...")
-        
+
         obs = context.get('observability')
         agent = context.get('agent', 'unknown')
         task_id = context.get('task_id', 'unknown')
@@ -1092,6 +1003,7 @@ class DockerAgentRunner:
             import time
             api_start_time = time.time()
             obs.emit_claude_call_started(agent, task_id, project, claude_model)
+            obs.emit_container_launch_started(agent, task_id, project, container_name, image_name)
 
         try:
             # Launch detached container
@@ -1100,12 +1012,20 @@ class DockerAgentRunner:
                 capture_output=True,
                 text=True
             )
-            
+
             if launch_result.returncode != 0:
-                raise Exception(f"Failed to launch container: {launch_result.stderr}")
-            
+                error_msg = f"Failed to launch container: {launch_result.stderr}"
+                logger.error(error_msg)
+                if obs:
+                    obs.emit_container_launch_failed(agent, task_id, project, container_name, error_msg)
+                raise Exception(error_msg)
+
             container_id = launch_result.stdout.strip()
             logger.info(f"Launched detached container: {container_id[:12]}")
+
+            # Emit container launch success
+            if obs:
+                obs.emit_container_launch_succeeded(agent, task_id, project, container_name, container_id)
 
             # Track active container in Redis for kill switch
             # Registration happens AFTER docker run succeeds so we have the real container_id
@@ -1242,10 +1162,10 @@ class DockerAgentRunner:
             # Wait for container to finish
             # We use 'docker wait' instead of process.wait() because 'docker logs -f' might hang
             # or we might want to stop following if the container dies.
-            
+
             wait_result = subprocess.run(['docker', 'wait', container_name], capture_output=True, text=True)
             exit_code = int(wait_result.stdout.strip())
-            
+
             # Allow log streamer to finish naturally
             # 'docker logs -f' should exit when the container stops, but we give it a timeout
             # to ensure we capture the final output (like session limit messages)
@@ -1254,9 +1174,21 @@ class DockerAgentRunner:
             except subprocess.TimeoutExpired:
                 logger.warning(f"Log streamer for {container_name} timed out, terminating...")
                 process.terminate()
-            
+
             stdout_thread.join(timeout=1)
             stderr_thread.join(timeout=1)
+
+            # Log stderr summary for failed containers
+            if exit_code != 0:
+                stderr_text = ''.join(stderr_parts)
+                logger.info(f"Container {container_name} failed with exit_code={exit_code}, stderr length={len(stderr_text)} bytes")
+
+                # Emit container execution failure event
+                if obs:
+                    duration_ms = (time.time() - api_start_time) * 1000 if 'api_start_time' in locals() else 0
+                    # Extract first error line for event
+                    error_preview = stderr_text[:200] if stderr_text else "No error output"
+                    obs.emit_container_execution_failed(agent, task_id, project, container_name, exit_code, error_preview, duration_ms)
 
             # Cleanup ALL prompt files in project directory
             # This handles accumulation from multiple runs and prevents workspace contamination
@@ -1278,8 +1210,11 @@ class DockerAgentRunner:
             if obs:
                 import time
                 api_duration_ms = (time.time() - api_start_time) * 1000
+                # Emit container execution completed (with exit code)
+                obs.emit_container_execution_completed(agent, task_id, project, container_name, exit_code, api_duration_ms)
+                # Emit Claude call completed (success determined by exit_code)
                 obs.emit_claude_call_completed(agent, task_id, project, api_duration_ms,
-                                               input_tokens, output_tokens)
+                                               input_tokens, output_tokens, success=(exit_code == 0))
 
             if exit_code == 0:
                 result_text = ''.join(result_parts)
@@ -1467,7 +1402,36 @@ class DockerAgentRunner:
                 if not stderr_text:
                     stderr_text = f"Container exited with code {exit_code} but no error output captured."
 
-                logger.error(f"Agent failed in container (exit_code={exit_code}): {stderr_text[:500]}")
+                # Extract the most useful error info from stderr
+                # Skip debug output (ls, echo) and find actual error messages
+                error_lines = []
+                for line in stderr_text.split('\n'):
+                    line_lower = line.lower()
+                    # Skip debug output
+                    if line.startswith(('total ', 'drwx', '-rw', 'lrwx', 'DEBUG:')):
+                        continue
+                    # Include lines with error indicators
+                    if any(keyword in line_lower for keyword in ['error', 'exception', 'failed', 'traceback', 'errno']):
+                        error_lines.append(line)
+
+                # If we found specific errors, use those; otherwise use last 500 chars (most recent output)
+                if error_lines:
+                    error_summary = '\n'.join(error_lines[:10])  # First 10 error lines
+                    stderr_excerpt = error_summary[:500]
+                else:
+                    # No specific errors found - show end of stderr (most recent output)
+                    stderr_excerpt = stderr_text[-500:] if len(stderr_text) > 500 else stderr_text
+
+                logger.error(f"Agent failed in container (exit_code={exit_code}): {stderr_excerpt}")
+
+                # Also log first 500 chars for context (debug level)
+                if len(stderr_text) > 500:
+                    logger.debug(f"Full stderr (first 500 chars): {stderr_text[:500]}")
+
+                # Emit Claude call failed event
+                if obs:
+                    api_duration_ms = (time.time() - api_start_time) * 1000
+                    obs.emit_claude_call_failed(agent, task_id, project, api_duration_ms, stderr_excerpt, exit_code)
 
                 # CRITICAL: Record failure outcome immediately before raising exception
                 # This ensures outcome is recorded even if exception handling fails
@@ -1485,7 +1449,7 @@ class DockerAgentRunner:
                                 agent=agent,
                                 outcome='failure',
                                 project_name=project,
-                                error=stderr_text[:500]
+                                error=stderr_excerpt  # Use filtered error instead of truncated stderr
                             )
                             logger.info(
                                 f"✓ Docker runner recorded failure for {project}/#{issue_number} {agent} in {column}"
@@ -1493,7 +1457,7 @@ class DockerAgentRunner:
                     except Exception as outcome_error:
                         logger.error(f"Failed to record outcome in docker_runner: {outcome_error}", exc_info=True)
 
-                raise Exception(f"Agent execution failed (exit_code={exit_code}): {stderr_text[:500]}")
+                raise Exception(f"Agent execution failed (exit_code={exit_code}): {stderr_excerpt}")
 
         except Exception as e:
             logger.error(f"Agent execution error: {e}")
