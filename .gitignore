@@ -45,6 +45,7 @@ config/*.pem
 tmp/
 temp/
 *.tmp
+*.backup
 
 # But DO track these:
 !config/pipelines.yaml

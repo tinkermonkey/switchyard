@@ -83,11 +83,18 @@ class AgentExecutor:
                     project_name, task_context['issue_number'],
                     agent_name, task_context.get('column', 'unknown'), task_id
                 )
-            except Exception as stamp_err:
+            except (IOError, OSError) as stamp_err:
                 logger.warning(
                     f"Failed to stamp task_id on execution for "
                     f"{project_name}/#{task_context['issue_number']}: {stamp_err}. "
                     f"Recovery will fall back to wildcard scan if needed."
+                )
+            except Exception as stamp_err:
+                logger.error(
+                    f"Unexpected error stamping task_id on execution for "
+                    f"{project_name}/#{task_context['issue_number']}: {stamp_err}. "
+                    f"This may indicate a bug in stamp_execution_task_id.",
+                    exc_info=True
                 )
 
         # Emit task received event
@@ -422,7 +429,8 @@ class AgentExecutor:
 
             duration_ms = (time.time() - start_time) * 1000
             self.obs.emit_agent_completed(
-                agent_name, task_id, project_name, duration_ms, True, None, pipeline_run_id, output_text, agent_execution_id
+                agent_name, task_id, project_name, duration_ms, True, None, pipeline_run_id, output_text, agent_execution_id,
+                execution_type=execution_type
             )
 
             # If dev_environment_setup completed successfully, queue verifier
@@ -621,7 +629,8 @@ class AgentExecutor:
             else:
                 # Normal agent failure - emit event and record outcome
                 self.obs.emit_agent_completed(
-                    agent_name, task_id, project_name, duration_ms, False, str(e), pipeline_run_id, None, agent_execution_id
+                    agent_name, task_id, project_name, duration_ms, False, str(e), pipeline_run_id, None, agent_execution_id,
+                    execution_type=execution_type
                 )
 
                 # Record failed execution outcome

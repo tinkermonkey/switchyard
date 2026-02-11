@@ -446,6 +446,7 @@ async def main():
                     'board': 'system',  # System-initiated task
                     'repository': project_name,
                     'automated_setup': True,  # Flag to indicate this is automated setup
+                    'skip_workspace_prep': True,  # System task — no feature branch needed
                     'use_docker': False  # Run locally in orchestrator environment to access Docker for building project images
                 },
                 created_at=utc_isoformat()

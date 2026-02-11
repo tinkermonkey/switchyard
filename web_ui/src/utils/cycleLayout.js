@@ -432,10 +432,9 @@ function identifyCyclesFromWorkflow(events, agentExecutions, workflowConfig) {
     const makerExecutions = events.filter(e => {
       if (e.event_type !== 'agent_initialized') return false;
       if (e.agent !== makerAgent) return false;
-      // Exclude repair cycle work - check execution_type first, fall back to task_id for old data
-      const isRepairExec = e.execution_type
-        ? e.execution_type.startsWith('repair_')
-        : (e.task_id && e.task_id.startsWith('repair_'));
+      // Exclude repair cycle work - check both execution_type and task_id for backward compat
+      const isRepairExec = (e.execution_type && e.execution_type.startsWith('repair_'))
+        || (e.task_id && e.task_id.startsWith('repair_'));
       if (isRepairExec) return false;
       
       const eventTime = new Date(e.timestamp).getTime();
@@ -534,11 +533,11 @@ function identifyCyclesFromWorkflow(events, agentExecutions, workflowConfig) {
     }
   });
   
-  // Also detect repair cycles - check execution_type first, fall back to task_id for old data
+  // Also detect repair cycles - check both execution_type and task_id for backward compat
   const repairEvents = events.filter(e => {
     if (e.event_type !== 'agent_initialized') return false;
-    if (e.execution_type) return e.execution_type.startsWith('repair_');
-    return e.task_id && e.task_id.startsWith('repair_');
+    return (e.execution_type && e.execution_type.startsWith('repair_'))
+      || (e.task_id && e.task_id.startsWith('repair_'));
   });
   
   if (repairEvents.length > 0) {

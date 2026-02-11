@@ -196,6 +196,10 @@ class AgentContainerRecovery:
                 project = remainder[:uuid_start]
             task_id = uuid_match.group(0)
 
+            if not project:
+                logger.warning(f"UUID fallback extracted empty project name from {container_name}")
+                return None
+
             return {
                 'project': project,
                 'task_id': task_id,
@@ -210,6 +214,13 @@ class AgentContainerRecovery:
 
         project = remainder[:last_hyphen_idx]
         task_id = remainder[last_hyphen_idx + 1:]
+
+        if not project or not task_id:
+            logger.warning(
+                f"Old-format fallback produced empty project or task_id: "
+                f"project={project!r}, task_id={task_id!r} from {container_name}"
+            )
+            return None
 
         return {
             'project': project,
@@ -329,6 +340,11 @@ class AgentContainerRecovery:
                         if '=' in part:
                             k, v = part.split('=', 1)
                             labels[k.strip()] = v.strip()
+                        elif part.strip():
+                            logger.debug(
+                                f"Skipping malformed label entry '{part.strip()}' "
+                                f"for container {container_name}"
+                            )
 
                 # Skip agent containers that are part of repair cycles
                 # Check execution_type label first, fall back to container name for old-format containers
@@ -409,6 +425,16 @@ class AgentContainerRecovery:
                     except Exception as e:
                         logger.debug(f"Could not get Redis data for container: {e}")
 
+                # If agent could not be resolved from any source, we cannot safely recover
+                if not agent:
+                    logger.warning(
+                        f"Could not determine agent for container {container_name} from "
+                        f"labels, parsed name, or Redis. Cannot safely recover — killing it."
+                    )
+                    self.kill_container(container_name, container_id)
+                    killed += 1
+                    continue
+
                 # If we have issue_number, check cancellation signal first
                 if issue_number:
                     from services.cancellation import get_cancellation_signal
@@ -446,12 +472,11 @@ class AgentContainerRecovery:
                         continue
 
                     # Check if execution matches the container
-                    # Use agent from labels (most reliable) or fall back to Redis/parsed data
-                    agent_from_label = labels.get('org.clauditoreum.agent', '')
+                    # Use resolved agent (from labels, metadata, or Redis)
                     exec_agent = execution.get('agent', '')
-                    if agent_from_label and exec_agent and agent_from_label != exec_agent:
+                    if agent and exec_agent and agent != exec_agent:
                         logger.warning(
-                            f"Container {container_name} agent mismatch (label: {agent_from_label}, history: {exec_agent}), killing it"
+                            f"Container {container_name} agent mismatch (resolved: {agent}, history: {exec_agent}), killing it"
                         )
                         self.kill_container(container_name, container_id)
                         self.cleanup_execution_state(project, issue_number, agent, "agent_mismatch")

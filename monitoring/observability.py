@@ -10,7 +10,7 @@ import uuid
 from typing import Dict, Any, Optional
 from datetime import datetime
 from enum import Enum
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, fields
 from elasticsearch import Elasticsearch
 from monitoring.timestamp_utils import utc_now, utc_isoformat
 
@@ -224,8 +224,11 @@ class ObservabilityEvent:
 
     @classmethod
     def from_json(cls, json_str: str) -> 'ObservabilityEvent':
-        """Deserialize from JSON"""
-        return cls(**json.loads(json_str))
+        """Deserialize from JSON, ignoring unknown fields for forward compatibility"""
+        data = json.loads(json_str)
+        known_fields = {f.name for f in fields(cls)}
+        filtered = {k: v for k, v in data.items() if k in known_fields}
+        return cls(**filtered)
 
 class ObservabilityManager:
     """Manages event emission for agent observability"""
@@ -704,7 +707,8 @@ class ObservabilityManager:
                             error: Optional[str] = None,
                             pipeline_run_id: Optional[str] = None,
                             output: Optional[str] = None,
-                            agent_execution_id: Optional[str] = None):
+                            agent_execution_id: Optional[str] = None,
+                            execution_type: str = ""):
         """Emit agent completion event"""
         event_type = EventType.AGENT_COMPLETED if success else EventType.AGENT_FAILED
 
@@ -725,7 +729,7 @@ class ObservabilityManager:
             # Also store a preview for events list
             data['output_preview'] = output[:1000] + "..." if len(output) > 1000 else output
         
-        self.emit(event_type, agent, task_id, project, data, pipeline_run_id)
+        self.emit(event_type, agent, task_id, project, data, pipeline_run_id, execution_type=execution_type)
     
     def emit_branch_selected(self, agent: str, task_id: str, project: str,
                             branch_name: str, reason: str, 

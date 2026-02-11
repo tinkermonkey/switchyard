@@ -568,7 +568,7 @@ class DockerAgentRunner:
         # and without relying on Redis state that might be lost during a crash.
         # Resolve execution_type from nested task_context or top-level context
         task_context_for_labels = context.get('context', {})
-        execution_type_label = task_context_for_labels.get('execution_type') or context.get('execution_type', 'unknown')
+        execution_type_label = task_context_for_labels.get('execution_type') or context.get('execution_type', '')
 
         cmd.extend([
             '--label', f'org.clauditoreum.project={context.get("project", "unknown")}',
@@ -1552,7 +1552,7 @@ class DockerAgentRunner:
             # Try nested context first, then top-level (for backwards compatibility)
             'issue_number': str(task_context.get('issue_number') or context.get('issue_number', 'unknown')),
             'pipeline_run_id': task_context.get('pipeline_run_id') or context.get('pipeline_run_id', ''),
-            'execution_type': task_context.get('execution_type') or context.get('execution_type', 'unknown')
+            'execution_type': task_context.get('execution_type') or context.get('execution_type', '')
         }
 
         backoff_times = [0.5, 1.0]
