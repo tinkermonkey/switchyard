@@ -68,6 +68,11 @@ This is the Claude Code Agent Orchestrator - an autonomous AI development system
 - Utilities for maintenance tasks (branch cleanup, state inspection)
 - Use these to investigate issues or perform routine maintenance
 
+**Agent Team Maintainer** (`scripts/maintain_agent_team.py`)
+- Generates and maintains project-specific agents and skills
+- Analyzes project codebases to create tailored AI agents
+- See `scripts/AGENT_TEAM_MAINTAINER.md` for details
+
 ### Workspace Isolation
 
 **Host File System**:
