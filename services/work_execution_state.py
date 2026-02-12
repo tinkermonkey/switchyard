@@ -644,6 +644,11 @@ class WorkExecutionStateTracker:
         """
         import subprocess
 
+        logger.debug(
+            f"Attempting to repair Redis tracking for {project}/#{issue_number} {agent}. "
+            f"Discovered containers: {container_names}"
+        )
+
         for container_name in container_names:
             try:
                 # Extract container ID and labels via docker inspect
@@ -671,6 +676,15 @@ class WorkExecutionStateTracker:
                 label_task_id = parts[3] if len(parts) > 3 and parts[3] else 'unknown'
                 label_issue = parts[4] if len(parts) > 4 and parts[4] else str(issue_number)
                 label_pipeline_run_id = parts[5] if len(parts) > 5 and parts[5] else ''
+
+                # CRITICAL FIX: Validate that container's issue number matches expected issue
+                # This prevents repairing the wrong container during reconciliation
+                if label_issue != str(issue_number):
+                    logger.warning(
+                        f"Container {container_name} is for issue #{label_issue}, "
+                        f"not #{issue_number} - skipping repair to prevent mismatch"
+                    )
+                    continue
 
                 from datetime import datetime
                 container_info = {
