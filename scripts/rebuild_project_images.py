@@ -11,6 +11,7 @@ Usage:
 Options:
     --project PROJECT       Rebuild only the specified project
     --with-agents          Queue dev environment setup/verification agents
+    --regenerate-agents    Regenerate project-specific agents/skills before rebuilding
     --dry-run              Show what would be done without executing
     --update-state         Update dev container state to VERIFIED after successful builds
     -h, --help             Show this help message
@@ -122,6 +123,48 @@ def discover_projects_with_dockerfiles(project_filter: str = None) -> list:
             logger.debug(f"Skipping {project}: No Dockerfile.agent found")
 
     return projects_with_dockerfiles
+
+
+def regenerate_project_agents(project_name: str, dry_run: bool = False) -> bool:
+    """
+    Regenerate agents and skills for a project
+
+    Args:
+        project_name: Name of the project
+        dry_run: If True, show what would be done without executing
+
+    Returns:
+        True if regeneration succeeded, False otherwise
+    """
+    logger.info(f"Regenerating agents/skills for {project_name}...")
+
+    try:
+        # Import agent maintainer
+        from scripts.maintain_agent_team import run_generation_workflow
+
+        # Create args object for agent generation
+        class Args:
+            auto_approve = True  # Auto-approve in CI/CD context
+            cleanup = True
+            dry_run = dry_run
+            rebuild_images = False  # Already rebuilding separately
+
+        # Run generation
+        result = run_generation_workflow(project_name, Args())
+
+        if result['status'] == 'completed':
+            logger.info(f"✓ Successfully regenerated agents/skills for {project_name}")
+            return True
+        elif result['status'] == 'skipped':
+            logger.info(f"✓ No changes needed for {project_name}")
+            return True
+        else:
+            logger.error(f"✗ Agent regeneration failed for {project_name}: {result.get('error', 'Unknown error')}")
+            return False
+
+    except Exception as e:
+        logger.error(f"✗ Failed to regenerate agents for {project_name}: {e}")
+        return False
 
 
 def rebuild_project_image(
@@ -289,6 +332,36 @@ def rebuild_all_projects(args):
 
     # Mode 1: Rebuild images
     if not args.with_agents:
+        # Optional: Regenerate agents/skills first
+        if args.regenerate_agents:
+            logger.info("\n=== Regenerating Agents/Skills ===\n")
+            regeneration_results = {}
+
+            for project in projects:
+                regeneration_results[project] = regenerate_project_agents(
+                    project,
+                    dry_run=args.dry_run
+                )
+
+            # Report regeneration summary
+            regeneration_successes = sum(1 for r in regeneration_results.values() if r)
+            regeneration_failures = len(regeneration_results) - regeneration_successes
+
+            logger.info("\n=== Regeneration Summary ===")
+            logger.info(f"Total: {len(regeneration_results)} projects")
+            logger.info(f"✓ Succeeded: {regeneration_successes}")
+            if regeneration_failures > 0:
+                logger.info(f"✗ Failed: {regeneration_failures}")
+                failed_projects = [p for p, r in regeneration_results.items() if not r]
+                for project in failed_projects:
+                    logger.info(f"  - {project}")
+
+                # Block image rebuild on regeneration failure
+                if not args.dry_run:
+                    logger.error("\n✗ Blocking image rebuild due to agent regeneration failures")
+                    logger.error("Fix the issues above and try again")
+                    return
+
         logger.info("\n=== Rebuilding Docker Images ===\n")
         results = {}
 
@@ -383,6 +456,12 @@ Examples:
         '--with-agents',
         action='store_true',
         help='Queue dev_environment_setup agents instead of directly rebuilding images'
+    )
+
+    parser.add_argument(
+        '--regenerate-agents',
+        action='store_true',
+        help='Regenerate project-specific agents/skills before rebuilding images'
     )
 
     parser.add_argument(
