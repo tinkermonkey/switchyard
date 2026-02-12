@@ -187,8 +187,37 @@ class PipelineProgression:
             status_field_id = board_state.status_field_id
             if not status_field_id:
                 logger.error(f"No status_field_id found in board state for {board_name}")
-                logger.error("Board may need to be re-reconciled to capture the status field ID")
-                return False
+                logger.warning(f"Attempting auto-repair: refreshing board field IDs from GitHub")
+
+                # Auto-repair by fetching field ID from GitHub
+                try:
+                    # Use existing state_manager method to refresh field IDs atomically
+                    refresh_success = state_manager.refresh_board_field_ids(project_name, board_name)
+
+                    if not refresh_success:
+                        logger.error("Auto-repair failed: could not refresh field IDs from GitHub")
+                        logger.error("Board may need to be re-reconciled to capture the status field ID")
+                        return False
+
+                    # Reload state to get the refreshed field ID
+                    refreshed_state = state_manager.load_project_state(project_name)
+                    if refreshed_state:
+                        refreshed_board = refreshed_state.boards.get(board_name)
+                        if refreshed_board and refreshed_board.status_field_id:
+                            status_field_id = refreshed_board.status_field_id
+                            # Update board_state reference for use below
+                            board_state = refreshed_board
+                            logger.info(f"Auto-repair succeeded: status_field_id = {status_field_id}")
+                        else:
+                            logger.error("Auto-repair failed: status_field_id still missing after refresh")
+                            return False
+                    else:
+                        logger.error("Auto-repair failed: could not reload state after refresh")
+                        return False
+                except Exception as e:
+                    logger.error(f"Auto-repair failed with exception: {e}")
+                    logger.error("Board may need to be re-reconciled to capture the status field ID")
+                    return False
 
             # Get the option ID for the target column from the columns list
             column_option_id = None

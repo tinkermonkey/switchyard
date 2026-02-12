@@ -167,7 +167,7 @@ class GitHubProjectManager:
                     
                     # Update state with discovered board
                     workflow_template = self.config_manager.get_workflow_template(pipeline_config.workflow)
-                    columns = await self._configure_board_columns(
+                    columns, status_field_id = await self._configure_board_columns(
                         discovered_board['number'],
                         discovered_board['id'],
                         workflow_template,
@@ -177,6 +177,8 @@ class GitHubProjectManager:
                     # Only update state if we successfully retrieved columns
                     if not columns:
                         logger.error(f"Failed to configure columns for discovered board '{pipeline_config.board_name}' - skipping state update to preserve existing state")
+                        if status_field_id:
+                            logger.warning(f"Status field ID was found ({status_field_id}) but no column options matched - possible configuration mismatch")
                         return False
 
                     self.state_manager.update_board_state(
@@ -185,7 +187,8 @@ class GitHubProjectManager:
                         discovered_board['number'],
                         discovered_board['id'],
                         discovered_board['node_id'],
-                        columns
+                        columns,
+                        status_field_id=status_field_id
                     )
                     logger.info(f"Discovered and updated board: {pipeline_config.board_name}")
                     return True
@@ -230,7 +233,7 @@ class GitHubProjectManager:
                 project_number = existing_board.project_number
 
                 if project_number:
-                    columns = await self._configure_board_columns(
+                    columns, status_field_id = await self._configure_board_columns(
                         project_number,
                         existing_board.project_id,
                         workflow_template,
@@ -240,6 +243,8 @@ class GitHubProjectManager:
                     # Only update state if we successfully retrieved columns
                     if not columns:
                         logger.error(f"Failed to configure columns for existing board '{pipeline_config.board_name}' - skipping state update to preserve existing state")
+                        if status_field_id:
+                            logger.warning(f"Status field ID was found ({status_field_id}) but no column options matched - possible configuration mismatch")
                         return False
 
                     # Update state with new columns
@@ -249,7 +254,8 @@ class GitHubProjectManager:
                         existing_board.project_number,
                         existing_board.project_id,
                         existing_board.node_id,
-                        columns
+                        columns,
+                        status_field_id=status_field_id
                     )
                     logger.info(f"Updated {len(columns)} columns for board: {pipeline_config.board_name}")
 
@@ -310,11 +316,13 @@ class GitHubProjectManager:
                 logger.warning("Project created but not linked to repository - will be org-level instead of repo-level")
 
             # Configure columns
-            columns = await self._configure_board_columns(project_number, project_id, workflow_template, project_config.github['org'])
+            columns, status_field_id = await self._configure_board_columns(project_number, project_id, workflow_template, project_config.github['org'])
 
             # Only update state if we successfully retrieved columns
             if not columns:
                 logger.error(f"Failed to configure columns for newly created board '{pipeline_config.board_name}' - board created but state not updated")
+                if status_field_id:
+                    logger.warning(f"Status field ID was found ({status_field_id}) but no column options matched - possible configuration mismatch")
                 return None
 
             # Update state
@@ -324,7 +332,8 @@ class GitHubProjectManager:
                 project_number,
                 project_id,
                 node_id,
-                columns
+                columns,
+                status_field_id=status_field_id
             )
 
             return {
@@ -347,7 +356,7 @@ class GitHubProjectManager:
             logger.error("Orchestrator cannot manage GitHub projects without successful board creation")
             return None
 
-    async def _configure_board_columns(self, project_number: int, project_id: str, workflow_template: WorkflowTemplate, github_org: str) -> List[Dict[str, str]]:
+    async def _configure_board_columns(self, project_number: int, project_id: str, workflow_template: WorkflowTemplate, github_org: str) -> tuple[List[Dict[str, str]], Optional[str]]:
         """Configure project board columns using GraphQL"""
         try:
             github_client = get_github_client()
@@ -358,7 +367,7 @@ class GitHubProjectManager:
             
             if not success:
                 logger.error(f"Failed to get project fields: {result}")
-                return []
+                return [], None
             
             fields_data = result
 
@@ -371,7 +380,7 @@ class GitHubProjectManager:
 
             if not status_field:
                 logger.error("Status field not found")
-                return []
+                return [], None
 
             # Get current options from the status field
             current_options = status_field.get('options', [])
@@ -415,19 +424,24 @@ class GitHubProjectManager:
                     else:
                         logger.warning(f"No GraphQL option ID found for column '{column.name}'")
 
-                # Also store the status field ID for later use
-                if columns:
-                    logger.info(f"Stored Status field ID: {status_field['id']}")
-                    # Store this in the board state for later use in pipeline_progression
-                    columns[0]['status_field_id'] = status_field['id']
+                # Get the status field ID
+                field_id = status_field['id']
 
-                return columns
+                # Store in columns[0] for backward compatibility
+                if columns:
+                    columns[0]['status_field_id'] = field_id
+                    logger.info(f"Stored Status field ID: {field_id}")
+                else:
+                    logger.warning(f"No column matches found, but storing status_field_id anyway")
+
+                # Return both columns and field_id separately
+                return columns, field_id
             else:
-                return []
+                return [], None
 
         except Exception as e:
             logger.error(f"Failed to configure columns: {e}")
-            return []
+            return [], None
 
     async def _update_status_field_graphql(self, project_id: str, field_id: str, options: List[Dict[str, str]]) -> Optional[List[Dict[str, str]]]:
         """Update Status field options using GraphQL

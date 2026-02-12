@@ -291,15 +291,25 @@ class GitHubStateManager:
 
     def update_board_state(self, project_name: str, board_name: str,
                           project_number: int, project_id: str, node_id: str,
-                          columns: List[Dict[str, str]]):
-        """Update board state with GitHub API response data"""
+                          columns: List[Dict[str, str]],
+                          status_field_id: Optional[str] = None):
+        """Update board state with GitHub API response data
+
+        Args:
+            project_name: Project name
+            board_name: Board name
+            project_number: GitHub project number
+            project_id: GitHub project ID
+            node_id: GitHub node ID
+            columns: List of column data dictionaries
+            status_field_id: Optional status field ID (if not provided, extracted from columns[0])
+        """
         state = self.load_project_state(project_name)
         if state is None:
             state = self.create_initial_state(project_name)
 
-        # Extract status_field_id from the first column if present
-        status_field_id = None
-        if columns and 'status_field_id' in columns[0]:
+        # Use passed status_field_id if provided, otherwise extract from first column
+        if status_field_id is None and columns and 'status_field_id' in columns[0]:
             status_field_id = columns[0]['status_field_id']
 
         github_columns = []

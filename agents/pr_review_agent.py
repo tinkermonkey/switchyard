@@ -1054,16 +1054,13 @@ If all requirements are met, write "All requirements verified - no gaps found" a
             task_queue = TaskQueue()
             progression = PipelineProgression(task_queue)
 
-            # Find the Planning board name
-            github_state = self.state_manager.load_project_state(project_name)
-            if not github_state:
-                logger.warning(f"No GitHub state for {project_name}, cannot advance to Documentation")
-                return
+            # Get planning board name from config (not stale state)
+            project_config = self.config_manager.get_project_config(project_name)
 
             planning_board = None
-            for board_name, board in github_state.boards.items():
-                if 'planning' in board_name.lower():
-                    planning_board = board_name
+            for pipeline in project_config.pipelines:
+                if 'planning' in pipeline.board_name.lower():
+                    planning_board = pipeline.board_name
                     break
 
             if planning_board:
@@ -1094,15 +1091,13 @@ If all requirements are met, write "All requirements verified - no gaps found" a
             task_queue = TaskQueue()
             progression = PipelineProgression(task_queue)
 
-            github_state = self.state_manager.load_project_state(project_name)
-            if not github_state:
-                logger.warning(f"No GitHub state for {project_name}, cannot return parent to In Development")
-                return
+            # Get planning board name from config (not stale state)
+            project_config = self.config_manager.get_project_config(project_name)
 
             planning_board = None
-            for board_name, board in github_state.boards.items():
-                if 'planning' in board_name.lower():
-                    planning_board = board_name
+            for pipeline in project_config.pipelines:
+                if 'planning' in pipeline.board_name.lower():
+                    planning_board = pipeline.board_name
                     break
 
             if planning_board:
