@@ -532,11 +532,7 @@ class PRReviewStage(PipelineStage):
 
             if obs:
                 obs.emit_agent_completed("pr_review_stage", task_id, project_name, duration_ms,
-                                       True, pipeline_run_id=pipeline_run_id,
-                                       agent_call_count=self._agent_call_count,
-                                       phases_completed=phases_completed,
-                                       phases_attempted=phases_attempted,
-                                       issues_created=len(all_created_issues))
+                                       True, pipeline_run_id=pipeline_run_id)
 
             return context
 
@@ -550,8 +546,7 @@ class PRReviewStage(PipelineStage):
             if obs:
                 obs.emit_agent_completed("pr_review_stage", task_id, project_name,
                                         duration_ms, False, error=str(e),
-                                        pipeline_run_id=pipeline_run_id,
-                                        agent_call_count=self._agent_call_count)
+                                        pipeline_run_id=pipeline_run_id)
 
             # Re-raise to let orchestrator handle
             raise
