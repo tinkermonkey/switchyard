@@ -255,7 +255,7 @@ class PRReviewStage(PipelineStage):
                 # Emit phase failed event
                 if obs:
                     phase1_duration = (utc_now() - phase1_start).total_seconds()
-                    obs.emit(EventType.PR_REVIEW_PHASE_COMPLETED, "pr_review_stage", task_id, project_name, {
+                    obs.emit(EventType.PR_REVIEW_PHASE_FAILED, "pr_review_stage", task_id, project_name, {
                         "phase": 1,
                         "phase_name": "PR Code Review",
                         "success": False,
@@ -368,7 +368,7 @@ class PRReviewStage(PipelineStage):
                     # Emit phase failed event
                     if obs:
                         phase2_duration = (utc_now() - phase2_start).total_seconds()
-                        obs.emit(EventType.PR_REVIEW_PHASE_COMPLETED, "pr_review_stage", task_id, project_name, {
+                        obs.emit(EventType.PR_REVIEW_PHASE_FAILED, "pr_review_stage", task_id, project_name, {
                             "phase": 2,
                             "sub_phase": phase2_index,
                             "phase_name": f"Context Verification: {check_name}",
@@ -444,7 +444,7 @@ class PRReviewStage(PipelineStage):
                 # Emit phase failed event
                 if obs:
                     phase3_duration = (utc_now() - phase3_start).total_seconds()
-                    obs.emit(EventType.PR_REVIEW_PHASE_COMPLETED, "pr_review_stage", task_id, project_name, {
+                    obs.emit(EventType.PR_REVIEW_PHASE_FAILED, "pr_review_stage", task_id, project_name, {
                         "phase": 3,
                         "phase_name": "CI Status Check",
                         "success": False,

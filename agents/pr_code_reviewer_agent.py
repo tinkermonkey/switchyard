@@ -5,7 +5,7 @@ Uses pr-review-toolkit skill to review PR code quality.
 Runs in Docker with project code mounted.
 """
 
-from typing import Dict, Any
+from typing import Dict, Any, List
 from agents.base_analysis_agent import AnalysisAgent
 from claude.claude_integration import run_claude_code
 import logging
@@ -32,6 +32,15 @@ class PRCodeReviewerAgent(AnalysisAgent):
     @property
     def agent_role_description(self) -> str:
         return "I review PR code quality using automated analysis tools."
+
+    @property
+    def output_sections(self) -> List[str]:
+        return [
+            "Critical Issues",
+            "High Priority Issues",
+            "Medium Priority Issues",
+            "Low Priority / Nice-to-Have",
+        ]
 
     async def execute(self, context: Dict[str, Any]) -> Dict[str, Any]:
         """

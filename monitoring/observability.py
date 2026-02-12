@@ -176,6 +176,7 @@ class EventType(Enum):
     PR_REVIEW_STAGE_STARTED = "pr_review_stage_started"
     PR_REVIEW_PHASE_STARTED = "pr_review_phase_started"
     PR_REVIEW_PHASE_COMPLETED = "pr_review_phase_completed"
+    PR_REVIEW_PHASE_FAILED = "pr_review_phase_failed"
     PR_REVIEW_STAGE_COMPLETED = "pr_review_stage_completed"
     
     # Conversational Loop Routing
@@ -381,6 +382,7 @@ class ObservabilityManager:
             EventType.PR_REVIEW_STAGE_STARTED,
             EventType.PR_REVIEW_PHASE_STARTED,
             EventType.PR_REVIEW_PHASE_COMPLETED,
+            EventType.PR_REVIEW_PHASE_FAILED,
             EventType.PR_REVIEW_STAGE_COMPLETED,
             # Startup Recovery & State Reconciliation
             EventType.EXECUTION_STATE_RECONCILED,

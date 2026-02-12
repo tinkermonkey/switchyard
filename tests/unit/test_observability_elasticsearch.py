@@ -860,7 +860,7 @@ class TestEventTypeCompleteness:
             'repair_cycle_warning_review_started', 'repair_cycle_warning_review_completed',
             'repair_cycle_warning_review_failed', 'repair_cycle_completed',
             'pr_review_stage_started', 'pr_review_phase_started',
-            'pr_review_phase_completed', 'pr_review_stage_completed',
+            'pr_review_phase_completed', 'pr_review_phase_failed', 'pr_review_stage_completed',
             'execution_state_reconciled',
         }
         
