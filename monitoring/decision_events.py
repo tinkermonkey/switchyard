@@ -680,7 +680,57 @@ class DecisionEventEmitter:
                 'reason': f"{'Successfully recovered' if success else 'Failed to recover'} from {error_type}: {recovery_action}"
             }
         )
-    
+
+    def emit_execution_state_reconciled(
+        self,
+        agent: str,
+        project: str,
+        issue_number: int,
+        column: str,
+        recovered_outcome: str,
+        context: Dict[str, Any],
+        pipeline_run_id: Optional[str] = None
+    ):
+        """
+        Emit event when a successful agent execution is recovered from Redis
+        during orchestrator startup. This is not an error — the agent completed
+        successfully and the result was found in Redis after a restart. The
+        monitoring loop will re-detect the card position and continue the pipeline.
+
+        Only used for the success path. Failed executions still use emit_error_decision.
+
+        Args:
+            agent: Agent name that completed
+            project: Project name
+            issue_number: Issue number
+            column: Board column the issue was in
+            recovered_outcome: The recovered outcome (currently always 'success')
+            context: Additional context about the reconciliation
+            pipeline_run_id: Optional pipeline run ID
+        """
+        task_id = f"reconcile_{project}_{issue_number}_{datetime.now().timestamp()}"
+
+        self.obs.emit(
+            EventType.EXECUTION_STATE_RECONCILED,
+            agent="orchestrator",
+            task_id=task_id,
+            project=project,
+            pipeline_run_id=pipeline_run_id,
+            data={
+                'decision_category': 'state_reconciliation',
+                'agent_name': agent,
+                'issue_number': issue_number,
+                'column': column,
+                'recovered_outcome': recovered_outcome,
+                'context': context,
+                'reason': (
+                    f"Agent {agent} execution for #{issue_number} recovered from Redis "
+                    f"after orchestrator restart (outcome: {recovered_outcome}). "
+                    f"Monitoring loop will re-detect card position and continue pipeline."
+                )
+            }
+        )
+
     def emit_circuit_breaker_opened(
         self,
         circuit_name: str,

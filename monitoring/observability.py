@@ -191,6 +191,9 @@ class EventType(Enum):
     CIRCUIT_BREAKER_CLOSED = "circuit_breaker_closed"
     RETRY_ATTEMPTED = "retry_attempted"
 
+    # Startup Recovery & State Reconciliation
+    EXECUTION_STATE_RECONCILED = "execution_state_reconciled"
+
     # Container Result Persistence & Recovery
     RESULT_PERSISTENCE_FAILED = "result_persistence_failed"
     FALLBACK_STORAGE_USED = "fallback_storage_used"
@@ -374,6 +377,13 @@ class ObservabilityManager:
             EventType.CIRCUIT_BREAKER_OPENED,
             EventType.CIRCUIT_BREAKER_CLOSED,
             EventType.RETRY_ATTEMPTED,
+            # PR Review Stage Management
+            EventType.PR_REVIEW_STAGE_STARTED,
+            EventType.PR_REVIEW_PHASE_STARTED,
+            EventType.PR_REVIEW_PHASE_COMPLETED,
+            EventType.PR_REVIEW_STAGE_COMPLETED,
+            # Startup Recovery & State Reconciliation
+            EventType.EXECUTION_STATE_RECONCILED,
             # Container Result Persistence & Recovery
             EventType.RESULT_PERSISTENCE_FAILED,
             EventType.FALLBACK_STORAGE_USED,

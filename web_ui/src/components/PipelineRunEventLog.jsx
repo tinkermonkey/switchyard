@@ -327,6 +327,29 @@ const ErrorRecoveredEvent = memo(({ event, onIconClick }) => {
   )
 })
 
+// State Reconciliation Events
+const ExecutionStateReconciledEvent = memo(({ event, onIconClick }) => {
+  const agentName = event?.data?.agent_name || event?.agent_name
+  const column = event?.data?.column || event?.column
+  const outcome = event?.data?.recovered_outcome || event?.recovered_outcome
+
+  return (
+    <PipelineRunEventLogEvent event={event} onIconClick={onIconClick} icon={RotateCcw} color="bg-blue-600">
+      <div className="space-y-1">
+        <div className="font-semibold">Execution State Reconciled</div>
+        <div className="text-xs">
+          Agent <span className="font-mono">{agentName}</span> completed ({outcome}) before restart — recovered from Redis
+        </div>
+        {column && (
+          <div className="text-xs text-blue-300">
+            Column: {column} — monitoring loop will continue pipeline automatically
+          </div>
+        )}
+      </div>
+    </PipelineRunEventLogEvent>
+  )
+})
+
 // Task Queue Events
 const TaskQueuedEvent = memo(({ event, onIconClick }) => (
   <PipelineRunEventLogEvent event={event} onIconClick={onIconClick} icon={Clock} color="bg-cyan-600">
@@ -433,6 +456,9 @@ const getEventComponent = (event, onIconClick) => {
     // Error Handling
     'error_encountered': ErrorEncounteredEvent,
     'error_recovered': ErrorRecoveredEvent,
+
+    // State Reconciliation
+    'execution_state_reconciled': ExecutionStateReconciledEvent,
 
     // Task Queue
     'task_queued': TaskQueuedEvent,

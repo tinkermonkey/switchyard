@@ -1607,11 +1607,11 @@ class WorkExecutionStateTracker:
                                     # Agent completed successfully but result was only recovered
                                     # from Redis after restart. The normal result-processing chain
                                     # (posting output to GitHub, triggering progression) was skipped.
-                                    # Pipeline requires manual card movement to advance.
+                                    # Monitoring loop will re-detect card position and continue pipeline.
                                     logger.info(
-                                        f"Recovered successful execution from Redis: "
+                                        f"Reconciled successful execution from Redis: "
                                         f"{project_name}/#{issue_number} {agent} in {column}. "
-                                        f"Pipeline requires manual card movement to advance."
+                                        f"Monitoring loop will re-detect card position and continue pipeline."
                                     )
 
                                     # Verify dev container state consistency for dev_environment_verifier
@@ -1647,30 +1647,24 @@ class WorkExecutionStateTracker:
                                         pipeline_run_mgr = get_pipeline_run_manager()
                                         active_run = pipeline_run_mgr.get_active_pipeline_run(project_name, issue_number)
 
-                                        decision_events.emit_error_decision(
-                                            error_type='ExecutionRecoveredFromRedis',
-                                            error_message=(
-                                                f'Agent {agent} completed successfully but result was '
-                                                f'recovered from Redis after orchestrator restart. '
-                                                f'Pipeline requires manual card movement to advance.'
-                                            ),
+                                        decision_events.emit_execution_state_reconciled(
+                                            agent=agent,
+                                            project=project_name,
+                                            issue_number=issue_number,
+                                            column=column,
+                                            recovered_outcome='success',
                                             context={
-                                                'project': project_name,
-                                                'issue_number': issue_number,
-                                                'agent': agent,
-                                                'column': column,
                                                 'timestamp': timestamp,
                                                 'recovered_from_redis': True,
-                                                'blocking_pipeline': True,
-                                                'lock_held': True,
                                             },
-                                            recovery_action='manual_progression_required',
-                                            success=True,
-                                            project=project_name,
                                             pipeline_run_id=active_run.id if active_run else None
                                         )
                                     except Exception as e:
-                                        logger.error(f"Failed to emit recovery events: {e}", exc_info=True)
+                                        logger.error(
+                                            f"Failed to emit reconciliation event for "
+                                            f"{project_name}/#{issue_number} ({agent}): {e}",
+                                            exc_info=True
+                                        )
                                 else:
                                     # Failure path — applies to both recovered-from-Redis failures
                                     # and truly lost executions where no result was found
