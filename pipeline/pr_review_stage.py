@@ -729,41 +729,70 @@ class PRReviewStage(PipelineStage):
         return "\n".join(lines)
 
     def _build_pr_review_prompt(self, pr_url: str) -> str:
-        return f"""
-You are a PR Review Specialist. Review the following pull request for code quality issues.
+        """
+        Build PR review prompt that encourages skill usage while enforcing parseable output structure.
 
-**CRITICAL**: You MUST use the /pr-review-toolkit:review-pr skill for this task.
-DO NOT provide a manual review - the skill provides comprehensive automated analysis.
+        Pattern borrowed from work_breakdown_agent:
+        - STEP 1 (PRIMARY): Do the work (use the skill)
+        - STEP 2 (SECONDARY): Format the output (for automation)
+        """
+        # Extract PR number for checkout command
+        match = re.search(r'/pull/(\d+)$', pr_url)
+        pr_number = match.group(1) if match else None
 
-Use the /pr-review-toolkit:review-pr skill to review this PR: {pr_url}
+        checkout_instruction = ""
+        if pr_number:
+            checkout_instruction = f"""
+First, checkout the PR branch so review tools can analyze the changes:
 
-After running the review skill, organize your findings into severity levels.
+```bash
+gh pr checkout {pr_number}
+```
+"""
 
-## Output Format
+        return f"""You are a PR Review Specialist reviewing PR: {pr_url}
 
-Structure your findings EXACTLY like this:
+## STEP 1: Run Comprehensive Review
+
+**REQUIRED**: Use the pr-review-toolkit skill to run specialized review agents.
+{checkout_instruction}
+Then run the comprehensive review:
+
+/pr-review-toolkit:review-pr all parallel
+
+The skill will launch specialized agents (code-reviewer, test-analyzer, silent-failure-hunter, comment-analyzer, type-design-analyzer) and provide detailed findings.
+
+## STEP 2: Structure Results for Issue Creation
+
+After the review skill completes, you MUST format the findings in this EXACT structure so they can be parsed and converted to GitHub issues:
 
 ```
 ## PR Review Findings
 
 ### Critical Issues
-- **[Finding Title]**: [Description of the critical issue and what needs to change]
+- **[Finding Title]**: [Description with file:line references]
 
 ### High Priority Issues
-- **[Finding Title]**: [Description]
+- **[Finding Title]**: [Description with file:line references]
 
 ### Medium Priority Issues
-- **[Finding Title]**: [Description]
+- **[Finding Title]**: [Description with file:line references]
 
 ### Low Priority / Nice-to-Have
-- **[Finding Title]**: [Description]
+- **[Finding Title]**: [Description with file:line references]
 
 ### Clean Areas
 - [Areas that passed review with no issues]
 ```
 
-If there are NO issues at any severity level, write ONLY "None found" under that heading — do not add any explanation, context, or commentary.
-If the PR looks good overall, state that clearly in a separate summary paragraph.
+**IMPORTANT FORMATTING RULES**:
+1. Section must start with `## PR Review Findings`
+2. Use exact heading names: "Critical Issues", "High Priority Issues", "Medium Priority Issues", "Low Priority / Nice-to-Have"
+3. Each finding must use format: `- **[Title]**: [Description]`
+4. If no issues at a severity level, write ONLY "None found" - no additional text
+5. Include file:line references where applicable (e.g., `/workspace/file.ts:123`)
+
+This structured format enables automatic GitHub issue creation from your findings.
 """
 
     def _build_verification_prompt(self, pr_url: str, context_name: str, context_content: str) -> str:

@@ -6,6 +6,7 @@ import json
 import subprocess
 import logging
 import uuid
+import inspect
 from datetime import datetime
 from typing import Dict, Any, List, Optional
 from dataclasses import dataclass
@@ -2702,6 +2703,15 @@ class ProjectMonitor:
         If parent is in "In Development": move to "In Review" (triggers PR review agent via polling)
         If parent is already in "In Review": directly enqueue PR review agent (re-review after fixes)
         """
+        # Entry logging for debugging
+        caller_frame = inspect.stack()[1]
+        caller_info = f"{caller_frame.filename}:{caller_frame.lineno} in {caller_frame.function}()"
+
+        logger.info(
+            f"🔍 _advance_parent_for_pr_review ENTRY: parent #{parent_issue_number}, "
+            f"project={project_name}, caller={caller_info}"
+        )
+
         try:
             from config.state_manager import state_manager
             from state_management.pr_review_state_manager import pr_review_state_manager
@@ -2709,7 +2719,10 @@ class ProjectMonitor:
             # Find Planning board
             project_state = state_manager.load_project_state(project_name)
             if not project_state:
-                logger.warning(f"No project state for {project_name}, skipping Planning board advance")
+                logger.warning(
+                    f"🔍 _advance_parent_for_pr_review EARLY EXIT (no project state): "
+                    f"parent #{parent_issue_number}, project={project_name}"
+                )
                 return
 
             planning_board_name = None
@@ -2721,7 +2734,10 @@ class ProjectMonitor:
                     break
 
             if not planning_board:
-                logger.debug(f"No Planning board found for {project_name}, skipping")
+                logger.info(
+                    f"🔍 _advance_parent_for_pr_review EARLY EXIT (no planning board): "
+                    f"parent #{parent_issue_number}, project={project_name}"
+                )
                 return
 
             # Get parent's current column on the Planning board
@@ -2730,8 +2746,9 @@ class ProjectMonitor:
             )
 
             if not current_column:
-                logger.debug(
-                    f"Parent #{parent_issue_number} not found on Planning board, skipping"
+                logger.info(
+                    f"🔍 _advance_parent_for_pr_review EARLY EXIT (parent not on board): "
+                    f"parent #{parent_issue_number}, project={project_name}, board={planning_board_name}"
                 )
                 return
 
@@ -2766,6 +2783,7 @@ class ProjectMonitor:
                         # This gives PR review agent time to create all sub-issues
                         if time_since_review < 180:
                             logger.info(
+                                f"🔍 _advance_parent_for_pr_review EARLY EXIT (cooldown): "
                                 f"PR review ran {time_since_review:.0f}s ago for #{parent_issue_number}. "
                                 f"Waiting {180 - time_since_review:.0f}s before auto-advance to avoid race condition."
                             )
@@ -2784,14 +2802,39 @@ class ProjectMonitor:
 
                 parent_issue_data = await github.get_issue(parent_issue_number)
                 if parent_issue_data:
+                    # Log query timestamp for cache debugging
+                    query_timestamp = time.time()
+                    logger.info(
+                        f"🔍 Querying sub-issues for parent #{parent_issue_number} "
+                        f"(query_ts={query_timestamp:.3f})"
+                    )
+
                     sub_issues = await feature_branch_manager._get_sub_issues_from_parent(
                         github, parent_issue_data
                     )
 
                     open_sub_issues = [s for s in sub_issues if s.get('state') != 'closed']
 
+                    logger.info(
+                        f"🔍 Sub-issue check result for parent #{parent_issue_number}: "
+                        f"total={len(sub_issues)}, open={len(open_sub_issues)}, closed={len(sub_issues) - len(open_sub_issues)}"
+                    )
+
+                    if len(sub_issues) > 0:
+                        # Log first few sub-issues for debugging
+                        sample_size = min(3, len(sub_issues))
+                        for i in range(sample_size):
+                            si = sub_issues[i]
+                            logger.debug(
+                                f"  Sub-issue #{si.get('number')}: state={si.get('state')}, "
+                                f"title={si.get('title', 'N/A')[:50]}"
+                            )
+                        if len(sub_issues) > sample_size:
+                            logger.debug(f"  ... and {len(sub_issues) - sample_size} more sub-issues")
+
                     if open_sub_issues:
                         logger.info(
+                            f"🔍 _advance_parent_for_pr_review EARLY EXIT (open sub-issues): "
                             f"Parent #{parent_issue_number} has {len(open_sub_issues)} open sub-issues. "
                             f"Skipping auto-advance to 'In Review' until all sub-issues are complete."
                         )
@@ -2802,6 +2845,11 @@ class ProjectMonitor:
                 from services.pipeline_progression import PipelineProgression
                 task_queue = self.task_queue
 
+                logger.info(
+                    f"🔍 _advance_parent_for_pr_review: All checks passed, moving parent #{parent_issue_number} "
+                    f"from 'In Development' to 'In Review' (trigger=all_subtasks_completed)"
+                )
+
                 progression = PipelineProgression(task_queue)
                 success = progression.move_issue_to_column(
                     project_name, planning_board_name, parent_issue_number,
@@ -2809,11 +2857,14 @@ class ProjectMonitor:
                 )
                 if success:
                     logger.info(
-                        f"Moved parent #{parent_issue_number} from 'In Development' to 'In Review' "
+                        f"✅ Successfully moved parent #{parent_issue_number} from 'In Development' to 'In Review' "
                         f"on Planning board"
                     )
                 else:
-                    logger.error(f"Failed to move parent #{parent_issue_number} to 'In Review'")
+                    logger.error(
+                        f"❌ Failed to move parent #{parent_issue_number} to 'In Review' "
+                        f"(move_issue_to_column returned False)"
+                    )
 
             elif current_column == "In Review":
                 # Fallback for edge cases: The PR review agent now moves the parent back

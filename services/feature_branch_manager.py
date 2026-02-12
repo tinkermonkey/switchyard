@@ -406,9 +406,18 @@ class FeatureBranchManager:
             return []
 
         # Query GitHub's structured subIssues field via GraphQL
+        # NOTE: GitHub's GraphQL API may cache responses. If stale data is suspected,
+        # consider adding cache control headers or using conditional requests.
+        # The query timestamp logged below helps debug cache-related issues.
         try:
             from services.github_api_client import get_github_client
             github_client = get_github_client()
+
+            query_start = time.time()
+            logger.debug(
+                f"🔍 Querying GitHub GraphQL for sub-issues of #{parent_number} "
+                f"(query_ts={query_start:.3f})"
+            )
 
             query = '''
             query($owner: String!, $repo: String!, $issueNumber: Int!) {
@@ -436,9 +445,13 @@ class FeatureBranchManager:
             }
 
             success, result = github_client.graphql(query, variables)
+            query_duration = (time.time() - query_start) * 1000  # milliseconds
 
             if not success:
-                logger.error(f"GraphQL query failed for issue #{parent_number} sub-issues: {result}")
+                logger.error(
+                    f"GraphQL query failed for issue #{parent_number} sub-issues "
+                    f"(duration={query_duration:.0f}ms): {result}"
+                )
                 return []
 
             # Extract sub-issues from response
@@ -450,8 +463,8 @@ class FeatureBranchManager:
 
             if sub_issues:
                 logger.info(
-                    f"Found {len(sub_issues)} sub-issues for parent #{parent_number} "
-                    f"(total: {total_count}) via GitHub structured API"
+                    f"🔍 Found {len(sub_issues)} sub-issues for parent #{parent_number} "
+                    f"(total: {total_count}, duration={query_duration:.0f}ms) via GitHub structured API"
                 )
                 for sub_issue in sub_issues:
                     logger.debug(
@@ -459,7 +472,10 @@ class FeatureBranchManager:
                         f"(state: {sub_issue.get('state', 'unknown')})"
                     )
             else:
-                logger.debug(f"Issue #{parent_number} has no sub-issues")
+                logger.info(
+                    f"🔍 Issue #{parent_number} has no sub-issues "
+                    f"(duration={query_duration:.0f}ms, totalCount={total_count})"
+                )
 
             return sub_issues
 

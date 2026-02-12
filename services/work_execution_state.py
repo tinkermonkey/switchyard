@@ -580,9 +580,9 @@ class WorkExecutionStateTracker:
             
             # Check if trigger indicates programmatic change
             trigger = status_change.get('trigger', '')
-            if trigger in ['agent_auto_advance', 'pipeline_progression', 'review_cycle', 
+            if trigger in ['agent_auto_advance', 'pipeline_progression', 'review_cycle',
                           'review_cycle_completion', 'repair_cycle_completion',
-                          'agent_completion', 'auto']:
+                          'agent_completion', 'auto', 'all_subtasks_completed']:
                 # Check if it's recent
                 try:
                     change_time = datetime.fromisoformat(status_change['timestamp'])
