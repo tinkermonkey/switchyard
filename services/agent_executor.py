@@ -101,21 +101,18 @@ class AgentExecutor:
         self.obs.emit_task_received(agent_name, task_id, project_name, task_context,
                                     execution_type=execution_type)
 
-        # Extract pipeline_run_id from task_context for stream callback
+        # Extract pipeline_run_id from task_context for event tracking
         pipeline_run_id = task_context.get('pipeline_run_id')
         logger.info(f"[DIAGNOSTIC] Extracted pipeline_run_id from task_context: {pipeline_run_id} (type: {type(pipeline_run_id)})")
         logger.info(f"[DIAGNOSTIC] Full task_context keys: {list(task_context.keys())}")
 
-        # Create stream callback for live Claude Code output
-        stream_callback = self._create_stream_callback(agent_name, task_id, project_name, pipeline_run_id)
-
         # Build execution context with ALL required fields
+        # NOTE: Stream callback removed - docker-claude-wrapper.py handles all Claude log streaming
         execution_context = self._build_execution_context(
             agent_name=agent_name,
             project_name=project_name,
             task_id=task_id,
-            task_context=task_context,
-            stream_callback=stream_callback
+            task_context=task_context
         )
 
         # Create agent instance
@@ -706,48 +703,12 @@ class AgentExecutor:
 
             raise
 
-    def _create_stream_callback(self, agent_name: str, task_id: str, project_name: str, pipeline_run_id: str = None):
-        """Create callback for streaming Claude Code output to Redis"""
-        def stream_callback(event):
-            """Publish Claude stream events to Redis for websocket forwarding and history"""
-            try:
-                if self.obs and self.obs.enabled:
-                    event_data = {
-                        'agent': agent_name,
-                        'task_id': task_id,
-                        'project': project_name,
-                        'pipeline_run_id': pipeline_run_id,
-                        'timestamp': event.get('timestamp') or time.time(),
-                        'event': event
-                    }
-                    event_json = json.dumps(event_data)
-
-                    # Publish to pub/sub for real-time delivery
-                    self.obs.redis.publish('orchestrator:claude_stream', event_json)
-
-                    # Also add to Redis Stream for history (with automatic trimming)
-                    claude_stream_key = "orchestrator:claude_logs_stream"
-                    self.obs.redis.xadd(
-                        claude_stream_key,
-                        {'log': event_json},
-                        maxlen=500,
-                        approximate=True
-                    )
-
-                    # Set 2-hour TTL on the stream
-                    self.obs.redis.expire(claude_stream_key, 7200)
-            except Exception as e:
-                logger.error(f"Error publishing stream event: {e}")
-
-        return stream_callback
-
     def _build_execution_context(
         self,
         agent_name: str,
         project_name: str,
         task_id: str,
-        task_context: Dict[str, Any],
-        stream_callback
+        task_context: Dict[str, Any]
     ) -> Dict[str, Any]:
         """Build standardized execution context for agent"""
         from state_management.manager import StateManager
@@ -760,6 +721,7 @@ class AgentExecutor:
         project_dir = workspace_manager.get_project_dir(project_name)
 
         # Build context with ALL required fields for agents
+        # NOTE: stream_callback removed - docker-claude-wrapper.py handles all Claude log streaming
         context = {
             'pipeline_id': f"pipeline_{task_id}_{utc_now().timestamp()}",
             'task_id': task_id,
@@ -773,7 +735,6 @@ class AgentExecutor:
             'validation': {},
             'state_manager': state_manager,
             'observability': self.obs,  # REQUIRED: Observability manager
-            'stream_callback': stream_callback,  # REQUIRED: Live Claude logs
             'use_docker': task_context.get('use_docker', True)
         }
 
