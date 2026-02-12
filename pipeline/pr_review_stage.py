@@ -123,12 +123,8 @@ class PRReviewStage(PipelineStage):
 
         logger.info(f"PR Review Stage executing for parent issue #{parent_issue_number} in {project_name}")
 
-        # Record execution start for state tracking
-        if issue_number and 'column' in task_context:
-            from services.work_execution_state import work_execution_tracker
-            work_execution_tracker.record_execution_start(
-                project_name, issue_number, task_context['column'], "pr_review_stage"
-            )
+        # NOTE: record_execution_start is the caller's responsibility
+        # (e.g. _start_pr_review_for_issue), matching the repair cycle pattern.
 
         try:
             # Check review cycle count

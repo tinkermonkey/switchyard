@@ -2230,6 +2230,16 @@ class ProjectMonitor:
                         workflow_template, column, current_stage_config
                     )
 
+                # Check if this is a pr_review stage and handle it specially
+                # PRReviewStage runs in-process (not Docker), launched in a background thread
+                if current_stage_config and getattr(current_stage_config, 'stage_type', None) == 'pr_review':
+                    logger.info(f"Detected pr_review stage for issue #{issue_number} in {status}")
+                    return self._start_pr_review_for_issue(
+                        project_name, board_name, issue_number, status,
+                        repository, project_config, pipeline_config,
+                        workflow_template, column, current_stage_config
+                    )
+
                 # Fetch context from previous workflow stage (workspace-aware)
                 previous_stage_context = self.get_previous_stage_context(
                     repository, issue_number, project_config.github['org'],
@@ -2835,7 +2845,7 @@ class ProjectMonitor:
                     )
                     return
 
-                # Directly enqueue a task for pr_review_agent
+                # Re-trigger PR review via PRReviewStage (runs in-process)
                 logger.info(
                     f"Re-triggering PR review for #{parent_issue_number} "
                     f"(cycle {review_count + 1}/{MAX_REVIEW_CYCLES})"
@@ -2843,62 +2853,59 @@ class ProjectMonitor:
 
                 repo = f"{project_config.github['org']}/{project_config.github['repo']}"
 
-                # Get issue data
-                from services.github_integration import GitHubIntegration
-                github = GitHubIntegration(
-                    repo_owner=project_config.github['org'],
-                    repo_name=project_config.github['repo']
+                # Look up pipeline config and stage config for the planning board
+                pipeline_config = None
+                for pipeline in project_config.pipelines:
+                    if pipeline.board_name == planning_board_name:
+                        pipeline_config = pipeline
+                        break
+
+                if not pipeline_config:
+                    logger.error(
+                        f"No pipeline config found for board '{planning_board_name}', "
+                        f"cannot re-trigger PR review for #{parent_issue_number}"
+                    )
+                    return
+
+                workflow_template = self.config_manager.get_workflow_template(pipeline_config.workflow)
+                pipeline_template = self.config_manager.get_pipeline_template(pipeline_config.template)
+
+                # Find the "In Review" column from the workflow template
+                in_review_column = None
+                if workflow_template and hasattr(workflow_template, 'columns'):
+                    for col in workflow_template.columns:
+                        if col.name == 'In Review':
+                            in_review_column = col
+                            break
+
+                # Find the pr_review stage config from the pipeline template
+                stage_config = None
+                if pipeline_template and hasattr(pipeline_template, 'stages'):
+                    for stage in pipeline_template.stages:
+                        if getattr(stage, 'stage_type', None) == 'pr_review':
+                            stage_config = stage
+                            break
+
+                if not stage_config:
+                    logger.error(
+                        f"No pr_review stage config found in pipeline '{pipeline_config.template}', "
+                        f"cannot re-trigger PR review for #{parent_issue_number}"
+                    )
+                    return
+
+                result = self._start_pr_review_for_issue(
+                    project_name, planning_board_name, parent_issue_number,
+                    'In Review', repo, project_config, pipeline_config,
+                    workflow_template, in_review_column, stage_config
                 )
-                issue_data = await github.get_issue(parent_issue_number)
-
-                task_context = {
-                    'project': project_name,
-                    'board': planning_board_name,
-                    'repository': repo,
-                    'issue_number': parent_issue_number,
-                    'issue': issue_data or {},
-                    'column': 'In Review',
-                    'trigger': 'project_monitor',
-                    'trigger_source': 'pipeline_progression',
-                    'workspace_type': 'discussions',
-                    'timestamp': utc_isoformat()
-                }
-
-                from task_queue.task_manager import Task, TaskPriority
-                import time
-
-                task = Task(
-                    id=str(uuid.uuid4()),
-                    agent="pr_review_agent",
-                    project=project_name,
-                    priority=TaskPriority.MEDIUM,
-                    context=task_context,
-                    created_at=utc_isoformat()
-                )
-
-                from services.work_execution_state import work_execution_tracker
-                work_execution_tracker.record_execution_start(
-                    issue_number=parent_issue_number,
-                    column='In Review',
-                    agent='pr_review_agent',
-                    trigger_source='re_review',
-                    project_name=project_name
-                )
-
-                self.decision_events.emit_task_queued(
-                    agent='pr_review_agent',
-                    project=project_name,
-                    issue_number=parent_issue_number,
-                    board=planning_board_name,
-                    priority='MEDIUM',
-                    reason=f"Re-triggering PR review for #{parent_issue_number} after sub-issues completed (cycle {review_count + 1})",
-                    pipeline_run_id=None
-                )
-
-                self.task_queue.enqueue(task)
-                logger.info(
-                    f"Enqueued PR review agent for #{parent_issue_number} (re-review cycle)"
-                )
+                if result:
+                    logger.info(
+                        f"Started PR review stage for #{parent_issue_number} (re-review cycle)"
+                    )
+                else:
+                    logger.error(
+                        f"Failed to start PR review stage for #{parent_issue_number} (re-review cycle)"
+                    )
 
             else:
                 logger.debug(
@@ -4350,6 +4357,188 @@ The automated test-fix-validate cycle has failed and requires manual interventio
         thread = threading.Thread(target=monitor_thread, daemon=True)
         thread.start()
         logger.info(f"Container monitor thread started for {container_name}")
+
+    def _start_pr_review_for_issue(
+        self,
+        project_name: str,
+        board_name: str,
+        issue_number: int,
+        status: str,
+        repository: str,
+        project_config,
+        pipeline_config,
+        workflow_template,
+        column,
+        stage_config
+    ) -> Optional[str]:
+        """Start PR review stage for an issue in a background thread.
+
+        PRReviewStage runs in-process (not Docker), so we launch it in a
+        background thread with its own asyncio event loop.
+        """
+        try:
+            import asyncio
+            import threading
+            from pipeline.pr_review_stage import PRReviewStage
+            from services.work_execution_state import work_execution_tracker
+
+            # Check for duplicate execution
+            if work_execution_tracker.has_active_execution(project_name, issue_number):
+                logger.warning(
+                    f"Active execution already exists for {project_name}/#{issue_number}. "
+                    f"Skipping duplicate PR review launch."
+                )
+                return stage_config.stage
+
+            # Get issue details
+            issue_data = self.get_issue_details(repository, issue_number, project_config.github['org'])
+
+            # Get workspace info
+            workspace_type = pipeline_config.workspace
+            from config.state_manager import state_manager
+            discussion_id = None
+            if workspace_type in ['discussions', 'hybrid']:
+                discussion_id = state_manager.get_discussion_for_issue(project_name, issue_number)
+
+            # Get or create pipeline run
+            pipeline_run = self.pipeline_run_manager.get_or_create_pipeline_run(
+                issue_number=issue_number,
+                issue_title=issue_data.get('title', f'Issue #{issue_number}'),
+                issue_url=issue_data.get('url', ''),
+                project=project_name,
+                board=board_name,
+                discussion_id=discussion_id
+            )
+            logger.debug(f"Using pipeline run {pipeline_run.id} for PR review on issue #{issue_number}")
+
+            task_id = f"pr_review_{issue_number}_{pipeline_run.id}"
+
+            # Record execution start BEFORE launching background thread
+            work_execution_tracker.record_execution_start(
+                issue_number=issue_number,
+                column=status,
+                agent='pr_review_stage',
+                trigger_source='manual',
+                project_name=project_name
+            )
+
+            # Emit decision events
+            self.decision_events.emit_agent_routing_decision(
+                issue_number=issue_number,
+                project=project_name,
+                board=board_name,
+                current_status=status,
+                selected_agent='pr_review_stage',
+                reason=f"PR review stage routed for issue #{issue_number} in status '{status}'",
+                workspace_type=workspace_type,
+                pipeline_run_id=pipeline_run.id
+            )
+
+            self.decision_events.emit_task_queued(
+                agent='pr_review_stage',
+                project=project_name,
+                issue_number=issue_number,
+                board=board_name,
+                priority='MEDIUM',
+                reason=f"PR review stage for issue #{issue_number} in status '{status}'",
+                pipeline_run_id=pipeline_run.id
+            )
+
+            # Build stage context matching PRReviewStage.execute() expectations
+            from monitoring.observability import get_observability_manager
+            obs = get_observability_manager()
+
+            stage_context = {
+                'context': {
+                    'project': project_name,
+                    'board': board_name,
+                    'repository': repository,
+                    'issue_number': issue_number,
+                    'issue': issue_data,
+                    'column': status,
+                    'trigger_source': 'manual',
+                    'workspace_type': workspace_type,
+                    'pipeline_run_id': pipeline_run.id,
+                },
+                'observability': obs,
+                'task_id': task_id,
+                'pipeline_run_id': pipeline_run.id,
+            }
+
+            if discussion_id:
+                stage_context['context']['discussion_id'] = discussion_id
+
+            logger.info(
+                f"Starting PR review stage for issue #{issue_number} in background thread "
+                f"(pipeline run: {pipeline_run.id})"
+            )
+
+            # Launch in background thread with its own event loop
+            def run_pr_review():
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    stage = PRReviewStage(name="pr_review")
+                    loop.run_until_complete(stage.execute(stage_context))
+
+                    # Record success
+                    work_execution_tracker.record_execution_outcome(
+                        issue_number=issue_number,
+                        column=status,
+                        agent='pr_review_stage',
+                        outcome='completed',
+                        project_name=project_name
+                    )
+                    logger.info(f"PR review stage completed for issue #{issue_number}")
+
+                except Exception as e:
+                    logger.error(f"PR review stage failed for issue #{issue_number}: {e}", exc_info=True)
+
+                    # Record failure
+                    work_execution_tracker.record_execution_outcome(
+                        issue_number=issue_number,
+                        column=status,
+                        agent='pr_review_stage',
+                        outcome='failed',
+                        project_name=project_name,
+                        error=str(e)
+                    )
+
+                    # Post failure comment to GitHub
+                    try:
+                        from services.github_integration import GitHubIntegration
+                        github = GitHubIntegration(
+                            repo_owner=project_config.github['org'],
+                            repo_name=project_config.github['repo']
+                        )
+                        error_comment = (
+                            f"## PR Review Failed\n\n"
+                            f"The PR review stage encountered an error:\n\n"
+                            f"```\n{str(e)}\n```\n\n"
+                            f"---\n_PR review stage error - Claude Code Orchestrator_"
+                        )
+                        loop2 = asyncio.new_event_loop()
+                        asyncio.set_event_loop(loop2)
+                        try:
+                            loop2.run_until_complete(
+                                github.post_comment(issue_number, error_comment)
+                            )
+                        finally:
+                            loop2.close()
+                    except Exception as comment_error:
+                        logger.warning(f"Failed to post PR review failure comment: {comment_error}")
+                finally:
+                    loop.close()
+
+            thread = threading.Thread(target=run_pr_review, daemon=True, name=f"pr-review-{issue_number}")
+            thread.start()
+            logger.info(f"PR review background thread started for issue #{issue_number}")
+
+            return stage_config.stage
+
+        except Exception as e:
+            logger.error(f"Error starting PR review for issue #{issue_number}: {e}", exc_info=True)
+            return None
 
     def _start_repair_cycle_for_issue(
         self,
