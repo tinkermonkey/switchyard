@@ -403,6 +403,20 @@ def execute_board_query_cached(owner: str, project_number: int) -> Optional[dict
     return None
 
 
+def invalidate_board_query_cache(owner: str, project_number: int):
+    """
+    Invalidate cached board query to force fresh fetch.
+
+    Used by status validation retry logic to bypass stale cache
+    when GitHub returns invalid/transient status values.
+    """
+    cache_key = (owner, project_number)
+    with _board_query_cache_lock:
+        if cache_key in _board_query_cache:
+            del _board_query_cache[cache_key]
+            logger.debug(f"Invalidated board query cache for {owner}/project#{project_number}")
+
+
 @retry_on_timeout()
 def get_projects_list_for_owner(owner_login: str) -> Optional[list]:
     """

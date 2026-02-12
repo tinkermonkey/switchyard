@@ -1293,6 +1293,30 @@ class DecisionEventEmitter:
             }
         )
 
+    def emit_status_validation_failure(
+        self,
+        project_owner: str,
+        project_number: int,
+        invalid_count: int,
+        invalid_statuses: list,
+        affected_issues: list
+    ):
+        """Emit event when status validation fails after retries."""
+        self.obs.emit(
+            EventType.STATUS_VALIDATION_FAILURE,
+            agent="project_monitor",
+            task_id=f"status_validation_{project_owner}_{project_number}",
+            data={
+                'decision_category': 'status_validation',
+                'project_owner': project_owner,
+                'project_number': project_number,
+                'invalid_count': invalid_count,
+                'invalid_statuses': invalid_statuses,
+                'affected_issues': affected_issues,
+                'attempts': 3
+            }
+        )
+
 
 # Singleton getter for convenience
 _decision_event_emitter: Optional[DecisionEventEmitter] = None

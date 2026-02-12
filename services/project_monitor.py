@@ -420,14 +420,52 @@ class ProjectMonitor:
         self._max_poll_interval = 60
         self._idle_backoff_threshold = 4  # Start backoff after this many idle cycles
 
+    def _get_valid_columns_for_board(self, project_owner: str, project_number: int) -> set:
+        """
+        Get valid column names for a project board by reverse-looking up
+        the project configuration from owner and project number.
+
+        Returns:
+            Set of valid column names, or empty set if workflow not found
+        """
+        from config.state_manager import state_manager
+
+        # Reverse lookup: project_number → project_name, board_name
+        for project_name in self.config_manager.list_visible_projects():
+            project_state = state_manager.load_project_state(project_name)
+            if not project_state:
+                continue
+
+            for board_name, board_state in project_state.boards.items():
+                if board_state.project_number == project_number:
+                    # Found matching board - get workflow columns
+                    project_config = self.config_manager.get_project_config(project_name)
+                    pipeline = next(
+                        (p for p in project_config.pipelines if p.board_name == board_name),
+                        None
+                    )
+                    if pipeline:
+                        workflow = self.config_manager.get_workflow_template(pipeline.workflow)
+                        return {col.name for col in workflow.columns}
+
+        # Fallback: couldn't find workflow
+        logger.warning(
+            f"Could not determine workflow for {project_owner}/project#{project_number}. "
+            f"Status validation will be skipped."
+        )
+        return set()
+
     def get_project_items(self, project_owner: str, project_number: int) -> List[ProjectItem]:
         """Query GitHub Projects v2 API to get current project items.
 
         Uses execute_board_query_cached() for automatic short-TTL caching and deduplication
         with other callers (PipelineQueueManager, force_sync_with_github).
+
+        Validates status values against workflow columns and retries on invalid/transient statuses.
         """
-        from services.github_owner_utils import execute_board_query_cached, get_owner_type
+        from services.github_owner_utils import execute_board_query_cached, invalidate_board_query_cache, get_owner_type
         from services.github_api_client import get_github_client
+        import time
 
         # Check if circuit breaker is already open - if so, don't waste time retrying
         github_client = get_github_client()
@@ -437,49 +475,146 @@ class ProjectMonitor:
                 logger.debug(f"Circuit breaker is open for {time_until:.0f}s, skipping project item query")
             return []
 
-        # Use cached board query (deduplicates with PipelineQueueManager and force_sync)
-        data = execute_board_query_cached(project_owner, project_number)
-        if data is None:
-            logger.warning(f"Board query returned no data for {project_owner}/project#{project_number}")
-            return []
+        # Get valid columns for validation
+        valid_columns = self._get_valid_columns_for_board(project_owner, project_number)
+        if not valid_columns:
+            # Workflow lookup failed - skip validation, return raw items
+            data = execute_board_query_cached(project_owner, project_number)
+            if data is None:
+                logger.warning(f"Board query returned no data for {project_owner}/project#{project_number}")
+                return []
 
-        try:
-            # Get project data from the correct path based on owner type
-            owner_type = get_owner_type(project_owner)
-            if owner_type == 'user':
-                project_data = data['user']['projectV2']
-            else:  # organization
-                project_data = data['organization']['projectV2']
+            try:
+                # Parse without validation (same as before)
+                owner_type = get_owner_type(project_owner)
+                if owner_type == 'user':
+                    project_data = data['user']['projectV2']
+                else:  # organization
+                    project_data = data['organization']['projectV2']
 
-            items = []
-            for node in project_data['items']['nodes']:
-                content = node.get('content')
-                if not content:  # Skip draft items
+                items = []
+                for node in project_data['items']['nodes']:
+                    content = node.get('content')
+                    if not content:  # Skip draft items
+                        continue
+
+                    # Find status field
+                    status = "No Status"
+                    for field_value in node['fieldValues']['nodes']:
+                        if field_value and field_value.get('field', {}).get('name') == 'Status':
+                            status = field_value.get('name', 'No Status')
+                            break
+
+                    item = ProjectItem(
+                        item_id=node['id'],
+                        content_id=content['id'],
+                        issue_number=content['number'],
+                        title=content['title'],
+                        status=status,
+                        repository=content['repository']['name'],
+                        last_updated=content['updatedAt']
+                    )
+                    items.append(item)
+
+                return items
+
+            except (KeyError, TypeError) as e:
+                logger.error(f"Failed to parse board query response for {project_owner}/project#{project_number}: {e}")
+                return []
+
+        # Retry loop for invalid statuses
+        max_retries = 2  # Total 3 attempts
+        for attempt in range(max_retries + 1):
+            data = execute_board_query_cached(project_owner, project_number)
+            if data is None:
+                logger.warning(f"Board query returned no data for {project_owner}/project#{project_number}")
+                return []
+
+            try:
+                # Parse items
+                owner_type = get_owner_type(project_owner)
+                if owner_type == 'user':
+                    project_data = data['user']['projectV2']
+                else:  # organization
+                    project_data = data['organization']['projectV2']
+
+                items = []
+                for node in project_data['items']['nodes']:
+                    content = node.get('content')
+                    if not content:  # Skip draft items
+                        continue
+
+                    # Find status field
+                    status = "No Status"
+                    for field_value in node['fieldValues']['nodes']:
+                        if field_value and field_value.get('field', {}).get('name') == 'Status':
+                            status = field_value.get('name', 'No Status')
+                            break
+
+                    item = ProjectItem(
+                        item_id=node['id'],
+                        content_id=content['id'],
+                        issue_number=content['number'],
+                        title=content['title'],
+                        status=status,
+                        repository=content['repository']['name'],
+                        last_updated=content['updatedAt']
+                    )
+                    items.append(item)
+
+                # Validate statuses
+                invalid_items = [item for item in items if item.status not in valid_columns]
+
+                if not invalid_items:
+                    # All valid - success
+                    if attempt > 0:
+                        logger.info(
+                            f"✅ Status validation recovered: All items now valid for "
+                            f"{project_owner}/project#{project_number} after {attempt+1} attempts"
+                        )
+                    return items
+
+                # Have invalid items
+                if attempt < max_retries:
+                    invalid_statuses = {item.status for item in invalid_items}
+                    delay = 2 ** attempt * 2  # 2s, 4s
+                    logger.warning(
+                        f"⚠️  Status validation retry: {len(invalid_items)} items with invalid status "
+                        f"(attempt {attempt+1}/3): {invalid_statuses}. Retrying in {delay}s..."
+                    )
+
+                    # Invalidate cache and retry
+                    invalidate_board_query_cache(project_owner, project_number)
+                    time.sleep(delay)
                     continue
+                else:
+                    # Final attempt failed - filter and return
+                    invalid_statuses = {item.status for item in invalid_items}
+                    logger.error(
+                        f"❌ Status validation failed: After 3 attempts, {len(invalid_items)} items "
+                        f"still invalid for {project_owner}/project#{project_number}. "
+                        f"Filtering them out. Statuses: {invalid_statuses}. "
+                        f"Issues: {[item.issue_number for item in invalid_items]}"
+                    )
 
-                # Find status field
-                status = "No Status"
-                for field_value in node['fieldValues']['nodes']:
-                    if field_value and field_value.get('field', {}).get('name') == 'Status':
-                        status = field_value.get('name', 'No Status')
-                        break
+                    # Emit observability event
+                    self.decision_events.emit_status_validation_failure(
+                        project_owner=project_owner,
+                        project_number=project_number,
+                        invalid_count=len(invalid_items),
+                        invalid_statuses=list(invalid_statuses),
+                        affected_issues=[item.issue_number for item in invalid_items]
+                    )
 
-                item = ProjectItem(
-                    item_id=node['id'],
-                    content_id=content['id'],
-                    issue_number=content['number'],
-                    title=content['title'],
-                    status=status,
-                    repository=content['repository']['name'],
-                    last_updated=content['updatedAt']
-                )
-                items.append(item)
+                    # Return only valid items
+                    return [item for item in items if item.status in valid_columns]
 
-            return items
+            except (KeyError, TypeError) as e:
+                logger.error(f"Failed to parse board query response for {project_owner}/project#{project_number}: {e}")
+                return []
 
-        except (KeyError, TypeError) as e:
-            logger.error(f"Failed to parse board query response for {project_owner}/project#{project_number}: {e}")
-            return []
+        # Should not reach here, but return empty list as fallback
+        return []
 
     async def get_issue_column_async(self, project_name: str, board_name: str, issue_number: int) -> Optional[str]:
         """
@@ -4960,43 +5095,43 @@ _Repair cycle initiated by Claude Code Orchestrator_
     def _reconcile_active_runs(self):
         """
         Reconcile active pipeline runs with current board state.
-        
+
         If an issue has an active pipeline run but is in an exit column (or a column with no agent),
         we should end the pipeline run.
         """
         logger.info("Reconciling active pipeline runs with board state...")
-        
+
         try:
             for project_name in self.config_manager.list_visible_projects():
                 project_config = self.config_manager.get_project_config(project_name)
-                
+
                 for pipeline in project_config.pipelines:
                     if not pipeline.active:
                         continue
-                        
+
                     board_key = f"{project_name}_{pipeline.board_name}"
                     if board_key not in self.last_state:
                         continue
-                        
+
                     current_items = self.last_state[board_key].values()
                     workflow_template = self.config_manager.get_workflow_template(pipeline.workflow)
-                    
+
                     for item in current_items:
                         # Check if there is an active run
                         pipeline_run = self.pipeline_run_manager.get_active_pipeline_run(
                             project_name, item.issue_number
                         )
-                        
+
                         if pipeline_run:
                             # Check if current column is an exit column or has no agent
                             column_config = next(
                                 (c for c in workflow_template.columns if c.name == item.status),
                                 None
                             )
-                            
+
                             should_end = False
                             reason = ""
-                            
+
                             if not column_config:
                                 should_end = True
                                 reason = f"Column '{item.status}' not found in workflow"
@@ -5008,7 +5143,7 @@ _Repair cycle initiated by Claude Code Orchestrator_
                                  item.status in workflow_template.pipeline_exit_columns:
                                 should_end = True
                                 reason = f"Column '{item.status}' is an exit column"
-                                
+
                             if should_end:
                                 logger.info(
                                     f"Found active run {pipeline_run.id} for issue #{item.issue_number} "

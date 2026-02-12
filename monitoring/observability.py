@@ -97,6 +97,9 @@ class EventType(Enum):
     CLAUDE_API_CALL_COMPLETED = "claude_api_call_completed"
     CLAUDE_API_CALL_FAILED = "claude_api_call_failed"
 
+    # Status validation events
+    STATUS_VALIDATION_FAILURE = "status_validation_failure"
+
     # Container lifecycle events
     CONTAINER_LAUNCH_STARTED = "container_launch_started"
     CONTAINER_LAUNCH_SUCCEEDED = "container_launch_succeeded"
