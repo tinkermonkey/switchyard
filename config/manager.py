@@ -82,7 +82,7 @@ class WorkflowColumn:
     type: Optional[str] = None  # "maker", "review", or None
     maker_agent: Optional[str] = None  # For review columns: which agent to send feedback to
     max_iterations: int = 3  # For review columns: max revision cycles
-    auto_advance_on_approval: bool = True  # For review columns: auto-move on approval
+    auto_advance_on_approval: bool = False  # Must be explicitly enabled per-column
     escalate_on_blocked: bool = True  # For review columns: escalate blocking issues
 
 
@@ -294,7 +294,7 @@ class ConfigManager:
                     type=column_data.get('type'),
                     maker_agent=column_data.get('maker_agent'),
                     max_iterations=column_data.get('max_iterations', 3),
-                    auto_advance_on_approval=column_data.get('auto_advance_on_approval', True),
+                    auto_advance_on_approval=column_data.get('auto_advance_on_approval', False),
                     escalate_on_blocked=column_data.get('escalate_on_blocked', True)
                 ))
 

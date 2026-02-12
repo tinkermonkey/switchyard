@@ -20,7 +20,6 @@ from .senior_software_engineer_agent import SeniorSoftwareEngineerAgent
 from .code_reviewer_agent import CodeReviewerAgent
 from .technical_writer_agent import TechnicalWriterAgent
 from .documentation_editor_agent import DocumentationEditorAgent
-from .pr_review_agent import PRReviewAgent
 from .pr_code_reviewer_agent import PRCodeReviewerAgent
 from .requirements_verifier_agent import RequirementsVerifierAgent
 
@@ -36,7 +35,6 @@ AGENT_REGISTRY = {
     "code_reviewer": CodeReviewerAgent,
     "technical_writer": TechnicalWriterAgent,
     "documentation_editor": DocumentationEditorAgent,
-    "pr_review_agent": PRReviewAgent,
     "pr_code_reviewer": PRCodeReviewerAgent,
     "requirements_verifier": RequirementsVerifierAgent,
 }
@@ -55,7 +53,6 @@ __all__ = [
     "CodeReviewerAgent",
     "TechnicalWriterAgent",
     "DocumentationEditorAgent",
-    "PRReviewAgent",
     "PRCodeReviewerAgent",
     "RequirementsVerifierAgent",
     "AGENT_REGISTRY",

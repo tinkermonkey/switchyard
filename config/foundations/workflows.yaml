@@ -103,6 +103,7 @@ workflow_templates:
       - name: "In Review"
         stage_mapping: "pr_review"
         agent: "pr_review_agent"
+        auto_advance_on_approval: false  # PR review agent handles its own progression
         description: "Automated PR review and requirements verification"
         automation_rules:
           - trigger: "item_moved_to_column"

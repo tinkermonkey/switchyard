@@ -2816,7 +2816,7 @@ class ProjectMonitor:
                     project_name, parent_issue_number
                 )
 
-                from agents.pr_review_agent import MAX_REVIEW_CYCLES
+                from pipeline.pr_review_stage import MAX_REVIEW_CYCLES
                 if review_count >= MAX_REVIEW_CYCLES:
                     logger.info(
                         f"Review cycle limit ({MAX_REVIEW_CYCLES}) reached for #{parent_issue_number}, "

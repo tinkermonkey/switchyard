@@ -479,19 +479,18 @@ class PRReviewStage(PipelineStage):
                     project_name, parent_issue_number, created_issue_numbers
                 )
 
-                if current_cycle < MAX_REVIEW_CYCLES:
-                    if all_created_issues:
-                        await self._move_issues_to_development(
-                            all_created_issues, project_name, github_config
-                        )
-                    self._return_parent_to_development(project_name, parent_issue_number)
-                    manual_progression_made = True
-                else:
-                    if all_created_issues:
-                        summary_comment = self._build_cycle_limit_comment(
-                            current_cycle, all_created_issues
-                        )
-                        self._post_comment_on_issue(repo, parent_issue_number, summary_comment)
+                if all_created_issues:
+                    await self._move_issues_to_development(
+                        all_created_issues, project_name, github_config
+                    )
+                self._return_parent_to_development(project_name, parent_issue_number)
+                manual_progression_made = True
+
+                if current_cycle >= MAX_REVIEW_CYCLES and all_created_issues:
+                    summary_comment = self._build_cycle_limit_comment(
+                        current_cycle, all_created_issues
+                    )
+                    self._post_comment_on_issue(repo, parent_issue_number, summary_comment)
 
             else:
                 # Clean pass - advance to documentation
@@ -562,7 +561,7 @@ class PRReviewStage(PipelineStage):
             raise
 
     # ==================================================================================
-    # HELPER METHODS (copied from pr_review_agent.py)
+    # HELPER METHODS
     # ==================================================================================
 
     def _resolve_parent_issue_number(self, task_context: Dict[str, Any], project_name: str) -> Optional[int]:
@@ -1211,9 +1210,10 @@ If all requirements are met, write "All requirements verified - no gaps found" a
         return (
             f"## PR Review - Cycle {cycle}/{MAX_REVIEW_CYCLES} (Final)\n\n"
             f"This is the final automated review cycle. The following issues were identified "
-            f"but will remain in Backlog for manual triage:\n\n"
+            f"and moved to Development:\n\n"
             f"{issues_list}\n\n"
-            f"Further review and resolution should be handled manually."
+            f"No further automated reviews will be triggered after these are resolved. "
+            f"Manually move the parent issue to 'In Review' to reset the cycle count."
         )
 
     def _post_comment_on_issue(self, repo: str, issue_number: int, comment: str):

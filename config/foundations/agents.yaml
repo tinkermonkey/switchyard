@@ -208,26 +208,6 @@ agents:
       - file_operations
       - git_integration
 
-  pr_review_agent:
-    description: "Automated PR review with requirements verification"
-    model: "claude-opus-4-5-20251101"
-    timeout: 3600  # 60 minutes for up to 5 Claude Code calls
-    retries: 2
-    makes_code_changes: false
-    filesystem_write_allowed: false
-    requires_dev_container: true  # Needs project code access for PR review
-    requires_docker: true
-    capabilities:
-      - code_review
-      - pr_analysis
-      - requirements_verification
-      - issue_creation
-    tools_enabled:
-      - file_operations
-      - git_integration
-    mcp_servers:
-      - context7
-
   pr_code_reviewer:
     description: "PR code quality review using pr-review-toolkit skill"
     model: "claude-opus-4-5-20251101"
