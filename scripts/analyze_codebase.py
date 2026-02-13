@@ -179,6 +179,12 @@ Include:
 
     logger.info("  Running architecture discovery with Claude Code CLI...")
     result = await run_claude_code(prompt, context)
+
+    # Save the returned content to the expected file location
+    summary_file = output_dir / 'ArchitectureSummary.md'
+    summary_file.write_text(result)
+    logger.debug(f"Wrote {len(result)} bytes to {summary_file}")
+
     return result
 
 
@@ -326,6 +332,12 @@ Include:
 
     logger.info("  Running tech stack discovery with Claude Code CLI...")
     result = await run_claude_code(prompt, context)
+
+    # Save the returned content to the expected file location
+    summary_file = output_dir / 'TechStackSummary.md'
+    summary_file.write_text(result)
+    logger.debug(f"Wrote {len(result)} bytes to {summary_file}")
+
     return result
 
 
@@ -450,6 +462,12 @@ Write to:
 
     logger.info("  Running conventions discovery with Claude Code CLI...")
     result = await run_claude_code(prompt, context)
+
+    # Save the returned content to the expected file location
+    summary_file = output_dir / 'PatternsSummary.md'
+    summary_file.write_text(result)
+    logger.debug(f"Wrote {len(result)} bytes to {summary_file}")
+
     return result
 
 
