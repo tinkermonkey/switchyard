@@ -14,14 +14,14 @@ Options:
     --dry-run              Show what would be done without executing
     --auto-approve         Skip interactive strategy approval prompts
     --cleanup              Remove outdated generated artifacts
-    --rebuild-images       Rebuild Docker images after generation
+    --rebuild-images       Rebuild Docker images after generation (requires container)
     -h, --help             Show this help message
 
 Examples:
-    # Generate for all projects
+    # Generate for all projects (can run outside container)
     python scripts/maintain_agent_team.py
 
-    # Generate for specific project
+    # Generate for specific project (can run outside container)
     python scripts/maintain_agent_team.py --project context-studio
 
     # Preview changes without executing
@@ -30,8 +30,8 @@ Examples:
     # Full workflow with auto-approval
     python scripts/maintain_agent_team.py --auto-approve --cleanup
 
-    # Generate and rebuild Docker images
-    python scripts/maintain_agent_team.py --auto-approve --rebuild-images
+    # Generate and rebuild Docker images (MUST run inside orchestrator container)
+    docker-compose exec orchestrator python scripts/maintain_agent_team.py --auto-approve --rebuild-images --project rounds
 """
 
 import argparse
@@ -63,13 +63,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Constants
-CLAUDE_DIR = Path(os.environ.get('ORCHESTRATOR_ROOT', '.')) / '.claude'
-GENERATED_DIR = CLAUDE_DIR / 'generated'
-AGENTS_DIR = CLAUDE_DIR / 'agents'
-SKILLS_DIR = CLAUDE_DIR / 'skills'
-MANIFEST_FILE = GENERATED_DIR / 'manifest.yaml'
-STATE_DIR = Path(os.environ.get('ORCHESTRATOR_ROOT', '.')) / 'state' / 'projects'
+# Constants for orchestrator-level directories (per-project state only)
+ORCHESTRATOR_ROOT = Path(os.environ.get('ORCHESTRATOR_ROOT', '.'))
+STATE_DIR = ORCHESTRATOR_ROOT / 'state' / 'projects'
 
 
 def get_workspace_root() -> Path:
@@ -89,54 +85,26 @@ def get_workspace_root() -> Path:
         return orchestrator_root.parent
 
 
-def ensure_directories():
-    """Ensure required directories exist"""
-    GENERATED_DIR.mkdir(parents=True, exist_ok=True)
-    AGENTS_DIR.mkdir(parents=True, exist_ok=True)
-    SKILLS_DIR.mkdir(parents=True, exist_ok=True)
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    logger.debug(f"Ensured directories: {GENERATED_DIR}, {AGENTS_DIR}, {SKILLS_DIR}, {STATE_DIR}")
-
-
-def load_manifest() -> Dict[str, Any]:
+def get_project_claude_dir(project: str) -> Path:
     """
-    Load the generation manifest
-
-    Returns:
-        Manifest data or empty structure if not exists
-    """
-    if MANIFEST_FILE.exists():
-        try:
-            with open(MANIFEST_FILE, 'r') as f:
-                return yaml.safe_load(f) or {}
-        except Exception as e:
-            logger.warning(f"Failed to load manifest: {e}")
-            return {}
-
-    # Return empty structure
-    return {
-        'version': '1.0',
-        'last_updated': utc_isoformat(),
-        'projects': {}
-    }
-
-
-def save_manifest(manifest: Dict[str, Any]):
-    """
-    Save the generation manifest
+    Get .claude directory for a specific project
 
     Args:
-        manifest: Manifest data to save
-    """
-    manifest['last_updated'] = utc_isoformat()
+        project: Project name
 
-    try:
-        with open(MANIFEST_FILE, 'w') as f:
-            yaml.safe_dump(manifest, f, default_flow_style=False, sort_keys=False)
-        logger.debug(f"Saved manifest to {MANIFEST_FILE}")
-    except Exception as e:
-        logger.error(f"Failed to save manifest: {e}")
-        raise
+    Returns:
+        Path to project's .claude directory
+    """
+    workspace_root = get_workspace_root()
+    project_dir = workspace_root / project
+    return project_dir / '.claude'
+
+
+def ensure_directories():
+    """Ensure required orchestrator-level directories exist"""
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    logger.debug(f"Ensured directory: {STATE_DIR}")
+    # Note: Project-specific .claude directories are created by generate_artifacts.py as needed
 
 
 def load_project_state(project: str) -> Dict[str, Any]:
@@ -339,6 +307,86 @@ def discover_projects_for_generation(project_filter: str = None) -> List[str]:
     return valid_projects
 
 
+def trigger_docker_rebuild(project: str, dry_run: bool = False) -> bool:
+    """
+    Trigger Docker image rebuild for a project by calling rebuild script.
+
+    Note: This requires running inside the orchestrator Docker container
+    because the rebuild script needs access to the Docker socket.
+
+    Args:
+        project: Project name
+        dry_run: If True, show what would be done without executing
+
+    Returns:
+        True if rebuild succeeded, False otherwise
+    """
+    import subprocess
+    import sys
+
+    try:
+        logger.info(f"  Triggering Docker rebuild for {project}...")
+
+        if dry_run:
+            logger.info(f"  [DRY RUN] Would execute: python scripts/rebuild_project_images.py --project {project} --update-state")
+            return True
+
+        # Call rebuild script as subprocess
+        # This properly isolates the Docker-dependent rebuild script
+        rebuild_script = Path(__file__).parent / 'rebuild_project_images.py'
+
+        cmd = [
+            sys.executable,  # Use same Python interpreter
+            str(rebuild_script),
+            '--project', project,
+            '--update-state'  # Update dev container state after successful rebuild
+        ]
+
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=1800  # 30 minute timeout (same as rebuild script)
+        )
+
+        if result.returncode == 0:
+            logger.info(f"  ✓ Docker rebuild completed successfully")
+            # Log last few lines of output for confirmation
+            if result.stdout:
+                output_lines = result.stdout.strip().split('\n')
+                for line in output_lines[-5:]:
+                    if line.strip():
+                        logger.info(f"    {line}")
+            return True
+        else:
+            logger.error(f"  ✗ Docker rebuild failed (exit code {result.returncode})")
+            if result.stderr:
+                error_lines = result.stderr.strip().split('\n')
+                logger.error(f"  Error output:")
+                for line in error_lines[-10:]:
+                    if line.strip():
+                        logger.error(f"    {line}")
+
+            # Check for common error: Docker not available
+            if 'docker' in result.stderr.lower() and ('not found' in result.stderr.lower() or 'permission denied' in result.stderr.lower()):
+                logger.error(
+                    f"\n  Hint: Docker rebuild requires running inside the orchestrator container.\n"
+                    f"  Run: docker-compose exec orchestrator python scripts/maintain_agent_team.py --project {project} --rebuild-images"
+                )
+
+            return False
+
+    except subprocess.TimeoutExpired:
+        logger.error(f"  ✗ Docker rebuild timeout (exceeded 30 minutes)")
+        return False
+    except Exception as e:
+        logger.error(f"  ✗ Failed to trigger Docker rebuild: {e}")
+        logger.error(
+            f"  Hint: Ensure you're running inside the orchestrator container or omit --rebuild-images flag"
+        )
+        return False
+
+
 def run_generation_workflow(project: str, args) -> Dict[str, Any]:
     """
     Main generation workflow for a project
@@ -376,16 +424,22 @@ def run_generation_workflow(project: str, args) -> Dict[str, Any]:
         logger.info("  Phase 5: Generate artifacts")
         logger.info("  Phase 6: Validate artifacts")
         logger.info("  Phase 7: Deploy to .claude/")
-        logger.info("  Phase 8: Update manifest and state")
+        logger.info("  Phase 8: Update state")
+        if args.rebuild_images:
+            logger.info("  Phase 9: Rebuild Docker image (--rebuild-images)")
+        if args.cleanup:
+            logger.info("  Cleanup: Remove outdated artifacts (--cleanup)")
         return {'status': 'dry_run'}
 
     # Phase 2: Analyze codebase
     logger.info("\nPhase 2: Analyzing codebase...")
     from scripts.analyze_codebase import run_codebase_analysis
+    import asyncio
 
     try:
-        analysis = run_codebase_analysis(project, get_workspace_root())
-        logger.info(f"  ✓ Analysis complete ({len(analysis['key_files'])} key files sampled)")
+        # Run async analysis in sync context
+        analysis = asyncio.run(run_codebase_analysis(project, get_workspace_root()))
+        logger.info(f"  ✓ Analysis complete (summaries created)")
     except Exception as e:
         logger.error(f"  ✗ Analysis failed: {e}")
         return {'status': 'error', 'phase': 'analysis', 'error': str(e)}
@@ -452,13 +506,32 @@ def run_generation_workflow(project: str, args) -> Dict[str, Any]:
         logger.info(f"  ✓ All {validation_results['passed']} artifact(s) validated")
 
     # Phase 7: Artifacts deployed (implicit - already written in Phase 5)
-    logger.info("\nPhase 7: Artifacts deployed to .claude/")
+    logger.info(f"\nPhase 7: Artifacts deployed to {project}/.claude/")
 
-    # Phase 8: Update manifest and state
-    logger.info("\nPhase 8: Updating manifest and state...")
-    update_manifest_with_artifacts(project, created_artifacts, strategy)
+    # Phase 8: Update state
+    logger.info("\nPhase 8: Updating state...")
     update_state_with_generation(project, changes, analysis, created_artifacts)
-    logger.info("  ✓ Manifest and state updated")
+    logger.info("  ✓ State updated")
+
+    # Phase 9: Rebuild Docker images (if --rebuild-images flag and Dockerfile.agent exists)
+    rebuild_triggered = False
+    if args.rebuild_images:
+        workspace_root = get_workspace_root()
+        dockerfile_path = workspace_root / project / 'Dockerfile.agent'
+
+        if dockerfile_path.exists():
+            logger.info(f"\nPhase 9: Rebuilding Docker image for {project}...")
+            # Note: dry_run is always False here (early return at line 428 if True)
+            # But pass it anyway as defense-in-depth
+            rebuild_success = trigger_docker_rebuild(project, dry_run=False)
+
+            if rebuild_success:
+                logger.info(f"  ✓ Docker image rebuild completed")
+                rebuild_triggered = True
+            else:
+                logger.warning(f"  ⚠ Docker image rebuild failed (see logs above)")
+        else:
+            logger.info(f"\nPhase 9: Skipping Docker rebuild (no Dockerfile.agent for {project})")
 
     # Cleanup phase (if --cleanup flag)
     if args.cleanup:
@@ -473,51 +546,18 @@ def run_generation_workflow(project: str, args) -> Dict[str, Any]:
     logger.info(f"  Agents: {len(created_artifacts['agents'])}")
     logger.info(f"  Skills: {len(created_artifacts['skills'])}")
     logger.info(f"  Validation: {validation_results['passed']}/{validation_results['total']} passed")
+    if args.rebuild_images:
+        if rebuild_triggered:
+            logger.info(f"  Docker Rebuild: ✓ Success")
+        else:
+            logger.info(f"  Docker Rebuild: Skipped (no Dockerfile.agent)")
 
     return {
         'status': 'completed',
         'artifacts': created_artifacts,
-        'validation': validation_results
+        'validation': validation_results,
+        'rebuild_triggered': rebuild_triggered if args.rebuild_images else None
     }
-
-
-def update_manifest_with_artifacts(project: str, artifacts: Dict, strategy: Dict):
-    """
-    Update manifest with newly created artifacts
-
-    Args:
-        project: Project name
-        artifacts: Created artifacts dict
-        strategy: Generation strategy
-    """
-    manifest = load_manifest()
-
-    if 'projects' not in manifest:
-        manifest['projects'] = {}
-
-    manifest['projects'][project] = {
-        'last_generation': utc_isoformat(),
-        'generation_hash': calculate_codebase_hash(project),
-        'agents': [
-            {
-                'name': a.stem,
-                'file': f'agents/{a.name}',
-                'purpose': next((ag['purpose'] for ag in strategy['agents'] if ag['name'] == a.stem), '')
-            }
-            for a in artifacts['agents']
-        ],
-        'skills': [
-            {
-                'name': s.name,
-                'directory': f'skills/{s.name}/',
-                'purpose': next((sk['purpose'] for sk in strategy['skills'] if sk['name'] == s.name), '')
-            }
-            for s in artifacts['skills']
-        ]
-    }
-
-    save_manifest(manifest)
-    logger.debug(f"  Updated manifest for {project}")
 
 
 def update_state_with_generation(project: str, changes: Dict, analysis: Dict, artifacts: Dict):
@@ -587,9 +627,6 @@ def generate_for_projects(args):
     if args.dry_run:
         logger.info("\n[DRY RUN MODE] No changes will be made\n")
 
-    # Load manifest
-    manifest = load_manifest()
-
     # Process each project
     results = {}
     for project in projects:
@@ -630,10 +667,10 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Generate for all projects
+  # Generate for all projects (can run outside container)
   python scripts/maintain_agent_team.py
 
-  # Generate for specific project
+  # Generate for specific project (can run outside container)
   python scripts/maintain_agent_team.py --project context-studio
 
   # Preview changes without executing
@@ -642,8 +679,8 @@ Examples:
   # Full workflow with auto-approval
   python scripts/maintain_agent_team.py --auto-approve --cleanup
 
-  # Generate and rebuild Docker images
-  python scripts/maintain_agent_team.py --auto-approve --rebuild-images
+  # Generate and rebuild Docker images (MUST run inside orchestrator container)
+  docker-compose exec orchestrator python scripts/maintain_agent_team.py --auto-approve --rebuild-images --project rounds
         """
     )
 
@@ -674,7 +711,7 @@ Examples:
     parser.add_argument(
         '--rebuild-images',
         action='store_true',
-        help='Rebuild Docker images after generation (requires orchestrator running)'
+        help='Rebuild Docker images after generation (requires orchestrator container: docker-compose exec orchestrator ...)'
     )
 
     args = parser.parse_args()

@@ -67,7 +67,7 @@ async def generate_strategy_with_llm(
 
     Args:
         project: Project name
-        analysis: Codebase analysis results
+        analysis: Codebase analysis results (with summary markdown content)
         config: Project configuration
 
     Returns:
@@ -75,42 +75,40 @@ async def generate_strategy_with_llm(
     """
     logger.info(f"Generating strategy for {project} using Claude Code CLI...")
 
-    # Extract key info from analysis with safe defaults
-    try:
-        languages = analysis.get('tech_stacks', {}).get('languages', [])
-        frameworks = analysis.get('tech_stacks', {}).get('frameworks', [])
-        test_framework = analysis.get('testing', {}).get('test_framework', 'unknown')
-        has_tests = analysis.get('testing', {}).get('test_count', 0) > 0
-        has_docker = analysis.get('deployment', {}).get('docker', False)
-        has_ci_cd = analysis.get('deployment', {}).get('ci_cd', 'none') != 'none'
-        detected_layers = analysis.get('structure', {}).get('detected_layers', [])
-    except Exception as e:
-        logger.error(f"Failed to extract data from analysis dict: {e}")
-        logger.error(f"Analysis dict keys: {list(analysis.keys())}")
-        raise ValueError(f"Malformed analysis dict - missing expected structure: {e}")
+    # Extract summaries from analysis
+    arch_summary = analysis.get('architecture_summary', 'No architecture summary available')
+    tech_summary = analysis.get('techstack_summary', 'No tech stack summary available')
+    patterns_summary = analysis.get('patterns_summary', 'No patterns summary available')
+
+    # Truncate summaries if too long (keep first 3000 chars each)
+    max_chars = 3000
+    if len(arch_summary) > max_chars:
+        arch_summary = arch_summary[:max_chars] + "\n\n[... truncated for length ...]"
+    if len(tech_summary) > max_chars:
+        tech_summary = tech_summary[:max_chars] + "\n\n[... truncated for length ...]"
+    if len(patterns_summary) > max_chars:
+        patterns_summary = patterns_summary[:max_chars] + "\n\n[... truncated for length ...]"
 
     # Build prompt
     prompt = f"""You are an expert at designing AI agent teams for software projects.
 
-Given this codebase analysis for the **{project}** project:
+You have completed comprehensive analysis of the **{project}** codebase. Review these summaries:
 
-**Technology Stack:**
-- Languages: {', '.join(languages)}
-- Frameworks: {', '.join(frameworks) if frameworks else 'None detected'}
-- Test framework: {test_framework}
-- Has tests: {has_tests}
-- Docker: {has_docker}
-- CI/CD: {has_ci_cd}
+## Architecture Summary
 
-**Architecture:**
-- Detected layers: {', '.join(detected_layers) if detected_layers else 'None detected'}
-- Total files: {analysis.get('structure', {}).get('total_files', 0)}
-- Total directories: {analysis.get('structure', {}).get('total_dirs', 0)}
+{arch_summary}
 
-**Dependencies:**
-- Critical dependencies: {', '.join(analysis.get('dependencies', {}).get('critical', [])[:10]) if analysis.get('dependencies', {}).get('critical') else 'None'}
+## Tech Stack Summary
 
-Design an optimal team of project-specific agents and skills for this codebase.
+{tech_summary}
+
+## Patterns & Conventions Summary
+
+{patterns_summary}
+
+## Your Mission
+
+Design an optimal team of project-specific agents and skills for this codebase based on the summaries above.
 
 **Required Agents** (always create these 3):
 1. **{project}-architect**: Expert in this codebase's architecture, can explain how components work together

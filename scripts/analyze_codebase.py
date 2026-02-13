@@ -1,585 +1,514 @@
 #!/usr/bin/env python3
 """
-Codebase Analyzer
+Codebase Analyzer - Prompt-Driven Edition
 
-Fast, deterministic analysis of project structure without LLM calls.
-Analyzes directory structure, tech stacks, dependencies, and samples key files.
+Uses Claude Code CLI to perform intelligent analysis instead of deterministic patterns.
+Orchestrates three discovery prompts to deeply understand the codebase.
 """
 
 import json
 import logging
 import os
-import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional
 
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+# Import Claude Code integration
+from claude.claude_integration import run_claude_code
+from monitoring.timestamp_utils import utc_isoformat
+
 # Configure logging
 logger = logging.getLogger(__name__)
 
-# Priority scoring for file sampling
-FILE_PRIORITY_PATTERNS = {
-    # Priority 100: Base classes, interfaces, __init__.py
-    r'(base|abstract|interface)[_\-].*\.(py|ts|js|go|rs)$': 100,
-    r'__init__\.py$': 100,
-    r'index\.(ts|js)$': 100,
 
-    # Priority 80: Entry points
-    r'(main|app|server|index)\.(py|ts|js|go|rs)$': 80,
-    r'(routes|router|endpoints?)\.(py|ts|js)$': 80,
-
-    # Priority 70: Type definitions and models
-    r'(models?|types?|schemas?|entities)\.(py|ts|js)$': 70,
-    r'\.d\.ts$': 70,
-
-    # Priority 60: Configuration files
-    r'config\.(py|ts|js|yaml|yml|toml)$': 60,
-    r'settings\.(py|ts|js)$': 60,
-
-    # Priority 50: Core business logic
-    r'(service|handler|controller|manager)\.(py|ts|js|go|rs)$': 50,
-
-    # Priority 40: Utilities and helpers
-    r'(util|helper|common)\.(py|ts|js|go|rs)$': 40,
-
-    # Priority 30: Tests
-    r'test_.*\.py$': 30,
-    r'.*\.test\.(ts|js)$': 30,
-    r'.*\.spec\.(ts|js)$': 30,
-}
-
-
-def calculate_file_priority(file_path: Path) -> int:
+def get_workspace_root() -> Path:
     """
-    Calculate priority score for a file based on patterns
-
-    Args:
-        file_path: Path to file
+    Get the workspace root directory
 
     Returns:
-        Priority score (higher = more important)
+        Path to workspace root (/workspace in container, parent of orchestrator root outside)
     """
-    file_name = file_path.name.lower()
-
-    for pattern, priority in FILE_PRIORITY_PATTERNS.items():
-        if re.search(pattern, file_name):
-            return priority
-
-    # Default priority based on file type
-    if file_path.suffix in ['.py', '.ts', '.js', '.go', '.rs']:
-        return 20
-
-    return 10
+    if Path('/workspace').exists() and Path('/workspace').is_dir():
+        return Path('/workspace')
+    else:
+        orchestrator_root = Path(os.environ.get('ORCHESTRATOR_ROOT', Path(__file__).parent.parent))
+        return orchestrator_root.parent
 
 
-def analyze_directory_structure(project_dir: Path, max_depth: int = 3) -> Dict[str, Any]:
+async def run_architecture_discovery(project: str, workspace_root: Path) -> str:
     """
-    Analyze directory structure (top N levels)
-
-    Args:
-        project_dir: Project directory path
-        max_depth: Maximum depth to analyze
-
-    Returns:
-        Directory structure analysis
-    """
-    total_files = 0
-    total_dirs = 0
-    structure = {}
-    detected_layers = []
-    test_directories = []
-
-    # Common architectural layer indicators
-    layer_indicators = [
-        'api', 'apis', 'routes', 'endpoints',
-        'services', 'service',
-        'models', 'model', 'entities',
-        'controllers', 'handlers',
-        'middleware',
-        'utils', 'utilities', 'helpers',
-        'config', 'configuration',
-        'core', 'common',
-        'database', 'db',
-        'schemas', 'types',
-    ]
-
-    # Test directory indicators
-    test_indicators = ['test', 'tests', '__tests__', 'spec', 'specs']
-
-    def scan_dir(path: Path, depth: int = 0):
-        nonlocal total_files, total_dirs
-
-        if depth > max_depth:
-            return None
-
-        result = {'name': path.name, 'children': []}
-
-        try:
-            for item in sorted(path.iterdir()):
-                # Skip hidden directories and common ignores
-                if item.name.startswith('.') or item.name in ['node_modules', '__pycache__', 'venv', 'dist', 'build']:
-                    continue
-
-                if item.is_dir():
-                    total_dirs += 1
-
-                    # Check for architectural layers
-                    if depth <= 1 and item.name.lower() in layer_indicators:
-                        detected_layers.append(f"{item.name}/")
-
-                    # Check for test directories
-                    if any(ind in item.name.lower() for ind in test_indicators):
-                        test_directories.append(str(item.relative_to(project_dir)))
-
-                    child = scan_dir(item, depth + 1)
-                    if child:
-                        result['children'].append(child)
-                elif item.is_file():
-                    total_files += 1
-        except PermissionError:
-            logger.warning(f"Permission denied: {path}")
-
-        return result
-
-    structure = scan_dir(project_dir)
-
-    return {
-        'total_files': total_files,
-        'total_dirs': total_dirs,
-        'structure': structure,
-        'detected_layers': detected_layers,
-        'test_directories': test_directories,
-    }
-
-
-def detect_tech_stacks(project_dir: Path) -> Dict[str, Any]:
-    """
-    Detect tech stacks from dependency files
-
-    Args:
-        project_dir: Project directory path
-
-    Returns:
-        Tech stack detection results
-    """
-    languages = []
-    frameworks = []
-    primary_language = None
-
-    # Python detection
-    if (project_dir / 'requirements.txt').exists() or (project_dir / 'pyproject.toml').exists():
-        languages.append('python')
-        primary_language = primary_language or 'python'
-
-        # Detect Python frameworks
-        python_frameworks = detect_python_frameworks(project_dir)
-        frameworks.extend(python_frameworks)
-
-    # Node.js detection
-    if (project_dir / 'package.json').exists():
-        languages.append('javascript')
-        primary_language = primary_language or 'javascript'
-
-        # Detect Node.js frameworks
-        node_frameworks = detect_node_frameworks(project_dir)
-        frameworks.extend(node_frameworks)
-
-    # Rust detection
-    if (project_dir / 'Cargo.toml').exists():
-        languages.append('rust')
-        primary_language = primary_language or 'rust'
-
-    # Go detection
-    if (project_dir / 'go.mod').exists():
-        languages.append('go')
-        primary_language = primary_language or 'go'
-
-    return {
-        'languages': languages,
-        'frameworks': frameworks,
-        'primary_language': primary_language or 'unknown',
-    }
-
-
-def detect_python_frameworks(project_dir: Path) -> List[str]:
-    """Detect Python frameworks from requirements"""
-    frameworks = []
-
-    requirements_file = project_dir / 'requirements.txt'
-    pyproject_file = project_dir / 'pyproject.toml'
-
-    framework_indicators = {
-        'fastapi': ['fastapi'],
-        'django': ['django'],
-        'flask': ['flask'],
-        'pytest': ['pytest'],
-        'pydantic': ['pydantic'],
-    }
-
-    content = ""
-
-    if requirements_file.exists():
-        try:
-            with open(requirements_file, 'r') as f:
-                content += f.read().lower()
-        except Exception as e:
-            logger.warning(f"Failed to read requirements.txt: {e}")
-
-    if pyproject_file.exists():
-        try:
-            with open(pyproject_file, 'r') as f:
-                content += f.read().lower()
-        except Exception as e:
-            logger.warning(f"Failed to read pyproject.toml: {e}")
-
-    for framework, indicators in framework_indicators.items():
-        if any(ind in content for ind in indicators):
-            frameworks.append(framework)
-
-    return frameworks
-
-
-def detect_node_frameworks(project_dir: Path) -> List[str]:
-    """Detect Node.js frameworks from package.json"""
-    frameworks = []
-
-    package_json = project_dir / 'package.json'
-
-    if not package_json.exists():
-        return frameworks
-
-    try:
-        with open(package_json, 'r') as f:
-            import json
-            data = json.load(f)
-
-        deps = {}
-        deps.update(data.get('dependencies', {}))
-        deps.update(data.get('devDependencies', {}))
-
-        framework_indicators = {
-            'react': ['react'],
-            'vue': ['vue'],
-            'angular': ['@angular/core'],
-            'express': ['express'],
-            'next.js': ['next'],
-            'nest.js': ['@nestjs/core'],
-        }
-
-        for framework, indicators in framework_indicators.items():
-            if any(ind in deps for ind in indicators):
-                frameworks.append(framework)
-
-    except Exception as e:
-        logger.warning(f"Failed to parse package.json: {e}")
-
-    return frameworks
-
-
-def parse_dependencies(project_dir: Path) -> Dict[str, List[str]]:
-    """
-    Parse dependency files
-
-    Args:
-        project_dir: Project directory path
-
-    Returns:
-        Dependencies by language
-    """
-    dependencies = {}
-
-    # Python dependencies
-    requirements_file = project_dir / 'requirements.txt'
-    if requirements_file.exists():
-        try:
-            with open(requirements_file, 'r') as f:
-                python_deps = [
-                    line.strip() for line in f
-                    if line.strip() and not line.startswith('#')
-                ]
-                dependencies['python'] = python_deps[:50]  # Limit to 50
-        except Exception as e:
-            logger.warning(f"Failed to parse requirements.txt: {e}")
-
-    # Node.js dependencies
-    package_json = project_dir / 'package.json'
-    if package_json.exists():
-        try:
-            with open(package_json, 'r') as f:
-                import json
-                data = json.load(f)
-
-            all_deps = {}
-            all_deps.update(data.get('dependencies', {}))
-            all_deps.update(data.get('devDependencies', {}))
-
-            node_deps = [f"{k}@{v}" for k, v in list(all_deps.items())[:50]]
-            dependencies['node'] = node_deps
-        except Exception as e:
-            logger.warning(f"Failed to parse package.json: {e}")
-
-    return dependencies
-
-
-def identify_critical_dependencies(dependencies: Dict[str, List[str]]) -> List[str]:
-    """
-    Identify critical dependencies (frameworks, not utilities)
-
-    Args:
-        dependencies: Dependencies by language
-
-    Returns:
-        List of critical dependency names
-    """
-    critical = []
-
-    # Framework keywords (priority order)
-    framework_keywords = [
-        'fastapi', 'django', 'flask',
-        'react', 'vue', 'angular', 'next',
-        'express', 'nest',
-        'pytest', 'jest',
-        'postgresql', 'mysql', 'mongodb', 'redis',
-        'elasticsearch', 'kafka',
-        'pydantic', 'sqlalchemy',
-    ]
-
-    for lang, deps in dependencies.items():
-        for dep in deps:
-            dep_lower = dep.split('@')[0].split('==')[0].split('>=')[0].lower()
-
-            for keyword in framework_keywords:
-                if keyword in dep_lower:
-                    critical.append(dep_lower)
-                    break
-
-    return list(set(critical))  # Remove duplicates
-
-
-def analyze_test_structure(project_dir: Path) -> Dict[str, Any]:
-    """
-    Analyze test structure
-
-    Args:
-        project_dir: Project directory path
-
-    Returns:
-        Test structure analysis
-    """
-    test_framework = None
-    test_count = 0
-    test_directories = []
-
-    # Detect test framework
-    if (project_dir / 'pytest.ini').exists() or (project_dir / 'pyproject.toml').exists():
-        # Check for pytest in requirements
-        requirements_file = project_dir / 'requirements.txt'
-        if requirements_file.exists():
-            try:
-                with open(requirements_file, 'r') as f:
-                    if 'pytest' in f.read().lower():
-                        test_framework = 'pytest'
-            except Exception:
-                pass
-
-    if (project_dir / 'jest.config.js').exists() or (project_dir / 'jest.config.ts').exists():
-        test_framework = 'jest'
-
-    # Find test files
-    test_patterns = ['**/test_*.py', '**/*_test.py', '**/*.test.ts', '**/*.test.js', '**/*.spec.ts', '**/*.spec.js']
-
-    for pattern in test_patterns:
-        try:
-            test_files = list(project_dir.glob(pattern))
-            test_count += len(test_files)
-
-            # Collect unique test directories
-            for test_file in test_files:
-                test_dir = str(test_file.parent.relative_to(project_dir))
-                if test_dir not in test_directories:
-                    test_directories.append(test_dir)
-        except Exception as e:
-            logger.warning(f"Failed to glob {pattern}: {e}")
-
-    return {
-        'test_framework': test_framework or 'unknown',
-        'test_count': test_count,
-        'test_directories': test_directories,
-    }
-
-
-def detect_deployment_patterns(project_dir: Path) -> Dict[str, Any]:
-    """
-    Detect deployment configuration
-
-    Args:
-        project_dir: Project directory path
-
-    Returns:
-        Deployment pattern analysis
-    """
-    docker = False
-    ci_cd = None
-    deployment_files = []
-
-    # Docker detection
-    if (project_dir / 'Dockerfile').exists():
-        docker = True
-        deployment_files.append('Dockerfile')
-
-    if (project_dir / 'docker-compose.yml').exists() or (project_dir / 'docker-compose.yaml').exists():
-        docker = True
-        deployment_files.append('docker-compose.yml')
-
-    # CI/CD detection
-    if (project_dir / '.github' / 'workflows').exists():
-        ci_cd = 'github_actions'
-        try:
-            workflow_files = list((project_dir / '.github' / 'workflows').glob('*.yml'))
-            deployment_files.extend([f'.github/workflows/{f.name}' for f in workflow_files])
-        except Exception:
-            pass
-
-    if (project_dir / '.gitlab-ci.yml').exists():
-        ci_cd = 'gitlab_ci'
-        deployment_files.append('.gitlab-ci.yml')
-
-    if (project_dir / 'Makefile').exists():
-        deployment_files.append('Makefile')
-
-    return {
-        'docker': docker,
-        'ci_cd': ci_cd or 'none',
-        'deployment_files': deployment_files,
-    }
-
-
-def sample_key_files(project_dir: Path, max_files: int = 20) -> List[Dict[str, Any]]:
-    """
-    Smart sampling of key files
-
-    Args:
-        project_dir: Project directory path
-        max_files: Maximum number of files to sample
-
-    Returns:
-        List of sampled file info with priority scores
-    """
-    candidates = []
-
-    # Scan for Python, TypeScript, JavaScript, Go, Rust files
-    extensions = ['.py', '.ts', '.js', '.go', '.rs']
-
-    for ext in extensions:
-        try:
-            for file_path in project_dir.rglob(f'*{ext}'):
-                # Skip excluded directories
-                if any(excl in file_path.parts for excl in ['.git', 'node_modules', '__pycache__', 'venv', 'dist', 'build', '.pytest_cache']):
-                    continue
-
-                # Calculate priority
-                priority = calculate_file_priority(file_path)
-
-                try:
-                    size = file_path.stat().st_size
-
-                    # Skip very large files
-                    if size > 100000:  # 100KB
-                        continue
-
-                    candidates.append({
-                        'path': str(file_path.relative_to(project_dir)),
-                        'size': size,
-                        'priority': priority,
-                    })
-                except Exception as e:
-                    logger.warning(f"Failed to stat {file_path}: {e}")
-        except Exception as e:
-            logger.warning(f"Failed to glob {ext}: {e}")
-
-    # Sort by priority (descending), then by size (ascending for same priority)
-    candidates.sort(key=lambda x: (-x['priority'], x['size']))
-
-    # Return top N
-    return candidates[:max_files]
-
-
-def run_codebase_analysis(project: str, workspace_root: Path) -> Dict[str, Any]:
-    """
-    Main analysis orchestrator
+    Use Claude Code CLI to discover and document architecture
 
     Args:
         project: Project name
         workspace_root: Workspace root path
 
     Returns:
-        Complete codebase analysis
+        Result from Claude Code
     """
     project_dir = workspace_root / project
+    output_dir = project_dir / '.claude' / 'clauditoreum'
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    if not project_dir.exists():
-        raise FileNotFoundError(f"Project directory not found: {project_dir}")
+    prompt = f"""# Codebase Architecture Discovery
 
-    logger.info(f"Analyzing codebase: {project}")
+You are analyzing the **{project}** project to understand its architecture.
 
-    # Phase 1: Discovery
-    logger.info("  Phase 1: Analyzing directory structure...")
-    structure = analyze_directory_structure(project_dir)
-    logger.info(f"    Found {structure['total_files']} files, {structure['total_dirs']} directories")
+## Your Mission
 
-    logger.info("  Phase 2: Detecting tech stacks...")
-    tech_stacks = detect_tech_stacks(project_dir)
-    logger.info(f"    Primary language: {tech_stacks['primary_language']}")
-    logger.info(f"    Frameworks: {', '.join(tech_stacks['frameworks']) or 'None detected'}")
+Conduct a comprehensive architectural analysis and create a detailed summary document.
 
-    # Phase 2: Dependencies
-    logger.info("  Phase 3: Parsing dependencies...")
-    dependencies = parse_dependencies(project_dir)
-    dep_count = sum(len(deps) for deps in dependencies.values())
-    logger.info(f"    Found {dep_count} dependencies")
+### Step 1: Discover Directory Structure
 
-    critical_deps = identify_critical_dependencies(dependencies)
-    logger.info(f"    Critical dependencies: {', '.join(critical_deps) or 'None'}")
+Use Glob and Read tools to understand the project layout:
+- What are the top-level directories?
+- How is code organized (by feature, by layer, monorepo, etc.)?
+- Are there architectural boundaries (core/, adapters/, domain/, infrastructure/)?
 
-    # Phase 3: Code patterns
-    logger.info("  Phase 4: Analyzing test structure...")
-    test_structure = analyze_test_structure(project_dir)
-    logger.info(f"    Test framework: {test_structure['test_framework']}")
-    logger.info(f"    Test count: {test_structure['test_count']}")
+### Step 2: Identify Architectural Patterns
 
-    logger.info("  Phase 5: Detecting deployment patterns...")
-    deployment = detect_deployment_patterns(project_dir)
-    logger.info(f"    Docker: {deployment['docker']}")
-    logger.info(f"    CI/CD: {deployment['ci_cd']}")
+Look for evidence of:
+- **Hexagonal/Ports & Adapters**: Separate domain logic from adapters
+- **Layered Architecture**: Presentation, business, data layers
+- **Microservices**: Multiple deployable services
+- **Monolith**: Single deployable application
+- **Domain-Driven Design**: Bounded contexts, aggregates, entities
+- **Event-Driven**: Event sourcing, CQRS patterns
 
-    # Phase 4: Smart sampling
-    logger.info("  Phase 6: Sampling key files...")
-    key_files = sample_key_files(project_dir, max_files=20)
-    logger.info(f"    Sampled {len(key_files)} key files")
+### Step 3: Analyze Key Components
 
-    # Phase 5: Save to JSON
-    analysis = {
+Sample and read important files (main.py, index.ts, etc.) to understand:
+- Entry points and initialization
+- Dependency wiring / composition roots
+- Configuration management
+- Error handling patterns
+
+### Step 4: Read Project Documentation
+
+Check for and read:
+- `CLAUDE.md` - Development conventions
+- `README.md` - Project overview
+- `ARCHITECTURE.md` or `docs/architecture/` - Existing architectural docs
+- Code comments explaining design decisions
+
+### Step 5: Create Architecture Summary
+
+Write a comprehensive summary to:
+**`.claude/clauditoreum/ArchitectureSummary.md`**
+
+Include:
+
+```markdown
+# Architecture Summary: {project}
+
+## Overview
+[1-2 paragraph description of the system]
+
+## Architectural Style
+[Hexagonal, Layered, Microservices, etc. - BE SPECIFIC with evidence]
+
+## Directory Structure
+```
+[Show key directories with explanations]
+```
+
+## Component Boundaries
+[Describe how code is separated - layers, modules, services]
+
+## Key Design Patterns
+[List patterns found with file examples]
+
+## Entry Points
+[Main execution paths - where does code start?]
+
+## Dependency Flow
+[How do components depend on each other? Diagrams if helpful]
+
+## Critical Files
+[10-15 most important files with brief descriptions]
+```
+
+**Important:**
+- Be specific and evidence-based (cite files you read)
+- If you find CLAUDE.md or ARCHITECTURE.md, incorporate that knowledge
+- Use tools liberally - Read files, Grep for patterns, Glob for structure
+- If uncertain about something, say so rather than guessing
+"""
+
+    context = {
         'project': project,
-        'timestamp': datetime.now(timezone.utc).isoformat(),
-        'structure': structure,
-        'tech_stacks': tech_stacks,
-        'dependencies': {
-            'all': dependencies,
-            'critical': critical_deps
-        },
-        'testing': test_structure,
-        'deployment': deployment,
-        'key_files': key_files
+        'agent': 'architecture_discoverer',
+        'task_id': f'arch-discovery-{project}',
+        'use_docker': False,
+        'work_dir': str(project_dir),
+        'claude_model': 'claude-sonnet-4-5-20250929',
+        'observability': None,
     }
 
-    # Save analysis
-    output_dir = Path(os.environ.get('ORCHESTRATOR_ROOT', '.')) / 'state' / 'projects' / project
+    logger.info("  Running architecture discovery with Claude Code CLI...")
+    result = await run_claude_code(prompt, context)
+    return result
+
+
+async def run_techstack_discovery(project: str, workspace_root: Path) -> str:
+    """
+    Use Claude Code CLI to discover and research tech stack
+
+    Args:
+        project: Project name
+        workspace_root: Workspace root path
+
+    Returns:
+        Result from Claude Code
+    """
+    project_dir = workspace_root / project
+    output_dir = project_dir / '.claude' / 'clauditoreum'
     output_dir.mkdir(parents=True, exist_ok=True)
-    output_file = output_dir / 'codebase_analysis.json'
+
+    prompt = f"""# Tech Stack Discovery & Research
+
+You are analyzing the **{project}** project to understand and document its technology stack.
+
+## Your Mission
+
+Discover all technologies used, research unfamiliar ones, and create a comprehensive tech stack summary.
+
+### Step 1: Find Dependency Files
+
+Search for and read:
+- Python: `pyproject.toml`, `requirements.txt`, `Pipfile`, `setup.py`
+- JavaScript/TypeScript: `package.json`, `yarn.lock`, `pnpm-lock.yaml`
+- Go: `go.mod`
+- Rust: `Cargo.toml`
+- Java: `pom.xml`, `build.gradle`
+- Ruby: `Gemfile`
+- PHP: `composer.json`
+- .NET: `*.csproj`, `*.fsproj`
+
+Look at ALL depths (root, nested directories) - don't assume files are at the root.
+
+### Step 2: Extract Dependencies
+
+For each dependency file found:
+1. Parse and list all dependencies (including dev/optional dependencies)
+2. Categorize by purpose:
+   - **Web Frameworks**: FastAPI, Express, Django, etc.
+   - **Testing**: pytest, Jest, etc.
+   - **Data/ORM**: SQLAlchemy, TypeORM, etc.
+   - **Async/Concurrency**: asyncio, tokio, etc.
+   - **Type Safety**: Pydantic, Zod, etc.
+   - **Build Tools**: webpack, vite, etc.
+
+### Step 3: Research Unfamiliar Technologies
+
+For each significant dependency you don't recognize:
+1. Use WebSearch to find documentation
+2. Understand:
+   - What does it do?
+   - What category of tool is it?
+   - What are common patterns/best practices?
+   - How does it typically structure code?
+
+### Step 4: Detect Testing Approach
+
+Analyze test files and configurations:
+- What test framework is used?
+- Where are tests located?
+- Are there async test patterns?
+- Test coverage approach?
+
+### Step 5: Sample Code for Patterns
+
+Read 5-10 key source files to detect:
+- **Language features**: Type hints, async/await, pattern matching
+- **Coding style**: Immutability, functional vs OOP, etc.
+- **Dependency injection**: Constructor injection, frameworks
+- **Error handling**: Exceptions, Result types, etc.
+
+### Step 6: Create Tech Stack Summary
+
+Write to:
+**`.claude/clauditoreum/TechStackSummary.md`**
+
+Include:
+
+```markdown
+# Tech Stack Summary: {project}
+
+## Language & Runtime
+- Primary Language: [Python 3.11, TypeScript, etc.]
+- Runtime: [Node.js, Python interpreter, etc.]
+
+## Major Frameworks & Libraries
+
+### Web Framework
+- **Name**: [FastAPI, Express, etc.]
+- **Purpose**: [What it does]
+- **Best Practices**: [Key patterns from research]
+
+### Testing Framework
+- **Name**: [pytest-asyncio, Jest, etc.]
+- **Location**: [Where tests live]
+- **Patterns**: [How tests are structured]
+
+[Repeat for each major category]
+
+## Development Tools
+- Build: [webpack, poetry, cargo, etc.]
+- Linting: [ruff, eslint, etc.]
+- Type Checking: [mypy, tsc, etc.]
+
+## Deployment & Infrastructure
+- Containerization: [Docker, none]
+- CI/CD: [GitHub Actions, Jenkins, etc.]
+
+## Code Patterns Detected
+- **Async/Await**: [Evidence from code samples]
+- **Type Safety**: [Type hints, interfaces, etc.]
+- **Immutability**: [Frozen dataclasses, const, etc.]
+- **Dependency Injection**: [Constructor injection, frameworks]
+
+## Dependencies List
+[Complete list of dependencies with brief descriptions]
+```
+
+**Research Notes:**
+- For each technology you researched, include a brief note on what you learned
+- If you found particularly useful documentation, link it
+
+**Important:**
+- Use WebSearch liberally for technologies you don't recognize
+- Be comprehensive - find ALL dependency files (they may be nested)
+- Cite specific files and line numbers for patterns you detect
+"""
+
+    context = {
+        'project': project,
+        'agent': 'techstack_discoverer',
+        'task_id': f'techstack-discovery-{project}',
+        'use_docker': False,
+        'work_dir': str(project_dir),
+        'claude_model': 'claude-sonnet-4-5-20250929',
+        'observability': None,
+    }
+
+    logger.info("  Running tech stack discovery with Claude Code CLI...")
+    result = await run_claude_code(prompt, context)
+    return result
+
+
+async def run_conventions_discovery(project: str, workspace_root: Path) -> str:
+    """
+    Use Claude Code CLI to discover coding conventions and patterns
+
+    Args:
+        project: Project name
+        workspace_root: Workspace root path
+
+    Returns:
+        Result from Claude Code
+    """
+    project_dir = workspace_root / project
+    output_dir = project_dir / '.claude' / 'clauditoreum'
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    prompt = f"""# Coding Conventions & Patterns Discovery
+
+You are analyzing the **{project}** project to understand its coding conventions.
+
+## Your Mission
+
+Read code samples and documentation to extract coding standards, patterns, and best practices used in this specific project.
+
+### Step 1: Read Project Guidelines
+
+Find and thoroughly read:
+- `CLAUDE.md` - Primary source of coding conventions
+- `CONTRIBUTING.md` - Contribution guidelines
+- `README.md` - May contain coding standards section
+- `docs/` directory - Look for style guides, patterns docs
+
+### Step 2: Sample Representative Files
+
+Read 10-15 well-structured files from different parts of the codebase:
+- Entry points (main.py, index.ts, etc.)
+- Domain models (models.py, entities/, etc.)
+- Business logic (services/, handlers/, etc.)
+- Tests (to understand testing patterns)
+
+### Step 3: Extract Patterns from Code
+
+Identify recurring patterns:
+- **Naming Conventions**: snake_case, camelCase, file naming patterns
+- **Code Organization**: How are files structured? Imports organized?
+- **Type Annotations**: Comprehensive, partial, or absent?
+- **Error Handling**: Exceptions, Result types, error propagation
+- **Async Patterns**: Consistent async/await usage, callback patterns
+- **Immutability**: Frozen dataclasses, readonly, const usage
+- **Documentation**: Docstring style, comment patterns
+- **Configuration**: How is config managed and passed around?
+
+### Step 4: Identify Antipatterns to Avoid
+
+From CLAUDE.md or code analysis, note:
+- What patterns are explicitly discouraged?
+- What architectural boundaries must not be crossed?
+- What common mistakes should be avoided?
+
+### Step 5: Create Patterns Summary
+
+Write to:
+**`.claude/clauditoreum/PatternsSummary.md`**
+
+```markdown
+# Coding Patterns & Conventions: {project}
+
+## Conventions from CLAUDE.md
+[Extract key guidelines from CLAUDE.md if it exists]
+
+## Naming Conventions
+- Files: [Pattern and examples]
+- Classes: [Pattern and examples]
+- Functions: [Pattern and examples]
+- Variables: [Pattern and examples]
+
+## Code Organization
+- Import order: [How imports are organized]
+- File structure: [Typical file layout]
+- Module boundaries: [How code is separated]
+
+## Type Safety & Annotations
+- Style: [Comprehensive type hints? TypeScript strict mode?]
+- Examples: [Show typical type usage]
+
+## Error Handling
+- Pattern: [Exceptions, Result types, etc.]
+- Examples: [From actual code]
+
+## Testing Conventions
+- File naming: [test_*.py, *.test.ts, etc.]
+- Test structure: [AAA pattern, fixtures, etc.]
+- Async testing: [How async tests are handled]
+
+## Common Patterns
+[List 5-10 patterns found across multiple files]
+
+## Antipatterns to Avoid
+[List what NOT to do, from CLAUDE.md or code review]
+
+## Best Practices Specific to This Project
+[Unique conventions not found in other codebases]
+```
+
+**Important:**
+- Prioritize CLAUDE.md - it's the authoritative source
+- Be specific with examples (file:line references)
+- Note both what TO do and what NOT to do
+"""
+
+    context = {
+        'project': project,
+        'agent': 'conventions_discoverer',
+        'task_id': f'conventions-discovery-{project}',
+        'use_docker': False,
+        'work_dir': str(project_dir),
+        'claude_model': 'claude-sonnet-4-5-20250929',
+        'observability': None,
+    }
+
+    logger.info("  Running conventions discovery with Claude Code CLI...")
+    result = await run_claude_code(prompt, context)
+    return result
+
+
+async def run_codebase_analysis(project: str, workspace_root: Path) -> Dict[str, Any]:
+    """
+    Orchestrate Claude Code CLI to perform comprehensive analysis
+
+    Args:
+        project: Project name
+        workspace_root: Workspace root path
+
+    Returns:
+        Analysis summary with paths to generated markdown files
+    """
+    logger.info(f"Running codebase analysis for {project}...")
+
+    project_dir = workspace_root / project
+    output_dir = project_dir / '.claude' / 'clauditoreum'
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Phase 1: Architecture discovery (Claude Code CLI)
+    logger.info("Phase 1: Discovering architecture...")
+    try:
+        await run_architecture_discovery(project, workspace_root)
+        logger.info("  ✓ Created: ArchitectureSummary.md")
+    except Exception as e:
+        logger.error(f"  ✗ Architecture discovery failed: {e}")
+        raise
+
+    # Phase 2: Tech stack discovery (Claude Code CLI)
+    logger.info("Phase 2: Discovering tech stack...")
+    try:
+        await run_techstack_discovery(project, workspace_root)
+        logger.info("  ✓ Created: TechStackSummary.md")
+    except Exception as e:
+        logger.error(f"  ✗ Tech stack discovery failed: {e}")
+        raise
+
+    # Phase 3: Conventions discovery (Claude Code CLI)
+    logger.info("Phase 3: Discovering patterns & conventions...")
+    try:
+        await run_conventions_discovery(project, workspace_root)
+        logger.info("  ✓ Created: PatternsSummary.md")
+    except Exception as e:
+        logger.error(f"  ✗ Conventions discovery failed: {e}")
+        raise
+
+    # Read generated summaries
+    arch_summary_path = output_dir / 'ArchitectureSummary.md'
+    tech_summary_path = output_dir / 'TechStackSummary.md'
+    patterns_summary_path = output_dir / 'PatternsSummary.md'
+
+    # Verify files exist
+    if not arch_summary_path.exists():
+        raise FileNotFoundError(f"Architecture summary not created: {arch_summary_path}")
+    if not tech_summary_path.exists():
+        raise FileNotFoundError(f"Tech stack summary not created: {tech_summary_path}")
+    if not patterns_summary_path.exists():
+        raise FileNotFoundError(f"Patterns summary not created: {patterns_summary_path}")
+
+    arch_summary = arch_summary_path.read_text()
+    tech_summary = tech_summary_path.read_text()
+    patterns_summary = patterns_summary_path.read_text()
+
+    # Extract basic metadata for backwards compatibility
+    # (Some callers expect tech_stacks, key_files fields)
+    analysis = {
+        'project': project,
+        'timestamp': utc_isoformat(),
+        'architecture_summary': arch_summary,
+        'techstack_summary': tech_summary,
+        'patterns_summary': patterns_summary,
+        'summary_files': {
+            'architecture': str(arch_summary_path),
+            'techstack': str(tech_summary_path),
+            'patterns': str(patterns_summary_path),
+        },
+        # Legacy fields for backwards compatibility
+        'tech_stacks': extract_tech_stacks_from_summary(tech_summary),
+        'key_files': [],  # No longer sampled by deterministic code
+    }
+
+    # Save analysis metadata
+    orchestrator_root = Path(os.environ.get('ORCHESTRATOR_ROOT', '.'))
+    state_output_dir = orchestrator_root / 'state' / 'projects' / project
+    state_output_dir.mkdir(parents=True, exist_ok=True)
+    output_file = state_output_dir / 'codebase_analysis.json'
 
     with open(output_file, 'w') as f:
         json.dump(analysis, f, indent=2)
@@ -589,11 +518,43 @@ def run_codebase_analysis(project: str, workspace_root: Path) -> Dict[str, Any]:
     return analysis
 
 
-def main():
+def extract_tech_stacks_from_summary(tech_summary: str) -> Dict[str, Any]:
+    """
+    Extract basic tech stack info from summary for backwards compatibility
+
+    Args:
+        tech_summary: Tech stack summary markdown
+
+    Returns:
+        Basic tech stack structure
+    """
+    # Simple extraction - look for "Primary Language:" line
+    languages = []
+    frameworks = []
+    primary_language = 'unknown'
+
+    for line in tech_summary.split('\n'):
+        if 'Primary Language:' in line:
+            # Extract language after colon
+            lang = line.split(':')[-1].strip()
+            primary_language = lang.lower().split()[0] if lang else 'unknown'
+            languages = [primary_language]
+        elif '### ' in line and any(fw in line.lower() for fw in ['framework', 'testing', 'web']):
+            # Try to extract framework name from next line
+            continue
+
+    return {
+        'languages': languages,
+        'frameworks': frameworks,
+        'primary_language': primary_language,
+    }
+
+
+async def main():
     """CLI entry point for testing"""
     import argparse
 
-    parser = argparse.ArgumentParser(description="Analyze project codebase")
+    parser = argparse.ArgumentParser(description="Analyze project codebase using Claude Code CLI")
     parser.add_argument('project', help='Project name to analyze')
     args = parser.parse_args()
 
@@ -601,22 +562,21 @@ def main():
     logging.basicConfig(level=logging.INFO, format='%(message)s')
 
     # Get workspace root
-    if Path('/workspace').exists():
-        workspace_root = Path('/workspace')
-    else:
-        workspace_root = Path(__file__).parent.parent.parent
+    workspace_root = get_workspace_root()
 
     try:
-        analysis = run_codebase_analysis(args.project, workspace_root)
+        import asyncio
+        analysis = await run_codebase_analysis(args.project, workspace_root)
         print(f"\n✓ Analysis complete for {args.project}")
-        print(f"  Languages: {', '.join(analysis['tech_stacks']['languages'])}")
-        print(f"  Frameworks: {', '.join(analysis['tech_stacks']['frameworks']) or 'None'}")
-        print(f"  Files analyzed: {analysis['structure']['total_files']}")
-        print(f"  Key files sampled: {len(analysis['key_files'])}")
+        print(f"  Summaries created:")
+        print(f"    - ArchitectureSummary.md")
+        print(f"    - TechStackSummary.md")
+        print(f"    - PatternsSummary.md")
     except Exception as e:
         logger.error(f"✗ Analysis failed: {e}", exc_info=True)
         sys.exit(1)
 
 
 if __name__ == '__main__':
-    main()
+    import asyncio
+    asyncio.run(main())

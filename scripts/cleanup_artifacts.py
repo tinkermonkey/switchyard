@@ -22,41 +22,77 @@ from scripts.validate_artifacts import validate_artifact, validate_yaml_frontmat
 # Configure logging
 logger = logging.getLogger(__name__)
 
-# Constants
-CLAUDE_DIR = Path(os.environ.get('ORCHESTRATOR_ROOT', '.')) / '.claude'
-AGENTS_DIR = CLAUDE_DIR / 'agents'
-SKILLS_DIR = CLAUDE_DIR / 'skills'
-ARCHIVE_DIR = CLAUDE_DIR / 'archives'
-MANIFEST_FILE = CLAUDE_DIR / 'generated' / 'manifest.yaml'
+# Constants for orchestrator-level directories
+ORCHESTRATOR_ROOT = Path(os.environ.get('ORCHESTRATOR_ROOT', '.'))
+STATE_DIR = ORCHESTRATOR_ROOT / 'state' / 'projects'
 
 
-def load_manifest() -> Dict[str, Any]:
-    """Load generation manifest"""
-    if MANIFEST_FILE.exists():
+def get_workspace_root() -> Path:
+    """
+    Get the workspace root directory
+
+    Returns:
+        Path to workspace root (/workspace in container, parent of orchestrator root outside)
+    """
+    # Inside container: /workspace
+    # Outside container: Parent of orchestrator root (e.g., /home/user/workspace/orchestrator)
+    if Path('/workspace').exists() and Path('/workspace').is_dir():
+        return Path('/workspace')
+    else:
+        # Outside container: parent of ORCHESTRATOR_ROOT
+        orchestrator_root = Path(os.environ.get('ORCHESTRATOR_ROOT', Path(__file__).parent.parent))
+        return orchestrator_root.parent
+
+
+def get_project_claude_dir(project: str) -> Path:
+    """
+    Get .claude directory for a specific project
+
+    Args:
+        project: Project name
+
+    Returns:
+        Path to project's .claude directory
+    """
+    workspace_root = get_workspace_root()
+    project_dir = workspace_root / project
+    return project_dir / '.claude'
+
+
+def load_project_state(project: str) -> Dict[str, Any]:
+    """
+    Load agent generation state for a project
+
+    Args:
+        project: Project name
+
+    Returns:
+        State data or empty structure if not exists
+    """
+    state_file = STATE_DIR / project / 'agent_generation_state.yaml'
+
+    if state_file.exists():
         try:
-            with open(MANIFEST_FILE, 'r') as f:
+            with open(state_file, 'r') as f:
                 return yaml.safe_load(f) or {}
         except Exception as e:
-            logger.warning(f"Failed to load manifest: {e}")
+            logger.warning(f"Failed to load state for {project}: {e}")
             return {}
 
-    return {'version': '1.0', 'projects': {}}
-
-
-def save_manifest(manifest: Dict[str, Any]):
-    """Save generation manifest"""
-    try:
-        MANIFEST_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with open(MANIFEST_FILE, 'w') as f:
-            yaml.safe_dump(manifest, f, default_flow_style=False, sort_keys=False)
-    except Exception as e:
-        logger.error(f"Failed to save manifest: {e}")
-        raise
+    # Return empty structure
+    return {
+        'version': '1.0',
+        'project': project,
+        'artifacts': {
+            'agents': [],
+            'skills': []
+        }
+    }
 
 
 def identify_outdated_artifacts(project: str) -> List[Dict[str, Any]]:
     """
-    Identify artifacts eligible for cleanup
+    Identify artifacts eligible for cleanup by checking against project state
 
     Args:
         project: Project name
@@ -64,66 +100,66 @@ def identify_outdated_artifacts(project: str) -> List[Dict[str, Any]]:
     Returns:
         List of outdated artifacts with metadata
     """
-    # Load manifest
-    manifest = load_manifest()
-    project_data = manifest.get('projects', {}).get(project, {})
+    # Load per-project state
+    state = load_project_state(project)
 
-    if not project_data:
-        logger.info(f"  No manifest entry for {project}, checking filesystem...")
-        # Fall back to filesystem scan
-        return identify_orphaned_artifacts(project)
-
+    # Check for validation failures in registered artifacts
     outdated = []
 
-    # Check each agent in manifest
-    for agent in project_data.get('agents', []):
-        agent_file = AGENTS_DIR / agent['file'].replace('agents/', '')
+    # Get project-specific directories
+    claude_dir = get_project_claude_dir(project)
+    agents_dir = claude_dir / 'agents'
+    skills_dir = claude_dir / 'skills'
 
-        # Criteria 1: File doesn't exist (orphaned entry)
-        if not agent_file.exists():
+    # Check registered agents for validation failures
+    for agent_name in state.get('artifacts', {}).get('agents', []):
+        agent_file_path = agents_dir / f"{agent_name}.md"
+
+        if not agent_file_path.exists():
+            # Registered but missing - mark for cleanup from state
             outdated.append({
                 'type': 'agent',
-                'name': agent['name'],
-                'file': str(agent_file),
-                'reason': 'orphaned_entry'
+                'name': agent_name,
+                'file': str(agent_file_path),
+                'reason': 'missing_file'
             })
             continue
 
-        # Criteria 2: Validation failures
-        validation = validate_artifact(agent_file)
+        # Check validation
+        validation = validate_artifact(agent_file_path)
         if not validation['passed']:
             outdated.append({
                 'type': 'agent',
-                'name': agent['name'],
-                'file': str(agent_file),
+                'name': agent_name,
+                'file': str(agent_file_path),
                 'reason': 'validation_failure',
                 'errors': validation['errors']
             })
 
-    # Check each skill in manifest
-    for skill in project_data.get('skills', []):
-        skill_dir = SKILLS_DIR / skill['directory'].replace('skills/', '').rstrip('/')
-        skill_file = skill_dir / 'SKILL.md'
+    # Check registered skills for validation failures
+    for skill_name in state.get('artifacts', {}).get('skills', []):
+        skill_dir_path = skills_dir / skill_name
+        skill_file_path = skill_dir_path / 'SKILL.md'
 
-        # Criteria 1: File doesn't exist (orphaned entry)
-        if not skill_file.exists():
+        if not skill_file_path.exists():
+            # Registered but missing
             outdated.append({
                 'type': 'skill',
-                'name': skill['name'],
-                'file': str(skill_file),
-                'directory': str(skill_dir),
-                'reason': 'orphaned_entry'
+                'name': skill_name,
+                'file': str(skill_file_path),
+                'directory': str(skill_dir_path),
+                'reason': 'missing_file'
             })
             continue
 
-        # Criteria 2: Validation failures
-        validation = validate_artifact(skill_file)
+        # Check validation
+        validation = validate_artifact(skill_file_path)
         if not validation['passed']:
             outdated.append({
                 'type': 'skill',
-                'name': skill['name'],
-                'file': str(skill_file),
-                'directory': str(skill_dir),
+                'name': skill_name,
+                'file': str(skill_file_path),
+                'directory': str(skill_dir_path),
                 'reason': 'validation_failure',
                 'errors': validation['errors']
             })
@@ -133,7 +169,7 @@ def identify_outdated_artifacts(project: str) -> List[Dict[str, Any]]:
 
 def identify_orphaned_artifacts(project: str) -> List[Dict[str, Any]]:
     """
-    Find artifacts on filesystem with no manifest entry
+    Find generated artifacts on filesystem NOT in project state
 
     Args:
         project: Project name
@@ -141,36 +177,48 @@ def identify_orphaned_artifacts(project: str) -> List[Dict[str, Any]]:
     Returns:
         List of orphaned artifacts
     """
+    # Load per-project state
+    state = load_project_state(project)
+    registered_agents = set(state.get('artifacts', {}).get('agents', []))
+    registered_skills = set(state.get('artifacts', {}).get('skills', []))
+
     orphaned = []
 
-    # Check agents
-    if AGENTS_DIR.exists():
-        for agent_file in AGENTS_DIR.glob(f'{project}-*.md'):
-            # Check if generated
+    # Get project-specific directories
+    claude_dir = get_project_claude_dir(project)
+    agents_dir = claude_dir / 'agents'
+    skills_dir = claude_dir / 'skills'
+
+    # Check agents on filesystem
+    if agents_dir.exists():
+        for agent_file in agents_dir.glob(f'{project}-*.md'):
+            # Check if generated and not in state
             validation = validate_yaml_frontmatter(agent_file)
             if validation.get('passed') and validation.get('frontmatter', {}).get('generated'):
-                orphaned.append({
-                    'type': 'agent',
-                    'name': agent_file.stem,
-                    'file': str(agent_file),
-                    'reason': 'no_manifest_entry'
-                })
+                if agent_file.stem not in registered_agents:
+                    orphaned.append({
+                        'type': 'agent',
+                        'name': agent_file.stem,
+                        'file': str(agent_file),
+                        'reason': 'not_in_project_state'
+                    })
 
-    # Check skills
-    if SKILLS_DIR.exists():
-        for skill_dir in SKILLS_DIR.glob(f'{project}-*'):
+    # Check skills on filesystem
+    if skills_dir.exists():
+        for skill_dir in skills_dir.glob(f'{project}-*'):
             if skill_dir.is_dir():
                 skill_file = skill_dir / 'SKILL.md'
                 if skill_file.exists():
                     validation = validate_yaml_frontmatter(skill_file)
                     if validation.get('passed') and validation.get('frontmatter', {}).get('generated'):
-                        orphaned.append({
-                            'type': 'skill',
-                            'name': skill_dir.name,
-                            'file': str(skill_file),
-                            'directory': str(skill_dir),
-                            'reason': 'no_manifest_entry'
-                        })
+                        if skill_dir.name not in registered_skills:
+                            orphaned.append({
+                                'type': 'skill',
+                                'name': skill_dir.name,
+                                'file': str(skill_file),
+                                'directory': str(skill_dir),
+                                'reason': 'not_in_project_state'
+                            })
 
     return orphaned
 
@@ -186,9 +234,10 @@ def archive_artifact(artifact: Dict[str, Any], project: str) -> Path:
     Returns:
         Path to archived artifact
     """
-    # Create archive directory with timestamp
+    # Create archive directory with timestamp in project's .claude/archives/
+    claude_dir = get_project_claude_dir(project)
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    archive_dir = ARCHIVE_DIR / project / timestamp
+    archive_dir = claude_dir / 'archives' / timestamp
     archive_dir.mkdir(parents=True, exist_ok=True)
 
     # Copy artifact to archive
@@ -222,13 +271,18 @@ def safe_delete_artifact(artifact: Dict[str, Any], project: str, dry_run: bool =
     """
     artifact_path = Path(artifact['file']).resolve()
 
+    # Get project-specific directories for validation
+    claude_dir = get_project_claude_dir(project)
+    agents_dir = claude_dir / 'agents'
+    skills_dir = claude_dir / 'skills'
+
     # 0. Path traversal protection - verify path is within expected directory
     if artifact['type'] == 'agent':
-        if not artifact_path.is_relative_to(AGENTS_DIR.resolve()):
+        if not artifact_path.is_relative_to(agents_dir.resolve()):
             raise ValueError(f"Refusing to delete agent path outside agents directory: {artifact_path}")
     elif artifact['type'] == 'skill':
         skill_dir = Path(artifact.get('directory', artifact_path.parent)).resolve()
-        if not skill_dir.is_relative_to(SKILLS_DIR.resolve()):
+        if not skill_dir.is_relative_to(skills_dir.resolve()):
             raise ValueError(f"Refusing to delete skill path outside skills directory: {skill_dir}")
 
     # 1. Verify generated flag (safety check)
@@ -260,7 +314,7 @@ def safe_delete_artifact(artifact: Dict[str, Any], project: str, dry_run: bool =
         elif artifact['type'] == 'skill':
             skill_dir = Path(artifact.get('directory', artifact_path.parent)).resolve()
             # Double-check boundary (already validated above, defense in depth)
-            if not skill_dir.is_relative_to(SKILLS_DIR.resolve()):
+            if not skill_dir.is_relative_to(skills_dir.resolve()):
                 raise ValueError(f"Path traversal detected: {skill_dir}")
             if skill_dir.is_dir():
                 shutil.rmtree(skill_dir)
@@ -271,35 +325,38 @@ def safe_delete_artifact(artifact: Dict[str, Any], project: str, dry_run: bool =
         raise
 
 
-def remove_from_manifest(project: str, artifact: Dict[str, Any]):
+def remove_from_project_state(project: str, artifact: Dict[str, Any]):
     """
-    Remove artifact from manifest
+    Remove artifact from project state
 
     Args:
         project: Project name
         artifact: Artifact metadata
     """
-    manifest = load_manifest()
+    import yaml
 
-    if project not in manifest.get('projects', {}):
-        return
-
-    project_data = manifest['projects'][project]
+    state = load_project_state(project)
 
     if artifact['type'] == 'agent':
-        project_data['agents'] = [
-            a for a in project_data.get('agents', [])
-            if a['name'] != artifact['name']
-        ]
+        agents = state.get('artifacts', {}).get('agents', [])
+        if artifact['name'] in agents:
+            agents.remove(artifact['name'])
+            state.setdefault('artifacts', {})['agents'] = agents
 
     elif artifact['type'] == 'skill':
-        project_data['skills'] = [
-            s for s in project_data.get('skills', [])
-            if s['name'] != artifact['name']
-        ]
+        skills = state.get('artifacts', {}).get('skills', [])
+        if artifact['name'] in skills:
+            skills.remove(artifact['name'])
+            state.setdefault('artifacts', {})['skills'] = skills
 
-    save_manifest(manifest)
-    logger.debug(f"  Updated manifest: removed {artifact['name']}")
+    # Save updated state
+    state_file = STATE_DIR / project / 'agent_generation_state.yaml'
+    state_file.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(state_file, 'w') as f:
+        yaml.safe_dump(state, f, default_flow_style=False, sort_keys=False)
+
+    logger.debug(f"  Updated project state: removed {artifact['name']}")
 
 
 def cleanup_project_artifacts(project: str, dry_run: bool = False, force: bool = False):
@@ -313,10 +370,17 @@ def cleanup_project_artifacts(project: str, dry_run: bool = False, force: bool =
     """
     logger.info(f"Cleaning up artifacts for {project}...")
 
-    # Identify outdated artifacts
+    # Safety check: ensure state exists before cleanup
+    state = load_project_state(project)
+    if not state or not state.get('artifacts'):
+        logger.warning(f"  ⚠ No state file for {project} - skipping cleanup to prevent data loss")
+        logger.warning(f"    Run maintain_agent_team.py first to create state")
+        return
+
+    # Identify outdated artifacts (validation failures, missing files)
     outdated = identify_outdated_artifacts(project)
 
-    # Also check for orphaned artifacts (not in manifest)
+    # Also check for orphaned artifacts (not in project state)
     orphaned = identify_orphaned_artifacts(project)
 
     # Deduplicate by artifact name before extending
@@ -351,7 +415,7 @@ def cleanup_project_artifacts(project: str, dry_run: bool = False, force: bool =
         try:
             safe_delete_artifact(artifact, project, dry_run)
             if not dry_run:
-                remove_from_manifest(project, artifact)
+                remove_from_project_state(project, artifact)
             deleted_count += 1
         except Exception as e:
             logger.error(f"  ✗ Error deleting {artifact['name']}: {e}")
