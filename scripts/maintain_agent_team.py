@@ -398,18 +398,9 @@ def run_generation_workflow(project: str, args) -> Dict[str, Any]:
     try:
         config = config_manager.get_project_config(project)
 
-        # Handle both sync and async contexts
-        try:
-            loop = asyncio.get_running_loop()
-            # We're in an async context, can't use asyncio.run()
-            # Create a new event loop in a thread instead
-            import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor() as executor:
-                future = executor.submit(asyncio.run, generate_strategy_with_llm(project, analysis, config))
-                strategy = future.result()
-        except RuntimeError:
-            # No event loop running, safe to use asyncio.run()
-            strategy = asyncio.run(generate_strategy_with_llm(project, analysis, config))
+        # SIMPLIFIED: Just use asyncio.run() - we're always in sync context
+        # (maintain_agent_team.py main() is not async)
+        strategy = asyncio.run(generate_strategy_with_llm(project, analysis, config))
 
         logger.info(f"  ✓ Strategy generated ({len(strategy['agents'])} agents, {len(strategy['skills'])} skills)")
     except Exception as e:

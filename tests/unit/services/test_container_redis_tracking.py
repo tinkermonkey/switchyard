@@ -206,8 +206,14 @@ class TestRepairMissingRedisTracking:
         with patch('subprocess.run', return_value=mock_subprocess_result) as mock_run:
             with patch('redis.Redis', return_value=mock_redis):
                 tracker._repair_missing_redis_tracking(
-                    'myproject', 42, 'code_agent',
-                    ['claude-agent-myproject-task99']
+                    execution={
+                        'issue_number': 42,
+                        'agent': 'code_agent',
+                        'task_id': 'task-99',
+                        'column': 'Development'
+                    },
+                    project='myproject',
+                    container_names=['claude-agent-myproject-task99']
                 )
 
         # Verify docker inspect was called
@@ -244,7 +250,13 @@ class TestRepairMissingRedisTracking:
             with patch('redis.Redis') as mock_redis_cls:
                 # Should not raise
                 tracker._repair_missing_redis_tracking(
-                    'proj', 1, 'agent', ['nonexistent-container']
+                    execution={
+                        'issue_number': 1,
+                        'agent': 'agent',
+                        'task_id': 'task-1'
+                    },
+                    project='proj',
+                    container_names=['nonexistent-container']
                 )
                 # Redis should not be called
                 mock_redis_cls.return_value.hset.assert_not_called()
@@ -264,14 +276,245 @@ class TestRepairMissingRedisTracking:
         with patch('subprocess.run', return_value=mock_subprocess_result):
             with patch('redis.Redis', return_value=mock_redis):
                 tracker._repair_missing_redis_tracking(
-                    'fallback-proj', 99, 'fallback_agent',
-                    ['claude-agent-fallback']
+                    execution={
+                        'issue_number': 99,
+                        'agent': 'fallback_agent',
+                        'task_id': None
+                    },
+                    project='fallback-proj',
+                    container_names=['claude-agent-fallback']
                 )
 
         mapping = mock_redis.hset.call_args[1]['mapping']
         assert mapping['agent'] == 'fallback_agent'
         assert mapping['project'] == 'fallback-proj'
         assert mapping['issue_number'] == '99'
+
+    def test_repair_with_task_id_validation_pass(self, tmp_path):
+        """When container's task_id matches execution's task_id, repair succeeds."""
+        tracker = self._make_tracker(tmp_path)
+
+        # Container has matching task_id
+        inspect_output = 'sha256xyz|code_agent|myproject|task-123|42|run-5\n'
+        mock_subprocess_result = MagicMock()
+        mock_subprocess_result.returncode = 0
+        mock_subprocess_result.stdout = inspect_output
+
+        mock_redis = MagicMock()
+
+        with patch('subprocess.run', return_value=mock_subprocess_result):
+            with patch('redis.Redis', return_value=mock_redis):
+                tracker._repair_missing_redis_tracking(
+                    execution={
+                        'issue_number': 42,
+                        'agent': 'code_agent',
+                        'task_id': 'task-123',
+                        'column': 'Development'
+                    },
+                    project='myproject',
+                    container_names=['claude-agent-myproject-task123']
+                )
+
+        # Verify repair succeeded
+        mock_redis.hset.assert_called_once()
+        mapping = mock_redis.hset.call_args[1]['mapping']
+        assert mapping['task_id'] == 'task-123'
+        assert mapping['issue_number'] == '42'
+        assert mapping['repaired'] == 'true'
+
+    def test_repair_with_task_id_validation_fail(self, tmp_path):
+        """When container's task_id doesn't match execution's task_id, repair is skipped."""
+        tracker = self._make_tracker(tmp_path)
+
+        # Container has DIFFERENT task_id
+        inspect_output = 'sha256xyz|code_agent|myproject|task-999|42|run-5\n'
+        mock_subprocess_result = MagicMock()
+        mock_subprocess_result.returncode = 0
+        mock_subprocess_result.stdout = inspect_output
+
+        mock_redis = MagicMock()
+
+        with patch('subprocess.run', return_value=mock_subprocess_result):
+            with patch('redis.Redis', return_value=mock_redis):
+                tracker._repair_missing_redis_tracking(
+                    execution={
+                        'issue_number': 42,
+                        'agent': 'code_agent',
+                        'task_id': 'task-123',  # Different from container
+                        'column': 'Development'
+                    },
+                    project='myproject',
+                    container_names=['claude-agent-myproject-task999']
+                )
+
+        # Verify repair was SKIPPED due to task_id mismatch
+        mock_redis.hset.assert_not_called()
+
+    def test_repair_issue_validation_without_task_id(self, tmp_path):
+        """When task_id not available, fall back to issue_number validation."""
+        tracker = self._make_tracker(tmp_path)
+
+        # Container has no task_id, but has issue_number
+        inspect_output = 'sha256xyz|code_agent|myproject|unknown|42|run-5\n'
+        mock_subprocess_result = MagicMock()
+        mock_subprocess_result.returncode = 0
+        mock_subprocess_result.stdout = inspect_output
+
+        mock_redis = MagicMock()
+
+        with patch('subprocess.run', return_value=mock_subprocess_result):
+            with patch('redis.Redis', return_value=mock_redis):
+                tracker._repair_missing_redis_tracking(
+                    execution={
+                        'issue_number': 42,
+                        'agent': 'code_agent',
+                        'task_id': None,  # No task_id available
+                        'column': 'Development'
+                    },
+                    project='myproject',
+                    container_names=['claude-agent-myproject-old']
+                )
+
+        # Verify repair succeeded via issue_number validation
+        mock_redis.hset.assert_called_once()
+        mapping = mock_redis.hset.call_args[1]['mapping']
+        assert mapping['issue_number'] == '42'
+
+
+class TestDiscoverContainersForExecution:
+    """Tests for _discover_containers_for_execution hierarchical discovery."""
+
+    def _make_tracker(self, tmp_path):
+        cls = _import_tracker_class(tmp_path)
+        return cls(state_dir=tmp_path)
+
+    def test_uses_provided_containers(self, tmp_path):
+        """When containers provided, use them without querying Docker."""
+        tracker = self._make_tracker(tmp_path)
+
+        execution = {
+            'issue_number': 42,
+            'task_id': 'task-123',
+            'agent': 'code_agent'
+        }
+        provided = ['container-1', 'container-2']
+
+        with patch('subprocess.run') as mock_run:
+            result = tracker._discover_containers_for_execution(
+                'myproject', execution, provided
+            )
+
+        # Should return provided containers without calling docker
+        assert result == provided
+        mock_run.assert_not_called()
+
+    def test_discover_by_task_id_label(self, tmp_path):
+        """Discover containers via task_id label (most precise)."""
+        tracker = self._make_tracker(tmp_path)
+
+        execution = {
+            'issue_number': 42,
+            'task_id': 'task-123',
+            'agent': 'code_agent'
+        }
+
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = 'claude-agent-myproject-task123\n'
+
+        with patch('subprocess.run', return_value=mock_result) as mock_run:
+            containers = tracker._discover_containers_for_execution(
+                'myproject', execution, []
+            )
+
+        assert containers == ['claude-agent-myproject-task123']
+
+        # Verify docker ps called with task_id filter
+        call_args = mock_run.call_args[0][0]
+        assert 'docker' in call_args
+        assert 'ps' in call_args
+        assert any('label=org.clauditoreum.task_id=task-123' in str(arg) for arg in call_args)
+
+    def test_discover_by_project_issue_labels(self, tmp_path):
+        """When task_id unavailable, fall back to project+issue labels."""
+        tracker = self._make_tracker(tmp_path)
+
+        execution = {
+            'issue_number': 42,
+            'task_id': None,  # No task_id
+            'agent': 'code_agent'
+        }
+
+        # First call (task_id) returns nothing, second call (project+issue) succeeds
+        mock_result_empty = MagicMock()
+        mock_result_empty.returncode = 0
+        mock_result_empty.stdout = ''
+
+        mock_result_success = MagicMock()
+        mock_result_success.returncode = 0
+        mock_result_success.stdout = 'claude-agent-myproject-legacy\n'
+
+        with patch('subprocess.run', side_effect=[mock_result_success]) as mock_run:
+            containers = tracker._discover_containers_for_execution(
+                'myproject', execution, []
+            )
+
+        assert containers == ['claude-agent-myproject-legacy']
+
+        # Verify docker ps called with project+issue filters
+        call_args = mock_run.call_args[0][0]
+        assert 'docker' in call_args
+        assert 'ps' in call_args
+        # Should have both project and issue_number filters
+        assert any('label=org.clauditoreum.project=myproject' in str(arg) for arg in call_args)
+
+    def test_discover_by_name_pattern_fallback(self, tmp_path):
+        """When labels unavailable, fall back to name pattern matching."""
+        tracker = self._make_tracker(tmp_path)
+
+        execution = {
+            'issue_number': 42,
+            'task_id': None,
+            'agent': 'code_agent'
+        }
+
+        # Task ID query fails, project+issue query fails, name pattern succeeds
+        mock_result_empty = MagicMock()
+        mock_result_empty.returncode = 0
+        mock_result_empty.stdout = ''
+
+        mock_result_name = MagicMock()
+        mock_result_name.returncode = 0
+        mock_result_name.stdout = 'claude-agent-myproject-old1\nclaude-agent-myproject-old2\n'
+
+        with patch('subprocess.run', side_effect=[mock_result_empty, mock_result_name]) as mock_run:
+            containers = tracker._discover_containers_for_execution(
+                'myproject', execution, []
+            )
+
+        assert len(containers) == 2
+        assert 'claude-agent-myproject-old1' in containers
+
+    def test_discover_returns_empty_when_none_found(self, tmp_path):
+        """When no containers found by any method, return empty list."""
+        tracker = self._make_tracker(tmp_path)
+
+        execution = {
+            'issue_number': 42,
+            'task_id': None,
+            'agent': 'code_agent'
+        }
+
+        mock_result_empty = MagicMock()
+        mock_result_empty.returncode = 0
+        mock_result_empty.stdout = ''
+
+        with patch('subprocess.run', return_value=mock_result_empty):
+            containers = tracker._discover_containers_for_execution(
+                'myproject', execution, []
+            )
+
+        assert containers == []
 
 
 class TestCheckRedisTrackingUseScanIter:

@@ -17,6 +17,9 @@ from typing import Dict, Any, Optional
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+# Import Claude Code integration
+from claude.claude_integration import run_claude_code
+
 # Configure logging
 logger = logging.getLogger(__name__)
 
@@ -60,7 +63,7 @@ async def generate_strategy_with_llm(
     config: Dict[str, Any]
 ) -> Dict[str, Any]:
     """
-    Generate strategy using Claude API
+    Generate strategy using Claude Code CLI via run_claude_code()
 
     Args:
         project: Project name
@@ -70,16 +73,21 @@ async def generate_strategy_with_llm(
     Returns:
         Generated strategy with agents and skills
     """
-    logger.info(f"Generating strategy for {project} using Claude API...")
+    logger.info(f"Generating strategy for {project} using Claude Code CLI...")
 
-    # Extract key info from analysis
-    languages = analysis['tech_stacks']['languages']
-    frameworks = analysis['tech_stacks']['frameworks']
-    test_framework = analysis['testing']['test_framework']
-    has_tests = analysis['testing']['test_count'] > 0
-    has_docker = analysis['deployment']['docker']
-    has_ci_cd = analysis['deployment']['ci_cd'] != 'none'
-    detected_layers = analysis['structure']['detected_layers']
+    # Extract key info from analysis with safe defaults
+    try:
+        languages = analysis.get('tech_stacks', {}).get('languages', [])
+        frameworks = analysis.get('tech_stacks', {}).get('frameworks', [])
+        test_framework = analysis.get('testing', {}).get('test_framework', 'unknown')
+        has_tests = analysis.get('testing', {}).get('test_count', 0) > 0
+        has_docker = analysis.get('deployment', {}).get('docker', False)
+        has_ci_cd = analysis.get('deployment', {}).get('ci_cd', 'none') != 'none'
+        detected_layers = analysis.get('structure', {}).get('detected_layers', [])
+    except Exception as e:
+        logger.error(f"Failed to extract data from analysis dict: {e}")
+        logger.error(f"Analysis dict keys: {list(analysis.keys())}")
+        raise ValueError(f"Malformed analysis dict - missing expected structure: {e}")
 
     # Build prompt
     prompt = f"""You are an expert at designing AI agent teams for software projects.
@@ -96,11 +104,11 @@ Given this codebase analysis for the **{project}** project:
 
 **Architecture:**
 - Detected layers: {', '.join(detected_layers) if detected_layers else 'None detected'}
-- Total files: {analysis['structure']['total_files']}
-- Total directories: {analysis['structure']['total_dirs']}
+- Total files: {analysis.get('structure', {}).get('total_files', 0)}
+- Total directories: {analysis.get('structure', {}).get('total_dirs', 0)}
 
 **Dependencies:**
-- Critical dependencies: {', '.join(analysis['dependencies']['critical'][:10]) if analysis['dependencies']['critical'] else 'None'}
+- Critical dependencies: {', '.join(analysis.get('dependencies', {}).get('critical', [])[:10]) if analysis.get('dependencies', {}).get('critical') else 'None'}
 
 Design an optimal team of project-specific agents and skills for this codebase.
 
@@ -155,27 +163,37 @@ Return ONLY a JSON object (no markdown, no explanations outside JSON) with this 
 
 Now generate the strategy:"""
 
-    # Call Anthropic API
+    # Determine orchestrator root (script is in scripts/ subdirectory)
+    script_dir = Path(__file__).parent.parent  # Go up from scripts/ to orchestrator root
+    orchestrator_root = Path(os.environ.get('ORCHESTRATOR_ROOT', str(script_dir)))
+
+    # Build context for run_claude_code()
+    context = {
+        'project': project,
+        'agent': 'strategy_generator',
+        'task_id': f'strategy-{project}',
+        'use_docker': False,  # Run locally, no Docker needed
+        'work_dir': str(orchestrator_root),
+        'claude_model': 'claude-sonnet-4-5-20250929',
+        'observability': None,  # Optional: emit events if orchestrator running
+    }
+
     try:
-        import anthropic
-    except ImportError:
-        raise ImportError("anthropic package not installed. Run: pip install anthropic")
+        # Call Claude Code CLI via run_claude_code()
+        response_text = await run_claude_code(prompt, context)
 
-    api_key = os.environ.get('ANTHROPIC_API_KEY')
-    if not api_key:
-        raise ValueError("ANTHROPIC_API_KEY environment variable not set")
+        # Handle both dict and string responses
+        if isinstance(response_text, dict):
+            response_text = response_text.get('result', '')
 
-    client = anthropic.Anthropic(api_key=api_key)
+        # Validate response is not empty
+        if not response_text or not response_text.strip():
+            raise ValueError(
+                "Claude Code returned an empty response. This may indicate an API error, "
+                "authentication issue, or network problem. Check CLAUDE_CODE_OAUTH_TOKEN "
+                "or ANTHROPIC_API_KEY environment variable."
+            )
 
-    try:
-        response = client.messages.create(
-            model="claude-sonnet-4-5-20250929",
-            max_tokens=4000,
-            messages=[{"role": "user", "content": prompt}]
-        )
-
-        # Extract response text
-        response_text = response.content[0].text
         logger.debug(f"Raw response: {response_text[:500]}...")
 
         # Parse JSON response
@@ -188,8 +206,8 @@ Now generate the strategy:"""
 
         logger.info(f"  ✓ Generated strategy: {len(strategy['agents'])} agents, {len(strategy['skills'])} skills")
 
-        # Save strategy
-        output_dir = Path(os.environ.get('ORCHESTRATOR_ROOT', '.')) / 'state' / 'projects' / project
+        # Save strategy (reuse orchestrator_root from context building)
+        output_dir = orchestrator_root / 'state' / 'projects' / project
         output_dir.mkdir(parents=True, exist_ok=True)
         output_file = output_dir / 'generation_strategy.json'
 
@@ -200,13 +218,15 @@ Now generate the strategy:"""
 
         return strategy
 
-    except anthropic.APIError as e:
-        logger.error(f"Anthropic API error: {e}")
-        raise
     except json.JSONDecodeError as e:
         logger.error(f"Failed to parse strategy JSON: {e}")
-        logger.error(f"Raw response: {response_text}")
+        # Use locals() to safely access response_text
+        if 'response_text' in locals():
+            logger.error(f"Raw response: {response_text}")
         raise ValueError(f"Invalid JSON in strategy response: {e}")
+    except Exception as e:
+        logger.error(f"Strategy generation error: {e}")
+        raise
 
 
 def display_strategy(project: str, strategy: Dict[str, Any]):

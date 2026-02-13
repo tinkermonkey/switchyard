@@ -1306,6 +1306,7 @@ class DecisionEventEmitter:
             EventType.STATUS_VALIDATION_FAILURE,
             agent="project_monitor",
             task_id=f"status_validation_{project_owner}_{project_number}",
+            project="orchestrator",  # Project monitor is orchestrator-level
             data={
                 'decision_category': 'status_validation',
                 'project_owner': project_owner,
@@ -1315,6 +1316,122 @@ class DecisionEventEmitter:
                 'affected_issues': affected_issues,
                 'attempts': 3
             }
+        )
+
+    def emit_sub_issue_created(
+        self,
+        project: str,
+        parent_issue: int,
+        issue_number: int,
+        title: str,
+        board: str,
+        reason: str,
+        source: str,  # "pr_review" or "work_breakdown"
+        context_data: Optional[Dict[str, Any]] = None,
+        pipeline_run_id: Optional[str] = None
+    ):
+        """
+        Emit event when sub-issue is created and linked to parent
+
+        Args:
+            project: Project name
+            parent_issue: Parent issue number
+            issue_number: Created sub-issue number
+            title: Sub-issue title
+            board: Board name
+            reason: Human-readable reason for creation
+            source: Creation source ("pr_review" or "work_breakdown")
+            context_data: Optional context (review_cycle, severity, phase, etc.)
+            pipeline_run_id: Pipeline run ID for traceability
+        """
+        task_id = f"sub_issue_{project}_{issue_number}"
+
+        event_data = {
+            'decision_category': 'issue_creation',
+            'parent_issue': parent_issue,
+            'issue_number': issue_number,
+            'board': board,
+            'inputs': {
+                'parent_issue': parent_issue,
+                'title': title,
+                'source': source,
+            },
+            'decision': {
+                'action': 'create_sub_issue',
+                'issue_number': issue_number,
+                'linked_to_parent': True
+            },
+            'reason': reason
+        }
+
+        if context_data:
+            event_data['inputs'].update(context_data)
+
+        self.obs.emit(
+            EventType.SUB_ISSUE_CREATED,
+            agent="orchestrator",
+            task_id=task_id,
+            project=project,
+            data=event_data,
+            pipeline_run_id=pipeline_run_id
+        )
+
+    def emit_sub_issue_creation_failed(
+        self,
+        project: str,
+        parent_issue: int,
+        title: str,
+        board: str,
+        error: Exception,
+        source: str,  # "pr_review" or "work_breakdown"
+        context_data: Optional[Dict[str, Any]] = None,
+        pipeline_run_id: Optional[str] = None
+    ):
+        """
+        Emit event when sub-issue creation or linking fails
+
+        Args:
+            project: Project name
+            parent_issue: Parent issue number
+            title: Attempted issue title
+            board: Board name
+            error: Exception that caused the failure
+            source: Creation source ("pr_review" or "work_breakdown")
+            context_data: Optional context (review_cycle, severity, phase, etc.)
+            pipeline_run_id: Pipeline run ID for traceability
+        """
+        task_id = f"sub_issue_failed_{project}_{parent_issue}_{hash(title) % 10000}"
+
+        event_data = {
+            'decision_category': 'issue_creation',
+            'parent_issue': parent_issue,
+            'board': board,
+            'inputs': {
+                'parent_issue': parent_issue,
+                'title': title,
+                'attempted_issue': title,
+                'source': source,
+            },
+            'decision': {
+                'action': 'create_sub_issue',
+                'success': False,
+                'error_type': type(error).__name__,
+                'error_message': str(error)
+            },
+            'reason': f"Failed to create sub-issue: {type(error).__name__}: {str(error)}"
+        }
+
+        # Merge context-specific data into inputs
+        if context_data:
+            event_data['inputs'].update(context_data)
+
+        self.obs.emit(
+            EventType.SUB_ISSUE_CREATION_FAILED,
+            agent="orchestrator",
+            task_id=task_id,
+            project=project,
+            data=event_data,
+            pipeline_run_id=pipeline_run_id
         )
 
 

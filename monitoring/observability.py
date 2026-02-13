@@ -219,6 +219,10 @@ class EventType(Enum):
     BRANCH_STALE_DETECTED = "branch_stale_detected"
     BRANCH_SELECTION_ESCALATED = "branch_selection_escalated"
 
+    # Issue Management
+    SUB_ISSUE_CREATED = "sub_issue_created"
+    SUB_ISSUE_CREATION_FAILED = "sub_issue_creation_failed"
+
 @dataclass
 class ObservabilityEvent:
     """Structured event for agent observability"""
@@ -407,6 +411,9 @@ class ObservabilityManager:
             EventType.BRANCH_CONFLICT_DETECTED,
             EventType.BRANCH_STALE_DETECTED,
             EventType.BRANCH_SELECTION_ESCALATED,
+            # Issue Management
+            EventType.SUB_ISSUE_CREATED,
+            EventType.SUB_ISSUE_CREATION_FAILED,
         }
         return event_type in decision_events
 

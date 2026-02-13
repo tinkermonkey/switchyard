@@ -671,7 +671,130 @@ class TestDecisionEventEmitter:
         data = call_args[1]['data']
         assert data['agent'] == "software_engineer"
         assert data['reason'] == "Issue closed"
-    
+
+    # ========== SUB-ISSUE CREATION TESTS ==========
+
+    def test_emit_sub_issue_created_pr_review(self, emitter, mock_obs):
+        """Test sub-issue created event for PR review workflow"""
+        emitter.emit_sub_issue_created(
+            project="test-project",
+            parent_issue=456,
+            issue_number=789,
+            title="[PR Review] Missing error handling",
+            board="SDLC Execution",
+            reason="PR review finding: high severity issue",
+            source="pr_review",
+            context_data={
+                'severity': 'high',
+                'source_phase': 'code_review',
+                'review_cycle': 2,
+                'pr_url': 'https://github.com/org/repo/pull/123'
+            },
+            pipeline_run_id="pipeline_123"
+        )
+
+        # Verify structure
+        assert mock_obs.emit.called
+        call_args = mock_obs.emit.call_args
+        assert call_args[0][0] == EventType.SUB_ISSUE_CREATED
+        assert call_args[1]['data']['decision_category'] == 'issue_creation'
+        assert call_args[1]['data']['parent_issue'] == 456
+        assert call_args[1]['data']['issue_number'] == 789
+        assert call_args[1]['data']['inputs']['source'] == 'pr_review'
+        assert call_args[1]['data']['inputs']['severity'] == 'high'
+        assert call_args[1]['data']['inputs']['review_cycle'] == 2
+        assert call_args[1]['data']['decision']['linked_to_parent'] is True
+        assert call_args[1]['pipeline_run_id'] == "pipeline_123"
+
+    def test_emit_sub_issue_created_work_breakdown(self, emitter, mock_obs):
+        """Test sub-issue created event for work breakdown workflow"""
+        emitter.emit_sub_issue_created(
+            project="test-project",
+            parent_issue=123,
+            issue_number=456,
+            title="Phase 1: Infrastructure setup",
+            board="SDLC Execution",
+            reason="Work breakdown phase: Phase 1: Infrastructure setup",
+            source="work_breakdown",
+            context_data={
+                'phase': 'Phase 1: Infrastructure setup',
+                'order_in_phase': 1
+            },
+            pipeline_run_id=None
+        )
+
+        # Verify work breakdown context
+        assert mock_obs.emit.called
+        call_args = mock_obs.emit.call_args
+        assert call_args[0][0] == EventType.SUB_ISSUE_CREATED
+        assert call_args[1]['data']['inputs']['source'] == 'work_breakdown'
+        assert call_args[1]['data']['inputs']['phase'] == 'Phase 1: Infrastructure setup'
+        assert call_args[1]['data']['inputs']['order_in_phase'] == 1
+        assert call_args[1]['pipeline_run_id'] is None
+
+    def test_emit_sub_issue_creation_failed_pr_review(self, emitter, mock_obs):
+        """Test sub-issue creation failed event for PR review workflow"""
+        test_error = Exception("GitHub API rate limit exceeded")
+
+        emitter.emit_sub_issue_creation_failed(
+            project="test-project",
+            parent_issue=456,
+            title="[PR Review] Missing error handling",
+            board="SDLC Execution",
+            error=test_error,
+            source="pr_review",
+            context_data={
+                'severity': 'high',
+                'source_phase': 'code_review',
+                'review_cycle': 2,
+                'pr_url': 'https://github.com/org/repo/pull/123'
+            },
+            pipeline_run_id="pipeline_123"
+        )
+
+        # Verify structure
+        assert mock_obs.emit.called
+        call_args = mock_obs.emit.call_args
+        assert call_args[0][0] == EventType.SUB_ISSUE_CREATION_FAILED
+
+        data = call_args[1]['data']
+        assert data['decision_category'] == 'issue_creation'
+        assert data['parent_issue'] == 456
+        assert data['decision']['success'] is False
+        assert data['decision']['error_type'] == 'Exception'
+        assert 'rate limit' in data['decision']['error_message']
+        assert data['inputs']['source'] == 'pr_review'
+        assert data['inputs']['severity'] == 'high'
+
+    def test_emit_sub_issue_creation_failed_work_breakdown(self, emitter, mock_obs):
+        """Test sub-issue creation failed event for work breakdown workflow"""
+        import subprocess
+        test_error = subprocess.CalledProcessError(1, 'gh', stderr='Issue creation failed')
+
+        emitter.emit_sub_issue_creation_failed(
+            project="test-project",
+            parent_issue=123,
+            title="Phase 1: Infrastructure setup",
+            board="SDLC Execution",
+            error=test_error,
+            source="work_breakdown",
+            context_data={
+                'phase': 'Phase 1: Infrastructure setup',
+                'order_in_phase': 1
+            },
+            pipeline_run_id=None
+        )
+
+        # Verify structure
+        assert mock_obs.emit.called
+        call_args = mock_obs.emit.call_args
+        assert call_args[0][0] == EventType.SUB_ISSUE_CREATION_FAILED
+
+        data = call_args[1]['data']
+        assert data['decision']['error_type'] == 'CalledProcessError'
+        assert data['inputs']['source'] == 'work_breakdown'
+        assert data['inputs']['phase'] == 'Phase 1: Infrastructure setup'
+
     # ========== CONSISTENCY TESTS ==========
     
     def test_all_decision_events_have_decision_category(self, emitter, mock_obs):

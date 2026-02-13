@@ -634,19 +634,154 @@ class WorkExecutionStateTracker:
         except Exception as e:
             logger.error(f"Error checking Redis tracking: {e}")
             return False
-    
-    def _repair_missing_redis_tracking(self, project: str, issue_number: int, agent: str, container_names: list):
+
+    def _discover_containers_for_execution(self, project: str, execution: dict, provided_container_names: list) -> list:
+        """
+        Discover containers for an execution using hierarchical discovery methods.
+
+        Priority:
+        1. Use provided container names (from caller's docker ps)
+        2. Docker label filter by task_id (if available) - MOST PRECISE
+        3. Docker label filter by project + issue_number (fallback)
+        4. Name pattern matching (legacy fallback)
+
+        Returns: List of container names matching this execution
+        """
+        import subprocess
+
+        # If caller already found containers, use those
+        if provided_container_names:
+            logger.debug(
+                f"Using {len(provided_container_names)} containers from caller for "
+                f"{project}/#{execution.get('issue_number')}"
+            )
+            return provided_container_names
+
+        task_id = execution.get('task_id')
+        issue_number = execution.get('issue_number')
+
+        # Method 1: Docker label filter by task_id (most precise)
+        if task_id:
+            try:
+                result = subprocess.run(
+                    ['docker', 'ps', '--filter', f'label=org.clauditoreum.task_id={task_id}',
+                     '--format', '{{.Names}}'],
+                    capture_output=True,
+                    text=True,
+                    timeout=5
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    containers = [n.strip() for n in result.stdout.strip().split('\n') if n.strip()]
+                    if containers:
+                        logger.info(
+                            f"Discovered {len(containers)} container(s) via task_id label "
+                            f"({task_id}) for {project}/#{issue_number}"
+                        )
+                        return containers
+            except Exception as e:
+                logger.warning(f"Failed to discover containers by task_id label: {e}")
+
+        # Method 2: Docker label filter by project + issue_number (medium precision)
+        if issue_number:
+            try:
+                result = subprocess.run(
+                    ['docker', 'ps',
+                     '--filter', f'label=org.clauditoreum.project={project}',
+                     '--filter', f'label=org.clauditoreum.issue_number={issue_number}',
+                     '--format', '{{.Names}}'],
+                    capture_output=True,
+                    text=True,
+                    timeout=5
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    containers = [n.strip() for n in result.stdout.strip().split('\n') if n.strip()]
+                    if containers:
+                        logger.info(
+                            f"Discovered {len(containers)} container(s) via project+issue labels "
+                            f"for {project}/#{issue_number} (task_id unavailable)"
+                        )
+                        return containers
+            except Exception as e:
+                logger.warning(f"Failed to discover containers by project+issue labels: {e}")
+
+        # Method 3: Name pattern matching (legacy fallback - least precise)
+        logger.info(
+            f"Falling back to name pattern matching for {project}/#{issue_number} "
+            f"(labels not available)"
+        )
+        try:
+            result = subprocess.run(
+                ['docker', 'ps', '--filter', f'name=claude-agent-{project}-',
+                 '--format', '{{.Names}}'],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                containers = [n.strip() for n in result.stdout.strip().split('\n') if n.strip()]
+                if containers:
+                    logger.warning(
+                        f"Discovered {len(containers)} container(s) via name pattern for {project} - "
+                        f"may include false positives, will validate with labels"
+                    )
+                    return containers
+        except Exception as e:
+            logger.warning(f"Failed to discover containers by name pattern: {e}")
+
+        logger.info(f"No containers discovered for {project}/#{issue_number} task_id={task_id}")
+        return []
+
+    def _repair_missing_redis_tracking(self, execution: dict, project: str, container_names: list = None):
         """
         Repair missing Redis tracking keys by reading Docker container labels.
 
         When a container exists in Docker but has no Redis tracking key, this method
         inspects the container to extract metadata from labels and re-registers it.
+
+        Args:
+            execution: Execution record dict with task_id, issue_number, agent, etc.
+            project: Project name
+            container_names: Optional list of container names to repair (discovered if not provided)
         """
         import subprocess
 
+        # Extract metadata from execution record
+        task_id = execution.get('task_id')
+        issue_number = execution.get('issue_number')
+        agent = execution.get('agent')
+        column = execution.get('column', 'unknown')
+        timestamp = execution.get('timestamp')
+
+        if not issue_number:
+            logger.error(f"Execution record missing issue_number, cannot repair: {execution}")
+            return
+
+        if not agent:
+            logger.error(f"Execution record missing agent field, cannot repair: {execution}")
+            return
+
         logger.debug(
-            f"Attempting to repair Redis tracking for {project}/#{issue_number} {agent}. "
-            f"Discovered containers: {container_names}"
+            f"Attempting repair for {project}/#{issue_number}: "
+            f"agent={agent}, task_id={task_id}, column={column}, timestamp={timestamp}"
+        )
+
+        # Use provided containers or discover via hierarchical search
+        if container_names is None:
+            container_names = []
+
+        if not container_names:
+            container_names = self._discover_containers_for_execution(project, execution, [])
+
+        if not container_names:
+            logger.info(
+                f"No containers found for {project}/#{issue_number} task_id={task_id} - "
+                f"nothing to repair"
+            )
+            return
+
+        logger.debug(
+            f"Repairing Redis tracking for {project}/#{issue_number}. "
+            f"Containers to inspect: {container_names}"
         )
 
         for container_name in container_names:
@@ -677,12 +812,49 @@ class WorkExecutionStateTracker:
                 label_issue = parts[4] if len(parts) > 4 and parts[4] else str(issue_number)
                 label_pipeline_run_id = parts[5] if len(parts) > 5 and parts[5] else ''
 
-                # CRITICAL FIX: Validate that container's issue number matches expected issue
-                # This prevents repairing the wrong container during reconciliation
+                # Validation hierarchy: task_id (primary) > issue_number (secondary) > agent (tertiary)
+
+                # Level 1: Task ID validation (most reliable)
+                if task_id and label_task_id and label_task_id != 'unknown':
+                    if label_task_id != task_id:
+                        logger.warning(
+                            f"VALIDATION FAILED (task_id mismatch): Container {container_name} "
+                            f"has task_id={label_task_id}, expected={task_id}. Skipping repair."
+                        )
+                        continue
+                    logger.info(
+                        f"VALIDATION PASSED (task_id): {container_name} matches task_id={task_id}"
+                    )
+
+                # Level 2: Issue number validation (consistency check)
                 if label_issue != str(issue_number):
+                    if task_id and label_task_id == task_id:
+                        # Task ID matched but issue doesn't - data inconsistency
+                        logger.error(
+                            f"DATA INCONSISTENCY: Container {container_name} has matching task_id "
+                            f"but mismatched issue (container: #{label_issue}, execution: #{issue_number}). "
+                            f"Proceeding with repair."
+                        )
+                    else:
+                        # Issue mismatch and no task_id confirmation - skip
+                        logger.warning(
+                            f"VALIDATION FAILED (issue_number): Container {container_name} "
+                            f"is for issue #{label_issue}, not #{issue_number}. Skipping repair."
+                        )
+                        continue
+
+                # Level 3: Agent consistency check (informational)
+                if label_agent and agent and label_agent != agent:
                     logger.warning(
-                        f"Container {container_name} is for issue #{label_issue}, "
-                        f"not #{issue_number} - skipping repair to prevent mismatch"
+                        f"Agent mismatch for {container_name}: "
+                        f"container={label_agent}, execution={agent}"
+                    )
+
+                # Level 4: Project validation (sanity check)
+                if label_project != project:
+                    logger.error(
+                        f"VALIDATION FAILED (project): Container {container_name} "
+                        f"project={label_project}, expected={project}. Skipping."
                     )
                     continue
 
@@ -706,7 +878,8 @@ class WorkExecutionStateTracker:
 
                 logger.info(
                     f"REPAIRED Redis tracking for container {container_name} "
-                    f"(agent={label_agent}, project={label_project}, issue=#{label_issue})"
+                    f"(agent={label_agent}, project={label_project}, issue=#{label_issue}, "
+                    f"task_id={label_task_id}, validation={'task_id' if (task_id and label_task_id and label_task_id != 'unknown') else 'issue_number'})"
                 )
 
             except Exception as e:
@@ -1517,8 +1690,17 @@ class WorkExecutionStateTracker:
                                     f"Container exists in Docker but not in Redis tracking for "
                                     f"{project_name}/#{issue_number} {agent} - attempting repair"
                                 )
+                                # Enrich execution dict with state-level metadata
+                                # (issue_number and project are stored at state level, not in execution record)
+                                execution_with_metadata = {
+                                    **execution,
+                                    'issue_number': issue_number,
+                                    'project': project_name
+                                }
                                 self._repair_missing_redis_tracking(
-                                    project_name, issue_number, agent, all_container_names
+                                    execution=execution_with_metadata,
+                                    project=project_name,
+                                    container_names=all_container_names
                                 )
                             elif has_redis_tracking and not has_docker_container:
                                 logger.warning(

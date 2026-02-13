@@ -272,17 +272,49 @@ $ python scripts/maintain_agent_team.py --dry-run
 2026-02-12 08:20:03,465 - __main__ - INFO -   - what_am_i_watching
 ```
 
+## Authentication Requirements
+
+The Agent Team Maintainer uses Claude Code CLI via the orchestrator's infrastructure. **No separate Anthropic API subscription required**.
+
+### Required Credentials
+
+You need ONE of the following:
+
+1. **Claude Code Subscription** (recommended):
+   ```bash
+   export CLAUDE_CODE_OAUTH_TOKEN="your-token-here"
+   ```
+   - Get token from Claude Code CLI: `claude auth login`
+   - Subscription billing (cheaper for high usage)
+
+2. **Anthropic API Key** (pay-per-use):
+   ```bash
+   export ANTHROPIC_API_KEY="sk-ant-..."
+   ```
+   - Get from: https://console.anthropic.com/
+   - API billing (more expensive for high usage)
+
+### How It Works
+
+- Strategy generation uses `run_claude_code()` (local mode)
+- No Docker container needed for analysis phase
+- Reuses orchestrator's Claude Code CLI infrastructure
+- Automatic token tracking and observability events
+
 ## Next Steps: Sprint 2 (Analysis)
 
 ### Planned Features
 
-1. **Codebase Analysis Strategy** (6-phase, 60-70 minutes per project)
+1. **Enhanced Codebase Analysis** (deterministic + LLM insights)
+   - Deterministic analysis: Structure, dependencies, tech stacks (fast, ~2 min)
+   - LLM-enhanced insights: Semantic understanding via Claude Code CLI (5-10 min)
+   - Combined approach minimizes token usage and cost
+   - Avoids the need for exhaustive code reading (6-phase, 60-70 minute approach)
    - Discovery: Read project config, list structure, identify tech stacks
    - Dependency Analysis: Parse requirements/package.json, find usage patterns
    - Architecture Detection: Identify layers, sample key files
-   - Code Path Tracing: Trace 2-3 critical workflows
    - Quality Patterns: Understand test structure, linting
-   - Synthesis: Generate structured outputs
+   - LLM Strategy: Generate optimal agent/skill strategy from analysis
 
 2. **Smart Sampling Algorithm** (don't read every file)
    - Priority 100: Base classes, interfaces

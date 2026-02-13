@@ -21,6 +21,7 @@ from state_management.pr_review_state_manager import pr_review_state_manager
 from agents.non_retryable import NonRetryableAgentError
 from monitoring.timestamp_utils import utc_now, utc_isoformat
 from monitoring.observability import EventType
+from monitoring.decision_events import DecisionEventEmitter
 from services.cancellation import get_cancellation_signal
 
 logger = logging.getLogger(__name__)
@@ -231,7 +232,8 @@ class PRReviewStage(PipelineStage):
                 if review_issues:
                     review_found_issues = True
                     created = await self._create_review_issues(
-                        review_issues, repo, github_config, parent_issue_number, project_name
+                        review_issues, repo, github_config, parent_issue_number, project_name,
+                        obs, pipeline_run_id, pr_url
                     )
                     all_created_issues.extend(created)
                     logger.info(f"Phase 1: Created {len(created)} issues from PR review")
@@ -343,7 +345,8 @@ class PRReviewStage(PipelineStage):
                     if gap_issues:
                         review_found_issues = True
                         created = await self._create_review_issues(
-                            gap_issues, repo, github_config, parent_issue_number, project_name
+                            gap_issues, repo, github_config, parent_issue_number, project_name,
+                            obs, pipeline_run_id, pr_url
                         )
                         all_created_issues.extend(created)
                         logger.info(f"Created {len(created)} issues from {check_name} verification")
@@ -408,7 +411,8 @@ class PRReviewStage(PipelineStage):
                     review_found_issues = True
                     ci_issue_spec = self._build_ci_failure_issue(failures, pr_url)
                     created = await self._create_review_issues(
-                        [ci_issue_spec], repo, github_config, parent_issue_number, project_name
+                        [ci_issue_spec], repo, github_config, parent_issue_number, project_name,
+                        obs, pipeline_run_id, pr_url
                     )
                     all_created_issues.extend(created)
                     logger.info(f"Phase 3: {len(failures)} CI checks failing, created {len(created)} issues")
@@ -758,7 +762,11 @@ gh pr checkout {pr_number}
 {checkout_instruction}
 Then run the comprehensive review:
 
-/pr-review-toolkit:review-pr all parallel
+/pr-review-toolkit:review-pr all
+
+**IMPORTANT**: Do NOT use parallel mode or set `run_in_background: true` when invoking review agents.
+Run the review agents sequentially, waiting for each to complete before proceeding.
+This ensures you collect ALL review findings before compiling the final output.
 
 The skill will launch specialized agents (code-reviewer, test-analyzer, silent-failure-hunter, comment-analyzer, type-design-analyzer) and provide detailed findings.
 
@@ -934,7 +942,10 @@ If all requirements are met, write "All requirements verified - no gaps found" a
         repo: str,
         github_config: Dict,
         parent_issue_number: int,
-        project_name: str
+        project_name: str,
+        obs: Optional[Any] = None,
+        pipeline_run_id: Optional[str] = None,
+        pr_url: Optional[str] = None
     ) -> List[Dict[str, Any]]:
         """Create GitHub issues for review findings and link as sub-issues."""
         github_state = self.state_manager.load_project_state(project_name)
@@ -1020,6 +1031,30 @@ If all requirements are met, write "All requirements verified - no gaps found" a
                 if parent_issue_id:
                     self._link_sub_issue(parent_issue_id, issue_id, issue_number, parent_issue_number)
 
+                    # Emit SUCCESS event
+                    if obs:
+                        decision_emitter = DecisionEventEmitter(obs)
+                        current_review_cycle = pr_review_state_manager.get_review_count(
+                            project_name, parent_issue_number
+                        )
+
+                        decision_emitter.emit_sub_issue_created(
+                            project=project_name,
+                            parent_issue=parent_issue_number,
+                            issue_number=int(issue_number),
+                            title=spec['title'],
+                            board="SDLC Execution",
+                            reason=f"PR review finding: {spec.get('severity', 'medium')} severity issue",
+                            source="pr_review",
+                            context_data={
+                                'severity': spec.get('severity', 'medium'),
+                                'source_phase': spec.get('source', 'unknown'),
+                                'review_cycle': current_review_cycle,
+                                'pr_url': pr_url
+                            },
+                            pipeline_run_id=pipeline_run_id
+                        )
+
                 created_issues.append({
                     'number': issue_number,
                     'url': issue_url,
@@ -1031,6 +1066,30 @@ If all requirements are met, write "All requirements verified - no gaps found" a
 
             except Exception as e:
                 logger.error(f"Failed to create review issue '{spec['title']}': {e}", exc_info=True)
+
+                # Emit FAILURE event
+                if obs:
+                    decision_emitter = DecisionEventEmitter(obs)
+                    current_review_cycle = pr_review_state_manager.get_review_count(
+                        project_name, parent_issue_number
+                    )
+
+                    decision_emitter.emit_sub_issue_creation_failed(
+                        project=project_name,
+                        parent_issue=parent_issue_number,
+                        title=spec['title'],
+                        board="SDLC Execution",
+                        error=e,
+                        source="pr_review",
+                        context_data={
+                            'severity': spec.get('severity', 'medium'),
+                            'source_phase': spec.get('source', 'unknown'),
+                            'review_cycle': current_review_cycle,
+                            'pr_url': pr_url
+                        },
+                        pipeline_run_id=pipeline_run_id
+                    )
+                # Continue with other issues
 
         return created_issues
 

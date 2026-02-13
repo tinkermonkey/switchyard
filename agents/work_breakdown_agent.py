@@ -16,6 +16,7 @@ from typing import Dict, Any, List, Optional
 from agents.base_analysis_agent import AnalysisAgent
 from config.manager import ConfigManager
 from config.state_manager import GitHubStateManager
+from monitoring.decision_events import DecisionEventEmitter
 import logging
 import json
 import re
@@ -913,6 +914,26 @@ Make sure to:
                     )
                     logger.info(f"Linked issue #{issue_number} as sub-issue of #{parent_issue_number}")
 
+                    # Emit SUCCESS event (only for newly created issues, not existing)
+                    if not existing_issue:
+                        obs = task_context.get('observability')
+                        if obs:
+                            decision_emitter = DecisionEventEmitter(obs)
+                            decision_emitter.emit_sub_issue_created(
+                                project=project_name,
+                                parent_issue=int(parent_issue_number),
+                                issue_number=int(issue_number),
+                                title=sub_issue['title'],
+                                board="SDLC Execution",
+                                reason=f"Work breakdown phase: {sub_issue['phase']}",
+                                source="work_breakdown",
+                                context_data={
+                                    'phase': sub_issue['phase'],
+                                    'order_in_phase': idx,
+                                },
+                                pipeline_run_id=None  # Work breakdown runs standalone
+                            )
+
                 created_issues.append({
                     'number': issue_number,
                     'url': issue_url,
@@ -924,6 +945,24 @@ Make sure to:
 
             except Exception as e:
                 logger.error(f"Failed to create sub-issue '{sub_issue['title']}': {e}")
+
+                # Emit FAILURE event
+                obs = task_context.get('observability')
+                if obs:
+                    decision_emitter = DecisionEventEmitter(obs)
+                    decision_emitter.emit_sub_issue_creation_failed(
+                        project=project_name,
+                        parent_issue=int(parent_issue_number),
+                        title=sub_issue['title'],
+                        board="SDLC Execution",
+                        error=e,
+                        source="work_breakdown",
+                        context_data={
+                            'phase': sub_issue['phase'],
+                            'order_in_phase': idx,
+                        },
+                        pipeline_run_id=None
+                    )
                 # Continue with other issues
 
         return created_issues
