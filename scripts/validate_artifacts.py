@@ -20,9 +20,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 logger = logging.getLogger(__name__)
 
 # Constants
-CLAUDE_DIR = Path(os.environ.get('ORCHESTRATOR_ROOT', '.')) / '.claude'
-AGENTS_DIR = CLAUDE_DIR / 'agents'
-SKILLS_DIR = CLAUDE_DIR / 'skills'
+ORCHESTRATOR_ROOT = Path(os.environ.get('ORCHESTRATOR_ROOT', '.'))
 
 # Valid tool names
 VALID_TOOLS = [
@@ -30,6 +28,34 @@ VALID_TOOLS = [
     'WebSearch', 'WebFetch', 'Skill', 'Task',
     'NotebookEdit', 'AskUserQuestion', 'EnterPlanMode', 'ExitPlanMode'
 ]
+
+
+def get_workspace_root() -> Path:
+    """
+    Get the workspace root directory
+
+    Returns:
+        Path to workspace root (/workspace in container, parent of orchestrator root outside)
+    """
+    if Path('/workspace').exists() and Path('/workspace').is_dir():
+        return Path('/workspace')
+    else:
+        return ORCHESTRATOR_ROOT.parent
+
+
+def get_project_claude_dir(project: str) -> Path:
+    """
+    Get .claude directory for a specific project
+
+    Args:
+        project: Project name
+
+    Returns:
+        Path to project's .claude directory
+    """
+    workspace_root = get_workspace_root()
+    project_dir = workspace_root / project
+    return project_dir / '.claude'
 
 
 def validate_yaml_frontmatter(file_path: Path) -> Dict[str, Any]:
@@ -241,23 +267,30 @@ def find_generated_artifacts(project: Optional[str] = None) -> Dict[str, List[Pa
         'skills': []
     }
 
+    if project is None:
+        logger.warning("find_generated_artifacts() called without project parameter - this may find no artifacts")
+        return artifacts
+
+    # Get project-specific directories
+    claude_dir = get_project_claude_dir(project)
+    agents_dir = claude_dir / 'agents'
+    skills_dir = claude_dir / 'skills'
+
     # Find agent files
-    if AGENTS_DIR.exists():
-        for agent_file in AGENTS_DIR.glob('*.md'):
+    if agents_dir.exists():
+        for agent_file in agents_dir.glob(f'{project}-*.md'):
             # Check if generated
             try:
                 with open(agent_file, 'r') as f:
                     content = f.read()
                     if 'generated: true' in content:
-                        # Filter by project if specified
-                        if project is None or agent_file.stem.startswith(f'{project}-'):
-                            artifacts['agents'].append(agent_file)
+                        artifacts['agents'].append(agent_file)
             except Exception:
                 pass
 
     # Find skill files
-    if SKILLS_DIR.exists():
-        for skill_dir in SKILLS_DIR.iterdir():
+    if skills_dir.exists():
+        for skill_dir in skills_dir.glob(f'{project}-*'):
             if skill_dir.is_dir():
                 skill_file = skill_dir / 'SKILL.md'
                 if skill_file.exists():
@@ -266,9 +299,7 @@ def find_generated_artifacts(project: Optional[str] = None) -> Dict[str, List[Pa
                         with open(skill_file, 'r') as f:
                             content = f.read()
                             if 'generated: true' in content:
-                                # Filter by project if specified
-                                if project is None or skill_dir.name.startswith(f'{project}-'):
-                                    artifacts['skills'].append(skill_file)
+                                artifacts['skills'].append(skill_file)
                     except Exception:
                         pass
 

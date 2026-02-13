@@ -39,6 +39,34 @@ def get_workspace_root() -> Path:
         return orchestrator_root.parent
 
 
+def validate_project_name(project: str):
+    """
+    Validate project name for filesystem safety
+
+    Args:
+        project: Project name to validate
+
+    Raises:
+        ValueError: If project name is invalid
+    """
+    import re
+
+    if not project or not isinstance(project, str):
+        raise ValueError("Project name must be a non-empty string")
+
+    if not re.match(r'^[a-zA-Z0-9][a-zA-Z0-9_-]*$', project):
+        raise ValueError(
+            f"Invalid project name '{project}': "
+            f"must start with alphanumeric and contain only alphanumeric, hyphens, and underscores"
+        )
+
+    if '..' in project or '/' in project or '\\' in project:
+        raise ValueError(f"Invalid project name '{project}': path traversal detected")
+
+    if len(project) > 200:
+        raise ValueError(f"Invalid project name '{project}': too long (max 200 chars)")
+
+
 async def run_architecture_discovery(project: str, workspace_root: Path) -> str:
     """
     Use Claude Code CLI to discover and document architecture
@@ -436,6 +464,7 @@ async def run_codebase_analysis(project: str, workspace_root: Path) -> Dict[str,
     Returns:
         Analysis summary with paths to generated markdown files
     """
+    validate_project_name(project)
     logger.info(f"Running codebase analysis for {project}...")
 
     project_dir = workspace_root / project

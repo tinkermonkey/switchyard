@@ -54,9 +54,38 @@ def get_project_claude_dir(project: str) -> Path:
     Returns:
         Path to project's .claude directory
     """
+    validate_project_name(project)
     workspace_root = get_workspace_root()
     project_dir = workspace_root / project
     return project_dir / '.claude'
+
+
+def validate_project_name(project: str):
+    """
+    Validate project name for filesystem safety
+
+    Args:
+        project: Project name to validate
+
+    Raises:
+        ValueError: If project name is invalid
+    """
+    import re
+
+    if not project or not isinstance(project, str):
+        raise ValueError("Project name must be a non-empty string")
+
+    if not re.match(r'^[a-zA-Z0-9][a-zA-Z0-9_-]*$', project):
+        raise ValueError(
+            f"Invalid project name '{project}': "
+            f"must start with alphanumeric and contain only alphanumeric, hyphens, and underscores"
+        )
+
+    if '..' in project or '/' in project or '\\' in project:
+        raise ValueError(f"Invalid project name '{project}': path traversal detected")
+
+    if len(project) > 200:
+        raise ValueError(f"Invalid project name '{project}': too long (max 200 chars)")
 
 
 def load_project_state(project: str) -> Dict[str, Any]:
@@ -69,6 +98,7 @@ def load_project_state(project: str) -> Dict[str, Any]:
     Returns:
         State data or empty structure if not exists
     """
+    validate_project_name(project)
     state_file = STATE_DIR / project / 'agent_generation_state.yaml'
 
     if state_file.exists():
@@ -333,8 +363,6 @@ def remove_from_project_state(project: str, artifact: Dict[str, Any]):
         project: Project name
         artifact: Artifact metadata
     """
-    import yaml
-
     state = load_project_state(project)
 
     if artifact['type'] == 'agent':

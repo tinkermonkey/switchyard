@@ -387,6 +387,29 @@ def trigger_docker_rebuild(project: str, dry_run: bool = False) -> bool:
         return False
 
 
+async def _run_async_phases(project: str, config: Dict[str, Any]) -> tuple:
+    """
+    Run async phases (analysis and strategy) in a single event loop
+
+    Args:
+        project: Project name
+        config: Project configuration
+
+    Returns:
+        Tuple of (analysis, strategy)
+    """
+    from scripts.analyze_codebase import run_codebase_analysis
+    from scripts.generate_strategy import generate_strategy_with_llm
+
+    # Phase 2: Analyze codebase
+    analysis = await run_codebase_analysis(project, get_workspace_root())
+
+    # Phase 3: Generate strategy
+    strategy = await generate_strategy_with_llm(project, analysis, config)
+
+    return analysis, strategy
+
+
 def run_generation_workflow(project: str, args) -> Dict[str, Any]:
     """
     Main generation workflow for a project
@@ -431,35 +454,23 @@ def run_generation_workflow(project: str, args) -> Dict[str, Any]:
             logger.info("  Cleanup: Remove outdated artifacts (--cleanup)")
         return {'status': 'dry_run'}
 
-    # Phase 2: Analyze codebase
+    # Phase 2 & 3: Run async phases (analysis and strategy) in single event loop
     logger.info("\nPhase 2: Analyzing codebase...")
-    from scripts.analyze_codebase import run_codebase_analysis
     import asyncio
-
-    try:
-        # Run async analysis in sync context
-        analysis = asyncio.run(run_codebase_analysis(project, get_workspace_root()))
-        logger.info(f"  ✓ Analysis complete (summaries created)")
-    except Exception as e:
-        logger.error(f"  ✗ Analysis failed: {e}")
-        return {'status': 'error', 'phase': 'analysis', 'error': str(e)}
-
-    # Phase 3: Generate strategy
-    logger.info("\nPhase 3: Generating strategy...")
-    from scripts.generate_strategy import generate_strategy_with_llm, display_strategy, confirm_strategy
-    import asyncio
+    from scripts.generate_strategy import display_strategy, confirm_strategy
 
     try:
         config = config_manager.get_project_config(project)
 
-        # SIMPLIFIED: Just use asyncio.run() - we're always in sync context
-        # (maintain_agent_team.py main() is not async)
-        strategy = asyncio.run(generate_strategy_with_llm(project, analysis, config))
+        # Run both async phases in a single event loop to avoid event loop conflicts
+        analysis, strategy = asyncio.run(_run_async_phases(project, config))
 
+        logger.info(f"  ✓ Analysis complete (summaries created)")
+        logger.info("\nPhase 3: Generating strategy...")
         logger.info(f"  ✓ Strategy generated ({len(strategy['agents'])} agents, {len(strategy['skills'])} skills)")
     except Exception as e:
-        logger.error(f"  ✗ Strategy generation failed: {e}")
-        return {'status': 'error', 'phase': 'strategy', 'error': str(e)}
+        logger.error(f"  ✗ Async phases failed: {e}")
+        return {'status': 'error', 'phase': 'async_phases', 'error': str(e)}
 
     # Phase 4: User review
     if not args.auto_approve:
