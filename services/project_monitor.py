@@ -423,19 +423,17 @@ class ProjectMonitor:
     def _get_valid_columns_for_board(
         self,
         project_owner: str,
-        project_number: int,
-        force_api_fallback: bool = False
+        project_number: int
     ) -> set:
         """
         Get valid column names for a board.
 
         First tries reverse lookup via state files.
-        Falls back to direct GitHub API query if needed.
+        Automatically falls back to direct GitHub API query if reverse lookup fails.
 
         Args:
             project_owner: GitHub organization or user
             project_number: Project number
-            force_api_fallback: Skip reverse lookup and use GitHub API directly
 
         Returns:
             Set of valid column names, or empty set if all methods fail
@@ -444,40 +442,39 @@ class ProjectMonitor:
         import subprocess
         import json
 
-        # Try reverse lookup first (unless forced to use API)
-        if not force_api_fallback:
-            for project_name in self.config_manager.list_visible_projects():
-                project_state = state_manager.load_project_state(project_name)
-                if not project_state:
-                    continue
+        # Try reverse lookup first
+        for project_name in self.config_manager.list_visible_projects():
+            project_state = state_manager.load_project_state(project_name)
+            if not project_state:
+                continue
 
-                for board_name, board_state in project_state.boards.items():
-                    if board_state.project_number == project_number:
-                        # Found matching board - get workflow columns
-                        project_config = self.config_manager.get_project_config(project_name)
-                        pipeline = next(
-                            (p for p in project_config.pipelines if p.board_name == board_name),
-                            None
+            for board_name, board_state in project_state.boards.items():
+                if board_state.project_number == project_number:
+                    # Found matching board - get workflow columns
+                    project_config = self.config_manager.get_project_config(project_name)
+                    pipeline = next(
+                        (p for p in project_config.pipelines if p.board_name == board_name),
+                        None
+                    )
+                    if pipeline:
+                        workflow = self.config_manager.get_workflow_template(pipeline.workflow)
+                        columns = {col.name for col in workflow.columns}
+                        logger.debug(
+                            f"Reverse lookup success for {project_owner}/project#{project_number}: "
+                            f"found {len(columns)} columns"
                         )
-                        if pipeline:
-                            workflow = self.config_manager.get_workflow_template(pipeline.workflow)
-                            columns = {col.name for col in workflow.columns}
-                            logger.debug(
-                                f"Reverse lookup success for {project_owner}/project#{project_number}: "
-                                f"found {len(columns)} columns"
-                            )
-                            return columns
-                        else:
-                            logger.warning(
-                                f"Reverse lookup partial failure for {project_owner}/project#{project_number}: "
-                                f"board found but no matching pipeline"
-                            )
+                        return columns
+                    else:
+                        logger.warning(
+                            f"Reverse lookup partial failure for {project_owner}/project#{project_number}: "
+                            f"board found but no matching pipeline"
+                        )
 
-            # Reverse lookup failed - log and try fallback
-            logger.warning(
-                f"Reverse lookup failed for {project_owner}/project#{project_number}. "
-                f"Attempting direct GitHub API fallback..."
-            )
+        # Reverse lookup failed - log and try fallback
+        logger.warning(
+            f"Reverse lookup failed for {project_owner}/project#{project_number}. "
+            f"Attempting direct GitHub API fallback..."
+        )
 
         # FALLBACK: Query GitHub API directly for board columns
         try:
@@ -537,69 +534,58 @@ class ProjectMonitor:
             return []
 
         # Get valid columns for validation
+        # This call tries reverse lookup first, then automatically falls back to GitHub API if needed
         valid_columns = self._get_valid_columns_for_board(project_owner, project_number)
 
         if not valid_columns:
-            # First retry: Force GitHub API fallback
-            logger.warning(
-                f"Initial reverse lookup failed for {project_owner}/project#{project_number}. "
-                f"Forcing GitHub API fallback..."
+            # Both reverse lookup AND GitHub API fallback already tried and failed
+            logger.error(
+                f"❌ Cannot validate status for {project_owner}/project#{project_number}: "
+                f"workflow lookup failed. Returning raw items without validation."
             )
-            valid_columns = self._get_valid_columns_for_board(
-                project_owner,
-                project_number,
-                force_api_fallback=True
-            )
+            # Return items without validation
+            data = execute_board_query_cached(project_owner, project_number)
+            if data is None:
+                logger.warning(f"Board query returned no data for {project_owner}/project#{project_number}")
+                return []
 
-            if not valid_columns:
-                # Both methods failed - skip validation entirely
-                logger.error(
-                    f"❌ Cannot validate status for {project_owner}/project#{project_number}: "
-                    f"workflow lookup failed. Returning raw items."
-                )
-                # Return items without validation
-                data = execute_board_query_cached(project_owner, project_number)
-                if data is None:
-                    logger.warning(f"Board query returned no data for {project_owner}/project#{project_number}")
-                    return []
+            try:
+                # Parse without validation
+                owner_type = get_owner_type(project_owner)
+                if owner_type == 'user':
+                    project_data = data['user']['projectV2']
+                else:  # organization
+                    project_data = data['organization']['projectV2']
 
-                try:
-                    # Parse without validation (same as before)
-                    owner_type = get_owner_type(project_owner)
-                    if owner_type == 'user':
-                        project_data = data['user']['projectV2']
-                    else:  # organization
-                        project_data = data['organization']['projectV2']
+                items = []
+                for node in project_data['items']['nodes']:
+                    content = node.get('content')
+                    if not content:  # Skip draft items
+                        continue
 
-                    items = []
-                    for node in project_data['items']['nodes']:
-                        content = node.get('content')
-                        if not content:  # Skip draft items
-                            continue
+                    # Find status field
+                    status = "No Status"
+                    for field_value in node['fieldValues']['nodes']:
+                        if field_value and field_value.get('field', {}).get('name') == 'Status':
+                            status = field_value.get('name', 'No Status')
+                            break
 
-                        # Find status field
-                        status = "No Status"
-                        for field_value in node['fieldValues']['nodes']:
-                            if field_value and field_value.get('field', {}).get('name') == 'Status':
-                                status = field_value.get('name', 'No Status')
-                                break
+                    item = ProjectItem(
+                        item_id=node['id'],
+                        content_id=content['id'],
+                        issue_number=content['number'],
+                        title=content['title'],
+                        status=status,
+                        repository=content['repository']['name'],
+                        last_updated=content['updatedAt']
+                    )
+                    items.append(item)
 
-                        item = ProjectItem(
-                            item_id=node['id'],
-                            content_id=content['id'],
-                            issue_number=content['number'],
-                            title=content['title'],
-                            status=status,
-                            repository=content['repository']['name'],
-                            last_updated=content['updatedAt']
-                        )
-                        items.append(item)
+                return items
 
-                    return items
-
-                except (KeyError, TypeError) as e:
-                    logger.error(f"Failed to parse board query response for {project_owner}/project#{project_number}: {e}")
-                    return []
+            except (KeyError, TypeError) as e:
+                logger.error(f"Failed to parse board query response for {project_owner}/project#{project_number}: {e}")
+                return []
 
         # Retry loop for invalid statuses
         max_retries = 2  # Total 3 attempts
