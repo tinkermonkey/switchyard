@@ -1968,15 +1968,10 @@ class DockerAgentRunner:
                 'workspace_type': 'issues'
             }
 
-            # Run async code in new event loop
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            try:
-                loop.run_until_complete(
-                    github.post_agent_output(context, output)
-                )
-            finally:
-                loop.close()
+            # Post output using asyncio.run()
+            asyncio.run(
+                github.post_agent_output(context, output)
+            )
 
             logger.info(f"Posted recovered container output to GitHub issue #{issue_number}")
 

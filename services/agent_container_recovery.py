@@ -1405,14 +1405,9 @@ class AgentContainerRecovery:
             }
 
             def post_comment():
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                try:
-                    loop.run_until_complete(
-                        github.post_agent_output(comment_context, "\n".join(summary_lines))
-                    )
-                finally:
-                    loop.close()
+                asyncio.run(
+                    github.post_agent_output(comment_context, "\n".join(summary_lines))
+                )
 
             thread = threading.Thread(target=post_comment)
             thread.start()
@@ -1433,20 +1428,15 @@ class AgentContainerRecovery:
                 from services.auto_commit import auto_commit_service
 
                 def do_commit():
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-                    try:
-                        return loop.run_until_complete(
-                            auto_commit_service.commit_agent_changes(
-                                project=project,
-                                agent='repair_cycle',
-                                task_id=f'repair_cycle_{issue_number}',
-                                issue_number=issue_number,
-                                custom_message=f"Complete repair cycle for issue #{issue_number}\n\nAutomated test-fix-validate cycle completed successfully.\nAll tests passing."
-                            )
+                    return asyncio.run(
+                        auto_commit_service.commit_agent_changes(
+                            project=project,
+                            agent='repair_cycle',
+                            task_id=f'repair_cycle_{issue_number}',
+                            issue_number=issue_number,
+                            custom_message=f"Complete repair cycle for issue #{issue_number}\n\nAutomated test-fix-validate cycle completed successfully.\nAll tests passing."
                         )
-                    finally:
-                        loop.close()
+                    )
 
                 # Run in separate thread
                 commit_success = [False]

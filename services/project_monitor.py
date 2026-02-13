@@ -420,38 +420,99 @@ class ProjectMonitor:
         self._max_poll_interval = 60
         self._idle_backoff_threshold = 4  # Start backoff after this many idle cycles
 
-    def _get_valid_columns_for_board(self, project_owner: str, project_number: int) -> set:
+    def _get_valid_columns_for_board(
+        self,
+        project_owner: str,
+        project_number: int,
+        force_api_fallback: bool = False
+    ) -> set:
         """
-        Get valid column names for a project board by reverse-looking up
-        the project configuration from owner and project number.
+        Get valid column names for a board.
+
+        First tries reverse lookup via state files.
+        Falls back to direct GitHub API query if needed.
+
+        Args:
+            project_owner: GitHub organization or user
+            project_number: Project number
+            force_api_fallback: Skip reverse lookup and use GitHub API directly
 
         Returns:
-            Set of valid column names, or empty set if workflow not found
+            Set of valid column names, or empty set if all methods fail
         """
         from config.state_manager import state_manager
+        import subprocess
+        import json
 
-        # Reverse lookup: project_number → project_name, board_name
-        for project_name in self.config_manager.list_visible_projects():
-            project_state = state_manager.load_project_state(project_name)
-            if not project_state:
-                continue
+        # Try reverse lookup first (unless forced to use API)
+        if not force_api_fallback:
+            for project_name in self.config_manager.list_visible_projects():
+                project_state = state_manager.load_project_state(project_name)
+                if not project_state:
+                    continue
 
-            for board_name, board_state in project_state.boards.items():
-                if board_state.project_number == project_number:
-                    # Found matching board - get workflow columns
-                    project_config = self.config_manager.get_project_config(project_name)
-                    pipeline = next(
-                        (p for p in project_config.pipelines if p.board_name == board_name),
-                        None
-                    )
-                    if pipeline:
-                        workflow = self.config_manager.get_workflow_template(pipeline.workflow)
-                        return {col.name for col in workflow.columns}
+                for board_name, board_state in project_state.boards.items():
+                    if board_state.project_number == project_number:
+                        # Found matching board - get workflow columns
+                        project_config = self.config_manager.get_project_config(project_name)
+                        pipeline = next(
+                            (p for p in project_config.pipelines if p.board_name == board_name),
+                            None
+                        )
+                        if pipeline:
+                            workflow = self.config_manager.get_workflow_template(pipeline.workflow)
+                            columns = {col.name for col in workflow.columns}
+                            logger.debug(
+                                f"Reverse lookup success for {project_owner}/project#{project_number}: "
+                                f"found {len(columns)} columns"
+                            )
+                            return columns
+                        else:
+                            logger.warning(
+                                f"Reverse lookup partial failure for {project_owner}/project#{project_number}: "
+                                f"board found but no matching pipeline"
+                            )
 
-        # Fallback: couldn't find workflow
-        logger.warning(
-            f"Could not determine workflow for {project_owner}/project#{project_number}. "
-            f"Status validation will be skipped."
+            # Reverse lookup failed - log and try fallback
+            logger.warning(
+                f"Reverse lookup failed for {project_owner}/project#{project_number}. "
+                f"Attempting direct GitHub API fallback..."
+            )
+
+        # FALLBACK: Query GitHub API directly for board columns
+        try:
+            # Use gh CLI to get project field values
+            result = subprocess.run(
+                ['gh', 'project', 'field-list', str(project_number),
+                 '--owner', project_owner, '--format', 'json'],
+                capture_output=True, text=True, check=True, timeout=30
+            )
+            fields = json.loads(result.stdout)
+
+            # Find Status field
+            status_field = next((f for f in fields if f['name'] == 'Status'), None)
+            if status_field and 'options' in status_field:
+                columns = {opt['name'] for opt in status_field['options']}
+                logger.info(
+                    f"GitHub API fallback success for {project_owner}/project#{project_number}: "
+                    f"found {len(columns)} columns"
+                )
+                return columns
+            else:
+                logger.error(
+                    f"GitHub API fallback failed for {project_owner}/project#{project_number}: "
+                    f"Status field not found or has no options"
+                )
+        except Exception as e:
+            logger.error(
+                f"GitHub API fallback failed for {project_owner}/project#{project_number}: {e}",
+                exc_info=True
+            )
+
+        # Both methods failed
+        logger.error(
+            f"❌ CRITICAL: Could not determine valid columns for {project_owner}/project#{project_number}. "
+            f"Reverse lookup failed AND GitHub API fallback failed. Status validation SKIPPED."
         )
         return set()
 
@@ -477,50 +538,68 @@ class ProjectMonitor:
 
         # Get valid columns for validation
         valid_columns = self._get_valid_columns_for_board(project_owner, project_number)
+
         if not valid_columns:
-            # Workflow lookup failed - skip validation, return raw items
-            data = execute_board_query_cached(project_owner, project_number)
-            if data is None:
-                logger.warning(f"Board query returned no data for {project_owner}/project#{project_number}")
-                return []
+            # First retry: Force GitHub API fallback
+            logger.warning(
+                f"Initial reverse lookup failed for {project_owner}/project#{project_number}. "
+                f"Forcing GitHub API fallback..."
+            )
+            valid_columns = self._get_valid_columns_for_board(
+                project_owner,
+                project_number,
+                force_api_fallback=True
+            )
 
-            try:
-                # Parse without validation (same as before)
-                owner_type = get_owner_type(project_owner)
-                if owner_type == 'user':
-                    project_data = data['user']['projectV2']
-                else:  # organization
-                    project_data = data['organization']['projectV2']
+            if not valid_columns:
+                # Both methods failed - skip validation entirely
+                logger.error(
+                    f"❌ Cannot validate status for {project_owner}/project#{project_number}: "
+                    f"workflow lookup failed. Returning raw items."
+                )
+                # Return items without validation
+                data = execute_board_query_cached(project_owner, project_number)
+                if data is None:
+                    logger.warning(f"Board query returned no data for {project_owner}/project#{project_number}")
+                    return []
 
-                items = []
-                for node in project_data['items']['nodes']:
-                    content = node.get('content')
-                    if not content:  # Skip draft items
-                        continue
+                try:
+                    # Parse without validation (same as before)
+                    owner_type = get_owner_type(project_owner)
+                    if owner_type == 'user':
+                        project_data = data['user']['projectV2']
+                    else:  # organization
+                        project_data = data['organization']['projectV2']
 
-                    # Find status field
-                    status = "No Status"
-                    for field_value in node['fieldValues']['nodes']:
-                        if field_value and field_value.get('field', {}).get('name') == 'Status':
-                            status = field_value.get('name', 'No Status')
-                            break
+                    items = []
+                    for node in project_data['items']['nodes']:
+                        content = node.get('content')
+                        if not content:  # Skip draft items
+                            continue
 
-                    item = ProjectItem(
-                        item_id=node['id'],
-                        content_id=content['id'],
-                        issue_number=content['number'],
-                        title=content['title'],
-                        status=status,
-                        repository=content['repository']['name'],
-                        last_updated=content['updatedAt']
-                    )
-                    items.append(item)
+                        # Find status field
+                        status = "No Status"
+                        for field_value in node['fieldValues']['nodes']:
+                            if field_value and field_value.get('field', {}).get('name') == 'Status':
+                                status = field_value.get('name', 'No Status')
+                                break
 
-                return items
+                        item = ProjectItem(
+                            item_id=node['id'],
+                            content_id=content['id'],
+                            issue_number=content['number'],
+                            title=content['title'],
+                            status=status,
+                            repository=content['repository']['name'],
+                            last_updated=content['updatedAt']
+                        )
+                        items.append(item)
 
-            except (KeyError, TypeError) as e:
-                logger.error(f"Failed to parse board query response for {project_owner}/project#{project_number}: {e}")
-                return []
+                    return items
+
+                except (KeyError, TypeError) as e:
+                    logger.error(f"Failed to parse board query response for {project_owner}/project#{project_number}: {e}")
+                    return []
 
         # Retry loop for invalid statuses
         max_retries = 2  # Total 3 attempts
@@ -897,12 +976,8 @@ class ProjectMonitor:
                                 )
                             ).result()
                     except RuntimeError:
-                        # No running loop, create one
-                        loop = asyncio.new_event_loop()
-                        asyncio.set_event_loop(loop)
-                        
-                        # Get parent issue number
-                        parent_issue_number = loop.run_until_complete(
+                        # No running loop, use asyncio.run()
+                        parent_issue_number = asyncio.run(
                             feature_branch_manager.get_parent_issue(
                                 github_integration,
                                 issue_number,
@@ -1887,16 +1962,11 @@ class ProjectMonitor:
                         # For discussions, also check discussion comments (fallback)
                         # Use a separate thread to avoid "loop already running" errors if called from async context
                         import concurrent.futures
-                        
+
                         def run_check():
-                            new_loop = asyncio.new_event_loop()
-                            asyncio.set_event_loop(new_loop)
-                            try:
-                                return new_loop.run_until_complete(
-                                    github.has_agent_processed_discussion(discussion_id, agent)
-                                )
-                            finally:
-                                new_loop.close()
+                            return asyncio.run(
+                                github.has_agent_processed_discussion(discussion_id, agent)
+                            )
 
                         with concurrent.futures.ThreadPoolExecutor() as executor:
                             already_processed = executor.submit(run_check).result()
@@ -4937,21 +5007,16 @@ The automated test-fix-validate cycle has failed and requires manual interventio
                     logger.info(
                         f"Preparing feature branch for repair cycle on issue #{issue_number}"
                     )
-                    
-                    # We're in a thread context, create and use new event loop
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-                    try:
-                        branch_name = loop.run_until_complete(
-                            feature_branch_manager.prepare_feature_branch(
-                                project=project_name,
-                                issue_number=issue_number,
-                                github_integration=github,
-                                issue_title=issue_title
-                            )
+
+                    # Prepare feature branch using asyncio.run()
+                    branch_name = asyncio.run(
+                        feature_branch_manager.prepare_feature_branch(
+                            project=project_name,
+                            issue_number=issue_number,
+                            github_integration=github,
+                            issue_title=issue_title
                         )
-                    finally:
-                        loop.close()
+                    )
                     
                     logger.info(f"Checked out feature branch for repair cycle: {branch_name}")
                     stage_context['branch_name'] = branch_name

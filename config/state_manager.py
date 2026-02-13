@@ -40,6 +40,18 @@ class GitHubBoard:
     columns: List[GitHubColumn]
     status_field_id: Optional[str] = None  # GraphQL field ID for the Status field
 
+    def __post_init__(self):
+        """Validate board state after initialization"""
+        if self.project_number <= 0:
+            raise ValueError(
+                f"Invalid project_number for board '{self.name}': {self.project_number}. "
+                f"Project number must be positive."
+            )
+        if not self.project_id:
+            raise ValueError(
+                f"Invalid project_id for board '{self.name}': cannot be empty"
+            )
+
 
 @dataclass
 class GitHubProjectState:
