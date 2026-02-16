@@ -10,6 +10,7 @@ Manages the complete git workflow lifecycle:
 
 import subprocess
 import logging
+import fnmatch
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 from dataclasses import dataclass
@@ -30,6 +31,81 @@ class BranchInfo:
     pr_number: Optional[int] = None
     pr_url: Optional[str] = None
     pr_state: Optional[str] = None  # 'draft', 'open', 'merged', 'closed'
+
+
+def validate_no_unwanted_docs(project_dir: str, staged_files: List[str]) -> Dict[str, Any]:
+    """
+    Validate that no unwanted documentation markdown files are being committed.
+
+    Per CLAUDE.md guidelines: "Do not create markdown files or any documentation
+    during your tasks unless creating documentation is explicitly part of the task requirements."
+
+    Args:
+        project_dir: Path to project directory
+        staged_files: List of staged file paths
+
+    Returns:
+        Dict with 'valid' (bool) and 'violations' (list of problematic files)
+    """
+    # Allowed locations for markdown files
+    allowed_patterns = [
+        '.claude/**/*.md',           # Agent/skill definitions
+        'documentation/**/*.md',      # Formal documentation
+        'README.md',                  # Project readme
+        '**/CLAUDE.md',               # Project instructions
+        'docs/**/*.md',               # Documentation directory
+        '**/.github/**/*.md',         # GitHub workflows and templates
+    ]
+
+    # Disallowed patterns (task reports and status files)
+    disallowed_patterns = [
+        '*_REPORT.md',
+        '*_STATUS.md',
+        '*_CHECKLIST.md',
+        '*_REVIEW.md',
+        '*_FIX.md',
+        '*_VERIFICATION.md',
+        '*_ANALYSIS.md',
+        '*_SUMMARY.md',
+        '*_TODO.md',
+        '*_NOTES.md',
+        'CODE_REVIEW.md',
+        'DEPLOYMENT_CHECKLIST.md',
+        'IMPLEMENTATION_*.md',
+        'REFACTOR_*.md',
+    ]
+
+    violations = []
+
+    for file_path in staged_files:
+        # Only check markdown files
+        if not file_path.endswith('.md'):
+            continue
+
+        # Check if in allowed location
+        allowed = any(fnmatch.fnmatch(file_path, pattern) for pattern in allowed_patterns)
+
+        if allowed:
+            continue
+
+        # Check if matches disallowed pattern
+        disallowed = any(fnmatch.fnmatch(file_path, pattern) for pattern in disallowed_patterns)
+
+        if disallowed:
+            violations.append({
+                'file': file_path,
+                'reason': 'documentation_file_violates_guidelines',
+                'message': (
+                    f"File '{file_path}' appears to be a task report or status file. "
+                    f"Per CLAUDE.md guidelines, use GitHub comments/discussions instead. "
+                    f"Do not commit documentation markdown files unless explicitly required."
+                )
+            })
+
+    return {
+        'valid': len(violations) == 0,
+        'violations': violations
+    }
 
 
 class GitWorkflowManager:
@@ -744,7 +820,13 @@ class GitWorkflowManager:
             logger.error(f"Failed to add all: {e}")
             return False
 
-    async def commit(self, project_dir: str, message: str, skip_hooks: bool = True) -> bool:
+    async def commit(
+        self,
+        project_dir: str,
+        message: str,
+        skip_hooks: bool = True,
+        validate_docs: bool = True
+    ) -> bool:
         """
         Commit staged changes.
 
@@ -752,11 +834,40 @@ class GitWorkflowManager:
             project_dir: Path to the project directory
             message: Commit message
             skip_hooks: If True, skip pre-commit hooks with --no-verify (default: True for orchestrator)
+            validate_docs: If True, validate no unwanted documentation files (default: True)
 
         Returns:
             True if commit succeeded, False otherwise
         """
         try:
+            # Validate staged files if enabled
+            if validate_docs:
+                # Get list of staged files
+                status_result = subprocess.run(
+                    ['git', 'diff', '--cached', '--name-only'],
+                    cwd=project_dir,
+                    capture_output=True,
+                    text=True,
+                    timeout=10
+                )
+
+                if status_result.returncode == 0:
+                    staged_files = [f.strip() for f in status_result.stdout.split('\n') if f.strip()]
+
+                    # Validate no unwanted documentation files
+                    validation = validate_no_unwanted_docs(project_dir, staged_files)
+
+                    if not validation['valid']:
+                        logger.error("Commit blocked: Unwanted documentation files detected")
+                        for violation in validation['violations']:
+                            logger.error(f"  ✗ {violation['file']}: {violation['message']}")
+
+                        logger.error(
+                            "\nPer CLAUDE.md guidelines: Do not create markdown documentation files. "
+                            "Use GitHub comments/discussions instead."
+                        )
+                        return False
+
             cmd = ['git', 'commit', '-m', message]
 
             # Skip pre-commit hooks for orchestrator commits by default

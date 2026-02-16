@@ -2,7 +2,7 @@
 """
 Artifact Generator
 
-Generates agent and skill markdown files from templates and strategy.
+Generates agent and skill markdown files using Claude Code CLI prompts.
 """
 
 import logging
@@ -15,20 +15,43 @@ from typing import Dict, Any, List
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from scripts.template_engine import (
-    load_template,
-    populate_template,
-    build_agent_context,
-    build_skill_context
-)
+from claude.claude_integration import run_claude_code
+from monitoring.timestamp_utils import utc_isoformat
 
 # Configure logging
 logger = logging.getLogger(__name__)
 
-# Constants
-CLAUDE_DIR = Path(os.environ.get('ORCHESTRATOR_ROOT', '.')) / '.claude'
-AGENTS_DIR = CLAUDE_DIR / 'agents'
-SKILLS_DIR = CLAUDE_DIR / 'skills'
+
+def get_workspace_root() -> Path:
+    """
+    Get the workspace root directory
+
+    Returns:
+        Path to workspace root (/workspace in container, parent of orchestrator root outside)
+    """
+    # Inside container: /workspace
+    # Outside container: Parent of orchestrator root (e.g., /home/user/workspace/orchestrator)
+    if Path('/workspace').exists() and Path('/workspace').is_dir():
+        return Path('/workspace')
+    else:
+        # Outside container: parent of ORCHESTRATOR_ROOT
+        orchestrator_root = Path(os.environ.get('ORCHESTRATOR_ROOT', Path(__file__).parent.parent))
+        return orchestrator_root.parent
+
+
+def get_project_claude_dir(project: str) -> Path:
+    """
+    Get .claude directory for a specific project
+
+    Args:
+        project: Project name
+
+    Returns:
+        Path to project's .claude directory
+    """
+    workspace_root = get_workspace_root()
+    project_dir = workspace_root / project
+    return project_dir / '.claude'
 
 
 def validate_artifact_name(name: str, artifact_type: str):
@@ -63,7 +86,7 @@ def validate_artifact_name(name: str, artifact_type: str):
         raise ValueError(f"Invalid {artifact_type} name '{name}': too long (max 200 chars)")
 
 
-def generate_agent(
+async def generate_agent(
     project: str,
     agent_spec: Dict[str, Any],
     analysis: Dict[str, Any],
@@ -72,7 +95,7 @@ def generate_agent(
     dry_run: bool = False
 ) -> Path:
     """
-    Generate agent markdown file
+    Generate agent markdown file using Claude Code CLI
 
     Args:
         project: Project name
@@ -88,32 +111,158 @@ def generate_agent(
     # Validate agent name for filesystem safety
     validate_artifact_name(agent_spec['name'], 'agent')
 
-    # Load template
-    template = load_template('agent_template.md')
-
-    # Build context
-    context = build_agent_context(project, agent_spec, analysis, strategy, codebase_hash)
-
-    # Populate template
-    content = populate_template(template, context)
-
-    # Determine output path
-    agent_file = AGENTS_DIR / f"{agent_spec['name']}.md"
+    # Get project-specific .claude directory
+    workspace_root = get_workspace_root()
+    claude_dir = get_project_claude_dir(project)
+    agents_dir = claude_dir / 'agents'
+    agent_file = agents_dir / f"{agent_spec['name']}.md"
 
     if dry_run:
         logger.info(f"[DRY RUN] Would write: {agent_file}")
         return agent_file
 
-    # Write file
-    agent_file.parent.mkdir(parents=True, exist_ok=True)
-    with open(agent_file, 'w') as f:
-        f.write(content)
+    # Read summaries
+    summaries_dir = workspace_root / project / '.claude' / 'clauditoreum'
+    arch_summary = (summaries_dir / 'ArchitectureSummary.md').read_text()
+    tech_summary = (summaries_dir / 'TechStackSummary.md').read_text()
+    patterns_summary = (summaries_dir / 'PatternsSummary.md').read_text()
 
-    logger.info(f"  ✓ Generated agent: {agent_file.name}")
-    return agent_file
+    # Build prompt for Claude Code CLI
+    prompt = f"""# Agent Definition Generation
+
+You are creating an agent definition for the **{project}** project.
+
+## Agent to Create
+
+**Name:** {agent_spec['name']}
+**Purpose:** {agent_spec.get('purpose', 'Not specified')}
+**Rationale:** {agent_spec.get('rationale', 'Not specified')}
+
+**Capabilities:**
+{chr(10).join('- ' + cap for cap in agent_spec.get('capabilities', []))}
+
+**Tools:** {', '.join(agent_spec.get('tools', []))}
+**Model:** {agent_spec.get('model', 'sonnet')}
+
+## Project Context
+
+**Architecture Summary:**
+```markdown
+{arch_summary[:3000]}
+```
+
+**Tech Stack Summary:**
+```markdown
+{tech_summary[:3000]}
+```
+
+**Patterns & Conventions:**
+```markdown
+{patterns_summary[:3000]}
+```
+
+## Your Mission
+
+Create a complete agent definition markdown file with YAML frontmatter.
+
+**Output Path:** `.claude/agents/{agent_spec['name']}.md`
+
+Use this structure:
+
+```markdown
+---
+name: {agent_spec['name']}
+description: {agent_spec.get('purpose', 'Agent description')}
+tools: {agent_spec.get('tools', ['Read', 'Grep', 'Glob'])}
+model: {agent_spec.get('model', 'sonnet')}
+color: {agent_spec.get('color', 'blue')}
+generated: true
+generation_timestamp: {utc_isoformat()}
+generation_version: "2.0"
+source_project: {project}
+source_codebase_hash: {codebase_hash}
+---
+
+# {{Agent Display Name}}
+
+You are a specialized agent for the **{project}** project.
+
+## Role
+
+{{Detailed role description - BE SPECIFIC with architectural context from summaries}}
+
+## Project Context
+
+**Architecture:** {{From ArchitectureSummary - actual architecture style}}
+**Key Technologies:** {{From TechStackSummary - actual frameworks}}
+**Conventions:** {{From PatternsSummary - actual coding patterns}}
+
+## Knowledge Base
+
+### Architecture Understanding
+{{Paste relevant sections from ArchitectureSummary that this agent needs}}
+
+### Tech Stack Knowledge
+{{Paste relevant sections from TechStackSummary that this agent needs}}
+
+### Coding Patterns
+{{Paste relevant patterns from PatternsSummary that this agent should enforce}}
+
+## Capabilities
+
+{{List specific capabilities from agent_spec - WITH FILE EXAMPLES from the project}}
+
+## Guidelines
+
+{{List specific guidelines from CLAUDE.md and PatternsSummary}}
+
+## Common Tasks
+
+{{Concrete examples - USE ACTUAL FILES that exist in the project}}
+
+## Antipatterns to Watch For
+
+{{Specific antipatterns from PatternsSummary}}
+
+---
+
+*This agent was automatically generated from codebase analysis.*
+```
+
+**Important:**
+- Pull content directly from the summaries - don't make things up
+- Every "example task" should reference actual files that exist (use Read tool to verify)
+- Patterns and conventions should come from PatternsSummary.md
+- Ground everything in the actual project analysis
+- Use the Write tool to create the file at the specified path
+"""
+
+    # Run Claude Code CLI to generate agent
+    context = {
+        'project': project,
+        'work_dir': str(workspace_root / project),
+        'agent': 'artifact_generator',
+        'use_docker': False
+    }
+
+    try:
+        result = await run_claude_code(prompt, context)
+
+        # Claude should have created the file, but verify it exists
+        if not agent_file.exists():
+            # If Claude didn't create it, write the returned content
+            agent_file.parent.mkdir(parents=True, exist_ok=True)
+            agent_file.write_text(result)
+
+        logger.info(f"  ✓ Generated agent: {agent_file.name}")
+        return agent_file
+
+    except Exception as e:
+        logger.error(f"  ✗ Failed to generate agent {agent_spec['name']}: {e}")
+        raise
 
 
-def generate_skill(
+async def generate_skill(
     project: str,
     skill_spec: Dict[str, Any],
     analysis: Dict[str, Any],
@@ -122,7 +271,7 @@ def generate_skill(
     dry_run: bool = False
 ) -> Path:
     """
-    Generate skill markdown file
+    Generate skill markdown file using Claude Code CLI
 
     Args:
         project: Project name
@@ -138,33 +287,138 @@ def generate_skill(
     # Validate skill name for filesystem safety
     validate_artifact_name(skill_spec['name'], 'skill')
 
-    # Load template
-    template = load_template('skill_template.md')
-
-    # Build context
-    context = build_skill_context(project, skill_spec, analysis, strategy, codebase_hash)
-
-    # Populate template
-    content = populate_template(template, context)
-
-    # Determine output path
-    skill_dir = SKILLS_DIR / skill_spec['name']
+    # Get project-specific .claude directory
+    workspace_root = get_workspace_root()
+    claude_dir = get_project_claude_dir(project)
+    skills_dir = claude_dir / 'skills'
+    skill_dir = skills_dir / skill_spec['name']
     skill_file = skill_dir / 'SKILL.md'
 
     if dry_run:
         logger.info(f"[DRY RUN] Would write: {skill_file}")
         return skill_dir
 
-    # Write file
-    skill_dir.mkdir(parents=True, exist_ok=True)
-    with open(skill_file, 'w') as f:
-        f.write(content)
+    # Read summaries
+    summaries_dir = workspace_root / project / '.claude' / 'clauditoreum'
+    arch_summary = (summaries_dir / 'ArchitectureSummary.md').read_text()
+    tech_summary = (summaries_dir / 'TechStackSummary.md').read_text()
+    patterns_summary = (summaries_dir / 'PatternsSummary.md').read_text()
 
-    logger.info(f"  ✓ Generated skill: {skill_dir.name}")
-    return skill_dir
+    # Build prompt for Claude Code CLI
+    prompt = f"""# Skill Definition Generation
+
+You are creating a skill definition for the **{project}** project.
+
+## Skill to Create
+
+**Name:** {skill_spec['name']}
+**Purpose:** {skill_spec.get('purpose', 'Not specified')}
+**Implementation:** {skill_spec.get('implementation', 'Not specified')}
+**Args:** {skill_spec.get('args', [])}
+
+## Project Context
+
+**Architecture Summary:**
+```markdown
+{arch_summary[:2000]}
+```
+
+**Tech Stack Summary:**
+```markdown
+{tech_summary[:2000]}
+```
+
+**Patterns & Conventions:**
+```markdown
+{patterns_summary[:2000]}
+```
+
+## Your Mission
+
+Create a complete skill definition markdown file with YAML frontmatter.
+
+**Output Path:** `.claude/skills/{skill_spec['name']}/SKILL.md`
+
+Use this structure:
+
+```markdown
+---
+name: {skill_spec['name']}
+description: {skill_spec.get('purpose', 'Skill description')}
+user_invocable: true
+args: {skill_spec.get('args', [])}
+generated: true
+generation_timestamp: {utc_isoformat()}
+generation_version: "2.0"
+source_project: {project}
+source_codebase_hash: {codebase_hash}
+---
+
+# {{Skill Display Name}}
+
+Quick-reference skill for **{project}**.
+
+## Usage
+
+```bash
+/{skill_spec['name']} {{args}}
+```
+
+## Purpose
+
+{{Detailed purpose - BE SPECIFIC with project context}}
+
+## Implementation
+
+{{Actual commands/operations to perform - USE ACTUAL PROJECT FILES AND COMMANDS}}
+
+For example:
+- If this is a test skill, use the actual test framework command from TechStackSummary
+- If this is an architecture skill, reference actual directories from ArchitectureSummary
+- If this is a patterns skill, cite actual files from PatternsSummary
+
+## Examples
+
+{{Concrete usage examples with actual project context}}
+
+---
+
+*This skill was automatically generated.*
+```
+
+**Important:**
+- Use actual commands from the project (from TechStackSummary - test framework, build tools, etc.)
+- Reference actual files and directories from ArchitectureSummary
+- Don't use generic placeholders - be specific to THIS project
+- Use the Write tool to create the file at the specified path
+"""
+
+    # Run Claude Code CLI to generate skill
+    context = {
+        'project': project,
+        'work_dir': str(workspace_root / project),
+        'agent': 'artifact_generator',
+        'use_docker': False
+    }
+
+    try:
+        result = await run_claude_code(prompt, context)
+
+        # Claude should have created the file, but verify it exists
+        if not skill_file.exists():
+            # If Claude didn't create it, write the returned content
+            skill_file.parent.mkdir(parents=True, exist_ok=True)
+            skill_file.write_text(result)
+
+        logger.info(f"  ✓ Generated skill: {skill_dir.name}")
+        return skill_dir
+
+    except Exception as e:
+        logger.error(f"  ✗ Failed to generate skill {skill_spec['name']}: {e}")
+        raise
 
 
-def generate_all_artifacts(
+async def generate_all_artifacts(
     project: str,
     strategy: Dict[str, Any],
     analysis: Dict[str, Any],
@@ -172,7 +426,7 @@ def generate_all_artifacts(
     dry_run: bool = False
 ) -> Dict[str, List[Path]]:
     """
-    Generate all agents and skills for a project
+    Generate all agents and skills for a project using Claude Code CLI
 
     Args:
         project: Project name
@@ -193,7 +447,7 @@ def generate_all_artifacts(
     logger.info(f"  Generating {len(strategy['agents'])} agent(s)...")
     for agent_spec in strategy['agents']:
         try:
-            agent_path = generate_agent(project, agent_spec, analysis, strategy, codebase_hash, dry_run)
+            agent_path = await generate_agent(project, agent_spec, analysis, strategy, codebase_hash, dry_run)
             created_artifacts['agents'].append(agent_path)
         except Exception as e:
             logger.error(f"  ✗ Failed to generate agent {agent_spec['name']}: {e}")
@@ -202,7 +456,7 @@ def generate_all_artifacts(
     logger.info(f"  Generating {len(strategy['skills'])} skill(s)...")
     for skill_spec in strategy['skills']:
         try:
-            skill_path = generate_skill(project, skill_spec, analysis, strategy, codebase_hash, dry_run)
+            skill_path = await generate_skill(project, skill_spec, analysis, strategy, codebase_hash, dry_run)
             created_artifacts['skills'].append(skill_path)
         except Exception as e:
             logger.error(f"  ✗ Failed to generate skill {skill_spec['name']}: {e}")
@@ -210,20 +464,165 @@ def generate_all_artifacts(
     return created_artifacts
 
 
-def main():
-    """CLI entry point for testing"""
-    import argparse
+async def review_artifacts_quality(
+    project: str,
+    created_artifacts: Dict[str, List[Path]],
+    dry_run: bool = False
+) -> Dict[str, Any]:
+    """
+    Use Claude Code CLI to review and refine generated artifacts
+
+    Args:
+        project: Project name
+        created_artifacts: Dict with 'agents' and 'skills' lists of paths
+        dry_run: If True, don't make changes
+
+    Returns:
+        Dict with review results
+    """
+    workspace_root = get_workspace_root()
+
+    # Build list of artifacts for review
+    agent_files = [p.name for p in created_artifacts['agents']]
+    skill_files = [p.parent.name + '/SKILL.md' for p in created_artifacts['skills']]
+
+    logger.info(f"  Reviewing {len(agent_files)} agent(s) and {len(skill_files)} skill(s)...")
+
+    # Build comprehensive review prompt
+    prompt = f"""# Agent Team Quality Review
+
+You are reviewing the generated agent and skill definitions for **{project}**.
+
+## Artifacts to Review
+
+**Agents ({len(agent_files)}):**
+{chr(10).join(f'- .claude/agents/{name}' for name in agent_files)}
+
+**Skills ({len(skill_files)}):**
+{chr(10).join(f'- .claude/skills/{name}' for name in skill_files)}
+
+## Your Mission
+
+Review ALL generated artifacts and fix any issues found. Focus on quality, accuracy, and polish.
+
+### Review Criteria
+
+For each artifact:
+
+1. **Placeholder Removal** (Critical):
+   - Find and fix unfilled placeholders like `{{e}}`, `{{trace_id}}`, `{{store_error}}`, etc.
+   - Replace with realistic variable names or complete the code examples
+   - Common placeholders to fix:
+     - Exception variables: `{{e}}` → `e` or specific name
+     - IDs: `{{trace_id}}` → `trace_id` or example value
+     - Errors: `{{store_error}}` → `store_error`
+     - Lists: `{{invalid_services}}` → `invalid_services`
+
+2. **Code Example Quality**:
+   - Ensure all code examples are complete and runnable
+   - Use actual file paths from the project
+   - Follow project conventions (async/await, type hints, etc.)
+   - Remove any template artifacts or incomplete snippets
+
+3. **Consistency**:
+   - Verify YAML frontmatter is complete and valid
+   - Check that tone and formatting are consistent across all artifacts
+   - Ensure descriptions are clear and actionable
+
+4. **Accuracy**:
+   - Verify file paths and line numbers are correct (use Read/Grep to check)
+   - Confirm port interfaces and method signatures match actual code
+   - Test that example commands will actually work
+
+5. **Optimization**:
+   - Remove redundancy and verbosity
+   - Clarify ambiguous instructions
+   - Add missing context where needed
+   - Improve examples to be more practical
+
+6. **Formatting**:
+   - Ensure proper markdown formatting
+   - Code blocks have correct language tags
+   - Lists and sections are well-structured
+
+## Process
+
+1. Read each artifact file using the Read tool
+2. Identify issues based on criteria above
+3. Use the Edit tool to fix issues (preserve existing content structure)
+4. Focus on surgical edits - don't rewrite unnecessarily
+5. After reviewing all files, provide a summary of changes made
+
+## Important Guidelines
+
+- Make targeted fixes, not wholesale rewrites
+- Preserve the core content and knowledge base
+- Use Edit tool for changes (not Write - we want to preserve content)
+- If you find a file path reference, verify it exists before keeping it
+- If unsure about something, leave it rather than guessing
+
+## Expected Output
+
+After reviewing and fixing all artifacts, provide a summary:
+
+```markdown
+# Quality Review Summary
+
+## Changes Made
+
+### Agents
+- agent-name.md: Fixed X placeholders, improved Y examples
+- ...
+
+### Skills
+- skill-name/SKILL.md: Fixed X issues, clarified Y
+- ...
+
+## Statistics
+- Total artifacts reviewed: X
+- Issues found: Y
+- Issues fixed: Z
+- Artifacts modified: N
+
+## Validation Ready
+All artifacts should now pass validation without warnings.
+```
+"""
+
+    if dry_run:
+        logger.info(f"[DRY RUN] Would review {len(agent_files) + len(skill_files)} artifacts")
+        return {'status': 'dry_run', 'reviewed': 0, 'modified': 0}
+
+    # Run Claude Code CLI for review
+    context = {
+        'project': project,
+        'work_dir': str(workspace_root / project),
+        'agent': 'quality_reviewer',
+        'use_docker': False
+    }
+
+    try:
+        result = await run_claude_code(prompt, context)
+
+        logger.info(f"  ✓ Quality review complete")
+
+        return {
+            'status': 'completed',
+            'reviewed': len(agent_files) + len(skill_files),
+            'summary': result
+        }
+
+    except Exception as e:
+        logger.error(f"  ✗ Quality review failed: {e}")
+        return {
+            'status': 'error',
+            'error': str(e)
+        }
+
+
+async def _run_generation(args):
+    """Async wrapper for generation"""
     import json
-
-    parser = argparse.ArgumentParser(description="Generate agents and skills")
-    parser.add_argument('project', help='Project name')
-    parser.add_argument('--strategy', help='Path to strategy JSON (default: auto-detect)')
-    parser.add_argument('--analysis', help='Path to analysis JSON (default: auto-detect)')
-    parser.add_argument('--dry-run', action='store_true', help='Preview without writing files')
-    args = parser.parse_args()
-
-    # Setup logging
-    logging.basicConfig(level=logging.INFO, format='%(message)s')
 
     # Load strategy
     if args.strategy:
@@ -251,24 +650,42 @@ def main():
     with open(analysis_file, 'r') as f:
         analysis = json.load(f)
 
+    # Get codebase hash from analysis or calculate
+    from scripts.maintain_agent_team import calculate_codebase_hash
+    codebase_hash = calculate_codebase_hash(args.project)
+
     # Generate artifacts
+    created_artifacts = await generate_all_artifacts(
+        args.project,
+        strategy,
+        analysis,
+        codebase_hash,
+        dry_run=args.dry_run
+    )
+
+    print(f"\n✓ Generation complete for {args.project}")
+    print(f"  Agents: {len(created_artifacts['agents'])}")
+    print(f"  Skills: {len(created_artifacts['skills'])}")
+
+
+def main():
+    """CLI entry point for testing"""
+    import argparse
+    import asyncio
+
+    parser = argparse.ArgumentParser(description="Generate agents and skills")
+    parser.add_argument('project', help='Project name')
+    parser.add_argument('--strategy', help='Path to strategy JSON (default: auto-detect)')
+    parser.add_argument('--analysis', help='Path to analysis JSON (default: auto-detect)')
+    parser.add_argument('--dry-run', action='store_true', help='Preview without writing files')
+    args = parser.parse_args()
+
+    # Setup logging
+    logging.basicConfig(level=logging.INFO, format='%(message)s')
+
+    # Run async generation
     try:
-        # Get codebase hash from analysis or calculate
-        from scripts.maintain_agent_team import calculate_codebase_hash
-        codebase_hash = calculate_codebase_hash(args.project)
-
-        created_artifacts = generate_all_artifacts(
-            args.project,
-            strategy,
-            analysis,
-            codebase_hash,
-            dry_run=args.dry_run
-        )
-
-        print(f"\n✓ Generation complete for {args.project}")
-        print(f"  Agents: {len(created_artifacts['agents'])}")
-        print(f"  Skills: {len(created_artifacts['skills'])}")
-
+        asyncio.run(_run_generation(args))
     except Exception as e:
         logger.error(f"✗ Generation failed: {e}", exc_info=True)
         sys.exit(1)

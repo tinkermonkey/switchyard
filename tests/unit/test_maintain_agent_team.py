@@ -4,8 +4,7 @@ Unit tests for Agent Team Maintainer
 Tests the foundation components:
 - Project discovery
 - Change detection
-- Manifest management
-- State tracking
+- State tracking (per-project)
 """
 
 import pytest
@@ -23,13 +22,9 @@ from scripts.maintain_agent_team import (
     discover_projects_for_generation,
     detect_codebase_changes,
     calculate_codebase_hash,
-    load_manifest,
-    save_manifest,
     load_project_state,
     save_project_state,
     ensure_directories,
-    GENERATED_DIR,
-    MANIFEST_FILE,
     STATE_DIR
 )
 
@@ -56,25 +51,14 @@ def temp_workspace(tmp_path):
 @pytest.fixture
 def temp_config(tmp_path, monkeypatch):
     """Configure temporary directories for tests"""
-    claude_dir = tmp_path / ".claude"
-    claude_dir.mkdir()
-
-    generated_dir = claude_dir / "generated"
-    generated_dir.mkdir()
-
     state_dir = tmp_path / "state" / "projects"
     state_dir.mkdir(parents=True)
 
     # Monkeypatch the module-level constants
     import scripts.maintain_agent_team as module
-    monkeypatch.setattr(module, 'GENERATED_DIR', generated_dir)
-    monkeypatch.setattr(module, 'MANIFEST_FILE', generated_dir / 'manifest.yaml')
     monkeypatch.setattr(module, 'STATE_DIR', state_dir)
-    monkeypatch.setattr(module, 'CLAUDE_DIR', claude_dir)
 
     return {
-        'claude_dir': claude_dir,
-        'generated_dir': generated_dir,
         'state_dir': state_dir
     }
 
@@ -220,89 +204,6 @@ class TestChangeDetection:
         assert 'modified' in result['impact']['reason']
 
 
-class TestManifestManagement:
-    """Tests for manifest file management"""
-
-    def test_load_manifest_empty(self, temp_config):
-        """Test loading manifest when it doesn't exist"""
-        manifest = load_manifest()
-
-        assert manifest['version'] == '1.0'
-        assert 'last_updated' in manifest
-        assert manifest['projects'] == {}
-
-    def test_save_and_load_manifest(self, temp_config):
-        """Test saving and loading manifest"""
-        manifest = {
-            'version': '1.0',
-            'projects': {
-                'context-studio': {
-                    'last_generation': '2026-02-12T14:30:00Z',
-                    'generation_hash': 'abc123',
-                    'agents': [
-                        {
-                            'name': 'context-studio-tester',
-                            'file': 'agents/context-studio-tester.md',
-                            'purpose': 'Test execution'
-                        }
-                    ]
-                }
-            }
-        }
-
-        save_manifest(manifest)
-        loaded = load_manifest()
-
-        assert loaded['version'] == '1.0'
-        assert 'context-studio' in loaded['projects']
-        assert loaded['projects']['context-studio']['generation_hash'] == 'abc123'
-        assert len(loaded['projects']['context-studio']['agents']) == 1
-
-    def test_save_manifest_updates_timestamp(self, temp_config):
-        """Test that save_manifest updates last_updated timestamp"""
-        manifest = {
-            'version': '1.0',
-            'last_updated': '2026-01-01T00:00:00Z',
-            'projects': {}
-        }
-
-        save_manifest(manifest)
-        loaded = load_manifest()
-
-        # Timestamp should be updated
-        assert loaded['last_updated'] != '2026-01-01T00:00:00Z'
-
-    def test_yaml_injection_protection(self, temp_config):
-        """Test that YAML injection is prevented by safe_dump"""
-        # Attempt to inject malicious YAML tag in a value
-        malicious_manifest = {
-            'version': '1.0',
-            'projects': {
-                'test-project': {
-                    'last_generation': '!<tag:yaml.org,2002:python/object/apply:os.system> ["echo pwned"]'
-                }
-            }
-        }
-
-        save_manifest(malicious_manifest)
-
-        # Load it back - should be safe (string, not code)
-        loaded = load_manifest()
-        assert 'version' in loaded
-        assert loaded['version'] == '1.0'
-        assert 'test-project' in loaded['projects']
-
-        # The malicious string should be loaded as a plain string, not executed
-        gen_value = loaded['projects']['test-project']['last_generation']
-        assert isinstance(gen_value, str)
-        # The value is preserved as a string (not executed)
-        assert 'tag:yaml.org' in gen_value
-
-        # Verify it's a string, not an executed command
-        # If it were executed, it would be NoneType or raise an error
-        assert type(gen_value) == str
-
-
 class TestStateTracking:
     """Tests for project state tracking"""
 
@@ -432,13 +333,12 @@ class TestDirectorySetup:
         """Test that ensure_directories creates required directories"""
         # Remove directories to test creation
         import shutil
-        generated_dir = temp_config['generated_dir']
-        if generated_dir.exists():
-            shutil.rmtree(generated_dir)
+        state_dir = temp_config['state_dir']
+        if state_dir.exists():
+            shutil.rmtree(state_dir)
 
         ensure_directories()
 
-        assert temp_config['generated_dir'].exists()
         assert temp_config['state_dir'].exists()
 
 

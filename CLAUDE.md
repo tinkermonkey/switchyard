@@ -4,6 +4,23 @@ This file provides guidance to coding agents when working with this codebase.
 
 **IMPORTANT**: Do not create markdown files or any documentation during your tasks unless creating documentation is explicitly part of the task requirements.
 
+### What NOT to Create
+
+Do not create task reports, status files, or temporary documentation files such as:
+- `CODE_REVIEW.md`, `DEPLOYMENT_CHECKLIST.md`, `IMPLEMENTATION_REPORT.md`
+- `*_STATUS.md`, `*_CHECKLIST.md`, `*_REVIEW.md`, `*_FIX.md`, `*_VERIFICATION.md`
+- `*_ANALYSIS.md`, `*_SUMMARY.md`, `*_TODO.md`, `*_NOTES.md`
+
+**Why**: These files clutter the repository and violate the guideline. Instead:
+- Post updates and findings as **GitHub issue comments**
+- Post review feedback as **GitHub PR comments**
+- Use **GitHub discussions** for longer-form communication
+
+**Allowed markdown files** (only when necessary):
+- Agent/skill definitions in `.claude/agents/` and `.claude/skills/`
+- Formal documentation in `documentation/` directory
+- `README.md` and `CLAUDE.md` project files
+
 ## Quick Reference by Role
 
 - **Coding Agent**: Core Architecture (§11), Development Workflow (§280)
