@@ -1,5 +1,6 @@
 # App specific stuff
 medic/*
+.claude/settings.local.json
 
 # Environment variables
 .env
