@@ -976,10 +976,10 @@ class FeatureBranchManager:
         from services.git_workflow_manager import git_workflow_manager
         await git_workflow_manager.add_all(project_dir)
 
-    async def git_commit(self, project_dir: str, message: str):
-        """Commit changes"""
+    async def git_commit(self, project_dir: str, message: str) -> bool:
+        """Commit changes. Returns True if commit succeeded, False otherwise."""
         from services.git_workflow_manager import git_workflow_manager
-        await git_workflow_manager.commit(project_dir, message)
+        return await git_workflow_manager.commit(project_dir, message)
 
     async def git_push(self, project_dir: str, branch_name: str):
         """Push branch to remote"""
@@ -1600,7 +1600,9 @@ Waiting for human decision...
 
                 # Commit and push standalone branch
                 await self.git_add_all(project_dir)
-                await self.git_commit(project_dir, commit_message)
+                commit_succeeded = await self.git_commit(project_dir, commit_message)
+                if not commit_succeeded:
+                    logger.warning(f"Standalone commit was blocked for issue #{issue_number}. Continuing with push of prior commits.")
 
                 # Determine standalone branch name
                 from services.git_workflow_manager import git_workflow_manager
@@ -1650,7 +1652,9 @@ Waiting for human decision...
 
         # Step 3: Commit changes
         await self.git_add_all(project_dir)
-        await self.git_commit(project_dir, commit_message)
+        commit_succeeded = await self.git_commit(project_dir, commit_message)
+        if not commit_succeeded:
+            logger.warning(f"Commit was blocked (likely unwanted docs validation). Continuing with push of prior commits.")
 
         # Step 3: Verify branch exists before pushing
         branch_exists = await self.branch_exists(project_dir, feature_branch.branch_name)

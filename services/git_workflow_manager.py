@@ -8,6 +8,7 @@ Manages the complete git workflow lifecycle:
 - Integration with code review process
 """
 
+import os
 import subprocess
 import logging
 import fnmatch
@@ -743,6 +744,50 @@ class GitWorkflowManager:
         Raises exception if conflicts detected
         """
         try:
+            # Guard: ensure workspace is clean before attempting rebase.
+            # Previous agent runs may have left staged/unstaged/untracked files
+            # that would cause "cannot pull with rebase: uncommitted changes".
+            status_result = subprocess.run(
+                ['git', 'status', '--porcelain'],
+                cwd=project_dir, capture_output=True, text=True, timeout=10
+            )
+            if status_result.returncode == 0 and status_result.stdout.strip():
+                dirty_files = status_result.stdout.strip().split('\n')
+                logger.warning(
+                    f"Dirty workspace detected before pull rebase ({len(dirty_files)} files). "
+                    f"Cleaning up to allow rebase."
+                )
+                for df in dirty_files:
+                    logger.warning(f"  dirty: {df.strip()}")
+                # Reset staged changes, restore modified files, remove untracked files
+                for cmd, desc in [
+                    (['git', 'reset', 'HEAD', '.'], 'git reset HEAD'),
+                    (['git', 'checkout', '--', '.'], 'git checkout'),
+                    (['git', 'clean', '-fd'], 'git clean'),
+                ]:
+                    r = subprocess.run(
+                        cmd, cwd=project_dir, capture_output=True, text=True, timeout=10
+                    )
+                    if r.returncode != 0:
+                        logger.error(
+                            f"{desc} failed during pre-rebase cleanup (rc={r.returncode}): "
+                            f"{r.stderr.strip()}"
+                        )
+
+                # Verify cleanup succeeded
+                recheck = subprocess.run(
+                    ['git', 'status', '--porcelain'],
+                    cwd=project_dir, capture_output=True, text=True, timeout=10
+                )
+                if recheck.returncode == 0 and recheck.stdout.strip():
+                    remaining = recheck.stdout.strip().split('\n')
+                    logger.error(
+                        f"Workspace still dirty after cleanup ({len(remaining)} files remain). "
+                        f"Rebase will likely fail."
+                    )
+                    for r in remaining:
+                        logger.error(f"  still dirty: {r.strip()}")
+
             result = subprocess.run(
                 ['git', 'pull', '--rebase'],
                 cwd=project_dir,
@@ -859,13 +904,47 @@ class GitWorkflowManager:
 
                     if not validation['valid']:
                         logger.error("Commit blocked: Unwanted documentation files detected")
+                        violation_files = []
                         for violation in validation['violations']:
                             logger.error(f"  ✗ {violation['file']}: {violation['message']}")
+                            violation_files.append(violation['file'])
 
                         logger.error(
                             "\nPer CLAUDE.md guidelines: Do not create markdown documentation files. "
                             "Use GitHub comments/discussions instead."
                         )
+
+                        # Unstage and remove the offending files to prevent dirty state
+                        # from blocking subsequent git operations (e.g. pull --rebase)
+                        for vfile in violation_files:
+                            vpath = os.path.join(project_dir, vfile)
+                            try:
+                                reset_result = subprocess.run(
+                                    ['git', 'reset', 'HEAD', '--', vfile],
+                                    cwd=project_dir, capture_output=True, text=True, timeout=10
+                                )
+                                if reset_result.returncode != 0:
+                                    logger.error(
+                                        f"Failed to unstage {vfile}: {reset_result.stderr.strip()}. "
+                                        f"File remains staged and may block future git operations."
+                                    )
+                                    continue
+                                if os.path.isfile(vpath):
+                                    os.remove(vpath)
+                                    logger.info(f"Removed unwanted file: {vfile}")
+                                elif os.path.isdir(vpath):
+                                    logger.error(
+                                        f"Violation path {vfile} is a directory, not a file. "
+                                        f"Skipping removal - investigate docs validation logic."
+                                    )
+                                elif not os.path.exists(vpath):
+                                    logger.info(f"Violation file {vfile} already removed from disk")
+                            except (OSError, subprocess.SubprocessError) as cleanup_err:
+                                logger.error(
+                                    f"Failed to clean up violation file {vfile}: {cleanup_err}. "
+                                    f"File may remain on disk and block subsequent git operations."
+                                )
+
                         return False
 
             cmd = ['git', 'commit', '-m', message]
