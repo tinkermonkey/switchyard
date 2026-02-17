@@ -2983,8 +2983,10 @@ class ProjectMonitor:
                         logger.warning(f"Failed to parse last review timestamp: {e}")
 
                 # SECOND: Check for open sub-issues
+                # Use the same exit-column-aware logic as _check_pr_ready_on_issue_exit
                 from services.github_integration import GitHubIntegration
                 from services.feature_branch_manager import feature_branch_manager
+                from config.manager import config_manager
 
                 github = GitHubIntegration(
                     repo_owner=project_config.github['org'],
@@ -3004,32 +3006,61 @@ class ProjectMonitor:
                         github, parent_issue_data
                     )
 
-                    open_sub_issues = [s for s in sub_issues if s.get('state') != 'closed']
+                    if len(sub_issues) == 0:
+                        logger.debug(f"Parent #{parent_issue_number} has no sub-issues")
+                    else:
+                        # Get workflow template for exit column check
+                        workflow_template = None
+                        try:
+                            # Find the SDLC/dev pipeline workflow
+                            for pipeline in project_config.pipelines:
+                                if 'sdlc' in pipeline.name.lower() or 'dev' in pipeline.workflow.lower():
+                                    workflow_template = config_manager.get_workflow_template(pipeline.workflow)
+                                    break
 
-                    logger.info(
-                        f"🔍 Sub-issue check result for parent #{parent_issue_number}: "
-                        f"total={len(sub_issues)}, open={len(open_sub_issues)}, closed={len(sub_issues) - len(open_sub_issues)}"
-                    )
-
-                    if len(sub_issues) > 0:
-                        # Log first few sub-issues for debugging
-                        sample_size = min(3, len(sub_issues))
-                        for i in range(sample_size):
-                            si = sub_issues[i]
-                            logger.debug(
-                                f"  Sub-issue #{si.get('number')}: state={si.get('state')}, "
-                                f"title={si.get('title', 'N/A')[:50]}"
+                            if not workflow_template:
+                                logger.error(
+                                    f"❌ Could not find dev/SDLC workflow for project '{project_name}'. "
+                                    f"Exit column check will NOT be performed - validation will fall back to "
+                                    f"checking only GitHub closed state. This may cause the same bug we just fixed."
+                                )
+                        except Exception as e:
+                            logger.error(
+                                f"❌ Error getting workflow template for exit column check: {e}. "
+                                f"Validation will fall back to checking only GitHub closed state."
                             )
-                        if len(sub_issues) > sample_size:
-                            logger.debug(f"  ... and {len(sub_issues) - sample_size} more sub-issues")
 
-                    if open_sub_issues:
-                        logger.info(
-                            f"🔍 _advance_parent_for_pr_review EARLY EXIT (open sub-issues): "
-                            f"Parent #{parent_issue_number} has {len(open_sub_issues)} open sub-issues. "
-                            f"Skipping auto-advance to 'In Review' until all sub-issues are complete."
+                        # Use the SAME validation logic as _check_pr_ready_on_issue_exit
+                        # This checks: closed state OR in exit column (Staged, Done, etc.)
+                        # NOTE: If workflow_template is None, this falls back to state-only check
+                        all_complete = await feature_branch_manager._verify_all_sub_issues_complete(
+                            github,
+                            sub_issues,
+                            project_name=project_name,
+                            workflow_template=workflow_template,
+                            project_monitor=self,
+                            triggering_issue=None  # No triggering issue in this context
                         )
-                        return
+
+                        if not all_complete:
+                            # Count how many are actually incomplete for logging
+                            closed_count = len([s for s in sub_issues if (s.get('state') or '').upper() == 'CLOSED'])
+                            validation_method = "closed state + exit columns" if workflow_template else "closed state only"
+                            logger.info(
+                                f"🔍 _advance_parent_for_pr_review EARLY EXIT (incomplete sub-issues): "
+                                f"Parent #{parent_issue_number} has {len(sub_issues)} sub-issues "
+                                f"({closed_count} closed, {len(sub_issues) - closed_count} still in progress). "
+                                f"Skipping auto-advance to 'In Review' until all sub-issues are complete. "
+                                f"(validation method: {validation_method})"
+                            )
+                            return
+                        else:
+                            # All sub-issues verified as complete (using shared exit-column-aware logic)
+                            validation_method = "closed state + exit columns" if workflow_template else "closed state only"
+                            logger.info(
+                                f"✓ All {len(sub_issues)} sub-issues verified as complete for parent #{parent_issue_number} "
+                                f"(validation method: {validation_method})"
+                            )
 
                 # Move to "In Review" - the polling will detect the column change
                 # and trigger the PR review agent normally
