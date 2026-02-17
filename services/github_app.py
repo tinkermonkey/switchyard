@@ -24,6 +24,8 @@ class GitHubApp:
         self.app_id = os.environ.get('GITHUB_APP_ID')
         self.installation_id = os.environ.get('GITHUB_APP_INSTALLATION_ID')
         self.private_key_path = os.environ.get('GITHUB_APP_PRIVATE_KEY_PATH')
+        self._installation_token = None
+        self._token_expires_at = None
 
         if not all([self.app_id, self.installation_id, self.private_key_path]):
             logger.warning("GitHub App credentials not fully configured - some features may be limited")
@@ -37,11 +39,8 @@ class GitHubApp:
             self.enabled = True
             logger.info(f"GitHub App initialized (App ID: {self.app_id}, Installation ID: {self.installation_id})")
         except Exception as e:
-            logger.debug(f"Failed to load GitHub App private key: {e}")
+            logger.error(f"Failed to load GitHub App private key: {e}")
             self.enabled = False
-
-        self._installation_token = None
-        self._token_expires_at = None
 
     def _generate_jwt(self) -> str:
         """Generate JWT for GitHub App authentication"""
@@ -89,24 +88,31 @@ class GitHubApp:
             logger.error(f"Failed to get installation token: {e}")
             return None
 
+    def _invalidate_token(self):
+        """Invalidate cached installation token so the next call generates a fresh one."""
+        self._installation_token = None
+        self._token_expires_at = None
+
+    def _get_token(self, force_refresh: bool = False) -> Optional[str]:
+        """Get an authentication token, preferring App installation token with PAT fallback."""
+        if self.enabled:
+            if force_refresh:
+                self._invalidate_token()
+            token = self.get_installation_token()
+            if token:
+                return token
+            if force_refresh:
+                logger.warning("App token refresh failed, falling back to PAT")
+
+        return os.environ.get('GITHUB_TOKEN')
+
     def graphql_request(self, query: str, variables: Dict[str, Any] = None) -> Optional[Dict]:
         """Execute a GraphQL request using GitHub App authentication (with PAT fallback)"""
-        
-        token = None
-        if self.enabled:
-            token = self.get_installation_token()
-        
-        if not token:
-            # Fallback to PAT
-            token = os.environ.get('GITHUB_TOKEN')
-            if not token:
-                logger.debug("No installation token or PAT available for GraphQL request")
-                return None
 
-        headers = {
-            'Authorization': f'Bearer {token}',
-            'Accept': 'application/vnd.github.v3+json'
-        }
+        token = self._get_token()
+        if not token:
+            logger.error("No installation token or PAT available for GraphQL request")
+            return None
 
         payload = {'query': query}
         if variables:
@@ -115,9 +121,46 @@ class GitHubApp:
         try:
             response = requests.post(
                 'https://api.github.com/graphql',
-                headers=headers,
+                headers={
+                    'Authorization': f'Bearer {token}',
+                    'Accept': 'application/vnd.github.v3+json'
+                },
                 json=payload
             )
+
+            # On 401, refresh the token and retry once.
+            # GitHub rejects 401 before processing, so retrying mutations is safe.
+            if response.status_code == 401 and self.enabled:
+                logger.warning("GraphQL request got 401, refreshing token and retrying")
+                token = self._get_token(force_refresh=True)
+                if token:
+                    response = requests.post(
+                        'https://api.github.com/graphql',
+                        headers={
+                            'Authorization': f'Bearer {token}',
+                            'Accept': 'application/vnd.github.v3+json'
+                        },
+                        json=payload
+                    )
+
+                    # If retry also fails with 401, fall back to PAT
+                    if response.status_code == 401:
+                        pat = os.environ.get('GITHUB_TOKEN')
+                        if pat and pat != token:
+                            logger.warning("GraphQL retry still 401, falling back to PAT")
+                            response = requests.post(
+                                'https://api.github.com/graphql',
+                                headers={
+                                    'Authorization': f'Bearer {pat}',
+                                    'Accept': 'application/vnd.github.v3+json'
+                                },
+                                json=payload
+                            )
+                        elif not pat:
+                            logger.error("GraphQL retry still 401 and no GITHUB_TOKEN configured for PAT fallback")
+                else:
+                    logger.error("Cannot retry GraphQL request, no token available after refresh")
+
             response.raise_for_status()
 
             data = response.json()
@@ -134,50 +177,73 @@ class GitHubApp:
 
             return data.get('data')
 
-        except Exception as e:
+        except requests.exceptions.HTTPError as e:
             logger.error(f"GraphQL request failed: {e}")
             return None
+        except Exception as e:
+            logger.error(f"GraphQL request failed (unexpected): {e}", exc_info=True)
+            return None
+
+    def _rest_call(self, method: str, url: str, headers: Dict, data: Dict = None) -> requests.Response:
+        """Execute a single REST API call."""
+        method = method.upper()
+        if method == 'GET':
+            return requests.get(url, headers=headers)
+        elif method == 'POST':
+            return requests.post(url, headers=headers, json=data)
+        elif method == 'PATCH':
+            return requests.patch(url, headers=headers, json=data)
+        elif method == 'DELETE':
+            return requests.delete(url, headers=headers)
+        else:
+            raise ValueError(f"Unsupported HTTP method: {method}")
 
     def rest_request(self, method: str, path: str, data: Dict = None) -> Optional[Dict]:
         """Execute a REST API request using GitHub App authentication (with PAT fallback)"""
-        
-        token = None
-        if self.enabled:
-            token = self.get_installation_token()
-        
-        if not token:
-            # Fallback to PAT
-            token = os.environ.get('GITHUB_TOKEN')
-            if not token:
-                logger.debug("No installation token or PAT available for REST request")
-                return None
 
+        token = self._get_token()
+        if not token:
+            logger.error("No installation token or PAT available for REST request")
+            return None
+
+        url = f'https://api.github.com{path}'
         headers = {
             'Authorization': f'Bearer {token}',
             'Accept': 'application/vnd.github.v3+json'
         }
 
-
-        url = f'https://api.github.com{path}'
-
         try:
-            if method.upper() == 'GET':
-                response = requests.get(url, headers=headers)
-            elif method.upper() == 'POST':
-                response = requests.post(url, headers=headers, json=data)
-            elif method.upper() == 'PATCH':
-                response = requests.patch(url, headers=headers, json=data)
-            elif method.upper() == 'DELETE':
-                response = requests.delete(url, headers=headers)
-            else:
-                logger.error(f"Unsupported HTTP method: {method}")
-                return None
+            response = self._rest_call(method, url, headers, data)
+
+            # On 401, refresh the token and retry once.
+            # GitHub rejects 401 before processing, so retrying mutations is safe.
+            if response.status_code == 401 and self.enabled:
+                logger.warning(f"REST request got 401 for {method} {path}, refreshing token and retrying")
+                token = self._get_token(force_refresh=True)
+                if token:
+                    headers['Authorization'] = f'Bearer {token}'
+                    response = self._rest_call(method, url, headers, data)
+
+                    # If retry also fails with 401, fall back to PAT
+                    if response.status_code == 401:
+                        pat = os.environ.get('GITHUB_TOKEN')
+                        if pat and pat != token:
+                            logger.warning(f"REST retry still 401 for {method} {path}, falling back to PAT")
+                            headers['Authorization'] = f'Bearer {pat}'
+                            response = self._rest_call(method, url, headers, data)
+                        elif not pat:
+                            logger.error(f"REST retry still 401 for {method} {path} and no GITHUB_TOKEN configured for PAT fallback")
+                else:
+                    logger.error(f"Cannot retry REST request for {method} {path}, no token available after refresh")
 
             response.raise_for_status()
             return response.json() if response.text else {}
 
-        except Exception as e:
+        except requests.exceptions.HTTPError as e:
             logger.error(f"REST request failed: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"REST request failed (unexpected): {e}", exc_info=True)
             return None
 
 
