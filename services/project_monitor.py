@@ -3067,6 +3067,12 @@ class ProjectMonitor:
                 from services.pipeline_progression import PipelineProgression
                 task_queue = self.task_queue
 
+                # Stop any active feedback loop for this issue before advancing to prevent the
+                # race condition where the loop is still in active_loops when
+                # _start_pr_review_for_issue checks has_active_execution one polling cycle later.
+                from services.human_feedback_loop import human_feedback_loop_executor
+                human_feedback_loop_executor.request_stop(project_name, parent_issue_number)
+
                 logger.info(
                     f"🔍 _advance_parent_for_pr_review: All checks passed, moving parent #{parent_issue_number} "
                     f"from 'In Development' to 'In Review' (trigger=all_subtasks_completed)"

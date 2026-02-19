@@ -71,10 +71,8 @@ workflow_templates:
               stage: "design"
 
       - name: "Work Breakdown"
-        type: "conversational"
         stage_mapping: "work_breakdown"
         agent: "work_breakdown_agent"
-        feedback_timeout_seconds: 3600
         description: "Break epic into phase-based sub-issues"
         automation_rules:
           - trigger: "item_moved_to_column"
@@ -82,7 +80,7 @@ workflow_templates:
             parameters:
               labels: ["stage:work-breakdown"]
           - trigger: "item_moved_to_column"
-            action: "start_conversational_loop"
+            action: "start_pipeline_stage"
             parameters:
               stage: "work_breakdown"
 

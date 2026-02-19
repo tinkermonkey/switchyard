@@ -736,7 +736,7 @@ class HumanFeedbackLoopExecutor:
                 # This would indicate human intervention or workflow progression
                 try:
                     from services.project_monitor import ProjectMonitor
-                    monitor = ProjectMonitor()
+                    monitor = ProjectMonitor(None)
 
                     # Get current column for this issue
                     current_column = await monitor.get_issue_column_async(
