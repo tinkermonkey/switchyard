@@ -248,10 +248,19 @@ def cancel_issue_work(project: str, issue_number: int, reason: str) -> None:
         from services.work_execution_state import work_execution_tracker
         execution_history = work_execution_tracker.get_execution_history(project, issue_number)
 
+        # Deduplicate by (agent, column) so record_execution_outcome() is called
+        # once per pair. The method now cleans up all matching in_progress entries
+        # internally (including phantom probe entries), so calling it multiple times
+        # for the same pair would trigger spurious "no in_progress found" fallbacks.
+        seen_pairs = set()
         for execution in reversed(execution_history):
             if execution.get('outcome') == 'in_progress':
                 agent = execution.get('agent')
                 column = execution.get('column')
+                pair = (agent, column)
+                if pair in seen_pairs:
+                    continue
+                seen_pairs.add(pair)
                 work_execution_tracker.record_execution_outcome(
                     issue_number=issue_number,
                     column=column,

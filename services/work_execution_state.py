@@ -204,23 +204,41 @@ class WorkExecutionStateTracker:
         """Record the outcome of work execution"""
         state = self.load_state(project_name, issue_number)
 
-        # Find the most recent in_progress execution for this agent/column
+        # Update all in_progress entries for this agent/column.
+        # The most recent one is the real execution; older ones are phantom probe
+        # entries created by project_monitor before enqueuing (trigger_source='manual').
+        # record_execution_outcome() was previously called only on the real (task_queue)
+        # entry, leaving phantom probes stuck as in_progress permanently.
+        found_primary = False
+        phantom_count = 0
         for execution in reversed(state['execution_history']):
             if (execution['column'] == column and
                 execution['agent'] == agent and
                 execution['outcome'] == 'in_progress'):
 
                 execution['outcome'] = outcome
-                if error:
-                    execution['error'] = error
+                if not found_primary:
+                    # Most recent in_progress: the real execution entry
+                    if error:
+                        execution['error'] = error
+                    found_primary = True
+                else:
+                    # Older in_progress entries are phantom probes (pre-enqueue).
+                    # Mark them with the same outcome so they don't linger as in_progress.
+                    execution['error'] = (
+                        'Superseded by a later execution. This was a pre-enqueue probe '
+                        'entry; the actual outcome was recorded on the newer tracking entry.'
+                    )
+                    phantom_count += 1
 
-                self.save_state(project_name, issue_number, state)
-
-                logger.info(
-                    f"Recorded execution outcome: {project_name}/#{issue_number} "
-                    f"{agent} in {column} → {outcome}"
-                )
-                return
+        if found_primary:
+            self.save_state(project_name, issue_number, state)
+            suffix = f" (cleaned up {phantom_count} phantom probe entries)" if phantom_count else ""
+            logger.info(
+                f"Recorded execution outcome: {project_name}/#{issue_number} "
+                f"{agent} in {column} → {outcome}{suffix}"
+            )
+            return
 
         # If we get here, no in_progress execution was found
         # Create a new record (edge case where start wasn't recorded)

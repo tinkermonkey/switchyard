@@ -621,6 +621,128 @@ class TestStampExecutionTaskId:
         assert last_exec['agent'] == 'code_reviewer'
 
 
+class TestRecordExecutionOutcome:
+    """Tests for record_execution_outcome() phantom probe cleanup behavior."""
+
+    def _make_tracker(self, tmp_path):
+        cls = _import_tracker_class(tmp_path)
+        return cls(state_dir=tmp_path)
+
+    def _add_in_progress(self, tracker, project, issue, agent, column, trigger_source='task_queue'):
+        tracker.record_execution_start(
+            issue_number=issue,
+            column=column,
+            agent=agent,
+            trigger_source=trigger_source,
+            project_name=project,
+        )
+
+    def test_single_entry_success(self, tmp_path):
+        """Single in_progress entry: gets correct outcome, no error field when error=None."""
+        tracker = self._make_tracker(tmp_path)
+        self._add_in_progress(tracker, 'proj', 1, 'software_engineer', 'In Development')
+
+        tracker.record_execution_outcome(1, 'In Development', 'software_engineer', 'success', 'proj')
+
+        state = tracker.load_state('proj', 1)
+        assert len(state['execution_history']) == 1
+        assert state['execution_history'][0]['outcome'] == 'success'
+        assert 'error' not in state['execution_history'][0]
+
+    def test_single_entry_failure_with_error(self, tmp_path):
+        """Single in_progress entry: error field is set when error is provided."""
+        tracker = self._make_tracker(tmp_path)
+        self._add_in_progress(tracker, 'proj', 2, 'software_engineer', 'In Development')
+
+        tracker.record_execution_outcome(2, 'In Development', 'software_engineer', 'failure', 'proj',
+                                         error='Container exited with code 1')
+
+        state = tracker.load_state('proj', 2)
+        assert state['execution_history'][0]['outcome'] == 'failure'
+        assert state['execution_history'][0]['error'] == 'Container exited with code 1'
+
+    def test_phantom_probe_is_cleaned_up(self, tmp_path):
+        """Phantom probe (pre-enqueue, trigger_source='manual') is updated alongside the real entry."""
+        tracker = self._make_tracker(tmp_path)
+        # Probe entry created first (manual trigger_source, before enqueue)
+        self._add_in_progress(tracker, 'proj', 3, 'software_engineer', 'In Development', trigger_source='manual')
+        # Real entry created at dequeue time
+        self._add_in_progress(tracker, 'proj', 3, 'software_engineer', 'In Development', trigger_source='task_queue')
+
+        tracker.record_execution_outcome(3, 'In Development', 'software_engineer', 'success', 'proj')
+
+        state = tracker.load_state('proj', 3)
+        entries = state['execution_history']
+        assert len(entries) == 2
+        # Both entries should have outcome 'success', not 'in_progress'
+        assert all(e['outcome'] == 'success' for e in entries)
+        # The phantom (older, index 0) gets the superseded error message
+        assert 'Superseded by a later execution' in entries[0]['error']
+        # The primary (newer, index 1) has no error field (error=None was passed)
+        assert 'error' not in entries[1]
+
+    def test_multiple_phantoms_all_cleaned_up(self, tmp_path):
+        """Multiple phantom entries are all updated when one real entry exists."""
+        tracker = self._make_tracker(tmp_path)
+        self._add_in_progress(tracker, 'proj', 4, 'software_engineer', 'In Development', trigger_source='manual')
+        self._add_in_progress(tracker, 'proj', 4, 'software_engineer', 'In Development', trigger_source='manual')
+        self._add_in_progress(tracker, 'proj', 4, 'software_engineer', 'In Development', trigger_source='task_queue')
+
+        tracker.record_execution_outcome(4, 'In Development', 'software_engineer', 'success', 'proj')
+
+        state = tracker.load_state('proj', 4)
+        entries = state['execution_history']
+        assert len(entries) == 3
+        assert all(e['outcome'] == 'success' for e in entries)
+        # Two phantom entries both get superseded message
+        assert 'Superseded by a later execution' in entries[0]['error']
+        assert 'Superseded by a later execution' in entries[1]['error']
+        assert 'error' not in entries[2]
+
+    def test_zero_in_progress_falls_through_to_fallback(self, tmp_path):
+        """When no in_progress entry exists, the fallback path creates a new record."""
+        tracker = self._make_tracker(tmp_path)
+        # No in_progress entries — state file doesn't even exist yet
+
+        tracker.record_execution_outcome(5, 'In Development', 'software_engineer', 'failure', 'proj',
+                                         error='Restart after crash')
+
+        state = tracker.load_state('proj', 5)
+        assert len(state['execution_history']) == 1
+        assert state['execution_history'][0]['outcome'] == 'failure'
+        assert state['execution_history'][0]['trigger_source'] == 'unknown'
+
+    def test_unrelated_entries_not_affected(self, tmp_path):
+        """Entries for a different agent or column are not touched."""
+        tracker = self._make_tracker(tmp_path)
+        self._add_in_progress(tracker, 'proj', 6, 'code_reviewer', 'In Review')
+        self._add_in_progress(tracker, 'proj', 6, 'software_engineer', 'In Development')
+
+        tracker.record_execution_outcome(6, 'In Development', 'software_engineer', 'success', 'proj')
+
+        state = tracker.load_state('proj', 6)
+        by_agent = {e['agent']: e for e in state['execution_history']}
+        assert by_agent['software_engineer']['outcome'] == 'success'
+        assert by_agent['code_reviewer']['outcome'] == 'in_progress'
+
+    def test_phantom_does_not_receive_caller_error(self, tmp_path):
+        """Error from the real execution is not propagated to the phantom entry."""
+        tracker = self._make_tracker(tmp_path)
+        self._add_in_progress(tracker, 'proj', 7, 'software_engineer', 'In Development', trigger_source='manual')
+        self._add_in_progress(tracker, 'proj', 7, 'software_engineer', 'In Development', trigger_source='task_queue')
+
+        tracker.record_execution_outcome(7, 'In Development', 'software_engineer', 'failure', 'proj',
+                                         error='Tests failed')
+
+        state = tracker.load_state('proj', 7)
+        entries = state['execution_history']
+        # Primary (index 1) gets the real error
+        assert entries[1]['error'] == 'Tests failed'
+        # Phantom (index 0) gets the superseded message, not the real error
+        assert 'Superseded by a later execution' in entries[0]['error']
+        assert 'Tests failed' not in entries[0]['error']
+
+
 class TestDevEnvironmentSetupContext:
     """Tests for dev_environment_setup task context flags."""
 
