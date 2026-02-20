@@ -789,6 +789,10 @@ class HumanFeedbackLoopExecutor:
                     logger.warning(f"Could not check current column for issue #{state.issue_number}: {e}")
         finally:
             self._stop_events.pop(stop_key, None)
+            # Also remove from active_loops so has_active_execution returns False after loop exits
+            if state.issue_number in self.active_loops:
+                del self.active_loops[state.issue_number]
+                logger.debug(f"Removed issue #{state.issue_number} from active_loops in _conversational_loop finally block")
 
     async def _execute_agent(
         self,

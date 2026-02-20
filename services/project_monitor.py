@@ -2622,6 +2622,17 @@ class ProjectMonitor:
             except Exception as e:
                 logger.warning(f"Failed to clean up review cycle for issue #{issue_number} during exit-column handling: {e}")
 
+            # Clean up any active conversational loop state so has_active_execution returns False
+            try:
+                from services.human_feedback_loop import human_feedback_loop_executor
+                human_feedback_loop_executor.cleanup_loop(
+                    project_name=project_name,
+                    issue_number=issue_number,
+                    reason=f"Issue reached exit column '{exit_column}'"
+                )
+            except Exception as e:
+                logger.warning(f"Failed to clean up feedback loop for issue #{issue_number} during exit-column handling: {e}")
+
             # Clear signal so issue can be re-triggered if moved back
             signal.clear(project_name, issue_number)
 
