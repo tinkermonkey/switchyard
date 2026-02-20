@@ -434,8 +434,10 @@ class AgentExecutor:
             if agent_name == 'dev_environment_setup':
                 await self._queue_environment_verifier(project_name, task_context)
 
-            # Post agent output to GitHub (centralized posting)
-            await self._post_agent_output_to_github(agent_name, task_context, result)
+            # Post agent output to GitHub — skipped when docker_runner already handled it
+            # via _complete_agent_execution (which reads workspace routing from durable stores).
+            if not result.get('output_posted'):
+                await self._post_agent_output_to_github(agent_name, task_context, result)
 
             logger.info(
                 f"🔍 FINALIZATION DEBUG: workspace_context={'present' if workspace_context else 'NONE'}, "

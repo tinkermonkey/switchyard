@@ -1294,29 +1294,31 @@ class DockerAgentRunner:
                         output=result_text
                     )
 
-                # CRITICAL: Record successful outcome immediately before any result processing
-                # This ensures outcome is recorded even if result processing fails
+                # Post output to GitHub and record outcome via the unified completion handler.
+                # This uses durable stores (YAML state) to look up workspace routing, so it
+                # works identically for both fresh executions and recovered-after-restart ones.
+                output_posted = False
                 if 'issue_number' in context.get('context', {}):
                     try:
-                        from services.work_execution_state import work_execution_tracker
                         task_context = context.get('context', {})
                         issue_number = task_context['issue_number']
                         column = task_context.get('column', 'unknown')
 
-                        if column != 'unknown':
-                            work_execution_tracker.record_execution_outcome(
-                                issue_number=issue_number,
-                                column=column,
-                                agent=agent,
-                                outcome='success',
-                                project_name=project,
-                                error=None
-                            )
-                            logger.info(
-                                f"✓ Docker runner recorded success for {project}/#{issue_number} {agent} in {column}"
-                            )
-                    except Exception as outcome_error:
-                        logger.error(f"Failed to record outcome in docker_runner: {outcome_error}", exc_info=True)
+                        await self._complete_agent_execution(
+                            project=project,
+                            issue_number=issue_number,
+                            agent=agent,
+                            task_id=task_id,
+                            exit_code=exit_code,
+                            output=result_text,
+                            column=column
+                        )
+                        output_posted = True
+                    except Exception as completion_error:
+                        logger.error(
+                            f"Failed to complete agent execution: {completion_error}",
+                            exc_info=True
+                        )
 
                 # Close Claude Code breaker if it was open/half-open
                 # This allows recovery after rate limit reset
@@ -1334,7 +1336,8 @@ class DockerAgentRunner:
                     'success': True,
                     'result': result_text,
                     'session_id': session_id,
-                    'tools_used': tools_used_tracking
+                    'tools_used': tools_used_tracking,
+                    'output_posted': output_posted,
                 }
             else:
                 stderr_text = ''.join(stderr_parts)
@@ -1917,6 +1920,118 @@ class DockerAgentRunner:
             import traceback
             logger.error(traceback.format_exc())
 
+    def _build_completion_context(self, project: str, issue_number: int) -> Dict[str, Any]:
+        """
+        Build GitHub posting context from durable stores, not in-memory task state.
+
+        Looks up discussion_id from YAML state (written at discussion creation time)
+        and derives workspace_type from its presence. Works correctly after an
+        orchestrator restart because the YAML state persists across restarts.
+        """
+        from config.state_manager import config_manager as state_manager
+        from config.manager import config_manager
+
+        project_config = config_manager.get_project_config(project)
+        discussion_id = state_manager.get_discussion_for_issue(project, issue_number)
+        workspace_type = 'discussions' if discussion_id else 'issues'
+
+        return {
+            'issue_number': issue_number,
+            'repository': project_config.github.get('repo', project),
+            'project': project,
+            'workspace_type': workspace_type,
+            'discussion_id': discussion_id,
+        }
+
+    async def _complete_agent_execution(
+        self,
+        project: str,
+        issue_number: int,
+        agent: str,
+        task_id: str,
+        exit_code: int,
+        output: str,
+        column: str = 'unknown'
+    ) -> None:
+        """
+        Unified completion handler for both fresh and recovered container executions.
+
+        Reads workspace routing context from durable stores (YAML state) rather than
+        in-memory task context, so both fresh and recovered executions follow the same
+        code path with no special-casing. The distinction between 'fresh' and
+        'recovered' disappears here.
+
+        Args:
+            project: Project name
+            issue_number: Issue number
+            agent: Agent name
+            task_id: Task ID
+            exit_code: Container exit code
+            output: Agent output text
+            column: Column name for execution state matching
+        """
+        outcome = 'success' if exit_code == 0 else 'failed'
+        error = None if exit_code == 0 else f"Container exited with code {exit_code}"
+
+        # Post output to GitHub on success
+        if exit_code == 0 and output:
+            try:
+                from services.github_integration import GitHubIntegration, AgentCommentFormatter
+                from config.manager import config_manager
+                from monitoring.timestamp_utils import utc_isoformat
+
+                project_config = config_manager.get_project_config(project)
+                github = GitHubIntegration(
+                    repo_owner=project_config.github['org'],
+                    repo_name=project_config.github['repo']
+                )
+
+                comment = AgentCommentFormatter.format_agent_completion(
+                    agent_name=agent,
+                    output=output,
+                    summary_stats={}
+                )
+
+                # Build context from durable stores — works for fresh and recovered alike
+                context = self._build_completion_context(project, issue_number)
+
+                post_result = await github.post_agent_output(context, comment)
+
+                if post_result.get('success'):
+                    logger.info(
+                        f"Posted {agent} output to GitHub "
+                        f"(workspace: {context['workspace_type']}, issue: #{issue_number})"
+                    )
+                    # Track comment timestamp for feedback loop polling
+                    from services.feedback_manager import FeedbackManager
+                    FeedbackManager().set_last_agent_comment_time(
+                        issue_number, agent, utc_isoformat()
+                    )
+                else:
+                    logger.error(
+                        f"Failed to post {agent} output to GitHub: {post_result.get('error')}"
+                    )
+            except Exception as e:
+                logger.error(f"Error posting {agent} output to GitHub: {e}", exc_info=True)
+
+        # Record execution outcome
+        try:
+            from services.work_execution_state import work_execution_tracker
+            if column != 'unknown':
+                work_execution_tracker.record_execution_outcome(
+                    issue_number=issue_number,
+                    column=column,
+                    agent=agent,
+                    outcome=outcome,
+                    project_name=project,
+                    error=error
+                )
+                logger.info(
+                    f"Recorded execution outcome: {project}/#{issue_number} {agent} → {outcome}"
+                )
+        except Exception as e:
+            logger.error(f"Failed to record execution outcome: {e}", exc_info=True)
+
     def _process_recovered_container_completion(
         self,
         container_name: str,
@@ -1931,8 +2046,8 @@ class DockerAgentRunner:
         """
         Process completion of a recovered container.
 
-        Posts output to GitHub, records execution outcome, cleans up container.
-        Similar to normal completion flow but handles the recovery case.
+        Delegates to _complete_agent_execution so both fresh and recovered
+        executions share the same posting and recording logic.
 
         Args:
             container_name: Container name
@@ -1945,59 +2060,30 @@ class DockerAgentRunner:
             column: Column name for proper execution state matching (default: 'unknown')
         """
         try:
+            import asyncio
             logger.info(
                 f"Processing recovered container completion: {container_name} "
                 f"(exit_code={exit_code})"
             )
 
-            # Get GitHub integration
-            from services.github_integration import GitHubIntegration
-            from config.manager import config_manager
-
-            project_config = config_manager.get_project_config(project)
-            github = GitHubIntegration(
-                repo_owner=project_config.github['org'],
-                repo_name=project_config.github['repo']
-            )
-
-            # Post output to GitHub (same as normal flow)
-            import asyncio
-            context = {
-                'issue_number': issue_number,
-                'repository': project_config.github.get('repo', project),
-                'workspace_type': 'issues'
-            }
-
-            # Post output using asyncio.run()
             asyncio.run(
-                github.post_agent_output(context, output)
-            )
-
-            logger.info(f"Posted recovered container output to GitHub issue #{issue_number}")
-
-            # Record execution outcome
-            from services.work_execution_state import work_execution_tracker
-
-            outcome = 'success' if exit_code == 0 else 'failed'
-            error = None if exit_code == 0 else f"Container exited with code {exit_code}"
-
-            work_execution_tracker.record_execution_outcome(
-                issue_number=issue_number,
-                column=column,  # Use actual column from execution history
-                agent=agent,
-                outcome=outcome,
-                project_name=project,
-                error=error
-            )
-
-            logger.info(
-                f"Recorded execution outcome for recovered container: "
-                f"{project}/#{issue_number} {agent} → {outcome}"
+                self._complete_agent_execution(
+                    project=project,
+                    issue_number=issue_number,
+                    agent=agent,
+                    task_id=task_id,
+                    exit_code=exit_code,
+                    output=output,
+                    column=column
+                )
             )
 
             # Auto-advance to next column if successful and column has auto_advance_on_approval
             if exit_code == 0 and column != 'unknown':
                 try:
+                    from config.manager import config_manager
+                    project_config = config_manager.get_project_config(project)
+
                     # Find the pipeline and workflow for this column
                     for pipeline in project_config.pipelines:
                         workflow_template = config_manager.get_workflow_template(pipeline.workflow)
