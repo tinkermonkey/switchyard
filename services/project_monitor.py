@@ -4703,11 +4703,14 @@ The automated test-fix-validate cycle has failed and requires manual interventio
 
             task_id = f"pr_review_{issue_number}_{pipeline_run.id}"
 
-            # Record execution start BEFORE launching background thread
+            # Record execution start BEFORE launching background thread.
+            # Use 'pr_code_reviewer' (the actual Docker agent) not 'pr_review_stage'
+            # (the in-process wrapper), so the name matches the container label
+            # org.clauditoreum.agent set by agent_executor and docker_runner.
             work_execution_tracker.record_execution_start(
                 issue_number=issue_number,
                 column=status,
-                agent='pr_review_stage',
+                agent='pr_code_reviewer',
                 trigger_source='manual',
                 project_name=project_name
             )
@@ -4718,14 +4721,14 @@ The automated test-fix-validate cycle has failed and requires manual interventio
                 project=project_name,
                 board=board_name,
                 current_status=status,
-                selected_agent='pr_review_stage',
+                selected_agent='pr_code_reviewer',
                 reason=f"PR review stage routed for issue #{issue_number} in status '{status}'",
                 workspace_type=workspace_type,
                 pipeline_run_id=pipeline_run.id
             )
 
             self.decision_events.emit_task_queued(
-                agent='pr_review_stage',
+                agent='pr_code_reviewer',
                 project=project_name,
                 issue_number=issue_number,
                 board=board_name,
@@ -4775,7 +4778,7 @@ The automated test-fix-validate cycle has failed and requires manual interventio
                     work_execution_tracker.record_execution_outcome(
                         issue_number=issue_number,
                         column=status,
-                        agent='pr_review_stage',
+                        agent='pr_code_reviewer',
                         outcome='completed',
                         project_name=project_name
                     )
@@ -4788,7 +4791,7 @@ The automated test-fix-validate cycle has failed and requires manual interventio
                     work_execution_tracker.record_execution_outcome(
                         issue_number=issue_number,
                         column=status,
-                        agent='pr_review_stage',
+                        agent='pr_code_reviewer',
                         outcome='failed',
                         project_name=project_name,
                         error=str(e)
