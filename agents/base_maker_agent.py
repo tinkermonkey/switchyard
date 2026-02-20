@@ -467,6 +467,12 @@ This checklist is **CRITICAL** - it helps the reviewer see you addressed each po
                 analysis_text = result.get('result', '')
                 session_id = result.get('session_id')
 
+                # Propagate output_posted flag so agent_executor skips double-posting.
+                # docker_runner._complete_agent_execution sets this when it has already
+                # posted the output to GitHub (routing via durable YAML state).
+                if result.get('output_posted'):
+                    context['output_posted'] = True
+
                 # Store session_id in context for session continuity
                 if session_id:
                     context['claude_session_id'] = session_id

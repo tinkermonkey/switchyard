@@ -68,7 +68,12 @@ class PRCodeReviewerAgent(AnalysisAgent):
         result = await run_claude_code(direct_prompt, context)
 
         # Extract result
-        result_text = result.get('result', '') if isinstance(result, dict) else str(result)
+        if isinstance(result, dict):
+            result_text = result.get('result', '')
+            if result.get('output_posted'):
+                context['output_posted'] = True
+        else:
+            result_text = str(result)
 
         context['markdown_analysis'] = result_text
         context['raw_analysis_result'] = result_text

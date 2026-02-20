@@ -286,6 +286,8 @@ Conduct a comprehensive code review covering:
             # Handle both dict format (with tools_used metadata) and legacy string format
             if isinstance(result, dict):
                 markdown_output = result.get('result', '')
+                if result.get('output_posted'):
+                    context['output_posted'] = True
             else:
                 markdown_output = result if isinstance(result, str) else str(result)
             context['markdown_review'] = markdown_output
