@@ -1999,7 +1999,7 @@ class DockerAgentRunner:
                 )
 
                 # Build context from durable stores — works for fresh and recovered alike.
-                # For fresh human-feedback-loop responses, also include reply_to_comment_id
+                # For fresh human-feedback-loop responses, also pass reply_to_comment_id
                 # so the post lands in the correct thread rather than as a top-level comment.
                 # Recovered executions legitimately lack this (ephemeral, not persisted), so
                 # they fall back to a top-level comment, which is acceptable.
@@ -2007,7 +2007,7 @@ class DockerAgentRunner:
                 if reply_to_comment_id:
                     context['reply_to_comment_id'] = reply_to_comment_id
 
-                post_result = await github.post_agent_output(context, comment)
+                post_result = await github.post_agent_output(context, comment, reply_to_id=reply_to_comment_id)
 
                 if post_result.get('success'):
                     logger.info(

@@ -252,6 +252,8 @@ REMEMBER: You MUST execute Python code to update the dev container state. Withou
         # Handle both dict format (with tools_used metadata) and legacy string format
         if isinstance(result, dict):
             review_text = result.get('result', '')
+            if result.get('output_posted'):
+                context['output_posted'] = True
         else:
             review_text = result if isinstance(result, str) else str(result)
 
