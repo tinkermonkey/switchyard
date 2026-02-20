@@ -1928,7 +1928,7 @@ class DockerAgentRunner:
         and derives workspace_type from its presence. Works correctly after an
         orchestrator restart because the YAML state persists across restarts.
         """
-        from config.state_manager import config_manager as state_manager
+        from config.state_manager import state_manager
         from config.manager import config_manager
 
         project_config = config_manager.get_project_config(project)
