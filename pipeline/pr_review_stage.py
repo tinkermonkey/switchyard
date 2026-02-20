@@ -276,15 +276,18 @@ class PRReviewStage(PipelineStage):
             discussion_outputs = self._load_discussion_outputs(project_name, parent_issue_number)
             parent_issue_body = self._get_parent_issue_body(repo, parent_issue_number)
 
+            # Each entry: (display_name, authority_key, content)
+            # The authority_key is passed to _build_verification_prompt to select
+            # context-specific framing without relying on substring matching.
             context_checks = [
-                ("Parent Issue Requirements", parent_issue_body),
-                ("Idea Researcher Output", discussion_outputs.get('idea_researcher')),
-                ("Business Analyst Output", discussion_outputs.get('business_analyst')),
-                ("Software Architect Output", discussion_outputs.get('software_architect')),
+                ("Parent Issue Requirements", "parent_issue", parent_issue_body),
+                ("Idea Researcher Output", "idea_researcher", discussion_outputs.get('idea_researcher')),
+                ("Business Analyst Output", "business_analyst", discussion_outputs.get('business_analyst')),
+                ("Software Architect Output", "software_architect", discussion_outputs.get('software_architect')),
             ]
 
             phase2_index = 0
-            for check_name, check_content in context_checks:
+            for check_name, authority_key, check_content in context_checks:
                 if not check_content:
                     logger.info(f"Skipping {check_name} verification (no content)")
                     continue
@@ -317,9 +320,9 @@ class PRReviewStage(PipelineStage):
 
                 try:
                     self._agent_call_count += 1
-                    # Build verification prompt
+                    # Build verification prompt with authority framing for this source
                     verification_prompt = self._build_verification_prompt(
-                        pr_url, check_name, check_content
+                        pr_url, check_name, authority_key, check_content
                     )
 
                     # Launch requirements_verifier in Docker (via AgentExecutor)
@@ -874,16 +877,17 @@ After the review skill completes, you MUST format the findings in this EXACT str
 This structured format enables automatic GitHub issue creation from your findings.
 """
 
-    def _build_verification_prompt(self, pr_url: str, context_name: str, context_content: str) -> str:
+    def _build_verification_prompt(
+        self, pr_url: str, context_name: str, authority_key: str, context_content: str
+    ) -> str:
         max_context_len = 15000
         if len(context_content) > max_context_len:
             context_content = context_content[:max_context_len] + "\n\n[... truncated ...]"
 
-        # Derive authority framing based on which context source this is.
-        # This prevents phantom "gap" issues from aspirational research being treated
-        # the same as committed architectural specifications.
-        if 'Idea Researcher' in context_name:
-            authority_framing = (
+        # Dispatch on the explicit authority_key (not the display name) so the framing
+        # is robust against future renames of the human-readable context_name.
+        _authority_framings = {
+            "idea_researcher": (
                 "## Context Authority: Research Suggestions\n\n"
                 "This context source represents **aspirational research and early ideation** — "
                 "suggestions and possibilities explored during the research phase, NOT committed requirements.\n\n"
@@ -891,30 +895,29 @@ This structured format enables automatic GitHub issue creation from your finding
                 "to implementing a specific feature from this source. "
                 "Do NOT flag missing research suggestions, stretch goals, future enhancement ideas, "
                 "or exploratory concepts as implementation gaps."
-            )
-        elif 'Business Analyst' in context_name:
-            authority_framing = (
+            ),
+            "business_analyst": (
                 "## Context Authority: Functional Requirements\n\n"
                 "This context source represents **functional business requirements**. "
                 "Flag gaps for items explicitly described as required, must-have, or core functionality. "
                 "Skip items described as nice-to-have, future enhancements, or optional."
-            )
-        elif 'Software Architect' in context_name:
-            authority_framing = (
+            ),
+            "software_architect": (
                 "## Context Authority: Committed Technical Specifications\n\n"
                 "This context source represents **committed architectural decisions and technical specifications** — "
                 "the agreed-upon technical contracts that must be implemented.\n\n"
                 "Flag ALL gaps, deviations from specified patterns, and missing components. "
                 "These specifications carry the highest authority."
-            )
-        else:
-            # Parent Issue or unknown source — treat as acceptance criteria
-            authority_framing = (
-                "## Context Authority: Acceptance Criteria\n\n"
-                "This context source is the **source of truth for acceptance criteria**. "
-                "Every explicit requirement listed here must be implemented. "
-                "Flag any missing or partially implemented requirements."
-            )
+            ),
+        }
+        authority_framing = _authority_framings.get(
+            authority_key,
+            # Default (parent_issue or unknown): treat as acceptance criteria
+            "## Context Authority: Acceptance Criteria\n\n"
+            "This context source is the **source of truth for acceptance criteria**. "
+            "Every explicit requirement listed here must be implemented. "
+            "Flag any missing or partially implemented requirements."
+        )
 
         return f"""
 You are a Requirements Verification Specialist. Your job is to verify that a PR's implementation

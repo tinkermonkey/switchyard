@@ -681,7 +681,7 @@ class RepairCycleStage(PipelineStage):
 
         # Build the appropriate prompt for this test type
         if config.test_type == "compilation":
-            direct_prompt = f"""Ensure all code in this project passes compilation and linting checks.
+            direct_prompt = """Ensure all code in this project passes compilation and linting checks.
 
 Your goal is to identify and report compilation errors and linting violations so they can be fixed before running tests.
 
@@ -717,25 +717,44 @@ If all code compiles and lints cleanly, return:
 DO NOT include any explanation, markdown formatting, or other text - ONLY the JSON object."""
 
         elif config.test_type == "ci":
+            # Calculate a safe polling deadline from the configured timeout, leaving
+            # buffer for the JSON response. Agent needs to know when to stop gracefully.
+            poll_deadline_minutes = max(5, (config.timeout - 120) // 60)
             direct_prompt = f"""Check whether CI (continuous integration) is passing for this project's current branch.
+
+You have approximately {poll_deadline_minutes} minutes to complete this check before your session times out.
+If CI has not completed within that window, return a failure result indicating CI is still running.
 
 Follow these steps exactly:
 
-1. First, push the current branch to origin so CI has the latest changes:
+1. Verify the current branch is a feature branch (not main/master/develop):
+   `git rev-parse --abbrev-ref HEAD`
+   If the branch is main, master, or develop — stop immediately and return:
+   {{"passed": 0, "failed": 1, "warnings": 0, "failures": [{{"file": "git", "test": "branch-check", "message": "CI test type should not run on default branch"}}], "warning_list": []}}
+
+2. Check whether there are local commits not yet pushed to origin:
+   `git status -sb`
+   Only push if there are unpushed commits. Push with:
    `git push origin HEAD`
-   If there is nothing to push (already up to date), that is fine — proceed to step 2.
+   If already up-to-date, skip the push and proceed to step 3.
 
-2. Wait for the most recent CI run to complete. Use:
-   `gh run list --limit 1 --branch $(git rev-parse --abbrev-ref HEAD) --json databaseId,status,conclusion`
-   Poll every 30 seconds until `status` is `completed`. The CI run may take several minutes — be patient and keep polling.
+3. Wait for the most recent CI run to complete:
+   `gh run list --limit 1 --branch $(git rev-parse --abbrev-ref HEAD) --json databaseId,status,conclusion,workflowName`
+   Poll every 30 seconds until `status` is `completed`.
+   If no CI run appears within 3 minutes of pushing, return:
+   {{"passed": 0, "failed": 1, "warnings": 0, "failures": [{{"file": "ci", "test": "trigger", "message": "No CI run triggered within 3 minutes of push — CI may not be configured for this branch"}}], "warning_list": []}}
+   If CI has still not completed when you are within 2 minutes of your deadline, stop polling and return:
+   {{"passed": 0, "failed": 1, "warnings": 0, "failures": [{{"file": "ci", "test": "timeout", "message": "CI run did not complete within the allotted time ({poll_deadline_minutes} minutes)"}}], "warning_list": []}}
 
-3. Once completed, check the conclusion. If `conclusion` is `success`, CI is passing.
+4. Once completed, check the conclusion. If `conclusion` is `success`, CI passed — return the passing result.
 
-4. If CI failed, retrieve the failure details:
+5. If CI failed, retrieve failure details:
    `gh run view <run_id> --log-failed`
    Save the full output to /tmp/ci_failures.txt for reference.
 
-5. Parse the failures into the structured format below. Each CI job failure should be reported as a separate entry. Use the job name and step name as the "test" field, and the file path from the log output as the "file" field (use the job/workflow name if no file is identifiable).
+6. Parse the failures into the structured format below. Each CI job failure is a separate entry.
+   Use the source file path from the log as "file" (or the job/workflow name if no file is identifiable).
+   Use the job name and step name as "test".
 
 CRITICAL: You MUST return ONLY valid JSON in this EXACT format (no markdown, no explanation):
 {{
