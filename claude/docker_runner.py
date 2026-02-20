@@ -1303,6 +1303,7 @@ class DockerAgentRunner:
                         task_context = context.get('context', {})
                         issue_number = task_context['issue_number']
                         column = task_context.get('column', 'unknown')
+                        reply_to_comment_id = task_context.get('reply_to_comment_id')
 
                         await self._complete_agent_execution(
                             project=project,
@@ -1311,7 +1312,8 @@ class DockerAgentRunner:
                             task_id=task_id,
                             exit_code=exit_code,
                             output=result_text,
-                            column=column
+                            column=column,
+                            reply_to_comment_id=reply_to_comment_id
                         )
                         output_posted = True
                     except Exception as completion_error:
@@ -1951,7 +1953,8 @@ class DockerAgentRunner:
         task_id: str,
         exit_code: int,
         output: str,
-        column: str = 'unknown'
+        column: str = 'unknown',
+        reply_to_comment_id: str = None
     ) -> None:
         """
         Unified completion handler for both fresh and recovered container executions.
@@ -1969,6 +1972,9 @@ class DockerAgentRunner:
             exit_code: Container exit code
             output: Agent output text
             column: Column name for execution state matching
+            reply_to_comment_id: Optional discussion comment ID to reply to in-thread.
+                Provided for fresh human-feedback-loop responses; None for initial runs
+                and recovered executions (which post top-level as an acceptable fallback).
         """
         outcome = 'success' if exit_code == 0 else 'failed'
         error = None if exit_code == 0 else f"Container exited with code {exit_code}"
@@ -1992,8 +1998,14 @@ class DockerAgentRunner:
                     summary_stats={}
                 )
 
-                # Build context from durable stores — works for fresh and recovered alike
+                # Build context from durable stores — works for fresh and recovered alike.
+                # For fresh human-feedback-loop responses, also include reply_to_comment_id
+                # so the post lands in the correct thread rather than as a top-level comment.
+                # Recovered executions legitimately lack this (ephemeral, not persisted), so
+                # they fall back to a top-level comment, which is acceptable.
                 context = self._build_completion_context(project, issue_number)
+                if reply_to_comment_id:
+                    context['reply_to_comment_id'] = reply_to_comment_id
 
                 post_result = await github.post_agent_output(context, comment)
 
