@@ -392,20 +392,40 @@ async def process_task_integrated(task, state_manager, logger):
         from agents.non_retryable import NonRetryableAgentError
         raise NonRetryableAgentError(f"Task blocked: {user_message}")
 
-    # Record execution start in work execution state
+    # Record execution start in work execution state.
+    # Guard: only write a new probe entry if no in_progress entry already exists for
+    # this agent/column. project_monitor writes a 'manual' probe before enqueueing;
+    # creating a second 'task_queue' probe here would leave a redundant in_progress
+    # entry if the orchestrator restarts before stamp_execution_task_id() runs.
     if 'issue_number' in task_context and 'column' in task_context:
         from services.work_execution_state import work_execution_tracker
-        work_execution_tracker.record_execution_start(
-            issue_number=task_context['issue_number'],
-            column=task_context['column'],
-            agent=task.agent,
-            trigger_source='task_queue',
-            project_name=task.project
+        issue_number_ctx = task_context['issue_number']
+        column_ctx = task_context['column']
+        state = work_execution_tracker.load_state(task.project, issue_number_ctx)
+        has_in_progress = any(
+            e.get('outcome') == 'in_progress' and
+            e.get('agent') == task.agent and
+            e.get('column') == column_ctx
+            for e in state.get('execution_history', [])
         )
-        logger.info(
-            f"Recorded execution start for {task.agent} on {task.project}/#{task_context['issue_number']} "
-            f"in column {task_context['column']} (trigger: task_queue)"
-        )
+        if not has_in_progress:
+            work_execution_tracker.record_execution_start(
+                issue_number=issue_number_ctx,
+                column=column_ctx,
+                agent=task.agent,
+                trigger_source='task_queue',
+                project_name=task.project
+            )
+            logger.info(
+                f"Recorded execution start for {task.agent} on {task.project}/#{issue_number_ctx} "
+                f"in column {column_ctx} (trigger: task_queue)"
+            )
+        else:
+            logger.info(
+                f"Skipped duplicate execution start for {task.agent} on "
+                f"{task.project}/#{issue_number_ctx} in column {column_ctx}: "
+                f"existing in_progress entry found (pre-enqueue probe)"
+            )
 
     # Execute agent using centralized executor
     executor = get_agent_executor()

@@ -204,11 +204,9 @@ class WorkExecutionStateTracker:
         """Record the outcome of work execution"""
         state = self.load_state(project_name, issue_number)
 
-        # Update all in_progress entries for this agent/column.
-        # The most recent one is the real execution; older ones are phantom probe
-        # entries created by project_monitor before enqueuing (trigger_source='manual').
-        # record_execution_outcome() was previously called only on the real (task_queue)
-        # entry, leaving phantom probes stuck as in_progress permanently.
+        # Find the in_progress entry for this agent/column and update it.
+        # Normally there is exactly one (the pre-enqueue probe created by project_monitor).
+        # The loop handles any historical duplicates defensively.
         found_primary = False
         phantom_count = 0
         for execution in reversed(state['execution_history']):
@@ -344,8 +342,8 @@ class WorkExecutionStateTracker:
                 )
                 return True, "manual_rework_detected"
 
-        # Case 3: Previous execution failed, was blocked, or was cancelled
-        if last_execution['outcome'] in ['failure', 'blocked', 'cancelled']:
+        # Case 3: Previous execution failed, was blocked, cancelled, or abandoned
+        if last_execution['outcome'] in ['failure', 'blocked', 'cancelled', 'abandoned']:
             logger.debug(
                 f"Should execute {agent} on {project_name}/#{issue_number}: "
                 f"retry_after_{last_execution['outcome']}"
@@ -2030,6 +2028,55 @@ class WorkExecutionStateTracker:
             logger.info(f"Cleaned up {cleaned_count} stuck in_progress execution states")
         else:
             logger.info("No stuck in_progress execution states found")
+
+    def abandon_stale_in_progress_entries(
+        self,
+        project_name: str,
+        issue_number: int,
+        active_task_ids: set
+    ) -> int:
+        """
+        Mark orphaned in_progress entries as 'abandoned' after an orchestrator restart.
+
+        An entry is considered stale (and safe to abandon) when:
+        - It has no task_id (was never assigned to a container — a pure probe entry), OR
+        - Its task_id is not in active_task_ids (the container is no longer running)
+
+        Entries whose task_id IS in active_task_ids are left untouched because
+        their container was successfully recovered.
+
+        Args:
+            project_name: Project name
+            issue_number: Issue number
+            active_task_ids: Set of task_ids belonging to currently running/recovered containers
+
+        Returns:
+            Number of entries marked as abandoned
+        """
+        state = self.load_state(project_name, issue_number)
+        abandoned = 0
+
+        for execution in state['execution_history']:
+            if execution.get('outcome') != 'in_progress':
+                continue
+
+            task_id = execution.get('task_id')
+            if task_id and task_id in active_task_ids:
+                # Container is still running — leave this entry alone
+                continue
+
+            execution['outcome'] = 'abandoned'
+            execution['error'] = 'Orchestrator restarted without completing this execution.'
+            abandoned += 1
+
+        if abandoned:
+            self.save_state(project_name, issue_number, state)
+            logger.info(
+                f"Abandoned {abandoned} stale in_progress entries for "
+                f"{project_name}/#{issue_number}"
+            )
+
+        return abandoned
 
 
 # Global instance

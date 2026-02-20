@@ -309,24 +309,29 @@ class AgentContainerRecovery:
     def recover_or_cleanup_containers(self) -> Tuple[int, int, int]:
         """
         Main recovery function - checks all running containers and decides whether to keep or kill
-        
+
         Returns:
             Tuple of (recovered_count, killed_count, error_count)
         """
         logger.info("Starting agent container recovery process")
-        
+
         running_containers = self.get_running_agent_containers()
-        
+
         if not running_containers:
             logger.info("No running agent containers found")
+            # Still run orphan cleanup even when no containers are running
+            abandoned = self.cleanup_orphaned_execution_history(recovered_task_ids=set())
+            if abandoned:
+                logger.info(f"Abandoned {abandoned} orphaned in_progress entries (no containers running)")
             return (0, 0, 0)
-        
+
         logger.info(f"Found {len(running_containers)} running agent containers")
-        
+
         recovered = 0
         killed = 0
         errors = 0
-        
+        recovered_task_ids: set = set()
+
         for container in running_containers:
             container_name = container['name']
             container_id = container['id']
@@ -558,22 +563,89 @@ class AgentContainerRecovery:
                         f"✓ Recovered container without monitoring (no issue number): {container_name}"
                     )
 
+                # Track task_id so orphan cleanup knows this execution is still live
+                if task_id:
+                    recovered_task_ids.add(task_id)
+
                 recovered += 1
-                
+
             except Exception as e:
                 logger.error(f"Error processing container {container_name}: {e}")
                 errors += 1
-        
+
         logger.info(
             f"Container recovery complete: {recovered} recovered, {killed} killed, {errors} errors"
         )
-        
+
+        # Abandon any in_progress history entries whose containers are no longer running
+        abandoned = self.cleanup_orphaned_execution_history(recovered_task_ids)
+        if abandoned:
+            logger.info(f"Abandoned {abandoned} orphaned in_progress entries after container recovery")
+
         return (recovered, killed, errors)
     
+    def cleanup_orphaned_execution_history(self, recovered_task_ids: set) -> int:
+        """
+        Scan all execution-history state files and abandon any in_progress entries
+        whose container is no longer running.
+
+        Called after recover_or_cleanup_containers() has finished processing all
+        running containers, so recovered_task_ids is the complete set of task_ids
+        that are legitimately still active.
+
+        An in_progress entry is abandoned when:
+        - It has no task_id (pure probe entry; no container was ever started for it), OR
+        - Its task_id is not in recovered_task_ids (container is gone)
+
+        Args:
+            recovered_task_ids: Set of task_ids belonging to containers that were
+                                 successfully recovered and are still running.
+
+        Returns:
+            Total number of entries abandoned across all state files.
+        """
+        import re
+        from services.work_execution_state import work_execution_tracker
+
+        total_abandoned = 0
+        state_dir = work_execution_tracker.state_dir
+
+        try:
+            state_files = list(state_dir.glob('*.yaml'))
+        except Exception as e:
+            logger.error(f"Failed to list execution history state files: {e}")
+            return 0
+
+        # Filename format: {project_name}_issue_{issue_number}.yaml
+        pattern = re.compile(r'^(.+)_issue_(\d+)\.yaml$')
+
+        for state_file in state_files:
+            match = pattern.match(state_file.name)
+            if not match:
+                logger.debug(f"Skipping non-matching state file: {state_file.name}")
+                continue
+
+            project_name = match.group(1)
+            issue_number = int(match.group(2))
+
+            try:
+                abandoned = work_execution_tracker.abandon_stale_in_progress_entries(
+                    project_name=project_name,
+                    issue_number=issue_number,
+                    active_task_ids=recovered_task_ids
+                )
+                total_abandoned += abandoned
+            except Exception as e:
+                logger.error(
+                    f"Error abandoning stale entries for {project_name}/#{issue_number}: {e}"
+                )
+
+        return total_abandoned
+
     def get_running_repair_cycle_containers(self) -> List[Dict[str, str]]:
         """
         Get list of running repair cycle containers from Docker
-        
+
         Returns:
             List of container info dicts with name, status, created_at
         """
