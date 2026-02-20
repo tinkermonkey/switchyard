@@ -129,13 +129,7 @@ class PRReviewStage(PipelineStage):
 
         try:
             # Check review cycle count
-            trigger_source = task_context.get('trigger_source', '')
             review_count = pr_review_state_manager.get_review_count(project_name, parent_issue_number)
-
-            if trigger_source == 'manual' and review_count >= MAX_REVIEW_CYCLES:
-                logger.info(f"Manual trigger - resetting review cycle count")
-                pr_review_state_manager.reset_review_count(project_name, parent_issue_number)
-                review_count = 0
 
             if review_count >= MAX_REVIEW_CYCLES:
                 msg = f"Review cycle limit ({MAX_REVIEW_CYCLES}) reached for #{parent_issue_number}"

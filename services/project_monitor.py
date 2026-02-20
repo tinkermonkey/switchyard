@@ -3073,6 +3073,33 @@ class ProjectMonitor:
                                 f"(validation method: {validation_method})"
                             )
 
+                # Guard: do not advance to "In Review" if the review cycle limit is already reached.
+                # This prevents an infinite loop where the final review cycle creates sub-issues,
+                # those sub-issues are fixed, and then _advance_parent_for_pr_review blindly
+                # pushes the parent back into "In Review" to start another cycle.
+                from pipeline.pr_review_stage import MAX_REVIEW_CYCLES
+                current_review_count = pr_review_state_manager.get_review_count(
+                    project_name, parent_issue_number
+                )
+                if current_review_count >= MAX_REVIEW_CYCLES:
+                    logger.info(
+                        f"🔍 _advance_parent_for_pr_review EARLY EXIT (cycle limit): "
+                        f"parent #{parent_issue_number} has reached the PR review cycle limit "
+                        f"({current_review_count}/{MAX_REVIEW_CYCLES}). Not advancing to 'In Review'."
+                    )
+                    from services.github_integration import GitHubIntegration
+                    github = GitHubIntegration(
+                        repo_owner=project_config.github['org'],
+                        repo_name=project_config.github['repo']
+                    )
+                    await github.post_comment(
+                        parent_issue_number,
+                        f"All sub-issues have been completed, but the maximum automated PR review "
+                        f"cycle limit ({MAX_REVIEW_CYCLES}) has been reached. "
+                        f"Further review should be performed manually."
+                    )
+                    return
+
                 # Move to "In Review" - the polling will detect the column change
                 # and trigger the PR review agent normally
                 from services.pipeline_progression import PipelineProgression
