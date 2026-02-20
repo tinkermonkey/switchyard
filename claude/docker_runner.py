@@ -1970,8 +1970,7 @@ class DockerAgentRunner:
                 if not workflow_template:
                     continue
                 if any(c.name == column for c in workflow_template.columns):
-                    pipeline_template = config_manager.get_pipeline_template(pipeline.template)
-                    return getattr(pipeline_template, 'workspace', 'issues')
+                    return getattr(pipeline, 'workspace', 'issues')
         except Exception:
             pass
         return 'issues'
