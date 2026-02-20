@@ -1922,20 +1922,24 @@ class DockerAgentRunner:
             import traceback
             logger.error(traceback.format_exc())
 
-    def _build_completion_context(self, project: str, issue_number: int) -> Dict[str, Any]:
+    def _build_completion_context(self, project: str, issue_number: int, workspace_type: str) -> Dict[str, Any]:
         """
         Build GitHub posting context from durable stores, not in-memory task state.
 
-        Looks up discussion_id from YAML state (written at discussion creation time)
-        and derives workspace_type from its presence. Works correctly after an
-        orchestrator restart because the YAML state persists across restarts.
+        workspace_type is passed in explicitly by the caller (derived from pipeline
+        config), not inferred from discussion_id presence. discussion_id and
+        workspace_type are independent: an issue may have a discussion in the state
+        file for context reasons without that discussion being the target workspace.
+
+        Works correctly after an orchestrator restart because the pipeline config and
+        YAML state both persist across restarts.
         """
         from config.state_manager import state_manager
         from config.manager import config_manager
 
         project_config = config_manager.get_project_config(project)
-        discussion_id = state_manager.get_discussion_for_issue(project, issue_number)
-        workspace_type = 'discussions' if discussion_id else 'issues'
+        discussion_id = state_manager.get_discussion_for_issue(project, issue_number) \
+            if workspace_type in ('discussions', 'hybrid') else None
 
         return {
             'issue_number': issue_number,
@@ -1944,6 +1948,33 @@ class DockerAgentRunner:
             'workspace_type': workspace_type,
             'discussion_id': discussion_id,
         }
+
+    def _get_workspace_type_from_column(self, project: str, column: str) -> str:
+        """
+        Derive workspace_type from pipeline config using project and column name.
+
+        workspace_type is a property of the pipeline template (e.g. 'issues' for
+        sdlc_execution, 'discussions' for planning_design). Given the column the
+        agent was executing in, we can find the owning pipeline and return its
+        workspace. Falls back to 'issues' if the column is unknown or unmatched.
+        """
+        if column == 'unknown':
+            return 'issues'
+        try:
+            from config.manager import config_manager
+            project_config = config_manager.get_project_config(project)
+            if not project_config:
+                return 'issues'
+            for pipeline in project_config.pipelines:
+                workflow_template = config_manager.get_workflow_template(pipeline.workflow)
+                if not workflow_template:
+                    continue
+                if any(c.name == column for c in workflow_template.columns):
+                    pipeline_template = config_manager.get_pipeline_template(pipeline.template)
+                    return getattr(pipeline_template, 'workspace', 'issues')
+        except Exception:
+            pass
+        return 'issues'
 
     async def _complete_agent_execution(
         self,
@@ -1959,10 +1990,9 @@ class DockerAgentRunner:
         """
         Unified completion handler for both fresh and recovered container executions.
 
-        Reads workspace routing context from durable stores (YAML state) rather than
-        in-memory task context, so both fresh and recovered executions follow the same
-        code path with no special-casing. The distinction between 'fresh' and
-        'recovered' disappears here.
+        Derives workspace_type from pipeline config (project + column) rather than
+        from in-memory task context or discussion_id presence, so both fresh and
+        recovered executions follow the same code path with no special-casing.
 
         Args:
             project: Project name
@@ -1999,11 +2029,14 @@ class DockerAgentRunner:
                 )
 
                 # Build context from durable stores — works for fresh and recovered alike.
+                # workspace_type is derived from pipeline config (project + column) rather
+                # than inferred from discussion_id presence; the two are independent.
                 # For fresh human-feedback-loop responses, also pass reply_to_comment_id
                 # so the post lands in the correct thread rather than as a top-level comment.
                 # Recovered executions legitimately lack this (ephemeral, not persisted), so
                 # they fall back to a top-level comment, which is acceptable.
-                context = self._build_completion_context(project, issue_number)
+                workspace_type = self._get_workspace_type_from_column(project, column)
+                context = self._build_completion_context(project, issue_number, workspace_type)
                 if reply_to_comment_id:
                     context['reply_to_comment_id'] = reply_to_comment_id
 
