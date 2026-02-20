@@ -679,18 +679,82 @@ class RepairCycleStage(PipelineStage):
         project = context.get("project", "unknown")
         pipeline_run_id = context.get("pipeline_run_id")
 
-        # Build task context for this agent execution
-        task_context = {
-            **context,
-            "pipeline_run_id": pipeline_run_id,  # Ensure pipeline_run_id flows through
-            "task_description": f"Run {config.test_type} tests (test cycle iteration {test_cycle_iteration})",
-            "timeout": config.timeout,
-            # Skip workspace preparation - repair cycle already runs in prepared workspace
-            "skip_workspace_prep": True,
-            # Clear review_cycle context to avoid iteration count confusion from previous review cycles
-            "review_cycle": None,
-            # Provide the custom instructions as a 'direct_prompt' so the agent can use it
-            "direct_prompt": f"""Run all {config.test_type} tests for this project.
+        # Build the appropriate prompt for this test type
+        if config.test_type == "compilation":
+            direct_prompt = f"""Ensure all code in this project passes compilation and linting checks.
+
+Your goal is to identify and report compilation errors and linting violations so they can be fixed before running tests.
+
+1. Identify the project's tech stack by inspecting config files (package.json, pyproject.toml, tsconfig.json, setup.py, etc.)
+
+2. Run the appropriate compilation and linting tools:
+   - **TypeScript/JavaScript**: `npx tsc --noEmit` (or the configured tsconfig) and ESLint if configured
+   - **Python**: `mypy .` and/or `ruff check .` / `flake8` if configured
+   - **Other languages**: use the project's configured build/lint toolchain
+
+3. Save the full output to /tmp/compilation_results.txt for reference.
+
+4. Return structured results. Each distinct error is a separate failure entry. Use the source file as "file", the error code or rule as "test", and the error message as "message".
+
+CRITICAL: You MUST return ONLY valid JSON in this EXACT format (no markdown, no explanation):
+{{
+    "passed": <number of files with no errors>,
+    "failed": <number of files with errors>,
+    "warnings": <number of lint warnings>,
+    "failures": [
+        {{"file": "src/component.ts", "test": "TS2339", "message": "Property 'x' does not exist on type 'Y'"}},
+        ...
+    ],
+    "warning_list": [
+        {{"file": "src/util.ts", "message": "no-unused-vars: 'foo' is defined but never used"}},
+        ...
+    ]
+}}
+
+If all code compiles and lints cleanly, return:
+{{"passed": 1, "failed": 0, "warnings": 0, "failures": [], "warning_list": []}}
+
+DO NOT include any explanation, markdown formatting, or other text - ONLY the JSON object."""
+
+        elif config.test_type == "ci":
+            direct_prompt = f"""Check whether CI (continuous integration) is passing for this project's current branch.
+
+Follow these steps exactly:
+
+1. First, push the current branch to origin so CI has the latest changes:
+   `git push origin HEAD`
+   If there is nothing to push (already up to date), that is fine — proceed to step 2.
+
+2. Wait for the most recent CI run to complete. Use:
+   `gh run list --limit 1 --branch $(git rev-parse --abbrev-ref HEAD) --json databaseId,status,conclusion`
+   Poll every 30 seconds until `status` is `completed`. The CI run may take several minutes — be patient and keep polling.
+
+3. Once completed, check the conclusion. If `conclusion` is `success`, CI is passing.
+
+4. If CI failed, retrieve the failure details:
+   `gh run view <run_id> --log-failed`
+   Save the full output to /tmp/ci_failures.txt for reference.
+
+5. Parse the failures into the structured format below. Each CI job failure should be reported as a separate entry. Use the job name and step name as the "test" field, and the file path from the log output as the "file" field (use the job/workflow name if no file is identifiable).
+
+CRITICAL: You MUST return ONLY valid JSON in this EXACT format (no markdown, no explanation):
+{{
+    "passed": <number of CI jobs that passed>,
+    "failed": <number of CI jobs that failed>,
+    "warnings": 0,
+    "failures": [
+        {{"file": "<source file path or job name>", "test": "<job name / step name>", "message": "<error message from CI log>"}},
+        ...
+    ],
+    "warning_list": []
+}}
+
+If CI is passing (conclusion is success), return:
+{{"passed": 1, "failed": 0, "warnings": 0, "failures": [], "warning_list": []}}
+
+DO NOT include any explanation, markdown formatting, or other text - ONLY the JSON object."""
+        else:
+            direct_prompt = f"""Run all {config.test_type} tests for this project.
 
 Please identify the appropriate test framework and location for {config.test_type} tests.
 
@@ -717,7 +781,20 @@ CRITICAL: You MUST return ONLY valid JSON in this EXACT format (no markdown, no 
     ]
 }}
 
-DO NOT include any explanation, markdown formatting, or other text - ONLY the JSON object.""",
+DO NOT include any explanation, markdown formatting, or other text - ONLY the JSON object."""
+
+        # Build task context for this agent execution
+        task_context = {
+            **context,
+            "pipeline_run_id": pipeline_run_id,  # Ensure pipeline_run_id flows through
+            "task_description": f"Run {config.test_type} tests (test cycle iteration {test_cycle_iteration})",
+            "timeout": config.timeout,
+            # Skip workspace preparation - repair cycle already runs in prepared workspace
+            "skip_workspace_prep": True,
+            # Clear review_cycle context to avoid iteration count confusion from previous review cycles
+            "review_cycle": None,
+            # Provide the custom instructions as a 'direct_prompt' so the agent can use it
+            "direct_prompt": direct_prompt,
         }
 
         # Retry logic for infrastructure failures (e.g., JSON parsing)

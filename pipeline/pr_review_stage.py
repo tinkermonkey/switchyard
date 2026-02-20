@@ -196,8 +196,20 @@ class PRReviewStage(PipelineStage):
 
             try:
                 self._agent_call_count += 1
+                # Build prior cycle context for reviewer memory (only on cycles 2+)
+                prior_cycle_context = ""
+                if current_cycle > 1:
+                    prior_cycle_context = self._build_prior_cycle_context(
+                        project_name, parent_issue_number, repo
+                    )
+                    if prior_cycle_context:
+                        logger.info(
+                            f"Injecting prior cycle history into reviewer prompt "
+                            f"(cycle {current_cycle})"
+                        )
+
                 # Build prompt for pr_code_reviewer
-                pr_review_prompt = self._build_pr_review_prompt(pr_url)
+                pr_review_prompt = self._build_pr_review_prompt(pr_url, prior_cycle_context)
 
                 # Launch pr_code_reviewer in Docker (via AgentExecutor)
                 pr_review_result = await agent_executor.execute_agent(
@@ -726,7 +738,53 @@ class PRReviewStage(PipelineStage):
             lines.append(f"| {name} | {state} | {details} |")
         return "\n".join(lines)
 
-    def _build_pr_review_prompt(self, pr_url: str) -> str:
+    def _build_prior_cycle_context(
+        self, project_name: str, parent_issue_number: int, repo: str
+    ) -> str:
+        """
+        Build a summary of prior review cycle findings for injection into the reviewer prompt.
+
+        Fetches issue titles from GitHub for each issue created in previous cycles so the
+        reviewer can avoid re-reporting already-fixed issues and can flag regressions explicitly.
+        """
+        history = pr_review_state_manager.get_review_history(project_name, parent_issue_number)
+        if not history:
+            return ""
+
+        lines = []
+        for iteration in history:
+            cycle_num = iteration.get('iteration', '?')
+            timestamp = iteration.get('timestamp', '')
+            issue_numbers = iteration.get('issues_created', [])
+
+            if not issue_numbers:
+                lines.append(f"\n**Cycle {cycle_num}** ({timestamp[:10]}): Clean pass — no issues found")
+                continue
+
+            lines.append(f"\n**Cycle {cycle_num}** ({timestamp[:10]}): {len(issue_numbers)} issue(s) created and closed")
+            for num in issue_numbers:
+                try:
+                    result = subprocess.run(
+                        ['gh', 'issue', 'view', str(num), '-R', repo,
+                         '--json', 'title,state'],
+                        capture_output=True, text=True, timeout=15
+                    )
+                    if result.returncode == 0 and result.stdout.strip():
+                        data = json.loads(result.stdout)
+                        title = data.get('title', f'Issue #{num}')
+                        state = data.get('state', 'unknown').lower()
+                        lines.append(f"  - #{num} ({state}): {title}")
+                    else:
+                        lines.append(f"  - #{num}: (could not fetch title)")
+                except Exception:
+                    lines.append(f"  - #{num}")
+
+        if not lines:
+            return ""
+
+        return "\n".join(lines)
+
+    def _build_pr_review_prompt(self, pr_url: str, prior_cycle_context: str = "") -> str:
         """
         Build PR review prompt that encourages skill usage while enforcing parseable output structure.
 
@@ -748,8 +806,26 @@ gh pr checkout {pr_number}
 ```
 """
 
-        return f"""You are a PR Review Specialist reviewing PR: {pr_url}
+        prior_cycle_section = ""
+        if prior_cycle_context:
+            prior_cycle_section = f"""
+## Prior Review Cycles
 
+The following issues were found and closed in previous automated review cycles for this PR.
+Do NOT re-report issues that were fixed in prior cycles unless you have concrete evidence
+the fix was reverted or the issue exists at a different location.
+
+For each issue you report, explicitly note in the description whether it is:
+- **NEW**: First time this issue has been identified
+- **REGRESSION**: Was previously fixed but has reappeared
+
+{prior_cycle_context}
+
+---
+"""
+
+        return f"""You are a PR Review Specialist reviewing PR: {pr_url}
+{prior_cycle_section}
 ## STEP 1: Run Comprehensive Review
 
 **REQUIRED**: Use the pr-review-toolkit skill to run specialized review agents.
@@ -772,16 +848,16 @@ After the review skill completes, you MUST format the findings in this EXACT str
 ## PR Review Findings
 
 ### Critical Issues
-- **[Finding Title]**: [Description with file:line references]
+- **[Finding Title]**: [Description with file:line references] (NEW / REGRESSION)
 
 ### High Priority Issues
-- **[Finding Title]**: [Description with file:line references]
+- **[Finding Title]**: [Description with file:line references] (NEW / REGRESSION)
 
 ### Medium Priority Issues
-- **[Finding Title]**: [Description with file:line references]
+- **[Finding Title]**: [Description with file:line references] (NEW / REGRESSION)
 
 ### Low Priority / Nice-to-Have
-- **[Finding Title]**: [Description with file:line references]
+- **[Finding Title]**: [Description with file:line references] (NEW / REGRESSION)
 
 ### Clean Areas
 - [Areas that passed review with no issues]
@@ -793,6 +869,7 @@ After the review skill completes, you MUST format the findings in this EXACT str
 3. Each finding must use format: `- **[Title]**: [Description]`
 4. If no issues at a severity level, write ONLY "None found" - no additional text
 5. Include file:line references where applicable (e.g., `/workspace/file.ts:123`)
+6. Tag each finding as (NEW) or (REGRESSION) if prior cycle history was provided above
 
 This structured format enables automatic GitHub issue creation from your findings.
 """
@@ -802,6 +879,43 @@ This structured format enables automatic GitHub issue creation from your finding
         if len(context_content) > max_context_len:
             context_content = context_content[:max_context_len] + "\n\n[... truncated ...]"
 
+        # Derive authority framing based on which context source this is.
+        # This prevents phantom "gap" issues from aspirational research being treated
+        # the same as committed architectural specifications.
+        if 'Idea Researcher' in context_name:
+            authority_framing = (
+                "## Context Authority: Research Suggestions\n\n"
+                "This context source represents **aspirational research and early ideation** — "
+                "suggestions and possibilities explored during the research phase, NOT committed requirements.\n\n"
+                "**Flag a gap ONLY IF** the Software Architect output or Parent Issue explicitly committed "
+                "to implementing a specific feature from this source. "
+                "Do NOT flag missing research suggestions, stretch goals, future enhancement ideas, "
+                "or exploratory concepts as implementation gaps."
+            )
+        elif 'Business Analyst' in context_name:
+            authority_framing = (
+                "## Context Authority: Functional Requirements\n\n"
+                "This context source represents **functional business requirements**. "
+                "Flag gaps for items explicitly described as required, must-have, or core functionality. "
+                "Skip items described as nice-to-have, future enhancements, or optional."
+            )
+        elif 'Software Architect' in context_name:
+            authority_framing = (
+                "## Context Authority: Committed Technical Specifications\n\n"
+                "This context source represents **committed architectural decisions and technical specifications** — "
+                "the agreed-upon technical contracts that must be implemented.\n\n"
+                "Flag ALL gaps, deviations from specified patterns, and missing components. "
+                "These specifications carry the highest authority."
+            )
+        else:
+            # Parent Issue or unknown source — treat as acceptance criteria
+            authority_framing = (
+                "## Context Authority: Acceptance Criteria\n\n"
+                "This context source is the **source of truth for acceptance criteria**. "
+                "Every explicit requirement listed here must be implemented. "
+                "Flag any missing or partially implemented requirements."
+            )
+
         return f"""
 You are a Requirements Verification Specialist. Your job is to verify that a PR's implementation
 fully addresses the requirements from a specific context source.
@@ -810,6 +924,8 @@ fully addresses the requirements from a specific context source.
 {pr_url}
 
 Review the PR diff to understand what was implemented.
+
+{authority_framing}
 
 ## Context Source: {context_name}
 
@@ -824,9 +940,12 @@ The following is the original context that should be fully addressed by the PR:
 1. Read the PR diff carefully
 2. Compare against the context source above
 3. Identify any requirements, specifications, or design decisions from the context that are:
-   - NOT implemented in the PR
-   - Partially implemented (missing aspects)
-   - Implemented differently than specified (potential deviation)
+   - NOT implemented in the PR (gap)
+   - Partially implemented — missing aspects (gap)
+   - Implemented differently than specified (deviation)
+
+Apply the authority framing above when deciding what qualifies as a gap. Research suggestions
+and aspirational ideas from the Idea Researcher are NOT gaps unless explicitly committed to.
 
 ## Output Format
 
@@ -1054,6 +1173,7 @@ If all requirements are met, write "All requirements verified - no gaps found" a
                     'url': issue_url,
                     'title': spec['title'],
                     'severity': spec.get('severity', 'medium'),
+                    'body': spec.get('body', ''),
                 })
 
                 logger.info(f"Created review issue #{issue_number}: {spec['title']}")
@@ -1084,6 +1204,36 @@ If all requirements are met, write "All requirements verified - no gaps found" a
                         pipeline_run_id=pipeline_run_id
                     )
                 # Continue with other issues
+
+        # Two-pass: update each issue body with sibling context so fix agents can coordinate.
+        # Only applies when multiple issues were created in this review cycle.
+        if len(created_issues) > 1:
+            sibling_header = (
+                "\n\n---\n\n"
+                "## Concurrent Fix Issues (Same Review Cycle)\n\n"
+                "The following issues are being fixed simultaneously in this review cycle. "
+                "Check these issues for any files they modify before making your own changes "
+                "to avoid introducing conflicts:\n\n"
+            )
+            for issue_data in created_issues:
+                sibling_lines = "\n".join(
+                    f"- #{s['number']}: {s['title']}"
+                    for s in created_issues
+                    if s['number'] != issue_data['number']
+                )
+                new_body = issue_data['body'] + sibling_header + sibling_lines
+                try:
+                    subprocess.run(
+                        ['gh', 'issue', 'edit', issue_data['number'], '-R', repo,
+                         '--body', new_body],
+                        capture_output=True, text=True, check=True, timeout=30
+                    )
+                    logger.info(f"Updated #{issue_data['number']} with sibling issue context")
+                except Exception as e:
+                    logger.error(
+                        f"Failed to add sibling context to #{issue_data['number']}: {e}",
+                        exc_info=True
+                    )
 
         return created_issues
 
