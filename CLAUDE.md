@@ -404,12 +404,6 @@ curl http://localhost:5001/current-pipeline    # Current pipeline state
 curl http://localhost:5001/pipeline-run-events # Pipeline run events
 curl http://localhost:5001/active-pipeline-runs # Active pipeline runs
 
-# Review filter management
-curl http://localhost:5001/api/review-filters              # GET filters
-curl http://localhost:5001/api/review-filters -X POST      # Create filter
-curl http://localhost:5001/api/review-filters/<id> -X PUT  # Update filter
-curl http://localhost:5001/api/review-filters/<id> -X DELETE # Delete filter
-
 # Circuit breaker monitoring
 curl http://localhost:5001/api/circuit-breakers  # Circuit breaker states
 
