@@ -130,7 +130,7 @@ agents:
 
   senior_software_engineer:
     description: "Software development and implementation"
-    model: "claude-sonnet-4-5-20250929"
+    model: "claude-haiku-4-5-20251001"
     timeout: 1800
     retries: 3
     circuit_breaker:
