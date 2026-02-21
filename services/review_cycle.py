@@ -2030,27 +2030,6 @@ class ReviewCycleExecutor:
             logger.warning(f"Failed to get git diff: {e}")
             return ""
 
-    def _get_merge_base(self, project_dir: str) -> str:
-        """Return the merge-base SHA between HEAD and origin/main (or main).
-
-        This is the point where the feature branch diverged from the base branch.
-        Returns "" on any error.
-        """
-        import subprocess
-        for base in ('origin/main', 'main', 'origin/master', 'master'):
-            try:
-                result = subprocess.run(
-                    ['git', 'merge-base', 'HEAD', base],
-                    cwd=project_dir, capture_output=True, text=True, check=True
-                )
-                sha = result.stdout.strip()
-                if sha:
-                    return sha
-            except Exception:
-                continue
-        logger.warning("Failed to find merge-base with any known base branch")
-        return ""
-
     def _create_review_task_context(
         self,
         cycle_state: ReviewCycleState,
@@ -2085,27 +2064,22 @@ class ReviewCycleExecutor:
                 else:
                     logger.info(f"No changes since pre-maker snapshot {cycle_state.pre_maker_commit[:8]}")
 
-            # Fallback: merge-base (covers deployments before pre_maker_commit was introduced)
+            # Fallback: diff only the most recent commit (HEAD~1..HEAD)
             if not scoped_diff:
-                merge_base = self._get_merge_base(str(project_dir))
-                if merge_base:
-                    scoped_diff = self._get_git_diff_since_commit(str(project_dir), merge_base)
-                    if scoped_diff:
-                        logger.info(
-                            f"Fallback: full feature-branch diff ({len(scoped_diff)} chars) "
-                            f"from merge-base {merge_base[:8]}"
-                        )
-
-            # Last resort: last_approved_commit (older fallback, kept for safety)
-            if not scoped_diff and cycle_state.last_approved_commit:
-                scoped_diff = self._get_git_diff_since_commit(
-                    str(project_dir), cycle_state.last_approved_commit
-                )
+                scoped_diff = self._get_git_diff_since_commit(str(project_dir), 'HEAD~1')
                 if scoped_diff:
                     logger.info(
-                        f"Last-resort fallback: diff ({len(scoped_diff)} chars) "
-                        f"since approved commit {cycle_state.last_approved_commit[:8]}"
+                        f"Fallback: most recent commit diff ({len(scoped_diff)} chars)"
                     )
+
+            # No diff available — state is broken; reviewer has nothing to review
+            if not scoped_diff:
+                raise RuntimeError(
+                    f"Cannot build reviewer context for issue #{cycle_state.issue_number}: "
+                    f"no git diff available. pre_maker_commit="
+                    f"{cycle_state.pre_maker_commit!r} and HEAD~1 fallback both returned empty. "
+                    f"Aborting review cycle."
+                )
 
             # Safety ceiling: truncate if still too large
             if len(scoped_diff) > MAX_REVIEWER_GIT_DIFF:
