@@ -541,7 +541,28 @@ class TokenMetricsService:
             prev_effective_input: Optional[int] = None
             prev_tool_uses: List[str] = []
 
-            for doc in docs:
+            # Pre-pass: record the last index of each unique Anthropic message ID.
+            # Claude Code re-emits the same message (same usage, same ID) each time a
+            # new content block is appended during streaming. We must skip earlier
+            # emissions to avoid 2–4× overcounting of tokens and tool invocations.
+            _last_idx_for_msg: Dict[str, int] = {}
+            for _i, _doc in enumerate(docs):
+                _raw = _doc.get('raw_event')
+                if not _raw:
+                    continue
+                if isinstance(_raw, str):
+                    try:
+                        _raw = json.loads(_raw)
+                    except Exception:
+                        continue
+                _event = _raw.get('event') if isinstance(_raw, dict) else None
+                if _event and _event.get('type') == 'assistant':
+                    _msg_id = _event.get('message', {}).get('id')
+                    if _msg_id:
+                        _last_idx_for_msg[_msg_id] = _i
+            _canonical_indices = set(_last_idx_for_msg.values())
+
+            for _i, doc in enumerate(docs):
                 raw_event = doc.get('raw_event')
                 if not raw_event:
                     continue
@@ -557,6 +578,10 @@ class TokenMetricsService:
                     continue
 
                 message = event.get('message', {})
+                msg_id = message.get('id')
+                if msg_id and _i not in _canonical_indices:
+                    continue  # skip streaming re-emission; only process last emission per message
+
                 usage = message.get('usage', {})
                 model = message.get('model')
 
