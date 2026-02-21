@@ -947,7 +947,7 @@ class ReviewCycleExecutor:
                             agent=cycle_state.maker_agent,
                             task_id=f"review_cycle_iter_{cycle_state.current_iteration}",
                             issue_number=cycle_state.issue_number,
-                            custom_message=f"Address code review feedback (iteration {cycle_state.current_iteration})\n\nIssue #{cycle_state.issue_number}"
+                            custom_message=f"Address code review feedback (iteration {cycle_state.current_iteration})\n\nIssue #{cycle_state.issue_number}\n[orchestrator-commit]"
                         )
 
                 # Get maker output
@@ -1936,7 +1936,7 @@ class ReviewCycleExecutor:
                         agent=cycle_state.maker_agent,
                         task_id=f"review_cycle_iter_{iteration}",
                         issue_number=cycle_state.issue_number,
-                        custom_message=f"Address code review feedback (iteration {iteration})\n\nIssue #{cycle_state.issue_number}"
+                        custom_message=f"Address code review feedback (iteration {iteration})\n\nIssue #{cycle_state.issue_number}\n[orchestrator-commit]"
                     )
 
                     if commit_success:
@@ -2006,6 +2006,30 @@ class ReviewCycleExecutor:
             logger.warning(f"Failed to get git diff: {e}")
             return ""
 
+    def _get_pre_most_recent_maker_commit(self, project_dir: str) -> str:
+        """Return the parent SHA of the most recent [orchestrator-commit] on this branch.
+
+        This gives us the baseline for 'what did the most recent agent execution change'.
+        Returns "" if no orchestrator commit is found or on any error.
+        """
+        import subprocess
+        try:
+            result = subprocess.run(
+                ['git', 'log', '--format=%H', '--grep=orchestrator-commit', '-1'],
+                cwd=project_dir, capture_output=True, text=True, check=True
+            )
+            sha = result.stdout.strip()
+            if not sha:
+                return ""
+            parent = subprocess.run(
+                ['git', 'rev-parse', f'{sha}^'],
+                cwd=project_dir, capture_output=True, text=True, check=True
+            )
+            return parent.stdout.strip()
+        except Exception as e:
+            logger.warning(f"Failed to find pre-maker commit: {e}")
+            return ""
+
     def _create_review_task_context(
         self,
         cycle_state: ReviewCycleState,
@@ -2015,23 +2039,47 @@ class ReviewCycleExecutor:
         full_discussion_context: str = ""
     ) -> Dict[str, Any]:
         """Create task context for reviewer agent"""
-        # Get the latest maker output
+        MAX_REVIEWER_GIT_DIFF = 400_000  # ~100k tokens safety ceiling
+
+        # Get the latest maker output (kept for review_cycle metadata only)
         latest_maker_output = cycle_state.maker_outputs[-1]['output'] if cycle_state.maker_outputs else ""
 
-        # Use full discussion context if provided, otherwise fall back to just the maker output
-        context_for_review = full_discussion_context if full_discussion_context else latest_maker_output
+        # For discussions workspace, pass full_discussion_context; for issues, leave empty
+        context_for_review = full_discussion_context if full_discussion_context else ""
 
-        # Get scoped git diff for issues workspace
+        # Get focused git diff for issues workspace
         scoped_diff = ""
-        if cycle_state.workspace_type == 'issues' and cycle_state.last_approved_commit:
+        if cycle_state.workspace_type == 'issues':
             from services.project_workspace import workspace_manager
             project_dir = workspace_manager.get_project_dir(cycle_state.project_name)
-            scoped_diff = self._get_git_diff_since_commit(
-                str(project_dir),
-                cycle_state.last_approved_commit
-            )
-            if scoped_diff:
-                logger.info(f"Generated scoped git diff ({len(scoped_diff)} chars) since commit {cycle_state.last_approved_commit[:8]}")
+
+            # Prefer diff of only the most recent agent execution
+            pre_commit = self._get_pre_most_recent_maker_commit(str(project_dir))
+            if pre_commit:
+                scoped_diff = self._get_git_diff_since_commit(str(project_dir), pre_commit)
+                if scoped_diff:
+                    logger.info(
+                        f"Generated focused agent diff ({len(scoped_diff)} chars) "
+                        f"from pre-maker commit {pre_commit[:8]}"
+                    )
+
+            # Fallback: full diff since last approved review
+            if not scoped_diff and cycle_state.last_approved_commit:
+                scoped_diff = self._get_git_diff_since_commit(
+                    str(project_dir), cycle_state.last_approved_commit
+                )
+                if scoped_diff:
+                    logger.info(
+                        f"Fallback: full diff ({len(scoped_diff)} chars) "
+                        f"since approved commit {cycle_state.last_approved_commit[:8]}"
+                    )
+
+            # Safety ceiling: truncate if still too large
+            if len(scoped_diff) > MAX_REVIEWER_GIT_DIFF:
+                logger.warning(
+                    f"Git diff truncated from {len(scoped_diff)} to {MAX_REVIEWER_GIT_DIFF} chars"
+                )
+                scoped_diff = scoped_diff[:MAX_REVIEWER_GIT_DIFF] + "\n\n[... diff truncated ...]"
 
         task_context = {
             'project': cycle_state.project_name,
@@ -2051,8 +2099,8 @@ class ReviewCycleExecutor:
                 'previous_maker_output': latest_maker_output,
                 'is_rereviewing': iteration > 1
             },
-            'previous_stage_output': context_for_review,  # Full discussion context
-            'scoped_git_diff': scoped_diff,  # Git diff since last approval (issues workspace only)
+            'previous_stage_output': context_for_review,  # Discussions context only; empty for issues
+            'scoped_git_diff': scoped_diff,  # Focused diff of most recent agent execution
             'timestamp': datetime.now().isoformat()
         }
         logger.info(f"[DIAGNOSTIC] Created review task_context with pipeline_run_id: {cycle_state.pipeline_run_id} for issue #{cycle_state.issue_number}")

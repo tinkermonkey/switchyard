@@ -109,13 +109,6 @@ REQUIRED: Include "**Status**: X" at the top for automation parsing."""
         # Extract from nested task context
         task_context = context.get('context', {})
 
-        # Get the previous stage output (from maker agent)
-        previous_stage = task_context.get('previous_stage_output', '')
-
-        if not previous_stage:
-            raise Exception("Code Reviewer needs previous stage output from maker agent")
-
-        implementation = previous_stage
         review_cycle = task_context.get('review_cycle', {})
         issue = task_context.get('issue', {})
 
@@ -240,10 +233,6 @@ You are a **Senior Software Engineer** conducting comprehensive code review.
 **Title**: {issue.get('title', 'No title')}
 **Description**: {issue.get('body', 'No description')}
 {git_diff_section}
-## Implementation to Review
-
-{implementation}
-
 ## Your Review Task
 
 Conduct a comprehensive code review covering:

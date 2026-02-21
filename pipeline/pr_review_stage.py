@@ -281,7 +281,6 @@ class PRReviewStage(PipelineStage):
             # context-specific framing without relying on substring matching.
             context_checks = [
                 ("Parent Issue Requirements", "parent_issue", parent_issue_body),
-                ("Idea Researcher Output", "idea_researcher", discussion_outputs.get('idea_researcher')),
                 ("Business Analyst Output", "business_analyst", discussion_outputs.get('business_analyst')),
                 ("Software Architect Output", "software_architect", discussion_outputs.get('software_architect')),
             ]
@@ -643,7 +642,7 @@ class PRReviewStage(PipelineStage):
 
             comments = result['node']['comments']['nodes']
 
-            agent_keys = ['idea_researcher', 'business_analyst', 'software_architect']
+            agent_keys = ['business_analyst', 'software_architect']
 
             all_bodies = []
             for comment in comments:
@@ -887,15 +886,6 @@ This structured format enables automatic GitHub issue creation from your finding
         # Dispatch on the explicit authority_key (not the display name) so the framing
         # is robust against future renames of the human-readable context_name.
         _authority_framings = {
-            "idea_researcher": (
-                "## Context Authority: Research Suggestions\n\n"
-                "This context source represents **aspirational research and early ideation** — "
-                "suggestions and possibilities explored during the research phase, NOT committed requirements.\n\n"
-                "**Flag a gap ONLY IF** the Software Architect output or Parent Issue explicitly committed "
-                "to implementing a specific feature from this source. "
-                "Do NOT flag missing research suggestions, stretch goals, future enhancement ideas, "
-                "or exploratory concepts as implementation gaps."
-            ),
             "business_analyst": (
                 "## Context Authority: Functional Requirements\n\n"
                 "This context source represents **functional business requirements**. "

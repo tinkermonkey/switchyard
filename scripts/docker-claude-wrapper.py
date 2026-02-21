@@ -65,7 +65,6 @@ class ClaudeWrapper:
                 port=self.redis_port,
                 socket_timeout=1.0,  # 1-second write timeout
                 socket_connect_timeout=2.0,  # 2-second connect timeout
-                retry_on_timeout=False,  # Fail fast, don't retry
                 health_check_interval=30,  # Check connection health every 30s
                 decode_responses=False  # Binary mode for JSON
             )
