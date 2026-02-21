@@ -180,18 +180,51 @@ class TokenMetricsService:
             except Exception as e:
                 logger.warning(f"Could not ensure index template {template_name}: {e}")
 
-    async def run_metrics_job(self):
+    def find_oldest_event_hours_ago(self) -> int:
+        """
+        Query ES for the oldest agent_initialized event and return how many hours
+        ago it occurred, rounded up to the nearest hour.  Returns 168 (7 days) as
+        a floor if no events are found or the query fails.
+        """
+        try:
+            result = self.es.search(
+                index='agent-events-*',
+                body={
+                    'size': 1,
+                    'query': {'term': {'event_type': 'agent_initialized'}},
+                    'sort': [{'timestamp': {'order': 'asc'}}],
+                    '_source': ['timestamp'],
+                }
+            )
+            hits = result['hits']['hits']
+            if not hits:
+                return 168
+            oldest_ts = hits[0]['_source']['timestamp']
+            oldest_dt = datetime.fromisoformat(oldest_ts.replace('Z', '+00:00'))
+            delta = datetime.now(timezone.utc) - oldest_dt
+            return max(1, int(delta.total_seconds() / 3600) + 1)
+        except Exception as e:
+            logger.warning(f"Could not determine oldest event timestamp: {e}; defaulting to 168h")
+            return 168
+
+    async def run_metrics_job(self, lookback_hours: int = None):
         """
         Run the full token metrics computation job.
 
         Both agent and cycle metrics are computed as hourly buckets covering the
-        last (interval_hours * 2) complete hours plus the current partial hour.
+        last lookback_hours complete hours plus the current partial hour.
         Each hourly document is upserted so re-running is idempotent.
+
+        When lookback_hours is None (the default), the value is derived from
+        TOKEN_METRICS_INTERVAL_HOURS * 2, preserving the existing scheduled-job
+        behaviour.  Pass an explicit value to backfill a longer window without
+        affecting the cron cadence.
         """
         import asyncio
 
-        interval_hours = int(os.environ.get('TOKEN_METRICS_INTERVAL_HOURS', '3'))
-        lookback_hours = interval_hours * 2
+        if lookback_hours is None:
+            interval_hours = int(os.environ.get('TOKEN_METRICS_INTERVAL_HOURS', '3'))
+            lookback_hours = interval_hours * 2
         now = datetime.now(timezone.utc)
         current_hour_start = now.replace(minute=0, second=0, microsecond=0)
 
@@ -211,8 +244,14 @@ class TokenMetricsService:
 
         total_agent_docs = 0
         total_cycle_docs = 0
+        total_hours = len(hours_to_compute)
 
-        for hour_start, hour_end in hours_to_compute:
+        for idx, (hour_start, hour_end) in enumerate(hours_to_compute):
+            if idx > 0 and idx % 100 == 0:
+                logger.info(
+                    f"Token metrics progress: {idx}/{total_hours} hours processed "
+                    f"({total_agent_docs} agent docs, {total_cycle_docs} cycle docs so far)"
+                )
             # --- Agent hourly metrics ---
             try:
                 agent_hourly = await loop.run_in_executor(

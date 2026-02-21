@@ -1723,6 +1723,37 @@ def get_cycle_metrics():
         return jsonify({'success': False, 'error': str(e), 'metrics': []}), 500
 
 
+@app.route('/api/metrics/run-now', methods=['POST'])
+def trigger_token_metrics():
+    """Trigger an immediate token metrics computation job."""
+    try:
+        from services.scheduled_tasks import get_scheduled_tasks_service
+        scheduler = get_scheduled_tasks_service()
+        scheduler.run_token_metrics_now()
+        return jsonify({'success': True, 'message': 'Token metrics job triggered'})
+    except Exception as e:
+        logger.error(f"Error triggering token metrics: {e}", exc_info=True)
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/metrics/run-full-history', methods=['POST'])
+def trigger_token_metrics_full_history():
+    """Backfill token metrics across all available event history.
+
+    Determines the oldest agent_initialized event in Elasticsearch and runs the
+    metrics job with a lookback that covers the entire available window.  The
+    scheduled cron job cadence is not affected.
+    """
+    try:
+        from services.scheduled_tasks import get_scheduled_tasks_service
+        scheduler = get_scheduled_tasks_service()
+        scheduler.run_full_history_token_metrics_now()
+        return jsonify({'success': True, 'message': 'Full-history token metrics backfill triggered'})
+    except Exception as e:
+        logger.error(f"Error triggering full-history token metrics: {e}", exc_info=True)
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
 def _merge_canonical_breakdown(target: dict, source: dict) -> None:
     """
     Merge a source canonical breakdown object into a target accumulator in-place.

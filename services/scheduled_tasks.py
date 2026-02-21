@@ -706,6 +706,29 @@ class ScheduledTasksService:
         logger.info("Manually triggering empty output detection")
         asyncio.create_task(self._detect_empty_outputs())
 
+    def run_token_metrics_now(self):
+        """Run token metrics computation immediately (for testing/manual trigger)"""
+        logger.info("Manually triggering token metrics computation")
+        asyncio.create_task(self._run_token_metrics())
+
+    def run_full_history_token_metrics_now(self):
+        """Backfill token metrics across all available history without affecting the cron cadence."""
+        logger.info("Manually triggering full-history token metrics backfill")
+        asyncio.create_task(self._run_full_history_token_metrics())
+
+    async def _run_full_history_token_metrics(self):
+        """Run token metrics job with a lookback that covers all available event history."""
+        logger.info("Starting full-history token metrics backfill")
+        try:
+            from services.token_metrics_service import get_token_metrics_service
+            service = get_token_metrics_service()
+            loop = asyncio.get_running_loop()
+            lookback_hours = await loop.run_in_executor(None, service.find_oldest_event_hours_ago)
+            logger.info(f"Full-history backfill: oldest event is ~{lookback_hours}h ago")
+            await service.run_metrics_job(lookback_hours=lookback_hours)
+        except Exception as e:
+            logger.error(f"Fatal error in full-history token metrics backfill: {e}", exc_info=True)
+
 
 # Global instance
 _scheduled_tasks_service = None

@@ -3,14 +3,6 @@ import { RefreshCw, BarChart2 } from 'lucide-react'
 
 const DAYS_OPTIONS = [1, 3, 7]  // server clamps cycle metrics to 7 days max
 
-const CYCLE_COLORS = {
-  review_cycle: { bg: 'bg-blue-900/30', border: 'border-blue-600', text: 'text-blue-400', label: 'Review Cycle' },
-  repair_cycle: { bg: 'bg-orange-900/30', border: 'border-orange-600', text: 'text-orange-400', label: 'Repair Cycle' },
-  pr_review_stage: { bg: 'bg-purple-900/30', border: 'border-purple-600', text: 'text-purple-400', label: 'PR Review Stage' },
-}
-
-const DEFAULT_COLOR = { bg: 'bg-gh-canvas-subtle', border: 'border-gh-border', text: 'text-gh-fg', label: null }
-
 // Strip 'claude-' prefix and trailing 8-digit date from a model ID.
 // e.g. 'claude-haiku-4-5-20251001' → 'haiku-4-5', 'claude-sonnet-4-6' → 'sonnet-4-6'
 const formatModelName = (mod) => {
@@ -46,8 +38,7 @@ function TokenRow({ label, avg, min, max }) {
 }
 
 function CycleCard({ cycle }) {
-  const colors = CYCLE_COLORS[cycle.cycle_type] || DEFAULT_COLOR
-  const label = colors.label || cycle.cycle_type
+  const label = cycle.cycle_type
   const tc = cycle.task_count || 0
 
   const agentBreakdown = Object.entries(cycle.agent_breakdown || {})
@@ -60,10 +51,10 @@ function CycleCard({ cycle }) {
   const models = Object.keys(cycle.model_breakdown || {})
 
   return (
-    <div className={`${colors.bg} border ${colors.border} rounded-md overflow-hidden`}>
-      <div className={`px-4 py-3 border-b ${colors.border}`}>
+    <div className={`$ border rounded-md overflow-hidden`}>
+      <div className={`px-4 py-3 border-b `}>
         <div className="flex items-center justify-between">
-          <h3 className={`text-sm font-semibold ${colors.text}`}>{label}</h3>
+          <h3 className={`text-sm font-semibold `}>{label}</h3>
           <span className="text-xs text-gh-fg-muted">{tc} executions</span>
         </div>
       </div>
