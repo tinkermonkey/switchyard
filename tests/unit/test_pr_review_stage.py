@@ -38,7 +38,7 @@ async def test_phase1_launches_pr_code_reviewer(pr_review_stage):
          patch.object(pr_review_stage, '_load_discussion_outputs', return_value={}), \
          patch.object(pr_review_stage, '_get_parent_issue_body', return_value=''), \
          patch.object(pr_review_stage, '_check_ci_status', return_value=([], [])), \
-         patch.object(pr_review_stage, '_parse_review_findings', return_value=[]), \
+         patch.object(pr_review_stage, '_parse_consolidated_findings', return_value=[]), \
          patch.object(pr_review_stage, '_advance_parent_to_documentation'):
 
         mock_executor = AsyncMock()
@@ -78,7 +78,7 @@ async def test_phase2_launches_requirements_verifier(pr_review_stage):
          }), \
          patch.object(pr_review_stage, '_get_parent_issue_body', return_value='Parent issue requirements'), \
          patch.object(pr_review_stage, '_check_ci_status', return_value=([], [])), \
-         patch.object(pr_review_stage, '_parse_review_findings', return_value=[]), \
+         patch.object(pr_review_stage, '_parse_consolidated_findings', return_value=[]), \
          patch.object(pr_review_stage, '_advance_parent_to_documentation'):
 
         mock_executor = AsyncMock()
@@ -101,9 +101,10 @@ async def test_phase2_launches_requirements_verifier(pr_review_stage):
         calls = [call[1] for call in mock_executor.execute_agent.call_args_list]
         phase2_calls = [c for c in calls if c['execution_type'] == 'pr_review_phase2']
 
-        # Should have 3 calls: Parent Issue, Idea Researcher, Business Analyst
-        # (Software Architect not included since we didn't mock it)
-        assert len(phase2_calls) >= 2
+        # Exactly 2 calls: Parent Issue Requirements + Business Analyst.
+        # idea_researcher is excluded from context_checks; software_architect not mocked
+        # so its content is empty and the verification is skipped.
+        assert len(phase2_calls) == 2
         assert all(c['agent_name'] == 'requirements_verifier' for c in phase2_calls)
 
         # Verify task context includes required fields
@@ -161,7 +162,7 @@ async def test_manual_progression_flag_set_when_clean_pass(pr_review_stage):
          patch.object(pr_review_stage, '_load_discussion_outputs', return_value={}), \
          patch.object(pr_review_stage, '_get_parent_issue_body', return_value=''), \
          patch.object(pr_review_stage, '_check_ci_status', return_value=([], [])), \
-         patch.object(pr_review_stage, '_parse_review_findings', return_value=[]), \
+         patch.object(pr_review_stage, '_parse_consolidated_findings', return_value=[]), \
          patch.object(pr_review_stage, '_advance_parent_to_documentation'):
 
         mock_executor = AsyncMock()
@@ -193,7 +194,7 @@ async def test_manual_progression_flag_not_set_when_inconclusive(pr_review_stage
          patch.object(pr_review_stage, '_load_discussion_outputs', return_value={}), \
          patch.object(pr_review_stage, '_get_parent_issue_body', return_value=''), \
          patch.object(pr_review_stage, '_check_ci_status', return_value=([], [])), \
-         patch.object(pr_review_stage, '_parse_review_findings', return_value=[]):
+         patch.object(pr_review_stage, '_parse_consolidated_findings', return_value=[]):
 
         mock_executor = AsyncMock()
         # Make Phase 1 fail
@@ -223,7 +224,7 @@ async def test_phase3_runs_locally_no_docker(pr_review_stage):
          patch.object(pr_review_stage, '_load_discussion_outputs', return_value={}), \
          patch.object(pr_review_stage, '_get_parent_issue_body', return_value=''), \
          patch.object(pr_review_stage, '_check_ci_status', return_value=([], [])) as mock_ci_check, \
-         patch.object(pr_review_stage, '_parse_review_findings', return_value=[]), \
+         patch.object(pr_review_stage, '_parse_consolidated_findings', return_value=[]), \
          patch.object(pr_review_stage, '_advance_parent_to_documentation'):
 
         mock_executor = AsyncMock()
@@ -306,7 +307,7 @@ async def test_skips_workspace_prep_false(pr_review_stage):
          patch.object(pr_review_stage, '_load_discussion_outputs', return_value={}), \
          patch.object(pr_review_stage, '_get_parent_issue_body', return_value=''), \
          patch.object(pr_review_stage, '_check_ci_status', return_value=([], [])), \
-         patch.object(pr_review_stage, '_parse_review_findings', return_value=[]), \
+         patch.object(pr_review_stage, '_parse_consolidated_findings', return_value=[]), \
          patch.object(pr_review_stage, '_advance_parent_to_documentation'):
 
         mock_executor = AsyncMock()
@@ -365,7 +366,7 @@ async def test_phase2_skipped_when_no_context(pr_review_stage):
          patch.object(pr_review_stage, '_load_discussion_outputs', return_value={}), \
          patch.object(pr_review_stage, '_get_parent_issue_body', return_value=''), \
          patch.object(pr_review_stage, '_check_ci_status', return_value=([], [])), \
-         patch.object(pr_review_stage, '_parse_review_findings', return_value=[]), \
+         patch.object(pr_review_stage, '_parse_consolidated_findings', return_value=[]), \
          patch.object(pr_review_stage, '_advance_parent_to_documentation'):
 
         mock_executor = AsyncMock()
@@ -401,7 +402,7 @@ async def test_creates_issues_for_ci_failures(pr_review_stage):
          patch.object(pr_review_stage, '_check_ci_status', return_value=(
              [{'name': 'test', 'state': 'failure', 'bucket': 'fail'}], []
          )), \
-         patch.object(pr_review_stage, '_parse_review_findings', return_value=[]), \
+         patch.object(pr_review_stage, '_parse_consolidated_findings', return_value=[]), \
          patch.object(pr_review_stage, '_build_ci_failure_issue', return_value={
              'title': 'CI Failure', 'body': 'CI failed', 'severity': 'high'
          }), \
@@ -444,7 +445,7 @@ async def test_markdown_analysis_includes_summary(pr_review_stage):
          patch.object(pr_review_stage, '_load_discussion_outputs', return_value={}), \
          patch.object(pr_review_stage, '_get_parent_issue_body', return_value=''), \
          patch.object(pr_review_stage, '_check_ci_status', return_value=([], [])), \
-         patch.object(pr_review_stage, '_parse_review_findings', return_value=[]), \
+         patch.object(pr_review_stage, '_parse_consolidated_findings', return_value=[]), \
          patch.object(pr_review_stage, '_advance_parent_to_documentation'):
 
         mock_executor = AsyncMock()

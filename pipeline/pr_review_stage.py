@@ -1579,16 +1579,22 @@ Rules:
         try:
             data = json.loads(json_text)
         except json.JSONDecodeError:
-            # Fallback: extract the outermost JSON object from surrounding prose
-            match = re.search(r'\{[\s\S]*\}', json_text)
-            if match:
+            # Fallback: agent may have added prose before/after the JSON object.
+            # raw_decode starts at the first '{' and parses exactly one JSON value,
+            # ignoring any trailing content — avoids the greedy-regex pitfall where
+            # a '}' in trailing prose causes the extracted substring to be unparseable.
+            first_brace = json_text.find('{')
+            if first_brace >= 0:
                 try:
-                    data = json.loads(match.group(0))
+                    data, _ = json.JSONDecoder().raw_decode(json_text, first_brace)
                 except json.JSONDecodeError:
                     pass
 
         if data is None:
-            logger.warning("Could not parse consolidation output as JSON; creating no issues")
+            logger.warning(
+                "Could not parse consolidation output as JSON; creating no issues. "
+                f"Output excerpt: {json_text[:200]!r}"
+            )
             return []
 
         groups = data.get('groups', [])
