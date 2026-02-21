@@ -418,6 +418,91 @@ For example:
         raise
 
 
+CLAUDE_MD_SECTION_START = "<!-- generated-agents-section -->"
+CLAUDE_MD_SECTION_END = "<!-- /generated-agents-section -->"
+
+
+def render_claude_md_section(strategy: Dict[str, Any]) -> str:
+    """Build the auto-generated CLAUDE.md block from a strategy dict."""
+    agents = strategy.get('agents', [])
+    skills = strategy.get('skills', [])
+
+    lines = [CLAUDE_MD_SECTION_START]
+
+    if agents:
+        lines.extend([
+            "",
+            "## Specialized Sub-Agents",
+            "",
+            "Specialized sub-agents are available via the `Task` tool. Use them instead of "
+            "working from general knowledge — they have deep project-specific context.",
+            "",
+            "| Agent | When to use |",
+            "|---|---|",
+        ])
+        for agent in agents:
+            rationale = agent.get('rationale', agent.get('purpose', ''))
+            when_to_use = rationale.split('.')[0].rstrip('.,;')
+            lines.append(f"| `{agent['name']}` | {when_to_use} |")
+
+        lines.extend(["", "```"])
+        for agent in agents[:3]:
+            purpose = agent.get('purpose', agent['name'])
+            lines.append(
+                f'Task(subagent_type="{agent["name"]}", prompt="<your question about {purpose}>")'
+            )
+        lines.append("```")
+
+    if skills:
+        lines.extend([
+            "",
+            "## Skills",
+            "",
+            "| Skill | What it does |",
+            "|---|---|",
+        ])
+        for skill in skills:
+            lines.append(f"| `/{skill['name']}` | {skill.get('purpose', '')} |")
+
+    lines.extend(["", CLAUDE_MD_SECTION_END])
+    return "\n".join(lines)
+
+
+def update_project_claude_md(project: str, strategy: Dict[str, Any], dry_run: bool = False) -> bool:
+    """
+    Write or replace the generated agent/skills section in the project root CLAUDE.md.
+
+    Replaces content between sentinel comments on re-runs; appends on first run.
+    Targets the project root CLAUDE.md (not .claude/CLAUDE.md).
+    """
+    workspace_root = get_workspace_root()
+    claude_md_path = workspace_root / project / 'CLAUDE.md'
+
+    new_section = render_claude_md_section(strategy)
+
+    if dry_run:
+        logger.info(f"[DRY RUN] Would update {claude_md_path} with generated agent/skills section")
+        return True
+
+    if claude_md_path.exists():
+        existing = claude_md_path.read_text(encoding='utf-8')
+        if CLAUDE_MD_SECTION_START in existing and CLAUDE_MD_SECTION_END in existing:
+            before = existing[:existing.index(CLAUDE_MD_SECTION_START)]
+            after = existing[existing.index(CLAUDE_MD_SECTION_END) + len(CLAUDE_MD_SECTION_END):]
+            updated = before.rstrip('\n') + '\n\n' + new_section + after.rstrip('\n') + '\n'
+        else:
+            updated = existing.rstrip('\n') + '\n\n' + new_section + '\n'
+    else:
+        updated = f"# {project}\n\n{new_section}\n"
+
+    claude_md_path.write_text(updated, encoding='utf-8')
+    logger.info(
+        f"  ✓ Updated {claude_md_path} with "
+        f"{len(strategy.get('agents', []))} agents, {len(strategy.get('skills', []))} skills"
+    )
+    return True
+
+
 async def generate_all_artifacts(
     project: str,
     strategy: Dict[str, Any],
@@ -460,6 +545,10 @@ async def generate_all_artifacts(
             created_artifacts['skills'].append(skill_path)
         except Exception as e:
             logger.error(f"  ✗ Failed to generate skill {skill_spec['name']}: {e}")
+
+    # Update project CLAUDE.md with generated agent/skills section
+    logger.info("  Updating project CLAUDE.md...")
+    update_project_claude_md(project, strategy, dry_run=dry_run)
 
     return created_artifacts
 

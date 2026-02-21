@@ -553,7 +553,7 @@ def run_generation_workflow(project: str, args) -> Dict[str, Any]:
         logger.info(f"  ✓ All {validation_results['passed']} artifact(s) validated")
 
     # Phase 8: Artifacts deployed (implicit - already written in Phase 5)
-    logger.info(f"\nPhase 8: Artifacts deployed to {project}/.claude/")
+    logger.info(f"\nPhase 8: Artifacts deployed to {project}/.claude/ and {project}/CLAUDE.md updated")
 
     # Phase 9: Update state
     logger.info("\nPhase 9: Updating state...")
