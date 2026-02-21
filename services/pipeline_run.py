@@ -772,7 +772,7 @@ class PipelineRunManager:
                                         result = subprocess.run(
                                             ['gh', 'issue', 'view', str(next_issue['issue_number']),
                                              '--repo', f"{project_config.github['org']}/{project_config.github['repo']}",
-                                             '--json', 'title,url'],
+                                             '--json', 'title,body,url'],
                                             capture_output=True, text=True, check=True
                                         )
                                         next_issue_data = json.loads(result.stdout)
