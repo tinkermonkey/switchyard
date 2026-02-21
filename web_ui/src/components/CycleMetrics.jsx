@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from 'react'
 import { RefreshCw, BarChart2 } from 'lucide-react'
 
-const DAYS_OPTIONS = [1, 7, 30]
+const DAYS_OPTIONS = [1, 3, 7]  // server clamps cycle metrics to 7 days max
 
 const CYCLE_COLORS = {
   review_cycle: { bg: 'bg-blue-900/30', border: 'border-blue-600', text: 'text-blue-400', label: 'Review Cycle' },
@@ -15,19 +15,21 @@ const formatTokenCount = (n) => {
   if (n == null) return '—'
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
   if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`
-  return String(n)
+  return String(Math.round(n))
 }
 
-function StatBox({ label, avg, min, max }) {
+function TokenRow({ label, avg, min, max }) {
   return (
-    <div className="bg-gh-canvas-subtle rounded p-2 text-center border border-gh-border">
-      <div className="text-xs text-gh-fg-muted mb-1">{label}</div>
-      <div className="font-mono text-sm font-semibold">{formatTokenCount(avg)}</div>
-      {(min != null && max != null) && (
-        <div className="text-xs text-gh-fg-muted font-mono mt-0.5">
-          {formatTokenCount(min)} – {formatTokenCount(max)}
-        </div>
-      )}
+    <div className="flex items-center justify-between py-1 border-b border-gh-border last:border-0">
+      <span className="text-xs text-gh-fg-muted">{label}</span>
+      <div className="text-right">
+        <span className="font-mono text-sm font-semibold">{formatTokenCount(avg)}</span>
+        {(min != null && max != null) && (
+          <span className="text-xs text-gh-fg-muted font-mono ml-2">
+            ({formatTokenCount(min)} – {formatTokenCount(max)})
+          </span>
+        )}
+      </div>
     </div>
   )
 }
@@ -35,16 +37,14 @@ function StatBox({ label, avg, min, max }) {
 function CycleCard({ cycle }) {
   const colors = CYCLE_COLORS[cycle.cycle_type] || DEFAULT_COLOR
   const label = colors.label || cycle.cycle_type
+  const tc = cycle.task_count || 0
 
   const agentBreakdown = Object.entries(cycle.agent_breakdown || {})
-    .sort((a, b) => (b[1].sample_count || 0) - (a[1].sample_count || 0))
+    .sort((a, b) => (b[1].task_count || 0) - (a[1].task_count || 0))
 
-  const topTools = Object.entries(cycle.tool_call_counts || {})
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 8)
-
-  const toolAttribution = Object.entries(cycle.tool_token_attribution || {})
-    .sort((a, b) => b[1].total_tokens - a[1].total_tokens)
+  const toolBreakdown = Object.entries(cycle.tool_breakdown || {})
+    .sort((a, b) => (b[1].sum_context_growth || 0) - (a[1].sum_context_growth || 0))
+    .slice(0, 10)
 
   const models = Object.keys(cycle.model_breakdown || {})
 
@@ -53,37 +53,44 @@ function CycleCard({ cycle }) {
       <div className={`px-4 py-3 border-b ${colors.border}`}>
         <div className="flex items-center justify-between">
           <h3 className={`text-sm font-semibold ${colors.text}`}>{label}</h3>
-          <span className="text-xs text-gh-fg-muted">{cycle.sample_count} executions</span>
+          <span className="text-xs text-gh-fg-muted">{tc} executions</span>
         </div>
       </div>
 
       <div className="p-4 space-y-4">
-        {/* 6-stat token summary: 3 columns × 2 rows */}
-        <div className="grid grid-cols-3 gap-3">
-          <StatBox
-            label="Avg Input"
-            avg={cycle.avg_total_input}
-            min={cycle.min_total_input}
-            max={cycle.max_total_input}
+        {/* Four-type token summary */}
+        <div className="bg-gh-canvas-subtle rounded p-3 border border-gh-border">
+          <TokenRow
+            label="Avg Direct Input"
+            avg={cycle.avg_direct_input}
           />
-          <StatBox
+          <TokenRow
+            label="Avg Cache Reads"
+            avg={cycle.avg_cache_read}
+          />
+          <TokenRow
+            label="Avg Cache Creation"
+            avg={cycle.avg_cache_creation}
+          />
+          <TokenRow
             label="Avg Output"
-            avg={cycle.avg_total_output}
-            min={cycle.min_total_output}
-            max={cycle.max_total_output}
+            avg={cycle.avg_output}
+            min={cycle.min_output}
+            max={cycle.max_output}
           />
-          <StatBox
-            label="Avg Total"
-            avg={cycle.avg_total_all}
-            min={cycle.min_total_all}
-            max={cycle.max_total_all}
+          <TokenRow
+            label="Avg Max Context"
+            avg={cycle.avg_max_context}
+            min={cycle.min_max_context}
+            max={cycle.max_max_context}
           />
-          <StatBox label="Min Total" avg={cycle.min_total_all} />
-          <StatBox label="Max Total" avg={cycle.max_total_all} />
-          <StatBox label="Avg Initial" avg={cycle.avg_initial_input} />
+          <TokenRow
+            label="Avg Initial Context"
+            avg={cycle.avg_initial_input}
+          />
         </div>
 
-        {/* 2-col grid: agent breakdown + top tools & models */}
+        {/* 2-col grid: agent breakdown + models */}
         <div className="grid grid-cols-2 gap-4">
           {/* Agent breakdown */}
           <div>
@@ -94,19 +101,19 @@ function CycleCard({ cycle }) {
                   <tr className="text-gh-fg-muted">
                     <th className="text-left font-normal pb-1">Agent</th>
                     <th className="text-right font-normal pb-1">Runs</th>
-                    <th className="text-right font-normal pb-1">Avg Input</th>
+                    <th className="text-right font-normal pb-1">Avg Direct</th>
+                    <th className="text-right font-normal pb-1">Avg Cache R</th>
                     <th className="text-right font-normal pb-1">Avg Output</th>
-                    <th className="text-right font-normal pb-1">Avg Total</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-gh-border">
                   {agentBreakdown.map(([agent, stats]) => (
                     <tr key={agent}>
                       <td className="font-mono py-0.5">{agent}</td>
-                      <td className="text-right py-0.5">{stats.sample_count || 0}</td>
-                      <td className="text-right py-0.5 font-mono">{formatTokenCount(stats.avg_total_input)}</td>
-                      <td className="text-right py-0.5 font-mono">{formatTokenCount(stats.avg_total_output)}</td>
-                      <td className="text-right py-0.5 font-mono">{formatTokenCount(stats.avg_total_all)}</td>
+                      <td className="text-right py-0.5">{stats.task_count || 0}</td>
+                      <td className="text-right py-0.5 font-mono">{formatTokenCount(stats.avg_direct_input)}</td>
+                      <td className="text-right py-0.5 font-mono">{formatTokenCount(stats.avg_cache_read)}</td>
+                      <td className="text-right py-0.5 font-mono">{formatTokenCount(stats.avg_output)}</td>
                     </tr>
                   ))}
                 </tbody>
@@ -116,20 +123,8 @@ function CycleCard({ cycle }) {
             )}
           </div>
 
-          {/* Top tools + models */}
-          <div className="space-y-3">
-            {topTools.length > 0 && (
-              <div>
-                <h4 className="text-xs font-semibold text-gh-fg-muted uppercase mb-2">Top Tools</h4>
-                <div className="flex flex-wrap gap-1">
-                  {topTools.map(([name, count]) => (
-                    <span key={name} className="text-xs text-gh-fg-muted font-mono">
-                      {name}×{count}
-                    </span>
-                  ))}
-                </div>
-              </div>
-            )}
+          {/* Models */}
+          <div>
             {models.length > 0 && (
               <div>
                 <h4 className="text-xs font-semibold text-gh-fg-muted uppercase mb-2">Models</h4>
@@ -145,26 +140,33 @@ function CycleCard({ cycle }) {
           </div>
         </div>
 
-        {/* Tool Token Attribution */}
-        {toolAttribution.length > 0 && (
+        {/* Tool Breakdown */}
+        {toolBreakdown.length > 0 && (
           <div>
-            <h4 className="text-xs font-semibold text-gh-fg-muted uppercase mb-2">Tool Token Attribution</h4>
+            <h4 className="text-xs font-semibold text-gh-fg-muted uppercase mb-2">Tool Breakdown (top by context growth)</h4>
             <table className="w-full text-xs">
               <thead>
                 <tr className="text-gh-fg-muted">
                   <th className="text-left font-normal pb-1">Tool</th>
-                  <th className="text-right font-normal pb-1">Calls</th>
-                  <th className="text-right font-normal pb-1">Avg Tokens/Call</th>
+                  <th className="text-right font-normal pb-1">Invocations</th>
+                  <th className="text-right font-normal pb-1">Avg Output/Call</th>
+                  <th className="text-right font-normal pb-1">Context Growth</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-gh-border">
-                {toolAttribution.map(([tool, attr]) => (
-                  <tr key={tool}>
-                    <td className="font-mono py-0.5">{tool}</td>
-                    <td className="text-right py-0.5">{attr.call_count}</td>
-                    <td className="text-right py-0.5 font-mono">{formatTokenCount(attr.avg_tokens_per_call)}</td>
-                  </tr>
-                ))}
+                {toolBreakdown.map(([tool, tb]) => {
+                  const inv = tb.task_count || 0
+                  return (
+                    <tr key={tool}>
+                      <td className="font-mono py-0.5">{tool}</td>
+                      <td className="text-right py-0.5">{inv}</td>
+                      <td className="text-right py-0.5 font-mono">
+                        {inv > 0 ? formatTokenCount((tb.sum_output || 0) / inv) : '—'}
+                      </td>
+                      <td className="text-right py-0.5 font-mono">{formatTokenCount(tb.sum_context_growth)}</td>
+                    </tr>
+                  )
+                })}
               </tbody>
             </table>
           </div>
@@ -174,8 +176,7 @@ function CycleCard({ cycle }) {
   )
 }
 
-export default function CycleMetrics() {
-  const [days, setDays] = useState(7)
+export default function CycleMetrics({ days, onDaysChange }) {
   const [metrics, setMetrics] = useState([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
@@ -214,7 +215,7 @@ export default function CycleMetrics() {
             {DAYS_OPTIONS.map(d => (
               <button
                 key={d}
-                onClick={() => setDays(d)}
+                onClick={() => onDaysChange(d)}
                 className={`px-3 py-1 text-sm rounded border transition-colors ${
                   days === d
                     ? 'bg-gh-accent-emphasis border-gh-accent-primary text-white'

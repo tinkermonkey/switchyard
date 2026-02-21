@@ -113,6 +113,7 @@ class TestObservabilityElasticsearchIndexing:
             EventType.REPAIR_CYCLE_WARNING_REVIEW_COMPLETED,
             EventType.REPAIR_CYCLE_WARNING_REVIEW_FAILED,
             EventType.REPAIR_CYCLE_COMPLETED,
+            EventType.REPAIR_CYCLE_FAILED,
         ]
         
         for event_type in decision_events:

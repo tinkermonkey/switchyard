@@ -7,16 +7,19 @@ const formatTokenCount = (n) => {
   if (n == null) return '—'
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
   if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`
-  return String(n)
+  return String(Math.round(n))
 }
 
-const StatCell = ({ avg, min, max }) => (
+// Derive avg fields from an agent metrics doc returned by the API.
+// The API returns both raw sums and pre-computed avg_* fields.
+const getAvg = (m, field) => m[field] ?? 0
+const getCount = (m) => m.task_count ?? 0
+
+const StatCell = ({ value, sub }) => (
   <td className="px-3 py-2 text-sm">
-    <div className="font-mono">{formatTokenCount(avg)}</div>
-    {(min != null || max != null) && (
-      <div className="text-xs text-gh-fg-muted font-mono">
-        {formatTokenCount(min)} – {formatTokenCount(max)}
-      </div>
+    <div className="font-mono">{formatTokenCount(value)}</div>
+    {sub != null && (
+      <div className="text-xs text-gh-fg-muted font-mono">{sub}</div>
     )}
   </td>
 )
@@ -26,7 +29,7 @@ export default function AgentMetrics() {
   const [metrics, setMetrics] = useState([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
-  const [sortField, setSortField] = useState('avg_total_all')
+  const [sortField, setSortField] = useState('avg_output')
   const [sortDir, setSortDir] = useState('desc')
   const [expandedAgents, setExpandedAgents] = useState(new Set())
 
@@ -74,8 +77,11 @@ export default function AgentMetrics() {
   }
 
   const sorted = [...metrics].sort((a, b) => {
-    const av = a[sortField] ?? 0
-    const bv = b[sortField] ?? 0
+    const av = getAvg(a, sortField)
+    const bv = getAvg(b, sortField)
+    if (typeof av === 'string') {
+      return sortDir === 'asc' ? av.localeCompare(bv) : bv.localeCompare(av)
+    }
     return sortDir === 'asc' ? av - bv : bv - av
   })
 
@@ -131,6 +137,12 @@ export default function AgentMetrics() {
         </div>
       )}
 
+      {loading && (
+        <div className="flex items-center justify-center py-12">
+          <RefreshCw className="w-6 h-6 animate-spin text-gh-accent-primary" />
+        </div>
+      )}
+
       {!loading && metrics.length === 0 && (
         <div className="p-8 bg-gh-canvas-subtle border border-gh-border rounded-md text-center">
           <BarChart2 className="w-8 h-8 text-gh-fg-muted mx-auto mb-3" />
@@ -150,22 +162,24 @@ export default function AgentMetrics() {
                 <tr>
                   <th className="px-3 py-2 w-6" />
                   <SortHeader field="agent_name" label="Agent" />
-                  <SortHeader field="sample_count" label="Executions" />
-                  <th className="px-3 py-2 text-left text-xs font-semibold text-gh-fg-muted uppercase">Avg/Min/Max Initial</th>
-                  <th className="px-3 py-2 text-left text-xs font-semibold text-gh-fg-muted uppercase">Avg/Min/Max Input</th>
-                  <th className="px-3 py-2 text-left text-xs font-semibold text-gh-fg-muted uppercase">Avg/Min/Max Output</th>
-                  <th className="px-3 py-2 text-left text-xs font-semibold text-gh-fg-muted uppercase">Avg/Min/Max Total</th>
+                  <SortHeader field="task_count" label="Executions" />
+                  <th className="px-3 py-2 text-left text-xs font-semibold text-gh-fg-muted uppercase">Avg Direct Input</th>
+                  <th className="px-3 py-2 text-left text-xs font-semibold text-gh-fg-muted uppercase">Avg Cache Reads</th>
+                  <th className="px-3 py-2 text-left text-xs font-semibold text-gh-fg-muted uppercase">Avg Cache Creation</th>
+                  <SortHeader field="avg_output" label="Avg Output" />
+                  <SortHeader field="avg_max_context" label="Avg Max Context" />
                   <th className="px-3 py-2 text-left text-xs font-semibold text-gh-fg-muted uppercase">Models</th>
                   <th className="px-3 py-2 text-left text-xs font-semibold text-gh-fg-muted uppercase">Top 3 Tools</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-gh-border">
                 {sorted.map(m => {
-                  const topTools = Object.entries(m.tool_call_counts || {})
-                    .sort((a, b) => b[1] - a[1])
+                  const topTools = Object.entries(m.tool_breakdown || {})
+                    .sort((a, b) => (b[1].task_count || 0) - (a[1].task_count || 0))
                     .slice(0, 3)
                   const models = Object.keys(m.model_breakdown || {})
                   const isExpanded = expandedAgents.has(m.agent_name)
+                  const tc = getCount(m)
 
                   return (
                     <Fragment key={m.agent_name}>
@@ -182,11 +196,18 @@ export default function AgentMetrics() {
                         <td className="px-3 py-2">
                           <span className="font-mono text-sm text-gh-fg">{m.agent_name}</span>
                         </td>
-                        <td className="px-3 py-2 text-sm text-center">{m.sample_count}</td>
-                        <StatCell avg={m.avg_initial_input} min={m.min_initial_input} max={m.max_initial_input} />
-                        <StatCell avg={m.avg_total_input} min={m.min_total_input} max={m.max_total_input} />
-                        <StatCell avg={m.avg_total_output} min={m.min_total_output} max={m.max_total_output} />
-                        <StatCell avg={m.avg_total_all} min={m.min_total_all} max={m.max_total_all} />
+                        <td className="px-3 py-2 text-sm text-center">{tc}</td>
+                        <StatCell value={getAvg(m, 'avg_direct_input')} />
+                        <StatCell value={getAvg(m, 'avg_cache_read')} />
+                        <StatCell value={getAvg(m, 'avg_cache_creation')} />
+                        <StatCell
+                          value={getAvg(m, 'avg_output')}
+                          sub={`${formatTokenCount(m.min_output)}–${formatTokenCount(m.max_output)}`}
+                        />
+                        <StatCell
+                          value={getAvg(m, 'avg_max_context')}
+                          sub={`${formatTokenCount(m.min_max_context)}–${formatTokenCount(m.max_max_context)}`}
+                        />
                         <td className="px-3 py-2">
                           <div className="flex flex-wrap gap-1">
                             {models.map(mod => (
@@ -198,13 +219,13 @@ export default function AgentMetrics() {
                         </td>
                         <td className="px-3 py-2">
                           <div className="space-y-0.5">
-                            {topTools.map(([name, count]) => (
+                            {topTools.map(([name, tb]) => (
                               <div key={name} className="text-xs font-mono">
                                 <span className="text-gh-fg-muted">{name}</span>
-                                <span className="text-gh-fg">×{count}</span>
-                                {m.sample_count > 0 && (
+                                <span className="text-gh-fg">×{tb.task_count || 0}</span>
+                                {tc > 0 && (
                                   <span className="text-gh-fg-muted ml-1">
-                                    ({(count / m.sample_count).toFixed(1)}/exec)
+                                    ({((tb.task_count || 0) / tc).toFixed(1)}/exec)
                                   </span>
                                 )}
                               </div>
@@ -214,41 +235,44 @@ export default function AgentMetrics() {
                       </tr>
                       {isExpanded && (
                         <tr className="bg-gh-canvas">
-                          <td colSpan={9} className="px-4 py-3">
+                          <td colSpan={10} className="px-4 py-3">
                             <div className="grid grid-cols-2 gap-6">
-                              {/* Tool Token Attribution */}
+                              {/* Tool Breakdown */}
                               <div>
-                                <h4 className="text-xs font-semibold text-gh-fg-muted uppercase mb-2">Tool Token Attribution</h4>
-                                {Object.keys(m.tool_token_attribution || {}).length > 0 ? (
+                                <h4 className="text-xs font-semibold text-gh-fg-muted uppercase mb-2">Tool Breakdown</h4>
+                                {Object.keys(m.tool_breakdown || {}).length > 0 ? (
                                   <table className="w-full text-xs">
                                     <thead>
                                       <tr className="text-gh-fg-muted">
                                         <th className="text-left font-normal pb-1">Tool</th>
-                                        <th className="text-right font-normal pb-1">Total Calls</th>
-                                        <th className="text-right font-normal pb-1">Avg Calls/Exec</th>
-                                        <th className="text-right font-normal pb-1">Avg Tokens/Call</th>
+                                        <th className="text-right font-normal pb-1">Invocations</th>
+                                        <th className="text-right font-normal pb-1">Avg Output/Call</th>
+                                        <th className="text-right font-normal pb-1">Context Growth</th>
                                       </tr>
                                     </thead>
                                     <tbody className="divide-y divide-gh-border">
-                                      {Object.entries(m.tool_token_attribution)
-                                        .sort((a, b) => b[1].total_tokens - a[1].total_tokens)
-                                        .map(([tool, attr]) => (
-                                          <tr key={tool}>
-                                            <td className="font-mono py-0.5">{tool}</td>
-                                            <td className="text-right py-0.5">{attr.call_count}</td>
-                                            <td className="text-right py-0.5 font-mono">
-                                              {m.sample_count > 0
-                                                ? (attr.call_count / m.sample_count).toFixed(1)
-                                                : '—'}
-                                            </td>
-                                            <td className="text-right py-0.5 font-mono">{formatTokenCount(attr.avg_tokens_per_call)}</td>
-                                          </tr>
-                                        ))
+                                      {Object.entries(m.tool_breakdown)
+                                        .sort((a, b) => (b[1].sum_context_growth || 0) - (a[1].sum_context_growth || 0))
+                                        .map(([tool, tb]) => {
+                                          const inv = tb.task_count || 0
+                                          return (
+                                            <tr key={tool}>
+                                              <td className="font-mono py-0.5">{tool}</td>
+                                              <td className="text-right py-0.5">{inv}</td>
+                                              <td className="text-right py-0.5 font-mono">
+                                                {inv > 0 ? formatTokenCount((tb.sum_output || 0) / inv) : '—'}
+                                              </td>
+                                              <td className="text-right py-0.5 font-mono">
+                                                {formatTokenCount(tb.sum_context_growth)}
+                                              </td>
+                                            </tr>
+                                          )
+                                        })
                                       }
                                     </tbody>
                                   </table>
                                 ) : (
-                                  <p className="text-gh-fg-muted text-xs">No attribution data</p>
+                                  <p className="text-gh-fg-muted text-xs">No tool data</p>
                                 )}
                               </div>
 
@@ -260,27 +284,33 @@ export default function AgentMetrics() {
                                     <thead>
                                       <tr className="text-gh-fg-muted">
                                         <th className="text-left font-normal pb-1">Model</th>
-                                        <th className="text-right font-normal pb-1">Executions</th>
-                                        <th className="text-right font-normal pb-1">Avg Total</th>
-                                        <th className="text-right font-normal pb-1">Min</th>
-                                        <th className="text-right font-normal pb-1">Max</th>
+                                        <th className="text-right font-normal pb-1">Tasks</th>
+                                        <th className="text-right font-normal pb-1">Avg Direct</th>
+                                        <th className="text-right font-normal pb-1">Avg Cache R</th>
+                                        <th className="text-right font-normal pb-1">Avg Output</th>
+                                        <th className="text-right font-normal pb-1">Avg Max Ctx</th>
                                       </tr>
                                     </thead>
                                     <tbody className="divide-y divide-gh-border">
                                       {models.map(mod => {
                                         const mb = m.model_breakdown[mod]
-                                        // Support both old format (number) and new format (object)
-                                        const taskCount = typeof mb === 'object' ? mb.task_count : mb
-                                        const avgTotal = typeof mb === 'object' ? mb.avg_total : null
-                                        const minTotal = typeof mb === 'object' ? mb.min_total : null
-                                        const maxTotal = typeof mb === 'object' ? mb.max_total : null
+                                        const mtc = mb.task_count || 0
                                         return (
                                           <tr key={mod}>
                                             <td className="font-mono py-0.5">{mod.split('-').slice(-2).join('-')}</td>
-                                            <td className="text-right py-0.5">{taskCount}</td>
-                                            <td className="text-right py-0.5 font-mono">{formatTokenCount(avgTotal)}</td>
-                                            <td className="text-right py-0.5 font-mono">{formatTokenCount(minTotal)}</td>
-                                            <td className="text-right py-0.5 font-mono">{formatTokenCount(maxTotal)}</td>
+                                            <td className="text-right py-0.5">{mtc}</td>
+                                            <td className="text-right py-0.5 font-mono">
+                                              {formatTokenCount(mtc > 0 ? (mb.sum_direct_input || 0) / mtc : 0)}
+                                            </td>
+                                            <td className="text-right py-0.5 font-mono">
+                                              {formatTokenCount(mtc > 0 ? (mb.sum_cache_read || 0) / mtc : 0)}
+                                            </td>
+                                            <td className="text-right py-0.5 font-mono">
+                                              {formatTokenCount(mtc > 0 ? (mb.sum_output || 0) / mtc : 0)}
+                                            </td>
+                                            <td className="text-right py-0.5 font-mono">
+                                              {formatTokenCount(mtc > 0 ? (mb.sum_max_context || 0) / mtc : 0)}
+                                            </td>
                                           </tr>
                                         )
                                       })}

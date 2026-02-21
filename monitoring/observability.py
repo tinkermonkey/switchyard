@@ -167,6 +167,7 @@ class EventType(Enum):
     REPAIR_CYCLE_WARNING_REVIEW_COMPLETED = "repair_cycle_warning_review_completed"
     REPAIR_CYCLE_WARNING_REVIEW_FAILED = "repair_cycle_warning_review_failed"
     REPAIR_CYCLE_COMPLETED = "repair_cycle_completed"
+    REPAIR_CYCLE_FAILED = "repair_cycle_failed"
 
     # Repair Cycle Container Lifecycle
     REPAIR_CYCLE_CONTAINER_STARTED = "repair_cycle_container_started"
@@ -374,6 +375,7 @@ class ObservabilityManager:
             EventType.REPAIR_CYCLE_WARNING_REVIEW_COMPLETED,
             EventType.REPAIR_CYCLE_WARNING_REVIEW_FAILED,
             EventType.REPAIR_CYCLE_COMPLETED,
+            EventType.REPAIR_CYCLE_FAILED,
             # Conversational Loop Routing
             EventType.CONVERSATIONAL_LOOP_STARTED,
             EventType.CONVERSATIONAL_QUESTION_ROUTED,

@@ -499,6 +499,7 @@ class RepairCycleStage(PipelineStage):
 
             # Step 1: Run tests (containerized agent)
             test_result = await self._run_tests(config, context, test_cycle_iteration, test_type_index)
+            await self._checkpoint(config.test_type, test_cycle_iteration, context)
 
             # Check for infrastructure failures (indicated by __infrastructure__ file)
             infrastructure_failures = [f for f in test_result.failures if f.file == "__infrastructure__"]
@@ -625,9 +626,7 @@ class RepairCycleStage(PipelineStage):
                     pipeline_run_id=pipeline_run_id,
                 )
 
-            # Checkpoint if needed
-            if test_cycle_iteration % self.checkpoint_interval == 0:
-                await self._checkpoint(config.test_type, test_cycle_iteration, context)
+            await self._checkpoint(config.test_type, test_cycle_iteration, context)
 
         # Max iterations reached
         logger.error(f"Max iterations ({config.max_iterations}) reached for " f"{config.test_type} tests")

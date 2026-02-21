@@ -4607,9 +4607,9 @@ The automated test-fix-validate cycle has failed and requires manual interventio
                         except Exception as e:
                             logger.error(f"Failed to end pipeline run in finally block: {e}")
 
-                    # CRITICAL: Release pipeline lock on failure
-                    # On success, the lock will be released when auto-advancing to next column
-                    # On failure, the issue stays in Testing, so we must explicitly release the lock
+                    # On success, the lock will be released when auto-advancing to next column.
+                    # On failure, the lock is intentionally retained — the issue stays in Testing
+                    # and blocks the pipeline until a human intervenes and moves it manually.
                     if not overall_success:
                         # Post detailed failure summary to GitHub issue
                         try:
@@ -4642,28 +4642,51 @@ The automated test-fix-validate cycle has failed and requires manual interventio
                         except Exception as es_error:
                             logger.debug(f"Failed to record failure event in Elasticsearch: {es_error}")
 
-                        # Release pipeline lock
-                        try:
-                            from services.pipeline_lock_manager import get_pipeline_lock_manager
-                            lock_manager = get_pipeline_lock_manager()
-                            current_lock = lock_manager.get_lock(project_name, board_name)
+                        # Retain pipeline lock — the issue stays in Testing pending manual intervention.
+                        # Holding the lock prevents other issues from being dispatched until a human
+                        # moves this issue out of Testing. The rescan skips issues that hold their own
+                        # lock, so this issue will not re-trigger automatically.
+                        logger.info(
+                            f"Retaining pipeline lock for {project_name}/{board_name} "
+                            f"(repair cycle for issue #{issue_number} failed — awaiting manual intervention)"
+                        )
 
-                            if current_lock and current_lock.locked_by_issue == issue_number:
-                                logger.info(
-                                    f"Releasing pipeline lock for {project_name}/{board_name} "
-                                    f"(repair cycle for issue #{issue_number} failed)"
+                        # Set a Redis marker so the stale-lock watchdog in _reconcile_active_runs
+                        # knows this lock is intentionally held, not leaked. The marker is cleared
+                        # automatically when the next repair cycle starts for this issue.
+                        try:
+                            if self.task_queue.redis_client:
+                                repair_failed_key = (
+                                    f"pipeline_lock:repair_failed:"
+                                    f"{project_name}:{board_name}:{issue_number}"
                                 )
-                                lock_manager.release_lock(project_name, board_name, issue_number)
-                            else:
-                                logger.warning(
-                                    f"Lock for {project_name}/{board_name} not held by issue #{issue_number} "
-                                    f"during repair cycle failure cleanup"
-                                )
-                        except Exception as lock_error:
-                            logger.error(
-                                f"CRITICAL: Failed to release lock for {project_name}/{board_name} "
-                                f"after repair cycle failure: {lock_error}", exc_info=True
+                                # 48h TTL as a safety net; cleared on next repair cycle start
+                                self.task_queue.redis_client.set(repair_failed_key, "1", ex=172800)
+                        except Exception as redis_err:
+                            logger.warning(f"Failed to set repair_failed marker in Redis: {redis_err}")
+
+                        # Emit decision event so lock-retention is visible in observability
+                        try:
+                            from monitoring.observability import get_observability_manager, EventType
+                            obs_manager = get_observability_manager()
+                            obs_manager.emit(
+                                EventType.REPAIR_CYCLE_FAILED,
+                                "orchestrator",
+                                f"repair_cycle_{issue_number}_{pipeline_run_id}",
+                                project_name,
+                                {
+                                    "issue_number": issue_number,
+                                    "board": board_name,
+                                    "error_message": error_message,
+                                    "exit_code": exit_code,
+                                    "container_name": container_name,
+                                    "lock_retained": True,
+                                    "action_required": "manual_intervention",
+                                },
+                                pipeline_run_id=pipeline_run_id,
                             )
+                        except Exception as obs_error:
+                            logger.warning(f"Failed to emit repair_cycle_failed event: {obs_error}")
                 except Exception as state_error:
                     logger.error(
                         f"CRITICAL: Failed to update execution state for {project_name}/#{issue_number}: "
@@ -5020,6 +5043,18 @@ The automated test-fix-validate cycle has failed and requires manual interventio
                 # Already hold the lock (may have held it from Development stage)
                 logger.debug(f"Repair cycle for issue #{issue_number} already holds pipeline lock")
 
+            # Clear any repair-failed marker so the stale-lock watchdog doesn't
+            # skip this issue if the orchestrator restarts mid-cycle.
+            try:
+                if self.task_queue.redis_client:
+                    repair_failed_key = (
+                        f"pipeline_lock:repair_failed:"
+                        f"{project_name}:{board_name}:{issue_number}"
+                    )
+                    self.task_queue.redis_client.delete(repair_failed_key)
+            except Exception as redis_err:
+                logger.warning(f"Failed to clear repair_failed marker in Redis: {redis_err}")
+
             logger.info(
                 f"Starting repair cycle for issue #{issue_number} in Docker container "
                 f"(agent: {stage_config.default_agent}, test types: {[tc.test_type for tc in test_configs]})"
@@ -5327,14 +5362,36 @@ _Repair cycle initiated by Claude Code Orchestrator_
                         )
                         
                         if not pipeline_run:
-                            # Stale lock! No active run but lock exists
-                            logger.warning(
-                                f"Found stale lock on {project_name}/{pipeline.board_name} "
-                                f"held by issue #{lock.locked_by_issue} with no active pipeline run. "
-                                f"Releasing lock..."
+                            # Check if this lock is intentionally retained after a repair cycle failure.
+                            # In that case it is NOT stale — the issue needs manual intervention.
+                            repair_failed_key = (
+                                f"pipeline_lock:repair_failed:"
+                                f"{project_name}:{pipeline.board_name}:{lock.locked_by_issue}"
                             )
-                            lock_manager.release_lock(project_name, pipeline.board_name, lock.locked_by_issue)
-                            logger.info(f"Released stale lock for issue #{lock.locked_by_issue}")
+                            is_intentional = False
+                            try:
+                                if self.task_queue.redis_client:
+                                    is_intentional = bool(
+                                        self.task_queue.redis_client.exists(repair_failed_key)
+                                    )
+                            except Exception:
+                                pass
+
+                            if is_intentional:
+                                logger.info(
+                                    f"Lock on {project_name}/{pipeline.board_name} held by "
+                                    f"issue #{lock.locked_by_issue} is intentionally retained "
+                                    f"after repair cycle failure — skipping stale lock release"
+                                )
+                            else:
+                                # Stale lock! No active run, no repair-failed marker
+                                logger.warning(
+                                    f"Found stale lock on {project_name}/{pipeline.board_name} "
+                                    f"held by issue #{lock.locked_by_issue} with no active pipeline run. "
+                                    f"Releasing lock..."
+                                )
+                                lock_manager.release_lock(project_name, pipeline.board_name, lock.locked_by_issue)
+                                logger.info(f"Released stale lock for issue #{lock.locked_by_issue}")
 
         except Exception as e:
             logger.error(f"Error reconciling active runs: {e}")

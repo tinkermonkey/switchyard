@@ -1607,7 +1607,13 @@ def get_agent_execution(execution_id):
 
 @app.route('/api/metrics/agents', methods=['GET'])
 def get_agent_metrics():
-    """Get pre-computed per-agent token usage metrics"""
+    """
+    Get per-agent token usage metrics aggregated over the requested time window.
+
+    Fetches hourly bucket documents from token-metrics-agents-hourly-* and
+    aggregates them with weighted math so averages, totals, and min/max are
+    correct across any number of hours.
+    """
     try:
         try:
             days = int(request.args.get('days', 7))
@@ -1616,42 +1622,43 @@ def get_agent_metrics():
         days = max(1, min(days, 365))
         agent_filter = request.args.get('agent')
 
-        query_filter = {
-            'range': {
-                'computed_at': {'gte': f'now-{days}d'}
-            }
-        }
-
+        must_clauses = [{'range': {'hour_bucket': {'gte': f'now-{days}d'}}}]
         if agent_filter:
-            body = {
-                'size': 1000,
-                'query': {
-                    'bool': {
-                        'must': [
-                            query_filter,
-                            {'term': {'agent_name': agent_filter}}
-                        ]
-                    }
-                },
-                'collapse': {'field': 'agent_name'},
-                'sort': [{'computed_at': {'order': 'desc'}}]
-            }
-        else:
-            body = {
-                'size': 1000,
-                'query': query_filter,
-                'collapse': {'field': 'agent_name'},
-                'sort': [{'computed_at': {'order': 'desc'}}]
-            }
+            must_clauses.append({'term': {'agent_name': agent_filter}})
 
         try:
-            result = es_client.search(index='token-metrics-agents-*', body=body)
-            metrics = [hit['_source'] for hit in result['hits']['hits']]
+            requested_size = days * 24 * 20  # hours × max agents
+            query_size = min(requested_size, 10000)  # ES max_result_window default
+            if requested_size > query_size:
+                logger.warning(
+                    f"Agent metrics query for {days} days would need {requested_size} docs; "
+                    f"capped at {query_size} — older hours may be excluded"
+                )
+            result = es_client.search(
+                index='token-metrics-agents-hourly-*',
+                body={
+                    'size': query_size,
+                    'query': {'bool': {'must': must_clauses}},
+                    'sort': [{'hour_bucket': {'order': 'asc'}}],
+                }
+            )
+            hourly_docs = [hit['_source'] for hit in result['hits']['hits']]
         except Exception as e:
             if 'index_not_found' in str(e).lower() or 'no such index' in str(e).lower():
-                metrics = []
-            else:
-                raise
+                return jsonify({'success': True, 'metrics': []})
+            raise
+
+        by_agent: dict = {}
+        for doc in hourly_docs:
+            an = doc.get('agent_name')
+            if an:
+                by_agent.setdefault(an, []).append(doc)
+
+        metrics = []
+        for agent_name, docs in by_agent.items():
+            aggregated = _aggregate_hourly_agent_docs(agent_name, docs)
+            if aggregated:
+                metrics.append(aggregated)
 
         return jsonify({'success': True, 'metrics': metrics})
 
@@ -1662,57 +1669,290 @@ def get_agent_metrics():
 
 @app.route('/api/metrics/cycles', methods=['GET'])
 def get_cycle_metrics():
-    """Get pre-computed per-cycle-type token usage metrics"""
+    """
+    Get cycle token metrics aggregated over the requested time window.
+
+    Fetches hourly bucket documents from token-metrics-cycles-hourly-* and
+    aggregates them with weighted math so averages, totals, and min/max are
+    correct across any number of hours.
+    """
     try:
         try:
             days = int(request.args.get('days', 7))
         except (ValueError, TypeError):
             return jsonify({'success': False, 'error': 'Invalid days parameter', 'metrics': []}), 400
-        days = max(1, min(days, 365))
+        days = max(1, min(days, 7))  # raw data retained for 7 days
         cycle_type_filter = request.args.get('cycle_type')
 
-        query_filter = {
-            'range': {
-                'computed_at': {'gte': f'now-{days}d'}
-            }
-        }
-
+        must_clauses = [{'range': {'hour_bucket': {'gte': f'now-{days}d'}}}]
         if cycle_type_filter:
-            body = {
-                'size': 1000,
-                'query': {
-                    'bool': {
-                        'must': [
-                            query_filter,
-                            {'term': {'cycle_type': cycle_type_filter}}
-                        ]
-                    }
-                },
-                'collapse': {'field': 'cycle_type'},
-                'sort': [{'computed_at': {'order': 'desc'}}]
-            }
-        else:
-            body = {
-                'size': 1000,
-                'query': query_filter,
-                'collapse': {'field': 'cycle_type'},
-                'sort': [{'computed_at': {'order': 'desc'}}]
-            }
+            must_clauses.append({'term': {'cycle_type': cycle_type_filter}})
 
         try:
-            result = es_client.search(index='token-metrics-cycles-*', body=body)
-            metrics = [hit['_source'] for hit in result['hits']['hits']]
+            result = es_client.search(
+                index='token-metrics-cycles-hourly-*',
+                body={
+                    'size': days * 24 * 10,  # hours × max cycle types
+                    'query': {'bool': {'must': must_clauses}},
+                    'sort': [{'hour_bucket': {'order': 'asc'}}],
+                }
+            )
+            hourly_docs = [hit['_source'] for hit in result['hits']['hits']]
         except Exception as e:
             if 'index_not_found' in str(e).lower() or 'no such index' in str(e).lower():
-                metrics = []
-            else:
-                raise
+                return jsonify({'success': True, 'metrics': []})
+            raise
+
+        # Group hourly docs by cycle_type and aggregate
+        by_type: dict = {}
+        for doc in hourly_docs:
+            ct = doc.get('cycle_type')
+            if ct:
+                by_type.setdefault(ct, []).append(doc)
+
+        metrics = []
+        for cycle_type, docs in by_type.items():
+            aggregated = _aggregate_hourly_cycle_docs(cycle_type, docs)
+            if aggregated:
+                metrics.append(aggregated)
 
         return jsonify({'success': True, 'metrics': metrics})
 
     except Exception as e:
         logger.error(f"Error fetching cycle metrics: {e}", exc_info=True)
         return jsonify({'success': False, 'error': str(e), 'metrics': []}), 500
+
+
+def _merge_canonical_breakdown(target: dict, source: dict) -> None:
+    """
+    Merge a source canonical breakdown object into a target accumulator in-place.
+
+    Canonical fields (task_count, sum_*, min_*, max_*) are summed or min/max-ed
+    appropriately. The nested tool_breakdown and model_breakdown inside agent entries
+    are merged recursively.
+    """
+    sum_fields = [
+        'task_count', 'sum_direct_input', 'sum_cache_read', 'sum_cache_creation',
+        'sum_output', 'sum_initial_input', 'sum_max_context', 'sum_context_growth',
+    ]
+    minmax_fields_min = ['min_max_context', 'min_output']
+    minmax_fields_max = ['max_max_context', 'max_output']
+
+    for f in sum_fields:
+        target[f] = target.get(f, 0) + source.get(f, 0)
+    for f in minmax_fields_min:
+        sv = source.get(f, 0)
+        tv = target.get(f, 0)
+        # 0 is used as sentinel meaning "no data recorded" (not a legitimate min value),
+        # so skip zero values when merging minimums.
+        target[f] = sv if tv == 0 else (tv if sv == 0 else min(tv, sv))
+    for f in minmax_fields_max:
+        target[f] = max(target.get(f, 0), source.get(f, 0))
+
+    # Recursively merge nested tool_breakdown and model_breakdown
+    for nested_key in ('tool_breakdown', 'model_breakdown'):
+        if nested_key not in source:
+            continue
+        if nested_key not in target:
+            target[nested_key] = {}
+        for entry_name, entry_data in (source[nested_key] or {}).items():
+            if entry_name not in target[nested_key]:
+                target[nested_key][entry_name] = {}
+            _merge_canonical_breakdown(target[nested_key][entry_name], entry_data)
+
+
+def _build_display_fields(stats: dict, task_count: int) -> dict:
+    """
+    Compute derived display averages from raw sum fields.
+    Returns a dict of avg_* fields ready for the API response.
+    """
+    def avg(field):
+        return stats.get(field, 0) / task_count if task_count > 0 else 0
+
+    return {
+        'avg_direct_input': avg('sum_direct_input'),
+        'avg_cache_read': avg('sum_cache_read'),
+        'avg_cache_creation': avg('sum_cache_creation'),
+        'avg_output': avg('sum_output'),
+        'avg_initial_input': avg('sum_initial_input'),
+        'avg_max_context': avg('sum_max_context'),
+    }
+
+
+def _aggregate_hourly_agent_docs(agent_name: str, docs: list) -> dict:
+    """
+    Aggregate a list of hourly sum-based agent documents into a display-ready dict.
+
+    Averages are computed as weighted means (sum / total_tasks) so combining
+    hours with different task counts produces the correct overall average.
+    """
+    total_tasks = sum(d.get('task_count', 0) for d in docs)
+    if total_tasks == 0:
+        return {}
+
+    def wsum(field):
+        return sum(d.get(field, 0) for d in docs)
+
+    def safe_min(field):
+        # 0 used as sentinel ("no data"), so filter it out before taking the minimum
+        vals = [d[field] for d in docs if d.get(field, 0) > 0]
+        return min(vals) if vals else 0
+
+    def safe_max(field):
+        return max((d.get(field, 0) for d in docs), default=0)
+
+    # Merge nested tool_breakdown and model_breakdown from each hourly doc
+    tool_bd_agg: dict = {}
+    for d in docs:
+        for tool, tb in (d.get('tool_breakdown') or {}).items():
+            if tool not in tool_bd_agg:
+                tool_bd_agg[tool] = {}
+            _merge_canonical_breakdown(tool_bd_agg[tool], tb)
+
+    model_bd_agg: dict = {}
+    for d in docs:
+        for model, mb in (d.get('model_breakdown') or {}).items():
+            if model not in model_bd_agg:
+                model_bd_agg[model] = {}
+            _merge_canonical_breakdown(model_bd_agg[model], mb)
+
+    sum_direct = wsum('sum_direct_input')
+    sum_cr = wsum('sum_cache_read')
+    sum_cc = wsum('sum_cache_creation')
+    sum_out = wsum('sum_output')
+    sum_ii = wsum('sum_initial_input')
+    sum_mc = wsum('sum_max_context')
+
+    return {
+        'agent_name': agent_name,
+        'task_count': total_tasks,
+        # Raw sums
+        'sum_direct_input': sum_direct,
+        'sum_cache_read': sum_cr,
+        'sum_cache_creation': sum_cc,
+        'sum_output': sum_out,
+        'sum_initial_input': sum_ii,
+        'sum_max_context': sum_mc,
+        'min_max_context': safe_min('min_max_context'),
+        'max_max_context': safe_max('max_max_context'),
+        'min_output': safe_min('min_output'),
+        'max_output': safe_max('max_output'),
+        # Derived averages
+        'avg_direct_input': sum_direct / total_tasks,
+        'avg_cache_read': sum_cr / total_tasks,
+        'avg_cache_creation': sum_cc / total_tasks,
+        'avg_output': sum_out / total_tasks,
+        'avg_initial_input': sum_ii / total_tasks,
+        'avg_max_context': sum_mc / total_tasks,
+        # Nested breakdowns
+        'tool_breakdown': tool_bd_agg,
+        'model_breakdown': model_bd_agg,
+    }
+
+
+def _aggregate_hourly_cycle_docs(cycle_type: str, docs: list) -> dict:
+    """
+    Aggregate a list of hourly sum-based cycle documents into a display-ready dict.
+
+    Averages are computed as weighted means (sum / total_tasks) so combining
+    hours with different task counts produces the correct overall average.
+    Min/max are the true min/max across all individual tasks in any of the hours.
+    """
+    total_tasks = sum(d.get('task_count', 0) for d in docs)
+    if total_tasks == 0:
+        return {}
+
+    def wsum(field):
+        return sum(d.get(field, 0) for d in docs)
+
+    def safe_min(field):
+        vals = [d[field] for d in docs if field in d and d[field] > 0]
+        return min(vals) if vals else 0
+
+    def safe_max(field):
+        vals = [d[field] for d in docs if field in d]
+        return max(vals) if vals else 0
+
+    # Merge tool_breakdown from each hourly doc
+    tool_bd_agg: dict = {}
+    for d in docs:
+        for tool, tb in (d.get('tool_breakdown') or {}).items():
+            if tool not in tool_bd_agg:
+                tool_bd_agg[tool] = {}
+            _merge_canonical_breakdown(tool_bd_agg[tool], tb)
+
+    # Merge model_breakdown from each hourly doc
+    model_bd_agg: dict = {}
+    for d in docs:
+        for model, mb in (d.get('model_breakdown') or {}).items():
+            if model not in model_bd_agg:
+                model_bd_agg[model] = {}
+            _merge_canonical_breakdown(model_bd_agg[model], mb)
+
+    # Merge agent_breakdown — each agent entry has the full canonical shape
+    # including its own tool_breakdown and model_breakdown
+    agent_bd_agg: dict = {}
+    for d in docs:
+        for agent, ab in (d.get('agent_breakdown') or {}).items():
+            if agent not in agent_bd_agg:
+                agent_bd_agg[agent] = {}
+            _merge_canonical_breakdown(agent_bd_agg[agent], ab)
+
+    # Build display agent_breakdown with avg fields
+    agent_breakdown = {}
+    for agent, ab in agent_bd_agg.items():
+        tc = ab.get('task_count', 0)
+        agent_breakdown[agent] = {
+            'task_count': tc,
+            'sum_direct_input': ab.get('sum_direct_input', 0),
+            'sum_cache_read': ab.get('sum_cache_read', 0),
+            'sum_cache_creation': ab.get('sum_cache_creation', 0),
+            'sum_output': ab.get('sum_output', 0),
+            'sum_initial_input': ab.get('sum_initial_input', 0),
+            'sum_max_context': ab.get('sum_max_context', 0),
+            'min_max_context': ab.get('min_max_context', 0),
+            'max_max_context': ab.get('max_max_context', 0),
+            'min_output': ab.get('min_output', 0),
+            'max_output': ab.get('max_output', 0),
+            'tool_breakdown': ab.get('tool_breakdown', {}),
+            'model_breakdown': ab.get('model_breakdown', {}),
+        }
+        agent_breakdown[agent].update(_build_display_fields(ab, tc))
+
+    total_sum_direct = wsum('sum_direct_input')
+    total_sum_cache_read = wsum('sum_cache_read')
+    total_sum_cache_creation = wsum('sum_cache_creation')
+    total_sum_output = wsum('sum_output')
+    total_sum_initial_input = wsum('sum_initial_input')
+    total_sum_max_context = wsum('sum_max_context')
+
+    return {
+        'cycle_type': cycle_type,
+        'task_count': total_tasks,
+        # Raw sums (for programmatic use)
+        'sum_direct_input': total_sum_direct,
+        'sum_cache_read': total_sum_cache_read,
+        'sum_cache_creation': total_sum_cache_creation,
+        'sum_output': total_sum_output,
+        'sum_initial_input': total_sum_initial_input,
+        'sum_max_context': total_sum_max_context,
+        # Averages (for display)
+        'avg_direct_input': total_sum_direct / total_tasks,
+        'avg_cache_read': total_sum_cache_read / total_tasks,
+        'avg_cache_creation': total_sum_cache_creation / total_tasks,
+        'avg_output': total_sum_output / total_tasks,
+        'avg_initial_input': total_sum_initial_input / total_tasks,
+        'avg_max_context': total_sum_max_context / total_tasks,
+        # Range fields
+        'min_max_context': safe_min('min_max_context'),
+        'max_max_context': safe_max('max_max_context'),
+        'min_output': safe_min('min_output'),
+        'max_output': safe_max('max_output'),
+        # Nested breakdowns
+        'tool_breakdown': tool_bd_agg,
+        'model_breakdown': model_bd_agg,
+        'agent_breakdown': agent_breakdown,
+    }
 
 
 @app.route('/api/circuit-breakers', methods=['GET'])
