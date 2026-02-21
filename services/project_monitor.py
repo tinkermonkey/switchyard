@@ -5107,15 +5107,25 @@ The automated test-fix-validate cycle has failed and requires manual interventio
                         f"Preparing feature branch for repair cycle on issue #{issue_number}"
                     )
 
-                    # Prepare feature branch using asyncio.run()
-                    branch_name = asyncio.run(
-                        feature_branch_manager.prepare_feature_branch(
-                            project=project_name,
-                            issue_number=issue_number,
-                            github_integration=github,
-                            issue_title=issue_title
-                        )
+                    # Prepare feature branch - handle both running-loop and no-loop contexts.
+                    # asyncio.run() fails if a loop is already running in this thread;
+                    # run_until_complete() on a new loop also fails for the same reason.
+                    # Use the same pattern as lines 950-963: detect the running loop and
+                    # dispatch to a fresh ThreadPoolExecutor thread if one is found.
+                    import concurrent.futures
+                    coro = feature_branch_manager.prepare_feature_branch(
+                        project=project_name,
+                        issue_number=issue_number,
+                        github_integration=github,
+                        issue_title=issue_title
                     )
+                    try:
+                        asyncio.get_running_loop()
+                        # Running loop in this thread - dispatch to a fresh thread
+                        with concurrent.futures.ThreadPoolExecutor() as pool:
+                            branch_name = pool.submit(asyncio.run, coro).result()
+                    except RuntimeError:
+                        branch_name = asyncio.run(coro)
                     
                     logger.info(f"Checked out feature branch for repair cycle: {branch_name}")
                     stage_context['branch_name'] = branch_name
@@ -5172,16 +5182,16 @@ The automated test-fix-validate cycle is now starting in a containerized environ
 _Repair cycle initiated by Claude Code Orchestrator_
 """
 
-                # We're in a thread context (not async), so create and run a new event loop
+                # Post the comment - handle both running-loop and no-loop contexts.
                 import asyncio
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
+                import concurrent.futures
+                post_coro = github.post_agent_output(start_context, comment_text)
                 try:
-                    loop.run_until_complete(
-                        github.post_agent_output(start_context, comment_text)
-                    )
-                finally:
-                    loop.close()
+                    asyncio.get_running_loop()
+                    with concurrent.futures.ThreadPoolExecutor() as pool:
+                        pool.submit(asyncio.run, post_coro).result()
+                except RuntimeError:
+                    asyncio.run(post_coro)
             except Exception as e:
                 logger.warning(f"Failed to post initial comment: {e}")
 
