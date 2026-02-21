@@ -437,6 +437,8 @@ function AgentExecutionView() {
     let cumulativeLastInput = 0
     let cumulativeLastOutput = 0
     let lastCacheRead = 0
+    let lastCacheCreation = 0
+    let lastDirectInput = 0
     const modelsUsed = new Set()
     const toolCallCounts = {}
     const tokenToolsAvailable = []
@@ -460,15 +462,19 @@ function AgentExecutionView() {
         const model = evt.message.model
         if (model) modelsUsed.add(model)
 
-        const inputTokens = usage.input_tokens || 0
-        const outputTokens = usage.output_tokens || 0
+        const inputDirect = usage.input_tokens || 0
         const cacheRead = usage.cache_read_input_tokens || 0
+        const cacheCreation = usage.cache_creation_input_tokens || 0
+        const effectiveInput = inputDirect + cacheRead + cacheCreation
+        const outputTokens = usage.output_tokens || 0
 
-        if (firstInput === null) firstInput = inputTokens
-        cumulativeLastInput = inputTokens
+        if (firstInput === null) firstInput = effectiveInput
+        cumulativeLastInput = effectiveInput
         cumulativeLastOutput = outputTokens
-        // cache_read_input_tokens is cumulative in the Anthropic API, use last value
+        // These fields are cumulative in the Anthropic API — use last-value semantics
         lastCacheRead = cacheRead
+        lastCacheCreation = cacheCreation
+        lastDirectInput = inputDirect
 
         const contents = Array.isArray(evt.message.content) ? evt.message.content : []
         for (const item of contents) {
@@ -485,6 +491,8 @@ function AgentExecutionView() {
       totalInput: cumulativeLastInput,
       totalOutput: cumulativeLastOutput,
       totalCacheRead: lastCacheRead,
+      totalCacheCreation: lastCacheCreation,
+      totalDirectInput: lastDirectInput,
       totalAll: cumulativeLastInput + cumulativeLastOutput,
       modelsUsed: Array.from(modelsUsed),
       toolsAvailable: tokenToolsAvailable,
@@ -716,16 +724,24 @@ function AgentExecutionView() {
                       <td className="text-right font-mono">{formatTokenCount(tokenUsage.initialInput)}</td>
                     </tr>
                     <tr>
+                      <td className="text-gh-fg-muted py-0.5">Direct input</td>
+                      <td className="text-right font-mono">{formatTokenCount(tokenUsage.totalDirectInput)}</td>
+                    </tr>
+                    <tr>
+                      <td className="text-gh-fg-muted py-0.5">Cache reads</td>
+                      <td className="text-right font-mono">{formatTokenCount(tokenUsage.totalCacheRead)}</td>
+                    </tr>
+                    <tr>
+                      <td className="text-gh-fg-muted py-0.5">Cache writes</td>
+                      <td className="text-right font-mono">{formatTokenCount(tokenUsage.totalCacheCreation)}</td>
+                    </tr>
+                    <tr className="border-t border-gh-border">
                       <td className="text-gh-fg-muted py-0.5">Total input</td>
                       <td className="text-right font-mono">{formatTokenCount(tokenUsage.totalInput)}</td>
                     </tr>
                     <tr>
                       <td className="text-gh-fg-muted py-0.5">Total output</td>
                       <td className="text-right font-mono">{formatTokenCount(tokenUsage.totalOutput)}</td>
-                    </tr>
-                    <tr>
-                      <td className="text-gh-fg-muted py-0.5">Cache read</td>
-                      <td className="text-right font-mono">{formatTokenCount(tokenUsage.totalCacheRead)}</td>
                     </tr>
                     <tr className="border-t border-gh-border">
                       <td className="text-gh-fg font-semibold py-0.5">Grand total</td>

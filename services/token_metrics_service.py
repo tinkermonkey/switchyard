@@ -70,6 +70,8 @@ class TokenMetricsService:
                                 "window_end": {"type": "date"},
                                 "sample_count": {"type": "integer"},
                                 "avg_initial_input": {"type": "float"},
+                                "min_initial_input": {"type": "integer"},
+                                "max_initial_input": {"type": "integer"},
                                 "avg_total_input": {"type": "float"},
                                 "min_total_input": {"type": "integer"},
                                 "max_total_input": {"type": "integer"},
@@ -79,6 +81,14 @@ class TokenMetricsService:
                                 "avg_total_all": {"type": "float"},
                                 "min_total_all": {"type": "integer"},
                                 "max_total_all": {"type": "integer"},
+                                "avg_cache_read": {"type": "float"},
+                                "avg_cache_creation": {"type": "float"},
+                                "avg_direct_input": {"type": "float"},
+                                # Nested dicts with dynamic keys: disable indexing to prevent mapping explosion
+                                "tool_call_counts":       {"type": "object", "enabled": False},
+                                "model_breakdown":        {"type": "object", "enabled": False},
+                                "tool_token_attribution": {"type": "object", "enabled": False},
+                                "agent_breakdown":        {"type": "object", "enabled": False},
                             }
                         }
                     }
@@ -180,7 +190,7 @@ class TokenMetricsService:
                             ]
                         }
                     },
-                    '_source': ['agent', 'task_id', 'agent_execution_id']
+                    '_source': ['agent', 'agent_name', 'task_id', 'agent_execution_id']
                 }
             )
         except Exception as e:
@@ -412,13 +422,25 @@ class TokenMetricsService:
         per_task_total_input = []
         per_task_total_output = []
         per_task_total_all = []
+        per_task_cache_read = []
+        per_task_cache_creation = []
+        per_task_direct_input = []
         combined_tool_counts: Dict[str, int] = {}
-        model_counts: Dict[str, int] = {}
+        # model_task_values: model -> list of last cumulative effective_input per task
+        model_task_values: Dict[str, List[int]] = {}
+        # tool_token_attr: tool_name -> {total_tokens, call_count}
+        tool_token_attr: Dict[str, Dict] = {}
 
         for task_id, docs in task_streams.items():
             first_input = None
             last_input = 0
             last_output = 0
+            last_cache_read = 0
+            last_cache_creation = 0
+            last_direct_input = 0
+            prev_effective_input = None
+            prev_tool_uses: List[str] = []
+            task_model_last: Dict[str, int] = {}
 
             for doc in docs:
                 raw_event = doc.get('raw_event')
@@ -446,34 +468,64 @@ class TokenMetricsService:
                 if not usage:
                     continue
 
-                input_tokens = usage.get('input_tokens') or 0
+                input_direct = usage.get('input_tokens') or 0
+                cache_read = usage.get('cache_read_input_tokens') or 0
+                cache_creation = usage.get('cache_creation_input_tokens') or 0
                 output_tokens = usage.get('output_tokens') or 0
+                effective_input = input_direct + cache_read + cache_creation
 
                 if model:
-                    model_counts[model] = model_counts.get(model, 0) + 1
+                    task_model_last[model] = effective_input
+
+                # Tool attribution: delta between this turn and the previous one
+                # is attributed to tools called in the previous turn
+                if prev_effective_input is not None and prev_tool_uses:
+                    delta = max(0, effective_input - prev_effective_input)
+                    k = len(prev_tool_uses)
+                    per_tool_delta = delta / k if k > 0 else 0
+                    for tool_name in prev_tool_uses:
+                        if tool_name not in tool_token_attr:
+                            tool_token_attr[tool_name] = {'total_tokens': 0.0, 'call_count': 0}
+                        tool_token_attr[tool_name]['total_tokens'] += per_tool_delta
+                        tool_token_attr[tool_name]['call_count'] += 1
+
+                prev_effective_input = effective_input
 
                 if first_input is None:
-                    first_input = input_tokens
+                    first_input = effective_input
 
-                last_input = input_tokens
+                last_input = effective_input
                 last_output = output_tokens
+                last_cache_read = cache_read
+                last_cache_creation = cache_creation
+                last_direct_input = input_direct
 
-                # Count tool calls and approximate token delta per tool
+                # Count tool calls; track names for next-turn attribution
                 contents = message.get('content') or []
                 if not isinstance(contents, list):
                     contents = []
 
-                tool_uses = [c for c in contents if c.get('type') == 'tool_use']
-                for tool_use in tool_uses:
-                    name = tool_use.get('name')
-                    if name:
-                        combined_tool_counts[name] = combined_tool_counts.get(name, 0) + 1
+                current_tool_uses: List[str] = []
+                for c in contents:
+                    if c.get('type') == 'tool_use':
+                        name = c.get('name')
+                        if name:
+                            combined_tool_counts[name] = combined_tool_counts.get(name, 0) + 1
+                            current_tool_uses.append(name)
+
+                prev_tool_uses = current_tool_uses
 
             if first_input is not None:
                 per_task_initial_input.append(first_input)
                 per_task_total_input.append(last_input)
                 per_task_total_output.append(last_output)
                 per_task_total_all.append(last_input + last_output)
+                per_task_cache_read.append(last_cache_read)
+                per_task_cache_creation.append(last_cache_creation)
+                per_task_direct_input.append(last_direct_input)
+
+            for model_name, val in task_model_last.items():
+                model_task_values.setdefault(model_name, []).append(val)
 
         if not per_task_total_all:
             return None
@@ -481,9 +533,31 @@ class TokenMetricsService:
         def avg(lst):
             return sum(lst) / len(lst) if lst else 0
 
+        model_breakdown = {
+            model: {
+                'avg_total': avg(values),
+                'min_total': min(values),
+                'max_total': max(values),
+                'task_count': len(values),
+            }
+            for model, values in model_task_values.items()
+        }
+
+        tool_token_attribution = {
+            tool: {
+                'total_tokens': int(data['total_tokens']),
+                'call_count': data['call_count'],
+                'avg_tokens_per_call': int(data['total_tokens'] / data['call_count'])
+                    if data['call_count'] > 0 else 0,
+            }
+            for tool, data in tool_token_attr.items()
+        }
+
         return {
             'sample_count': len(per_task_total_all),
             'avg_initial_input': avg(per_task_initial_input),
+            'min_initial_input': min(per_task_initial_input) if per_task_initial_input else 0,
+            'max_initial_input': max(per_task_initial_input) if per_task_initial_input else 0,
             'avg_total_input': avg(per_task_total_input),
             'min_total_input': min(per_task_total_input) if per_task_total_input else 0,
             'max_total_input': max(per_task_total_input) if per_task_total_input else 0,
@@ -493,8 +567,12 @@ class TokenMetricsService:
             'avg_total_all': avg(per_task_total_all),
             'min_total_all': min(per_task_total_all) if per_task_total_all else 0,
             'max_total_all': max(per_task_total_all) if per_task_total_all else 0,
+            'avg_cache_read': avg(per_task_cache_read),
+            'avg_cache_creation': avg(per_task_cache_creation),
+            'avg_direct_input': avg(per_task_direct_input),
             'tool_call_counts': combined_tool_counts,
-            'model_breakdown': model_counts,
+            'model_breakdown': model_breakdown,
+            'tool_token_attribution': tool_token_attribution,
         }
 
     def _compute_agent_breakdown_for_tasks(
@@ -514,7 +592,7 @@ class TokenMetricsService:
                             ]
                         }
                     },
-                    '_source': ['agent', 'task_id']
+                    '_source': ['agent', 'agent_name', 'task_id']
                 }
             )
         except Exception as e:
@@ -538,6 +616,7 @@ class TokenMetricsService:
                     'avg_total_all': stats['avg_total_all'],
                     'avg_total_input': stats['avg_total_input'],
                     'avg_total_output': stats['avg_total_output'],
+                    'avg_initial_input': stats['avg_initial_input'],
                 }
 
         return breakdown

@@ -18,6 +18,20 @@ const formatTokenCount = (n) => {
   return String(n)
 }
 
+function StatBox({ label, avg, min, max }) {
+  return (
+    <div className="bg-gh-canvas-subtle rounded p-2 text-center border border-gh-border">
+      <div className="text-xs text-gh-fg-muted mb-1">{label}</div>
+      <div className="font-mono text-sm font-semibold">{formatTokenCount(avg)}</div>
+      {(min != null && max != null) && (
+        <div className="text-xs text-gh-fg-muted font-mono mt-0.5">
+          {formatTokenCount(min)} – {formatTokenCount(max)}
+        </div>
+      )}
+    </div>
+  )
+}
+
 function CycleCard({ cycle }) {
   const colors = CYCLE_COLORS[cycle.cycle_type] || DEFAULT_COLOR
   const label = colors.label || cycle.cycle_type
@@ -28,6 +42,9 @@ function CycleCard({ cycle }) {
   const topTools = Object.entries(cycle.tool_call_counts || {})
     .sort((a, b) => b[1] - a[1])
     .slice(0, 8)
+
+  const toolAttribution = Object.entries(cycle.tool_token_attribution || {})
+    .sort((a, b) => b[1].total_tokens - a[1].total_tokens)
 
   const models = Object.keys(cycle.model_breakdown || {})
 
@@ -41,19 +58,29 @@ function CycleCard({ cycle }) {
       </div>
 
       <div className="p-4 space-y-4">
-        {/* 4-stat token summary row */}
-        <div className="grid grid-cols-4 gap-3">
-          {[
-            { label: 'Avg Input', value: cycle.avg_total_input },
-            { label: 'Avg Output', value: cycle.avg_total_output },
-            { label: 'Avg Total', value: cycle.avg_total_all },
-            { label: 'Max Total', value: cycle.max_total_all },
-          ].map(({ label: statLabel, value }) => (
-            <div key={statLabel} className="bg-gh-canvas-subtle rounded p-2 text-center border border-gh-border">
-              <div className="text-xs text-gh-fg-muted mb-1">{statLabel}</div>
-              <div className="font-mono text-sm font-semibold">{formatTokenCount(value)}</div>
-            </div>
-          ))}
+        {/* 6-stat token summary: 3 columns × 2 rows */}
+        <div className="grid grid-cols-3 gap-3">
+          <StatBox
+            label="Avg Input"
+            avg={cycle.avg_total_input}
+            min={cycle.min_total_input}
+            max={cycle.max_total_input}
+          />
+          <StatBox
+            label="Avg Output"
+            avg={cycle.avg_total_output}
+            min={cycle.min_total_output}
+            max={cycle.max_total_output}
+          />
+          <StatBox
+            label="Avg Total"
+            avg={cycle.avg_total_all}
+            min={cycle.min_total_all}
+            max={cycle.max_total_all}
+          />
+          <StatBox label="Min Total" avg={cycle.min_total_all} />
+          <StatBox label="Max Total" avg={cycle.max_total_all} />
+          <StatBox label="Avg Initial" avg={cycle.avg_initial_input} />
         </div>
 
         {/* 2-col grid: agent breakdown + top tools & models */}
@@ -67,6 +94,8 @@ function CycleCard({ cycle }) {
                   <tr className="text-gh-fg-muted">
                     <th className="text-left font-normal pb-1">Agent</th>
                     <th className="text-right font-normal pb-1">Runs</th>
+                    <th className="text-right font-normal pb-1">Avg Input</th>
+                    <th className="text-right font-normal pb-1">Avg Output</th>
                     <th className="text-right font-normal pb-1">Avg Total</th>
                   </tr>
                 </thead>
@@ -75,6 +104,8 @@ function CycleCard({ cycle }) {
                     <tr key={agent}>
                       <td className="font-mono py-0.5">{agent}</td>
                       <td className="text-right py-0.5">{stats.sample_count || 0}</td>
+                      <td className="text-right py-0.5 font-mono">{formatTokenCount(stats.avg_total_input)}</td>
+                      <td className="text-right py-0.5 font-mono">{formatTokenCount(stats.avg_total_output)}</td>
                       <td className="text-right py-0.5 font-mono">{formatTokenCount(stats.avg_total_all)}</td>
                     </tr>
                   ))}
@@ -113,6 +144,31 @@ function CycleCard({ cycle }) {
             )}
           </div>
         </div>
+
+        {/* Tool Token Attribution */}
+        {toolAttribution.length > 0 && (
+          <div>
+            <h4 className="text-xs font-semibold text-gh-fg-muted uppercase mb-2">Tool Token Attribution</h4>
+            <table className="w-full text-xs">
+              <thead>
+                <tr className="text-gh-fg-muted">
+                  <th className="text-left font-normal pb-1">Tool</th>
+                  <th className="text-right font-normal pb-1">Calls</th>
+                  <th className="text-right font-normal pb-1">Avg Tokens/Call</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-gh-border">
+                {toolAttribution.map(([tool, attr]) => (
+                  <tr key={tool}>
+                    <td className="font-mono py-0.5">{tool}</td>
+                    <td className="text-right py-0.5">{attr.call_count}</td>
+                    <td className="text-right py-0.5 font-mono">{formatTokenCount(attr.avg_tokens_per_call)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
       </div>
     </div>
   )

@@ -216,7 +216,14 @@ CLAUDE_STREAMS_MAPPING = {
             "success": {"type": "boolean"},
             "error_message": {"type": "text", "fields": {"keyword": {"type": "keyword", "ignore_above": 512}}},
             "raw_event": {"type": "object", "enabled": False},  # Store without indexing nested structure
-            "pipeline_run_id": {"type": "keyword"}  # Link to pipeline run
+            "pipeline_run_id": {"type": "keyword"},  # Link to pipeline run
+            "token_input":           {"type": "integer"},
+            "token_cache_read":      {"type": "integer"},
+            "token_cache_creation":  {"type": "integer"},
+            "token_effective_input": {"type": "integer"},
+            "token_output":          {"type": "integer"},
+            "token_total":           {"type": "integer"},
+            "token_model":           {"type": "keyword"}
         }
     },
     "settings": {
@@ -436,6 +443,23 @@ def enrich_claude_log(log_data: dict) -> dict:
                 elif item.get("type") == "text":
                     enriched["event_type"] = "text_output"
                     break
+
+        # Extract token usage as indexed top-level fields
+        usage = message.get("usage")
+        if usage:
+            token_input = usage.get("input_tokens") or 0
+            token_cache_read = usage.get("cache_read_input_tokens") or 0
+            token_cache_creation = usage.get("cache_creation_input_tokens") or 0
+            token_output = usage.get("output_tokens") or 0
+            enriched["token_input"] = token_input
+            enriched["token_cache_read"] = token_cache_read
+            enriched["token_cache_creation"] = token_cache_creation
+            enriched["token_effective_input"] = token_input + token_cache_read + token_cache_creation
+            enriched["token_output"] = token_output
+            enriched["token_total"] = token_input + token_cache_read + token_cache_creation + token_output
+            model = message.get("model")
+            if model:
+                enriched["token_model"] = model
 
     elif event_type == "user":
         enriched["event_category"] = "claude_stream"

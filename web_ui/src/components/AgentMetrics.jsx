@@ -1,5 +1,5 @@
-import { useState, useEffect, useCallback } from 'react'
-import { RefreshCw, BarChart2 } from 'lucide-react'
+import { Fragment, useState, useEffect, useCallback } from 'react'
+import { RefreshCw, BarChart2, ChevronDown, ChevronRight } from 'lucide-react'
 
 const DAYS_OPTIONS = [1, 7, 30]
 
@@ -28,6 +28,7 @@ export default function AgentMetrics() {
   const [error, setError] = useState(null)
   const [sortField, setSortField] = useState('avg_total_all')
   const [sortDir, setSortDir] = useState('desc')
+  const [expandedAgents, setExpandedAgents] = useState(new Set())
 
   const fetchMetrics = useCallback(async () => {
     setLoading(true)
@@ -58,6 +59,18 @@ export default function AgentMetrics() {
       setSortField(field)
       setSortDir('desc')
     }
+  }
+
+  const toggleAgent = (agentName) => {
+    setExpandedAgents(prev => {
+      const next = new Set(prev)
+      if (next.has(agentName)) {
+        next.delete(agentName)
+      } else {
+        next.add(agentName)
+      }
+      return next
+    })
   }
 
   const sorted = [...metrics].sort((a, b) => {
@@ -135,12 +148,13 @@ export default function AgentMetrics() {
             <table className="w-full">
               <thead className="border-b border-gh-border">
                 <tr>
+                  <th className="px-3 py-2 w-6" />
                   <SortHeader field="agent_name" label="Agent" />
                   <SortHeader field="sample_count" label="Executions" />
-                  <SortHeader field="avg_initial_input" label="Avg Initial Prompt" />
+                  <th className="px-3 py-2 text-left text-xs font-semibold text-gh-fg-muted uppercase">Avg/Min/Max Initial</th>
                   <th className="px-3 py-2 text-left text-xs font-semibold text-gh-fg-muted uppercase">Avg/Min/Max Input</th>
                   <th className="px-3 py-2 text-left text-xs font-semibold text-gh-fg-muted uppercase">Avg/Min/Max Output</th>
-                  <SortHeader field="avg_total_all" label="Avg Total" />
+                  <th className="px-3 py-2 text-left text-xs font-semibold text-gh-fg-muted uppercase">Avg/Min/Max Total</th>
                   <th className="px-3 py-2 text-left text-xs font-semibold text-gh-fg-muted uppercase">Models</th>
                   <th className="px-3 py-2 text-left text-xs font-semibold text-gh-fg-muted uppercase">Top 3 Tools</th>
                 </tr>
@@ -151,36 +165,136 @@ export default function AgentMetrics() {
                     .sort((a, b) => b[1] - a[1])
                     .slice(0, 3)
                   const models = Object.keys(m.model_breakdown || {})
+                  const isExpanded = expandedAgents.has(m.agent_name)
 
                   return (
-                    <tr key={m.agent_name} className="hover:bg-gh-canvas transition-colors">
-                      <td className="px-3 py-2">
-                        <span className="font-mono text-sm text-gh-fg">{m.agent_name}</span>
-                      </td>
-                      <td className="px-3 py-2 text-sm text-center">{m.sample_count}</td>
-                      <td className="px-3 py-2 text-sm font-mono">{formatTokenCount(m.avg_initial_input)}</td>
-                      <StatCell avg={m.avg_total_input} min={m.min_total_input} max={m.max_total_input} />
-                      <StatCell avg={m.avg_total_output} min={m.min_total_output} max={m.max_total_output} />
-                      <td className="px-3 py-2 text-sm font-mono font-semibold">{formatTokenCount(m.avg_total_all)}</td>
-                      <td className="px-3 py-2">
-                        <div className="flex flex-wrap gap-1">
-                          {models.map(mod => (
-                            <span key={mod} className="px-1.5 py-0.5 bg-gh-accent-subtle border border-gh-accent-muted rounded text-xs font-mono">
-                              {mod.split('-').slice(-2).join('-')}
-                            </span>
-                          ))}
-                        </div>
-                      </td>
-                      <td className="px-3 py-2">
-                        <div className="flex flex-wrap gap-1">
-                          {topTools.map(([name, count]) => (
-                            <span key={name} className="text-xs text-gh-fg-muted font-mono">
-                              {name}×{count}
-                            </span>
-                          ))}
-                        </div>
-                      </td>
-                    </tr>
+                    <Fragment key={m.agent_name}>
+                      <tr
+                        className="hover:bg-gh-canvas transition-colors cursor-pointer"
+                        onClick={() => toggleAgent(m.agent_name)}
+                      >
+                        <td className="px-3 py-2 text-gh-fg-muted">
+                          {isExpanded
+                            ? <ChevronDown className="w-3.5 h-3.5" />
+                            : <ChevronRight className="w-3.5 h-3.5" />
+                          }
+                        </td>
+                        <td className="px-3 py-2">
+                          <span className="font-mono text-sm text-gh-fg">{m.agent_name}</span>
+                        </td>
+                        <td className="px-3 py-2 text-sm text-center">{m.sample_count}</td>
+                        <StatCell avg={m.avg_initial_input} min={m.min_initial_input} max={m.max_initial_input} />
+                        <StatCell avg={m.avg_total_input} min={m.min_total_input} max={m.max_total_input} />
+                        <StatCell avg={m.avg_total_output} min={m.min_total_output} max={m.max_total_output} />
+                        <StatCell avg={m.avg_total_all} min={m.min_total_all} max={m.max_total_all} />
+                        <td className="px-3 py-2">
+                          <div className="flex flex-wrap gap-1">
+                            {models.map(mod => (
+                              <span key={mod} className="px-1.5 py-0.5 bg-gh-accent-subtle border border-gh-accent-muted rounded text-xs font-mono">
+                                {mod.split('-').slice(-2).join('-')}
+                              </span>
+                            ))}
+                          </div>
+                        </td>
+                        <td className="px-3 py-2">
+                          <div className="space-y-0.5">
+                            {topTools.map(([name, count]) => (
+                              <div key={name} className="text-xs font-mono">
+                                <span className="text-gh-fg-muted">{name}</span>
+                                <span className="text-gh-fg">×{count}</span>
+                                {m.sample_count > 0 && (
+                                  <span className="text-gh-fg-muted ml-1">
+                                    ({(count / m.sample_count).toFixed(1)}/exec)
+                                  </span>
+                                )}
+                              </div>
+                            ))}
+                          </div>
+                        </td>
+                      </tr>
+                      {isExpanded && (
+                        <tr className="bg-gh-canvas">
+                          <td colSpan={9} className="px-4 py-3">
+                            <div className="grid grid-cols-2 gap-6">
+                              {/* Tool Token Attribution */}
+                              <div>
+                                <h4 className="text-xs font-semibold text-gh-fg-muted uppercase mb-2">Tool Token Attribution</h4>
+                                {Object.keys(m.tool_token_attribution || {}).length > 0 ? (
+                                  <table className="w-full text-xs">
+                                    <thead>
+                                      <tr className="text-gh-fg-muted">
+                                        <th className="text-left font-normal pb-1">Tool</th>
+                                        <th className="text-right font-normal pb-1">Total Calls</th>
+                                        <th className="text-right font-normal pb-1">Avg Calls/Exec</th>
+                                        <th className="text-right font-normal pb-1">Avg Tokens/Call</th>
+                                      </tr>
+                                    </thead>
+                                    <tbody className="divide-y divide-gh-border">
+                                      {Object.entries(m.tool_token_attribution)
+                                        .sort((a, b) => b[1].total_tokens - a[1].total_tokens)
+                                        .map(([tool, attr]) => (
+                                          <tr key={tool}>
+                                            <td className="font-mono py-0.5">{tool}</td>
+                                            <td className="text-right py-0.5">{attr.call_count}</td>
+                                            <td className="text-right py-0.5 font-mono">
+                                              {m.sample_count > 0
+                                                ? (attr.call_count / m.sample_count).toFixed(1)
+                                                : '—'}
+                                            </td>
+                                            <td className="text-right py-0.5 font-mono">{formatTokenCount(attr.avg_tokens_per_call)}</td>
+                                          </tr>
+                                        ))
+                                      }
+                                    </tbody>
+                                  </table>
+                                ) : (
+                                  <p className="text-gh-fg-muted text-xs">No attribution data</p>
+                                )}
+                              </div>
+
+                              {/* Model Breakdown */}
+                              <div>
+                                <h4 className="text-xs font-semibold text-gh-fg-muted uppercase mb-2">Model Breakdown</h4>
+                                {models.length > 0 ? (
+                                  <table className="w-full text-xs">
+                                    <thead>
+                                      <tr className="text-gh-fg-muted">
+                                        <th className="text-left font-normal pb-1">Model</th>
+                                        <th className="text-right font-normal pb-1">Executions</th>
+                                        <th className="text-right font-normal pb-1">Avg Total</th>
+                                        <th className="text-right font-normal pb-1">Min</th>
+                                        <th className="text-right font-normal pb-1">Max</th>
+                                      </tr>
+                                    </thead>
+                                    <tbody className="divide-y divide-gh-border">
+                                      {models.map(mod => {
+                                        const mb = m.model_breakdown[mod]
+                                        // Support both old format (number) and new format (object)
+                                        const taskCount = typeof mb === 'object' ? mb.task_count : mb
+                                        const avgTotal = typeof mb === 'object' ? mb.avg_total : null
+                                        const minTotal = typeof mb === 'object' ? mb.min_total : null
+                                        const maxTotal = typeof mb === 'object' ? mb.max_total : null
+                                        return (
+                                          <tr key={mod}>
+                                            <td className="font-mono py-0.5">{mod.split('-').slice(-2).join('-')}</td>
+                                            <td className="text-right py-0.5">{taskCount}</td>
+                                            <td className="text-right py-0.5 font-mono">{formatTokenCount(avgTotal)}</td>
+                                            <td className="text-right py-0.5 font-mono">{formatTokenCount(minTotal)}</td>
+                                            <td className="text-right py-0.5 font-mono">{formatTokenCount(maxTotal)}</td>
+                                          </tr>
+                                        )
+                                      })}
+                                    </tbody>
+                                  </table>
+                                ) : (
+                                  <p className="text-gh-fg-muted text-xs">No model data</p>
+                                )}
+                              </div>
+                            </div>
+                          </td>
+                        </tr>
+                      )}
+                    </Fragment>
                   )
                 })}
               </tbody>
