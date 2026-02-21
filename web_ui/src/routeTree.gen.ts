@@ -9,8 +9,6 @@
 // Additionally, you should also exclude this file from your linter and/or formatter to prevent it from being checked or modified.
 
 import { Route as rootRouteImport } from './routes/__root'
-import { Route as ReviewLearningRouteImport } from './routes/review-learning'
-import { Route as RepairCyclesRouteImport } from './routes/repair-cycles'
 import { Route as ProjectsRouteImport } from './routes/projects'
 import { Route as PipelineRunDebugRouteImport } from './routes/pipeline-run-debug'
 import { Route as PipelineRunRouteImport } from './routes/pipeline-run'
@@ -19,16 +17,6 @@ import { Route as AgentExecutionExecutionIdRouteImport } from './routes/agent-ex
 import { Route as AgentMetricsRouteImport } from './routes/agent-metrics'
 import { Route as CycleMetricsRouteImport } from './routes/cycle-metrics'
 
-const ReviewLearningRoute = ReviewLearningRouteImport.update({
-  id: '/review-learning',
-  path: '/review-learning',
-  getParentRoute: () => rootRouteImport,
-} as any)
-const RepairCyclesRoute = RepairCyclesRouteImport.update({
-  id: '/repair-cycles',
-  path: '/repair-cycles',
-  getParentRoute: () => rootRouteImport,
-} as any)
 const ProjectsRoute = ProjectsRouteImport.update({
   id: '/projects',
   path: '/projects',
@@ -71,8 +59,6 @@ export interface FileRoutesByFullPath {
   '/pipeline-run': typeof PipelineRunRoute
   '/pipeline-run-debug': typeof PipelineRunDebugRoute
   '/projects': typeof ProjectsRoute
-  '/repair-cycles': typeof RepairCyclesRoute
-  '/review-learning': typeof ReviewLearningRoute
   '/agent-execution/$executionId': typeof AgentExecutionExecutionIdRoute
   '/agent-metrics': typeof AgentMetricsRoute
   '/cycle-metrics': typeof CycleMetricsRoute
@@ -82,8 +68,6 @@ export interface FileRoutesByTo {
   '/pipeline-run': typeof PipelineRunRoute
   '/pipeline-run-debug': typeof PipelineRunDebugRoute
   '/projects': typeof ProjectsRoute
-  '/repair-cycles': typeof RepairCyclesRoute
-  '/review-learning': typeof ReviewLearningRoute
   '/agent-execution/$executionId': typeof AgentExecutionExecutionIdRoute
   '/agent-metrics': typeof AgentMetricsRoute
   '/cycle-metrics': typeof CycleMetricsRoute
@@ -94,8 +78,6 @@ export interface FileRoutesById {
   '/pipeline-run': typeof PipelineRunRoute
   '/pipeline-run-debug': typeof PipelineRunDebugRoute
   '/projects': typeof ProjectsRoute
-  '/repair-cycles': typeof RepairCyclesRoute
-  '/review-learning': typeof ReviewLearningRoute
   '/agent-execution/$executionId': typeof AgentExecutionExecutionIdRoute
   '/agent-metrics': typeof AgentMetricsRoute
   '/cycle-metrics': typeof CycleMetricsRoute
@@ -107,8 +89,6 @@ export interface FileRouteTypes {
     | '/pipeline-run'
     | '/pipeline-run-debug'
     | '/projects'
-    | '/repair-cycles'
-    | '/review-learning'
     | '/agent-execution/$executionId'
     | '/agent-metrics'
     | '/cycle-metrics'
@@ -118,8 +98,6 @@ export interface FileRouteTypes {
     | '/pipeline-run'
     | '/pipeline-run-debug'
     | '/projects'
-    | '/repair-cycles'
-    | '/review-learning'
     | '/agent-execution/$executionId'
     | '/agent-metrics'
     | '/cycle-metrics'
@@ -129,8 +107,6 @@ export interface FileRouteTypes {
     | '/pipeline-run'
     | '/pipeline-run-debug'
     | '/projects'
-    | '/repair-cycles'
-    | '/review-learning'
     | '/agent-execution/$executionId'
     | '/agent-metrics'
     | '/cycle-metrics'
@@ -141,8 +117,6 @@ export interface RootRouteChildren {
   PipelineRunRoute: typeof PipelineRunRoute
   PipelineRunDebugRoute: typeof PipelineRunDebugRoute
   ProjectsRoute: typeof ProjectsRoute
-  RepairCyclesRoute: typeof RepairCyclesRoute
-  ReviewLearningRoute: typeof ReviewLearningRoute
   AgentExecutionExecutionIdRoute: typeof AgentExecutionExecutionIdRoute
   AgentMetricsRoute: typeof AgentMetricsRoute
   CycleMetricsRoute: typeof CycleMetricsRoute
@@ -150,20 +124,6 @@ export interface RootRouteChildren {
 
 declare module '@tanstack/react-router' {
   interface FileRoutesByPath {
-    '/review-learning': {
-      id: '/review-learning'
-      path: '/review-learning'
-      fullPath: '/review-learning'
-      preLoaderRoute: typeof ReviewLearningRouteImport
-      parentRoute: typeof rootRouteImport
-    }
-    '/repair-cycles': {
-      id: '/repair-cycles'
-      path: '/repair-cycles'
-      fullPath: '/repair-cycles'
-      preLoaderRoute: typeof RepairCyclesRouteImport
-      parentRoute: typeof rootRouteImport
-    }
     '/projects': {
       id: '/projects'
       path: '/projects'
@@ -221,8 +181,6 @@ const rootRouteChildren: RootRouteChildren = {
   PipelineRunRoute: PipelineRunRoute,
   PipelineRunDebugRoute: PipelineRunDebugRoute,
   ProjectsRoute: ProjectsRoute,
-  RepairCyclesRoute: RepairCyclesRoute,
-  ReviewLearningRoute: ReviewLearningRoute,
   AgentExecutionExecutionIdRoute: AgentExecutionExecutionIdRoute,
   AgentMetricsRoute: AgentMetricsRoute,
   CycleMetricsRoute: CycleMetricsRoute,
