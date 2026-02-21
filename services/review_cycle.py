@@ -928,7 +928,9 @@ class ReviewCycleExecutor:
                 if cycle_state.workspace_type == 'issues':
                     from services.project_workspace import workspace_manager
                     _pd = workspace_manager.get_project_dir(cycle_state.project_name)
-                    cycle_state.pre_maker_commit = self._get_git_commit_hash(str(_pd))
+                    commit_hash = self._get_git_commit_hash(str(_pd))
+                    if commit_hash:
+                        cycle_state.pre_maker_commit = commit_hash
                 self._save_cycle_state(cycle_state)
 
                 await self._execute_agent_directly(
@@ -1140,6 +1142,12 @@ class ReviewCycleExecutor:
 
                 # Invoke maker with updated review feedback
                 cycle_state.status = 'maker_working'
+                if cycle_state.workspace_type == 'issues':
+                    from services.project_workspace import workspace_manager
+                    _pd = workspace_manager.get_project_dir(cycle_state.project_name)
+                    commit_hash = self._get_git_commit_hash(str(_pd))
+                    if commit_hash:
+                        cycle_state.pre_maker_commit = commit_hash
                 self._save_cycle_state(cycle_state)
 
                 maker_context = await self._execute_agent_directly(
@@ -1922,7 +1930,9 @@ class ReviewCycleExecutor:
             if cycle_state.workspace_type == 'issues':
                 from services.project_workspace import workspace_manager
                 _pd = workspace_manager.get_project_dir(cycle_state.project_name)
-                cycle_state.pre_maker_commit = self._get_git_commit_hash(str(_pd))
+                commit_hash = self._get_git_commit_hash(str(_pd))
+                if commit_hash:
+                    cycle_state.pre_maker_commit = commit_hash
                 self._save_cycle_state(cycle_state)
 
             # Execute maker agent directly
