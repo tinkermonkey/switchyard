@@ -2006,29 +2006,70 @@ class ReviewCycleExecutor:
             logger.warning(f"Failed to get git diff: {e}")
             return ""
 
+    def _get_merge_base(self, project_dir: str) -> str:
+        """Return the merge-base SHA between HEAD and origin/main (or main).
+
+        This is the point where the feature branch diverged from the base branch.
+        Returns "" on any error.
+        """
+        import subprocess
+        for base in ('origin/main', 'main', 'origin/master', 'master'):
+            try:
+                result = subprocess.run(
+                    ['git', 'merge-base', 'HEAD', base],
+                    cwd=project_dir, capture_output=True, text=True, check=True
+                )
+                sha = result.stdout.strip()
+                if sha:
+                    return sha
+            except Exception:
+                continue
+        logger.warning("Failed to find merge-base with any known base branch")
+        return ""
+
     def _get_pre_most_recent_maker_commit(self, project_dir: str) -> str:
         """Return the parent SHA of the most recent [orchestrator-commit] on this branch.
 
-        This gives us the baseline for 'what did the most recent agent execution change'.
-        Returns "" if no orchestrator commit is found or on any error.
+        Searches only commits unique to this feature branch (merge-base..HEAD) so
+        that orchestrator commits on main from other issues are never matched.
+
+        Falls back to the merge-base itself if no orchestrator commit is found on
+        the feature branch -- this covers the initial review where the maker's first
+        commit was not yet tagged with [orchestrator-commit].
+
+        Returns "" only on hard errors (no git, detached HEAD with no history, etc.)
         """
         import subprocess
+        merge_base = self._get_merge_base(project_dir)
+        rev_range = f'{merge_base}..HEAD' if merge_base else 'HEAD'
+
         try:
             result = subprocess.run(
-                ['git', 'log', '--format=%H', '--grep=orchestrator-commit', '-1'],
+                ['git', 'log', '--format=%H', f'--grep=orchestrator-commit', '-1', rev_range],
                 cwd=project_dir, capture_output=True, text=True, check=True
             )
             sha = result.stdout.strip()
-            if not sha:
-                return ""
-            parent = subprocess.run(
-                ['git', 'rev-parse', f'{sha}^'],
-                cwd=project_dir, capture_output=True, text=True, check=True
-            )
-            return parent.stdout.strip()
+            if sha:
+                # Return the parent of the most recent orchestrator commit
+                parent = subprocess.run(
+                    ['git', 'rev-parse', f'{sha}^'],
+                    cwd=project_dir, capture_output=True, text=True, check=True
+                )
+                return parent.stdout.strip()
+
+            # No orchestrator commit on this branch yet (initial review):
+            # use the merge-base so the diff covers the full feature branch work
+            if merge_base:
+                logger.info(
+                    f"No [orchestrator-commit] on feature branch; "
+                    f"using merge-base {merge_base[:8]} as diff baseline"
+                )
+                return merge_base
+
+            return ""
         except Exception as e:
             logger.warning(f"Failed to find pre-maker commit: {e}")
-            return ""
+            return merge_base  # best-effort fallback
 
     def _create_review_task_context(
         self,
@@ -2063,14 +2104,14 @@ class ReviewCycleExecutor:
                         f"from pre-maker commit {pre_commit[:8]}"
                     )
 
-            # Fallback: full diff since last approved review
+            # Last-resort fallback: use last_approved_commit if git merge-base lookup failed
             if not scoped_diff and cycle_state.last_approved_commit:
                 scoped_diff = self._get_git_diff_since_commit(
                     str(project_dir), cycle_state.last_approved_commit
                 )
                 if scoped_diff:
                     logger.info(
-                        f"Fallback: full diff ({len(scoped_diff)} chars) "
+                        f"Last-resort fallback: diff ({len(scoped_diff)} chars) "
                         f"since approved commit {cycle_state.last_approved_commit[:8]}"
                     )
 
