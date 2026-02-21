@@ -724,7 +724,7 @@ class PRReviewStage(PipelineStage):
             f"_Created by PR Review Stage_"
         )
         return {
-            'title': '[PR Review] CI check failures',
+            'title': '[PR Feedback] CI check failures',
             'body': body,
             'severity': 'high',
         }
@@ -988,21 +988,21 @@ If all requirements are met, write "All requirements verified - no gaps found" a
         for severity, items in severity_sections.items():
             if self._is_actionable_section(items, severity, source):
                 issues.append({
-                    'title': f"[PR Review] {severity} issues from {source}",
+                    'title': f"[PR Feedback] {severity} issues from {source}",
                     'body': self._format_issue_body(severity, items, source),
                     'severity': severity.lower(),
                 })
 
         if self._is_actionable_section(gaps, "Gaps", source):
             issues.append({
-                'title': f"[PR Review] Implementation gaps - {source}",
+                'title': f"[PR Feedback] Implementation gaps - {source}",
                 'body': self._format_issue_body("Gap", gaps, source),
                 'severity': 'high',
             })
 
         if self._is_actionable_section(deviations, "Deviations", source):
             issues.append({
-                'title': f"[PR Review] Implementation deviations - {source}",
+                'title': f"[PR Feedback] Implementation deviations - {source}",
                 'body': self._format_issue_body("Deviation", deviations, source),
                 'severity': 'medium',
             })
@@ -1045,8 +1045,8 @@ If all requirements are met, write "All requirements verified - no gaps found" a
 
     def _format_issue_body(self, severity: str, items: str, source: str) -> str:
         return (
+            f"Based on feedback from the {source}, address the following issues:\n\n"
             f"## {severity} Findings\n\n"
-            f"**Source**: {source}\n\n"
             f"{items}\n\n"
             f"---\n"
             f"_Created by PR Review Stage_"
