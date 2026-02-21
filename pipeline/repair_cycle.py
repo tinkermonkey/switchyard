@@ -51,6 +51,30 @@ from services.cancellation import CancellationError
 
 logger = logging.getLogger(__name__)
 
+# Shared output format appended to every test-runner prompt.
+# Using a plain string (not an f-string) so the literal {} in the JSON examples
+# are safe to concatenate with both plain and f-string prompt bodies.
+_TEST_OUTPUT_FORMAT = """
+CRITICAL: You MUST return ONLY valid JSON in this EXACT format (no markdown, no explanation):
+{
+    "passed": <number of passing checks or tests>,
+    "failed": <number of failing checks or tests>,
+    "warnings": <number of warnings (0 if none)>,
+    "failures": [
+        {"file": "<file path>", "test": "<check or test name>", "message": "<failure message>"},
+        ...
+    ],
+    "warning_list": [
+        {"file": "<file path>", "message": "<warning message>"},
+        ...
+    ]
+}
+
+If everything passes cleanly, return:
+{"passed": 1, "failed": 0, "warnings": 0, "failures": [], "warning_list": []}
+
+DO NOT include any explanation, markdown formatting, or other text - ONLY the JSON object."""
+
 
 @dataclass
 class RepairTestRunConfig:
@@ -694,27 +718,21 @@ Your goal is to identify and report compilation errors and linting violations so
 
 3. Save the full output to /tmp/compilation_results.txt for reference.
 
-4. Return structured results. Each distinct error is a separate failure entry. Use the source file as "file", the error code or rule as "test", and the error message as "message".
+4. Return structured results. Each distinct error is a separate failure entry. Use the source file as "file", the error code or rule as "test", and the error message as "message".""" + _TEST_OUTPUT_FORMAT
 
-CRITICAL: You MUST return ONLY valid JSON in this EXACT format (no markdown, no explanation):
-{{
-    "passed": <number of files with no errors>,
-    "failed": <number of files with errors>,
-    "warnings": <number of lint warnings>,
-    "failures": [
-        {{"file": "src/component.ts", "test": "TS2339", "message": "Property 'x' does not exist on type 'Y'"}},
-        ...
-    ],
-    "warning_list": [
-        {{"file": "src/util.ts", "message": "no-unused-vars: 'foo' is defined but never used"}},
-        ...
-    ]
-}}
+        elif config.test_type == "pre-commit":
+            direct_prompt = """Run the pre-commit scripts for this project and report any failures.
 
-If all code compiles and lints cleanly, return:
-{{"passed": 1, "failed": 0, "warnings": 0, "failures": [], "warning_list": []}}
+1. Identify how pre-commit is configured by inspecting the project root (e.g. .pre-commit-config.yaml, package.json scripts, Makefile targets named "pre-commit").
 
-DO NOT include any explanation, markdown formatting, or other text - ONLY the JSON object."""
+2. Run the pre-commit scripts against all files:
+   - If using the `pre-commit` tool: `pre-commit run --all-files`
+   - If using a npm/package.json script: `npm run pre-commit` (or the configured script name)
+   - If using a Makefile target: `make pre-commit`
+
+3. Save the full output to /tmp/pre_commit_results.txt for reference.
+
+4. Return structured results. Each distinct hook failure is a separate entry. Use the hook name as "test" and the file it failed on (if reported) as "file"; use the hook name as "file" if no specific file is identified.""" + _TEST_OUTPUT_FORMAT
 
         elif config.test_type == "ci":
             # Calculate a safe polling deadline from the configured timeout, leaving
@@ -754,24 +772,8 @@ Follow these steps exactly:
 
 6. Parse the failures into the structured format below. Each CI job failure is a separate entry.
    Use the source file path from the log as "file" (or the job/workflow name if no file is identifiable).
-   Use the job name and step name as "test".
+   Use the job name and step name as "test".""" + _TEST_OUTPUT_FORMAT
 
-CRITICAL: You MUST return ONLY valid JSON in this EXACT format (no markdown, no explanation):
-{{
-    "passed": <number of CI jobs that passed>,
-    "failed": <number of CI jobs that failed>,
-    "warnings": 0,
-    "failures": [
-        {{"file": "<source file path or job name>", "test": "<job name / step name>", "message": "<error message from CI log>"}},
-        ...
-    ],
-    "warning_list": []
-}}
-
-If CI is passing (conclusion is success), return:
-{{"passed": 1, "failed": 0, "warnings": 0, "failures": [], "warning_list": []}}
-
-DO NOT include any explanation, markdown formatting, or other text - ONLY the JSON object."""
         else:
             direct_prompt = f"""Run all {config.test_type} tests for this project.
 
@@ -783,24 +785,7 @@ These tests runs can take some time to complete, please be patient and don't put
 
 Also, make sure you are capturing the **full** output of the test runs, including any warnings and errors, to disk to avoid having to re-run the tests multiple times.
 
-Be mindful of environment setup steps like installing dependencies and activating virtual environments.
-
-CRITICAL: You MUST return ONLY valid JSON in this EXACT format (no markdown, no explanation):
-{{
-    "passed": <number of tests that passed>,
-    "failed": <number of tests that failed>,
-    "warnings": <number of warnings>,
-    "failures": [
-        {{"file": "test_file.py", "test": "test_function_name", "message": "failure message"}},
-        ...
-    ],
-    "warning_list": [
-        {{"file": "source_file.py", "message": "warning message"}},
-        ...
-    ]
-}}
-
-DO NOT include any explanation, markdown formatting, or other text - ONLY the JSON object."""
+Be mindful of environment setup steps like installing dependencies and activating virtual environments.""" + _TEST_OUTPUT_FORMAT
 
         # Build task context for this agent execution
         task_context = {
