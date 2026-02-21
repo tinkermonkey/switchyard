@@ -1,7 +1,7 @@
 import { Fragment, useState, useEffect, useCallback } from 'react'
 import { RefreshCw, BarChart2, ChevronDown, ChevronRight } from 'lucide-react'
 
-const DAYS_OPTIONS = [1, 7, 30]
+const DAYS_OPTIONS = [1, 3, 7]
 
 const formatTokenCount = (n) => {
   if (n == null) return '—'
@@ -15,6 +15,18 @@ const formatTokenCount = (n) => {
 const getAvg = (m, field) => m[field] ?? 0
 const getCount = (m) => m.task_count ?? 0
 
+// Strip the 'claude-' prefix and trailing 8-digit date snapshot from a model ID.
+// e.g. 'claude-haiku-4-5-20251001' → 'haiku-4-5'
+//      'claude-sonnet-4-6'          → 'sonnet-4-6'
+const formatModelName = (mod) => {
+  const parts = mod.split('-')
+  const withoutPrefix = parts[0] === 'claude' ? parts.slice(1) : parts
+  const withoutDate = /^\d{8}$/.test(withoutPrefix[withoutPrefix.length - 1])
+    ? withoutPrefix.slice(0, -1)
+    : withoutPrefix
+  return withoutDate.join('-')
+}
+
 const StatCell = ({ value, sub }) => (
   <td className="px-3 py-2 text-sm">
     <div className="font-mono">{formatTokenCount(value)}</div>
@@ -24,8 +36,7 @@ const StatCell = ({ value, sub }) => (
   </td>
 )
 
-export default function AgentMetrics() {
-  const [days, setDays] = useState(7)
+export default function AgentMetrics({ days, onDaysChange }) {
   const [metrics, setMetrics] = useState([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
@@ -109,7 +120,7 @@ export default function AgentMetrics() {
             {DAYS_OPTIONS.map(d => (
               <button
                 key={d}
-                onClick={() => setDays(d)}
+                onClick={() => onDaysChange(d)}
                 className={`px-3 py-1 text-sm rounded border transition-colors ${
                   days === d
                     ? 'bg-gh-accent-emphasis border-gh-accent-primary text-white'
@@ -212,7 +223,7 @@ export default function AgentMetrics() {
                           <div className="flex flex-wrap gap-1">
                             {models.map(mod => (
                               <span key={mod} className="px-1.5 py-0.5 bg-gh-accent-subtle border border-gh-accent-muted rounded text-xs font-mono">
-                                {mod.split('-').slice(-2).join('-')}
+                                {formatModelName(mod)}
                               </span>
                             ))}
                           </div>
@@ -297,7 +308,7 @@ export default function AgentMetrics() {
                                         const mtc = mb.task_count || 0
                                         return (
                                           <tr key={mod}>
-                                            <td className="font-mono py-0.5">{mod.split('-').slice(-2).join('-')}</td>
+                                            <td className="font-mono py-0.5">{formatModelName(mod)}</td>
                                             <td className="text-right py-0.5">{mtc}</td>
                                             <td className="text-right py-0.5 font-mono">
                                               {formatTokenCount(mtc > 0 ? (mb.sum_direct_input || 0) / mtc : 0)}

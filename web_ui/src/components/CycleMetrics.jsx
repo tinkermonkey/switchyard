@@ -11,6 +11,17 @@ const CYCLE_COLORS = {
 
 const DEFAULT_COLOR = { bg: 'bg-gh-canvas-subtle', border: 'border-gh-border', text: 'text-gh-fg', label: null }
 
+// Strip 'claude-' prefix and trailing 8-digit date from a model ID.
+// e.g. 'claude-haiku-4-5-20251001' → 'haiku-4-5', 'claude-sonnet-4-6' → 'sonnet-4-6'
+const formatModelName = (mod) => {
+  const parts = mod.split('-')
+  const withoutPrefix = parts[0] === 'claude' ? parts.slice(1) : parts
+  const withoutDate = /^\d{8}$/.test(withoutPrefix[withoutPrefix.length - 1])
+    ? withoutPrefix.slice(0, -1)
+    : withoutPrefix
+  return withoutDate.join('-')
+}
+
 const formatTokenCount = (n) => {
   if (n == null) return '—'
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
@@ -107,15 +118,19 @@ function CycleCard({ cycle }) {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-gh-border">
-                  {agentBreakdown.map(([agent, stats]) => (
-                    <tr key={agent}>
-                      <td className="font-mono py-0.5">{agent}</td>
-                      <td className="text-right py-0.5">{stats.task_count || 0}</td>
-                      <td className="text-right py-0.5 font-mono">{formatTokenCount(stats.avg_direct_input)}</td>
-                      <td className="text-right py-0.5 font-mono">{formatTokenCount(stats.avg_cache_read)}</td>
-                      <td className="text-right py-0.5 font-mono">{formatTokenCount(stats.avg_output)}</td>
-                    </tr>
-                  ))}
+                  {agentBreakdown.map(([agent, stats]) => {
+                    const atc = stats.task_count || 0
+                    const avgField = (f) => atc > 0 ? (stats[f] || 0) / atc : 0
+                    return (
+                      <tr key={agent}>
+                        <td className="font-mono py-0.5">{agent}</td>
+                        <td className="text-right py-0.5">{atc}</td>
+                        <td className="text-right py-0.5 font-mono">{formatTokenCount(avgField('sum_direct_input'))}</td>
+                        <td className="text-right py-0.5 font-mono">{formatTokenCount(avgField('sum_cache_read'))}</td>
+                        <td className="text-right py-0.5 font-mono">{formatTokenCount(avgField('sum_output'))}</td>
+                      </tr>
+                    )
+                  })}
                 </tbody>
               </table>
             ) : (
@@ -131,7 +146,7 @@ function CycleCard({ cycle }) {
                 <div className="flex flex-wrap gap-1">
                   {models.map(m => (
                     <span key={m} className="px-1.5 py-0.5 bg-gh-accent-subtle border border-gh-accent-muted rounded text-xs font-mono">
-                      {m.split('-').slice(-2).join('-')}
+                      {formatModelName(m)}
                     </span>
                   ))}
                 </div>
