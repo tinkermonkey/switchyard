@@ -31,6 +31,7 @@ function AgentExecutionView() {
   const [isMessageExpanded, setIsMessageExpanded] = useState(false)
   const [isPromptExpanded, setIsPromptExpanded] = useState(false)
   const [isPreviousResultExpanded, setIsPreviousResultExpanded] = useState(false)
+  const [isUsageExpanded, setIsUsageExpanded] = useState(false)
   const [autoScroll, setAutoScroll] = useState(true)
 
   // Agent execution navigation state
@@ -267,9 +268,9 @@ function AgentExecutionView() {
   }, [pipelineExecutions, executionId, navigate])
 
   // Merge API logs with live WebSocket updates and build agent state
-  const { executionEvents, agentState, mergedLogs, mergedPipelineEvents } = useMemo(() => {
+  const { executionEvents, agentState, mergedLogs, mergedPipelineEvents, tokenUsage } = useMemo(() => {
     if (!executionData) {
-      return { executionEvents: [], agentState: {}, mergedLogs: [], mergedPipelineEvents: [] }
+      return { executionEvents: [], agentState: {}, mergedLogs: [], mergedPipelineEvents: [], tokenUsage: { hasData: false } }
     }
     
     const agent = executionData.agent
@@ -431,6 +432,68 @@ function AgentExecutionView() {
       }
     }
     
+    // Derive token usage from merged logs
+    let firstInput = null
+    let cumulativeLastInput = 0
+    let cumulativeLastOutput = 0
+    let lastCacheRead = 0
+    const modelsUsed = new Set()
+    const toolCallCounts = {}
+    const tokenToolsAvailable = []
+    const mcpServersAvailable = []
+
+    for (const log of logs) {
+      const evt = log.raw_event?.event
+      if (!evt) continue
+
+      if (evt.type === 'system' && evt.subtype === 'init') {
+        if (Array.isArray(evt.tools) && tokenToolsAvailable.length === 0) {
+          tokenToolsAvailable.push(...evt.tools.map(t => t.name || String(t)))
+        }
+        if (evt.mcp_servers && typeof evt.mcp_servers === 'object' && mcpServersAvailable.length === 0) {
+          mcpServersAvailable.push(...Object.keys(evt.mcp_servers))
+        }
+      }
+
+      if (evt.type === 'assistant' && evt.message?.usage) {
+        const usage = evt.message.usage
+        const model = evt.message.model
+        if (model) modelsUsed.add(model)
+
+        const inputTokens = usage.input_tokens || 0
+        const outputTokens = usage.output_tokens || 0
+        const cacheRead = usage.cache_read_input_tokens || 0
+
+        if (firstInput === null) firstInput = inputTokens
+        cumulativeLastInput = inputTokens
+        cumulativeLastOutput = outputTokens
+        // cache_read_input_tokens is cumulative in the Anthropic API, use last value
+        lastCacheRead = cacheRead
+
+        const contents = Array.isArray(evt.message.content) ? evt.message.content : []
+        for (const item of contents) {
+          if (item.type === 'tool_use' && item.name) {
+            toolCallCounts[item.name] = (toolCallCounts[item.name] || 0) + 1
+          }
+        }
+      }
+    }
+
+    const tokenUsage = {
+      hasData: firstInput !== null,
+      initialInput: firstInput || 0,
+      totalInput: cumulativeLastInput,
+      totalOutput: cumulativeLastOutput,
+      totalCacheRead: lastCacheRead,
+      totalAll: cumulativeLastInput + cumulativeLastOutput,
+      modelsUsed: Array.from(modelsUsed),
+      toolsAvailable: tokenToolsAvailable,
+      mcpServersAvailable,
+      toolsSummary: Object.entries(toolCallCounts)
+        .map(([name, calls]) => ({ name, calls }))
+        .sort((a, b) => b.calls - a.calls)
+    }
+
     return {
       executionEvents: filteredEvents,
       agentState: {
@@ -442,9 +505,16 @@ function AgentExecutionView() {
         inputPrompt
       },
       mergedLogs: logs,
-      mergedPipelineEvents: pipelineEventsList
+      mergedPipelineEvents: pipelineEventsList,
+      tokenUsage
     }
   }, [executionData, executionLogs, allLogs, promptEvent, pipelineEvents, pipelineRunId])
+
+  const formatTokenCount = (n) => {
+    if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
+    if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`
+    return String(n)
+  }
 
   const formatToolCall = (toolCall) => {
     if (!toolCall) return null
@@ -602,6 +672,129 @@ function AgentExecutionView() {
               <HeaderCircuitBreakers />
             </div>
           </div>
+        </div>
+      )}
+
+      {/* Token Usage Panel */}
+      {tokenUsage.hasData && (
+        <div className="mb-3 bg-gh-canvas-subtle rounded-md border border-gh-border">
+          <button
+            onClick={() => setIsUsageExpanded(!isUsageExpanded)}
+            className="w-full flex items-center justify-between p-3 hover:bg-gh-border-muted transition-colors rounded-md"
+          >
+            <div className="flex items-center gap-2">
+              <span className="text-sm font-semibold text-gh-fg">Token Usage</span>
+              <span className="text-gh-fg-muted text-sm">·</span>
+              <span className="text-sm text-gh-fg-muted">
+                {formatTokenCount(tokenUsage.totalAll)} total
+              </span>
+              {tokenUsage.modelsUsed.length > 0 && (
+                <>
+                  <span className="text-gh-fg-muted text-sm">·</span>
+                  <span className="text-sm text-gh-fg-muted font-mono">{tokenUsage.modelsUsed[0]}</span>
+                </>
+              )}
+              {tokenUsage.toolsSummary.length > 0 && (
+                <>
+                  <span className="text-gh-fg-muted text-sm">·</span>
+                  <span className="text-sm text-gh-fg-muted">{tokenUsage.toolsSummary.length} tools used</span>
+                </>
+              )}
+            </div>
+            {isUsageExpanded ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
+          </button>
+
+          {isUsageExpanded && (
+            <div className="border-t border-gh-border p-3 grid grid-cols-3 gap-4">
+              {/* Col 1: Token counts */}
+              <div>
+                <h4 className="text-xs font-semibold text-gh-fg-muted uppercase mb-2">Token Counts</h4>
+                <table className="w-full text-sm">
+                  <tbody>
+                    <tr>
+                      <td className="text-gh-fg-muted py-0.5">Initial prompt</td>
+                      <td className="text-right font-mono">{formatTokenCount(tokenUsage.initialInput)}</td>
+                    </tr>
+                    <tr>
+                      <td className="text-gh-fg-muted py-0.5">Total input</td>
+                      <td className="text-right font-mono">{formatTokenCount(tokenUsage.totalInput)}</td>
+                    </tr>
+                    <tr>
+                      <td className="text-gh-fg-muted py-0.5">Total output</td>
+                      <td className="text-right font-mono">{formatTokenCount(tokenUsage.totalOutput)}</td>
+                    </tr>
+                    <tr>
+                      <td className="text-gh-fg-muted py-0.5">Cache read</td>
+                      <td className="text-right font-mono">{formatTokenCount(tokenUsage.totalCacheRead)}</td>
+                    </tr>
+                    <tr className="border-t border-gh-border">
+                      <td className="text-gh-fg font-semibold py-0.5">Grand total</td>
+                      <td className="text-right font-mono font-semibold">{formatTokenCount(tokenUsage.totalAll)}</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+
+              {/* Col 2: Models + Tools Available */}
+              <div>
+                <h4 className="text-xs font-semibold text-gh-fg-muted uppercase mb-2">Models</h4>
+                <div className="flex flex-wrap gap-1 mb-3">
+                  {tokenUsage.modelsUsed.map(m => (
+                    <span key={m} className="px-2 py-0.5 bg-gh-accent-subtle border border-gh-accent-muted rounded text-xs font-mono">
+                      {m}
+                    </span>
+                  ))}
+                </div>
+                {tokenUsage.toolsAvailable.length > 0 && (
+                  <>
+                    <h4 className="text-xs font-semibold text-gh-fg-muted uppercase mb-2">Tools Available</h4>
+                    <div className="flex flex-wrap gap-1">
+                      {tokenUsage.toolsAvailable.map(t => {
+                        const used = tokenUsage.toolsSummary.some(s => s.name === t)
+                        return (
+                          <span
+                            key={t}
+                            className={`px-2 py-0.5 rounded text-xs font-mono ${
+                              used
+                                ? 'bg-gh-warning-subtle border border-gh-warning text-gh-fg'
+                                : 'bg-gh-canvas border border-gh-border text-gh-fg-muted'
+                            }`}
+                          >
+                            {t}
+                          </span>
+                        )
+                      })}
+                    </div>
+                  </>
+                )}
+              </div>
+
+              {/* Col 3: Tools Used */}
+              <div>
+                <h4 className="text-xs font-semibold text-gh-fg-muted uppercase mb-2">Tools Used</h4>
+                {tokenUsage.toolsSummary.length > 0 ? (
+                  <table className="w-full text-sm">
+                    <thead>
+                      <tr>
+                        <th className="text-left text-gh-fg-muted font-normal text-xs pb-1">Tool</th>
+                        <th className="text-right text-gh-fg-muted font-normal text-xs pb-1">Calls</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {tokenUsage.toolsSummary.map(({ name, calls }) => (
+                        <tr key={name}>
+                          <td className="text-gh-fg font-mono py-0.5 text-xs">{name}</td>
+                          <td className="text-right text-gh-fg py-0.5">{calls}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                ) : (
+                  <p className="text-gh-fg-muted text-xs">No tool calls recorded</p>
+                )}
+              </div>
+            </div>
+          )}
         </div>
       )}
 

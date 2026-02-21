@@ -7,8 +7,10 @@ Uses APScheduler for Python-native scheduling.
 
 import logging
 import asyncio
+import os
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
@@ -90,6 +92,16 @@ class ScheduledTasksService:
             replace_existing=True
         )
 
+        # Schedule token metrics computation
+        token_metrics_hours = int(os.environ.get('TOKEN_METRICS_INTERVAL_HOURS', '3'))
+        self.scheduler.add_job(
+            self._run_token_metrics,
+            trigger=IntervalTrigger(hours=token_metrics_hours),
+            id='token_metrics',
+            name=f'Compute token usage metrics (every {token_metrics_hours}h)',
+            replace_existing=True
+        )
+
         self.scheduler.start()
         self.running = True
         logger.info("Scheduled tasks service started")
@@ -100,6 +112,7 @@ class ScheduledTasksService:
         logger.info("- Docker state reconciliation: Every 5 minutes")
         logger.info("- Queue state reconciliation: Every 10 minutes")
         logger.info("- Empty output detection: Every 15 minutes")
+        logger.info(f"- Token metrics computation: Every {token_metrics_hours} hours")
 
     def stop(self):
         """Stop the scheduler"""
@@ -647,6 +660,16 @@ class ScheduledTasksService:
 
         except Exception as e:
             logger.error(f"Error in empty output detection: {e}", exc_info=True)
+
+    async def _run_token_metrics(self):
+        """Run token metrics computation job"""
+        logger.info("Starting token metrics computation job")
+        try:
+            from services.token_metrics_service import get_token_metrics_service
+            service = get_token_metrics_service()
+            await service.run_metrics_job()
+        except Exception as e:
+            logger.error(f"Fatal error in token metrics job: {e}", exc_info=True)
 
     def run_cleanup_now(self):
         """Run cleanup task immediately (for testing/manual trigger)"""

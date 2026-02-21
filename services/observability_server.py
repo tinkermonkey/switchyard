@@ -1955,6 +1955,116 @@ def get_review_outcomes():
             'outcomes': []
         }), 500
 
+@app.route('/api/metrics/agents', methods=['GET'])
+def get_agent_metrics():
+    """Get pre-computed per-agent token usage metrics"""
+    try:
+        try:
+            days = int(request.args.get('days', 7))
+        except (ValueError, TypeError):
+            return jsonify({'success': False, 'error': 'Invalid days parameter', 'metrics': []}), 400
+        days = max(1, min(days, 365))
+        agent_filter = request.args.get('agent')
+
+        query_filter = {
+            'range': {
+                'computed_at': {'gte': f'now-{days}d'}
+            }
+        }
+
+        if agent_filter:
+            body = {
+                'size': 1000,
+                'query': {
+                    'bool': {
+                        'must': [
+                            query_filter,
+                            {'term': {'agent_name': agent_filter}}
+                        ]
+                    }
+                },
+                'collapse': {'field': 'agent_name'},
+                'sort': [{'computed_at': {'order': 'desc'}}]
+            }
+        else:
+            body = {
+                'size': 1000,
+                'query': query_filter,
+                'collapse': {'field': 'agent_name'},
+                'sort': [{'computed_at': {'order': 'desc'}}]
+            }
+
+        try:
+            result = es_client.search(index='token-metrics-agents-*', body=body)
+            metrics = [hit['_source'] for hit in result['hits']['hits']]
+        except Exception as e:
+            if 'index_not_found' in str(e).lower() or 'no such index' in str(e).lower():
+                metrics = []
+            else:
+                raise
+
+        return jsonify({'success': True, 'metrics': metrics})
+
+    except Exception as e:
+        logger.error(f"Error fetching agent metrics: {e}", exc_info=True)
+        return jsonify({'success': False, 'error': str(e), 'metrics': []}), 500
+
+
+@app.route('/api/metrics/cycles', methods=['GET'])
+def get_cycle_metrics():
+    """Get pre-computed per-cycle-type token usage metrics"""
+    try:
+        try:
+            days = int(request.args.get('days', 7))
+        except (ValueError, TypeError):
+            return jsonify({'success': False, 'error': 'Invalid days parameter', 'metrics': []}), 400
+        days = max(1, min(days, 365))
+        cycle_type_filter = request.args.get('cycle_type')
+
+        query_filter = {
+            'range': {
+                'computed_at': {'gte': f'now-{days}d'}
+            }
+        }
+
+        if cycle_type_filter:
+            body = {
+                'size': 1000,
+                'query': {
+                    'bool': {
+                        'must': [
+                            query_filter,
+                            {'term': {'cycle_type': cycle_type_filter}}
+                        ]
+                    }
+                },
+                'collapse': {'field': 'cycle_type'},
+                'sort': [{'computed_at': {'order': 'desc'}}]
+            }
+        else:
+            body = {
+                'size': 1000,
+                'query': query_filter,
+                'collapse': {'field': 'cycle_type'},
+                'sort': [{'computed_at': {'order': 'desc'}}]
+            }
+
+        try:
+            result = es_client.search(index='token-metrics-cycles-*', body=body)
+            metrics = [hit['_source'] for hit in result['hits']['hits']]
+        except Exception as e:
+            if 'index_not_found' in str(e).lower() or 'no such index' in str(e).lower():
+                metrics = []
+            else:
+                raise
+
+        return jsonify({'success': True, 'metrics': metrics})
+
+    except Exception as e:
+        logger.error(f"Error fetching cycle metrics: {e}", exc_info=True)
+        return jsonify({'success': False, 'error': str(e), 'metrics': []}), 500
+
+
 @app.route('/api/circuit-breakers', methods=['GET'])
 def get_circuit_breakers():
     """Get circuit breaker status from pattern ingestion service and Claude Code"""

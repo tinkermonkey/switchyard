@@ -16,6 +16,8 @@ import { Route as PipelineRunDebugRouteImport } from './routes/pipeline-run-debu
 import { Route as PipelineRunRouteImport } from './routes/pipeline-run'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as AgentExecutionExecutionIdRouteImport } from './routes/agent-execution.$executionId'
+import { Route as AgentMetricsRouteImport } from './routes/agent-metrics'
+import { Route as CycleMetricsRouteImport } from './routes/cycle-metrics'
 
 const ReviewLearningRoute = ReviewLearningRouteImport.update({
   id: '/review-learning',
@@ -53,6 +55,16 @@ const AgentExecutionExecutionIdRoute =
     path: '/agent-execution/$executionId',
     getParentRoute: () => rootRouteImport,
   } as any)
+const AgentMetricsRoute = AgentMetricsRouteImport.update({
+  id: '/agent-metrics',
+  path: '/agent-metrics',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const CycleMetricsRoute = CycleMetricsRouteImport.update({
+  id: '/cycle-metrics',
+  path: '/cycle-metrics',
+  getParentRoute: () => rootRouteImport,
+} as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
@@ -62,6 +74,8 @@ export interface FileRoutesByFullPath {
   '/repair-cycles': typeof RepairCyclesRoute
   '/review-learning': typeof ReviewLearningRoute
   '/agent-execution/$executionId': typeof AgentExecutionExecutionIdRoute
+  '/agent-metrics': typeof AgentMetricsRoute
+  '/cycle-metrics': typeof CycleMetricsRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
@@ -71,6 +85,8 @@ export interface FileRoutesByTo {
   '/repair-cycles': typeof RepairCyclesRoute
   '/review-learning': typeof ReviewLearningRoute
   '/agent-execution/$executionId': typeof AgentExecutionExecutionIdRoute
+  '/agent-metrics': typeof AgentMetricsRoute
+  '/cycle-metrics': typeof CycleMetricsRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
@@ -81,6 +97,8 @@ export interface FileRoutesById {
   '/repair-cycles': typeof RepairCyclesRoute
   '/review-learning': typeof ReviewLearningRoute
   '/agent-execution/$executionId': typeof AgentExecutionExecutionIdRoute
+  '/agent-metrics': typeof AgentMetricsRoute
+  '/cycle-metrics': typeof CycleMetricsRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
@@ -92,6 +110,8 @@ export interface FileRouteTypes {
     | '/repair-cycles'
     | '/review-learning'
     | '/agent-execution/$executionId'
+    | '/agent-metrics'
+    | '/cycle-metrics'
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/'
@@ -101,6 +121,8 @@ export interface FileRouteTypes {
     | '/repair-cycles'
     | '/review-learning'
     | '/agent-execution/$executionId'
+    | '/agent-metrics'
+    | '/cycle-metrics'
   id:
     | '__root__'
     | '/'
@@ -110,6 +132,8 @@ export interface FileRouteTypes {
     | '/repair-cycles'
     | '/review-learning'
     | '/agent-execution/$executionId'
+    | '/agent-metrics'
+    | '/cycle-metrics'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
@@ -120,6 +144,8 @@ export interface RootRouteChildren {
   RepairCyclesRoute: typeof RepairCyclesRoute
   ReviewLearningRoute: typeof ReviewLearningRoute
   AgentExecutionExecutionIdRoute: typeof AgentExecutionExecutionIdRoute
+  AgentMetricsRoute: typeof AgentMetricsRoute
+  CycleMetricsRoute: typeof CycleMetricsRoute
 }
 
 declare module '@tanstack/react-router' {
@@ -173,6 +199,20 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AgentExecutionExecutionIdRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/agent-metrics': {
+      id: '/agent-metrics'
+      path: '/agent-metrics'
+      fullPath: '/agent-metrics'
+      preLoaderRoute: typeof AgentMetricsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/cycle-metrics': {
+      id: '/cycle-metrics'
+      path: '/cycle-metrics'
+      fullPath: '/cycle-metrics'
+      preLoaderRoute: typeof CycleMetricsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
   }
 }
 
@@ -184,6 +224,8 @@ const rootRouteChildren: RootRouteChildren = {
   RepairCyclesRoute: RepairCyclesRoute,
   ReviewLearningRoute: ReviewLearningRoute,
   AgentExecutionExecutionIdRoute: AgentExecutionExecutionIdRoute,
+  AgentMetricsRoute: AgentMetricsRoute,
+  CycleMetricsRoute: CycleMetricsRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)
