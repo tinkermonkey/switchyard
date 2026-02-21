@@ -55,6 +55,7 @@ class ReviewCycleState:
         self.last_review_comment_id = None  # Last comment ID from reviewer
         self.last_escalation_comment_id = None  # Escalation comment ID for feedback tracking
         self.last_approved_commit = None  # Git commit hash of last approved review (for scoped diffs)
+        self.pre_maker_commit = None  # HEAD snapshot taken just before the maker agent runs each iteration
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -79,6 +80,7 @@ class ReviewCycleState:
             'last_review_comment_id': self.last_review_comment_id,
             'last_escalation_comment_id': self.last_escalation_comment_id,
             'last_approved_commit': self.last_approved_commit,
+            'pre_maker_commit': self.pre_maker_commit,
         }
 
     @classmethod
@@ -107,6 +109,7 @@ class ReviewCycleState:
         state.last_review_comment_id = data.get('last_review_comment_id')
         state.last_escalation_comment_id = data.get('last_escalation_comment_id')
         state.last_approved_commit = data.get('last_approved_commit')
+        state.pre_maker_commit = data.get('pre_maker_commit')
         return state
 
 
@@ -922,6 +925,10 @@ class ReviewCycleExecutor:
 
                 # Execute maker agent
                 cycle_state.status = 'maker_working'
+                if cycle_state.workspace_type == 'issues':
+                    from services.project_workspace import workspace_manager
+                    _pd = workspace_manager.get_project_dir(cycle_state.project_name)
+                    cycle_state.pre_maker_commit = self._get_git_commit_hash(str(_pd))
                 self._save_cycle_state(cycle_state)
 
                 await self._execute_agent_directly(
@@ -947,7 +954,7 @@ class ReviewCycleExecutor:
                             agent=cycle_state.maker_agent,
                             task_id=f"review_cycle_iter_{cycle_state.current_iteration}",
                             issue_number=cycle_state.issue_number,
-                            custom_message=f"Address code review feedback (iteration {cycle_state.current_iteration})\n\nIssue #{cycle_state.issue_number}\n[orchestrator-commit]"
+                            custom_message=f"Address code review feedback (iteration {cycle_state.current_iteration})\n\nIssue #{cycle_state.issue_number}"
                         )
 
                 # Get maker output
@@ -1911,6 +1918,13 @@ class ReviewCycleExecutor:
                         # Continue without branch - agent will work on current branch
                         logger.warning(f"Continuing on current branch for issue #{cycle_state.issue_number}")
 
+            # Snapshot HEAD before the maker runs so the reviewer diffs only this iteration
+            if cycle_state.workspace_type == 'issues':
+                from services.project_workspace import workspace_manager
+                _pd = workspace_manager.get_project_dir(cycle_state.project_name)
+                cycle_state.pre_maker_commit = self._get_git_commit_hash(str(_pd))
+                self._save_cycle_state(cycle_state)
+
             # Execute maker agent directly
             await self._execute_agent_directly(
                 cycle_state.maker_agent,
@@ -1936,7 +1950,7 @@ class ReviewCycleExecutor:
                         agent=cycle_state.maker_agent,
                         task_id=f"review_cycle_iter_{iteration}",
                         issue_number=cycle_state.issue_number,
-                        custom_message=f"Address code review feedback (iteration {iteration})\n\nIssue #{cycle_state.issue_number}\n[orchestrator-commit]"
+                        custom_message=f"Address code review feedback (iteration {iteration})\n\nIssue #{cycle_state.issue_number}"
                     )
 
                     if commit_success:
@@ -2027,50 +2041,6 @@ class ReviewCycleExecutor:
         logger.warning("Failed to find merge-base with any known base branch")
         return ""
 
-    def _get_pre_most_recent_maker_commit(self, project_dir: str) -> str:
-        """Return the parent SHA of the most recent [orchestrator-commit] on this branch.
-
-        Searches only commits unique to this feature branch (merge-base..HEAD) so
-        that orchestrator commits on main from other issues are never matched.
-
-        Falls back to the merge-base itself if no orchestrator commit is found on
-        the feature branch -- this covers the initial review where the maker's first
-        commit was not yet tagged with [orchestrator-commit].
-
-        Returns "" only on hard errors (no git, detached HEAD with no history, etc.)
-        """
-        import subprocess
-        merge_base = self._get_merge_base(project_dir)
-        rev_range = f'{merge_base}..HEAD' if merge_base else 'HEAD'
-
-        try:
-            result = subprocess.run(
-                ['git', 'log', '--format=%H', f'--grep=orchestrator-commit', '-1', rev_range],
-                cwd=project_dir, capture_output=True, text=True, check=True
-            )
-            sha = result.stdout.strip()
-            if sha:
-                # Return the parent of the most recent orchestrator commit
-                parent = subprocess.run(
-                    ['git', 'rev-parse', f'{sha}^'],
-                    cwd=project_dir, capture_output=True, text=True, check=True
-                )
-                return parent.stdout.strip()
-
-            # No orchestrator commit on this branch yet (initial review):
-            # use the merge-base so the diff covers the full feature branch work
-            if merge_base:
-                logger.info(
-                    f"No [orchestrator-commit] on feature branch; "
-                    f"using merge-base {merge_base[:8]} as diff baseline"
-                )
-                return merge_base
-
-            return ""
-        except Exception as e:
-            logger.warning(f"Failed to find pre-maker commit: {e}")
-            return merge_base  # best-effort fallback
-
     def _create_review_task_context(
         self,
         cycle_state: ReviewCycleState,
@@ -2094,17 +2064,29 @@ class ReviewCycleExecutor:
             from services.project_workspace import workspace_manager
             project_dir = workspace_manager.get_project_dir(cycle_state.project_name)
 
-            # Prefer diff of only the most recent agent execution
-            pre_commit = self._get_pre_most_recent_maker_commit(str(project_dir))
-            if pre_commit:
-                scoped_diff = self._get_git_diff_since_commit(str(project_dir), pre_commit)
+            # Primary: diff from the HEAD snapshot taken just before the maker ran
+            if cycle_state.pre_maker_commit:
+                scoped_diff = self._get_git_diff_since_commit(str(project_dir), cycle_state.pre_maker_commit)
                 if scoped_diff:
                     logger.info(
                         f"Generated focused agent diff ({len(scoped_diff)} chars) "
-                        f"from pre-maker commit {pre_commit[:8]}"
+                        f"from pre-maker snapshot {cycle_state.pre_maker_commit[:8]}"
                     )
+                else:
+                    logger.info(f"No changes since pre-maker snapshot {cycle_state.pre_maker_commit[:8]}")
 
-            # Last-resort fallback: use last_approved_commit if git merge-base lookup failed
+            # Fallback: merge-base (covers deployments before pre_maker_commit was introduced)
+            if not scoped_diff:
+                merge_base = self._get_merge_base(str(project_dir))
+                if merge_base:
+                    scoped_diff = self._get_git_diff_since_commit(str(project_dir), merge_base)
+                    if scoped_diff:
+                        logger.info(
+                            f"Fallback: full feature-branch diff ({len(scoped_diff)} chars) "
+                            f"from merge-base {merge_base[:8]}"
+                        )
+
+            # Last resort: last_approved_commit (older fallback, kept for safety)
             if not scoped_diff and cycle_state.last_approved_commit:
                 scoped_diff = self._get_git_diff_since_commit(
                     str(project_dir), cycle_state.last_approved_commit
