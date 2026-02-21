@@ -168,6 +168,7 @@ class PRReviewStage(PipelineStage):
             review_found_issues = False
             phases_attempted = 0
             phases_completed = 0
+            phase_outputs: List[Tuple[str, str]] = []
 
             # ---- Phase 1: PR Code Review ----
             # Check for cancellation
@@ -226,25 +227,14 @@ class PRReviewStage(PipelineStage):
                     execution_type="pr_review_phase1"
                 )
 
-                # Parse findings
+                # Collect text for Phase 4 consolidation (don't create issues yet)
                 pr_review_text = pr_review_result.get('markdown_analysis', '')
-                review_issues = self._parse_review_findings(pr_review_text, "PR Code Review")
+                phase_outputs.append(("PR Code Review", pr_review_text))
                 review_summary_parts.append(f"### PR Code Review\n\n{pr_review_text}")
                 phases_completed += 1
 
                 phase1_duration = (utc_now() - phase1_start).total_seconds()
-                logger.info(f"Phase 1 completed in {phase1_duration:.1f}s")
-
-                if review_issues:
-                    review_found_issues = True
-                    created = await self._create_review_issues(
-                        review_issues, repo, github_config, parent_issue_number, project_name,
-                        obs, pipeline_run_id, pr_url
-                    )
-                    all_created_issues.extend(created)
-                    logger.info(f"Phase 1: Created {len(created)} issues from PR review")
-                else:
-                    logger.info("Phase 1: No issues found in PR review")
+                logger.info(f"Phase 1 completed in {phase1_duration:.1f}s, collected for consolidation")
 
                 # Emit phase completed event
                 if obs:
@@ -252,7 +242,7 @@ class PRReviewStage(PipelineStage):
                         "phase": 1,
                         "phase_name": "PR Code Review",
                         "success": True,
-                        "issues_found": len(review_issues),
+                        "text_collected": bool(pr_review_text),
                         "duration_seconds": phase1_duration,
                     }, pipeline_run_id)
 
@@ -341,25 +331,14 @@ class PRReviewStage(PipelineStage):
                         execution_type="pr_review_phase2"
                     )
 
-                    # Parse findings
+                    # Collect text for Phase 4 consolidation (don't create issues yet)
                     verification_text = verification_result.get('markdown_analysis', '')
-                    gap_issues = self._parse_review_findings(verification_text, check_name)
+                    phase_outputs.append((check_name, verification_text))
                     review_summary_parts.append(f"### {check_name} Verification\n\n{verification_text}")
                     phases_completed += 1
 
                     phase2_duration = (utc_now() - phase2_start).total_seconds()
-                    logger.info(f"Phase 2.{phase2_index} completed in {phase2_duration:.1f}s")
-
-                    if gap_issues:
-                        review_found_issues = True
-                        created = await self._create_review_issues(
-                            gap_issues, repo, github_config, parent_issue_number, project_name,
-                            obs, pipeline_run_id, pr_url
-                        )
-                        all_created_issues.extend(created)
-                        logger.info(f"Created {len(created)} issues from {check_name} verification")
-                    else:
-                        logger.info(f"No gaps found in {check_name} verification")
+                    logger.info(f"Phase 2.{phase2_index} completed in {phase2_duration:.1f}s, collected for consolidation")
 
                     # Emit phase completed event
                     if obs:
@@ -368,7 +347,7 @@ class PRReviewStage(PipelineStage):
                             "sub_phase": phase2_index,
                             "phase_name": f"Context Verification: {check_name}",
                             "success": True,
-                            "issues_found": len(gap_issues),
+                            "text_collected": bool(verification_text),
                             "duration_seconds": phase2_duration,
                         }, pipeline_run_id)
 
@@ -463,6 +442,78 @@ class PRReviewStage(PipelineStage):
                         "error": str(e),
                         "duration_seconds": phase3_duration,
                     }, pipeline_run_id)
+
+            # ---- Phase 4: Consolidation ----
+            if phase_outputs:
+                # Check for cancellation
+                if issue_number and get_cancellation_signal().is_cancelled(project_name, issue_number):
+                    logger.warning(f"PR review cancelled for {project_name}/#{issue_number}")
+                    context['markdown_analysis'] = "## PR Review Cancelled\n\nPipeline run ended externally."
+                    return context
+
+                # Check circuit breaker
+                if self._agent_call_count >= self.max_agent_calls:
+                    logger.error(f"Circuit breaker triggered: {self._agent_call_count} >= {self.max_agent_calls}")
+                    context['markdown_analysis'] = "## PR Review Failed\n\nCircuit breaker triggered (max agent calls reached)."
+                    return context
+
+                logger.info(f"Phase 4: Consolidating findings from {len(phase_outputs)} phase(s)")
+                phase4_start = utc_now()
+                phases_attempted += 1
+
+                if obs:
+                    obs.emit(EventType.PR_REVIEW_PHASE_STARTED, "pr_review_stage", task_id, project_name, {
+                        "phase": 4,
+                        "phase_name": "Consolidation",
+                        "agent": self.pr_review_agent,
+                    }, pipeline_run_id)
+
+                try:
+                    consolidated_text = await self._run_consolidation_phase(
+                        phase_outputs, pr_url, task_context, obs, pipeline_run_id, task_id, project_name
+                    )
+                    phases_completed += 1
+
+                    phase4_duration = (utc_now() - phase4_start).total_seconds()
+                    logger.info(f"Phase 4 completed in {phase4_duration:.1f}s")
+
+                    consolidated_issues = []
+                    if consolidated_text:
+                        consolidated_issues = self._parse_consolidated_findings(consolidated_text)
+                        if consolidated_issues:
+                            review_found_issues = True
+                            created = await self._create_review_issues(
+                                consolidated_issues, repo, github_config, parent_issue_number,
+                                project_name, obs, pipeline_run_id, pr_url
+                            )
+                            all_created_issues.extend(created)
+                            logger.info(f"Phase 4: Created {len(created)} consolidated issues")
+                        else:
+                            logger.info("Phase 4: No actionable findings after consolidation")
+                        review_summary_parts.append(f"### Consolidated Findings\n\n{consolidated_text}")
+
+                    if obs:
+                        obs.emit(EventType.PR_REVIEW_PHASE_COMPLETED, "pr_review_stage", task_id, project_name, {
+                            "phase": 4,
+                            "phase_name": "Consolidation",
+                            "success": True,
+                            "issues_found": len(consolidated_issues),
+                            "duration_seconds": phase4_duration,
+                        }, pipeline_run_id)
+
+                except Exception as e:
+                    logger.error(f"Phase 4 consolidation failed: {e}", exc_info=True)
+                    review_summary_parts.append(f"### Consolidation\n\nFailed: {e}")
+
+                    if obs:
+                        phase4_duration = (utc_now() - phase4_start).total_seconds()
+                        obs.emit(EventType.PR_REVIEW_PHASE_FAILED, "pr_review_stage", task_id, project_name, {
+                            "phase": 4,
+                            "phase_name": "Consolidation",
+                            "success": False,
+                            "error": str(e),
+                            "duration_seconds": phase4_duration,
+                        }, pipeline_run_id)
 
             # ---- Post-review decision ----
             created_issue_numbers = [int(i['number']) for i in all_created_issues]
@@ -1431,6 +1482,146 @@ If all requirements are met, write "All requirements verified - no gaps found" a
             f"No further automated reviews will be triggered after these are resolved. "
             f"Manually move the parent issue to 'In Review' to reset the cycle count."
         )
+
+    async def _run_consolidation_phase(
+        self,
+        phase_outputs: List[Tuple[str, str]],
+        pr_url: str,
+        task_context: Dict[str, Any],
+        obs: Optional[Any],
+        pipeline_run_id: Optional[str],
+        task_id: str,
+        project_name: str,
+    ) -> str:
+        """Run Phase 4 consolidation — feed all phase texts into a single agent call."""
+        self._agent_call_count += 1
+        prompt = self._build_consolidation_prompt(phase_outputs)
+        agent_executor = get_agent_executor()
+        result = await agent_executor.execute_agent(
+            agent_name=self.pr_review_agent,
+            project_name=project_name,
+            task_context={
+                **task_context,
+                'pr_url': pr_url,
+                'phase': 'consolidation',
+                'direct_prompt': prompt,
+                'skip_workspace_prep': True,
+            },
+            execution_type="pr_review_phase4"
+        )
+        return result.get('markdown_analysis', '')
+
+    def _build_consolidation_prompt(self, phase_outputs: List[Tuple[str, str]]) -> str:
+        """Build the consolidation prompt requesting JSON output."""
+        phase_blocks = ""
+        for source_name, markdown_text in phase_outputs:
+            phase_blocks += f"### Source: {source_name}\n\n{markdown_text}\n\n---\n\n"
+
+        return f"""You are a PR Review Consolidator. Your job is to review findings from multiple
+review phases and produce a single, consolidated list of actionable issues grouped by
+affected component or area — not by severity or source phase.
+
+## Filtering Criteria
+
+Only include a finding if ALL of the following are true:
+1. It references a specific file and line number (e.g., `src/auth/login.py:42`) OR describes a
+   concretely missing implementation (not a research suggestion or aspirational idea).
+2. It represents a real gap or bug in the committed code — not a style preference, future
+   enhancement, or speculative improvement.
+3. It is explicitly required by the requirements/specifications (for gaps found in Phase 2
+   verification) — not a nice-to-have or research suggestion from an idea researcher.
+
+Deduplicate ruthlessly: if the same underlying problem appears in multiple phases, merge them
+into a single finding. Keep the most descriptive version.
+
+## Phase Findings
+
+{phase_blocks}
+## Required Output
+
+Output a single JSON object. Do NOT wrap it in a code fence or add any other text before or after.
+
+The JSON must have this exact structure:
+{{
+  "groups": [
+    {{
+      "name": "Functional Area Name",
+      "severity": "critical|high|medium|low",
+      "findings": "- **Finding Title**: Description with file:line ref\\n- **Finding 2**: ..."
+    }}
+  ],
+  "filtered_out": [
+    "One-line note about what was removed and why"
+  ]
+}}
+
+Rules:
+- "name": Component or area (e.g. "Authentication Module", "API Layer", "Test Coverage",
+  "Error Handling") — NOT a severity level or source phase name.
+- "severity": The highest severity present among findings in this group
+  (critical > high > medium > low).
+- "findings": Markdown bullet list; each item formatted as `- **Title**: description`.
+  Include file:line references where available.
+- "filtered_out": Brief list of removed or merged findings with a one-line explanation each.
+- If nothing survives filtering, return "groups": [] and explain everything in "filtered_out".
+"""
+
+    def _parse_consolidated_findings(self, text: str) -> List[Dict[str, Any]]:
+        """Parse JSON-encoded consolidation output into issue specs (one per functional group)."""
+        json_text = text.strip()
+
+        # Strip code fences defensively — agent may wrap despite instructions
+        if json_text.startswith('```'):
+            json_text = re.sub(r'^```[a-z]*\s*\n?', '', json_text)
+            json_text = re.sub(r'\n?```\s*$', '', json_text).strip()
+
+        data = None
+        try:
+            data = json.loads(json_text)
+        except json.JSONDecodeError:
+            # Fallback: extract the outermost JSON object from surrounding prose
+            match = re.search(r'\{[\s\S]*\}', json_text)
+            if match:
+                try:
+                    data = json.loads(match.group(0))
+                except json.JSONDecodeError:
+                    pass
+
+        if data is None:
+            logger.warning("Could not parse consolidation output as JSON; creating no issues")
+            return []
+
+        groups = data.get('groups', [])
+        if not groups:
+            logger.info("Consolidation returned no groups — clean pass")
+            return []
+
+        valid_severities = {'critical', 'high', 'medium', 'low'}
+        issues = []
+        for group in groups:
+            name = (group.get('name') or '').strip()
+            severity = (group.get('severity') or 'medium').lower()
+            findings_markdown = (group.get('findings') or '').strip()
+
+            if not name or not findings_markdown:
+                logger.warning(f"Skipping incomplete consolidation group: {group!r}")
+                continue
+            if severity not in valid_severities:
+                severity = 'medium'
+            if not self._is_actionable_section(findings_markdown, name, "Consolidation"):
+                continue
+
+            issues.append({
+                'title': f'[PR Feedback] {name}',
+                'body': (
+                    f'Based on consolidated PR review, address the following in **{name}**:\n\n'
+                    f'{findings_markdown}\n\n'
+                    f'---\n_Created by PR Review Stage - Consolidation Phase_'
+                ),
+                'severity': severity,
+            })
+
+        return issues
 
     def _post_comment_on_issue(self, repo: str, issue_number: int, comment: str):
         """Post a comment on a GitHub issue."""

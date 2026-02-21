@@ -8,6 +8,7 @@ Run tests inside Docker compose orchestrator container.
 """
 
 import pytest
+from unittest.mock import patch, MagicMock, AsyncMock
 
 # Skip all tests in this module if not in Docker environment
 # PRReviewStage imports trigger dev_container_state which creates /app/state/dev_containers
@@ -114,25 +115,26 @@ async def test_phase2_launches_requirements_verifier(pr_review_stage):
 
 @pytest.mark.asyncio
 async def test_manual_progression_flag_set_when_issues_found(pr_review_stage):
-    """Verify manual_progression_made flag is set when returning to development"""
+    """Verify manual_progression_made flag is set when Phase 4 consolidation finds issues"""
     with patch('pipeline.pr_review_stage.get_agent_executor') as mock_get_executor, \
          patch('pipeline.pr_review_stage.pr_review_state_manager') as mock_state, \
          patch.object(pr_review_stage, '_find_pr_url', return_value='https://github.com/o/r/pull/1'), \
          patch.object(pr_review_stage, '_load_discussion_outputs', return_value={}), \
          patch.object(pr_review_stage, '_get_parent_issue_body', return_value=''), \
          patch.object(pr_review_stage, '_check_ci_status', return_value=([], [])), \
-         patch.object(pr_review_stage, '_parse_review_findings', return_value=[
-             {'title': 'Issue 1', 'body': 'Body', 'severity': 'high'}
+         patch.object(pr_review_stage, '_parse_consolidated_findings', return_value=[
+             {'title': '[PR Feedback] Authentication Module', 'body': 'Body', 'severity': 'high'}
          ]), \
          patch.object(pr_review_stage, '_create_review_issues', return_value=[
-             {'number': '99', 'url': 'url', 'title': 'Issue 1', 'severity': 'high'}
+             {'number': '99', 'url': 'url', 'title': '[PR Feedback] Authentication Module',
+              'severity': 'high', 'body': 'Body'}
          ]), \
          patch.object(pr_review_stage, '_move_issues_to_development'), \
          patch.object(pr_review_stage, '_return_parent_to_development'):
 
         mock_executor = AsyncMock()
         mock_executor.execute_agent = AsyncMock(return_value={
-            'markdown_analysis': '### Critical Issues\n- **Bug**: Found a bug'
+            'markdown_analysis': '{"groups": [], "filtered_out": []}'
         })
         mock_get_executor.return_value = mock_executor
         mock_state.get_review_count.return_value = 0
@@ -146,7 +148,7 @@ async def test_manual_progression_flag_set_when_issues_found(pr_review_stage):
 
         result = await pr_review_stage.execute(context)
 
-        # Verify flag is set
+        # Verify flag is set via the issues-found path
         assert result.get('manual_progression_made') is True
 
 
@@ -245,29 +247,37 @@ async def test_phase3_runs_locally_no_docker(pr_review_stage):
 
 
 @pytest.mark.asyncio
-async def test_cycle_limit_prevents_progression(pr_review_stage):
-    """Verify review at cycle limit doesn't move parent to development"""
+async def test_cycle_limit_posts_comment_and_returns_to_development(pr_review_stage):
+    """At the final review cycle, issues are returned to dev and a cycle limit comment is posted.
+
+    The NonRetryableAgentError guard fires on the *next* attempt (review_count >= MAX).
+    On the final allowed cycle (current_cycle == MAX_REVIEW_CYCLES), issues found by Phase 4
+    still cause the parent to return to development — but a cycle limit comment is also posted
+    to signal that no further automated reviews will run.
+    """
     with patch('pipeline.pr_review_stage.get_agent_executor') as mock_get_executor, \
          patch('pipeline.pr_review_stage.pr_review_state_manager') as mock_state, \
          patch.object(pr_review_stage, '_find_pr_url', return_value='https://github.com/o/r/pull/1'), \
          patch.object(pr_review_stage, '_load_discussion_outputs', return_value={}), \
          patch.object(pr_review_stage, '_get_parent_issue_body', return_value=''), \
          patch.object(pr_review_stage, '_check_ci_status', return_value=([], [])), \
-         patch.object(pr_review_stage, '_parse_review_findings', return_value=[
-             {'title': 'Issue 1', 'body': 'Body', 'severity': 'high'}
+         patch.object(pr_review_stage, '_parse_consolidated_findings', return_value=[
+             {'title': '[PR Feedback] Auth Layer', 'body': 'Body', 'severity': 'high'}
          ]), \
          patch.object(pr_review_stage, '_create_review_issues', return_value=[
-             {'number': '99', 'url': 'url', 'title': 'Issue 1', 'severity': 'high'}
+             {'number': '99', 'url': 'url', 'title': '[PR Feedback] Auth Layer',
+              'severity': 'high', 'body': 'Body'}
          ]), \
+         patch.object(pr_review_stage, '_move_issues_to_development'), \
          patch.object(pr_review_stage, '_return_parent_to_development') as mock_return, \
-         patch.object(pr_review_stage, '_post_comment_on_issue'):
+         patch.object(pr_review_stage, '_post_comment_on_issue') as mock_post_comment:
 
         mock_executor = AsyncMock()
         mock_executor.execute_agent = AsyncMock(return_value={
-            'markdown_analysis': '### Critical Issues\n- **Bug**: Found a bug'
+            'markdown_analysis': '{"groups": [], "filtered_out": []}'
         })
         mock_get_executor.return_value = mock_executor
-        # Cycle 3 (limit reached)
+        # Final allowed cycle: review_count=2 → current_cycle=3=MAX_REVIEW_CYCLES
         mock_state.get_review_count.return_value = 2
 
         context = {
@@ -279,11 +289,12 @@ async def test_cycle_limit_prevents_progression(pr_review_stage):
 
         result = await pr_review_stage.execute(context)
 
-        # Verify parent NOT moved to development
-        mock_return.assert_not_called()
+        # Issues found → parent IS returned to development
+        mock_return.assert_called_once()
+        assert result.get('manual_progression_made') is True
 
-        # Verify flag is NOT set (cycle limit reached)
-        assert 'manual_progression_made' not in result
+        # Cycle limit comment IS posted to signal no further automated reviews
+        mock_post_comment.assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -314,9 +325,14 @@ async def test_skips_workspace_prep_false(pr_review_stage):
 
         await pr_review_stage.execute(context)
 
-        # Verify all agent calls have skip_workspace_prep=False
+        # Phase 1/2 agents need project code mounted; Phase 4 consolidation is text-analysis-only
         for call in mock_executor.execute_agent.call_args_list:
-            assert call[1]['task_context']['skip_workspace_prep'] is False
+            exec_type = call[1]['execution_type']
+            skip_prep = call[1]['task_context']['skip_workspace_prep']
+            if exec_type in ('pr_review_phase1', 'pr_review_phase2'):
+                assert skip_prep is False, f"{exec_type} must have skip_workspace_prep=False"
+            elif exec_type == 'pr_review_phase4':
+                assert skip_prep is True, "pr_review_phase4 must have skip_workspace_prep=True"
 
 
 @pytest.mark.asyncio
