@@ -295,7 +295,12 @@ class LogCollector:
 
                         # Enrich Claude log
                         enriched = enrich_claude_log(log_data)
-                        enriched["_id"] = log_id
+                        # Use the Anthropic message ID as the ES doc ID for assistant events
+                        # so that Claude Code streaming re-emissions (same message.id, growing
+                        # content array) overwrite the same document rather than creating
+                        # duplicates. Fall back to the Redis stream ID for all other event types.
+                        anthropic_msg_id = log_data.get("event", {}).get("message", {}).get("id")
+                        enriched["_id"] = anthropic_msg_id if anthropic_msg_id else log_id
 
                         # Add to batch
                         self.batch.append(enriched)

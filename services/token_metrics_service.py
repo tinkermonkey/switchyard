@@ -543,8 +543,9 @@ class TokenMetricsService:
 
             # Pre-pass: record the last index of each unique Anthropic message ID.
             # Claude Code re-emits the same message (same usage, same ID) each time a
-            # new content block is appended during streaming. We must skip earlier
-            # emissions to avoid 2–4× overcounting of tokens and tool invocations.
+            # new content block is appended during streaming. The log_collector now uses
+            # message.id as the ES doc ID (so new data has at most one doc per message),
+            # but this dedup also correctly handles historical data ingested before that fix.
             _last_idx_for_msg: Dict[str, int] = {}
             for _i, _doc in enumerate(docs):
                 _raw = _doc.get('raw_event')
