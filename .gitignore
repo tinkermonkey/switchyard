@@ -12,15 +12,9 @@ orchestrator_data/
 *.checkpoint
 *.log
 
-# Old state directories (deprecated - now using orchestrator_data/)
+# local state tracking (these are ephemeral and user-specific)
 state/
-.claude/state/
-.claude/checkpoints/
-.claude/logs/
-
-# Project mounts (never commit actual project code here)
-projects/
-mounted_projects/
+config/projects/
 
 # Python
 __pycache__/
