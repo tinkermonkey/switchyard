@@ -4,9 +4,6 @@ import { RefreshCw, CheckCircle2, Circle, PlayCircle, ChevronDown, ChevronUp, Ch
 import Header from '../components/Header'
 import NavigationTabs from '../components/NavigationTabs'
 import LiveLogs from '../components/LiveLogs'
-import HeaderActiveAgents from '../components/HeaderActiveAgents'
-import HeaderSystemHealth from '../components/HeaderSystemHealth'
-import HeaderCircuitBreakers from '../components/HeaderCircuitBreakers'
 import { useSocket } from '../contexts/SocketContext'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
@@ -505,13 +502,19 @@ function AgentExecutionView() {
           }
         }
 
+        const getEffectiveToolName = (item) => {
+          if (item.name === 'Skill' && item.input?.skill) return item.input.skill
+          if (item.name === 'Task' && item.input?.subagent_type) return item.input.subagent_type
+          return item.name
+        }
         const currentTurnTools = []
         const contents = Array.isArray(evt.message.content) ? evt.message.content : []
         for (const item of contents) {
           if (item.type === 'tool_use' && item.name) {
-            toolCallCounts[item.name] = (toolCallCounts[item.name] || 0) + 1
-            if (item.id) toolIdToName[item.id] = item.name
-            currentTurnTools.push(item.name)
+            const effectiveName = getEffectiveToolName(item)
+            toolCallCounts[effectiveName] = (toolCallCounts[effectiveName] || 0) + 1
+            if (item.id) toolIdToName[item.id] = effectiveName
+            currentTurnTools.push(effectiveName)
           }
         }
 
@@ -635,6 +638,7 @@ function AgentExecutionView() {
   const { lastTodoWrite, lastTextMessage, lastToolCall, previousToolCall, previousToolResult, inputPrompt } = agentState
   const todoStats = getTodoStats(lastTodoWrite?.todos)
   const isExecuting = executionData?.status === 'running'
+  const pipelineTab = pipelineExecutions.some(e => e.status === 'running') ? 'active' : 'completed'
   
   if (loading) {
     return (
@@ -662,14 +666,17 @@ function AgentExecutionView() {
   return (
     <div className="min-h-screen p-5 bg-gh-canvas text-gh-fg">
 
+      <Header />
+
       {/* Agent Execution Navigation Header */}
       {pipelineExecutions.length > 0 && currentExecutionIndex >= 0 && (
-        <div className="mb-3 p-3 bg-gh-canvas-subtle rounded-md border border-gh-border">
+        <div className="mt-3 mb-3 p-3 bg-gh-canvas-subtle rounded-md border border-gh-border">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-3">
               {/* Back to Pipeline Run Debug link */}
               <Link
                 to="/pipeline-run-debug"
+                search={{ runId: pipelineRunId, tab: pipelineTab }}
                 className="flex items-center gap-1.5 px-3 py-2 bg-gh-canvas border border-gh-border rounded hover:bg-gh-border-muted transition-colors text-sm"
                 title="Back to Pipeline Run Debug"
               >
@@ -729,13 +736,6 @@ function AgentExecutionView() {
                 />
                 <span className="text-sm">Auto-advance</span>
               </label>
-            </div>
-
-            {/* Header Cards */}
-            <div className="flex gap-4">
-              <HeaderActiveAgents />
-              <HeaderSystemHealth />
-              <HeaderCircuitBreakers />
             </div>
           </div>
         </div>

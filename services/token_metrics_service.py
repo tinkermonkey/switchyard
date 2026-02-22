@@ -48,6 +48,19 @@ def _index_name(prefix: str, dt: datetime) -> str:
     return f"{prefix}-{dt.strftime('%Y.%m')}"
 
 
+def _get_effective_tool_name(c: dict) -> str | None:
+    """Resolve Skill and Task tool names to their actual skill/subagent names."""
+    name = c.get('name')
+    if not name:
+        return name
+    inp = c.get('input') or {}
+    if name == 'Skill' and inp.get('skill'):
+        return inp['skill']
+    if name == 'Task' and inp.get('subagent_type'):
+        return inp['subagent_type']
+    return name
+
+
 def _empty_tool_entry() -> Dict[str, Any]:
     return {
         'invocation_count': 0,
@@ -701,7 +714,7 @@ class TokenMetricsService:
                 current_tool_uses: List[str] = []
                 for c in contents:
                     if c.get('type') == 'tool_use':
-                        name = c.get('name')
+                        name = _get_effective_tool_name(c)
                         if name:
                             current_tool_uses.append(name)
 
@@ -1016,7 +1029,7 @@ class TokenMetricsService:
                     contents = []
                 for c in contents:
                     if c.get('type') == 'tool_use':
-                        name = c.get('name')
+                        name = _get_effective_tool_name(c)
                         if name:
                             per_task_tool_invocations[name] = per_task_tool_invocations.get(name, 0) + 1
 

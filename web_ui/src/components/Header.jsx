@@ -253,7 +253,9 @@ export default function Header() {
           {/* Left side: Title and badges */}
           <div className="flex-shrink-0">
             <h1 className="text-gh-accent-primary text-2xl font-semibold mb-3">
-              Agent Observability Dashboard
+              <div>Agent</div>
+              <div>Observability</div>
+              <div>Dashboard</div>
             </h1>
             <div className="flex gap-2 flex-wrap">
               <span className={`inline-block px-3 py-1 rounded-full text-xs font-semibold ${connected

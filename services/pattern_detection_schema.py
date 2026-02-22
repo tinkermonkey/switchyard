@@ -437,8 +437,15 @@ def enrich_claude_log(log_data: dict) -> dict:
                 if item.get("type") == "tool_use":
                     enriched["event_category"] = "tool_call"
                     enriched["event_type"] = "tool_call"
-                    enriched["tool_name"] = item.get("name")
-                    enriched["tool_params"] = item.get("input", {})
+                    raw_name = item.get("name", "")
+                    inp = item.get("input") or {}
+                    if raw_name == "Skill" and inp.get("skill"):
+                        enriched["tool_name"] = inp["skill"]
+                    elif raw_name == "Task" and inp.get("subagent_type"):
+                        enriched["tool_name"] = inp["subagent_type"]
+                    else:
+                        enriched["tool_name"] = raw_name
+                    enriched["tool_params"] = inp
                     break
                 elif item.get("type") == "text":
                     enriched["event_type"] = "text_output"
