@@ -206,9 +206,19 @@ class RepairCycleRunner:
             # Check for checkpoint
             checkpoint = self.load_checkpoint()
             if checkpoint:
-                # Restore state from checkpoint
-                self.stage._agent_call_count = checkpoint.get('agent_call_count', 0)
-                logger.info(f"Restored agent call count: {self.stage._agent_call_count}")
+                current_run_id = self.context.get('pipeline_run_id')
+                checkpoint_run_id = checkpoint.get('pipeline_run_id')
+                if current_run_id and checkpoint_run_id and current_run_id == checkpoint_run_id:
+                    # Same pipeline run — restore agent_call_count for restart resilience
+                    self.stage._agent_call_count = checkpoint.get('agent_call_count', 0)
+                    logger.info(f"Restored agent call count: {self.stage._agent_call_count}")
+                else:
+                    # Stale checkpoint from a different pipeline run — clear it and start fresh
+                    logger.info(
+                        f"Stale checkpoint found (run {checkpoint_run_id} vs current {current_run_id}), "
+                        f"clearing and starting fresh (had agent_call_count={checkpoint.get('agent_call_count')})"
+                    )
+                    self.checkpoint_manager.clear_checkpoint()
 
             # Execute stage
             logger.info("Starting repair cycle execution...")
