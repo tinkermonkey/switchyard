@@ -454,8 +454,11 @@ function AgentExecutionView() {
     let lastDirectInput = 0
     const modelsUsed = new Set()
     const toolCallCounts = {}
-    const toolIdToName = {}       // tool_use id → tool name, for matching results
-    const toolResultChars = {}    // tool name → total result chars across all calls
+    const toolIdToName = {}            // tool_use id → tool name, for matching results
+    const toolResultChars = {}         // tool name → total result chars across all calls
+    const toolContextGrowthTokens = {} // tool name → context growth tokens (delta effective_input, prev turn)
+    let prevEffectiveInput = null      // effective_input from previous assistant turn
+    let prevTurnTools = []             // tool names called in the previous assistant turn
     const tokenToolsAvailable = []
     const mcpServersAvailable = []
 
@@ -491,13 +494,29 @@ function AgentExecutionView() {
         lastCacheCreation = cacheCreation
         lastDirectInput = inputDirect
 
+        // Attribute context growth from this turn's input delta to the previous turn's tools.
+        // Delta = full context size now minus full context size then, which captures the
+        // tool results + assistant output that were appended between turns.
+        if (prevEffectiveInput !== null && prevTurnTools.length > 0) {
+          const delta = Math.max(0, effectiveInput - prevEffectiveInput)
+          const perTool = delta / prevTurnTools.length
+          for (const toolName of prevTurnTools) {
+            toolContextGrowthTokens[toolName] = (toolContextGrowthTokens[toolName] || 0) + perTool
+          }
+        }
+
+        const currentTurnTools = []
         const contents = Array.isArray(evt.message.content) ? evt.message.content : []
         for (const item of contents) {
           if (item.type === 'tool_use' && item.name) {
             toolCallCounts[item.name] = (toolCallCounts[item.name] || 0) + 1
             if (item.id) toolIdToName[item.id] = item.name
+            currentTurnTools.push(item.name)
           }
         }
+
+        prevEffectiveInput = effectiveInput
+        prevTurnTools = currentTurnTools
       }
 
       if (evt.type === 'user' && Array.isArray(evt.message?.content)) {
@@ -514,10 +533,14 @@ function AgentExecutionView() {
 
     const promptLength = inputPrompt?.text?.length || 0
 
+    const peakContext = cumulativeLastInput
+    const contextGrowth = cumulativeLastInput - (firstInput || 0)
+
     const tokenUsage = {
       hasData: firstInput !== null,
       initialInput: firstInput || 0,
-      totalInput: cumulativeLastInput,
+      peakContext,
+      contextGrowth,
       totalOutput: cumulativeLastOutput,
       totalCacheRead: lastCacheRead,
       totalCacheCreation: lastCacheCreation,
@@ -528,8 +551,13 @@ function AgentExecutionView() {
       toolsAvailable: tokenToolsAvailable,
       mcpServersAvailable,
       toolsSummary: Object.entries(toolCallCounts)
-        .map(([name, calls]) => ({ name, calls, resultChars: toolResultChars[name] || 0 }))
-        .sort((a, b) => (b.resultChars - a.resultChars) || (b.calls - a.calls))
+        .map(([name, calls]) => ({
+          name,
+          calls,
+          resultChars: toolResultChars[name] || 0,
+          contextGrowthTokens: Math.round(toolContextGrowthTokens[name] || 0)
+        }))
+        .sort((a, b) => (b.contextGrowthTokens - a.contextGrowthTokens) || (b.resultChars - a.resultChars) || (b.calls - a.calls))
     }
 
     return {
@@ -748,29 +776,39 @@ function AgentExecutionView() {
               <div>
                 <h4 className="text-xs font-semibold text-gh-fg-muted uppercase mb-2">Token Counts</h4>
                 <table className="w-full text-sm">
+                  <thead>
+                    <tr>
+                      <th className="text-left text-gh-fg-muted font-normal text-xs pb-1"></th>
+                      <th className="text-right text-gh-fg-muted font-normal text-xs pb-1">tokens</th>
+                    </tr>
+                  </thead>
                   <tbody>
                     <tr>
                       <td className="text-gh-fg-muted py-0.5">Initial prompt</td>
                       <td className="text-right font-mono">{formatTokenCount(tokenUsage.initialInput)}</td>
                     </tr>
                     <tr>
-                      <td className="text-gh-fg-muted py-0.5">Direct input</td>
-                      <td className="text-right font-mono">{formatTokenCount(tokenUsage.totalDirectInput)}</td>
-                    </tr>
-                    <tr>
-                      <td className="text-gh-fg-muted py-0.5">Cache reads</td>
-                      <td className="text-right font-mono">{formatTokenCount(tokenUsage.totalCacheRead)}</td>
-                    </tr>
-                    <tr>
-                      <td className="text-gh-fg-muted py-0.5">Cache writes</td>
-                      <td className="text-right font-mono">{formatTokenCount(tokenUsage.totalCacheCreation)}</td>
+                      <td className="text-gh-fg-muted py-0.5">Context growth</td>
+                      <td className="text-right font-mono">{formatTokenCount(tokenUsage.contextGrowth)}</td>
                     </tr>
                     <tr className="border-t border-gh-border">
-                      <td className="text-gh-fg-muted py-0.5">Total input</td>
-                      <td className="text-right font-mono">{formatTokenCount(tokenUsage.totalInput)}</td>
+                      <td className="text-gh-fg-muted py-0.5">Peak context</td>
+                      <td className="text-right font-mono">{formatTokenCount(tokenUsage.peakContext)}</td>
                     </tr>
                     <tr>
-                      <td className="text-gh-fg-muted py-0.5">Total output</td>
+                      <td className="text-gh-fg-muted py-0.5 pl-3 text-xs">↳ direct input</td>
+                      <td className="text-right font-mono text-xs">{formatTokenCount(tokenUsage.totalDirectInput)}</td>
+                    </tr>
+                    <tr>
+                      <td className="text-gh-fg-muted py-0.5 pl-3 text-xs">↳ cache reads</td>
+                      <td className="text-right font-mono text-xs">{formatTokenCount(tokenUsage.totalCacheRead)}</td>
+                    </tr>
+                    <tr>
+                      <td className="text-gh-fg-muted py-0.5 pl-3 text-xs">↳ cache writes</td>
+                      <td className="text-right font-mono text-xs">{formatTokenCount(tokenUsage.totalCacheCreation)}</td>
+                    </tr>
+                    <tr className="border-t border-gh-border">
+                      <td className="text-gh-fg-muted py-0.5">Output</td>
                       <td className="text-right font-mono">{formatTokenCount(tokenUsage.totalOutput)}</td>
                     </tr>
                     <tr className="border-t border-gh-border">
@@ -780,7 +818,7 @@ function AgentExecutionView() {
                     {tokenUsage.promptLength > 0 && (
                       <tr className="border-t border-gh-border">
                         <td className="text-gh-fg-muted py-0.5 pt-1.5">Prompt size</td>
-                        <td className="text-right font-mono pt-1.5">{formatTokenCount(tokenUsage.promptLength)} <span className="text-gh-fg-muted text-xs">chars</span></td>
+                        <td className="text-right font-mono pt-1.5 text-gh-fg-muted">{formatTokenCount(tokenUsage.promptLength)} chars</td>
                       </tr>
                     )}
                   </tbody>
@@ -831,14 +869,16 @@ function AgentExecutionView() {
                         <th className="text-left text-gh-fg-muted font-normal text-xs pb-1">Tool</th>
                         <th className="text-right text-gh-fg-muted font-normal text-xs pb-1">Calls</th>
                         <th className="text-right text-gh-fg-muted font-normal text-xs pb-1">Result (chars)</th>
+                        <th className="text-right text-gh-fg-muted font-normal text-xs pb-1">Ctx growth (tok)</th>
                       </tr>
                     </thead>
                     <tbody>
-                      {tokenUsage.toolsSummary.map(({ name, calls, resultChars }) => (
+                      {tokenUsage.toolsSummary.map(({ name, calls, resultChars, contextGrowthTokens }) => (
                         <tr key={name}>
                           <td className="text-gh-fg font-mono py-0.5 text-xs">{name}</td>
                           <td className="text-right text-gh-fg py-0.5">{calls}</td>
                           <td className="text-right text-gh-fg py-0.5">{resultChars > 0 ? formatTokenCount(resultChars) : '—'}</td>
+                          <td className="text-right text-gh-fg py-0.5">{contextGrowthTokens > 0 ? formatTokenCount(contextGrowthTokens) : '—'}</td>
                         </tr>
                       ))}
                     </tbody>
