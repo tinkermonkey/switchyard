@@ -531,7 +531,7 @@ class TestClaudeCodeEventStructure:
         assert data['duration_ms'] > 0
         assert data['input_tokens'] > 0
         assert data['output_tokens'] > 0
-        assert data['total_tokens'] == data['input_tokens'] + data['output_tokens']
+        assert data['total_tokens'] == data['input_tokens'] + data['output_tokens'] + data.get('cache_read_tokens', 0) + data.get('cache_creation_tokens', 0)
 
 
 class TestClaudeCodeStreamEvents:

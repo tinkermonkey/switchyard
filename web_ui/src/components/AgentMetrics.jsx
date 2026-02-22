@@ -1,5 +1,6 @@
 import { Fragment, useState, useEffect, useCallback } from 'react'
 import { RefreshCw, BarChart2, ChevronDown, ChevronRight } from 'lucide-react'
+import TrendChart from './TrendChart'
 
 const DAYS_OPTIONS = [1, 3, 7]
 
@@ -38,6 +39,7 @@ const StatCell = ({ value, sub }) => (
 
 export default function AgentMetrics({ days, onDaysChange }) {
   const [metrics, setMetrics] = useState([])
+  const [hourlySeries, setHourlySeries] = useState({})
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
   const [sortField, setSortField] = useState('avg_output')
@@ -52,6 +54,7 @@ export default function AgentMetrics({ days, onDaysChange }) {
       const data = await res.json()
       if (data.success) {
         setMetrics(data.metrics || [])
+        setHourlySeries(data.hourly_series || {})
       } else {
         setError(data.error || 'Failed to load agent metrics')
       }
@@ -163,6 +166,10 @@ export default function AgentMetrics({ days, onDaysChange }) {
             Check back after the job has run at least once.
           </p>
         </div>
+      )}
+
+      {Object.keys(hourlySeries).length > 0 && (
+        <TrendChart hourlySeries={hourlySeries} days={days} />
       )}
 
       {sorted.length > 0 && (
@@ -371,6 +378,7 @@ export default function AgentMetrics({ days, onDaysChange }) {
 
           <div>
             <p className="text-gh-fg font-semibold mb-1.5">Tool Breakdown (expanded row)</p>
+            <p className="text-gh-fg-muted text-xs mb-2">Note: token counts per tool are an equal-split approximation — when multiple tools are called in one turn, that turn&apos;s tokens are divided equally across them. The Claude API does not attribute tokens to individual tool calls.</p>
             <table className="w-full">
               <tbody className="divide-y divide-gh-border">
                 {[

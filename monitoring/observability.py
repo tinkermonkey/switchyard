@@ -570,17 +570,22 @@ class ObservabilityManager:
         return agent_execution_id
 
     def emit_prompt_constructed(self, agent: str, task_id: str, project: str,
-                               prompt: str, estimated_tokens: Optional[int] = None):
+                               prompt: str, estimated_tokens: Optional[int] = None,
+                               prompt_components: Optional[Dict[str, int]] = None):
         """Emit prompt constructed event"""
         # Truncate very long prompts for the event
         prompt_preview = prompt[:1000] + "..." if len(prompt) > 1000 else prompt
 
-        self.emit(EventType.PROMPT_CONSTRUCTED, agent, task_id, project, {
+        data: Dict[str, Any] = {
             'prompt': prompt,
             'prompt_preview': prompt_preview,
             'prompt_length': len(prompt),
             'estimated_tokens': estimated_tokens
-        })
+        }
+        if prompt_components:
+            data['prompt_components'] = prompt_components
+
+        self.emit(EventType.PROMPT_CONSTRUCTED, agent, task_id, project, data)
 
     def emit_claude_call_started(self, agent: str, task_id: str, project: str,
                                  model: str, input_tokens: Optional[int] = None):
@@ -593,23 +598,33 @@ class ObservabilityManager:
 
     def emit_claude_call_completed(self, agent: str, task_id: str, project: str,
                                    duration_ms: float, input_tokens: int,
-                                   output_tokens: int, success: bool = True):
+                                   output_tokens: int, cache_read_tokens: int = 0,
+                                   cache_creation_tokens: int = 0, success: bool = True):
         """Emit Claude API call completed event"""
         self.emit(EventType.CLAUDE_API_CALL_COMPLETED, agent, task_id, project, {
             'duration_ms': duration_ms,
             'input_tokens': input_tokens,
             'output_tokens': output_tokens,
-            'total_tokens': input_tokens + output_tokens,
+            'cache_read_tokens': cache_read_tokens,
+            'cache_creation_tokens': cache_creation_tokens,
+            'total_tokens': input_tokens + output_tokens + cache_read_tokens + cache_creation_tokens,
             'success': success
         })
 
     def emit_claude_call_failed(self, agent: str, task_id: str, project: str,
-                                duration_ms: float, error: str, exit_code: Optional[int] = None):
+                                duration_ms: float, error: str, exit_code: Optional[int] = None,
+                                input_tokens: int = 0, output_tokens: int = 0,
+                                cache_read_tokens: int = 0, cache_creation_tokens: int = 0):
         """Emit Claude API call failed event"""
         self.emit(EventType.CLAUDE_API_CALL_FAILED, agent, task_id, project, {
             'duration_ms': duration_ms,
             'error': error,
-            'exit_code': exit_code
+            'exit_code': exit_code,
+            'input_tokens': input_tokens,
+            'output_tokens': output_tokens,
+            'cache_read_tokens': cache_read_tokens,
+            'cache_creation_tokens': cache_creation_tokens,
+            'success': False
         })
 
     def emit_container_launch_started(self, agent: str, task_id: str, project: str,

@@ -29,9 +29,19 @@ async def run_claude_code(prompt: str, context: Dict[str, Any]) -> str:
         logger.error(f"Context keys: {list(context.keys())}")
         logger.error(f"Agent: {agent}, Task ID: {task_id}")
 
-    # Emit prompt constructed event
+    # Emit prompt constructed event with rough component size breakdown
     if obs:
-        obs.emit_prompt_constructed(agent, task_id, project, prompt)
+        task_context = context.get('context', {})
+        task_description = task_context.get('task_description', '') or task_context.get('requirements', '')
+        task_chars = len(str(task_description))
+        context_chars = len(str(task_context)) - task_chars
+        system_prompt_chars = max(0, len(prompt) - task_chars - max(0, context_chars))
+        obs.emit_prompt_constructed(agent, task_id, project, prompt,
+                                    prompt_components={
+                                        'system_prompt_chars': system_prompt_chars,
+                                        'context_chars': max(0, context_chars),
+                                        'task_chars': task_chars
+                                    })
 
     # Get MCP server configuration from context
     mcp_servers = context.get('mcp_servers', [])
@@ -239,6 +249,8 @@ Files: {context.get('files', [])}
             result_parts = []
             input_tokens = 0
             output_tokens = 0
+            cache_read_tokens = 0
+            cache_creation_tokens = 0
             session_id = None  # Track session ID for continuity
             stderr_lines = []  # Collect stderr for error reporting
             stdout_raw_lines = []  # Collect all stdout for debugging
@@ -300,6 +312,8 @@ Files: {context.get('files', [])}
                         if 'usage' in event:
                             input_tokens = event['usage'].get('input_tokens', input_tokens)
                             output_tokens = event['usage'].get('output_tokens', output_tokens)
+                            cache_read_tokens = event['usage'].get('cache_read_input_tokens', cache_read_tokens)
+                            cache_creation_tokens = event['usage'].get('cache_creation_input_tokens', cache_creation_tokens)
 
                         # Collect result text from assistant events only
                         # Note: stream_callback above gets ALL events (including 'result') for observability
@@ -333,7 +347,10 @@ Files: {context.get('files', [])}
                 # Emit completion event with accurate success flag
                 if obs:
                     obs.emit_claude_call_completed(agent, task_id, project, api_duration_ms,
-                                                   input_tokens, output_tokens, success=success)
+                                                   input_tokens, output_tokens,
+                                                   cache_read_tokens=cache_read_tokens,
+                                                   cache_creation_tokens=cache_creation_tokens,
+                                                   success=success)
 
                 if process.returncode == 0:
                     result_text = ''.join(result_parts)

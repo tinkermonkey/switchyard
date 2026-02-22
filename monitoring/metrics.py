@@ -221,7 +221,9 @@ class MetricsCollector:
         """Record task start (no-op, kept for compatibility)"""
         pass
         
-    def record_task_complete(self, agent: str, duration: float, success: bool):
+    def record_task_complete(self, agent: str, duration: float, success: bool,
+                             input_tokens: int = 0, output_tokens: int = 0,
+                             cache_read_tokens: int = 0, cache_creation_tokens: int = 0):
         """Record task completion to Elasticsearch and JSON log"""
         now = utc_now()
         timestamp_str = utc_isoformat()
@@ -229,9 +231,13 @@ class MetricsCollector:
             "timestamp": timestamp_str,
             "agent": agent,
             "duration": duration,
-            "success": success
+            "success": success,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "cache_read_tokens": cache_read_tokens,
+            "cache_creation_tokens": cache_creation_tokens
         }
-        
+
         # Write to Elasticsearch if enabled
         if self.es_enabled:
             try:
@@ -242,12 +248,16 @@ class MetricsCollector:
                         "@timestamp": timestamp_str,
                         "agent": agent,
                         "duration": duration,
-                        "success": success
+                        "success": success,
+                        "input_tokens": input_tokens,
+                        "output_tokens": output_tokens,
+                        "cache_read_tokens": cache_read_tokens,
+                        "cache_creation_tokens": cache_creation_tokens
                     }
                 )
             except Exception as e:
                 logger.error(f"Failed to write task metrics to Elasticsearch: {e}")
-        
+
         # Always write to JSON file as backup
         task_file = self.metrics_dir / f"task_metrics_{now.date()}.jsonl"
         with open(task_file, 'a') as f:

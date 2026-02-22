@@ -1058,6 +1058,8 @@ class DockerAgentRunner:
             stderr_parts = []
             input_tokens = 0
             output_tokens = 0
+            cache_read_tokens = 0
+            cache_creation_tokens = 0
             session_id = None
             tools_used_tracking = []  # Track tools used without mutating input context
 
@@ -1065,7 +1067,7 @@ class DockerAgentRunner:
             import threading
 
             def read_stream(stream, is_stderr):
-                nonlocal session_id, input_tokens, output_tokens, tools_used_tracking
+                nonlocal session_id, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, tools_used_tracking
                 for line in iter(stream.readline, ''):
                     if not line:
                         break
@@ -1111,7 +1113,9 @@ class DockerAgentRunner:
                         if 'usage' in event:
                             input_tokens = event['usage'].get('input_tokens', input_tokens)
                             output_tokens = event['usage'].get('output_tokens', output_tokens)
-                            logger.debug(f"Token usage: {input_tokens} input, {output_tokens} output")
+                            cache_read_tokens = event['usage'].get('cache_read_input_tokens', cache_read_tokens)
+                            cache_creation_tokens = event['usage'].get('cache_creation_input_tokens', cache_creation_tokens)
+                            logger.debug(f"Token usage: {input_tokens} input, {output_tokens} output, {cache_read_tokens} cache_read, {cache_creation_tokens} cache_creation")
 
                         # Log tool use for visibility in orchestrator logs
                         if event_type == 'tool_use':
@@ -1223,7 +1227,10 @@ class DockerAgentRunner:
                 obs.emit_container_execution_completed(agent, task_id, project, container_name, exit_code, api_duration_ms)
                 # Emit Claude call completed (success determined by exit_code)
                 obs.emit_claude_call_completed(agent, task_id, project, api_duration_ms,
-                                               input_tokens, output_tokens, success=(exit_code == 0))
+                                               input_tokens, output_tokens,
+                                               cache_read_tokens=cache_read_tokens,
+                                               cache_creation_tokens=cache_creation_tokens,
+                                               success=(exit_code == 0))
 
             if exit_code == 0:
                 result_text = ''.join(result_parts)
@@ -1445,7 +1452,10 @@ class DockerAgentRunner:
                 # Emit Claude call failed event
                 if obs:
                     api_duration_ms = (time.time() - api_start_time) * 1000
-                    obs.emit_claude_call_failed(agent, task_id, project, api_duration_ms, stderr_excerpt, exit_code)
+                    obs.emit_claude_call_failed(agent, task_id, project, api_duration_ms, stderr_excerpt, exit_code,
+                                                input_tokens=input_tokens, output_tokens=output_tokens,
+                                                cache_read_tokens=cache_read_tokens,
+                                                cache_creation_tokens=cache_creation_tokens)
 
                 # CRITICAL: Record failure outcome immediately before raising exception
                 # This ensures outcome is recorded even if exception handling fails
