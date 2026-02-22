@@ -102,109 +102,112 @@ export default function TrendChart({ hourlySeries, days }) {
       <p className="text-xs text-gh-fg-muted mb-2">
         Avg output tokens / execution — weighted across active series per segment
       </p>
-      <div className="relative">
-        <svg
-          viewBox={`0 0 ${VW} ${VH}`}
-          className="w-full"
-          style={{ height: '150px' }}
-          onMouseLeave={() => setHovered(null)}
-        >
-          {/* Y-axis gridlines and labels */}
-          {yTicks.map(f => {
-            const y = PAD.t + cH * (1 - f)
-            return (
-              <g key={f}>
-                <line
-                  x1={PAD.l} y1={y} x2={PAD.l + cW} y2={y}
-                  stroke="#555" strokeWidth="0.5"
-                  strokeDasharray={f > 0 ? '3,3' : ''} opacity="0.4"
-                />
-                <text x={PAD.l - 3} y={y + 3} textAnchor="end" fontSize="9" fill="#888">
-                  {fmt(maxTotal * f)}
-                </text>
-              </g>
-            )
-          })}
-
-          {/* Stacked bars */}
-          {processed.map((seg, i) => {
-            if (seg.total === 0) return null
-            let cumulH = 0
-            return (
-              <g key={i} onMouseEnter={() => setHovered(i)} style={{ cursor: 'crosshair' }}>
-                {names.map((name, ni) => {
-                  const val = seg.slices[ni]
-                  if (!val) return null
-                  const h = (val / maxTotal) * cH
-                  const y = PAD.t + cH - cumulH - h
-                  cumulH += h
-                  return (
-                    <rect
-                      key={name}
-                      x={PAD.l + i * step + (step - barW) / 2}
-                      y={y}
-                      width={barW}
-                      height={h}
-                      fill={PALETTE[ni % PALETTE.length]}
-                      opacity="0.85"
-                    />
-                  )
-                })}
-              </g>
-            )
-          })}
-
-          {/* X-axis labels */}
-          {xLabelIdxs.map(i => (
-            <text
-              key={i}
-              x={PAD.l + i * step + step / 2}
-              y={VH - 6}
-              textAnchor="middle"
-              fontSize="8.5"
-              fill="#888"
-            >
-              {segLabel(processed[i].start, days)}
-            </text>
-          ))}
-        </svg>
-
-        {/* Hover tooltip — fixed top-right so it never overlaps bars */}
-        {hovered !== null && processed[hovered].total > 0 && (
-          <div className="absolute top-1 right-1 bg-gh-canvas border border-gh-border rounded shadow-md p-2 text-xs pointer-events-none min-w-36 z-10">
-            <div className="text-gh-fg-muted mb-1.5 font-medium">
-              {segLabel(processed[hovered].start, days)}
-              {processed[hovered].totalTasks > 0 && (
-                <span className="ml-1.5 font-normal">({processed[hovered].totalTasks} exec)</span>
-              )}
-            </div>
-            {names.map((name, ni) => {
-              const val = processed[hovered].slices[ni]
-              if (!val) return null
+      <div className="flex gap-3">
+        {/* Chart — takes all remaining width */}
+        <div className="relative flex-1 min-w-0">
+          <svg
+            viewBox={`0 0 ${VW} ${VH}`}
+            className="w-full"
+            style={{ height: '150px' }}
+            onMouseLeave={() => setHovered(null)}
+          >
+            {/* Y-axis gridlines and labels */}
+            {yTicks.map(f => {
+              const y = PAD.t + cH * (1 - f)
               return (
-                <div key={name} className="flex items-center gap-1.5 py-0.5">
-                  <div className="w-2 h-2 rounded-sm flex-shrink-0" style={{ background: PALETTE[ni % PALETTE.length] }} />
-                  <span className="text-gh-fg-muted truncate max-w-28">{name}</span>
-                  <span className="font-mono ml-auto pl-1">{fmt(val)}</span>
-                </div>
+                <g key={f}>
+                  <line
+                    x1={PAD.l} y1={y} x2={PAD.l + cW} y2={y}
+                    stroke="#555" strokeWidth="0.5"
+                    strokeDasharray={f > 0 ? '3,3' : ''} opacity="0.4"
+                  />
+                  <text x={PAD.l - 3} y={y + 3} textAnchor="end" fontSize="9" fill="#888">
+                    {fmt(maxTotal * f)}
+                  </text>
+                </g>
               )
             })}
-            <div className="border-t border-gh-border mt-1.5 pt-1 flex justify-between">
-              <span className="text-gh-fg-muted">avg total</span>
-              <span className="font-mono">{fmt(processed[hovered].total)}</span>
-            </div>
-          </div>
-        )}
-      </div>
 
-      {/* Legend */}
-      <div className="flex flex-wrap gap-x-4 gap-y-1 mt-2">
-        {names.map((name, i) => (
-          <div key={name} className="flex items-center gap-1.5">
-            <div className="w-2.5 h-2.5 rounded-sm flex-shrink-0" style={{ background: PALETTE[i % PALETTE.length] }} />
-            <span className="text-xs text-gh-fg-muted font-mono">{name}</span>
-          </div>
-        ))}
+            {/* Stacked bars */}
+            {processed.map((seg, i) => {
+              if (seg.total === 0) return null
+              let cumulH = 0
+              return (
+                <g key={i} onMouseEnter={() => setHovered(i)} style={{ cursor: 'crosshair' }}>
+                  {names.map((name, ni) => {
+                    const val = seg.slices[ni]
+                    if (!val) return null
+                    const h = (val / maxTotal) * cH
+                    const y = PAD.t + cH - cumulH - h
+                    cumulH += h
+                    return (
+                      <rect
+                        key={name}
+                        x={PAD.l + i * step + (step - barW) / 2}
+                        y={y}
+                        width={barW}
+                        height={h}
+                        fill={PALETTE[ni % PALETTE.length]}
+                        opacity="0.85"
+                      />
+                    )
+                  })}
+                </g>
+              )
+            })}
+
+            {/* X-axis labels */}
+            {xLabelIdxs.map(i => (
+              <text
+                key={i}
+                x={PAD.l + i * step + step / 2}
+                y={VH - 6}
+                textAnchor="middle"
+                fontSize="8.5"
+                fill="#888"
+              >
+                {segLabel(processed[i].start, days)}
+              </text>
+            ))}
+          </svg>
+
+          {/* Hover tooltip — fixed top-right so it never overlaps bars */}
+          {hovered !== null && processed[hovered].total > 0 && (
+            <div className="absolute top-1 right-1 bg-gh-canvas border border-gh-border rounded shadow-md p-2 text-xs pointer-events-none min-w-36 z-10">
+              <div className="text-gh-fg-muted mb-1.5 font-medium">
+                {segLabel(processed[hovered].start, days)}
+                {processed[hovered].totalTasks > 0 && (
+                  <span className="ml-1.5 font-normal">({processed[hovered].totalTasks} exec)</span>
+                )}
+              </div>
+              {names.map((name, ni) => {
+                const val = processed[hovered].slices[ni]
+                if (!val) return null
+                return (
+                  <div key={name} className="flex items-center gap-1.5 py-0.5">
+                    <div className="w-2 h-2 rounded-sm flex-shrink-0" style={{ background: PALETTE[ni % PALETTE.length] }} />
+                    <span className="text-gh-fg-muted truncate max-w-28">{name}</span>
+                    <span className="font-mono ml-auto pl-1">{fmt(val)}</span>
+                  </div>
+                )
+              })}
+              <div className="border-t border-gh-border mt-1.5 pt-1 flex justify-between">
+                <span className="text-gh-fg-muted">avg total</span>
+                <span className="font-mono">{fmt(processed[hovered].total)}</span>
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* Legend — vertically stacked to the right of the chart */}
+        <div className="flex flex-col gap-1 flex-shrink-0 justify-center">
+          {names.map((name, i) => (
+            <div key={name} className="flex items-center gap-1.5">
+              <div className="w-2.5 h-2.5 rounded-sm flex-shrink-0" style={{ background: PALETTE[i % PALETTE.length] }} />
+              <span className="text-xs text-gh-fg-muted font-mono">{name}</span>
+            </div>
+          ))}
+        </div>
       </div>
     </div>
   )

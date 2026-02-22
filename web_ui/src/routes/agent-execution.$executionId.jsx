@@ -784,7 +784,7 @@ function AgentExecutionView() {
                   </thead>
                   <tbody>
                     <tr>
-                      <td className="text-gh-fg-muted py-0.5">Initial prompt</td>
+                      <td className="text-gh-fg-muted py-0.5">Initial context</td>
                       <td className="text-right font-mono">{formatTokenCount(tokenUsage.initialInput)}</td>
                     </tr>
                     <tr>
@@ -817,8 +817,8 @@ function AgentExecutionView() {
                     </tr>
                     {tokenUsage.promptLength > 0 && (
                       <tr className="border-t border-gh-border">
-                        <td className="text-gh-fg-muted py-0.5 pt-1.5">Prompt size</td>
-                        <td className="text-right font-mono pt-1.5 text-gh-fg-muted">{formatTokenCount(tokenUsage.promptLength)} chars</td>
+                        <td className="text-gh-fg-muted py-0.5 pt-1.5">Input prompt</td>
+                        <td className="text-right font-mono pt-1.5 text-gh-fg-muted">{formatTokenCount(tokenUsage.promptLength)} chars (~{formatTokenCount(Math.round(tokenUsage.promptLength / 4))} tok)</td>
                       </tr>
                     )}
                   </tbody>

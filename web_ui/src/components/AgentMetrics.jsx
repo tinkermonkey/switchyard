@@ -1,4 +1,5 @@
 import { Fragment, useState, useEffect, useCallback } from 'react'
+import { Link } from '@tanstack/react-router'
 import { RefreshCw, BarChart2, ChevronDown, ChevronRight } from 'lucide-react'
 import TrendChart from './TrendChart'
 
@@ -10,6 +11,7 @@ const formatTokenCount = (n) => {
   if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`
   return String(Math.round(n))
 }
+
 
 // Derive avg fields from an agent metrics doc returned by the API.
 // The API returns both raw sums and pre-computed avg_* fields.
@@ -45,18 +47,29 @@ export default function AgentMetrics({ days, onDaysChange }) {
   const [sortField, setSortField] = useState('avg_output')
   const [sortDir, setSortDir] = useState('desc')
   const [expandedAgents, setExpandedAgents] = useState(new Set())
+  const [topExecutions, setTopExecutions] = useState(null)
 
   const fetchMetrics = useCallback(async () => {
     setLoading(true)
     setError(null)
     try {
-      const res = await fetch(`/api/metrics/agents?days=${days}`)
-      const data = await res.json()
+      const [agentRes, topRes] = await Promise.all([
+        fetch(`/api/metrics/agents?days=${days}`),
+        fetch(`/api/metrics/executions/top?days=${days}`),
+      ])
+      const [data, topData] = await Promise.all([agentRes.json(), topRes.json()])
       if (data.success) {
         setMetrics(data.metrics || [])
         setHourlySeries(data.hourly_series || {})
       } else {
         setError(data.error || 'Failed to load agent metrics')
+      }
+      if (topData.success) {
+        setTopExecutions({
+          prompt: topData.top_initial_context || [],
+          peak: topData.top_peak_context || [],
+          tools: topData.top_tool_call_count || [],
+        })
       }
     } catch (err) {
       setError('Failed to load agent metrics')
@@ -350,6 +363,95 @@ export default function AgentMetrics({ days, onDaysChange }) {
           </div>
         </div>
       )}
+
+      {/* Top-10 Execution Tables */}
+      {topExecutions && (() => {
+        const allEmpty = topExecutions.prompt.length === 0 && topExecutions.peak.length === 0 && topExecutions.tools.length === 0
+        const ExecLink = ({ row, children }) =>
+          row.agent_execution_id ? (
+            <Link
+              to="/agent-execution/$executionId"
+              params={{ executionId: row.agent_execution_id }}
+              search={{ autoAdvance: false }}
+              className="text-gh-accent-primary hover:underline"
+            >
+              {children}
+            </Link>
+          ) : <span>{children}</span>
+
+        const fmtDate = (ts) => {
+          if (!ts) return '—'
+          try { return new Date(ts).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) }
+          catch { return ts }
+        }
+
+        const TopTable = ({ title, rows, metricLabel, metricValue }) => (
+          <div className="bg-gh-canvas-subtle border border-gh-border rounded-md overflow-hidden">
+            <div className="px-3 py-2 border-b border-gh-border">
+              <h3 className="text-sm font-semibold text-gh-fg">{title}</h3>
+            </div>
+            {rows.length === 0 ? (
+              <p className="px-3 py-4 text-xs text-gh-fg-muted text-center">No data yet — metrics are computed by the token metrics job</p>
+            ) : (
+              <div className="overflow-x-auto">
+                <table className="w-full text-xs">
+                  <thead className="border-b border-gh-border">
+                    <tr className="text-gh-fg-muted">
+                      <th className="px-3 py-1.5 text-left font-semibold uppercase">#</th>
+                      <th className="px-3 py-1.5 text-left font-semibold uppercase">Agent</th>
+                      <th className="px-3 py-1.5 text-right font-semibold uppercase">{metricLabel}</th>
+                      <th className="px-3 py-1.5 text-left font-semibold uppercase">Project</th>
+                      <th className="px-3 py-1.5 text-left font-semibold uppercase">Started</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-gh-border">
+                    {rows.map((row, i) => (
+                      <tr key={row.task_id || i} className="hover:bg-gh-canvas transition-colors">
+                        <td className="px-3 py-1.5 text-gh-fg-muted">{i + 1}</td>
+                        <td className="px-3 py-1.5 font-mono">
+                          <ExecLink row={row}>{row.agent_name || '—'}</ExecLink>
+                        </td>
+                        <td className="px-3 py-1.5 text-right font-mono">{metricValue(row)}</td>
+                        <td className="px-3 py-1.5 text-gh-fg-muted">{row.project || '—'}</td>
+                        <td className="px-3 py-1.5 text-gh-fg-muted whitespace-nowrap">{fmtDate(row.started_at)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+        )
+
+        return (
+          <div className="space-y-4 mt-6">
+            <h2 className="text-base font-semibold text-gh-fg">Top 10 Executions</h2>
+            {allEmpty && (
+              <p className="text-sm text-gh-fg-muted">No execution summary data yet — metrics are computed by the token metrics job</p>
+            )}
+            <div className="grid grid-cols-1 xl:grid-cols-3 gap-4">
+              <TopTable
+                title="Largest Initial Prompt"
+                rows={topExecutions.prompt}
+                metricLabel="Initial Context"
+                metricValue={(r) => formatTokenCount(r.initial_context)}
+              />
+              <TopTable
+                title="Highest Peak Context"
+                rows={topExecutions.peak}
+                metricLabel="Peak Context"
+                metricValue={(r) => formatTokenCount(r.peak_context)}
+              />
+              <TopTable
+                title="Most Tool Calls"
+                rows={topExecutions.tools}
+                metricLabel="Tool Calls"
+                metricValue={(r) => r.tool_call_count ?? '—'}
+              />
+            </div>
+          </div>
+        )
+      })()}
 
       {/* Metric Definitions */}
       <div className="bg-gh-canvas-subtle border border-gh-border rounded-md p-4 mt-6">

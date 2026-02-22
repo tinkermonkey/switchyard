@@ -587,6 +587,28 @@ class ObservabilityManager:
 
         self.emit(EventType.PROMPT_CONSTRUCTED, agent, task_id, project, data)
 
+        if self.es:
+            try:
+                index_name = f"claude-streams-{utc_now().strftime('%Y-%m-%d')}"
+                doc = {
+                    'timestamp': utc_isoformat(),
+                    'event_type': 'prompt_constructed',
+                    'agent': agent,
+                    'task_id': task_id,
+                    'project': project,
+                    'prompt_length': len(prompt),
+                    'raw_event': {
+                        'data': {
+                            'prompt_length': len(prompt),
+                            'estimated_tokens': estimated_tokens,
+                            'prompt_components': prompt_components,
+                        }
+                    },
+                }
+                self.es.index(index=index_name, document=doc)
+            except Exception as e:
+                logger.error(f"Failed to index prompt_constructed event to Elasticsearch: {e}")
+
     def emit_claude_call_started(self, agent: str, task_id: str, project: str,
                                  model: str, input_tokens: Optional[int] = None):
         """Emit Claude API call started event"""

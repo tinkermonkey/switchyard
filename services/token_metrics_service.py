@@ -31,6 +31,7 @@ logger = logging.getLogger(__name__)
 AGENTS_INDEX_PREFIX = 'token-metrics-agents'
 AGENTS_HOURLY_INDEX_PREFIX = 'token-metrics-agents-hourly'
 CYCLES_HOURLY_INDEX_PREFIX = 'token-metrics-cycles-hourly'
+EXECUTION_SUMMARIES_INDEX_PREFIX = 'agent-execution-summaries'
 
 # Cycle type prefixes to detect from event_type
 CYCLE_PREFIXES = ['review_cycle_', 'repair_cycle_', 'pr_review_']
@@ -152,6 +153,33 @@ class TokenMetricsService:
                     "cycle_type": {"type": "keyword"},
                     **hourly_properties,
                     "agent_breakdown": {"type": "object", "enabled": False},
+                }
+            ),
+            # Per-execution summary index
+            (
+                EXECUTION_SUMMARIES_INDEX_PREFIX,
+                f"{EXECUTION_SUMMARIES_INDEX_PREFIX}-template",
+                100,
+                {
+                    "task_id":              {"type": "keyword"},
+                    "agent_execution_id":   {"type": "keyword"},
+                    "agent_name":           {"type": "keyword"},
+                    "project":              {"type": "keyword"},
+                    "pipeline_run_id":      {"type": "keyword"},
+                    "status":               {"type": "keyword"},
+                    "execution_type":       {"type": "keyword"},
+                    "started_at":           {"type": "date"},
+                    "ended_at":             {"type": "date"},
+                    "duration_ms":          {"type": "long"},
+                    "initial_context":      {"type": "long"},
+                    "peak_context":         {"type": "long"},
+                    "context_growth":       {"type": "long"},
+                    "total_output":         {"type": "long"},
+                    "total_direct_input":   {"type": "long"},
+                    "total_cache_read":     {"type": "long"},
+                    "total_cache_creation": {"type": "long"},
+                    "tool_call_count":      {"type": "integer"},
+                    "prompt_length":        {"type": "long"},
                 }
             ),
         ]
@@ -287,6 +315,24 @@ class TokenMetricsService:
             except Exception as e:
                 logger.error(
                     f"Error computing cycle metrics for hour {hour_start.isoformat()}: {e}",
+                    exc_info=True
+                )
+
+            # --- Execution summaries ---
+            try:
+                exec_docs = await loop.run_in_executor(
+                    None, self._compute_execution_summary_docs, hour_start, hour_end
+                )
+                exec_index = _index_name(EXECUTION_SUMMARIES_INDEX_PREFIX, hour_start)
+                for doc in exec_docs:
+                    try:
+                        doc_id = doc.get('agent_execution_id') or doc['task_id']
+                        self.es.index(index=exec_index, id=doc_id, body=doc)
+                    except Exception as e:
+                        logger.error(f"Error writing execution summary doc {doc.get('task_id')}: {e}")
+            except Exception as e:
+                logger.error(
+                    f"Error computing execution summaries for hour {hour_start.isoformat()}: {e}",
                     exc_info=True
                 )
 
@@ -833,6 +879,326 @@ class TokenMetricsService:
                 breakdown[agent] = stats
 
         return breakdown
+
+
+    def _process_task_streams_per_task(self, task_ids: List[str]) -> Dict[str, Dict[str, Any]]:
+        """
+        Like _process_task_streams but returns per-task stats keyed by task_id instead
+        of aggregate lists. Used to build per-execution summary docs.
+
+        Returns: {task_id: {
+            'initial_context': int,
+            'peak_context': int,
+            'context_growth': int,
+            'total_output': int,
+            'total_direct_input': int,
+            'total_cache_read': int,
+            'total_cache_creation': int,
+            'tool_call_count': int,
+        }}
+        """
+        if not task_ids:
+            return {}
+
+        try:
+            stream_result = self.es.search(
+                index='claude-streams-*',
+                body={
+                    'size': 10000,
+                    'sort': [
+                        {'task_id': {'order': 'asc'}},
+                        {'timestamp': {'order': 'asc'}}
+                    ],
+                    'query': {
+                        'bool': {
+                            'must': [{'terms': {'task_id': task_ids}}],
+                            'must_not': [{'term': {'event_type': 'prompt_constructed'}}],
+                        }
+                    },
+                    '_source': ['task_id', 'raw_event', 'timestamp']
+                }
+            )
+        except Exception as e:
+            logger.error(f"Error querying claude-streams for per-task summaries: {e}")
+            return {}
+
+        hits = stream_result['hits']['hits']
+        if not hits:
+            return {}
+
+        total_available = stream_result['hits'].get('total', {})
+        if isinstance(total_available, dict):
+            total_available = total_available.get('value', len(hits))
+        if total_available > len(hits):
+            logger.warning(
+                f"claude-streams per-task query returned {len(hits)} of {total_available} hits — "
+                f"execution summaries may be incomplete"
+            )
+
+        # Group docs by task_id
+        task_streams: Dict[str, List[Dict]] = {}
+        for hit in hits:
+            src = hit['_source']
+            tid = src.get('task_id')
+            if tid:
+                task_streams.setdefault(tid, []).append(src)
+
+        results: Dict[str, Dict[str, Any]] = {}
+
+        for task_id, docs in task_streams.items():
+            sum_direct = 0
+            sum_cache_read = 0
+            sum_cache_creation = 0
+            sum_output = 0
+            first_input: Optional[int] = None
+            peak_input = 0
+            per_task_tool_invocations: Dict[str, int] = {}
+
+            # Dedup streaming re-emissions using message ID (same as _process_task_streams)
+            _last_idx_for_msg: Dict[str, int] = {}
+            for _i, _doc in enumerate(docs):
+                _raw = _doc.get('raw_event')
+                if not _raw:
+                    continue
+                if isinstance(_raw, str):
+                    try:
+                        _raw = json.loads(_raw)
+                    except Exception:
+                        continue
+                _event = _raw.get('event') if isinstance(_raw, dict) else None
+                if _event and _event.get('type') == 'assistant':
+                    _msg_id = _event.get('message', {}).get('id')
+                    if _msg_id:
+                        _last_idx_for_msg[_msg_id] = _i
+            _canonical_indices = set(_last_idx_for_msg.values())
+
+            for _i, doc in enumerate(docs):
+                raw_event = doc.get('raw_event')
+                if not raw_event:
+                    continue
+                if isinstance(raw_event, str):
+                    try:
+                        raw_event = json.loads(raw_event)
+                    except Exception:
+                        continue
+
+                event = raw_event.get('event') if isinstance(raw_event, dict) else None
+                if not event or event.get('type') != 'assistant':
+                    continue
+
+                message = event.get('message', {})
+                msg_id = message.get('id')
+                if msg_id and _i not in _canonical_indices:
+                    continue
+
+                usage = message.get('usage', {})
+                if not usage:
+                    continue
+
+                input_direct = usage.get('input_tokens') or 0
+                cache_read = usage.get('cache_read_input_tokens') or 0
+                cache_creation = usage.get('cache_creation_input_tokens') or 0
+                output_tokens = usage.get('output_tokens') or 0
+                effective_input = input_direct + cache_read + cache_creation
+
+                sum_direct += input_direct
+                sum_cache_read += cache_read
+                sum_cache_creation += cache_creation
+                sum_output += output_tokens
+
+                if first_input is None:
+                    first_input = effective_input
+                if effective_input > peak_input:
+                    peak_input = effective_input
+
+                contents = message.get('content') or []
+                if not isinstance(contents, list):
+                    contents = []
+                for c in contents:
+                    if c.get('type') == 'tool_use':
+                        name = c.get('name')
+                        if name:
+                            per_task_tool_invocations[name] = per_task_tool_invocations.get(name, 0) + 1
+
+            if first_input is not None:
+                context_growth = max(0, peak_input - first_input)
+                tool_call_count = sum(per_task_tool_invocations.values())
+                results[task_id] = {
+                    'initial_context': first_input,
+                    'peak_context': peak_input,
+                    'context_growth': context_growth,
+                    'total_output': sum_output,
+                    'total_direct_input': sum_direct,
+                    'total_cache_read': sum_cache_read,
+                    'total_cache_creation': sum_cache_creation,
+                    'tool_call_count': tool_call_count,
+                }
+
+        return results
+
+    def _compute_execution_summary_docs(
+        self, hour_start: datetime, hour_end: datetime
+    ) -> List[Dict[str, Any]]:
+        """
+        Build one summary doc per agent execution that started in [hour_start, hour_end].
+
+        Steps:
+          1. Query agent_initialized events for started_at + metadata
+          2. Query agent_completed/agent_failed for status + ended_at + duration_ms
+          3. Call _process_task_streams_per_task for token stats
+          4. Query claude-streams-* for prompt_length (prompt_constructed events)
+          5. Merge all four sources into one doc per task_id
+        """
+        # Step 1: agent_initialized events
+        try:
+            init_result = self.es.search(
+                index='agent-events-*',
+                body={
+                    'size': 10000,
+                    'query': {
+                        'bool': {
+                            'must': [
+                                {'term': {'event_type': 'agent_initialized'}},
+                                {'range': {'timestamp': {
+                                    'gte': hour_start.isoformat(),
+                                    'lte': hour_end.isoformat()
+                                }}}
+                            ]
+                        }
+                    },
+                    '_source': [
+                        'task_id', 'agent_name', 'project', 'timestamp', 'raw_event'
+                    ]
+                }
+            )
+        except Exception as e:
+            logger.error(f"Error querying agent_initialized for execution summaries [{hour_start}]: {e}")
+            return []
+
+        init_hits = init_result['hits']['hits']
+        if not init_hits:
+            return []
+
+        # Build map: task_id → init metadata (extract nested fields from raw_event).
+        # A task may have two agent_initialized events (one older-format without
+        # agent_execution_id). Prefer the entry that has agent_execution_id.
+        init_map: Dict[str, Dict] = {}
+        for hit in init_hits:
+            src = hit['_source']
+            tid = src.get('task_id')
+            if not tid:
+                continue
+            raw = src.get('raw_event') or {}
+            raw_data = raw.get('data') or {}
+            entry = {
+                'task_id': tid,
+                'agent_name': src.get('agent_name') or raw.get('agent') or '',
+                'project': src.get('project') or raw.get('project') or '',
+                'timestamp': src.get('timestamp') or raw.get('timestamp'),
+                'agent_execution_id': raw_data.get('agent_execution_id'),
+                'pipeline_run_id': raw_data.get('pipeline_run_id'),
+                'execution_type': raw.get('execution_type') or '',
+            }
+            existing = init_map.get(tid)
+            if not existing or (not existing.get('agent_execution_id') and entry.get('agent_execution_id')):
+                init_map[tid] = entry
+
+        task_ids = list(init_map.keys())
+
+        # Step 2: agent_completed / agent_failed
+        completion_map: Dict[str, Dict] = {}
+        try:
+            comp_result = self.es.search(
+                index='agent-events-*',
+                body={
+                    'size': 10000,
+                    'query': {
+                        'bool': {
+                            'must': [
+                                {'terms': {'event_type': ['agent_completed', 'agent_failed']}},
+                                {'terms': {'task_id': task_ids}}
+                            ]
+                        }
+                    },
+                    '_source': ['task_id', 'event_type', 'timestamp', 'duration_ms']
+                }
+            )
+            for hit in comp_result['hits']['hits']:
+                src = hit['_source']
+                tid = src.get('task_id')
+                if tid and tid not in completion_map:
+                    completion_map[tid] = {
+                        'status': 'completed' if src.get('event_type') == 'agent_completed' else 'failed',
+                        'ended_at': src.get('timestamp'),
+                        'duration_ms': src.get('duration_ms'),
+                    }
+        except Exception as e:
+            logger.warning(f"Error querying completion events for execution summaries: {e}")
+
+        # Step 3: token stats per task
+        token_map = self._process_task_streams_per_task(task_ids)
+
+        # Step 4: prompt_length from claude-streams-* prompt_constructed events
+        prompt_length_map: Dict[str, int] = {}
+        try:
+            prompt_result = self.es.search(
+                index='claude-streams-*',
+                body={
+                    'size': 10000,
+                    'query': {
+                        'bool': {
+                            'must': [
+                                {'term': {'event_type': 'prompt_constructed'}},
+                                {'terms': {'task_id': task_ids}}
+                            ]
+                        }
+                    },
+                    '_source': ['task_id', 'prompt_length']
+                }
+            )
+            for hit in prompt_result['hits']['hits']:
+                src = hit['_source']
+                tid = src.get('task_id')
+                pl = src.get('prompt_length')
+                if tid and pl is not None and tid not in prompt_length_map:
+                    prompt_length_map[tid] = pl
+        except Exception as e:
+            logger.warning(f"Error querying prompt_length for execution summaries: {e}")
+
+        # Step 5: merge into docs
+        docs = []
+        for tid, init_src in init_map.items():
+            agent_name = init_src.get('agent') or init_src.get('agent_name') or ''
+            doc: Dict[str, Any] = {
+                'task_id': tid,
+                'agent_execution_id': init_src.get('agent_execution_id'),
+                'agent_name': agent_name,
+                'project': init_src.get('project'),
+                'pipeline_run_id': init_src.get('pipeline_run_id'),
+                'execution_type': init_src.get('execution_type'),
+                'started_at': init_src.get('timestamp'),
+            }
+
+            comp = completion_map.get(tid, {})
+            doc['status'] = comp.get('status', 'unknown')
+            doc['ended_at'] = comp.get('ended_at')
+            doc['duration_ms'] = comp.get('duration_ms')
+
+            tokens = token_map.get(tid, {})
+            doc['initial_context'] = tokens.get('initial_context')
+            doc['peak_context'] = tokens.get('peak_context')
+            doc['context_growth'] = tokens.get('context_growth')
+            doc['total_output'] = tokens.get('total_output')
+            doc['total_direct_input'] = tokens.get('total_direct_input')
+            doc['total_cache_read'] = tokens.get('total_cache_read')
+            doc['total_cache_creation'] = tokens.get('total_cache_creation')
+            doc['tool_call_count'] = tokens.get('tool_call_count')
+
+            doc['prompt_length'] = prompt_length_map.get(tid)
+
+            docs.append(doc)
+
+        return docs
 
 
 # Singleton

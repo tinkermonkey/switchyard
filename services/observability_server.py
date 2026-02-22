@@ -1747,6 +1747,84 @@ def get_cycle_metrics():
         return jsonify({'success': False, 'error': str(e), 'metrics': []}), 500
 
 
+@app.route('/api/metrics/executions/top', methods=['GET'])
+def get_top_executions():
+    """
+    Return top-10 agent executions by prompt_length, peak_context, and tool_call_count.
+
+    Queries agent-execution-summaries-* (written by the token metrics job) over the
+    requested time window and runs three sort-desc/size-10 queries.
+    """
+    try:
+        try:
+            days = int(request.args.get('days', 7))
+        except (ValueError, TypeError):
+            return jsonify({'success': False, 'error': 'Invalid days parameter'}), 400
+        days = max(1, min(days, 30))
+
+        range_filter = {'range': {'started_at': {'gte': f'now-{days}d'}}}
+        source_fields = [
+            'task_id', 'agent_execution_id', 'agent_name', 'project',
+            'started_at', 'status', 'duration_ms',
+            'initial_context', 'peak_context', 'tool_call_count',
+        ]
+
+        def _top_query(sort_field: str) -> dict:
+            return {
+                'size': 10,
+                'query': {
+                    'bool': {
+                        'must': [range_filter],
+                        'filter': [{'exists': {'field': sort_field}}],
+                    }
+                },
+                'sort': [{sort_field: {'order': 'desc'}}],
+                '_source': source_fields,
+            }
+
+        msearch_body = []
+        for field in ('initial_context', 'peak_context', 'tool_call_count'):
+            msearch_body.append({'index': 'agent-execution-summaries-*'})
+            msearch_body.append(_top_query(field))
+
+        try:
+            ms_result = es_client.msearch(body=msearch_body)
+        except Exception as e:
+            if 'index_not_found' in str(e).lower() or 'no such index' in str(e).lower():
+                return jsonify({
+                    'success': True,
+                    'top_initial_context': [],
+                    'top_peak_context': [],
+                    'top_tool_call_count': [],
+                })
+            raise
+
+        def _hits(response: dict) -> list:
+            if response.get('error'):
+                err_str = str(response['error'])
+                if 'index_not_found' in err_str.lower() or 'no such index' in err_str.lower():
+                    return []
+                logger.warning(f"msearch sub-request error: {response['error']}")
+                return []
+            return [hit['_source'] for hit in response.get('hits', {}).get('hits', [])]
+
+        responses = ms_result.get('responses', [{}, {}, {}])
+        top_prompt = _hits(responses[0]) if len(responses) > 0 else []
+        top_peak   = _hits(responses[1]) if len(responses) > 1 else []
+        top_tools  = _hits(responses[2]) if len(responses) > 2 else []
+
+        return jsonify({
+            'success': True,
+            'top_initial_context': top_prompt,
+            'top_peak_context': top_peak,
+            'top_tool_call_count': top_tools,
+        })
+
+    except Exception as e:
+        logger.error(f"Error fetching top executions: {e}", exc_info=True)
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
 @app.route('/api/metrics/run-now', methods=['POST'])
 def trigger_token_metrics():
     """Trigger an immediate token metrics computation job."""

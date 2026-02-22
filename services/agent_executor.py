@@ -326,6 +326,24 @@ class AgentExecutor:
         attempt = 0
         
         try:
+            # Pre-flight validation: reject executions with empty issue descriptions.
+            # An empty body means the task was created with bad data and every agent
+            # prompt will silently fall back to "No description", producing garbage
+            # output.  Fail immediately — before any Docker container is launched —
+            # so the pipeline lock is retained and the problem surfaces for human review.
+            issue = task_context.get('issue', {})
+            if issue:
+                issue_body = issue.get('body')
+                if not issue_body or not str(issue_body).strip():
+                    from agents.non_retryable import NonRetryableAgentError
+                    raise NonRetryableAgentError(
+                        f"Agent {agent_name} cannot execute: issue "
+                        f"#{issue.get('number', '?')} ('{issue.get('title', 'unknown')}') "
+                        f"has an empty description. A non-empty issue body is required for "
+                        f"agents to produce meaningful output. Pipeline halted — resolve the "
+                        f"issue description and re-trigger."
+                    )
+
             while attempt < max_attempts:
                 attempt += 1
                 try:
