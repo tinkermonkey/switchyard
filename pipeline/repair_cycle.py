@@ -441,52 +441,7 @@ class RepairCycleStage(PipelineStage):
             # Check circuit breaker
             if self._agent_call_count >= self.max_total_agent_calls:
                 logger.error(f"Circuit breaker triggered: max agent calls " f"({self.max_total_agent_calls}) reached")
-                
-                # Note: Completion event will be emitted by caller
-                return CycleResult(
-                    test_type=config.test_type,
-                    passed=False,
-                    iterations=test_cycle_iteration,
-                    final_result=None,
-                    error="Circuit breaker: max agent calls reached",
-                    files_fixed=files_fixed,
-                    warnings_reviewed=warnings_reviewed,
-                )
-                
-                # Emit test cycle completed event with failure
-                if obs:
-                    obs.emit(
-                        EventType.REPAIR_CYCLE_TEST_CYCLE_COMPLETED,
-                        "repair_cycle",
-                        task_id,
-                        project,
-                        {
-                            "test_type": config.test_type,
-                            "test_type_index": test_type_index,
-                            "passed": 0,  # Convert bool to int for ES schema
-                            "test_cycle_iterations": test_cycle_iteration,
-                            "error": "Circuit breaker: max agent calls reached",
-                        },
-                        pipeline_run_id=pipeline_run_id,
-                    )
-                
-                # Emit cycle completed event with failure
-                if obs:
-                    obs.emit(
-                        EventType.REPAIR_CYCLE_COMPLETED,
-                        "repair_cycle",
-                        task_id,
-                        project,
-                        {
-                            "test_type": config.test_type,
-                            "test_type_index": test_type_index,
-                            "passed": 0,  # Convert bool to int for ES schema
-                            "test_cycle_iterations": test_cycle_iteration,
-                            "error": "Circuit breaker: max agent calls reached",
-                        },
-                        pipeline_run_id=pipeline_run_id,
-                    )
-                
+                # Completion event is emitted by the caller (execute())
                 return CycleResult(
                     test_type=config.test_type,
                     passed=False,
