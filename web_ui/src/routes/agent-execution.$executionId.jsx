@@ -18,6 +18,19 @@ import RepairCycleStatus from '../components/RepairCycleStatus'
     return agentName.split('_').map(word => word.charAt(0).toUpperCase() + word.slice(1)).join(' ')
   }
 
+const getToolResultLength = (content) => {
+  if (!content) return 0
+  if (typeof content === 'string') return content.length
+  if (Array.isArray(content)) {
+    return content.reduce((sum, item) => {
+      if (typeof item === 'string') return sum + item.length
+      if (item?.type === 'text') return sum + (item.text?.length || 0)
+      return sum
+    }, 0)
+  }
+  return 0
+}
+
 function AgentExecutionView() {
   const { executionId } = Route.useParams()
   const searchParams = Route.useSearch()
@@ -441,6 +454,8 @@ function AgentExecutionView() {
     let lastDirectInput = 0
     const modelsUsed = new Set()
     const toolCallCounts = {}
+    const toolIdToName = {}       // tool_use id → tool name, for matching results
+    const toolResultChars = {}    // tool name → total result chars across all calls
     const tokenToolsAvailable = []
     const mcpServersAvailable = []
 
@@ -480,10 +495,24 @@ function AgentExecutionView() {
         for (const item of contents) {
           if (item.type === 'tool_use' && item.name) {
             toolCallCounts[item.name] = (toolCallCounts[item.name] || 0) + 1
+            if (item.id) toolIdToName[item.id] = item.name
+          }
+        }
+      }
+
+      if (evt.type === 'user' && Array.isArray(evt.message?.content)) {
+        for (const item of evt.message.content) {
+          if (item.type === 'tool_result' && item.tool_use_id) {
+            const toolName = toolIdToName[item.tool_use_id]
+            if (toolName) {
+              toolResultChars[toolName] = (toolResultChars[toolName] || 0) + getToolResultLength(item.content)
+            }
           }
         }
       }
     }
+
+    const promptLength = inputPrompt?.text?.length || 0
 
     const tokenUsage = {
       hasData: firstInput !== null,
@@ -494,12 +523,13 @@ function AgentExecutionView() {
       totalCacheCreation: lastCacheCreation,
       totalDirectInput: lastDirectInput,
       totalAll: cumulativeLastInput + cumulativeLastOutput,
+      promptLength,
       modelsUsed: Array.from(modelsUsed),
       toolsAvailable: tokenToolsAvailable,
       mcpServersAvailable,
       toolsSummary: Object.entries(toolCallCounts)
-        .map(([name, calls]) => ({ name, calls }))
-        .sort((a, b) => b.calls - a.calls)
+        .map(([name, calls]) => ({ name, calls, resultChars: toolResultChars[name] || 0 }))
+        .sort((a, b) => (b.resultChars - a.resultChars) || (b.calls - a.calls))
     }
 
     return {
@@ -747,6 +777,12 @@ function AgentExecutionView() {
                       <td className="text-gh-fg font-semibold py-0.5">Grand total</td>
                       <td className="text-right font-mono font-semibold">{formatTokenCount(tokenUsage.totalAll)}</td>
                     </tr>
+                    {tokenUsage.promptLength > 0 && (
+                      <tr className="border-t border-gh-border">
+                        <td className="text-gh-fg-muted py-0.5 pt-1.5">Prompt size</td>
+                        <td className="text-right font-mono pt-1.5">{formatTokenCount(tokenUsage.promptLength)} <span className="text-gh-fg-muted text-xs">chars</span></td>
+                      </tr>
+                    )}
                   </tbody>
                 </table>
               </div>
@@ -794,13 +830,15 @@ function AgentExecutionView() {
                       <tr>
                         <th className="text-left text-gh-fg-muted font-normal text-xs pb-1">Tool</th>
                         <th className="text-right text-gh-fg-muted font-normal text-xs pb-1">Calls</th>
+                        <th className="text-right text-gh-fg-muted font-normal text-xs pb-1">Result (chars)</th>
                       </tr>
                     </thead>
                     <tbody>
-                      {tokenUsage.toolsSummary.map(({ name, calls }) => (
+                      {tokenUsage.toolsSummary.map(({ name, calls, resultChars }) => (
                         <tr key={name}>
                           <td className="text-gh-fg font-mono py-0.5 text-xs">{name}</td>
                           <td className="text-right text-gh-fg py-0.5">{calls}</td>
+                          <td className="text-right text-gh-fg py-0.5">{resultChars > 0 ? formatTokenCount(resultChars) : '—'}</td>
                         </tr>
                       ))}
                     </tbody>
