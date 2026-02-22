@@ -168,7 +168,7 @@ export default function AgentMetrics({ days, onDaysChange }) {
         </div>
       )}
 
-      {Object.keys(hourlySeries).length > 0 && (
+      {!loading && Object.keys(hourlySeries).length > 0 && (
         <TrendChart hourlySeries={hourlySeries} days={days} />
       )}
 

@@ -1660,7 +1660,19 @@ def get_agent_metrics():
             if aggregated:
                 metrics.append(aggregated)
 
-        return jsonify({'success': True, 'metrics': metrics})
+        # Compact per-agent hourly series for trend charts (no extra ES query)
+        hourly_series = {}
+        for doc in hourly_docs:
+            an = doc.get('agent_name')
+            tc = doc.get('task_count', 0)
+            if an and tc:
+                hourly_series.setdefault(an, []).append({
+                    'h': doc.get('hour_bucket'),
+                    'sum_out': int(doc.get('sum_output') or 0),
+                    'tc': tc,
+                })
+
+        return jsonify({'success': True, 'metrics': metrics, 'hourly_series': hourly_series})
 
     except Exception as e:
         logger.error(f"Error fetching agent metrics: {e}", exc_info=True)
@@ -1716,7 +1728,19 @@ def get_cycle_metrics():
             if aggregated:
                 metrics.append(aggregated)
 
-        return jsonify({'success': True, 'metrics': metrics})
+        # Compact per-cycle hourly series for trend charts (no extra ES query)
+        hourly_series = {}
+        for doc in hourly_docs:
+            ct = doc.get('cycle_type')
+            tc = doc.get('task_count', 0)
+            if ct and tc:
+                hourly_series.setdefault(ct, []).append({
+                    'h': doc.get('hour_bucket'),
+                    'sum_out': int(doc.get('sum_output') or 0),
+                    'tc': tc,
+                })
+
+        return jsonify({'success': True, 'metrics': metrics, 'hourly_series': hourly_series})
 
     except Exception as e:
         logger.error(f"Error fetching cycle metrics: {e}", exc_info=True)
@@ -1726,14 +1750,18 @@ def get_cycle_metrics():
 @app.route('/api/metrics/run-now', methods=['POST'])
 def trigger_token_metrics():
     """Trigger an immediate token metrics computation job."""
-    try:
-        from services.scheduled_tasks import get_scheduled_tasks_service
-        scheduler = get_scheduled_tasks_service()
-        scheduler.run_token_metrics_now()
-        return jsonify({'success': True, 'message': 'Token metrics job triggered'})
-    except Exception as e:
-        logger.error(f"Error triggering token metrics: {e}", exc_info=True)
-        return jsonify({'success': False, 'error': str(e)}), 500
+    import threading
+    import asyncio
+
+    def _run():
+        try:
+            from services.token_metrics_service import get_token_metrics_service
+            asyncio.run(get_token_metrics_service().run_metrics_job())
+        except Exception as e:
+            logger.error(f"Error in background token metrics job: {e}", exc_info=True)
+
+    threading.Thread(target=_run, daemon=True, name='token-metrics-now').start()
+    return jsonify({'success': True, 'message': 'Token metrics job triggered'})
 
 
 @app.route('/api/metrics/run-full-history', methods=['POST'])
@@ -1744,14 +1772,21 @@ def trigger_token_metrics_full_history():
     metrics job with a lookback that covers the entire available window.  The
     scheduled cron job cadence is not affected.
     """
-    try:
-        from services.scheduled_tasks import get_scheduled_tasks_service
-        scheduler = get_scheduled_tasks_service()
-        scheduler.run_full_history_token_metrics_now()
-        return jsonify({'success': True, 'message': 'Full-history token metrics backfill triggered'})
-    except Exception as e:
-        logger.error(f"Error triggering full-history token metrics: {e}", exc_info=True)
-        return jsonify({'success': False, 'error': str(e)}), 500
+    import threading
+    import asyncio
+
+    def _run():
+        try:
+            from services.token_metrics_service import get_token_metrics_service
+            svc = get_token_metrics_service()
+            lookback_hours = svc.find_oldest_event_hours_ago()
+            logger.info(f"Full-history token metrics backfill: oldest event ~{lookback_hours}h ago")
+            asyncio.run(svc.run_metrics_job(lookback_hours=lookback_hours))
+        except Exception as e:
+            logger.error(f"Error in background full-history token metrics job: {e}", exc_info=True)
+
+    threading.Thread(target=_run, daemon=True, name='token-metrics-full-history').start()
+    return jsonify({'success': True, 'message': 'Full-history token metrics backfill triggered'})
 
 
 def _merge_canonical_breakdown(target: dict, source: dict) -> None:
