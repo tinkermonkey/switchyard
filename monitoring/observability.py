@@ -600,6 +600,7 @@ class ObservabilityManager:
                     'prompt_length': len(prompt),
                     'raw_event': {
                         'data': {
+                            'prompt': prompt,
                             'prompt_length': len(prompt),
                             'estimated_tokens': estimated_tokens,
                             'prompt_components': prompt_components,
