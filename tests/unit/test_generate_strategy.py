@@ -130,7 +130,10 @@ class TestGenerateStrategyWithLLM:
             },
             'dependencies': {
                 'critical': ['fastapi', 'pydantic', 'sqlalchemy']
-            }
+            },
+            'architecture_summary': 'REST API built with fastapi and pydantic for validation.',
+            'techstack_summary': 'Python with fastapi framework. Testing via pytest with 42 tests.',
+            'patterns_summary': 'Standard layered architecture with api, business, and data layers.'
         }
 
     @pytest.fixture

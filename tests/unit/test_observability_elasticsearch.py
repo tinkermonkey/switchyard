@@ -840,6 +840,7 @@ class TestEventTypeCompleteness:
         expected_decision_events = {
             'feedback_detected', 'feedback_listening_started', 'feedback_listening_stopped', 'feedback_ignored',
             'agent_routing_decision', 'agent_selected', 'workspace_routing_decision',
+            'status_validation_failure',
             'status_progression_started', 'status_progression_completed', 'status_progression_failed',
             'pipeline_stage_transition',
             'review_cycle_started', 'review_cycle_iteration', 'review_cycle_maker_selected',
@@ -859,10 +860,11 @@ class TestEventTypeCompleteness:
             'repair_cycle_fix_cycle_started', 'repair_cycle_fix_cycle_completed',
             'repair_cycle_file_fix_started', 'repair_cycle_file_fix_completed', 'repair_cycle_file_fix_failed',
             'repair_cycle_warning_review_started', 'repair_cycle_warning_review_completed',
-            'repair_cycle_warning_review_failed', 'repair_cycle_completed',
+            'repair_cycle_warning_review_failed', 'repair_cycle_completed', 'repair_cycle_failed',
             'pr_review_stage_started', 'pr_review_phase_started',
             'pr_review_phase_completed', 'pr_review_phase_failed', 'pr_review_stage_completed',
             'execution_state_reconciled',
+            'sub_issue_created', 'sub_issue_creation_failed',
         }
         
         expected_lifecycle_events = {

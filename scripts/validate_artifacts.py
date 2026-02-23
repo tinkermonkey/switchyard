@@ -166,8 +166,12 @@ def validate_content_quality(file_path: Path) -> Dict[str, Any]:
         if len(content) > 50000:
             return {'passed': False, 'errors': ['Content too long (>50k chars)']}
 
-        # Check for unfilled placeholders
-        placeholders = re.findall(r'\{[a-zA-Z_]+\}', content)
+        # Check for unfilled placeholders, excluding code blocks and inline code
+        # to avoid false positives from legitimate code syntax (JS template literals,
+        # JSX attribute bindings, bash variables, OpenAPI path params, etc.)
+        non_code_content = re.sub(r'```.*?```', '', content, flags=re.DOTALL)
+        non_code_content = re.sub(r'`[^`\n]+`', '', non_code_content)
+        placeholders = re.findall(r'\{[a-zA-Z_]+\}', non_code_content)
         if placeholders:
             return {'passed': False, 'errors': [f'Unfilled placeholders: {placeholders[:5]}']}
 

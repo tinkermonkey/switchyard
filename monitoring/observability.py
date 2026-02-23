@@ -348,6 +348,7 @@ class ObservabilityManager:
             EventType.AGENT_SELECTED,
             EventType.WORKSPACE_ROUTING_DECISION,
             # Status & Pipeline Progression
+            EventType.STATUS_VALIDATION_FAILURE,
             EventType.STATUS_PROGRESSION_STARTED,
             EventType.STATUS_PROGRESSION_COMPLETED,
             EventType.STATUS_PROGRESSION_FAILED,
