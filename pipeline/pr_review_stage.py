@@ -124,8 +124,13 @@ class PRReviewStage(PipelineStage):
 
         logger.info(f"PR Review Stage executing for parent issue #{parent_issue_number} in {project_name}")
 
-        # NOTE: record_execution_start is the caller's responsibility
-        # (e.g. _start_pr_review_for_issue), matching the repair cycle pattern.
+        # NOTE: record_execution_start for Phase 1 (pr_code_reviewer) is the caller's
+        # responsibility (e.g. _start_pr_review_for_issue).  PRReviewStage is responsible
+        # for recording in_progress state before Phase 2 (requirements_verifier) and
+        # Phase 4 (consolidation) sub-agent containers so restart recovery can identify
+        # and keep those containers alive rather than killing them.
+        from services.work_execution_state import work_execution_tracker
+        column = task_context.get('column', 'In Review')
 
         try:
             # Check review cycle count
@@ -314,6 +319,16 @@ class PRReviewStage(PipelineStage):
                         pr_url, check_name, authority_key, check_content
                     )
 
+                    # Record in_progress BEFORE launching container so restart recovery
+                    # can identify this container as legitimate and keep it alive.
+                    work_execution_tracker.record_execution_start(
+                        issue_number=parent_issue_number,
+                        column=column,
+                        agent=self.requirements_verifier_agent,
+                        trigger_source='pr_review_phase2',
+                        project_name=project_name
+                    )
+
                     # Launch requirements_verifier in Docker (via AgentExecutor)
                     verification_result = await agent_executor.execute_agent(
                         agent_name=self.requirements_verifier_agent,
@@ -470,7 +485,8 @@ class PRReviewStage(PipelineStage):
 
                 try:
                     consolidated_text = await self._run_consolidation_phase(
-                        phase_outputs, pr_url, task_context, obs, pipeline_run_id, task_id, project_name
+                        phase_outputs, pr_url, task_context, obs, pipeline_run_id, task_id,
+                        project_name, parent_issue_number, column
                     )
                     phases_completed += 1
 
@@ -1492,11 +1508,25 @@ If all requirements are met, write "All requirements verified - no gaps found" a
         pipeline_run_id: Optional[str],
         task_id: str,
         project_name: str,
+        parent_issue_number: int,
+        column: str,
     ) -> str:
         """Run Phase 4 consolidation — feed all phase texts into a single agent call."""
         self._agent_call_count += 1
         prompt = self._build_consolidation_prompt(phase_outputs)
         agent_executor = get_agent_executor()
+
+        # Record in_progress BEFORE launching container so restart recovery can
+        # identify this container as legitimate and keep it alive.
+        from services.work_execution_state import work_execution_tracker
+        work_execution_tracker.record_execution_start(
+            issue_number=parent_issue_number,
+            column=column,
+            agent=self.pr_review_agent,
+            trigger_source='pr_review_phase4',
+            project_name=project_name
+        )
+
         result = await agent_executor.execute_agent(
             agent_name=self.pr_review_agent,
             project_name=project_name,

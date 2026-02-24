@@ -5899,19 +5899,23 @@ _Repair cycle initiated by Claude Code Orchestrator_
                         # Get active pipeline run for this issue
                         pipeline_run = pipeline_run_manager.get_active_pipeline_run(
                             project=project_name,
-                            board=board_name,
                             issue_number=issue_number
                         )
 
                         if pipeline_run:
-                            # Has active pipeline run - check if it's stale
-                            last_updated = datetime.fromisoformat(
-                                pipeline_run.get('last_updated_at', pipeline_run.get('@timestamp'))
-                            )
-
-                            if last_updated > grace_period:
-                                # Recently active, not stalled yet
-                                continue
+                            # Has active pipeline run - check if it was started recently
+                            # Use started_at as a proxy since PipelineRun has no last_updated_at field
+                            started_at_str = getattr(pipeline_run, 'started_at', None)
+                            if started_at_str:
+                                try:
+                                    started_at = datetime.fromisoformat(
+                                        started_at_str.replace('Z', '+00:00')
+                                    )
+                                    if started_at > grace_period:
+                                        # Pipeline run started very recently, give it startup time
+                                        continue
+                                except (ValueError, TypeError):
+                                    pass  # Can't parse timestamp, fall through to stalled check
 
                         # If we get here: no active run OR stale active run
                         # This is a stalled issue
