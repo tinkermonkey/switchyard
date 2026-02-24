@@ -48,6 +48,12 @@ class SeniorSoftwareEngineerAgent(MakerAgent):
         return """
 Implement the code changes to meet the requirements specified.
 
+**Project-Specific Expert Agents**:
+Check `/workspace/CLAUDE.md` for a "Specialized Sub-Agents" section. If any listed agent
+matches your task domain (e.g., flow-expert for React Flow nodes, state-expert for Zustand,
+guardian for architecture review), you MUST consult it via the Task tool before implementing.
+Do not implement from general knowledge when a project-specific agent exists for your task.
+
 **For UI/Frontend Changes**:
 - Use Playwright MCP to test your changes in the browser before completing
 - Capture screenshots of key UI states for the PR

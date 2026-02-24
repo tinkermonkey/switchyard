@@ -42,6 +42,17 @@ class SoftwareArchitectAgent(AnalysisAgent):
     # OPTIONAL CUSTOMIZATIONS
     # ==================================================================================
 
+    def get_initial_guidelines(self) -> str:
+        """Override to provide architecture-specific guidelines"""
+        return """
+**Project-Specific Expert Agents**:
+Check `/workspace/CLAUDE.md` for a "Specialized Sub-Agents" section. If any listed agent
+matches your task domain (e.g., architect for project-specific architectural patterns,
+guardian for boundary and antipattern enforcement), you MUST consult it via the Task tool
+before producing your design. Do not design from general knowledge when a project-specific
+agent exists for your task.
+"""
+
     def get_quality_standards(self) -> str:
         return """
 - Architecture patterns are appropriate for the problem domain and the application
