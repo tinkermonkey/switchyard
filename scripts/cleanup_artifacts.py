@@ -138,7 +138,7 @@ def identify_outdated_artifacts(project: str) -> List[Dict[str, Any]]:
 
     # Get project-specific directories
     claude_dir = get_project_claude_dir(project)
-    agents_dir = claude_dir / 'agents'
+    agents_dir = claude_dir / 'agents' / 'clauditoreum'
     skills_dir = claude_dir / 'skills'
 
     # Check registered agents for validation failures
@@ -216,12 +216,12 @@ def identify_orphaned_artifacts(project: str) -> List[Dict[str, Any]]:
 
     # Get project-specific directories
     claude_dir = get_project_claude_dir(project)
-    agents_dir = claude_dir / 'agents'
+    agents_dir = claude_dir / 'agents' / 'clauditoreum'
     skills_dir = claude_dir / 'skills'
 
     # Check agents on filesystem
     if agents_dir.exists():
-        for agent_file in agents_dir.glob(f'{project}-*.md'):
+        for agent_file in agents_dir.glob('*.md'):
             # Check if generated and not in state
             validation = validate_yaml_frontmatter(agent_file)
             if validation.get('passed') and validation.get('frontmatter', {}).get('generated'):
@@ -303,7 +303,7 @@ def safe_delete_artifact(artifact: Dict[str, Any], project: str, dry_run: bool =
 
     # Get project-specific directories for validation
     claude_dir = get_project_claude_dir(project)
-    agents_dir = claude_dir / 'agents'
+    agents_dir = claude_dir / 'agents' / 'clauditoreum'
     skills_dir = claude_dir / 'skills'
 
     # 0. Path traversal protection - verify path is within expected directory

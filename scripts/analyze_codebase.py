@@ -24,6 +24,8 @@ from monitoring.timestamp_utils import utc_isoformat
 # Configure logging
 logger = logging.getLogger(__name__)
 
+ORCHESTRATOR_ROOT = Path(os.environ.get('ORCHESTRATOR_ROOT', Path(__file__).parent.parent))
+
 
 def get_workspace_root() -> Path:
     """
@@ -79,7 +81,7 @@ async def run_architecture_discovery(project: str, workspace_root: Path) -> str:
         Result from Claude Code
     """
     project_dir = workspace_root / project
-    output_dir = project_dir / '.claude' / 'clauditoreum'
+    output_dir = ORCHESTRATOR_ROOT / 'state' / 'projects' / project / 'analysis'
     output_dir.mkdir(parents=True, exist_ok=True)
 
     prompt = f"""# Codebase Architecture Discovery
@@ -123,10 +125,9 @@ Check for and read:
 - `ARCHITECTURE.md` or `docs/architecture/` - Existing architectural docs
 - Code comments explaining design decisions
 
-### Step 5: Create Architecture Summary
+### Step 5: Return Architecture Summary
 
-Write a comprehensive summary to:
-**`.claude/clauditoreum/ArchitectureSummary.md`**
+Return the comprehensive summary as your response (do not write files - the orchestrator will save it).
 
 Include:
 
@@ -200,7 +201,7 @@ async def run_techstack_discovery(project: str, workspace_root: Path) -> str:
         Result from Claude Code
     """
     project_dir = workspace_root / project
-    output_dir = project_dir / '.claude' / 'clauditoreum'
+    output_dir = ORCHESTRATOR_ROOT / 'state' / 'projects' / project / 'analysis'
     output_dir.mkdir(parents=True, exist_ok=True)
 
     prompt = f"""# Tech Stack Discovery & Research
@@ -263,10 +264,9 @@ Read 5-10 key source files to detect:
 - **Dependency injection**: Constructor injection, frameworks
 - **Error handling**: Exceptions, Result types, etc.
 
-### Step 6: Create Tech Stack Summary
+### Step 6: Return Tech Stack Summary
 
-Write to:
-**`.claude/clauditoreum/TechStackSummary.md`**
+Return the comprehensive summary as your response (do not write files - the orchestrator will save it).
 
 Include:
 
@@ -353,7 +353,7 @@ async def run_conventions_discovery(project: str, workspace_root: Path) -> str:
         Result from Claude Code
     """
     project_dir = workspace_root / project
-    output_dir = project_dir / '.claude' / 'clauditoreum'
+    output_dir = ORCHESTRATOR_ROOT / 'state' / 'projects' / project / 'analysis'
     output_dir.mkdir(parents=True, exist_ok=True)
 
     prompt = f"""# Coding Conventions & Patterns Discovery
@@ -399,10 +399,9 @@ From CLAUDE.md or code analysis, note:
 - What architectural boundaries must not be crossed?
 - What common mistakes should be avoided?
 
-### Step 5: Create Patterns Summary
+### Step 5: Return Patterns Summary
 
-Write to:
-**`.claude/clauditoreum/PatternsSummary.md`**
+Return the comprehensive summary as your response (do not write files - the orchestrator will save it).
 
 ```markdown
 # Coding Patterns & Conventions: {project}
@@ -485,8 +484,7 @@ async def run_codebase_analysis(project: str, workspace_root: Path) -> Dict[str,
     validate_project_name(project)
     logger.info(f"Running codebase analysis for {project}...")
 
-    project_dir = workspace_root / project
-    output_dir = project_dir / '.claude' / 'clauditoreum'
+    output_dir = ORCHESTRATOR_ROOT / 'state' / 'projects' / project / 'analysis'
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Phase 1: Architecture discovery (Claude Code CLI)

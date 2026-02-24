@@ -277,12 +277,12 @@ def find_generated_artifacts(project: Optional[str] = None) -> Dict[str, List[Pa
 
     # Get project-specific directories
     claude_dir = get_project_claude_dir(project)
-    agents_dir = claude_dir / 'agents'
+    agents_dir = claude_dir / 'agents' / 'clauditoreum'
     skills_dir = claude_dir / 'skills'
 
     # Find agent files
     if agents_dir.exists():
-        for agent_file in agents_dir.glob(f'{project}-*.md'):
+        for agent_file in agents_dir.glob('*.md'):
             # Check if generated
             try:
                 with open(agent_file, 'r') as f:

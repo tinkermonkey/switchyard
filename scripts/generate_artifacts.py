@@ -21,6 +21,8 @@ from monitoring.timestamp_utils import utc_isoformat
 # Configure logging
 logger = logging.getLogger(__name__)
 
+ORCHESTRATOR_ROOT = Path(os.environ.get('ORCHESTRATOR_ROOT', Path(__file__).parent.parent))
+
 
 def get_workspace_root() -> Path:
     """
@@ -114,7 +116,7 @@ async def generate_agent(
     # Get project-specific .claude directory
     workspace_root = get_workspace_root()
     claude_dir = get_project_claude_dir(project)
-    agents_dir = claude_dir / 'agents'
+    agents_dir = claude_dir / 'agents' / 'clauditoreum'
     agent_file = agents_dir / f"{agent_spec['name']}.md"
 
     if dry_run:
@@ -122,7 +124,7 @@ async def generate_agent(
         return agent_file
 
     # Read summaries
-    summaries_dir = workspace_root / project / '.claude' / 'clauditoreum'
+    summaries_dir = ORCHESTRATOR_ROOT / 'state' / 'projects' / project / 'analysis'
     arch_summary = (summaries_dir / 'ArchitectureSummary.md').read_text()
     tech_summary = (summaries_dir / 'TechStackSummary.md').read_text()
     patterns_summary = (summaries_dir / 'PatternsSummary.md').read_text()
@@ -165,7 +167,7 @@ You are creating an agent definition for the **{project}** project.
 
 Create a complete agent definition markdown file with YAML frontmatter.
 
-**Output Path:** `.claude/agents/{agent_spec['name']}.md`
+**Output Path:** `.claude/agents/clauditoreum/{agent_spec['name']}.md`
 
 Use this structure:
 
@@ -299,7 +301,7 @@ async def generate_skill(
         return skill_dir
 
     # Read summaries
-    summaries_dir = workspace_root / project / '.claude' / 'clauditoreum'
+    summaries_dir = ORCHESTRATOR_ROOT / 'state' / 'projects' / project / 'analysis'
     arch_summary = (summaries_dir / 'ArchitectureSummary.md').read_text()
     tech_summary = (summaries_dir / 'TechStackSummary.md').read_text()
     patterns_summary = (summaries_dir / 'PatternsSummary.md').read_text()
@@ -587,7 +589,7 @@ You are reviewing the generated agent and skill definitions for **{project}**.
 ## Artifacts to Review
 
 **Agents ({len(agent_files)}):**
-{chr(10).join(f'- .claude/agents/{name}' for name in agent_files)}
+{chr(10).join(f'- .claude/agents/clauditoreum/{name}' for name in agent_files)}
 
 **Skills ({len(skill_files)}):**
 {chr(10).join(f'- .claude/skills/{name}' for name in skill_files)}
