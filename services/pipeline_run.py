@@ -615,16 +615,20 @@ class PipelineRunManager:
         self,
         project: str,
         issue_number: int,
-        reason: Optional[str] = None
+        reason: Optional[str] = None,
+        retain_lock: bool = False
     ) -> bool:
         """
         End an active pipeline run
-        
+
         Args:
             project: Project name
             issue_number: Issue number
             reason: Optional reason for ending (for logging)
-            
+            retain_lock: If True, do not release the pipeline lock. Use this when the
+                         caller intends to keep the lock held after the run ends (e.g.,
+                         repair cycle failure awaiting manual intervention).
+
         Returns:
             True if run was ended, False if no active run found
         """
@@ -696,7 +700,14 @@ class PipelineRunManager:
         self._persist_to_elasticsearch(pipeline_run)
         
         # Release pipeline lock if this issue holds it
-        # This prevents stale locks from blocking other issues when runs end due to errors
+        # This prevents stale locks from blocking other issues when runs end due to errors.
+        # Skip when retain_lock=True (e.g. repair cycle failure — lock held for manual intervention).
+        if retain_lock:
+            logger.info(
+                f"Retaining pipeline lock for {project} issue #{issue_number} after ending run "
+                f"(retain_lock=True, reason: {reason or 'unspecified'})"
+            )
+            return True
         try:
             from services.pipeline_lock_manager import get_pipeline_lock_manager
             lock_manager = get_pipeline_lock_manager()

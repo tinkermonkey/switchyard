@@ -323,6 +323,58 @@ class TestPipelineRunCompletion:
         # The hdel should have been called to remove the lock
         assert 'test-project' not in mock_redis.data.get(lock_key, {})
 
+    def test_end_pipeline_run_retain_lock_skips_release(
+        self,
+        pipeline_run_manager,
+        mock_elasticsearch,
+        mock_redis,
+        mock_project_config
+    ):
+        """
+        Regression test: end_pipeline_run(retain_lock=True) must NOT release the
+        pipeline lock. This is the path taken on repair cycle failure — the lock
+        must stay held so the issue blocks the pipeline until a human moves it.
+        """
+        run_id = 'test-run-retain-lock'
+        pipeline_run_data = {
+            'id': run_id,
+            'issue_number': 350,
+            'issue_title': 'Test Retain Lock',
+            'issue_url': 'https://github.com/test-org/test-repo/issues/350',
+            'project': 'test-project',
+            'board': 'Test Board',
+            'started_at': datetime.utcnow().isoformat(),
+            'status': 'active'
+        }
+        # Seed the run data (keyed by run_id, not issue number)
+        run_redis_key = f"orchestrator:pipeline_run:{run_id}"
+        mock_redis.setex(run_redis_key, 3600, json.dumps(pipeline_run_data))
+        # Seed the issue → run_id mapping so get_active_pipeline_run() finds it
+        mock_redis.hset("orchestrator:pipeline_run:issue_mapping", "test-project:350", run_id)
+
+        mock_lock_mgr = MagicMock()
+        mock_lock_mgr.release_lock = MagicMock()
+
+        with patch('services.pipeline_lock_manager.get_pipeline_lock_manager', return_value=mock_lock_mgr):
+            result = pipeline_run_manager.end_pipeline_run(
+                'test-project',
+                350,
+                reason='Repair cycle failed: tests still failing',
+                retain_lock=True
+            )
+
+        # Lock must NOT have been released
+        mock_lock_mgr.release_lock.assert_not_called()
+
+        # But the pipeline run itself should still be persisted as completed
+        updated_data = mock_redis.get(run_redis_key)
+        assert updated_data is not None
+        updated_run = json.loads(updated_data)
+        assert updated_run['status'] == 'completed'
+
+        # And end_pipeline_run should have returned True (run was ended)
+        assert result is True
+
     def test_end_pipeline_run_with_no_active_run(
         self,
         pipeline_run_manager,

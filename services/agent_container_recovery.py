@@ -1593,16 +1593,35 @@ class AgentContainerRecovery:
                         # The current active run matches the container's original run - safe to end
                         logger.info(f"Validated: Current active run {current_run_id} matches container run {pipeline_run_id}")
 
-                # Proceed to end the run (either matched or no active run found)
+                # Proceed to end the run (either matched or no active run found).
+                # On failure, retain the lock so the issue blocks the pipeline until
+                # a human moves it out of Testing (same behaviour as the live-run path).
                 ended = pipeline_run_manager.end_pipeline_run(
                     project=project,
                     issue_number=issue_number,
-                    reason="Repair cycle completed successfully" if overall_success else "Repair cycle failed"
+                    reason="Repair cycle completed successfully" if overall_success else "Repair cycle failed",
+                    retain_lock=not overall_success
                 )
                 if ended:
-                    logger.info(f"Ended pipeline run {pipeline_run_id} for {project}/#{issue_number}")
+                    logger.info(
+                        f"Ended pipeline run {pipeline_run_id} for {project}/#{issue_number}"
+                        + (" (lock retained — awaiting manual intervention)" if not overall_success else "")
+                    )
                 else:
                     logger.warning(f"Pipeline run {pipeline_run_id} was already ended or not found")
+
+                # Set the repair_failed Redis marker so _reconcile_active_runs knows
+                # this lock is intentionally held and the watchdog skips it.
+                if not overall_success:
+                    try:
+                        if self.redis:
+                            repair_failed_key = (
+                                f"pipeline_lock:repair_failed:"
+                                f"{project}:{board_name}:{issue_number}"
+                            )
+                            self.redis.set(repair_failed_key, "1", ex=172800)  # 48h TTL
+                    except Exception as redis_err:
+                        logger.warning(f"Failed to set repair_failed marker in Redis: {redis_err}")
             except Exception as e:
                 logger.error(f"Failed to end pipeline run {pipeline_run_id}: {e}", exc_info=True)
 

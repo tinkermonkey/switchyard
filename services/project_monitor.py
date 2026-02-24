@@ -4594,16 +4594,19 @@ The automated test-fix-validate cycle has failed and requires manual interventio
                     )
 
                     # End pipeline run if failed (success case is handled in normal flow)
-                    # Only end if not already ended (e.g., in timeout handler)
+                    # Only end if not already ended (e.g., in timeout handler).
+                    # Pass retain_lock=True so the pipeline lock is NOT released — the issue
+                    # stays blocked in Testing until a human moves it manually.
                     if not overall_success and not pipeline_run_ended:
                         try:
                             ended = self.pipeline_run_manager.end_pipeline_run(
                                 project=project_name,
                                 issue_number=issue_number,
-                                reason=f"Repair cycle failed: {error_message or 'Unknown error'}"
+                                reason=f"Repair cycle failed: {error_message or 'Unknown error'}",
+                                retain_lock=True
                             )
                             if ended:
-                                logger.info(f"Ended pipeline run for {project_name}/#{issue_number} due to failure")
+                                logger.info(f"Ended pipeline run for {project_name}/#{issue_number} due to failure (lock retained)")
                         except Exception as e:
                             logger.error(f"Failed to end pipeline run in finally block: {e}")
 
