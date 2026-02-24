@@ -254,6 +254,8 @@ CMD ["/bin/bash"]
 ❌ Not using .dockerignore - Sends huge build context to Docker daemon
 ❌ Not verifying Claude CLI is present - Agent will fail at runtime
 ❌ Installing dependencies without cache mounts - Slow and wasteful
+❌ `RUN touch /home/orchestrator/.gitconfig` - Creates a file that breaks the runtime bind mount (see .gitconfig section)
+❌ `RUN git config --global ...` - Writes ~/.gitconfig into the image, same breakage (see .gitconfig section)
 
 **Optimization: Create .dockerignore**:
 
@@ -291,6 +293,32 @@ This reduces build context from 770MB to <10MB and speeds up builds dramatically
 - Validation scripts are usually in the project root or mentioned in the issue
 
 **CRITICAL**: Steps 4 and 5 (BUILD and TEST) are MANDATORY for environment changes. Without them, you haven't verified the fix works.
+
+### The .gitconfig Mount — Read This Carefully
+
+`/home/orchestrator/.gitconfig` is a **runtime bind mount** injected by the orchestrator at container startup. It is never part of the image.
+
+**What this means for Dockerfile.agent**:
+- Do NOT create, touch, mkdir, or reference `/home/orchestrator/.gitconfig` in any Dockerfile step
+- Do NOT run `git config --global` or any command that writes to `~/.gitconfig` as the orchestrator user during the build
+- The base image explicitly removes `.gitconfig` before you build from it — leave that state alone
+
+**If you encounter a `.gitconfig`-related error**:
+- An error like `error mounting "/home/orchestrator/.gitconfig"` or `cannot create subdirectories in .../home/orchestrator/.gitconfig: not a directory` is a **host filesystem problem**, not an image problem
+- The correct fix is to report the error in your output — do NOT attempt to fix it by modifying the Dockerfile
+- The issue is that the mount source on the host is a directory instead of a file, which is a sysadmin-level fix outside your scope
+
+**Never do any of these, no matter what**:
+```
+❌ RUN touch /home/orchestrator/.gitconfig
+❌ RUN mkdir -p /home/orchestrator/.gitconfig
+❌ RUN [ -d /home/orchestrator/.gitconfig ] && rm -rf ...
+❌ RUN git config --global user.email "..."
+❌ RUN git config --global user.name "..."
+❌ Any RUN step that reads, writes, or tests /home/orchestrator/.gitconfig
+```
+
+Creating `.gitconfig` as a file in the image will cause ALL agent containers built from this image to fail with a Docker mount error, because the orchestrator will try to bind-mount a directory over a file.
 
 ### Common Environment Issues:
 
