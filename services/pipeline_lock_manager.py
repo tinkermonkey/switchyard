@@ -199,7 +199,7 @@ class PipelineLockManager:
                                         if lock_acquired_at:
                                             acquired_time = datetime.fromisoformat(lock_acquired_at)
                                             lock_age = datetime.now(timezone.utc) - acquired_time
-                                            if lock_age > timedelta(hours=2):
+                                            if lock_age > timedelta(hours=4):
                                                 # Stale - overwrite it
                                                 # Proceed to acquire logic below
                                                 pass
@@ -266,8 +266,8 @@ class PipelineLockManager:
             lock_acquired_time = datetime.fromisoformat(lock.lock_acquired_at)
             lock_age = datetime.now(timezone.utc) - lock_acquired_time
 
-            # Stale lock threshold: 2 hours
-            if lock_age > timedelta(hours=2):
+            # Stale lock threshold: 4 hours
+            if lock_age > timedelta(hours=4):
                 logger.warning(
                     f"Stale lock detected for {project}/{board} "
                     f"(held by #{lock.locked_by_issue} for {lock_age})"
@@ -497,9 +497,9 @@ class PipelineLockManager:
             try:
                 lock_key = self._get_lock_key(lock.project, lock.board)
 
-                # Validate lock age - don't sync stale locks (older than 2 hours)
+                # Validate lock age - don't sync stale locks (older than 4 hours)
                 from datetime import datetime, timezone, timedelta
-                lock_age_threshold = datetime.now(timezone.utc) - timedelta(hours=2)
+                lock_age_threshold = datetime.now(timezone.utc) - timedelta(hours=4)
                 lock_acquired_time = datetime.fromisoformat(lock.lock_acquired_at.replace('Z', '+00:00'))
 
                 if lock_acquired_time < lock_age_threshold:

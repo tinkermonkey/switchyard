@@ -1761,6 +1761,21 @@ If the failures appear to be isolated per-file issues with different root causes
                     f"Env rebuild ended with status={final_status} for {project} "
                     f"after {elapsed}s, stopping sub-cycle"
                 )
+                # If we timed out (final_status is None), the dev container may still be
+                # in IN_PROGRESS from when we queued the setup agent. Reset to UNVERIFIED
+                # so future pipeline executions aren't blocked by a stale in_progress state.
+                if final_status is None:
+                    current = dev_container_state.get_status(project)
+                    if current == DevContainerStatus.IN_PROGRESS:
+                        logger.warning(
+                            f"Env rebuild timed out for {project} with container still "
+                            f"IN_PROGRESS — resetting to UNVERIFIED to unblock future runs"
+                        )
+                        dev_container_state.set_status(
+                            project,
+                            DevContainerStatus.UNVERIFIED,
+                            error_message="Reset after env rebuild polling timeout",
+                        )
                 break
 
         if obs:
