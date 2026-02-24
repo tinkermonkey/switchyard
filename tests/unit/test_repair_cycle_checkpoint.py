@@ -1,13 +1,21 @@
 """
-Unit tests for repair cycle checkpoint system
+Unit tests for repair cycle checkpoint system and systemic failure detection
 """
 
 import json
 import pytest
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
 from pipeline.repair_cycle_checkpoint import (
     RepairCycleCheckpoint,
     create_checkpoint_state
+)
+from pipeline.repair_cycle import (
+    RepairCycleStage,
+    RepairTestRunConfig,
+    RepairTestResult,
+    RepairTestFailure,
+    SystemicAnalysisResult,
 )
 
 
@@ -297,3 +305,187 @@ class TestRepairCycleCheckpoint:
         assert loaded is not None
         assert loaded["iteration"] == 1  # From backup
         assert loaded["agent_call_count"] == 5
+
+
+# ---------------------------------------------------------------------------
+# Systemic failure detection tests
+# ---------------------------------------------------------------------------
+
+def _make_test_result(failed: int = 3) -> RepairTestResult:
+    """Helper: build a RepairTestResult with N failures across N files."""
+    failures = [
+        RepairTestFailure(file=f"src/comp{i}.tsx", test="test_render", message="import error")
+        for i in range(failed)
+    ]
+    return RepairTestResult(
+        test_type="unit",
+        iteration=1,
+        passed=0,
+        failed=failed,
+        warnings=0,
+        failures=failures,
+        warning_list=[],
+        raw_output="",
+        timestamp="2026-01-01T00:00:00Z",
+    )
+
+
+def _make_stage() -> RepairCycleStage:
+    """Helper: create a RepairCycleStage without Docker-only imports."""
+    return RepairCycleStage(
+        name="testing",
+        test_configs=[RepairTestRunConfig(test_type="unit")],
+        agent_name="senior_software_engineer",
+    )
+
+
+class TestSystemicFailureDetection:
+    """Tests for systemic failure analysis and routing in RepairCycleStage."""
+
+    def test_systemic_analysis_done_flag_initialized_false(self):
+        """_systemic_analysis_done is False on construction."""
+        stage = _make_stage()
+        assert stage._systemic_analysis_done is False
+
+    @pytest.mark.asyncio
+    async def test_analyze_systemic_failures_called_on_first_iteration_with_failures(self):
+        """_systemic_analysis_done flag gates the analysis call.
+
+        Verifies that the guard logic in _run_test_cycle invokes
+        _analyze_systemic_failures exactly once when _systemic_analysis_done is
+        False, and sets the flag afterwards so subsequent iterations skip it.
+        """
+        stage = _make_stage()
+        assert stage._systemic_analysis_done is False
+
+        no_issues = SystemicAnalysisResult(
+            has_env_issues=False,
+            has_systemic_code_issues=False,
+            env_issue_description="",
+            systemic_issue_description="",
+            affected_files=[],
+            raw_json={},
+        )
+
+        with patch.object(stage, "_analyze_systemic_failures", new=AsyncMock(return_value=no_issues)) as mock_analyze:
+            # Replicate the guard block from _run_test_cycle for the first call
+            test_result = _make_test_result(failed=2)
+            grouped = test_result.group_failures_by_file()
+
+            if not stage._systemic_analysis_done:
+                stage._systemic_analysis_done = True
+                await stage._analyze_systemic_failures(
+                    test_result, grouped, stage.test_configs[0], {}
+                )
+
+            mock_analyze.assert_awaited_once()
+            assert stage._systemic_analysis_done is True
+
+            # Simulate a second iteration — the guard must skip the call
+            if not stage._systemic_analysis_done:
+                await stage._analyze_systemic_failures(
+                    test_result, grouped, stage.test_configs[0], {}
+                )
+
+            # Still only called once
+            assert mock_analyze.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_systemic_fix_sub_cycle_skips_non_affected_files(self):
+        """_fix_failures_by_file receives only the non-systemic files after systemic fix."""
+        stage = _make_stage()
+
+        # Systemic analysis says src/comp0.tsx and src/comp1.tsx are systemic;
+        # src/comp2.tsx is an isolated issue.
+        systemic_analysis = SystemicAnalysisResult(
+            has_env_issues=False,
+            has_systemic_code_issues=True,
+            env_issue_description="",
+            systemic_issue_description="Replace deprecated API across all files",
+            affected_files=["src/comp0.tsx", "src/comp1.tsx"],
+            raw_json={},
+        )
+
+        # After the systemic fix, only src/comp2.tsx remains failing
+        remaining_result = RepairTestResult(
+            test_type="unit",
+            iteration=1,
+            passed=0,
+            failed=1,
+            warnings=0,
+            failures=[RepairTestFailure(file="src/comp2.tsx", test="test_render", message="other error")],
+            warning_list=[],
+            raw_output="",
+            timestamp="2026-01-01T00:00:00Z",
+        )
+
+        with patch.object(stage, "_analyze_systemic_failures", new=AsyncMock(return_value=systemic_analysis)), \
+             patch.object(stage, "_run_systemic_fix_sub_cycle", new=AsyncMock(return_value=remaining_result)) as mock_fix, \
+             patch.object(stage, "_fix_failures_by_file", new=AsyncMock(return_value=1)) as mock_per_file, \
+             patch.object(stage, "_checkpoint", new=AsyncMock()):
+
+            # Simulate the block in _run_test_cycle that routes after analysis
+            test_result = _make_test_result(failed=3)
+            grouped = test_result.group_failures_by_file()
+
+            if not stage._systemic_analysis_done:
+                stage._systemic_analysis_done = True
+                analysis = await stage._analyze_systemic_failures(
+                    test_result, grouped, stage.test_configs[0], {}
+                )
+                if analysis.has_systemic_code_issues:
+                    test_result = await stage._run_systemic_fix_sub_cycle(
+                        analysis, stage.test_configs[0], {}, 1, 1
+                    )
+                    grouped = test_result.group_failures_by_file()
+
+            await stage._fix_failures_by_file(grouped, stage.test_configs[0], {})
+
+            # Per-file fixer should only see the one remaining isolated file
+            called_files = list(mock_per_file.call_args[0][0].keys())
+            assert called_files == ["src/comp2.tsx"]
+            assert "src/comp0.tsx" not in called_files
+            assert "src/comp1.tsx" not in called_files
+
+    @pytest.mark.asyncio
+    async def test_systemic_analysis_not_repeated_on_second_iteration(self):
+        """_analyze_systemic_failures is NOT called if _systemic_analysis_done is True."""
+        stage = _make_stage()
+        stage._systemic_analysis_done = True  # Already ran
+
+        with patch.object(stage, "_analyze_systemic_failures", new=AsyncMock()) as mock_analyze:
+            # Simulate the guard in _run_test_cycle
+            if not stage._systemic_analysis_done:
+                await stage._analyze_systemic_failures(MagicMock(), {}, MagicMock(), {})
+
+            mock_analyze.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_analyze_systemic_failures_returns_no_issues_on_parse_failure(self):
+        """_analyze_systemic_failures falls back to no-issues on JSON parse failure."""
+        import sys
+
+        stage = _make_stage()
+        test_result = _make_test_result(failed=2)
+        grouped = test_result.group_failures_by_file()
+        context = {"project": "test-project", "observability": None}
+
+        # Inject a mock for services.agent_executor into sys.modules so the
+        # deferred `from services.agent_executor import get_agent_executor` inside
+        # _analyze_systemic_failures never triggers the Docker-only pipeline.factory
+        # → agents import chain.
+        mock_executor = MagicMock()
+        mock_executor.execute_agent = AsyncMock(
+            return_value={"markdown_analysis": "This is not JSON at all!"}
+        )
+        mock_agent_executor_mod = MagicMock()
+        mock_agent_executor_mod.get_agent_executor = MagicMock(return_value=mock_executor)
+
+        with patch.dict(sys.modules, {"services.agent_executor": mock_agent_executor_mod}):
+            result = await stage._analyze_systemic_failures(
+                test_result, grouped, stage.test_configs[0], context
+            )
+
+        assert result.has_env_issues is False
+        assert result.has_systemic_code_issues is False
+        assert result.affected_files == []

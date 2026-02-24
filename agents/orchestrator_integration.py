@@ -62,7 +62,7 @@ async def validate_task_can_run(task, logger) -> Dict[str, Any]:
         }
 
 
-async def queue_dev_environment_setup(project: str, logger):
+async def queue_dev_environment_setup(project: str, logger, change_description: str = ""):
     """
     Queue a dev_environment_setup task for a project.
 
@@ -72,6 +72,9 @@ async def queue_dev_environment_setup(project: str, logger):
     Args:
         project: Project name
         logger: Logger instance
+        change_description: Optional description of what env changes are needed,
+            injected into the task issue body so the setup agent receives specific
+            instructions (e.g. from systemic failure analysis).
     """
     from task_queue.task_manager import Task, TaskPriority, TaskQueue
     from services.dev_container_state import dev_container_state, DevContainerStatus
@@ -95,6 +98,13 @@ async def queue_dev_environment_setup(project: str, logger):
 
         task_queue = TaskQueue(use_redis=True)
 
+        base_body = 'Auto-triggered: Agent requires dev container but it is not verified'
+        issue_body = (
+            f"{base_body}\n\nRequired changes:\n{change_description}"
+            if change_description
+            else base_body
+        )
+
         task = Task(
             id=str(uuid.uuid4()),
             agent="dev_environment_setup",
@@ -103,7 +113,7 @@ async def queue_dev_environment_setup(project: str, logger):
             context={
                 'issue': {
                     'title': f'Development environment setup for {project}',
-                    'body': 'Auto-triggered: Agent requires dev container but it is not verified',
+                    'body': issue_body,
                     'number': 0
                 },
                 'issue_number': 0,

@@ -75,6 +75,19 @@ If everything passes cleanly, return:
 
 DO NOT include any explanation, markdown formatting, or other text - ONLY the JSON object."""
 
+MAX_SYSTEMIC_SUB_CYCLES = 3   # max attempts per special-case sub-cycle
+
+
+@dataclass
+class SystemicAnalysisResult:
+    """Result of systemic failure analysis"""
+    has_env_issues: bool
+    has_systemic_code_issues: bool
+    env_issue_description: str        # plain text for setup agent prompt
+    systemic_issue_description: str   # plain text for fix agent prompt
+    affected_files: List[str]         # files involved in systemic code fix
+    raw_json: Dict[str, Any]          # full parsed response
+
 
 @dataclass
 class RepairTestRunConfig:
@@ -202,6 +215,7 @@ class RepairCycleStage(PipelineStage):
         self.max_total_agent_calls = max_total_agent_calls
         self.checkpoint_interval = checkpoint_interval
         self._agent_call_count = 0
+        self._systemic_analysis_done = False
 
     @staticmethod
     def _sanitize_filename(filename: str) -> str:
@@ -542,6 +556,32 @@ class RepairCycleStage(PipelineStage):
             # Step 4: Group failures by file (direct Claude parse)
             grouped_failures = test_result.group_failures_by_file()
             logger.info(f"Found failures in {len(grouped_failures)} files: " f"{list(grouped_failures.keys())}")
+
+            # --- SYSTEMIC ANALYSIS BLOCK ---
+            # On the first iteration with failures, check for systemic root causes
+            # before dispatching expensive per-file fix calls.
+            if not self._systemic_analysis_done:
+                self._systemic_analysis_done = True
+                analysis = await self._analyze_systemic_failures(
+                    test_result, grouped_failures, config, context
+                )
+
+                if analysis.has_env_issues:
+                    test_result = await self._run_env_rebuild_sub_cycle(
+                        analysis, config, context, test_cycle_iteration, test_type_index
+                    )
+                    if not test_result.has_failures():
+                        continue  # Back to top of test cycle loop (success path)
+                    grouped_failures = test_result.group_failures_by_file()
+
+                if analysis.has_systemic_code_issues:
+                    test_result = await self._run_systemic_fix_sub_cycle(
+                        analysis, config, context, test_cycle_iteration, test_type_index
+                    )
+                    if not test_result.has_failures():
+                        continue  # Back to top of test cycle loop (success path)
+                    grouped_failures = test_result.group_failures_by_file()
+            # --- END SYSTEMIC ANALYSIS BLOCK ---
 
             # Emit fix cycle started event
             if obs:
@@ -1401,3 +1441,509 @@ For each warning:
 
         except Exception as e:
             logger.error(f"Failed to emit cycle metrics: {e}", exc_info=True)
+
+    async def _analyze_systemic_failures(
+        self,
+        test_result: "RepairTestResult",
+        grouped_failures: Dict[str, List["RepairTestFailure"]],
+        config: "RepairTestRunConfig",
+        context: Dict[str, Any],
+    ) -> SystemicAnalysisResult:
+        """
+        Analyze test failures for systemic root causes via a single SSE call.
+
+        Classifies failures into:
+        - Environmental: require Docker image rebuild (Dockerfile.agent changes)
+        - Systemic code: same bug pattern across many files, one global fix applies
+
+        Falls back to a "no issues" result (allowing per-file fixing to proceed)
+        if the SSE call fails or JSON parsing fails.
+        """
+        import re
+
+        obs = context.get("observability")
+        project = context.get("project", "unknown")
+        task_id = context.get("task_id", f"repair_cycle_{self.name}")
+        pipeline_run_id = context.get("pipeline_run_id")
+
+        if obs:
+            obs.emit(
+                EventType.REPAIR_CYCLE_SYSTEMIC_ANALYSIS_STARTED,
+                "repair_cycle",
+                task_id,
+                project,
+                {
+                    "test_type": config.test_type,
+                    "total_failures": test_result.failed,
+                    "file_count": len(grouped_failures),
+                },
+                pipeline_run_id=pipeline_run_id,
+            )
+
+        # Build a compact failure summary for the prompt
+        failure_lines = []
+        for file, failures in grouped_failures.items():
+            failure_lines.append(f"File: {file} ({len(failures)} failures)")
+            for f in failures[:5]:
+                failure_lines.append(f"  - [{f.test}] {f.message[:200]}")
+            if len(failures) > 5:
+                failure_lines.append(f"  ... and {len(failures) - 5} more")
+        failure_summary = "\n".join(failure_lines)
+
+        direct_prompt = f"""Analyze these test failures for systemic root causes.
+
+Project: {project}
+Test type: {config.test_type}
+Total failures: {test_result.failed}
+Files with failures: {len(grouped_failures)}
+
+Failure summary:
+{failure_summary}
+
+Classify the failures into:
+1. Environmental issues: version mismatches, missing packages, stale node_modules, outdated Docker image, or any issue requiring Dockerfile.agent changes
+2. Systemic code issues: the same code pattern or bug repeated across many files that can be fixed with a single global change
+
+You MUST return ONLY valid JSON in this EXACT format (no markdown, no explanation):
+{{
+    "has_env_issues": true,
+    "env_issue_description": "describe what Dockerfile.agent or environment changes are needed, or empty string if none",
+    "has_systemic_code_issues": false,
+    "systemic_issue_description": "describe the global code fix needed and how to apply it, or empty string if none",
+    "affected_files": ["list of files involved in the systemic code fix, or empty array"]
+}}
+
+If the failures appear to be isolated per-file issues with different root causes, return has_env_issues: false and has_systemic_code_issues: false."""
+
+        task_context = {
+            **context,
+            "pipeline_run_id": pipeline_run_id,
+            "task_description": f"Analyze systemic failures in {config.test_type} tests",
+            "timeout": min(config.timeout, 300),  # Cap at 5 minutes for analysis
+            "skip_workspace_prep": True,
+            "review_cycle": None,
+            "direct_prompt": direct_prompt,
+        }
+
+        no_issues = SystemicAnalysisResult(
+            has_env_issues=False,
+            has_systemic_code_issues=False,
+            env_issue_description="",
+            systemic_issue_description="",
+            affected_files=[],
+            raw_json={},
+        )
+
+        try:
+            if self._agent_call_count >= self.max_total_agent_calls:
+                logger.warning("Circuit breaker reached before systemic analysis, skipping")
+                return no_issues
+
+            from services.agent_executor import get_agent_executor
+            agent_executor = get_agent_executor()
+
+            self._agent_call_count += 1
+
+            result = await agent_executor.execute_agent(
+                agent_name=self.agent_name,
+                project_name=project,
+                task_context=task_context,
+                execution_type="repair_systemic_analysis",
+            )
+
+            result_text = result.get("markdown_analysis") or result.get("raw_analysis_result", "")
+
+            if not result_text or not result_text.strip():
+                logger.warning("Systemic analysis returned empty output, skipping")
+                return no_issues
+
+            # Extract JSON (no required-field validation — different schema than test results)
+            parsed = None
+            try:
+                parsed = json.loads(result_text.strip())
+            except json.JSONDecodeError:
+                json_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", result_text, re.DOTALL)
+                if json_match:
+                    try:
+                        parsed = json.loads(json_match.group(1))
+                    except json.JSONDecodeError:
+                        pass
+
+            if parsed is None:
+                json_objects = re.findall(r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}", result_text, re.DOTALL)
+                for json_str in reversed(json_objects):
+                    try:
+                        candidate = json.loads(json_str)
+                        if isinstance(candidate, dict) and "has_env_issues" in candidate:
+                            parsed = candidate
+                            break
+                    except json.JSONDecodeError:
+                        continue
+
+            if not isinstance(parsed, dict):
+                logger.warning(
+                    f"Systemic analysis did not return a JSON object, falling back to per-file fixes. "
+                    f"Response preview: {result_text[:500]}"
+                )
+                return no_issues
+
+            analysis_result = SystemicAnalysisResult(
+                has_env_issues=bool(parsed.get("has_env_issues", False)),
+                has_systemic_code_issues=bool(parsed.get("has_systemic_code_issues", False)),
+                env_issue_description=parsed.get("env_issue_description", ""),
+                systemic_issue_description=parsed.get("systemic_issue_description", ""),
+                affected_files=parsed.get("affected_files", []),
+                raw_json=parsed,
+            )
+
+            logger.info(
+                f"Systemic analysis: env_issues={analysis_result.has_env_issues}, "
+                f"code_issues={analysis_result.has_systemic_code_issues}, "
+                f"affected_files={len(analysis_result.affected_files)}"
+            )
+
+            if obs:
+                obs.emit(
+                    EventType.REPAIR_CYCLE_SYSTEMIC_ANALYSIS_COMPLETED,
+                    "repair_cycle",
+                    task_id,
+                    project,
+                    {
+                        "test_type": config.test_type,
+                        "has_env_issues": analysis_result.has_env_issues,
+                        "has_systemic_code_issues": analysis_result.has_systemic_code_issues,
+                        "affected_files_count": len(analysis_result.affected_files),
+                    },
+                    pipeline_run_id=pipeline_run_id,
+                )
+
+            return analysis_result
+
+        except CancellationError:
+            raise
+        except Exception as e:
+            logger.warning(
+                f"Systemic failure analysis failed: {e}, falling back to per-file fixes",
+                exc_info=True,
+            )
+            if obs:
+                obs.emit(
+                    EventType.REPAIR_CYCLE_SYSTEMIC_ANALYSIS_COMPLETED,
+                    "repair_cycle",
+                    task_id,
+                    project,
+                    {
+                        "test_type": config.test_type,
+                        "has_env_issues": False,
+                        "has_systemic_code_issues": False,
+                        "error": str(e),
+                    },
+                    pipeline_run_id=pipeline_run_id,
+                )
+            return no_issues
+
+    async def _run_env_rebuild_sub_cycle(
+        self,
+        analysis: SystemicAnalysisResult,
+        config: "RepairTestRunConfig",
+        context: Dict[str, Any],
+        test_cycle_iteration: int,
+        test_type_index: int,
+    ) -> "RepairTestResult":
+        """
+        Coordinate dev environment rebuild to fix environmental failures.
+
+        Resets container state, queues dev_environment_setup with the specific
+        change description, and polls until VERIFIED or BLOCKED/timeout.
+        Loops up to MAX_SYSTEMIC_SUB_CYCLES times if rebuild succeeds but tests
+        still fail (suggesting incomplete fix).
+
+        Returns the last RepairTestResult obtained, so _run_test_cycle() can
+        use it directly without a redundant test re-run.
+        """
+        from services.dev_container_state import dev_container_state, DevContainerStatus
+
+        obs = context.get("observability")
+        project = context.get("project", "unknown")
+        task_id = context.get("task_id", f"repair_cycle_{self.name}")
+        pipeline_run_id = context.get("pipeline_run_id")
+        issue_number = context.get("issue_number")
+
+        if obs:
+            obs.emit(
+                EventType.REPAIR_CYCLE_ENV_REBUILD_STARTED,
+                "repair_cycle",
+                task_id,
+                project,
+                {
+                    "test_type": config.test_type,
+                    "env_issue_description": analysis.env_issue_description,
+                },
+                pipeline_run_id=pipeline_run_id,
+            )
+
+        last_test_result = None
+        attempts_made = 0
+
+        for attempt in range(MAX_SYSTEMIC_SUB_CYCLES):
+            attempts_made = attempt + 1
+
+            # Check circuit breaker before each rebuild attempt
+            if self._agent_call_count >= self.max_total_agent_calls:
+                logger.error("Circuit breaker triggered during env rebuild sub-cycle")
+                break
+
+            logger.info(
+                f"Env rebuild sub-cycle attempt {attempts_made}/{MAX_SYSTEMIC_SUB_CYCLES}: "
+                f"{analysis.env_issue_description[:100]}"
+            )
+
+            try:
+                # Reset container state to UNVERIFIED to allow re-queuing
+                dev_container_state.set_status(
+                    project,
+                    DevContainerStatus.UNVERIFIED,
+                    error_message=f"Reset for systemic env fix: {analysis.env_issue_description[:200]}",
+                )
+
+                # Queue dev environment setup with the change description
+                from agents.orchestrator_integration import queue_dev_environment_setup
+                await queue_dev_environment_setup(
+                    project, logger, change_description=analysis.env_issue_description
+                )
+
+            except CancellationError:
+                raise
+            except Exception as e:
+                logger.error(f"Env rebuild setup failed on attempt {attempts_made}: {e}", exc_info=True)
+                break
+
+            # Poll until VERIFIED, BLOCKED, or timeout
+            poll_timeout = config.timeout // 2
+            poll_interval = 30
+            elapsed = 0
+            final_status = None
+
+            while elapsed < poll_timeout:
+                await asyncio.sleep(poll_interval)
+                elapsed += poll_interval
+
+                # Check for cancellation during long polling wait
+                if issue_number:
+                    from services.cancellation import get_cancellation_signal
+                    if get_cancellation_signal().is_cancelled(project, issue_number):
+                        logger.warning(
+                            f"Pipeline cancelled during env rebuild polling for {project}/#{issue_number}"
+                        )
+                        raise CancellationError(
+                            f"Pipeline cancelled for {project}/#{issue_number}"
+                        )
+
+                status = dev_container_state.get_status(project)
+                logger.info(
+                    f"Dev container status for {project}: {status.value} (elapsed: {elapsed}s)"
+                )
+                if status in (DevContainerStatus.VERIFIED, DevContainerStatus.BLOCKED):
+                    final_status = status
+                    break
+
+            if final_status == DevContainerStatus.VERIFIED:
+                # Rebuild succeeded; run tests to see if the env fix resolved failures
+                last_test_result = await self._run_tests(
+                    config, context, test_cycle_iteration, test_type_index
+                )
+                if not last_test_result.has_failures():
+                    break  # All tests pass — done
+                # Tests still failing after rebuild; try again (up to MAX attempts)
+            else:
+                # BLOCKED or timeout — stop retrying
+                logger.warning(
+                    f"Env rebuild ended with status={final_status} for {project} "
+                    f"after {elapsed}s, stopping sub-cycle"
+                )
+                break
+
+        if obs:
+            obs.emit(
+                EventType.REPAIR_CYCLE_ENV_REBUILD_COMPLETED,
+                "repair_cycle",
+                task_id,
+                project,
+                {
+                    "test_type": config.test_type,
+                    "attempts": attempts_made,
+                    "tests_pass": last_test_result is not None and not last_test_result.has_failures(),
+                },
+                pipeline_run_id=pipeline_run_id,
+            )
+
+        # If we never got to run tests (e.g., BLOCKED immediately), return a synthetic failure
+        if last_test_result is None:
+            last_test_result = RepairTestResult(
+                test_type=config.test_type,
+                iteration=test_cycle_iteration,
+                passed=0,
+                failed=1,
+                warnings=0,
+                failures=[
+                    RepairTestFailure(
+                        file="__env__",
+                        test="env_rebuild",
+                        message=(
+                            f"Env rebuild did not reach VERIFIED status for {project}. "
+                            f"Check dev container state and Dockerfile.agent."
+                        ),
+                    )
+                ],
+                warning_list=[],
+                raw_output="",
+                timestamp=utc_isoformat(),
+            )
+
+        return last_test_result
+
+    async def _run_systemic_fix_sub_cycle(
+        self,
+        analysis: SystemicAnalysisResult,
+        config: "RepairTestRunConfig",
+        context: Dict[str, Any],
+        test_cycle_iteration: int,
+        test_type_index: int,
+    ) -> "RepairTestResult":
+        """
+        Apply a global fix for a systemic code issue across all affected files.
+
+        Dispatches a single SSE per attempt with all affected files and the
+        systemic issue description. Loops up to MAX_SYSTEMIC_SUB_CYCLES times
+        if tests still fail after each attempt.
+
+        Returns the last RepairTestResult obtained, so _run_test_cycle() can
+        use it directly without a redundant test re-run.
+        """
+        obs = context.get("observability")
+        project = context.get("project", "unknown")
+        task_id = context.get("task_id", f"repair_cycle_{self.name}")
+        pipeline_run_id = context.get("pipeline_run_id")
+
+        if obs:
+            obs.emit(
+                EventType.REPAIR_CYCLE_SYSTEMIC_FIX_STARTED,
+                "repair_cycle",
+                task_id,
+                project,
+                {
+                    "test_type": config.test_type,
+                    "systemic_issue_description": analysis.systemic_issue_description,
+                    "affected_files_count": len(analysis.affected_files),
+                },
+                pipeline_run_id=pipeline_run_id,
+            )
+
+        files_list = (
+            "\n".join(f"- {f}" for f in analysis.affected_files)
+            if analysis.affected_files
+            else "(all failing files)"
+        )
+
+        last_test_result = None
+        attempts_made = 0
+
+        for attempt in range(MAX_SYSTEMIC_SUB_CYCLES):
+            attempts_made = attempt + 1
+
+            # Check circuit breaker before each attempt
+            if self._agent_call_count >= self.max_total_agent_calls:
+                logger.error("Circuit breaker triggered during systemic fix sub-cycle")
+                break
+
+            logger.info(
+                f"Systemic fix sub-cycle attempt {attempts_made}/{MAX_SYSTEMIC_SUB_CYCLES}: "
+                f"{analysis.systemic_issue_description[:100]}"
+            )
+
+            direct_prompt = f"""Apply a global fix for a systemic code issue across multiple files.
+
+Issue: {analysis.systemic_issue_description}
+
+Affected files:
+{files_list}
+
+Apply the fix to ALL affected files. Use targeted search-and-replace, sed, or direct edits as appropriate.
+Focus on applying the same fix consistently across all files rather than analyzing each individually."""
+
+            task_context = {
+                **context,
+                "pipeline_run_id": pipeline_run_id,
+                "task_description": (
+                    f"Apply systemic fix: {analysis.systemic_issue_description[:100]}"
+                ),
+                "timeout": config.timeout,
+                "skip_workspace_prep": True,
+                "review_cycle": None,
+                "direct_prompt": direct_prompt,
+            }
+
+            self._agent_call_count += 1
+
+            try:
+                from services.agent_executor import get_agent_executor
+                agent_executor = get_agent_executor()
+
+                await agent_executor.execute_agent(
+                    agent_name=self.agent_name,
+                    project_name=project,
+                    task_context=task_context,
+                    execution_type="repair_systemic_fix",
+                )
+                logger.info(f"Systemic fix attempt {attempts_made} completed")
+
+            except CancellationError:
+                raise
+            except Exception as e:
+                logger.error(
+                    f"Systemic fix attempt {attempts_made} failed: {e}", exc_info=True
+                )
+                # Continue to test run — partial fix may still have helped
+
+            # Re-run tests to evaluate the fix
+            last_test_result = await self._run_tests(
+                config, context, test_cycle_iteration, test_type_index
+            )
+            if not last_test_result.has_failures():
+                break  # Fix resolved all failures
+
+        if obs:
+            obs.emit(
+                EventType.REPAIR_CYCLE_SYSTEMIC_FIX_COMPLETED,
+                "repair_cycle",
+                task_id,
+                project,
+                {
+                    "test_type": config.test_type,
+                    "attempts": attempts_made,
+                    "tests_pass": last_test_result is not None and not last_test_result.has_failures(),
+                },
+                pipeline_run_id=pipeline_run_id,
+            )
+
+        # Should not be None (loop always runs at least once), but guard defensively
+        if last_test_result is None:
+            last_test_result = RepairTestResult(
+                test_type=config.test_type,
+                iteration=test_cycle_iteration,
+                passed=0,
+                failed=1,
+                warnings=0,
+                failures=[
+                    RepairTestFailure(
+                        file="__infrastructure__",
+                        test="systemic_fix",
+                        message="Systemic fix sub-cycle produced no test result",
+                    )
+                ],
+                warning_list=[],
+                raw_output="",
+                timestamp=utc_isoformat(),
+            )
+
+        return last_test_result

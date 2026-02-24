@@ -168,6 +168,12 @@ class EventType(Enum):
     REPAIR_CYCLE_WARNING_REVIEW_FAILED = "repair_cycle_warning_review_failed"
     REPAIR_CYCLE_COMPLETED = "repair_cycle_completed"
     REPAIR_CYCLE_FAILED = "repair_cycle_failed"
+    REPAIR_CYCLE_SYSTEMIC_ANALYSIS_STARTED = "repair_cycle_systemic_analysis_started"
+    REPAIR_CYCLE_SYSTEMIC_ANALYSIS_COMPLETED = "repair_cycle_systemic_analysis_completed"
+    REPAIR_CYCLE_ENV_REBUILD_STARTED = "repair_cycle_env_rebuild_started"
+    REPAIR_CYCLE_ENV_REBUILD_COMPLETED = "repair_cycle_env_rebuild_completed"
+    REPAIR_CYCLE_SYSTEMIC_FIX_STARTED = "repair_cycle_systemic_fix_started"
+    REPAIR_CYCLE_SYSTEMIC_FIX_COMPLETED = "repair_cycle_systemic_fix_completed"
 
     # Repair Cycle Container Lifecycle
     REPAIR_CYCLE_CONTAINER_STARTED = "repair_cycle_container_started"
@@ -377,6 +383,12 @@ class ObservabilityManager:
             EventType.REPAIR_CYCLE_WARNING_REVIEW_FAILED,
             EventType.REPAIR_CYCLE_COMPLETED,
             EventType.REPAIR_CYCLE_FAILED,
+            EventType.REPAIR_CYCLE_SYSTEMIC_ANALYSIS_STARTED,
+            EventType.REPAIR_CYCLE_SYSTEMIC_ANALYSIS_COMPLETED,
+            EventType.REPAIR_CYCLE_ENV_REBUILD_STARTED,
+            EventType.REPAIR_CYCLE_ENV_REBUILD_COMPLETED,
+            EventType.REPAIR_CYCLE_SYSTEMIC_FIX_STARTED,
+            EventType.REPAIR_CYCLE_SYSTEMIC_FIX_COMPLETED,
             # Conversational Loop Routing
             EventType.CONVERSATIONAL_LOOP_STARTED,
             EventType.CONVERSATIONAL_QUESTION_ROUTED,
