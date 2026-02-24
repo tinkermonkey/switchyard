@@ -1134,7 +1134,7 @@ class AgentContainerRecovery:
                         created_dt = datetime.strptime(created_str[:19], '%Y-%m-%d %H:%M:%S')
                         age = datetime.utcnow() - created_dt
 
-                        if age < timedelta(minutes=60):
+                        if age < timedelta(minutes=180):
                             logger.info(f"Container is young ({age.total_seconds()/60:.1f}min), keeping it and reconnecting")
                             # Re-attach monitoring thread for this young container
                             try:
