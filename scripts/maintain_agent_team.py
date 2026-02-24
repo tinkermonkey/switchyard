@@ -370,7 +370,7 @@ def trigger_docker_rebuild(project: str, dry_run: bool = False) -> bool:
             # Check for common error: Docker not available
             if 'docker' in result.stderr.lower() and ('not found' in result.stderr.lower() or 'permission denied' in result.stderr.lower()):
                 logger.error(
-                    f"\n  Hint: Docker rebuild requires running inside the orchestrator container.\n"
+                    f"  Hint: Docker rebuild requires running inside the orchestrator container."
                     f"  Run: docker-compose exec orchestrator python scripts/maintain_agent_team.py --project {project} --rebuild-images"
                 )
 
@@ -439,9 +439,9 @@ def run_generation_workflow(project: str, args) -> Dict[str, Any]:
     Returns:
         Dict with generation results
     """
-    logger.info(f"\n{'='*60}")
+    logger.info(f"{'='*60}")
     logger.info(f"Agent Team Generation: {project}")
-    logger.info(f"{'='*60}\n")
+    logger.info(f"{'='*60}")
 
     # Phase 1: Detect changes
     logger.info("Phase 1: Detecting codebase changes...")
@@ -451,24 +451,24 @@ def run_generation_workflow(project: str, args) -> Dict[str, Any]:
         logger.info(f"✓ No changes detected for {project}")
         logger.info(f"  Previous hash: {changes['previous_hash']}")
         logger.info(f"  Current hash: {changes['hash']}")
-        logger.info(f"\n  Use --cleanup to review generated artifacts anyway\n")
+        logger.info(f"  Use --cleanup to review generated artifacts anyway")
         return {'status': 'skipped', 'reason': 'no_changes'}
 
     logger.info(f"  Change level: {changes['impact']['level']}")
     logger.info(f"  Reason: {changes['impact']['reason']}")
 
     if args.dry_run:
-        logger.info("\n[DRY RUN] Would proceed with generation workflow:")
-        logger.info("  Phase 2: Analyze codebase")
-        logger.info("  Phase 3: Generate strategy")
-        logger.info("  Phase 4: User review (unless --auto-approve)")
-        logger.info("  Phase 5: Generate artifacts")
-        logger.info("  Phase 6: Quality review")
-        logger.info("  Phase 7: Validate artifacts")
-        logger.info("  Phase 8: Deploy to .claude/")
-        logger.info("  Phase 9: Update state")
+        logger.info("[DRY RUN] Would proceed with generation workflow:")
+        logger.info("Phase 2: Analyze codebase")
+        logger.info("Phase 3: Generate strategy")
+        logger.info("Phase 4: User review (unless --auto-approve)")
+        logger.info("Phase 5: Generate artifacts")
+        logger.info("Phase 6: Quality review")
+        logger.info("Phase 7: Validate artifacts")
+        logger.info("Phase 8: Deploy to .claude/")
+        logger.info("Phase 9: Update state")
         if args.rebuild_images:
-            logger.info("  Phase 10: Rebuild Docker image (--rebuild-images)")
+            logger.info("Phase 10: Rebuild Docker image (--rebuild-images)")
         if args.cleanup:
             logger.info("  Cleanup: Remove outdated artifacts (--cleanup)")
         return {'status': 'dry_run'}
@@ -493,7 +493,7 @@ def run_generation_workflow(project: str, args) -> Dict[str, Any]:
 
     # Phase 4: User review
     if not args.auto_approve:
-        logger.info("\nPhase 4: Review strategy...")
+        logger.info("Phase 4: Review strategy...")
         display_strategy(project, strategy)
 
         if not confirm_strategy():
@@ -502,10 +502,10 @@ def run_generation_workflow(project: str, args) -> Dict[str, Any]:
 
         logger.info("  ✓ Strategy approved")
     else:
-        logger.info("\nPhase 4: Strategy auto-approved (--auto-approve flag)")
+        logger.info("Phase 4: Strategy auto-approved (--auto-approve flag)")
 
     # Phase 5: Generate artifacts
-    logger.info("\nPhase 5: Generating artifacts...")
+    logger.info("Phase 5: Generating artifacts...")
 
     try:
         created_artifacts = asyncio.run(_run_artifact_generation(
@@ -520,7 +520,7 @@ def run_generation_workflow(project: str, args) -> Dict[str, Any]:
         return {'status': 'error', 'phase': 'generation', 'error': str(e)}
 
     # Phase 6: Quality review
-    logger.info("\nPhase 6: Quality review...")
+    logger.info("Phase 6: Quality review...")
     from scripts.generate_artifacts import review_artifacts_quality
 
     try:
@@ -539,7 +539,7 @@ def run_generation_workflow(project: str, args) -> Dict[str, Any]:
         logger.info("  Continuing with validation...")
 
     # Phase 7: Validate artifacts
-    logger.info("\nPhase 7: Validating artifacts...")
+    logger.info("Phase 7: Validating artifacts...")
     from scripts.validate_artifacts import validate_all_generated_artifacts
 
     validation_results = validate_all_generated_artifacts(project)
@@ -553,10 +553,10 @@ def run_generation_workflow(project: str, args) -> Dict[str, Any]:
         logger.info(f"  ✓ All {validation_results['passed']} artifact(s) validated")
 
     # Phase 8: Artifacts deployed (implicit - already written in Phase 5)
-    logger.info(f"\nPhase 8: Artifacts deployed to {project}/.claude/ and {project}/CLAUDE.md updated")
+    logger.info(f"Phase 8: Artifacts deployed to {project}/.claude/ and {project}/CLAUDE.md updated")
 
     # Phase 9: Update state
-    logger.info("\nPhase 9: Updating state...")
+    logger.info("Phase 9: Updating state...")
     update_state_with_generation(project, changes, analysis, created_artifacts)
     logger.info("  ✓ State updated")
 
@@ -578,16 +578,16 @@ def run_generation_workflow(project: str, args) -> Dict[str, Any]:
             else:
                 logger.warning(f"  ⚠ Docker image rebuild failed (see logs above)")
         else:
-            logger.info(f"\nPhase 9: Skipping Docker rebuild (no Dockerfile.agent for {project})")
+            logger.info(f"Phase 10: Skipping Docker rebuild (no Dockerfile.agent for {project})")
 
     # Cleanup phase (if --cleanup flag)
     if args.cleanup:
-        logger.info("\nCleanup: Removing outdated artifacts...")
+        logger.info("  Cleanup: Removing outdated artifacts...")
         from scripts.cleanup_artifacts import cleanup_project_artifacts
         cleanup_project_artifacts(project, dry_run=False, force=args.auto_approve)
 
     # Final summary
-    logger.info(f"\n{'='*60}")
+    logger.info(f"{'='*60}")
     logger.info("Generation Complete")
     logger.info(f"{'='*60}")
     logger.info(f"  Agents: {len(created_artifacts['agents'])}")
@@ -672,7 +672,7 @@ def generate_for_projects(args):
         logger.info(f"  - {project}")
 
     if args.dry_run:
-        logger.info("\n[DRY RUN MODE] No changes will be made\n")
+        logger.info("[DRY RUN MODE] No changes will be made")
 
     # Process each project
     results = {}
@@ -688,7 +688,7 @@ def generate_for_projects(args):
             results[project] = {'status': 'error', 'error': str(e)}
 
     # Report summary
-    logger.info("\n" + "="*60)
+    logger.info("="*60)
     logger.info("Generation Summary")
     logger.info("="*60)
     logger.info(f"Total: {len(results)} projects")
