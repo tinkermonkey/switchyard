@@ -378,7 +378,8 @@ class ReviewCycleExecutor:
                         pipeline_run_manager.end_pipeline_run(
                             cycle_state.project_name,
                             cycle_state.issue_number,
-                            reason="review_cycle_exceeded_max_iterations_on_resume"
+                            reason="review_cycle_exceeded_max_iterations_on_resume",
+                            retain_lock=True
                         )
                         logger.info(f"Ended pipeline run {cycle_state.pipeline_run_id} due to max iterations exceeded on resume")
                     except Exception as e:
@@ -606,7 +607,8 @@ class ReviewCycleExecutor:
                             pipeline_run_manager.end_pipeline_run(
                                 project_name,
                                 issue_number,
-                                reason="review_cycle_exceeded_max_iterations"
+                                reason="review_cycle_exceeded_max_iterations",
+                                retain_lock=True
                             )
                             logger.info(f"Ended pipeline run {existing_cycle.pipeline_run_id} due to max iterations exceeded")
                         except Exception as e:
@@ -682,7 +684,8 @@ class ReviewCycleExecutor:
                             pipeline_run_manager.end_pipeline_run(
                                 project_name,
                                 issue_number,
-                                reason=f"review_cycle_failed: {str(e)[:100]}"
+                                reason=f"review_cycle_failed: {str(e)[:100]}",
+                                retain_lock=True
                             )
                             logger.info(f"Ended pipeline run {existing_cycle.pipeline_run_id} due to review cycle failure")
                         except Exception as prm_error:

@@ -207,7 +207,8 @@ class AgentExecutor:
                                         f"Cannot continue safely to prevent commits to wrong branch."
                                     )
                                     logger.error(error_msg)
-                                    raise RuntimeError(error_msg)
+                                    from agents.non_retryable import NonRetryableAgentError
+                                    raise NonRetryableAgentError(error_msg)
 
                                 logger.info(f"Branch verification passed: confirmed on '{actual_branch}'")
 
@@ -231,6 +232,10 @@ class AgentExecutor:
                                 )
 
             except Exception as e:
+                from agents.non_retryable import NonRetryableAgentError
+                if isinstance(e, NonRetryableAgentError):
+                    raise
+
                 logger.error(
                     f"🔍 WORKSPACE PREP DEBUG: Exception during workspace preparation: {e}\n"
                     f"  workspace_context={'present' if workspace_context else 'NONE'}\n"
