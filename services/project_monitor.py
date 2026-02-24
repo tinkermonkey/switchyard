@@ -4543,19 +4543,6 @@ The automated test-fix-validate cycle has failed and requires manual interventio
                 except Exception as e:
                     logger.warning(f"Failed to emit container completed event: {e}")
 
-                # End pipeline run
-                try:
-                    ended = self.pipeline_run_manager.end_pipeline_run(
-                        project=project_name,
-                        issue_number=issue_number,
-                        reason="Container timeout after 2 hours"
-                    )
-                    if ended:
-                        pipeline_run_ended = True
-                        logger.info(f"Ended pipeline run for {project_name}/#{issue_number} due to timeout")
-                except Exception as e:
-                    logger.error(f"Failed to end pipeline run: {e}")
-
                 # Kill container
                 try:
                     subprocess.run(['docker', 'kill', container_name], timeout=30)
