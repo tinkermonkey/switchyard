@@ -4452,7 +4452,7 @@ The automated test-fix-validate cycle has failed and requires manual interventio
                             # Ideally we should have a "Move Failed" state or alert.
 
                 # End pipeline run on success
-                if pipeline_run_id:
+                if overall_success and pipeline_run_id:
                     try:
                         ended = self.pipeline_run_manager.end_pipeline_run(
                             project=project_name,
