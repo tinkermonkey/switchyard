@@ -110,6 +110,8 @@ class PRReviewStateManager:
 
         old_count = issue_data.get("review_count", 0)
         issue_data["review_count"] = 0
+        issue_data.pop("cycle_limit_notified", None)
+        issue_data.pop("cycle_limit_notified_at", None)
         self._save_state(project_name, data)
         logger.info(
             f"Reset review count for {project_name} #{parent_issue_number} "
@@ -132,6 +134,26 @@ class PRReviewStateManager:
         data = self._load_state(project_name)
         issue_data = data.get("pr_reviews", {}).get(parent_issue_number, {})
         return issue_data.get("last_review_at")
+
+    def is_cycle_limit_notified(self, project_name: str, parent_issue_number: int) -> bool:
+        """Return True if the cycle-limit-reached notification was already posted."""
+        data = self._load_state(project_name)
+        issue_data = data.get("pr_reviews", {}).get(parent_issue_number, {})
+        return bool(issue_data.get("cycle_limit_notified", False))
+
+    def mark_cycle_limit_notified(self, project_name: str, parent_issue_number: int):
+        """Record that the cycle-limit-reached notification has been posted."""
+        data = self._load_state(project_name)
+        reviews = data.setdefault("pr_reviews", {})
+        issue_data = reviews.setdefault(parent_issue_number, {"review_count": 0, "iterations": []})
+        issue_data["cycle_limit_notified"] = True
+        issue_data["cycle_limit_notified_at"] = (
+            datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
+        )
+        self._save_state(project_name, data)
+        logger.info(
+            f"Marked cycle limit as notified for {project_name} #{parent_issue_number}"
+        )
 
 
 # Global instance

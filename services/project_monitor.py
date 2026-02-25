@@ -3087,17 +3087,27 @@ class ProjectMonitor:
                         f"parent #{parent_issue_number} has reached the PR review cycle limit "
                         f"({current_review_count}/{MAX_REVIEW_CYCLES}). Not advancing to 'In Review'."
                     )
-                    from services.github_integration import GitHubIntegration
-                    github = GitHubIntegration(
-                        repo_owner=project_config.github['org'],
-                        repo_name=project_config.github['repo']
-                    )
-                    await github.post_comment(
-                        parent_issue_number,
-                        f"All sub-issues have been completed, but the maximum automated PR review "
-                        f"cycle limit ({MAX_REVIEW_CYCLES}) has been reached. "
-                        f"Further review should be performed manually."
-                    )
+                    if not pr_review_state_manager.is_cycle_limit_notified(
+                        project_name, parent_issue_number
+                    ):
+                        from services.github_integration import GitHubIntegration
+                        github = GitHubIntegration(
+                            repo_owner=project_config.github['org'],
+                            repo_name=project_config.github['repo']
+                        )
+                        await github.post_comment(
+                            parent_issue_number,
+                            f"All sub-issues have been completed, but the maximum automated PR review "
+                            f"cycle limit ({MAX_REVIEW_CYCLES}) has been reached. "
+                            f"Further review should be performed manually."
+                        )
+                        pr_review_state_manager.mark_cycle_limit_notified(
+                            project_name, parent_issue_number
+                        )
+                    else:
+                        logger.info(
+                            f"Cycle limit notification already sent for #{parent_issue_number}, skipping."
+                        )
                     return
 
                 # Move to "In Review" - the polling will detect the column change
@@ -3149,17 +3159,26 @@ class ProjectMonitor:
                         f"Review cycle limit ({MAX_REVIEW_CYCLES}) reached for #{parent_issue_number}, "
                         f"not re-triggering PR review"
                     )
-                    # Post comment about cycle limit
-                    from services.github_integration import GitHubIntegration
-                    github = GitHubIntegration(
-                        repo_owner=project_config.github['org'],
-                        repo_name=project_config.github['repo']
-                    )
-                    await github.post_comment(
-                        parent_issue_number,
-                        f"All sub-issues completed again, but the maximum PR review cycle limit ({MAX_REVIEW_CYCLES}) "
-                        f"has been reached. Further review should be performed manually."
-                    )
+                    if not pr_review_state_manager.is_cycle_limit_notified(
+                        project_name, parent_issue_number
+                    ):
+                        from services.github_integration import GitHubIntegration
+                        github = GitHubIntegration(
+                            repo_owner=project_config.github['org'],
+                            repo_name=project_config.github['repo']
+                        )
+                        await github.post_comment(
+                            parent_issue_number,
+                            f"All sub-issues completed again, but the maximum PR review cycle limit ({MAX_REVIEW_CYCLES}) "
+                            f"has been reached. Further review should be performed manually."
+                        )
+                        pr_review_state_manager.mark_cycle_limit_notified(
+                            project_name, parent_issue_number
+                        )
+                    else:
+                        logger.info(
+                            f"Cycle limit notification already sent for #{parent_issue_number}, skipping."
+                        )
                     return
 
                 # Re-trigger PR review via PRReviewStage (runs in-process)
