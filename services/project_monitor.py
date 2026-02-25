@@ -2042,6 +2042,9 @@ class ProjectMonitor:
                                     logger.error(f"Failed to start review cycle resume thread: {e}")
                                     import traceback
                                     logger.error(traceback.format_exc())
+                                    # Intentional: if the resume thread fails to start, fall through
+                                    # to fresh work creation as a recovery mechanism. already_handled
+                                    # stays False so the normal task-creation path runs below.
                             # For conversational columns, resume the feedback monitoring loop
                             elif column and hasattr(column, 'type') and column.type == 'conversational':
                                 # CRITICAL: Check if there's already active work for this issue
@@ -2181,6 +2184,9 @@ class ProjectMonitor:
                                     logger.error(f"Failed to start conversational feedback loop thread: {e}")
                                     import traceback
                                     logger.error(traceback.format_exc())
+                                    # Intentional: if the resume thread fails to start, fall through
+                                    # to fresh work creation as a recovery mechanism. already_handled
+                                    # stays False so the normal task-creation path runs below.
                             else:
                                 logger.info(f"Not a review or conversational column, skipping resume attempt")
                                 already_handled = True
