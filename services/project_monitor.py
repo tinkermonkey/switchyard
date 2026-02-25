@@ -2183,6 +2183,8 @@ class ProjectMonitor:
                                     logger.error(traceback.format_exc())
                             else:
                                 logger.info(f"Not a review or conversational column, skipping resume attempt")
+                                already_handled = True
+                                reason = "already_processed_successfully"
                     else:
                         # For issues workspace, check deduplication
                         # BUT skip this check for review and conversational columns
