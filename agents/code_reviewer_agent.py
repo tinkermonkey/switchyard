@@ -112,8 +112,8 @@ REQUIRED: Include "**Status**: X" at the top for automation parsing."""
         review_cycle = task_context.get('review_cycle', {})
         issue = task_context.get('issue', {})
 
-        # Get scoped git diff if available (for issues workspace)
-        scoped_diff = task_context.get('scoped_git_diff', '')
+        # Get change manifest if available (for issues workspace)
+        change_manifest = task_context.get('change_manifest', '')
 
         # Build iteration context for re-reviews
         iteration_context = ""
@@ -205,20 +205,18 @@ This is **Review Iteration {iteration} of {max_iterations}**.
         # Inject learned review filters
         filter_instructions = await self._get_filter_instructions()
 
-        # Build git diff section if available
+        # Build change manifest section if available
         git_diff_section = ""
-        if scoped_diff:
+        if change_manifest:
             git_diff_section = f"""
 
-## Code Changes (Git Diff)
+## Code Changes
 
-**IMPORTANT**: These are the ONLY changes you should review. Do not review unchanged code.
+{change_manifest}
 
-```diff
-{scoped_diff}
-```
-
-**Review Focus**: Analyze ONLY the lines marked with `+` (additions) and `-` (deletions) in the diff above.
+**Review focus**: Use the `git diff` commands listed above to fetch and examine the actual
+changes before reviewing. Review ONLY additions (`+`) and deletions (`-`) in the diff output.
+Do not review unchanged code.
 """
 
         prompt = f"""

@@ -2001,12 +2001,12 @@ class ReviewCycleExecutor:
         logger.error(f"Review loop exited unexpectedly for issue #{cycle_state.issue_number}")
         return ReviewStatus.UNKNOWN, column.name
 
-    def _get_git_commit_hash(self, project_dir: str) -> str:
-        """Get current git commit hash"""
+    def _get_git_commit_hash(self, project_dir: str, ref: str = 'HEAD') -> str:
+        """Resolve a git ref to its full commit SHA (defaults to HEAD)"""
         import subprocess
         try:
             result = subprocess.run(
-                ['git', 'rev-parse', 'HEAD'],
+                ['git', 'rev-parse', ref],
                 cwd=project_dir,
                 capture_output=True,
                 text=True,
@@ -2014,24 +2014,42 @@ class ReviewCycleExecutor:
             )
             return result.stdout.strip()
         except Exception as e:
-            logger.warning(f"Failed to get git commit hash: {e}")
+            logger.warning(f"Failed to resolve git ref {ref!r}: {e}")
             return ""
 
-    def _get_git_diff_since_commit(self, project_dir: str, since_commit: str) -> str:
-        """Get git diff from a specific commit to HEAD"""
+    def _get_change_manifest(self, project_dir: str, base_commit: str) -> str:
+        """Build a compact change manifest (stat + commits) for the reviewer.
+
+        Returns a formatted string the reviewer uses to decide which files to
+        inspect via 'git diff <base_commit> HEAD -- <file>'.
+        """
         import subprocess
-        try:
-            result = subprocess.run(
-                ['git', 'diff', since_commit, 'HEAD'],
-                cwd=project_dir,
-                capture_output=True,
-                text=True,
-                check=True
-            )
-            return result.stdout
-        except Exception as e:
-            logger.warning(f"Failed to get git diff: {e}")
+
+        def run(cmd):
+            try:
+                return subprocess.run(
+                    cmd, cwd=project_dir, capture_output=True, text=True, check=True
+                ).stdout.strip()
+            except Exception as e:
+                logger.warning(f"git command {cmd} failed: {e}")
+                return ""
+
+        stat = run(['git', 'diff', '--stat', base_commit, 'HEAD'])
+        commits = run(['git', 'log', '--oneline', f'{base_commit}..HEAD'])
+
+        if not stat:
             return ""
+
+        base_label = "pre-maker snapshot" if base_commit != "HEAD~1" else "HEAD~1 fallback"
+        commit_section = f"\n### Commits\n```\n{commits}\n```" if commits else ""
+        return (
+            f"**Base commit**: `{base_commit[:8]}` ({base_label})"
+            f"{commit_section}\n\n"
+            f"### Files changed\n```\n{stat}\n```\n\n"
+            f"Use your bash tool to examine the actual changes:\n"
+            f"- Full diff: `git diff {base_commit[:8]} HEAD`\n"
+            f"- Single file: `git diff {base_commit[:8]} HEAD -- <path/to/file>`"
+        )
 
     def _create_review_task_context(
         self,
@@ -2042,54 +2060,43 @@ class ReviewCycleExecutor:
         full_discussion_context: str = ""
     ) -> Dict[str, Any]:
         """Create task context for reviewer agent"""
-        MAX_REVIEWER_GIT_DIFF = 400_000  # ~100k tokens safety ceiling
-
         # Get the latest maker output (kept for review_cycle metadata only)
         latest_maker_output = cycle_state.maker_outputs[-1]['output'] if cycle_state.maker_outputs else ""
 
         # For discussions workspace, pass full_discussion_context; for issues, leave empty
         context_for_review = full_discussion_context if full_discussion_context else ""
 
-        # Get focused git diff for issues workspace
-        scoped_diff = ""
+        # Build a compact change manifest for issues workspace
+        change_manifest = ""
         if cycle_state.workspace_type == 'issues':
             from services.project_workspace import workspace_manager
             project_dir = workspace_manager.get_project_dir(cycle_state.project_name)
 
-            # Primary: diff from the HEAD snapshot taken just before the maker ran
-            if cycle_state.pre_maker_commit:
-                scoped_diff = self._get_git_diff_since_commit(str(project_dir), cycle_state.pre_maker_commit)
-                if scoped_diff:
-                    logger.info(
-                        f"Generated focused agent diff ({len(scoped_diff)} chars) "
-                        f"from pre-maker snapshot {cycle_state.pre_maker_commit[:8]}"
-                    )
+            # Primary: changes since the HEAD snapshot taken just before the maker ran
+            base_commit = cycle_state.pre_maker_commit
+            if base_commit:
+                change_manifest = self._get_change_manifest(str(project_dir), base_commit)
+                if change_manifest:
+                    logger.info(f"Generated change manifest from pre-maker snapshot {base_commit[:8]}")
                 else:
-                    logger.info(f"No changes since pre-maker snapshot {cycle_state.pre_maker_commit[:8]}")
+                    logger.info(f"No changes since pre-maker snapshot {base_commit[:8]}")
 
-            # Fallback: diff only the most recent commit (HEAD~1..HEAD)
-            if not scoped_diff:
-                scoped_diff = self._get_git_diff_since_commit(str(project_dir), 'HEAD~1')
-                if scoped_diff:
-                    logger.info(
-                        f"Fallback: most recent commit diff ({len(scoped_diff)} chars)"
-                    )
+            # Fallback: most recent commit only — resolve to a pinned SHA so the
+            # manifest contains a stable reference rather than the symbolic HEAD~1.
+            if not change_manifest:
+                resolved = self._get_git_commit_hash(str(project_dir), 'HEAD~1')
+                base_commit = resolved if resolved else 'HEAD~1'
+                change_manifest = self._get_change_manifest(str(project_dir), base_commit)
+                if change_manifest:
+                    logger.info(f"Fallback: generated change manifest from HEAD~1 ({base_commit[:8]})")
 
-            # No diff available — state is broken; reviewer has nothing to review
-            if not scoped_diff:
+            if not change_manifest:
                 raise RuntimeError(
                     f"Cannot build reviewer context for issue #{cycle_state.issue_number}: "
-                    f"no git diff available. pre_maker_commit="
+                    f"no git changes found. pre_maker_commit="
                     f"{cycle_state.pre_maker_commit!r} and HEAD~1 fallback both returned empty. "
                     f"Aborting review cycle."
                 )
-
-            # Safety ceiling: truncate if still too large
-            if len(scoped_diff) > MAX_REVIEWER_GIT_DIFF:
-                logger.warning(
-                    f"Git diff truncated from {len(scoped_diff)} to {MAX_REVIEWER_GIT_DIFF} chars"
-                )
-                scoped_diff = scoped_diff[:MAX_REVIEWER_GIT_DIFF] + "\n\n[... diff truncated ...]"
 
         task_context = {
             'project': cycle_state.project_name,
@@ -2110,7 +2117,7 @@ class ReviewCycleExecutor:
                 'is_rereviewing': iteration > 1
             },
             'previous_stage_output': context_for_review,  # Discussions context only; empty for issues
-            'scoped_git_diff': scoped_diff,  # Focused diff of most recent agent execution
+            'change_manifest': change_manifest,  # Compact manifest; reviewer fetches diffs via bash
             'timestamp': datetime.now().isoformat()
         }
         logger.info(f"[DIAGNOSTIC] Created review task_context with pipeline_run_id: {cycle_state.pipeline_run_id} for issue #{cycle_state.issue_number}")
