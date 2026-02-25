@@ -5849,7 +5849,7 @@ _Repair cycle initiated by Claude Code Orchestrator_
 
             # Get workflow template to identify exit columns
             workflow_template = config_manager.get_workflow_template(pipeline_config.workflow)
-            exit_columns = {col.name for col in workflow_template.columns if col.type == 'exit'}
+            exit_columns = set(getattr(workflow_template, 'pipeline_exit_columns', None) or [])
 
             # Use cached items if provided, otherwise fetch from GitHub
             if cached_items is not None:
