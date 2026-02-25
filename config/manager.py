@@ -408,9 +408,8 @@ class ConfigManager:
         return templates[template_name]
 
     def get_project_config(self, project_name: str) -> ProjectConfig:
-        """Get project configuration"""
-        if project_name not in self._project_configs:
-            self._project_configs[project_name] = self._load_project_config(project_name)
+        """Get project configuration, always reading from disk to pick up runtime edits"""
+        self._project_configs[project_name] = self._load_project_config(project_name)
         return self._project_configs[project_name]
 
     def get_project_agent_config(self, project_name: str, agent_name: str) -> AgentConfig:

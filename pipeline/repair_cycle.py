@@ -742,6 +742,11 @@ If CI has not completed within that window, return a failure result indicating C
 
 Follow these steps exactly:
 
+0. Check whether CI is configured for this project:
+   Look for CI configuration files (e.g. `.github/workflows/`, `.circleci/`, `.travis.yml`, `Jenkinsfile`, `azure-pipelines.yml`).
+   If none exist, CI is not set up for this project — return success immediately:
+   {{"passed": 1, "failed": 0, "warnings": 0, "failures": [], "warning_list": []}}
+
 1. Verify the current branch is a feature branch (not main/master/develop):
    `git rev-parse --abbrev-ref HEAD`
    If the branch is main, master, or develop — stop immediately and return:
