@@ -1778,6 +1778,52 @@ class DockerAgentRunner:
 
         logger.info(f"✓ Monitoring thread started for recovered container {container_name}")
 
+    @staticmethod
+    def _parse_stream_json_output(raw_output: str) -> str:
+        """
+        Extract markdown text from raw Claude stream-json output.
+
+        The docker-claude-wrapper stores every stdout line (raw JSON events) in
+        the 'output' field of its Redis result.  The normal execution path parses
+        these in real-time and overwrites the Redis key with just the extracted
+        text.  After an orchestrator restart the overwrite never happens, so the
+        recovery path receives raw JSON lines instead of markdown.
+
+        This method reproduces the same extraction logic as read_stream() so that
+        recovered containers produce identical output to live-monitored ones.
+
+        Returns the extracted text if the output contains parseable stream-json
+        events, otherwise returns raw_output unchanged.
+        """
+        import json as _json
+
+        text_parts = []
+        parsed_any = False
+
+        for line in raw_output.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                event = _json.loads(line)
+                parsed_any = True
+                if event.get('type') == 'assistant':
+                    message = event.get('message', {})
+                    content = message.get('content', [])
+                    for item in content:
+                        if isinstance(item, dict) and item.get('type') == 'text':
+                            text = item.get('text', '')
+                            if text:
+                                text_parts.append(text)
+            except (_json.JSONDecodeError, TypeError):
+                pass
+
+        if parsed_any and text_parts:
+            return ''.join(text_parts)
+
+        # Not stream-json (already parsed text, or plaintext fallback) — return as-is
+        return raw_output
+
     def _monitor_recovered_container(
         self,
         container_name: str,
@@ -1834,8 +1880,15 @@ class DockerAgentRunner:
 
                 if result_json:
                     result_data = json.loads(result_json)
-                    output = result_data.get('output', '')
-                    logger.info(f"✓ Loaded persisted result from Redis: {redis_key}")
+                    raw = result_data.get('output', '')
+                    output = self._parse_stream_json_output(raw)
+                    if output != raw:
+                        logger.info(
+                            f"✓ Loaded and parsed stream-json result from Redis: {redis_key} "
+                            f"({len(raw)} raw bytes → {len(output)} text bytes)"
+                        )
+                    else:
+                        logger.info(f"✓ Loaded persisted result from Redis: {redis_key}")
 
                     # Mark as recovered and update TTL
                     result_data['recovered'] = True
@@ -1863,7 +1916,8 @@ class DockerAgentRunner:
                     if result.returncode == 0 and result.stdout:
                         import json
                         fallback_data = json.loads(result.stdout)
-                        output = fallback_data.get('output', '')
+                        raw = fallback_data.get('output', '')
+                        output = self._parse_stream_json_output(raw)
                         logger.info(
                             f"✓ Retrieved result from container fallback file: {result_file} "
                             f"(Redis write failed during execution)"
@@ -1887,7 +1941,8 @@ class DockerAgentRunner:
                         timeout=60
                     )
                     if result.returncode == 0:
-                        output = result.stdout + result.stderr
+                        raw = result.stdout + result.stderr
+                        output = self._parse_stream_json_output(raw)
                         logger.info(f"✓ Retrieved logs from stopped container {container_name}")
                     else:
                         logger.info(
