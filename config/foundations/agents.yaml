@@ -4,7 +4,7 @@
 agents:
   dev_environment_setup:
     description: "Development environment configuration, Dockerfile generation, and validation with automated troubleshooting"
-    model: "claude-opus-4-5-20251101"
+    model: "claude-opus-4-6"
     timeout: 1800  # 30 minutes for Docker builds and validation
     retries: 2
     makes_code_changes: true  # Modifies dependency files (requirements.txt, etc.)
@@ -27,7 +27,7 @@ agents:
 
   dev_environment_verifier:
     description: "Verifies dev environment setup succeeded and marks container as verified"
-    model: "claude-sonnet-4-5-20250929"
+    model: "claude-sonnet-4-6"
     timeout: 300
     retries: 2
     makes_code_changes: false  # Only verifies and updates state
@@ -48,7 +48,7 @@ agents:
 
   idea_researcher:
     description: "Market research and idea validation"
-    model: "claude-opus-4-5-20251101"
+    model: "claude-opus-4-6"
     timeout: 300
     retries: 2
     makes_code_changes: false  # Posts research to GitHub discussions, doesn't create files
@@ -68,7 +68,7 @@ agents:
 
   business_analyst:
     description: "Requirements analysis and user story development"
-    model: "claude-sonnet-4-5-20250929"
+    model: "claude-sonnet-4-6"
     timeout: 300
     retries: 3
     makes_code_changes: false  # Posts to GitHub discussions, doesn't create files
@@ -89,7 +89,7 @@ agents:
 
   software_architect:
     description: "System architecture and technical design"
-    model: "claude-opus-4-5-20251101"
+    model: "claude-opus-4-6"
     timeout: 600
     retries: 3
     makes_code_changes: false  # Creates architecture documents and diagrams
@@ -110,7 +110,7 @@ agents:
 
   work_breakdown_agent:
     description: "Break approved designs into phase-based sub-issues for implementation"
-    model: "claude-sonnet-4-5-20250929"
+    model: "claude-sonnet-4-6"
     timeout: 300
     retries: 2
     makes_code_changes: false  # Creates GitHub issues, not files
@@ -130,7 +130,7 @@ agents:
 
   senior_software_engineer:
     description: "Software development and implementation"
-    model: "claude-haiku-4-5-20251001"
+    model: "claude-haiku-4-5"
     timeout: 1800
     retries: 3
     circuit_breaker:
@@ -154,7 +154,7 @@ agents:
 
   code_reviewer:
     description: "Code quality review and validation"
-    model: "claude-opus-4-5-20251101"
+    model: "claude-opus-4-6"
     timeout: 300
     retries: 2
     makes_code_changes: false  # Review only, no changes
@@ -174,7 +174,7 @@ agents:
 
   technical_writer:
     description: "Technical documentation creation"
-    model: "claude-sonnet-4-5-20250929"
+    model: "claude-sonnet-4-6"
     timeout: 300
     retries: 2
     makes_code_changes: true  # Creates documentation files
@@ -191,7 +191,7 @@ agents:
 
   documentation_editor:
     description: "Documentation review and editing"
-    model: "claude-sonnet-4-5-20250929"
+    model: "claude-sonnet-4-6"
     timeout: 300
     retries: 2
     makes_code_changes: false  # Review only, no changes
@@ -209,7 +209,7 @@ agents:
 
   pr_code_reviewer:
     description: "PR code quality review using pr-review-toolkit skill"
-    model: "claude-opus-4-5-20251101"
+    model: "claude-opus-4-6"
     timeout: 600  # 10 minutes for PR review
     retries: 2
     makes_code_changes: false
@@ -227,7 +227,7 @@ agents:
 
   requirements_verifier:
     description: "Verify PR against requirements and context"
-    model: "claude-sonnet-4-5-20250929"
+    model: "claude-sonnet-4-6"
     timeout: 300  # 5 minutes per verification
     retries: 2
     makes_code_changes: false
@@ -245,7 +245,7 @@ agents:
 
   test_agent:
     description: "Test agent for integration testing and CI/CD verification"
-    model: "claude-haiku-4-5-20251001"
+    model: "claude-haiku-4-5"
     timeout: 300  # 5 minutes
     retries: 2
     makes_code_changes: true  # Can modify files for testing
@@ -264,7 +264,7 @@ agents:
 
   claude_advisor:
     description: "Analyzes project failures and recommends improvements"
-    model: "claude-sonnet-4-5-20250929"
+    model: "claude-sonnet-4-6"
     timeout: 600
     retries: 1
     makes_code_changes: false
