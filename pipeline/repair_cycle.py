@@ -707,7 +707,10 @@ Your goal is to identify and report compilation errors and linting violations so
 
 2. Run the appropriate compilation and linting tools:
    - **TypeScript/JavaScript**: `npx tsc --noEmit` (or the configured tsconfig) and ESLint if configured
-   - **Python**: `mypy .` and/or `ruff check .` / `flake8` if configured
+   - **Python**:
+     a. First auto-fix: `ruff check --fix .` (applies safe automatic fixes)
+     b. Then check remaining: `ruff check .` — report only violations that require manual fixes
+     c. Type check: `mypy src/` (or `mypy .` if no src/ layout)
    - **Other languages**: use the project's configured build/lint toolchain
 
 3. Save the full output to /tmp/compilation_results.txt for reference.
