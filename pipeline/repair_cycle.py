@@ -215,7 +215,7 @@ class RepairCycleStage(PipelineStage):
         self.max_total_agent_calls = max_total_agent_calls
         self.checkpoint_interval = checkpoint_interval
         self._agent_call_count = 0
-        self._systemic_analysis_done = False
+        self._systemic_analysis_done_for: set = set()
 
     @staticmethod
     def _sanitize_filename(filename: str) -> str:
@@ -558,10 +558,11 @@ class RepairCycleStage(PipelineStage):
             logger.info(f"Found failures in {len(grouped_failures)} files: " f"{list(grouped_failures.keys())}")
 
             # --- SYSTEMIC ANALYSIS BLOCK ---
-            # On the first iteration with failures, check for systemic root causes
-            # before dispatching expensive per-file fix calls.
-            if not self._systemic_analysis_done:
-                self._systemic_analysis_done = True
+            # Once per test type, check for systemic root causes before dispatching
+            # expensive per-file fix calls. Each test type (compilation, unit, etc.)
+            # can have distinct systemic/environment issues specific to it.
+            if config.test_type not in self._systemic_analysis_done_for:
+                self._systemic_analysis_done_for.add(config.test_type)
                 analysis = await self._analyze_systemic_failures(
                     test_result, grouped_failures, config, context
                 )

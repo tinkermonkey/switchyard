@@ -343,20 +343,20 @@ class TestSystemicFailureDetection:
     """Tests for systemic failure analysis and routing in RepairCycleStage."""
 
     def test_systemic_analysis_done_flag_initialized_false(self):
-        """_systemic_analysis_done is False on construction."""
+        """_systemic_analysis_done_for is an empty set on construction."""
         stage = _make_stage()
-        assert stage._systemic_analysis_done is False
+        assert stage._systemic_analysis_done_for == set()
 
     @pytest.mark.asyncio
     async def test_analyze_systemic_failures_called_on_first_iteration_with_failures(self):
-        """_systemic_analysis_done flag gates the analysis call.
+        """_systemic_analysis_done_for set gates the analysis call per test type.
 
         Verifies that the guard logic in _run_test_cycle invokes
-        _analyze_systemic_failures exactly once when _systemic_analysis_done is
-        False, and sets the flag afterwards so subsequent iterations skip it.
+        _analyze_systemic_failures exactly once for a given test type, and adds
+        the type to the set afterwards so subsequent iterations skip it.
         """
         stage = _make_stage()
-        assert stage._systemic_analysis_done is False
+        assert stage._systemic_analysis_done_for == set()
 
         no_issues = SystemicAnalysisResult(
             has_env_issues=False,
@@ -367,24 +367,26 @@ class TestSystemicFailureDetection:
             raw_json={},
         )
 
+        config = stage.test_configs[0]
+
         with patch.object(stage, "_analyze_systemic_failures", new=AsyncMock(return_value=no_issues)) as mock_analyze:
             # Replicate the guard block from _run_test_cycle for the first call
             test_result = _make_test_result(failed=2)
             grouped = test_result.group_failures_by_file()
 
-            if not stage._systemic_analysis_done:
-                stage._systemic_analysis_done = True
+            if config.test_type not in stage._systemic_analysis_done_for:
+                stage._systemic_analysis_done_for.add(config.test_type)
                 await stage._analyze_systemic_failures(
-                    test_result, grouped, stage.test_configs[0], {}
+                    test_result, grouped, config, {}
                 )
 
             mock_analyze.assert_awaited_once()
-            assert stage._systemic_analysis_done is True
+            assert config.test_type in stage._systemic_analysis_done_for
 
             # Simulate a second iteration — the guard must skip the call
-            if not stage._systemic_analysis_done:
+            if config.test_type not in stage._systemic_analysis_done_for:
                 await stage._analyze_systemic_failures(
-                    test_result, grouped, stage.test_configs[0], {}
+                    test_result, grouped, config, {}
                 )
 
             # Still only called once
@@ -428,14 +430,15 @@ class TestSystemicFailureDetection:
             test_result = _make_test_result(failed=3)
             grouped = test_result.group_failures_by_file()
 
-            if not stage._systemic_analysis_done:
-                stage._systemic_analysis_done = True
+            config = stage.test_configs[0]
+            if config.test_type not in stage._systemic_analysis_done_for:
+                stage._systemic_analysis_done_for.add(config.test_type)
                 analysis = await stage._analyze_systemic_failures(
-                    test_result, grouped, stage.test_configs[0], {}
+                    test_result, grouped, config, {}
                 )
                 if analysis.has_systemic_code_issues:
                     test_result = await stage._run_systemic_fix_sub_cycle(
-                        analysis, stage.test_configs[0], {}, 1, 1
+                        analysis, config, {}, 1, 1
                     )
                     grouped = test_result.group_failures_by_file()
 
@@ -449,16 +452,71 @@ class TestSystemicFailureDetection:
 
     @pytest.mark.asyncio
     async def test_systemic_analysis_not_repeated_on_second_iteration(self):
-        """_analyze_systemic_failures is NOT called if _systemic_analysis_done is True."""
+        """_analyze_systemic_failures is NOT called if test type is already in _systemic_analysis_done_for."""
         stage = _make_stage()
-        stage._systemic_analysis_done = True  # Already ran
+        config = stage.test_configs[0]
+        stage._systemic_analysis_done_for = {config.test_type}  # Already ran for this type
 
         with patch.object(stage, "_analyze_systemic_failures", new=AsyncMock()) as mock_analyze:
             # Simulate the guard in _run_test_cycle
-            if not stage._systemic_analysis_done:
+            if config.test_type not in stage._systemic_analysis_done_for:
                 await stage._analyze_systemic_failures(MagicMock(), {}, MagicMock(), {})
 
             mock_analyze.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_systemic_analysis_runs_once_per_test_type(self):
+        """_analyze_systemic_failures runs once per distinct test type, not once per repair cycle.
+
+        With two test types ("compilation" and "unit"), the systemic check should
+        run the first time each type is encountered and be skipped on repeat
+        iterations of the same type.
+        """
+        stage = RepairCycleStage(
+            name="testing",
+            test_configs=[
+                RepairTestRunConfig(test_type="compilation"),
+                RepairTestRunConfig(test_type="unit"),
+            ],
+            agent_name="senior_software_engineer",
+        )
+
+        no_issues = SystemicAnalysisResult(
+            has_env_issues=False,
+            has_systemic_code_issues=False,
+            env_issue_description="",
+            systemic_issue_description="",
+            affected_files=[],
+            raw_json={},
+        )
+
+        with patch.object(stage, "_analyze_systemic_failures", new=AsyncMock(return_value=no_issues)) as mock_analyze:
+            test_result = _make_test_result(failed=1)
+            grouped = test_result.group_failures_by_file()
+
+            compilation_config = stage.test_configs[0]
+            unit_config = stage.test_configs[1]
+
+            # First encounter of "compilation" — should run
+            if compilation_config.test_type not in stage._systemic_analysis_done_for:
+                stage._systemic_analysis_done_for.add(compilation_config.test_type)
+                await stage._analyze_systemic_failures(test_result, grouped, compilation_config, {})
+
+            assert mock_analyze.await_count == 1
+
+            # Second encounter of "compilation" — should be skipped
+            if compilation_config.test_type not in stage._systemic_analysis_done_for:
+                await stage._analyze_systemic_failures(test_result, grouped, compilation_config, {})
+
+            assert mock_analyze.await_count == 1
+
+            # First encounter of "unit" — should run (different type)
+            if unit_config.test_type not in stage._systemic_analysis_done_for:
+                stage._systemic_analysis_done_for.add(unit_config.test_type)
+                await stage._analyze_systemic_failures(test_result, grouped, unit_config, {})
+
+            assert mock_analyze.await_count == 2
+            assert stage._systemic_analysis_done_for == {"compilation", "unit"}
 
     @pytest.mark.asyncio
     async def test_analyze_systemic_failures_returns_no_issues_on_parse_failure(self):
