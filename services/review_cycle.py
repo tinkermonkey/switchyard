@@ -545,7 +545,17 @@ class ReviewCycleExecutor:
                         self._save_cycle_state(cycle_state)
 
                         # Resume the cycle from the review point
-                        await self._continue_cycle_from_review(cycle_state, org)
+                        lock = self._get_cycle_lock(cycle_state.issue_number)
+                        if not lock.acquire(blocking=False):
+                            logger.info(
+                                f"Review cycle execution already in progress for issue "
+                                f"#{cycle_state.issue_number}, skipping resume"
+                            )
+                            continue
+                        try:
+                            await self._continue_cycle_from_review(cycle_state, org)
+                        finally:
+                            lock.release()
                         continue
 
                     # If maker was working, check if there's a maker output for this iteration
@@ -557,7 +567,17 @@ class ReviewCycleExecutor:
                         self._save_cycle_state(cycle_state)
 
                         # Resume the cycle from the maker point
-                        await self._continue_cycle_from_maker(cycle_state, org)
+                        lock = self._get_cycle_lock(cycle_state.issue_number)
+                        if not lock.acquire(blocking=False):
+                            logger.info(
+                                f"Review cycle execution already in progress for issue "
+                                f"#{cycle_state.issue_number}, skipping resume"
+                            )
+                            continue
+                        try:
+                            await self._continue_cycle_from_maker(cycle_state, org)
+                        finally:
+                            lock.release()
                         continue
 
                     logger.warning("Agent didn't complete before restart, manual intervention may be required.")
@@ -1461,15 +1481,26 @@ class ReviewCycleExecutor:
 
                     logger.info(f"Resuming review cycle - iteration {iteration + 1}/{cycle_state.max_iterations}")
 
-                    # Continue the review loop
-                    next_column, cycle_complete = await self._execute_review_loop(
-                        cycle_state,
-                        column,
-                        issue_data,
-                        org
-                    )
+                    # Guard against concurrent execution
+                    lock = self._get_cycle_lock(issue_number)
+                    if not lock.acquire(blocking=False):
+                        logger.info(
+                            f"Review cycle execution already in progress for issue #{issue_number}, "
+                            f"skipping concurrent resume"
+                        )
+                        return column.name, False
 
-                    return next_column, cycle_complete
+                    # Continue the review loop
+                    try:
+                        next_column, cycle_complete = await self._execute_review_loop(
+                            cycle_state,
+                            column,
+                            issue_data,
+                            org
+                        )
+                        return next_column, cycle_complete
+                    finally:
+                        lock.release()
 
                 # BLOCKED status handled by escalation logic below
 
@@ -1564,15 +1595,26 @@ class ReviewCycleExecutor:
                     # Register in active cycles
                     self.active_cycles[issue_number] = cycle_state
 
-                    # Continue the review loop from current iteration
-                    next_column, cycle_complete = await self._execute_review_loop(
-                        cycle_state,
-                        column,
-                        issue_data,
-                        org
-                    )
+                    # Guard against concurrent execution
+                    lock = self._get_cycle_lock(issue_number)
+                    if not lock.acquire(blocking=False):
+                        logger.info(
+                            f"Review cycle execution already in progress for issue #{issue_number}, "
+                            f"skipping concurrent resume"
+                        )
+                        return column.name, False
 
-                    return next_column, cycle_complete
+                    # Continue the review loop from current iteration
+                    try:
+                        next_column, cycle_complete = await self._execute_review_loop(
+                            cycle_state,
+                            column,
+                            issue_data,
+                            org
+                        )
+                        return next_column, cycle_complete
+                    finally:
+                        lock.release()
 
                 else:  # BLOCKED
                     logger.error("Review still blocked after human feedback")
