@@ -4747,6 +4747,39 @@ The automated test-fix-validate cycle has failed and requires manual interventio
                 )
                 return stage_config.stage
 
+            # Acquire pipeline lock if not already held.
+            # "In Review" is not a pipeline_trigger_column, so the normal routing path's
+            # lock-acquisition block is skipped entirely.  The PR review must hold the lock
+            # itself so the failsafe's lock guard (which skips locked pipelines) works.
+            from services.pipeline_lock_manager import get_pipeline_lock_manager
+            _lock_manager = get_pipeline_lock_manager()
+            _existing_lock = _lock_manager.get_lock(project_name, board_name)
+            _lock_held_by_us = (
+                _existing_lock and
+                _existing_lock.lock_status == 'locked' and
+                _existing_lock.locked_by_issue == issue_number
+            )
+            if not _lock_held_by_us:
+                _acquired, _reason = _lock_manager.try_acquire_lock(
+                    project=project_name,
+                    board=board_name,
+                    issue_number=issue_number
+                )
+                if not _acquired:
+                    logger.info(
+                        f"Cannot start PR review for #{issue_number}: "
+                        f"pipeline lock held by another issue ({_reason}). Skipping."
+                    )
+                    return stage_config.stage
+                logger.info(
+                    f"PR review acquired pipeline lock for {project_name}/{board_name} "
+                    f"(issue #{issue_number})"
+                )
+            else:
+                logger.debug(
+                    f"Pipeline lock already held by #{issue_number}, proceeding with PR review"
+                )
+
             # Get issue details
             issue_data = self.get_issue_details(repository, issue_number, project_config.github['org'])
 
@@ -4771,13 +4804,17 @@ The automated test-fix-validate cycle has failed and requires manual interventio
             task_id = f"pr_review_{issue_number}_{pipeline_run.id}"
 
             # Record execution start BEFORE launching background thread.
-            # Use 'pr_code_reviewer' (the actual Docker agent) not 'pr_review_stage'
-            # (the in-process wrapper), so the name matches the container label
-            # org.clauditoreum.agent set by agent_executor and docker_runner.
+            # Use 'pr_review_stage' (the in-process lifecycle wrapper), NOT 'pr_code_reviewer'
+            # (the inner Docker agent).  Using 'pr_code_reviewer' here caused the outer
+            # in_progress entry to be cleared prematurely when the phase-1 agent finished,
+            # because agent_executor.record_execution_outcome matches by agent name and
+            # marks the most-recent in_progress entry as complete.  With a distinct name the
+            # outer wrapper stays in_progress for the full duration of the stage, covering
+            # inter-phase gaps and post-processing (e.g. sub-issue creation).
             work_execution_tracker.record_execution_start(
                 issue_number=issue_number,
                 column=status,
-                agent='pr_code_reviewer',
+                agent='pr_review_stage',
                 trigger_source='manual',
                 project_name=project_name
             )
@@ -4841,11 +4878,11 @@ The automated test-fix-validate cycle has failed and requires manual interventio
                     stage = PRReviewStage(name="pr_review")
                     loop.run_until_complete(stage.execute(stage_context))
 
-                    # Record success
+                    # Record success — must match the 'pr_review_stage' outer wrapper name
                     work_execution_tracker.record_execution_outcome(
                         issue_number=issue_number,
                         column=status,
-                        agent='pr_code_reviewer',
+                        agent='pr_review_stage',
                         outcome='completed',
                         project_name=project_name
                     )
@@ -4854,11 +4891,11 @@ The automated test-fix-validate cycle has failed and requires manual interventio
                 except Exception as e:
                     logger.error(f"PR review stage failed for issue #{issue_number}: {e}", exc_info=True)
 
-                    # Record failure
+                    # Record failure — must match the 'pr_review_stage' outer wrapper name
                     work_execution_tracker.record_execution_outcome(
                         issue_number=issue_number,
                         column=status,
-                        agent='pr_code_reviewer',
+                        agent='pr_review_stage',
                         outcome='failed',
                         project_name=project_name,
                         error=str(e)
@@ -4898,6 +4935,23 @@ The automated test-fix-validate cycle has failed and requires manual interventio
 
         except Exception as e:
             logger.error(f"Error starting PR review for issue #{issue_number}: {e}", exc_info=True)
+            # Release the pipeline lock if we acquired it above but failed before launching the
+            # background thread.  Without this, the board stays locked until the 4-hour stale-lock
+            # timeout, blocking every other issue on the same board.
+            try:
+                from services.pipeline_lock_manager import get_pipeline_lock_manager
+                _lm = get_pipeline_lock_manager()
+                if _lm.is_locked_by_issue(project_name, board_name, issue_number):
+                    _lm.release_lock(project_name, board_name, issue_number)
+                    logger.info(
+                        f"Released pipeline lock for {project_name}/{board_name} "
+                        f"after PR review setup failure for #{issue_number}"
+                    )
+            except Exception as lock_err:
+                logger.error(
+                    f"Failed to release pipeline lock after PR review setup failure "
+                    f"for #{issue_number}: {lock_err}"
+                )
             return None
 
     def _start_repair_cycle_for_issue(
@@ -5814,6 +5868,41 @@ _Repair cycle initiated by Claude Code Orchestrator_
         # No automatic cleanup during runtime - see docstring for reasoning
         pass
 
+    def _get_last_pipeline_run_event_time(self, pipeline_run_id: str):
+        """
+        Return the timestamp of the most recent decision event for a pipeline run.
+
+        Used by stall detection as an authoritative activity heartbeat: every phase
+        transition, agent dispatch, and sub-issue creation writes a decision event,
+        so the most recent event timestamp accurately reflects when the run last made
+        progress — even during in-process post-processing that has no active agent.
+
+        Returns a timezone-aware datetime, or None if ES is unavailable or no events found.
+        """
+        try:
+            from monitoring.observability import get_observability_manager
+            from datetime import datetime, timezone
+            obs = get_observability_manager()
+            if not obs or not getattr(obs, 'es', None):
+                return None
+            result = obs.es.search(
+                index="decision-events-*",
+                body={
+                    "query": {"term": {"pipeline_run_id": pipeline_run_id}},
+                    "sort": [{"timestamp": {"order": "desc"}}],
+                    "size": 1,
+                    "_source": ["timestamp"],
+                }
+            )
+            hits = result.get('hits', {}).get('hits', [])
+            if hits:
+                ts = hits[0].get('_source', {}).get('timestamp')
+                if ts:
+                    return datetime.fromisoformat(ts.replace('Z', '+00:00'))
+        except Exception as e:
+            logger.debug(f"Failed to get last event time for pipeline run {pipeline_run_id}: {e}")
+        return None
+
     def _find_stalled_issues_for_pipeline(self, project_name: str, board_name: str,
                                             cached_items: List[ProjectItem] = None):
         """
@@ -5930,21 +6019,32 @@ _Repair cycle initiated by Claude Code Orchestrator_
                         )
 
                         if pipeline_run:
-                            # Has active pipeline run - check if it was started recently
-                            # Use started_at as a proxy since PipelineRun has no last_updated_at field
-                            started_at_str = getattr(pipeline_run, 'started_at', None)
-                            if started_at_str:
-                                try:
-                                    started_at = datetime.fromisoformat(
-                                        started_at_str.replace('Z', '+00:00')
-                                    )
-                                    if started_at > grace_period:
-                                        # Pipeline run started very recently, give it startup time
-                                        continue
-                                except (ValueError, TypeError):
-                                    pass  # Can't parse timestamp, fall through to stalled check
+                            # Has active pipeline run — check last activity via ES decision events.
+                            # Every phase transition, agent dispatch, and sub-issue creation writes
+                            # a decision event, making the most-recent event timestamp the
+                            # authoritative heartbeat for whether the run is still progressing.
+                            # This replaces the broken started_at proxy (which flagged any run
+                            # older than 2 minutes as potentially stalled regardless of activity).
+                            last_event_time = self._get_last_pipeline_run_event_time(pipeline_run.id)
+                            if last_event_time and last_event_time > grace_period:
+                                # Activity within the grace window — not stalled
+                                continue
+                            # ES unavailable or no events yet: fall back to started_at grace check
+                            if last_event_time is None:
+                                started_at_str = getattr(pipeline_run, 'started_at', None)
+                                if started_at_str:
+                                    try:
+                                        started_at = datetime.fromisoformat(
+                                            started_at_str.replace('Z', '+00:00')
+                                        )
+                                        if started_at > grace_period:
+                                            continue
+                                    except (ValueError, TypeError):
+                                        pass
+                            # else: ES returned an event older than grace_period — the run
+                            # has genuinely stalled (started_at fallback intentionally skipped).
 
-                        # If we get here: no active run OR stale active run
+                        # If we get here: no active run OR run with no recent activity
                         # This is a stalled issue
                         stalled_issues.append({
                             'issue_number': issue_number,
