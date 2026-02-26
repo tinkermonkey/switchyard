@@ -206,6 +206,7 @@ class RepairCycleStage(PipelineStage):
         test_configs: List[RepairTestRunConfig],
         agent_name: str = "senior_software_engineer",
         max_total_agent_calls: int = 100,  # Circuit breaker for cost control
+        max_total_iterations: int = 5,  # Global cap on fix iterations across ALL test types
         checkpoint_interval: int = 5,  # Checkpoint every N iterations
         **kwargs,
     ):
@@ -213,6 +214,7 @@ class RepairCycleStage(PipelineStage):
         self.test_configs = test_configs
         self.agent_name = agent_name
         self.max_total_agent_calls = max_total_agent_calls
+        self.max_total_iterations = max_total_iterations
         self.checkpoint_interval = checkpoint_interval
         self._agent_call_count = 0
         self._systemic_analysis_done_for: set = set()
@@ -278,18 +280,40 @@ class RepairCycleStage(PipelineStage):
 
         results = []
         error_message = None
+        total_iterations_used = 0  # Global counter across all test types
 
         try:
             # Track which test type in sequence (1st, 2nd, 3rd)
             for test_type_index, test_config in enumerate(self.test_configs, start=1):
-                logger.info(
-                    f"Starting {test_config.test_type} test cycle "
-                    f"(test type {test_type_index}/{len(self.test_configs)})"
-                )
+                remaining_iterations = self.max_total_iterations - total_iterations_used
+                if remaining_iterations <= 0:
+                    logger.warning(
+                        f"Global iteration cap ({self.max_total_iterations}) reached before "
+                        f"starting {test_config.test_type} (test type {test_type_index}/{len(self.test_configs)}). "
+                        f"Stopping repair cycle."
+                    )
+                    break
+
+                # Cap this test type's iterations at the remaining global budget
+                effective_config = test_config
+                if test_config.max_iterations > remaining_iterations:
+                    from dataclasses import replace
+                    effective_config = replace(test_config, max_iterations=remaining_iterations)
+                    logger.info(
+                        f"Starting {test_config.test_type} test cycle "
+                        f"(test type {test_type_index}/{len(self.test_configs)}, "
+                        f"capped at {remaining_iterations} iterations by global budget)"
+                    )
+                else:
+                    logger.info(
+                        f"Starting {test_config.test_type} test cycle "
+                        f"(test type {test_type_index}/{len(self.test_configs)})"
+                    )
 
                 cycle_start = utc_now()
-                cycle_result = await self._run_test_cycle(test_config, context, test_type_index)
+                cycle_result = await self._run_test_cycle(effective_config, context, test_type_index)
                 cycle_end = utc_now()
+                total_iterations_used += cycle_result.iterations
 
                 cycle_result.duration_seconds = (cycle_end - cycle_start).total_seconds()
                 results.append(cycle_result)
@@ -755,13 +779,22 @@ Follow these steps exactly:
 
 2. Check whether there are local commits not yet pushed to origin:
    `git status -sb`
-   Only push if there are unpushed commits. Push with:
+   If there are unpushed commits, attempt to push:
    `git push origin HEAD`
-   If already up-to-date, skip the push and proceed to step 3.
+   If the push succeeds, proceed to step 3.
+   If the push fails due to authentication/network issues, do NOT treat this as a CI failure.
+   Instead, check if any CI run exists for the current commit SHA that was already pushed earlier:
+   `git rev-parse origin/$(git rev-parse --abbrev-ref HEAD)` to get the last pushed SHA
+   Then query for CI runs on that commit. If the most recent run for the pushed commit is a success, return success.
+   If there is no successful run and push failed, return:
+   {{"passed": 0, "failed": 1, "warnings": 0, "failures": [{{"file": "git", "test": "push", "message": "Cannot push unpushed commits — authentication failed. CI cannot be verified against latest code."}}], "warning_list": []}}
 
 3. Wait for the most recent CI run to complete:
    `gh run list --limit 1 --branch $(git rev-parse --abbrev-ref HEAD) --json databaseId,status,conclusion,workflowName`
    Poll every 30 seconds until `status` is `completed`.
+   **IMPORTANT**: Only check the CI run that was triggered by the push in step 2 (or the most recent one if already up-to-date).
+   Do NOT report a stale CI run that predates the current commit as the result.
+   Verify the run's head SHA matches the current commit: `gh run view <run_id> --json headSha`
    If no CI run appears within 3 minutes of pushing, return:
    {{"passed": 0, "failed": 1, "warnings": 0, "failures": [{{"file": "ci", "test": "trigger", "message": "No CI run triggered within 3 minutes of push — CI may not be configured for this branch"}}], "warning_list": []}}
    If CI has still not completed when you are within 2 minutes of your deadline, stop polling and return:
@@ -1088,6 +1121,16 @@ Be mindful of environment setup steps like installing dependencies and activatin
 - Identify the root cause in the source code, explore similar functionality elsewhere in the code to see how this is handled
 - Evaluate if the test is still relevant and necessary, if it's not, remove it completely
 - If the test is meant for functionality which is not implemented, remove the test entirely
+
+**For formatter/linter failures** (e.g. "would reformat", "reformatted", style violation):
+- Always run the project's formatter on the file — do NOT manually reformat lines or adjust indentation by hand; formatters apply rules that hand-edits rarely satisfy exactly.
+- Discover the project's formatter from its config files (pyproject.toml, package.json, .prettierrc, .eslintrc, etc.).
+- Run the formatter from the **project root directory** so it picks up the project's own config (line length, rules, etc.).
+  - Python: `black <file>` (reads pyproject.toml/setup.cfg), `ruff check --fix <file>` then `ruff check <file>`
+  - JavaScript/TypeScript: `npx prettier --write <file>`, `npx eslint --fix <file>`
+  - Go: `gofmt -w <file>`
+  - Rust: `cargo fmt`
+- After running the formatter, confirm the check passes (e.g. `black --check <file>`, `npx prettier --check <file>`) before committing.
 """,
             }
 
