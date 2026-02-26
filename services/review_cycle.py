@@ -6,6 +6,7 @@ Implements the synchronous maker-checker review loop with iteration tracking.
 
 import asyncio
 import logging
+import threading
 from typing import Dict, Any, Optional, Tuple, List
 from datetime import datetime
 from config.manager import WorkflowColumn
@@ -122,12 +123,23 @@ class ReviewCycleExecutor:
         self.active_cycles = {}  # Track active review cycles by issue number
         self.state_dir = None  # Will be set per project
         self.outcome_correlator = get_review_outcome_correlator()
+        # Per-issue locks that prevent concurrent _execute_review_loop / _continue_cycle_from_review
+        # calls for the same issue (e.g. resume_active_cycles racing with the project monitor poll)
+        self._cycle_execution_locks: Dict[int, threading.Lock] = {}
+        self._cycle_locks_lock = threading.Lock()  # guards the dict above
         
         # Initialize decision observability
         from monitoring.observability import get_observability_manager
         from monitoring.decision_events import DecisionEventEmitter
         self.obs = get_observability_manager()
         self.decision_events = DecisionEventEmitter(self.obs)
+
+    def _get_cycle_lock(self, issue_number: int) -> threading.Lock:
+        """Return the execution lock for an issue, creating it on first use."""
+        with self._cycle_locks_lock:
+            if issue_number not in self._cycle_execution_locks:
+                self._cycle_execution_locks[issue_number] = threading.Lock()
+            return self._cycle_execution_locks[issue_number]
 
     def _get_github_integration(self, cycle_state: ReviewCycleState) -> GitHubIntegration:
         """Get properly initialized GitHubIntegration for this cycle"""
@@ -440,16 +452,25 @@ class ReviewCycleExecutor:
                             )
                             continue
 
+                        # Guard against concurrent execution from the project monitor poll
+                        lock = self._get_cycle_lock(cycle_state.issue_number)
+                        if not lock.acquire(blocking=False):
+                            logger.info(
+                                f"Review cycle execution already in progress for issue "
+                                f"#{cycle_state.issue_number}, skipping resume"
+                            )
+                            continue
+
                         # Fetch necessary context to run the loop
                         try:
                             from config.manager import config_manager
                             workflow_template = config_manager.get_project_workflow(cycle_state.project_name, cycle_state.board_name)
                             column = next((c for c in workflow_template.columns if c.agent == cycle_state.reviewer_agent), None)
-                            
+
                             if column:
                                 github = self._get_github_integration(cycle_state)
                                 issue_data = await github.get_issue_details(cycle_state.issue_number, cycle_state.repository)
-                                
+
                                 # Execute the review loop
                                 # Note: _execute_review_loop will increment iteration at the start
                                 await self._execute_review_loop(
@@ -462,13 +483,25 @@ class ReviewCycleExecutor:
                                 logger.error(f"Could not find column config for reviewer {cycle_state.reviewer_agent}")
                         except Exception as e:
                             logger.error(f"Failed to resume review loop: {e}", exc_info=True)
-                        
+                        finally:
+                            lock.release()
+
                         continue
 
                     if cycle_state.review_outputs and len(cycle_state.review_outputs) > 0:
                         # Reviewer has completed at least one iteration
                         logger.info(f"Cycle in initialized state with pending review - continuing")
-                        await self._continue_cycle_from_review(cycle_state, org)
+                        lock = self._get_cycle_lock(cycle_state.issue_number)
+                        if not lock.acquire(blocking=False):
+                            logger.info(
+                                f"Review cycle execution already in progress for issue "
+                                f"#{cycle_state.issue_number}, skipping resume"
+                            )
+                            continue
+                        try:
+                            await self._continue_cycle_from_review(cycle_state, org)
+                        finally:
+                            lock.release()
                         continue
                     else:
                         # No work done yet, needs to be triggered by column movement
@@ -642,7 +675,18 @@ class ReviewCycleExecutor:
                 
                 # Reuse existing cycle - do NOT append maker output or reset state
                 cycle_state = existing_cycle
-                
+
+                # Guard against concurrent execution (e.g. resume_active_cycles racing with the
+                # project monitor poll).  Non-blocking: if another thread already holds the lock
+                # for this issue there is nothing new to dispatch.
+                lock = self._get_cycle_lock(issue_number)
+                if not lock.acquire(blocking=False):
+                    logger.info(
+                        f"Review cycle execution already in progress for issue #{issue_number}, "
+                        f"skipping concurrent call"
+                    )
+                    return column.name, False
+
                 # Continue directly to executing the review loop
                 # The existing state already has the maker outputs and iteration tracking
                 try:
@@ -707,6 +751,8 @@ class ReviewCycleExecutor:
                         )
 
                     raise
+                finally:
+                    lock.release()
             else:
                 # Different review column - remove old cycle and create new one
                 logger.info(
@@ -775,6 +821,17 @@ class ReviewCycleExecutor:
             pipeline_run_id=cycle_state.pipeline_run_id
         )
 
+        # Guard against concurrent execution (e.g. resume_active_cycles racing with the project
+        # monitor poll).  Non-blocking: if another thread is already executing the loop for this
+        # issue (having just added the cycle to active_cycles above), skip rather than duplicate.
+        lock = self._get_cycle_lock(issue_number)
+        if not lock.acquire(blocking=False):
+            logger.info(
+                f"Review cycle execution already in progress for issue #{issue_number}, "
+                f"skipping concurrent call"
+            )
+            return column.name, False
+
         try:
             # Execute the review loop
             final_status, next_column = await self._execute_review_loop(
@@ -830,6 +887,8 @@ class ReviewCycleExecutor:
                 )
 
             raise
+        finally:
+            lock.release()
 
     async def _continue_cycle_from_review(self, cycle_state: ReviewCycleState, org: str):
         """Continue a stuck cycle that completed a review but state wasn't updated"""
@@ -1987,12 +2046,14 @@ class ReviewCycleExecutor:
                 await self._escalate_max_iterations(cycle_state, review_result_parsed)
                 return ReviewStatus.CHANGES_REQUESTED, column.name
 
-            # Store maker output
+            # Store maker output and persist immediately so a restart mid-loop
+            # doesn't leave the on-disk state missing the maker's work
             cycle_state.maker_outputs.append({
                 'iteration': iteration,
                 'output': maker_comment,
                 'timestamp': datetime.now().isoformat()
             })
+            self._save_cycle_state(cycle_state)
 
             # Continue to next iteration - the loop will go back to the reviewer
             logger.info(f"Maker responded, continuing to iteration {iteration + 1} for re-review")
