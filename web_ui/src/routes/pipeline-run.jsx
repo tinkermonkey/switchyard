@@ -279,6 +279,27 @@ function PipelineRunView() {
         if (!selectedPipelineRun && data.runs.length > 0) {
           setSelectedPipelineRun(data.runs[0])
         }
+
+        // If the selected run was active but is no longer in the active list, it has
+        // transitioned to completed/failed/killed — fetch its updated object so that
+        // status-dependent UI (drag, resize, memoization) updates immediately.
+        if (selectedPipelineRun?.status === 'active') {
+          const stillActive = data.runs.find(r => r.id === selectedPipelineRun.id)
+          if (!stillActive) {
+            try {
+              const completedRes = await fetch('/completed-pipeline-runs?limit=10&offset=0')
+              const completedData = await completedRes.json()
+              if (completedData.success) {
+                const updated = completedData.runs.find(r => r.id === selectedPipelineRun.id)
+                if (updated) {
+                  setSelectedPipelineRun(updated)
+                }
+              }
+            } catch (e) {
+              // Non-critical: status will sync on next manual refresh
+            }
+          }
+        }
       }
     } catch (error) {
       console.error('Error fetching active pipeline runs:', error)
