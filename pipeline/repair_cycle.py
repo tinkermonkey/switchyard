@@ -777,6 +777,23 @@ Follow these steps exactly:
    Use the source file path from the log as "file" (or the job/workflow name if no file is identifiable).
    Use the job name and step name as "test".""" + _TEST_OUTPUT_FORMAT
 
+        elif config.test_type == "storybook":
+            direct_prompt = """Run the Storybook story tests for this project.
+
+1. Check if Storybook is configured by looking for storybook-related scripts in package.json.
+   If Storybook is not configured, return success immediately:
+   {"passed": 1, "failed": 0, "warnings": 0, "failures": [], "warning_list": []}
+
+2. Run the full Storybook test suite using the all-in-one script:
+   `npm run test:storybook:full`
+   This script builds Storybook, serves it locally on port 61001, waits for the server to be ready,
+   and runs all story tests (including accessibility checks via axe-core).
+
+3. Save the full output to /tmp/storybook_results.txt for reference.
+
+4. Return structured results. Each failing story test is a separate failure entry.
+   Use the story file path as "file", the story/test name as "test", and the error message as "message".""" + _TEST_OUTPUT_FORMAT
+
         else:
             direct_prompt = f"""Run all {config.test_type} tests for this project.
 
