@@ -1,5 +1,5 @@
 import { memo } from 'react'
-import { Handle, Position } from '@xyflow/react'
+import { Handle, Position, NodeResizer } from '@xyflow/react'
 import { ChevronDown, ChevronRight, RotateCcw } from 'lucide-react'
 
 /**
@@ -20,6 +20,7 @@ const CycleBoundingNode = ({ data }) => {
     cyclePadding = 40,
     startTime,
     endTime,
+    isResizable = false,
   } = data
 
   // Get cycle type styling
@@ -62,8 +63,8 @@ const CycleBoundingNode = ({ data }) => {
   return (
     <div
       style={{
-        width: isCollapsed ? 280 : width,
-        height: isCollapsed ? 100 : height,
+        width: isCollapsed ? 280 : '100%',
+        height: isCollapsed ? 100 : '100%',
         border: '3px dashed',
         borderColor: style.borderColor,
         borderRadius: '12px',
@@ -74,6 +75,13 @@ const CycleBoundingNode = ({ data }) => {
       }}
       className="cycle-bounding-node"
     >
+      <NodeResizer
+        isVisible={isResizable && !isCollapsed}
+        minWidth={220}
+        minHeight={80}
+        handleStyle={{ background: '#6b7280', border: '1px solid white', borderRadius: '2px' }}
+        lineStyle={{ borderColor: '#6b728060' }}
+      />
       {/* Handles for connections when collapsed */}
       {isCollapsed && (
         <>

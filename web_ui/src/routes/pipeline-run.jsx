@@ -4,7 +4,7 @@ import Header from '../components/Header'
 import NavigationTabs from '../components/NavigationTabs'
 import CycleBoundingNode from '../components/CycleBoundingNode'
 import ConfirmationModal from '../components/ConfirmationModal'
-import { useState, useEffect, useCallback, useMemo } from 'react'
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import {
   ReactFlow,
   Controls,
@@ -254,7 +254,9 @@ function PipelineRunView() {
   const [showKillModal, setShowKillModal] = useState(false)
   const completedLimit = 10
   const { events: socketEvents } = useSocket()
-  
+  const socketEventsRef = useRef(socketEvents)
+  useEffect(() => { socketEventsRef.current = socketEvents }, [socketEvents])
+
   // Fetch active pipeline runs
   const fetchActivePipelineRuns = useCallback(async (isInitialLoad = false) => {
     try {
@@ -413,6 +415,8 @@ function PipelineRunView() {
   // Merge API events with live WebSocket events
   const mergedEvents = useMemo(() => {
     if (!selectedPipelineRun) return []
+    // Completed runs: don't merge socket events (they're irrelevant and would cause rebuilds)
+    if (selectedPipelineRun.status !== 'active') return pipelineRunEvents
     return mergePipelineRunEvents(pipelineRunEvents, socketEvents, selectedPipelineRun)
   }, [pipelineRunEvents, socketEvents, selectedPipelineRun])
   
@@ -430,11 +434,11 @@ function PipelineRunView() {
     
     // Track currently active agents from socket events
     const activeAgents = new Set()
-    socketEvents
+    socketEventsRef.current
       .filter(e => e.event_type === 'agent_initialized')
       .forEach(e => activeAgents.add(e.agent))
-    
-    socketEvents
+
+    socketEventsRef.current
       .filter(e => ['agent_completed', 'agent_failed'].includes(e.event_type))
       .forEach(e => activeAgents.delete(e.agent))
     
@@ -703,18 +707,21 @@ function PipelineRunView() {
     // Update edges for collapsed cycles
     const updatedEdges = updateEdgesForCycles(newEdges, updatedCycles, agentExecutions)
     
-    // Add toggle callback to cycle nodes
+    // Add toggle callback to cycle nodes; enable drag/resize for completed runs
+    const isCompleted = selectedPipelineRun?.status !== 'active'
     const finalNodes = layoutedNodes.map(node => {
       if (node.type === 'cycleBounding') {
         return {
           ...node,
+          ...(isCompleted && { draggable: true }),
           data: {
             ...node.data,
             onToggleCollapse: handleToggleCycle,
+            isResizable: isCompleted,
           },
         }
       }
-      return node
+      return isCompleted ? { ...node, draggable: true } : node
     })
     
     // Calculate chart dimensions based on layout
@@ -731,7 +738,7 @@ function PipelineRunView() {
         reactFlowInstance.fitView({ padding: 0.1, duration: 300 })
       }, 50)
     }
-  }, [mergedEvents, selectedPipelineRun, socketEvents, cycles, workflowConfig, setNodes, setEdges, reactFlowInstance, handleToggleCycle])
+  }, [mergedEvents, selectedPipelineRun, cycles, workflowConfig, setNodes, setEdges, reactFlowInstance, handleToggleCycle])
   
   // Initial load
   useEffect(() => {
@@ -833,7 +840,8 @@ function PipelineRunView() {
       // Refresh pipeline runs and events when new events arrive
       const latestEvent = socketEvents[socketEvents.length - 1]
       if (['agent_initialized', 'agent_completed', 'agent_failed'].includes(latestEvent.event_type)) {
-        if (selectedPipelineRun) {
+        // Only refetch events for active runs — completed runs don't produce new events
+        if (selectedPipelineRun?.status === 'active') {
           fetchPipelineRunEvents(selectedPipelineRun.id)
         }
         fetchActivePipelineRuns(false) // Background refresh from WebSocket event
@@ -1107,7 +1115,7 @@ function PipelineRunView() {
                       onNodeMouseLeave={onNodeMouseLeave}
                       onInit={setReactFlowInstance}
                       nodeTypes={nodeTypes}
-                      nodesDraggable={false}
+                      nodesDraggable={selectedPipelineRun?.status !== 'active'}
                       nodesConnectable={false}
                       fitView
                       fitViewOptions={{ padding: 0.05 }}
