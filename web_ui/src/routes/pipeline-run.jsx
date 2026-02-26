@@ -1,8 +1,9 @@
 import { createFileRoute } from '@tanstack/react-router'
-import { RefreshCw, Activity, CheckCircle, XCircle, AlertCircle, MessageSquare, GitBranch, PlayCircle, Lock, Unlock, Clock } from 'lucide-react'
+import { RefreshCw, Activity, CheckCircle, XCircle, AlertCircle, Lock, Unlock, Clock } from 'lucide-react'
 import Header from '../components/Header'
 import NavigationTabs from '../components/NavigationTabs'
 import CycleBoundingNode from '../components/CycleBoundingNode'
+import PipelineEventNode from '../components/PipelineEventNode'
 import ConfirmationModal from '../components/ConfirmationModal'
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import {
@@ -11,9 +12,6 @@ import {
   Background,
   useNodesState,
   useEdgesState,
-  MarkerType,
-  Handle,
-  Position,
 } from '@xyflow/react'
 import '@xyflow/react/dist/style.css'
 import { useSocket } from '../contexts/SocketContext'
@@ -25,178 +23,7 @@ import {
   updateEdgesForCycles,
 } from '../utils/cycleLayout'
 import { mergePipelineRunEvents, mergeArrayByIdStable } from '../utils/eventMerging'
-
-/**
- * Custom node component for pipeline run events with candy-stripe animation
- */
-const PipelineEventNode = ({ data }) => {
-  const { label, type, status, metadata, isActive } = data
-  
-  // Determine colors based on type and status
-  const getNodeStyle = () => {
-    const baseStyle = {
-      padding: '12px 16px',
-      borderRadius: '8px',
-      border: '2px solid',
-      minWidth: '200px',
-      maxWidth: '300px',
-      boxShadow: isActive ? '0 0 10px rgba(88, 166, 255, 0.5)' : '0 2px 4px rgba(0,0,0,0.1)',
-    }
-    
-    switch (type) {
-      case 'pipeline_created':
-        return {
-          ...baseStyle,
-          background: '#10b981',
-          borderColor: '#059669',
-          color: '#fff',
-        }
-      case 'pipeline_completed':
-        return {
-          ...baseStyle,
-          background: '#6366f1',
-          borderColor: '#4f46e5',
-          color: '#fff',
-        }
-      case 'decision_event':
-        // Color-code by decision category for better visual distinction
-        const getDecisionColors = (category) => {
-          switch (category) {
-            case 'routing':
-              return { bg: '#3b82f6', border: '#2563eb' }  // Blue - routing decisions
-            case 'progression':
-              return { bg: '#10b981', border: '#059669' }  // Green - status progression
-            case 'review_cycle':
-              return { bg: '#8b5cf6', border: '#7c3aed' }  // Purple - review cycles
-            case 'feedback':
-              return { bg: '#f59e0b', border: '#d97706' }  // Orange - feedback
-            case 'error_handling':
-              return { bg: '#ef4444', border: '#dc2626' }  // Red - errors
-            case 'task_management':
-              return { bg: '#06b6d4', border: '#0891b2' }  // Cyan - task queue
-            case 'branch_management':
-              return { bg: '#84cc16', border: '#65a30d' }  // Lime - git branches
-            case 'conversational_loop':
-              return { bg: '#ec4899', border: '#db2777' }  // Pink - conversations
-            default:
-              return { bg: '#f59e0b', border: '#d97706' }  // Default orange
-          }
-        }
-        
-        const colors = getDecisionColors(metadata?.decision_category)
-        return {
-          ...baseStyle,
-          background: colors.bg,
-          borderColor: colors.border,
-          color: '#fff',
-        }
-      case 'agent_execution':
-        if (status === 'running' || isActive) {
-          return {
-            ...baseStyle,
-            background: '#1f6feb',
-            borderColor: '#58a6ff',
-            color: '#fff',
-            border: '3px solid #58a6ff',
-          }
-        } else if (status === 'completed') {
-          return {
-            ...baseStyle,
-            background: '#238636',
-            borderColor: '#2ea043',
-            color: '#fff',
-          }
-        } else if (status === 'failed') {
-          return {
-            ...baseStyle,
-            background: '#da3633',
-            borderColor: '#f85149',
-            color: '#fff',
-          }
-        }
-        return {
-          ...baseStyle,
-          background: '#6e7681',
-          borderColor: '#30363d',
-          color: '#fff',
-        }
-      case 'review_feedback':
-        return {
-          ...baseStyle,
-          background: '#8b5cf6',
-          borderColor: '#7c3aed',
-          color: '#fff',
-        }
-      case 'human_feedback':
-        return {
-          ...baseStyle,
-          background: '#ec4899',
-          borderColor: '#db2777',
-          color: '#fff',
-        }
-      default:
-        return {
-          ...baseStyle,
-          background: '#374151',
-          borderColor: '#4b5563',
-          color: '#fff',
-        }
-    }
-  }
-  
-  const getIcon = () => {
-    switch (type) {
-      case 'pipeline_created':
-        return <PlayCircle className="w-4 h-4" />
-      case 'pipeline_completed':
-        return <CheckCircle className="w-4 h-4" />
-      case 'decision_event':
-        return <GitBranch className="w-4 h-4" />
-      case 'agent_execution':
-        if (status === 'completed') return <CheckCircle className="w-4 h-4" />
-        if (status === 'failed') return <XCircle className="w-4 h-4" />
-        return <Activity className="w-4 h-4" />
-      case 'review_feedback':
-        return <MessageSquare className="w-4 h-4" />
-      case 'human_feedback':
-        return <AlertCircle className="w-4 h-4" />
-      default:
-        return <Activity className="w-4 h-4" />
-    }
-  }
-  
-  return (
-    <div style={getNodeStyle()} className="relative">
-      {/* Candy stripe animation for active agents */}
-      {isActive && (
-        <div 
-          className="absolute top-0 left-0 right-0 h-1 rounded-t-md overflow-hidden"
-          style={{
-            backgroundImage: 'linear-gradient(45deg, rgba(255,255,255,.2) 25%, transparent 25%, transparent 50%, rgba(255,255,255,.2) 50%, rgba(255,255,255,.2) 75%, transparent 75%, transparent)',
-            backgroundSize: '1rem 1rem',
-            animation: 'pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite, stripes 1s linear infinite'
-          }}
-        />
-      )}
-      
-      <Handle type="target" position={Position.Top} style={{ opacity: 0 }} />
-      
-      <div className="flex items-start gap-2">
-        <div className="mt-0.5">{getIcon()}</div>
-        <div className="flex-1">
-          <div className="font-semibold text-sm">{label}</div>
-          {metadata && (
-            <div className="text-xs mt-1 opacity-90">
-              {metadata}
-            </div>
-          )}
-        </div>
-      </div>
-      
-      <Handle type="source" position={Position.Bottom} style={{ opacity: 0 }} />
-    </div>
-  )
-}
+import { buildFlowchart as buildFlowchartUtil } from '../utils/buildFlowchart'
 
 const nodeTypes = {
   pipelineEvent: PipelineEventNode,
@@ -449,269 +276,27 @@ function PipelineRunView() {
       setChartHeight(600)
       return
     }
-    
-    const newNodes = []
-    const newEdges = []
-    
-    // Track currently active agents from socket events
+
+    // Compute active agents from live socket events
     const activeAgents = new Set()
     socketEventsRef.current
       .filter(e => e.event_type === 'agent_initialized')
       .forEach(e => activeAgents.add(e.agent))
-
     socketEventsRef.current
       .filter(e => ['agent_completed', 'agent_failed'].includes(e.event_type))
       .forEach(e => activeAgents.delete(e.agent))
-    
-    // Add pipeline created node
-    const createdNode = {
-      id: 'created',
-      type: 'pipelineEvent',
-      position: { x: 0, y: 0 }, // Will be positioned by layout
-      data: {
-        label: 'Pipeline Started',
-        type: 'pipeline_created',
-        metadata: new Date(selectedPipelineRun.started_at).toLocaleString(),
-      },
-      draggable: false,
-    }
-    newNodes.push(createdNode)
-    
-    // Track agent executions: map of agent -> [execution instances]
-    const agentExecutions = new Map()
-    
-    // First pass: identify all agent executions
-    mergedEvents.forEach(event => {
-      if (event.event_category === 'agent_lifecycle') {
-        const agent = event.agent
-        const taskId = event.task_id
-        
-        if (event.event_type === 'agent_initialized') {
-          if (!agentExecutions.has(agent)) {
-            agentExecutions.set(agent, [])
-          }
-          agentExecutions.get(agent).push({
-            taskId,
-            startTime: event.timestamp,
-            startEvent: event,
-            endTime: null,
-            endEvent: null,
-            status: 'running',
-            isActive: activeAgents.has(agent),
-          })
-        } else if (['agent_completed', 'agent_failed'].includes(event.event_type)) {
-          const executions = agentExecutions.get(agent) || []
-          const execution = executions.find(e => e.taskId === taskId)
-          if (execution) {
-            execution.endTime = event.timestamp
-            execution.endEvent = event
-            execution.status = event.event_type === 'agent_completed' ? 'completed' : 'failed'
-          }
-        }
-      }
+
+    // Build raw unpositioned nodes/edges via shared utility
+    const { nodes: newNodes, edges: newEdges, agentExecutions, updatedCycles } = buildFlowchartUtil({
+      events: mergedEvents,
+      existingCycles: cycles,
+      workflowConfig,
+      selectedPipelineRun,
+      activeAgentNames: activeAgents,
     })
-    
-    // Identify review cycles (agents with multiple executions)
-    const detectedCycles = identifyCycles(pipelineRunEvents, agentExecutions, workflowConfig)
-    
-    // Merge with existing cycle state (preserve collapse state)
-    // NOTE: Don't call setCycles here to avoid updating state during render
-    const updatedCycles = new Map(detectedCycles)
-    cycles.forEach((existingCycle, agent) => {
-      if (updatedCycles.has(agent)) {
-        const newCycle = updatedCycles.get(agent)
-        updatedCycles.set(agent, {
-          ...newCycle,
-          isCollapsed: existingCycle.isCollapsed, // Preserve collapse state
-        })
-      }
-    })
-    
-    // Second pass: build nodes and edges chronologically
-    let previousNodeId = 'created'
-    const processedAgents = new Set()
-    
-    // Process events chronologically
-    const sortedEvents = [...pipelineRunEvents].sort((a, b) => 
-      new Date(a.timestamp) - new Date(b.timestamp)
-    )
-    
-    sortedEvents.forEach((event, idx) => {
-      let currentNodeId = null
-      
-      // Decision events
-      if (event.event_category === 'decision') {
-        const nodeId = `decision-${idx}`
-        const decisionType = event.event_type || 'decision'
-        const reason = event.reason || ''
-        
-        // Build enhanced metadata
-        const metadataParts = []
-        
-        // Add decision category badge
-        if (event.decision_category) {
-          metadataParts.push(`[${event.decision_category}]`)
-        }
-        
-        // Add key decision details
-        if (event.decision) {
-          if (event.decision.selected_agent) metadataParts.push(`→ ${event.decision.selected_agent}`)
-          if (event.decision.to_status) metadataParts.push(`→ ${event.decision.to_status}`)
-          if (event.decision.action) metadataParts.push(`${event.decision.action}`)
-        }
-        
-        // Add truncated reason
-        if (reason) {
-          const maxLen = 50
-          const truncated = reason.length > maxLen ? reason.substring(0, maxLen) + '...' : reason
-          metadataParts.push(truncated)
-        }
-        
-        newNodes.push({
-          id: nodeId,
-          type: 'pipelineEvent',
-          position: { x: 0, y: 0 }, // Will be positioned by layout
-          data: {
-            label: decisionType.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase()),
-            type: 'decision_event',
-            metadata: metadataParts.join(' • '),
-            decision_category: event.decision_category,
-            timestamp: event.timestamp, // ADDED: Include timestamp for cycle detection
-          },
-          draggable: false,
-        })
-        
-        currentNodeId = nodeId
-      }
-      
-      // Agent execution starts
-      else if (event.event_category === 'agent_lifecycle' && event.event_type === 'agent_initialized') {
-        const agent = event.agent
-        const taskId = event.task_id
-        const executions = agentExecutions.get(agent) || []
-        const executionIndex = executions.findIndex(e => e.taskId === taskId)
-        
-        // Check if this is part of a review cycle
-        if (updatedCycles.has(agent)) {
-          const cycleExecutions = updatedCycles.get(agent).executions
-          const cycleIndex = cycleExecutions.findIndex(e => e.taskId === taskId)
-          
-          const nodeId = `agent-${agent}-${cycleIndex}`
-          
-          const execution = cycleExecutions[cycleIndex]
-          const isActive = execution.isActive
-          
-          newNodes.push({
-            id: nodeId,
-            type: 'pipelineEvent',
-            position: { x: 0, y: 0 }, // Will be positioned by layout
-            data: {
-              label: agent.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase()),
-              type: 'agent_execution',
-              status: execution.status,
-              metadata: `Iteration ${cycleIndex + 1}${isActive ? ' (Running)' : ''}`,
-              isActive,
-            },
-            draggable: false,
-          })
-          
-          // Add feedback edge if this is a retry (not the first execution)
-          if (cycleIndex > 0) {
-            const previousExecutionId = `agent-${agent}-${cycleIndex - 1}`
-            newEdges.push({
-              id: `feedback-${agent}-${cycleIndex}`,
-              source: previousExecutionId,
-              target: nodeId,
-              type: 'smoothstep',
-              label: 'Revision',
-              labelStyle: { fontSize: '10px', fill: '#f59e0b' },
-              markerEnd: {
-                type: MarkerType.ArrowClosed,
-                color: '#f59e0b',
-              },
-              style: { stroke: '#f59e0b', strokeDasharray: '5,5' },
-            })
-          }
-          
-          currentNodeId = nodeId
-        } else {
-          // Single execution agent
-          const nodeId = `agent-${agent}-${executionIndex}`
-          const execution = executions[executionIndex]
-          const isActive = execution.isActive
-          
-          newNodes.push({
-            id: nodeId,
-            type: 'pipelineEvent',
-            position: { x: 0, y: 0 }, // Will be positioned by layout
-            data: {
-              label: agent.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase()),
-              type: 'agent_execution',
-              status: execution.status,
-              metadata: isActive ? 'Running' : execution.status,
-              isActive,
-            },
-            draggable: false,
-          })
-          
-          currentNodeId = nodeId
-        }
-        
-        processedAgents.add(agent)
-      }
-      
-      // Connect to previous node
-      if (currentNodeId && previousNodeId) {
-        newEdges.push({
-          id: `edge-${previousNodeId}-${currentNodeId}`,
-          source: previousNodeId,
-          target: currentNodeId,
-          type: 'smoothstep',
-          markerEnd: {
-            type: MarkerType.ArrowClosed,
-            color: '#6e7681',
-          },
-          style: { stroke: '#6e7681' },
-        })
-        previousNodeId = currentNodeId
-      }
-    })
-    
-    // Add pipeline completed node if pipeline is complete
-    if (selectedPipelineRun.status === 'completed') {
-      const completedNode = {
-        id: 'completed',
-        type: 'pipelineEvent',
-        position: { x: 0, y: 0 }, // Will be positioned by layout
-        data: {
-          label: 'Pipeline Completed',
-          type: 'pipeline_completed',
-          metadata: selectedPipelineRun.ended_at 
-            ? new Date(selectedPipelineRun.ended_at).toLocaleString()
-            : '',
-        },
-        draggable: false,
-      }
-      newNodes.push(completedNode)
-      
-      // Connect last node to completed
-      if (previousNodeId !== 'created') {
-        newEdges.push({
-          id: `edge-${previousNodeId}-completed`,
-          source: previousNodeId,
-          target: 'completed',
-          type: 'smoothstep',
-          markerEnd: {
-            type: MarkerType.ArrowClosed,
-            color: '#6e7681',
-          },
-          style: { stroke: '#6e7681' },
-        })
-      }
-    }
-    
+
     // Apply custom cycle layout
-    const { nodes: layoutedNodes, cycleNodes } = applyCycleLayout(
+    const { nodes: layoutedNodes } = applyCycleLayout(
       newNodes,
       newEdges,
       updatedCycles,
@@ -724,10 +309,10 @@ function PipelineRunView() {
         viewportHeight: 600,
       }
     )
-    
+
     // Update edges for collapsed cycles
     const updatedEdges = updateEdgesForCycles(newEdges, updatedCycles, agentExecutions)
-    
+
     // Add toggle callback to cycle nodes; enable drag/resize for completed runs
     const isCompleted = selectedPipelineRun?.status !== 'active'
     const finalNodes = layoutedNodes.map(node => {
@@ -744,15 +329,15 @@ function PipelineRunView() {
       }
       return isCompleted ? { ...node, draggable: true } : node
     })
-    
+
     // Calculate chart dimensions based on layout
     const maxX = Math.max(...finalNodes.map(n => n.position.x + (n.style?.width || 250)))
     const maxY = Math.max(...finalNodes.map(n => n.position.y + (n.style?.height || 80)))
     setChartHeight(Math.max(600, maxY + 100))
-    
+
     setNodes(finalNodes)
     setEdges(updatedEdges)
-    
+
     // Fit view after layout is complete
     if (reactFlowInstance) {
       setTimeout(() => {

@@ -1,5 +1,5 @@
 import { Link } from '@tanstack/react-router'
-import { Activity, FolderGit2, Workflow, Bug, Stethoscope, Code2, BarChart2 } from 'lucide-react'
+import { Activity, FolderGit2, Workflow, Bug, Stethoscope, Code2, BarChart2, Sliders } from 'lucide-react'
 
 export default function NavigationTabs() {
   return (
@@ -54,6 +54,18 @@ export default function NavigationTabs() {
       >
         <Workflow className="inline w-4 h-4 mr-2" />
         Pipeline Run Graphs (beta)
+      </Link>
+      <Link
+        to="/layout-sandbox"
+        activeProps={{
+          className: "px-4 py-2 bg-gh-accent-emphasis border border-gh-accent-primary rounded-md hover:bg-gh-accent-primary transition-colors text-sm text-white"
+        }}
+        inactiveProps={{
+          className: "px-4 py-2 bg-gh-canvas-subtle border border-gh-border rounded-md hover:bg-gh-border-muted transition-colors text-sm"
+        }}
+      >
+        <Sliders className="inline w-4 h-4 mr-2" />
+        Layout Sandbox
       </Link>
 
         <div> | </div>
