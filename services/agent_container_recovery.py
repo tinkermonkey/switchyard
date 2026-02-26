@@ -991,31 +991,65 @@ class AgentContainerRecovery:
             # Get project config
             config_manager = ConfigManager()
             project_config = config_manager.get_project_config(project)
-            
+
             if not project_config:
                 logger.warning(f"Could not find project config for {project}")
                 return
-            
-            # Find the dev/SDLC pipeline
-            pipeline_config = None
-            for pipeline in project_config.pipelines:
-                if 'SDLC' in pipeline.board_name or 'dev' in pipeline.board_name.lower():
-                    pipeline_config = pipeline
-                    break
 
+            from pathlib import Path
+            import json
+
+            # --- PRIMARY PATH: load everything from the persistent context file ---
+            context_file = Path(
+                f"/workspace/clauditoreum/orchestrator_data/repair_cycles"
+                f"/{project}/{issue_number}/context.json"
+            )
+
+            board_name = None
+            effective_run_id = run_id          # fallback to caller-supplied (may be truncated)
+            agent_name = 'senior_software_engineer'
+
+            if context_file.exists():
+                try:
+                    with open(context_file, 'r') as f:
+                        saved_context = json.load(f)
+
+                    board_name = saved_context.get('board')
+                    effective_run_id = saved_context.get('pipeline_run_id') or run_id
+                    agent_name = saved_context.get('agent_name') or agent_name
+
+                    logger.info(
+                        f"Loaded reconnect context from file: board={board_name}, "
+                        f"run_id={effective_run_id}, agent={agent_name}"
+                    )
+                except Exception as e:
+                    logger.warning(f"Could not load context file, falling back to heuristics: {e}")
+            else:
+                logger.warning(f"Context file not found: {context_file}, using heuristics")
+
+            # --- FALLBACK: heuristic board search ---
+            if not board_name:
+                for pipeline in project_config.pipelines:
+                    if 'SDLC' in pipeline.board_name or 'dev' in pipeline.board_name.lower():
+                        board_name = pipeline.board_name
+                        break
+
+            if not board_name:
+                logger.warning(f"No board found for {project} — cannot reconnect repair cycle container")
+                return
+
+            # Resolve pipeline config by exact board_name match
+            pipeline_config = next(
+                (p for p in project_config.pipelines if p.board_name == board_name), None
+            )
             if not pipeline_config:
-                logger.warning(f"No SDLC/dev pipeline found for {project}")
+                logger.warning(f"No pipeline config found for board {board_name}")
                 return
 
-            workflow_name = pipeline_config.workflow
-            workflow_template = config_manager.get_workflow_template(workflow_name)
-            
+            workflow_template = config_manager.get_workflow_template(pipeline_config.workflow)
             if not workflow_template:
-                logger.warning(f"Could not find workflow template {workflow_name}")
+                logger.warning(f"Could not find workflow template {pipeline_config.workflow}")
                 return
-
-            # Get board name from pipeline config
-            board_name = pipeline_config.board_name
 
             # Determine status from checkpoint or assume "Testing"
             status = checkpoint.get('stage_name', 'Testing') if checkpoint else 'Testing'
@@ -1023,25 +1057,8 @@ class AgentContainerRecovery:
             # Get repository
             repository = project_config.github.get('repo', project)
 
-            # Load context to get agent_name
-            from pathlib import Path
-            import json
-
-            context_file = Path(f"/workspace/clauditoreum/orchestrator_data/repair_cycles/{project}/{issue_number}/context.json")
-            agent_name = 'senior_software_engineer'  # Default fallback
-
-            if context_file.exists():
-                try:
-                    with open(context_file, 'r') as f:
-                        context = json.load(f)
-                        agent_name = context.get('agent_name', agent_name)
-                except Exception as e:
-                    logger.warning(f"Could not load context file for agent_name: {e}, using default")
-            else:
-                logger.warning(f"Context file not found: {context_file}, using default agent_name={agent_name}")
-
             # Create monitor instance (without starting main loop)
-            task_queue = TaskQueue()  # Dummy queue
+            task_queue = TaskQueue()
             monitor = ProjectMonitor(task_queue, config_manager)
 
             # Restart monitoring thread
@@ -1055,7 +1072,7 @@ class AgentContainerRecovery:
                 project_config=project_config,
                 workflow_template=workflow_template,
                 agent_name=agent_name,
-                pipeline_run_id=run_id
+                pipeline_run_id=effective_run_id
             )
             
             logger.info(f"✓ Reconnected to repair cycle container: {container_name}")
