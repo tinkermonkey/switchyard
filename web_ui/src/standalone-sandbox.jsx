@@ -1,6 +1,9 @@
 import { Upload, RotateCcw } from 'lucide-react'
 import CycleBoundingNode from './components/CycleBoundingNode'
 import PipelineEventNode from './components/PipelineEventNode'
+import ReviewCycleContainerNode from './components/ReviewCycleContainerNode'
+import RepairCycleContainerNode from './components/RepairCycleContainerNode'
+import IterationContainerNode from './components/IterationContainerNode'
 import { useState, useEffect, useCallback } from 'react'
 import {
   ReactFlow,
@@ -16,6 +19,9 @@ import { buildFlowchart } from './utils/buildFlowchart'
 const nodeTypes = {
   pipelineEvent: PipelineEventNode,
   cycleBounding: CycleBoundingNode,
+  reviewCycleContainer: ReviewCycleContainerNode,
+  repairCycleContainer: RepairCycleContainerNode,
+  iterationContainer: IterationContainerNode,
 }
 
 const DEFAULT_PARAMS = {
@@ -115,15 +121,16 @@ export default function StandaloneSandbox() {
     const { nodes: layoutedNodes } = applyCycleLayout(rawNodes, rawEdges, updatedCycles, layoutParams)
     const updatedEdges = updateEdgesForCycles(rawEdges, updatedCycles, agentExecutions)
 
+    const CYCLE_CONTAINER_TYPES = ['cycleBounding', 'reviewCycleContainer', 'repairCycleContainer']
     const finalNodes = layoutedNodes.map(node => {
-      if (node.type === 'cycleBounding') {
+      if (CYCLE_CONTAINER_TYPES.includes(node.type)) {
         return {
           ...node,
           draggable: true,
           data: {
             ...node.data,
             onToggleCollapse: handleToggleCycle,
-            isResizable: true,
+            isResizable: node.type === 'cycleBounding',
           },
         }
       }

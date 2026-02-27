@@ -78,6 +78,16 @@ body {
   background: #a8b1bb;
 }
 
+/* Strip React Flow's default white background/border from custom container node types */
+.react-flow__node-reviewCycleContainer,
+.react-flow__node-repairCycleContainer,
+.react-flow__node-iterationContainer {
+  background: transparent !important;
+  border: none !important;
+  padding: 0 !important;
+  border-radius: 0 !important;
+}
+
 /* Pulse animation for loading states */
 @keyframes pulse {
   0%, 100% { opacity: 0.8; }

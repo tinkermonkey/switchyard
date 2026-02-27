@@ -72,23 +72,24 @@ const ReviewCycleContainerNode = ({ data }) => {
         }}
       />
 
-      {/* Header bar */}
+      {/* Header bar — sits at the top inside the node boundary */}
       <div
         onClick={handleToggle}
         onMouseEnter={e => (e.currentTarget.style.background = BORDER_COLOR)}
         onMouseLeave={e => (e.currentTarget.style.background = `${BORDER_COLOR}e6`)}
         style={{
           position: 'absolute',
-          top: -30,
+          top: 0,
           left: 0,
           right: 0,
           display: 'flex',
           alignItems: 'center',
           gap: 8,
           padding: '6px 12px',
+          height: 30,
           background: `${BORDER_COLOR}e6`,
           color: 'white',
-          borderRadius: '6px 6px 0 0',
+          borderRadius: '10px 10px 0 0',
           fontSize: 13,
           fontWeight: 600,
           cursor: 'pointer',
