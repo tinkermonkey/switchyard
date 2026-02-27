@@ -781,14 +781,21 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
   })
 
   // ── Pass 1: Size iteration / test-cycle containers (bottom-up) ───────────
+  // Uses node.measured dimensions when available (two-phase layout), falls back to params.
   const iterSizes = new Map()
   iterContainers.forEach(iter => {
     const children = childrenByIter.get(iter.id) || []
     const n = children.length
+    const totalChildHeight = children.reduce(
+      (sum, c) => sum + (c.measured?.height ?? nodeHeight), 0
+    )
+    const maxChildWidth = n > 0
+      ? Math.max(...children.map(c => c.measured?.width ?? nodeWidth))
+      : nodeWidth
     const height = iterHeaderHeight + iterPadding * 2 +
-      n * nodeHeight +
+      totalChildHeight +
       Math.max(0, n - 1) * innerVertSpacing
-    const width = nodeWidth + iterPadding * 2
+    const width = maxChildWidth + iterPadding * 2
     iterSizes.set(iter.id, { width, height })
   })
 
@@ -808,10 +815,11 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
       const iterTotalWidth = iters.reduce(
         (sum, it) => sum + (iterSizes.get(it.id)?.width ?? 0), 0
       )
-      // width = cyclePadding + (numDirect/2)*nodeWidth + spacing + iters + spacing + (numDirect/2)*nodeWidth + cyclePadding
-      // Simplified: 1 nodeWidth on left (start), N iters in middle, 1 nodeWidth on right (end)
-      const leftWidth = numDirect > 0 ? nodeWidth + horizontalSpacing : 0
-      const rightWidth = numDirect > 1 ? horizontalSpacing + nodeWidth : 0
+      // Use measured widths for direct children (start/end events) when available
+      const startWidth = direct[0]?.measured?.width ?? nodeWidth
+      const endWidth = direct[1]?.measured?.width ?? nodeWidth
+      const leftWidth = numDirect > 0 ? startWidth + horizontalSpacing : 0
+      const rightWidth = numDirect > 1 ? horizontalSpacing + endWidth : 0
       const iterSpacingTotal = numIters > 1 ? horizontalSpacing * (numIters - 1) : 0
       const width = cyclePadding * 2 + leftWidth + iterTotalWidth + iterSpacingTotal + rightWidth
       const height = containerHeaderHeight + cyclePadding * 2 + maxIterHeight
@@ -832,7 +840,9 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
   // ── Pass 3: Position root-level items vertically ─────────────────────────
   // Root items = all nodes without parentId, in the order they appear in the array
   // (buildFlowchart.js inserts them in chronological order)
+  // Uses node.measured dimensions when available (two-phase layout).
   const positionedNodes = new Map()  // id → fully positioned node
+  const nodeGap = Math.max(16, verticalSpacing - nodeHeight)  // gap between consecutive nodes
 
   // Process all root-level nodes (no parentId) in array order, which is chronological
   const rootLayoutNodes = nodes.filter(n => !n.parentId)
@@ -847,11 +857,13 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
       })
       currentY += size.height + cycleGap + verticalSpacing
     } else {
+      const w = node.measured?.width ?? nodeWidth
+      const h = node.measured?.height ?? nodeHeight
       positionedNodes.set(node.id, {
         ...node,
-        position: { x: centerXPosition - nodeWidth / 2, y: currentY },
+        position: { x: centerXPosition - w / 2, y: currentY },
       })
-      currentY += verticalSpacing
+      currentY += h + nodeGap
     }
   })
 
@@ -875,7 +887,7 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
           ...direct[0],
           position: { x: relX, y: contentY },
         })
-        relX += nodeWidth + horizontalSpacing
+        relX += (direct[0].measured?.width ?? nodeWidth) + horizontalSpacing
       }
 
       // Iteration containers
@@ -912,17 +924,17 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
   })
 
   // ── Pass 5: Position grandchildren within iteration containers ────────────
+  // Uses cumulative measured heights for accurate vertical stacking.
   iterContainers.forEach(iter => {
     const children = childrenByIter.get(iter.id) || []
+    let childY = iterHeaderHeight + iterPadding
     // Preserve insertion order (chronological — buildFlowchart.js inserts them that way)
-    children.forEach((child, idx) => {
+    children.forEach(child => {
       positionedNodes.set(child.id, {
         ...child,
-        position: {
-          x: iterPadding,
-          y: iterHeaderHeight + iterPadding + idx * (nodeHeight + innerVertSpacing),
-        },
+        position: { x: iterPadding, y: childY },
       })
+      childY += (child.measured?.height ?? nodeHeight) + innerVertSpacing
     })
   })
 

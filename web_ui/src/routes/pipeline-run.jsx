@@ -7,6 +7,7 @@ import PipelineEventNode from '../components/PipelineEventNode'
 import ReviewCycleContainerNode from '../components/ReviewCycleContainerNode'
 import RepairCycleContainerNode from '../components/RepairCycleContainerNode'
 import IterationContainerNode from '../components/IterationContainerNode'
+import LayoutController from '../components/LayoutController'
 import ConfirmationModal from '../components/ConfirmationModal'
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import {
@@ -19,11 +20,7 @@ import {
 import '@xyflow/react/dist/style.css'
 import { useSocket } from '../contexts/SocketContext'
 import { formatDuration } from '../utils/stateHelpers'
-import {
-  applyCycleLayout,
-  toggleCycleCollapsed,
-  updateEdgesForCycles,
-} from '../utils/cycleLayout'
+import { toggleCycleCollapsed } from '../utils/cycleLayout'
 import { mergePipelineRunEvents, mergeArrayByIdStable } from '../utils/eventMerging'
 import { buildFlowchart as buildFlowchartUtil } from '../utils/buildFlowchart'
 import { processEvents } from '../utils/eventProcessing/index.js'
@@ -35,6 +32,8 @@ const nodeTypes = {
   repairCycleContainer: RepairCycleContainerNode,
   iterationContainer: IterationContainerNode,
 }
+
+const CYCLE_CONTAINER_TYPES = ['cycleBounding', 'reviewCycleContainer', 'repairCycleContainer']
 
 /**
  * Render lock status badge for a pipeline run
@@ -82,7 +81,7 @@ function PipelineRunView() {
   const [hasMoreCompleted, setHasMoreCompleted] = useState(true)
   const [chartHeight, setChartHeight] = useState(600)
   const [legendOpen, setLegendOpen] = useState(true)
-  const [reactFlowInstance, setReactFlowInstance] = useState(null)
+  const [rawBuild, setRawBuild] = useState(null)
   const [cycles, setCycles] = useState(new Map()) // Track cycle collapse state
   const [showKillModal, setShowKillModal] = useState(false)
   const completedLimit = 10
@@ -274,12 +273,10 @@ function PipelineRunView() {
     return mergePipelineRunEvents(pipelineRunEvents, socketEvents, selectedPipelineRun)
   }, [pipelineRunEvents, socketEvents, selectedPipelineRun])
   
-  // Build flowchart from events
-  const buildFlowchart = useCallback(() => {
+  // Build raw (unpositioned) flowchart from events — layout is handled by LayoutController
+  const buildRawFlowchart = useCallback(() => {
     if (!mergedEvents.length || !selectedPipelineRun) {
-      setNodes([])
-      setEdges([])
-      setChartHeight(600)
+      setRawBuild(null)
       return
     }
 
@@ -292,8 +289,7 @@ function PipelineRunView() {
       .filter(e => ['agent_completed', 'agent_failed'].includes(e.event_type))
       .forEach(e => activeAgents.delete(e.agent))
 
-    // Build raw unpositioned nodes/edges via shared utility
-    const { nodes: newNodes, edges: newEdges, agentExecutions, updatedCycles } = buildFlowchartUtil({
+    const result = buildFlowchartUtil({
       events: mergedEvents,
       existingCycles: cycles,
       workflowConfig,
@@ -301,28 +297,23 @@ function PipelineRunView() {
       activeAgentNames: activeAgents,
     })
 
-    // Apply custom cycle layout
-    const { nodes: layoutedNodes } = applyCycleLayout(
-      newNodes,
-      newEdges,
-      updatedCycles,
-      {
-        nodeWidth: 250,
-        nodeHeight: 80,
-        horizontalSpacing: 150,
-        cycleGap: 100,
-        cyclePadding: 40,
-        viewportHeight: 600,
-      }
-    )
+    setRawBuild(result)
+  }, [mergedEvents, selectedPipelineRun, cycles, workflowConfig])
 
-    // Update edges for collapsed cycles
-    const updatedEdges = updateEdgesForCycles(newEdges, updatedCycles, agentExecutions)
+  // Phase 1: set raw unpositioned nodes for React Flow to render and measure
+  useEffect(() => {
+    if (!rawBuild || rawBuild.nodes.length === 0) {
+      setNodes([])
+      setEdges([])
+      return
+    }
+    setNodes(rawBuild.nodes)
+  }, [rawBuild, setNodes, setEdges])
 
-    // Add toggle callback to cycle nodes; enable drag/resize for completed runs
-    const isCompleted = selectedPipelineRun?.status !== 'active'
-    const CYCLE_CONTAINER_TYPES = ['cycleBounding', 'reviewCycleContainer', 'repairCycleContainer']
-    const finalNodes = layoutedNodes.map(node => {
+  // Inject draggable/toggle callbacks after layout — passed to LayoutController
+  const isCompleted = selectedPipelineRun?.status !== 'active'
+  const finalizeNodes = useCallback((layoutedNodes) => {
+    return layoutedNodes.map(node => {
       if (CYCLE_CONTAINER_TYPES.includes(node.type)) {
         return {
           ...node,
@@ -336,22 +327,13 @@ function PipelineRunView() {
       }
       return isCompleted ? { ...node, draggable: true } : node
     })
+  }, [isCompleted, handleToggleCycle])
 
-    // Calculate chart dimensions based on layout
-    const maxX = Math.max(...finalNodes.map(n => n.position.x + (n.style?.width || 250)))
-    const maxY = Math.max(...finalNodes.map(n => n.position.y + (n.style?.height || 80)))
+  // Compute chart height after layout is applied
+  const onLayoutDone = useCallback((finalNodes) => {
+    const maxY = Math.max(...finalNodes.map(n => n.position.y + (n.style?.height ?? 80)))
     setChartHeight(Math.max(600, maxY + 100))
-
-    setNodes(finalNodes)
-    setEdges(updatedEdges)
-
-    // Fit view after layout is complete
-    if (reactFlowInstance) {
-      setTimeout(() => {
-        reactFlowInstance.fitView({ padding: 0.1, duration: 300 })
-      }, 50)
-    }
-  }, [mergedEvents, selectedPipelineRun, cycles, workflowConfig, setNodes, setEdges, reactFlowInstance, handleToggleCycle])
+  }, [])
   
   // Initial load
   useEffect(() => {
@@ -401,8 +383,8 @@ function PipelineRunView() {
   
   // Rebuild flowchart when events or socket events change
   useEffect(() => {
-    buildFlowchart()
-  }, [buildFlowchart])
+    buildRawFlowchart()
+  }, [buildRawFlowchart])
   
   // Update on socket events
   useEffect(() => {
@@ -683,7 +665,6 @@ function PipelineRunView() {
                       onEdgesChange={onEdgesChange}
                       onNodeMouseEnter={onNodeMouseEnter}
                       onNodeMouseLeave={onNodeMouseLeave}
-                      onInit={setReactFlowInstance}
                       nodeTypes={nodeTypes}
                       nodesDraggable={selectedPipelineRun?.status !== 'active'}
                       nodesConnectable={false}
@@ -694,6 +675,20 @@ function PipelineRunView() {
                       zoomOnScroll={false}
                       panOnScroll={true}
                     >
+                      <LayoutController
+                        rawBuild={rawBuild}
+                        layoutOptions={{
+                          nodeWidth: 250,
+                          nodeHeight: 80,
+                          horizontalSpacing: 150,
+                          cycleGap: 100,
+                          cyclePadding: 40,
+                        }}
+                        finalizeNodes={finalizeNodes}
+                        setNodes={setNodes}
+                        setEdges={setEdges}
+                        onLayoutDone={onLayoutDone}
+                      />
                       <Background />
                       <Controls />
                     </ReactFlow>

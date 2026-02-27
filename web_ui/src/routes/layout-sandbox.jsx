@@ -7,6 +7,7 @@ import PipelineEventNode from '../components/PipelineEventNode'
 import ReviewCycleContainerNode from '../components/ReviewCycleContainerNode'
 import RepairCycleContainerNode from '../components/RepairCycleContainerNode'
 import IterationContainerNode from '../components/IterationContainerNode'
+import LayoutController from '../components/LayoutController'
 import { useState, useEffect, useCallback } from 'react'
 import {
   ReactFlow,
@@ -16,7 +17,7 @@ import {
   useEdgesState,
 } from '@xyflow/react'
 import '@xyflow/react/dist/style.css'
-import { applyCycleLayout, toggleCycleCollapsed, updateEdgesForCycles } from '../utils/cycleLayout'
+import { toggleCycleCollapsed } from '../utils/cycleLayout'
 import { buildFlowchart } from '../utils/buildFlowchart'
 
 const nodeTypes = {
@@ -26,6 +27,8 @@ const nodeTypes = {
   repairCycleContainer: RepairCycleContainerNode,
   iterationContainer: IterationContainerNode,
 }
+
+const CYCLE_CONTAINER_TYPES = ['cycleBounding', 'reviewCycleContainer', 'repairCycleContainer']
 
 const DEFAULT_PARAMS = {
   nodeWidth: 250,
@@ -54,7 +57,7 @@ function LayoutSandboxView() {
   const [cycles, setCycles] = useState(new Map())
   const [isDragOver, setIsDragOver] = useState(false)
   const [error, setError] = useState(null)
-  const [reactFlowInstance, setReactFlowInstance] = useState(null)
+  const [rawBuild, setRawBuild] = useState(null)
   const [nodes, setNodes, onNodesChange] = useNodesState([])
   const [edges, setEdges, onEdgesChange] = useEdgesState([])
 
@@ -68,7 +71,6 @@ function LayoutSandboxView() {
     reader.onload = (e) => {
       try {
         const json = JSON.parse(e.target.result)
-        // Basic validation
         if (!json.pipelineRun || !Array.isArray(json.events)) {
           setError('Invalid debug export: missing pipelineRun or events fields')
           return
@@ -90,49 +92,53 @@ function LayoutSandboxView() {
 
   const handleFileInput = useCallback((e) => {
     loadFile(e.target.files[0])
-    // Reset input so the same file can be reloaded
     e.target.value = ''
   }, [loadFile])
 
   // Reset cycles when new data is loaded
   useEffect(() => {
     setCycles(new Map())
+    setRawBuild(null)
   }, [debugData])
 
-  // Rebuild graph whenever data, cycles, or layout params change
+  // Build raw (unpositioned) flowchart whenever data or cycles change
   useEffect(() => {
-    if (!debugData) return
+    if (!debugData) { setRawBuild(null); return }
     const { pipelineRun, events, workflowConfig } = debugData
     if (!pipelineRun || !events) return
 
-    const { nodes: rawNodes, edges: rawEdges, agentExecutions, updatedCycles } = buildFlowchart({
+    const result = buildFlowchart({
       events,
       existingCycles: cycles,
       workflowConfig: workflowConfig || null,
       selectedPipelineRun: pipelineRun,
-      activeAgentNames: new Set(), // No live agents in offline sandbox
+      activeAgentNames: new Set(),
     })
 
-    // If updatedCycles has keys not yet in cycles state, initialize state then re-render
+    const { updatedCycles } = result
     const hasNewCycles = updatedCycles.size > 0 &&
       [...updatedCycles.keys()].some(k => !cycles.has(k))
     if (hasNewCycles) {
       setCycles(updatedCycles)
-      return // Re-render triggered by setCycles
+      return
     }
 
-    if (rawNodes.length === 0) {
+    setRawBuild(result)
+  }, [debugData, cycles])
+
+  // Phase 1: set raw unpositioned nodes for React Flow to render and measure
+  useEffect(() => {
+    if (!rawBuild || rawBuild.nodes.length === 0) {
       setNodes([])
       setEdges([])
       return
     }
+    setNodes(rawBuild.nodes)
+  }, [rawBuild, setNodes, setEdges])
 
-    // Apply layout with user-controlled params
-    const { nodes: layoutedNodes } = applyCycleLayout(rawNodes, rawEdges, updatedCycles, layoutParams)
-    const updatedEdges = updateEdgesForCycles(rawEdges, updatedCycles, agentExecutions)
-
-    const CYCLE_CONTAINER_TYPES = ['cycleBounding', 'reviewCycleContainer', 'repairCycleContainer']
-    const finalNodes = layoutedNodes.map(node => {
+  // Callback to inject draggable/toggle props after layout (passed to LayoutController)
+  const finalizeNodes = useCallback((layoutedNodes) => {
+    return layoutedNodes.map(node => {
       if (CYCLE_CONTAINER_TYPES.includes(node.type)) {
         return {
           ...node,
@@ -146,14 +152,7 @@ function LayoutSandboxView() {
       }
       return { ...node, draggable: true }
     })
-
-    setNodes(finalNodes)
-    setEdges(updatedEdges)
-
-    if (reactFlowInstance) {
-      setTimeout(() => reactFlowInstance.fitView({ padding: 0.1, duration: 300 }), 50)
-    }
-  }, [debugData, cycles, layoutParams, handleToggleCycle, reactFlowInstance, setNodes, setEdges])
+  }, [handleToggleCycle])
 
   const handleParamChange = useCallback((key, value) => {
     const parsed = parseInt(value, 10)
@@ -267,7 +266,6 @@ function LayoutSandboxView() {
               edges={edges}
               onNodesChange={onNodesChange}
               onEdgesChange={onEdgesChange}
-              onInit={setReactFlowInstance}
               nodeTypes={nodeTypes}
               nodesDraggable={true}
               nodesConnectable={false}
@@ -278,6 +276,13 @@ function LayoutSandboxView() {
               zoomOnScroll={false}
               panOnScroll={true}
             >
+              <LayoutController
+                rawBuild={rawBuild}
+                layoutOptions={layoutParams}
+                finalizeNodes={finalizeNodes}
+                setNodes={setNodes}
+                setEdges={setEdges}
+              />
               <Background />
               <Controls />
             </ReactFlow>
