@@ -695,387 +695,422 @@ export function identifyCycles(events, agentExecutions, workflowConfig = null) {
 }
 
 /**
- * Custom layout algorithm that positions nodes with cycles as bounding boxes
- * Root-level nodes are stacked vertically and center-aligned
- * Cycle nodes are arranged horizontally (each iteration in a column)
- * @param {Array} nodes - React Flow nodes to layout
- * @param {Array} edges - React Flow edges
- * @param {Map} cycles - Map of cycle ID -> cycle data from identifyCycles
- * @param {Object} options - Layout options
- * @returns {Object} { nodes, cycleNodes, edges }
+ * Custom layout algorithm that positions nodes with cycles as bounding boxes.
+ *
+ * Supports two layouts:
+ *
+ * 1. NEW (3-level): nodes produced by the new buildFlowchart.js that use
+ *    reviewCycleContainer / repairCycleContainer / iterationContainer node types
+ *    with parentId hierarchy already set.
+ *    Layout proceeds bottom-up (size containers) then top-down (place everything).
+ *
+ * 2. LEGACY (2-level): nodes produced by the old buildFlowchart using cycleBounding
+ *    and a flat cycles Map. Falls back to the previous algorithm.
+ *
+ * @param {Array} nodes   - React Flow nodes to layout (may have parentId set)
+ * @param {Array} edges   - React Flow edges
+ * @param {Map}   cycles  - Map of cycle ID → cycle data (used for legacy path + collapse state)
+ * @param {Object} options
+ * @returns {{ nodes, cycleNodes, edges }}
  */
 export function applyCycleLayout(nodes, edges, cycles, options = {}) {
   const {
     nodeWidth = 250,
     nodeHeight = 80,
-    horizontalSpacing = 150, // Spacing between iterations within a cycle
-    verticalSpacing = 120, // Spacing between root-level nodes
-    cycleGap = 40, // Gap between cycle boxes and other elements
-    cyclePadding = 40, // Padding inside cycle boxes
+    horizontalSpacing = 150,
+    verticalSpacing = 120,
+    cycleGap = 40,
+    cyclePadding = 40,
+    // Iteration / grandchild layout constants
+    iterHeaderHeight = 24, // height of the iteration pill label
+    iterPadding = 20,      // padding inside iteration container (top & bottom)
+    innerVertSpacing = 20, // vertical gap between grandchildren
+    containerHeaderHeight = 36, // height of cycle container header bar
     viewportWidth = 1200,
-    centerX = null, // Auto-calculate if not provided
+    centerX = null,
   } = options
-  
-  // Debug logging
-  if (DEBUG_CYCLE_LAYOUT) {
-    console.group('🎨 applyCycleLayout - Debug Info')
-    console.log('📊 Input nodes:', nodes.length)
-    console.log('🔄 Detected cycles:', cycles.size)
-    
-    // Log cycle details
-    if (cycles.size > 0) {
-      console.group('🔄 Cycle Details:')
-      cycles.forEach((cycleData, cycleId) => {
-        console.log(`  ${cycleId}:`, {
-          type: cycleData.type,
-          agentExecutions: cycleData.agentExecutions?.length || 0,
-          isCollapsed: cycleData.isCollapsed,
-          startTime: cycleData.startTime,
-          endTime: cycleData.endTime,
-          agents: cycleData.agentExecutions?.map(e => e.agent) || []
-        })
-      })
-      console.groupEnd()
-    }
-  }
-  
-  // Calculate or use provided center X for vertical layout
+
   const centerXPosition = centerX !== null ? centerX : viewportWidth / 2
-  
-  // Group nodes by cycle membership (using agent executions and decision events in each cycle)
-  const nodesByCycle = new Map()
-  const standaloneNodes = []
-  
-  nodes.forEach(node => {
-    // Skip special nodes (created, completed)
-    if (node.id === 'created' || node.id === 'completed') {
-      standaloneNodes.push(node)
-      return
-    }
-    
-    // Check if this node is part of a cycle
-    let belongsToCycle = false
-    
-    for (const [cycleId, cycleData] of cycles.entries()) {
-      let inCycle = false
-      
-      // Check if this is an agent execution node
-      if (node.id.startsWith('agent-')) {
-        // Check if this node belongs to any agent execution in this cycle
-        inCycle = cycleData.agentExecutions?.some((execution) => {
-          // Execution has fields: agent, taskId, executionIndex, timestamp, containerId, branch
-          // Node IDs use execution index not taskId: agent-{agent}-{executionIndex}
-          // Match exactly by executionIndex
-          return execution.executionIndex >= 0 && 
-                 node.id === `agent-${execution.agent}-${execution.executionIndex}`
-        })
-      }
-      
-      // Check if this is a decision node
-      else if (node.id.startsWith('decision-') && node.data?.timestamp) {
-        // Check if this decision event falls within the cycle's time boundaries
-        const nodeTime = new Date(node.data.timestamp).getTime()
-        const cycleStart = new Date(cycleData.startTime).getTime()
-        const cycleEnd = new Date(cycleData.endTime).getTime()
-        inCycle = nodeTime >= cycleStart && nodeTime <= cycleEnd
-      }
-      
-      if (inCycle) {
-        if (!nodesByCycle.has(cycleId)) {
-          nodesByCycle.set(cycleId, [])
-        }
-        nodesByCycle.get(cycleId).push(node)
-        belongsToCycle = true
-        break
-      }
-    }
-    
-    if (!belongsToCycle) {
-      standaloneNodes.push(node)
+
+  // ── Detect which layout path to use ──────────────────────────────────────
+  const hasNewContainers = nodes.some(
+    n => n.type === 'reviewCycleContainer' || n.type === 'repairCycleContainer'
+  )
+
+  if (!hasNewContainers) {
+    // ── LEGACY PATH ────────────────────────────────────────────────────────
+    return _legacyApplyCycleLayout(nodes, edges, cycles, {
+      nodeWidth, nodeHeight, horizontalSpacing, verticalSpacing,
+      cycleGap, cyclePadding, centerXPosition,
+    })
+  }
+
+  // ── NEW 3-LEVEL LAYOUT PATH ───────────────────────────────────────────────
+
+  // Categorise nodes by type and parent relationship
+  const cycleContainers = nodes.filter(
+    n => (n.type === 'reviewCycleContainer' || n.type === 'repairCycleContainer') && !n.parentId
+  )
+  const iterContainers = nodes.filter(n => n.type === 'iterationContainer')
+  const grandchildren = nodes.filter(n => n.parentId && n.type === 'pipelineEvent' &&
+    iterContainers.some(ic => ic.id === n.parentId))
+  // Direct pipelineEvent children of cycle containers (review_cycle_started / completed)
+  const directCycleChildren = nodes.filter(n => n.parentId && n.type === 'pipelineEvent' &&
+    cycleContainers.some(cc => cc.id === n.parentId))
+
+  // Build lookup maps
+  const itersByParent = new Map()   // cycleId → [iterationContainer]
+  iterContainers.forEach(iter => {
+    const pid = iter.parentId
+    if (!itersByParent.has(pid)) itersByParent.set(pid, [])
+    itersByParent.get(pid).push(iter)
+  })
+
+  const childrenByIter = new Map()  // iterId → [grandchild pipelineEvent]
+  grandchildren.forEach(child => {
+    const pid = child.parentId
+    if (!childrenByIter.has(pid)) childrenByIter.set(pid, [])
+    childrenByIter.get(pid).push(child)
+  })
+
+  const directChildrenByCycle = new Map()  // cycleId → [pipelineEvent]
+  directCycleChildren.forEach(child => {
+    const pid = child.parentId
+    if (!directChildrenByCycle.has(pid)) directChildrenByCycle.set(pid, [])
+    directChildrenByCycle.get(pid).push(child)
+  })
+
+  // ── Pass 1: Size iteration / test-cycle containers (bottom-up) ───────────
+  const iterSizes = new Map()
+  iterContainers.forEach(iter => {
+    const children = childrenByIter.get(iter.id) || []
+    const n = children.length
+    const height = iterHeaderHeight + iterPadding * 2 +
+      n * nodeHeight +
+      Math.max(0, n - 1) * innerVertSpacing
+    const width = nodeWidth + iterPadding * 2
+    iterSizes.set(iter.id, { width, height })
+  })
+
+  // ── Pass 2: Size cycle containers ────────────────────────────────────────
+  const cycleSizes = new Map()
+  cycleContainers.forEach(cc => {
+    const iters = itersByParent.get(cc.id) || []
+    const direct = directChildrenByCycle.get(cc.id) || []
+    const maxIterHeight = iters.reduce(
+      (max, it) => Math.max(max, iterSizes.get(it.id)?.height ?? 0), nodeHeight
+    )
+
+    if (cc.type === 'reviewCycleContainer') {
+      // Layout: [start] [iter1] [iter2] … [end]  — all horizontal
+      const numDirect = direct.length   // typically 2 (start + end events)
+      const numIters = iters.length
+      const iterTotalWidth = iters.reduce(
+        (sum, it) => sum + (iterSizes.get(it.id)?.width ?? 0), 0
+      )
+      // width = cyclePadding + (numDirect/2)*nodeWidth + spacing + iters + spacing + (numDirect/2)*nodeWidth + cyclePadding
+      // Simplified: 1 nodeWidth on left (start), N iters in middle, 1 nodeWidth on right (end)
+      const leftWidth = numDirect > 0 ? nodeWidth + horizontalSpacing : 0
+      const rightWidth = numDirect > 1 ? horizontalSpacing + nodeWidth : 0
+      const iterSpacingTotal = numIters > 1 ? horizontalSpacing * (numIters - 1) : 0
+      const width = cyclePadding * 2 + leftWidth + iterTotalWidth + iterSpacingTotal + rightWidth
+      const height = containerHeaderHeight + cyclePadding * 2 + maxIterHeight
+      cycleSizes.set(cc.id, { width: Math.max(width, 500), height: Math.max(height, 180) })
+    } else if (cc.type === 'repairCycleContainer') {
+      // Layout: [tc1] [tc2] [tc3]  — horizontal, no direct event children
+      const numIters = iters.length
+      const iterTotalWidth = iters.reduce(
+        (sum, it) => sum + (iterSizes.get(it.id)?.width ?? 0), 0
+      )
+      const iterSpacingTotal = numIters > 1 ? horizontalSpacing * (numIters - 1) : 0
+      const width = cyclePadding * 2 + iterTotalWidth + iterSpacingTotal
+      const height = containerHeaderHeight + cyclePadding * 2 + maxIterHeight
+      cycleSizes.set(cc.id, { width: Math.max(width, 400), height: Math.max(height, 180) })
     }
   })
-  
-  // Debug: Log node grouping
-  if (DEBUG_CYCLE_LAYOUT) {
-    console.group('📦 Node Grouping:')
-    console.log('  Standalone nodes:', standaloneNodes.map(n => n.id))
-    console.log('  Nodes by cycle:')
-    nodesByCycle.forEach((nodes, cycleId) => {
-      console.log(`    ${cycleId}:`, nodes.map(n => n.id))
-    })
-    console.groupEnd()
-  }
-  
-  // Build vertical layout for root-level elements
-  const layoutItems = [] // Array of { type, data, y }
-  let currentY = 100 // Starting Y position
-  
-  // Sort standalone nodes by their original position/order
-  const sortedStandalone = [...standaloneNodes].sort((a, b) => {
-    // Extract any sequence number from ID
-    const getSequence = (id) => {
-      const match = id.match(/-(\d+)$/)
-      return match ? parseInt(match[1]) : 0
-    }
-    return getSequence(a.id) - getSequence(b.id)
-  })
-  
-  // Add 'created' node
-  const createdNode = nodes.find(n => n.id === 'created')
-  if (createdNode) {
-    layoutItems.push({
-      type: 'standalone',
-      node: createdNode,
-      y: currentY,
-    })
-    currentY += verticalSpacing
-  }
-  
-  // Add other standalone nodes
-  sortedStandalone
-    .filter(n => n.id !== 'created' && n.id !== 'completed')
-    .forEach(node => {
-      layoutItems.push({
-        type: 'standalone',
-        node,
-        y: currentY,
+
+  // ── Pass 3: Position root-level items vertically ─────────────────────────
+  // Root items = all nodes without parentId, in the order they appear in the array
+  // (buildFlowchart.js inserts them in chronological order)
+  const positionedNodes = new Map()  // id → fully positioned node
+
+  // Process all root-level nodes (no parentId) in array order, which is chronological
+  const rootLayoutNodes = nodes.filter(n => !n.parentId)
+  let currentY = 100
+  rootLayoutNodes.forEach(node => {
+    if (node.type === 'reviewCycleContainer' || node.type === 'repairCycleContainer') {
+      const size = cycleSizes.get(node.id) || { width: 500, height: 200 }
+      positionedNodes.set(node.id, {
+        ...node,
+        position: { x: centerXPosition - size.width / 2, y: currentY },
+        style: { ...node.style, width: size.width, height: size.height },
+      })
+      currentY += size.height + cycleGap + verticalSpacing
+    } else {
+      positionedNodes.set(node.id, {
+        ...node,
+        position: { x: centerXPosition - nodeWidth / 2, y: currentY },
       })
       currentY += verticalSpacing
-    })
-  
-  // Add cycles with their internal horizontal layout
-  // Only process parent cycles (top-level) - child cycles will be nested inside
-  const cycleNodes = []
-  for (const [cycleId, cycleData] of cycles.entries()) {
-    // Skip child cycles - they'll be rendered inside their parent
-    if (cycleData.parentCycleId) {
-      if (DEBUG_CYCLE_LAYOUT) {
-        console.log(`⏭️  Skipping child cycle ${cycleId} (parent: ${cycleData.parentCycleId})`)
-      }
-      continue
     }
-    
-    const cycleNodeList = nodesByCycle.get(cycleId) || []
-    
-    // Also include nodes from child cycles
-    const childCycles = Array.from(cycles.values()).filter(c => c.parentCycleId === cycleId)
-    childCycles.forEach(childCycle => {
-      const childNodes = nodesByCycle.get(childCycle.id) || []
-      cycleNodeList.push(...childNodes)
-    })
-    
-    if (cycleNodeList.length === 0) continue
-    
-    if (DEBUG_CYCLE_LAYOUT) {
-      console.log(`\n🔄 Processing cycle ${cycleId}`)
-      console.log(`  Nodes in cycle:`, cycleNodeList.map(n => n.id))
-    }
-    
-    // Sort cycle nodes by timestamp (chronologically)
-    cycleNodeList.sort((a, b) => {
-      // Get timestamp from node data
-      const getTimestamp = (node) => {
-        // Decision nodes have timestamp in data
-        if (node.data?.timestamp) {
-          return new Date(node.data.timestamp).getTime()
-        }
-        // Agent nodes: try to find matching execution in cycleData
-        if (node.id.startsWith('agent-')) {
-          const match = node.id.match(/^agent-(.+)-(\d+)$/)
-          if (match) {
-            const [, agent, executionIndex] = match
-            const execution = cycleData.agentExecutions?.find(
-              e => e.agent === agent && e.executionIndex === parseInt(executionIndex)
-            )
-            if (execution) {
-              return new Date(execution.timestamp).getTime()
-            }
-          }
-        }
-        return 0
-      }
-      return getTimestamp(a) - getTimestamp(b)
-    })
-    
-    // Calculate cycle dimensions
-    const cycleWidth = (cycleNodeList.length * (nodeWidth + horizontalSpacing)) - horizontalSpacing + (cyclePadding * 2)
-    const cycleHeight = nodeHeight + (cyclePadding * 2)
-    
-    // Position cycle centered horizontally
-    const cycleX = centerXPosition - cycleWidth / 2
-    const cycleY = currentY
-    
-    // Layout nodes within the cycle horizontally (left to right)
-    // IMPORTANT: These positions are relative to the parent cycle's (0,0) corner
-    const cycleChildNodes = cycleNodeList.map((node, index) => {
-      const relativeX = cyclePadding + (index * (nodeWidth + horizontalSpacing))
-      const relativeY = cyclePadding
-      
-      if (DEBUG_CYCLE_LAYOUT) {
-        console.log(`  📍 Positioning child ${node.id} at relative (${relativeX}, ${relativeY})`)
-      }
-      
-      return {
-        node,
-        cycleId,
-        relativeX,
-        relativeY,
-      }
-    })
-    
-    if (DEBUG_CYCLE_LAYOUT) {
-      console.log(`📦 Cycle ${cycleId}: parent at (${cycleX}, ${cycleY}), size ${cycleWidth}x${cycleHeight}`)
-      console.log(`   Contains ${cycleChildNodes.length} children`)
-    }
-    
-    layoutItems.push({
-      type: 'cycle',
-      cycleId,
-      cycleData,
-      cycleX,
-      cycleY,
-      cycleWidth,
-      cycleHeight,
-      childNodes: cycleChildNodes,
-    })
-    
-    // Get cycle type label
-    const typeLabels = {
-      'review_cycle': 'Review Cycle',
-      'repair_cycle': 'Repair Cycle',
-      'error_handling': 'Repair Cycle', // Legacy support
-      'conversational_loop': 'Conversational Loop',
-      'unknown': 'Cycle',
-    }
-    let cycleLabel = typeLabels[cycleData.type] || 'Cycle'
-    
-    // Add subtype for repair cycles
-    if (cycleData.type === 'repair_cycle' && cycleData.subtype) {
-      cycleLabel = cycleData.subtype === 'test_cycle' ? 'Test Repair Cycle' : 'Fix Repair Cycle'
-    }
-    
-    // Show if cycle is still open
-    if (cycleData.isOpen) {
-      cycleLabel += ' (In Progress)'
-    }
-    
-    // Count child cycles
-    const childCount = childCycles.length
-    if (childCount > 0) {
-      cycleLabel += ` [${childCount} nested cycle${childCount > 1 ? 's' : ''}]`
-    }
-    
-    // Create cycle bounding node (parent node)
-    const cycleNode = {
-      id: cycleId,
-      type: 'cycleBounding',
-      position: {
-        x: cycleX,
-        y: cycleY,
-      },
-      data: {
-        cycleId,
-        cycleType: cycleData.type,
-        label: cycleLabel,
-        iterationCount: cycleNodeList.length,
-        isCollapsed: cycleData.isCollapsed || false,
-        width: cycleWidth,
-        height: cycleHeight,
-        cyclePadding,
-        startTime: cycleData.startTime,
-        endTime: cycleData.endTime,
-      },
-      style: {
-        width: cycleWidth,
-        height: cycleHeight,
-        zIndex: -1, // Behind other nodes
-      },
-      // Enable parent-child functionality
-      expandParent: !cycleData.isCollapsed, // Allow children outside bounds when expanded
-      draggable: false,
-    }
-    
-    cycleNodes.push(cycleNode)
-    
-    // Move Y position down for next element
-    currentY += cycleHeight + cycleGap + verticalSpacing
-  }
-  
-  // Add 'completed' node
-  const completedNode = nodes.find(n => n.id === 'completed')
-  if (completedNode) {
-    layoutItems.push({
-      type: 'standalone',
-      node: completedNode,
-      y: currentY,
-    })
-  }
-  
-  // Apply positions to all nodes
-  const layoutedNodes = []
-  
-  layoutItems.forEach(item => {
-    if (item.type === 'standalone') {
-      // Standalone nodes: center horizontally
-      layoutedNodes.push({
-        ...item.node,
-        position: {
-          x: centerXPosition - nodeWidth / 2,
-          y: item.y,
-        },
-      })
-    } else if (item.type === 'cycle') {
-      // Cycle child nodes: position relative to parent (0,0)
-      // React Flow automatically offsets these by the parent's position
-      item.childNodes.forEach(({ node, cycleId, relativeX, relativeY }) => {
-        layoutedNodes.push({
-          ...node,
-          position: {
-            x: relativeX, // Relative to parent's (0,0)
-            y: relativeY, // Relative to parent's (0,0)
-          },
-          // Set parent relationship - use "parentId" (React Flow v11+) or "parentNode" (React Flow v10)
-          parentId: cycleId,  // FIXED: was "parent", should be "parentId"
-          // Don't constrain to parent bounds - let nodes be positioned freely within parent
-          // extent: 'parent', // REMOVED: This was constraining incorrectly
-          // Child nodes have higher zIndex so they appear above parent
-          style: {
-            ...node.style,
-            zIndex: 10,
-          },
+  })
+
+  // ── Pass 4: Position cycle container children ─────────────────────────────
+  cycleContainers.forEach(cc => {
+    const iters = (itersByParent.get(cc.id) || []).sort(
+      (a, b) => (a.data?.iterationNumber ?? 0) - (b.data?.iterationNumber ?? 0)
+    )
+    const direct = (directChildrenByCycle.get(cc.id) || []).sort(
+      (a, b) => new Date(a.data?.timestamp ?? 0) - new Date(b.data?.timestamp ?? 0)
+    )
+
+    const contentY = containerHeaderHeight + cyclePadding  // y offset inside container
+
+    if (cc.type === 'reviewCycleContainer') {
+      let relX = cyclePadding
+
+      // Start event (leftmost direct child)
+      if (direct[0]) {
+        positionedNodes.set(direct[0].id, {
+          ...direct[0],
+          position: { x: relX, y: contentY },
         })
+        relX += nodeWidth + horizontalSpacing
+      }
+
+      // Iteration containers
+      iters.forEach(iter => {
+        const iterSize = iterSizes.get(iter.id) || { width: nodeWidth + iterPadding * 2, height: 200 }
+        positionedNodes.set(iter.id, {
+          ...iter,
+          position: { x: relX, y: contentY },
+          style: { ...iter.style, width: iterSize.width, height: iterSize.height },
+        })
+        relX += iterSize.width + horizontalSpacing
+      })
+
+      // End event (rightmost direct child)
+      if (direct[1]) {
+        positionedNodes.set(direct[1].id, {
+          ...direct[1],
+          position: { x: relX, y: contentY },
+        })
+      }
+    } else if (cc.type === 'repairCycleContainer') {
+      let relX = cyclePadding
+
+      iters.forEach(iter => {
+        const iterSize = iterSizes.get(iter.id) || { width: nodeWidth + iterPadding * 2, height: 200 }
+        positionedNodes.set(iter.id, {
+          ...iter,
+          position: { x: relX, y: contentY },
+          style: { ...iter.style, width: iterSize.width, height: iterSize.height },
+        })
+        relX += iterSize.width + horizontalSpacing
       })
     }
   })
-  
-  // When using parent-child relationships, React Flow automatically handles
-  // hiding children when parent is collapsed, so we don't need to filter
-  
-  // CRITICAL: Define these BEFORE the debug block so they're always available
-  const parentNodes = [...cycleNodes, ...layoutedNodes.filter(n => !n.parentId)]
-  const childNodes = layoutedNodes.filter(n => n.parentId)
-  
-  // Debug: Log final node structure
-  if (DEBUG_CYCLE_LAYOUT) {
-    console.group('🏗️ Final Node Structure:')
-    console.log('  Parent nodes:', parentNodes.map(n => ({ id: n.id, type: n.type, pos: n.position })))
-    console.log('  Child nodes:', childNodes.map(n => ({ 
-      id: n.id, 
-      parentId: n.parentId, 
-      relativePos: n.position,
-      parentPos: parentNodes.find(p => p.id === n.parentId)?.position 
-    })))
-    console.groupEnd()
-    console.groupEnd() // End applyCycleLayout group
-  }
-  
-  // CRITICAL: Parent nodes must come BEFORE child nodes in React Flow
-  // Standalone nodes and cycle parent nodes first, then cycle children
+
+  // ── Pass 5: Position grandchildren within iteration containers ────────────
+  iterContainers.forEach(iter => {
+    const children = childrenByIter.get(iter.id) || []
+    // Preserve insertion order (chronological — buildFlowchart.js inserts them that way)
+    children.forEach((child, idx) => {
+      positionedNodes.set(child.id, {
+        ...child,
+        position: {
+          x: iterPadding,
+          y: iterHeaderHeight + iterPadding + idx * (nodeHeight + innerVertSpacing),
+        },
+      })
+    })
+  })
+
+  // ── Collect and order final nodes (parents before children) ──────────────
+  const parentNodes = nodes.filter(n => !n.parentId).map(n => positionedNodes.get(n.id) ?? n)
+  const childNodes = nodes.filter(n => n.parentId).map(n => positionedNodes.get(n.id) ?? n)
+
+  const cycleNodes = nodes.filter(
+    n => n.type === 'reviewCycleContainer' || n.type === 'repairCycleContainer'
+  ).map(n => positionedNodes.get(n.id) ?? n)
+
   return {
     nodes: [...parentNodes, ...childNodes],
     cycleNodes,
     edges,
   }
+}
+
+/**
+ * Legacy layout path for the old flat cycles Map approach (cycleBounding node type).
+ * Kept intact for backward compatibility with any existing data flows.
+ */
+function _legacyApplyCycleLayout(nodes, edges, cycles, opts) {
+  const {
+    nodeWidth, nodeHeight, horizontalSpacing, verticalSpacing,
+    cycleGap, cyclePadding, centerXPosition,
+  } = opts
+
+  if (DEBUG_CYCLE_LAYOUT) {
+    console.group('🎨 applyCycleLayout (legacy) - Debug Info')
+    console.log('📊 Input nodes:', nodes.length)
+    console.log('🔄 Detected cycles:', cycles.size)
+  }
+
+  const nodesByCycle = new Map()
+  const standaloneNodes = []
+
+  nodes.forEach(node => {
+    if (node.id === 'created' || node.id === 'completed') {
+      standaloneNodes.push(node)
+      return
+    }
+    let belongsToCycle = false
+    for (const [cycleId, cycleData] of cycles.entries()) {
+      let inCycle = false
+      if (node.id.startsWith('agent-')) {
+        inCycle = cycleData.agentExecutions?.some(execution =>
+          execution.executionIndex >= 0 &&
+          node.id === `agent-${execution.agent}-${execution.executionIndex}`
+        )
+      } else if (node.id.startsWith('decision-') && node.data?.timestamp) {
+        const nodeTime = new Date(node.data.timestamp).getTime()
+        const cycleStart = new Date(cycleData.startTime).getTime()
+        const cycleEnd = new Date(cycleData.endTime).getTime()
+        inCycle = nodeTime >= cycleStart && nodeTime <= cycleEnd
+      }
+      if (inCycle) {
+        if (!nodesByCycle.has(cycleId)) nodesByCycle.set(cycleId, [])
+        nodesByCycle.get(cycleId).push(node)
+        belongsToCycle = true
+        break
+      }
+    }
+    if (!belongsToCycle) standaloneNodes.push(node)
+  })
+
+  const layoutItems = []
+  let currentY = 100
+
+  const createdNode = nodes.find(n => n.id === 'created')
+  if (createdNode) {
+    layoutItems.push({ type: 'standalone', node: createdNode, y: currentY })
+    currentY += verticalSpacing
+  }
+
+  const sortedStandalone = [...standaloneNodes]
+    .filter(n => n.id !== 'created' && n.id !== 'completed')
+    .sort((a, b) => {
+      const getSeq = id => { const m = id.match(/-(\d+)$/); return m ? parseInt(m[1]) : 0 }
+      return getSeq(a.id) - getSeq(b.id)
+    })
+
+  sortedStandalone.forEach(node => {
+    layoutItems.push({ type: 'standalone', node, y: currentY })
+    currentY += verticalSpacing
+  })
+
+  const cycleNodes = []
+  for (const [cycleId, cycleData] of cycles.entries()) {
+    if (cycleData.parentCycleId) continue
+    const cycleNodeList = nodesByCycle.get(cycleId) || []
+    const childCycles = Array.from(cycles.values()).filter(c => c.parentCycleId === cycleId)
+    childCycles.forEach(cc => cycleNodeList.push(...(nodesByCycle.get(cc.id) || [])))
+    if (cycleNodeList.length === 0) continue
+
+    cycleNodeList.sort((a, b) => {
+      const getTs = node => {
+        if (node.data?.timestamp) return new Date(node.data.timestamp).getTime()
+        if (node.id.startsWith('agent-')) {
+          const match = node.id.match(/^agent-(.+)-(\d+)$/)
+          if (match) {
+            const exec = cycleData.agentExecutions?.find(
+              e => e.agent === match[1] && e.executionIndex === parseInt(match[2])
+            )
+            if (exec) return new Date(exec.timestamp).getTime()
+          }
+        }
+        return 0
+      }
+      return getTs(a) - getTs(b)
+    })
+
+    const cycleWidth = (cycleNodeList.length * (nodeWidth + horizontalSpacing)) - horizontalSpacing + cyclePadding * 2
+    const cycleHeight = nodeHeight + cyclePadding * 2
+    const cycleX = centerXPosition - cycleWidth / 2
+
+    const cycleChildNodes = cycleNodeList.map((node, index) => ({
+      node, cycleId,
+      relativeX: cyclePadding + index * (nodeWidth + horizontalSpacing),
+      relativeY: cyclePadding,
+    }))
+
+    layoutItems.push({
+      type: 'cycle', cycleId, cycleData,
+      cycleX, cycleY: currentY, cycleWidth, cycleHeight,
+      childNodes: cycleChildNodes,
+    })
+
+    const typeLabels = {
+      review_cycle: 'Review Cycle', repair_cycle: 'Repair Cycle',
+      error_handling: 'Repair Cycle', conversational_loop: 'Conversational Loop', unknown: 'Cycle',
+    }
+    let cycleLabel = typeLabels[cycleData.type] || 'Cycle'
+    if (cycleData.type === 'repair_cycle' && cycleData.subtype) {
+      cycleLabel = cycleData.subtype === 'test_cycle' ? 'Test Repair Cycle' : 'Fix Repair Cycle'
+    }
+    if (cycleData.isOpen) cycleLabel += ' (In Progress)'
+    if (childCycles.length > 0) cycleLabel += ` [${childCycles.length} nested cycle${childCycles.length > 1 ? 's' : ''}]`
+
+    cycleNodes.push({
+      id: cycleId,
+      type: 'cycleBounding',
+      position: { x: cycleX, y: currentY },
+      data: {
+        cycleId, cycleType: cycleData.type, label: cycleLabel,
+        iterationCount: cycleNodeList.length,
+        isCollapsed: cycleData.isCollapsed || false,
+        width: cycleWidth, height: cycleHeight,
+        cyclePadding,
+        startTime: cycleData.startTime, endTime: cycleData.endTime,
+      },
+      style: { width: cycleWidth, height: cycleHeight, zIndex: -1 },
+      expandParent: !cycleData.isCollapsed,
+      draggable: false,
+    })
+
+    currentY += cycleHeight + cycleGap + verticalSpacing
+  }
+
+  const completedNode = nodes.find(n => n.id === 'completed')
+  if (completedNode) {
+    layoutItems.push({ type: 'standalone', node: completedNode, y: currentY })
+  }
+
+  const layoutedNodes = []
+  layoutItems.forEach(item => {
+    if (item.type === 'standalone') {
+      layoutedNodes.push({
+        ...item.node,
+        position: { x: centerXPosition - nodeWidth / 2, y: item.y },
+      })
+    } else if (item.type === 'cycle') {
+      item.childNodes.forEach(({ node, cycleId, relativeX, relativeY }) => {
+        layoutedNodes.push({
+          ...node,
+          position: { x: relativeX, y: relativeY },
+          parentId: cycleId,
+          style: { ...node.style, zIndex: 10 },
+        })
+      })
+    }
+  })
+
+  if (DEBUG_CYCLE_LAYOUT) console.groupEnd()
+
+  const parentNodes = [...cycleNodes, ...layoutedNodes.filter(n => !n.parentId)]
+  const childNodes = layoutedNodes.filter(n => n.parentId)
+  return { nodes: [...parentNodes, ...childNodes], cycleNodes, edges }
 }
 
 /**

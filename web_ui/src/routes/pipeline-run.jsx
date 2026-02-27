@@ -4,6 +4,9 @@ import Header from '../components/Header'
 import NavigationTabs from '../components/NavigationTabs'
 import CycleBoundingNode from '../components/CycleBoundingNode'
 import PipelineEventNode from '../components/PipelineEventNode'
+import ReviewCycleContainerNode from '../components/ReviewCycleContainerNode'
+import RepairCycleContainerNode from '../components/RepairCycleContainerNode'
+import IterationContainerNode from '../components/IterationContainerNode'
 import ConfirmationModal from '../components/ConfirmationModal'
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import {
@@ -17,17 +20,20 @@ import '@xyflow/react/dist/style.css'
 import { useSocket } from '../contexts/SocketContext'
 import { formatDuration } from '../utils/stateHelpers'
 import {
-  identifyCycles,
   applyCycleLayout,
   toggleCycleCollapsed,
   updateEdgesForCycles,
 } from '../utils/cycleLayout'
 import { mergePipelineRunEvents, mergeArrayByIdStable } from '../utils/eventMerging'
 import { buildFlowchart as buildFlowchartUtil } from '../utils/buildFlowchart'
+import { processEvents } from '../utils/eventProcessing/index.js'
 
 const nodeTypes = {
   pipelineEvent: PipelineEventNode,
   cycleBounding: CycleBoundingNode,
+  reviewCycleContainer: ReviewCycleContainerNode,
+  repairCycleContainer: RepairCycleContainerNode,
+  iterationContainer: IterationContainerNode,
 }
 
 /**
@@ -315,15 +321,16 @@ function PipelineRunView() {
 
     // Add toggle callback to cycle nodes; enable drag/resize for completed runs
     const isCompleted = selectedPipelineRun?.status !== 'active'
+    const CYCLE_CONTAINER_TYPES = ['cycleBounding', 'reviewCycleContainer', 'repairCycleContainer']
     const finalNodes = layoutedNodes.map(node => {
-      if (node.type === 'cycleBounding') {
+      if (CYCLE_CONTAINER_TYPES.includes(node.type)) {
         return {
           ...node,
           ...(isCompleted && { draggable: true }),
           data: {
             ...node.data,
             onToggleCollapse: handleToggleCycle,
-            isResizable: isCompleted,
+            isResizable: isCompleted && node.type === 'cycleBounding',
           },
         }
       }
@@ -368,72 +375,29 @@ function PipelineRunView() {
     }
   }, [selectedPipelineRun, fetchPipelineRunEvents, fetchWorkflowConfig])
   
-  // Detect and update cycles when events or workflow config changes
+  // Detect and update cycles when events change.
+  // Uses processEvents to get new-format cycle IDs that match what buildFlowchart
+  // produces, so that collapse toggles work correctly.
   useEffect(() => {
     if (!mergedEvents.length) return
-    
-    console.log('🔄 [Pipeline Run] Detecting cycles with workflow config:', workflowConfig ? 'loaded' : 'not loaded')
-    
-    // Build agent executions map
-    const agentExecutions = new Map()
-    mergedEvents.forEach(event => {
-      if (event.event_category === 'agent_lifecycle' && event.event_type === 'agent_initialized') {
-        const agent = event.agent
-        if (!agentExecutions.has(agent)) {
-          agentExecutions.set(agent, [])
-        }
-        agentExecutions.get(agent).push({
-          taskId: event.task_id,
-          status: 'running',
-        })
-      }
+
+    const model = processEvents(mergedEvents)
+    const newCycleMap = new Map()
+    model.cycles.forEach(cycle => {
+      newCycleMap.set(cycle.id, { isCollapsed: false })
     })
-    
-    // Debug: Log detailed information about what we're passing to cycle detection
-    console.group('📊 [Pipeline Run] Cycle Detection Input Data')
-    console.log('Total events:', mergedEvents.length)
-    console.log('Agent execution map:')
-    agentExecutions.forEach((executions, agent) => {
-      console.log(`  - ${agent}: ${executions.length} execution(s)`, executions.map(e => e.taskId))
-    })
-    console.log('Workflow config:', workflowConfig)
-    
-    // Store data for debugging (accessible via window.debugPipelineData in console)
-    window.debugPipelineData = {
-      selectedPipelineRun,
-      pipelineRunEvents,
-      agentExecutions: Array.from(agentExecutions.entries()).map(([agent, execs]) => ({
-        agent,
-        executions: execs
-      })),
-      workflowConfig
-    }
-    console.log('💾 Debug data stored in window.debugPipelineData')
-    console.groupEnd()
-    
-    // Detect cycles - pass workflow config for configuration-based detection
-    const detectedCycles = identifyCycles(pipelineRunEvents, agentExecutions, workflowConfig)
-    
-    console.log(`🔄 [Pipeline Run] Detected ${detectedCycles.size} cycles`)
-    detectedCycles.forEach((cycle, cycleId) => {
-      console.log(`  - ${cycleId}:`, {
-        type: cycle.type,
-        agentExecutions: cycle.agentExecutions?.length || 0,
-        agents: [...new Set(cycle.agentExecutions?.map(e => e.agent) || [])]
-      })
-    })
-    
-    // Merge with existing collapse state
+
     setCycles(prevCycles => {
-      const updated = new Map(detectedCycles)
-      prevCycles.forEach((existingCycle, agent) => {
-        if (updated.has(agent)) {
-          updated.get(agent).isCollapsed = existingCycle.isCollapsed
+      const merged = new Map(newCycleMap)
+      // Preserve collapse state for any cycle already known
+      prevCycles.forEach((prev, id) => {
+        if (merged.has(id)) {
+          merged.get(id).isCollapsed = prev.isCollapsed
         }
       })
-      return updated
+      return merged
     })
-  }, [mergedEvents, workflowConfig, selectedPipelineRun])
+  }, [mergedEvents])
   
   // Rebuild flowchart when events or socket events change
   useEffect(() => {

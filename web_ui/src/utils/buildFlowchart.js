@@ -1,16 +1,31 @@
 import { MarkerType } from '@xyflow/react'
-import { identifyCycles } from './cycleLayout'
+import { processEvents } from './eventProcessing/index.js'
 
 /**
  * Builds React Flow nodes and edges from pipeline run events.
- * Returns unpositioned nodes so the caller can apply applyCycleLayout() with their own options.
+ *
+ * Node hierarchy produced:
+ *   Root level (no parentId):
+ *     - pipelineEvent: prelude / postlude standalone events + pipeline_created/completed
+ *     - reviewCycleContainer: one per review cycle
+ *     - repairCycleContainer: one per repair cycle
+ *
+ *   Level 2 (parentId = cycle container):
+ *     - pipelineEvent: review_cycle_started, review_cycle_completed (direct children of review cycle)
+ *     - iterationContainer: one per review iteration or repair test cycle
+ *
+ *   Level 3 (parentId = iterationContainer):
+ *     - pipelineEvent: all events within the iteration / test cycle
+ *
+ * IMPORTANT: parent nodes must appear before their children in the returned array
+ * (React Flow requirement for correct rendering).
  *
  * @param {Object} params
- * @param {Array}  params.events              - Pipeline run events (all events)
- * @param {Map}    params.existingCycles       - Existing cycles map to preserve collapse state
- * @param {Object} params.workflowConfig       - Workflow configuration for cycle detection
+ * @param {Array}  params.events              - Pipeline run events
+ * @param {Map}    params.existingCycles       - Existing cycles map (preserves collapse state)
+ * @param {Object} params.workflowConfig       - Workflow configuration (passed to processEvents)
  * @param {Object} params.selectedPipelineRun  - Pipeline run metadata
- * @param {Set}    params.activeAgentNames     - Set of currently-active agent names
+ * @param {Set}    params.activeAgentNames     - Currently-active agent names
  * @returns {{ nodes, edges, agentExecutions, updatedCycles }}
  */
 export function buildFlowchart({
@@ -24,10 +39,122 @@ export function buildFlowchart({
     return { nodes: [], edges: [], agentExecutions: new Map(), updatedCycles: new Map() }
   }
 
+  // ── 1. Process events into structured model ──────────────────────────────
+  const model = processEvents(events, workflowConfig)
+  const { prelude, cycles, postlude, agentExecutions } = model
+
+  // Merge collapse state from existing cycles (preserve user's open/closed choices)
+  const updatedCycles = new Map()
+  cycles.forEach(cycle => {
+    const existing = existingCycles.get(cycle.id)
+    updatedCycles.set(cycle.id, {
+      ...cycle,
+      isCollapsed: existing?.isCollapsed ?? false,
+    })
+  })
+
+  // ── Helpers ──────────────────────────────────────────────────────────────
+
+  /** The ordered leaf-node chain: we build this list, then connect sequentially. */
+  const leafChain = [] // [{ id, timestamp }]
+
   const newNodes = []
   const newEdges = []
 
-  // Add pipeline created node
+  /**
+   * Build and push a decision event node.
+   * Returns the created node (or null if the event should be skipped).
+   */
+  function makeDecisionNode(event, id, parentId = null) {
+    const reason = event.reason || ''
+    const metadataParts = []
+    if (event.decision_category) metadataParts.push(`[${event.decision_category}]`)
+    if (event.decision) {
+      if (event.decision.selected_agent) metadataParts.push(`→ ${event.decision.selected_agent}`)
+      if (event.decision.to_status) metadataParts.push(`→ ${event.decision.to_status}`)
+      if (event.decision.action) metadataParts.push(event.decision.action)
+    }
+    if (reason) {
+      const maxLen = 50
+      metadataParts.push(reason.length > maxLen ? reason.substring(0, maxLen) + '…' : reason)
+    }
+
+    const node = {
+      id,
+      type: 'pipelineEvent',
+      position: { x: 0, y: 0 },
+      data: {
+        label: event.event_type.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase()),
+        type: 'decision_event',
+        metadata: metadataParts.join(' • '),
+        decision_category: event.decision_category,
+        timestamp: event.timestamp,
+      },
+      draggable: false,
+    }
+    if (parentId) node.parentId = parentId
+    return node
+  }
+
+  /**
+   * Build and push an agent execution node.
+   * Returns the created node (or null if execution not found).
+   */
+  function makeAgentNode(event, id, parentId = null) {
+    const { agent, task_id: taskId } = event
+    const executions = agentExecutions.get(agent) || []
+    const executionIndex = executions.findIndex(e => e.taskId === taskId)
+    if (executionIndex < 0) return null
+
+    const execution = executions[executionIndex]
+    const isActive = activeAgentNames.has(agent)
+
+    const node = {
+      id,
+      type: 'pipelineEvent',
+      position: { x: 0, y: 0 },
+      data: {
+        label: agent.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase()),
+        type: 'agent_execution',
+        status: execution.status,
+        metadata: isActive ? 'Running' : execution.status,
+        isActive,
+      },
+      draggable: false,
+    }
+    if (parentId) node.parentId = parentId
+    return node
+  }
+
+  /**
+   * Process a raw event into a node, push to newNodes, and add to leafChain.
+   * Skips agent_completed / agent_failed events (status is reflected on the agent node).
+   * Returns the node id if a node was created, or null.
+   */
+  function processEventToNode(event, idPrefix, parentId = null) {
+    let node = null
+
+    if (event.event_category === 'decision') {
+      const id = `${idPrefix}-dec-${event.timestamp}`
+      node = makeDecisionNode(event, id, parentId)
+    } else if (
+      event.event_category === 'agent_lifecycle' &&
+      event.event_type === 'agent_initialized'
+    ) {
+      const id = `${idPrefix}-agent-${event.agent}-${event.task_id}`
+      node = makeAgentNode(event, id, parentId)
+    }
+    // agent_completed / agent_failed — skip (status captured on agent node)
+
+    if (node) {
+      newNodes.push(node)
+      leafChain.push({ id: node.id, timestamp: event.timestamp })
+      return node.id
+    }
+    return null
+  }
+
+  // ── 2. Pipeline started node ──────────────────────────────────────────────
   newNodes.push({
     id: 'created',
     type: 'pipelineEvent',
@@ -39,185 +166,149 @@ export function buildFlowchart({
     },
     draggable: false,
   })
+  leafChain.push({ id: 'created', timestamp: selectedPipelineRun.started_at })
 
-  // Track agent executions: map of agent -> [execution instances]
-  const agentExecutions = new Map()
-
-  // First pass: identify all agent executions and their status
-  events.forEach(event => {
-    if (event.event_category === 'agent_lifecycle') {
-      const agent = event.agent
-      const taskId = event.task_id
-
-      if (event.event_type === 'agent_initialized') {
-        if (!agentExecutions.has(agent)) {
-          agentExecutions.set(agent, [])
-        }
-        agentExecutions.get(agent).push({
-          taskId,
-          startTime: event.timestamp,
-          startEvent: event,
-          endTime: null,
-          endEvent: null,
-          status: 'running',
-          isActive: activeAgentNames.has(agent),
-        })
-      } else if (['agent_completed', 'agent_failed'].includes(event.event_type)) {
-        const executions = agentExecutions.get(agent) || []
-        const execution = executions.find(e => e.taskId === taskId)
-        if (execution) {
-          execution.endTime = event.timestamp
-          execution.endEvent = event
-          execution.status = event.event_type === 'agent_completed' ? 'completed' : 'failed'
-        }
-      }
-    }
+  // ── 3. Prelude events ─────────────────────────────────────────────────────
+  prelude.events.forEach(event => {
+    processEventToNode(event, 'pre', null)
   })
 
-  // Identify review/repair cycles
-  const detectedCycles = identifyCycles(events, agentExecutions, workflowConfig)
+  // ── 4. Cycles ─────────────────────────────────────────────────────────────
+  cycles.forEach(cycle => {
+    const cycleState = updatedCycles.get(cycle.id)
+    const isCollapsed = cycleState?.isCollapsed ?? false
 
-  // Merge with existing cycle state (preserve collapse state)
-  const updatedCycles = new Map(detectedCycles)
-  existingCycles.forEach((existingCycle, cycleKey) => {
-    if (updatedCycles.has(cycleKey)) {
-      updatedCycles.set(cycleKey, {
-        ...updatedCycles.get(cycleKey),
-        isCollapsed: existingCycle.isCollapsed,
-      })
-    }
-  })
-
-  // Second pass: build nodes and edges chronologically
-  let previousNodeId = 'created'
-
-  const sortedEvents = [...events].sort((a, b) =>
-    new Date(a.timestamp) - new Date(b.timestamp)
-  )
-
-  sortedEvents.forEach((event, idx) => {
-    let currentNodeId = null
-
-    // Decision events
-    if (event.event_category === 'decision') {
-      const nodeId = `decision-${idx}`
-      const decisionType = event.event_type || 'decision'
-      const reason = event.reason || ''
-
-      const metadataParts = []
-      if (event.decision_category) {
-        metadataParts.push(`[${event.decision_category}]`)
-      }
-      if (event.decision) {
-        if (event.decision.selected_agent) metadataParts.push(`→ ${event.decision.selected_agent}`)
-        if (event.decision.to_status) metadataParts.push(`→ ${event.decision.to_status}`)
-        if (event.decision.action) metadataParts.push(`${event.decision.action}`)
-      }
-      if (reason) {
-        const maxLen = 50
-        const truncated = reason.length > maxLen ? reason.substring(0, maxLen) + '...' : reason
-        metadataParts.push(truncated)
-      }
-
-      newNodes.push({
-        id: nodeId,
-        type: 'pipelineEvent',
+    if (cycle.type === 'review_cycle') {
+      // ── Review cycle container ──────────────────────────────────────────
+      const rcNode = {
+        id: cycle.id,
+        type: 'reviewCycleContainer',
         position: { x: 0, y: 0 },
         data: {
-          label: decisionType.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase()),
-          type: 'decision_event',
-          metadata: metadataParts.join(' • '),
-          decision_category: event.decision_category,
-          timestamp: event.timestamp,
+          cycleId: cycle.id,
+          label: 'Review Cycle',
+          iterationCount: cycle.iterations.length,
+          isCollapsed,
+          onToggleCollapse: null, // injected by caller
+          startTime: cycle.startEvent?.timestamp,
+          endTime: cycle.endEvent?.timestamp,
         },
+        style: { width: 0, height: 0 }, // sized by applyCycleLayout
         draggable: false,
-      })
-      currentNodeId = nodeId
-    }
+      }
+      newNodes.push(rcNode)
 
-    // Agent execution starts
-    else if (event.event_category === 'agent_lifecycle' && event.event_type === 'agent_initialized') {
-      const agent = event.agent
-      const taskId = event.task_id
-      const executions = agentExecutions.get(agent) || []
-      const executionIndex = executions.findIndex(e => e.taskId === taskId)
+      if (isCollapsed) {
+        // Collapsed: the container is the only leaf in the chain
+        leafChain.push({ id: cycle.id, timestamp: cycle.startEvent?.timestamp })
+      } else {
+        // Expanded: add direct children + iterations + grandchildren
 
-      // Check for legacy simple-cycle (cycle keyed by agent name with executions array)
-      if (updatedCycles.has(agent)) {
-        const cycleExecutions = updatedCycles.get(agent).executions
-        const cycleIndex = cycleExecutions.findIndex(e => e.taskId === taskId)
-        const nodeId = `agent-${agent}-${cycleIndex}`
-        const execution = cycleExecutions[cycleIndex]
-        const isActive = execution.isActive
-
-        newNodes.push({
-          id: nodeId,
-          type: 'pipelineEvent',
-          position: { x: 0, y: 0 },
-          data: {
-            label: agent.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase()),
-            type: 'agent_execution',
-            status: execution.status,
-            metadata: `Iteration ${cycleIndex + 1}${isActive ? ' (Running)' : ''}`,
-            isActive,
-          },
-          draggable: false,
-        })
-
-        if (cycleIndex > 0) {
-          const previousExecutionId = `agent-${agent}-${cycleIndex - 1}`
-          newEdges.push({
-            id: `feedback-${agent}-${cycleIndex}`,
-            source: previousExecutionId,
-            target: nodeId,
-            type: 'smoothstep',
-            label: 'Revision',
-            labelStyle: { fontSize: '10px', fill: '#f59e0b' },
-            markerEnd: { type: MarkerType.ArrowClosed, color: '#f59e0b' },
-            style: { stroke: '#f59e0b', strokeDasharray: '5,5' },
-          })
+        // review_cycle_started → direct child, leftmost
+        if (cycle.startEvent) {
+          const startId = `${cycle.id}-start`
+          const startNode = makeDecisionNode(cycle.startEvent, startId, cycle.id)
+          newNodes.push(startNode)
+          leafChain.push({ id: startId, timestamp: cycle.startEvent.timestamp })
         }
 
-        currentNodeId = nodeId
-      } else {
-        // Single execution agent (or agent in a boundary-detected cycle)
-        const nodeId = `agent-${agent}-${executionIndex}`
-        const execution = executions[executionIndex]
-        const isActive = execution.isActive
+        // Iterations
+        cycle.iterations.forEach(iteration => {
+          const iterId = `${cycle.id}-iter-${iteration.number}`
 
-        newNodes.push({
-          id: nodeId,
-          type: 'pipelineEvent',
-          position: { x: 0, y: 0 },
-          data: {
-            label: agent.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase()),
-            type: 'agent_execution',
-            status: execution.status,
-            metadata: isActive ? 'Running' : execution.status,
-            isActive,
-          },
-          draggable: false,
+          const iterNode = {
+            id: iterId,
+            type: 'iterationContainer',
+            parentId: cycle.id,
+            position: { x: 0, y: 0 },
+            data: {
+              iterationNumber: iteration.number,
+              label: `Iteration ${iteration.number}`,
+              eventCount: iteration.events.length + 1,
+            },
+            style: { width: 0, height: 0 }, // sized by applyCycleLayout
+            draggable: false,
+          }
+          newNodes.push(iterNode)
+
+          // Grandchildren: startEvent then the other events, chronologically
+          const allIterEvents = [iteration.startEvent, ...iteration.events]
+            .filter(Boolean)
+            .sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp))
+
+          allIterEvents.forEach(event => {
+            processEventToNode(event, iterId, iterId)
+          })
         })
 
-        currentNodeId = nodeId
+        // review_cycle_completed → direct child, rightmost (after iterations)
+        if (cycle.endEvent) {
+          const endId = `${cycle.id}-end`
+          const endNode = makeDecisionNode(cycle.endEvent, endId, cycle.id)
+          newNodes.push(endNode)
+          leafChain.push({ id: endId, timestamp: cycle.endEvent.timestamp })
+        }
       }
-    }
+    } else if (cycle.type === 'repair_cycle') {
+      // ── Repair cycle container ──────────────────────────────────────────
+      const rpcNode = {
+        id: cycle.id,
+        type: 'repairCycleContainer',
+        position: { x: 0, y: 0 },
+        data: {
+          cycleId: cycle.id,
+          label: 'Repair Cycle',
+          iterationCount: cycle.testCycles?.length ?? 0,
+          isCollapsed,
+          onToggleCollapse: null, // injected by caller
+          startTime: cycle.startEvent?.timestamp,
+          endTime: cycle.endEvent?.timestamp,
+        },
+        style: { width: 0, height: 0 }, // sized by applyCycleLayout
+        draggable: false,
+      }
+      newNodes.push(rpcNode)
 
-    // Connect to previous node
-    if (currentNodeId && previousNodeId) {
-      newEdges.push({
-        id: `edge-${previousNodeId}-${currentNodeId}`,
-        source: previousNodeId,
-        target: currentNodeId,
-        type: 'smoothstep',
-        markerEnd: { type: MarkerType.ArrowClosed, color: '#6e7681' },
-        style: { stroke: '#6e7681' },
-      })
-      previousNodeId = currentNodeId
+      if (isCollapsed) {
+        leafChain.push({ id: cycle.id, timestamp: cycle.startEvent?.timestamp })
+      } else if (cycle.testCycles) {
+        // Expanded: add test cycle containers + grandchildren
+        cycle.testCycles.forEach(tc => {
+          const tcId = `${cycle.id}-tc-${tc.number}`
+
+          const allTcEvents = [tc.startEvent, ...tc.events, tc.endEvent]
+            .filter(Boolean)
+            .sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp))
+
+          const tcNode = {
+            id: tcId,
+            type: 'iterationContainer',
+            parentId: cycle.id,
+            position: { x: 0, y: 0 },
+            data: {
+              iterationNumber: tc.number,
+              label: `Test Cycle ${tc.number}`,
+              eventCount: allTcEvents.length,
+            },
+            style: { width: 0, height: 0 }, // sized by applyCycleLayout
+            draggable: false,
+          }
+          newNodes.push(tcNode)
+
+          allTcEvents.forEach(event => {
+            processEventToNode(event, tcId, tcId)
+          })
+        })
+      }
     }
   })
 
-  // Add pipeline completed node if pipeline is done
+  // ── 5. Postlude events ────────────────────────────────────────────────────
+  postlude.events.forEach(event => {
+    processEventToNode(event, 'post', null)
+  })
+
+  // ── 6. Pipeline completed node ────────────────────────────────────────────
   if (selectedPipelineRun.status === 'completed') {
     newNodes.push({
       id: 'completed',
@@ -232,18 +323,27 @@ export function buildFlowchart({
       },
       draggable: false,
     })
+    leafChain.push({ id: 'completed', timestamp: selectedPipelineRun.ended_at })
+  }
 
-    if (previousNodeId !== 'created') {
+  // ── 7. Build sequential edges through leaf chain ──────────────────────────
+  for (let i = 1; i < leafChain.length; i++) {
+    const source = leafChain[i - 1].id
+    const target = leafChain[i].id
+    if (source && target && source !== target) {
       newEdges.push({
-        id: `edge-${previousNodeId}-completed`,
-        source: previousNodeId,
-        target: 'completed',
+        id: `edge-${source}-${target}`,
+        source,
+        target,
         type: 'smoothstep',
         markerEnd: { type: MarkerType.ArrowClosed, color: '#6e7681' },
         style: { stroke: '#6e7681' },
       })
     }
   }
+
+  // ── 8. Ensure correct React Flow node ordering (parents before children) ──
+  // newNodes is already built parents-first (containers added before their children above).
 
   return { nodes: newNodes, edges: newEdges, agentExecutions, updatedCycles }
 }
