@@ -206,7 +206,6 @@ class RepairCycleStage(PipelineStage):
         test_configs: List[RepairTestRunConfig],
         agent_name: str = "senior_software_engineer",
         max_total_agent_calls: int = 100,  # Circuit breaker for cost control
-        max_total_iterations: int = 5,  # Global cap on fix iterations across ALL test types
         checkpoint_interval: int = 5,  # Checkpoint every N iterations
         **kwargs,
     ):
@@ -214,7 +213,6 @@ class RepairCycleStage(PipelineStage):
         self.test_configs = test_configs
         self.agent_name = agent_name
         self.max_total_agent_calls = max_total_agent_calls
-        self.max_total_iterations = max_total_iterations
         self.checkpoint_interval = checkpoint_interval
         self._agent_call_count = 0
         self._systemic_analysis_done_for: set = set()
@@ -280,40 +278,18 @@ class RepairCycleStage(PipelineStage):
 
         results = []
         error_message = None
-        total_iterations_used = 0  # Global counter across all test types
 
         try:
             # Track which test type in sequence (1st, 2nd, 3rd)
             for test_type_index, test_config in enumerate(self.test_configs, start=1):
-                remaining_iterations = self.max_total_iterations - total_iterations_used
-                if remaining_iterations <= 0:
-                    logger.warning(
-                        f"Global iteration cap ({self.max_total_iterations}) reached before "
-                        f"starting {test_config.test_type} (test type {test_type_index}/{len(self.test_configs)}). "
-                        f"Stopping repair cycle."
-                    )
-                    break
-
-                # Cap this test type's iterations at the remaining global budget
-                effective_config = test_config
-                if test_config.max_iterations > remaining_iterations:
-                    from dataclasses import replace
-                    effective_config = replace(test_config, max_iterations=remaining_iterations)
-                    logger.info(
-                        f"Starting {test_config.test_type} test cycle "
-                        f"(test type {test_type_index}/{len(self.test_configs)}, "
-                        f"capped at {remaining_iterations} iterations by global budget)"
-                    )
-                else:
-                    logger.info(
-                        f"Starting {test_config.test_type} test cycle "
-                        f"(test type {test_type_index}/{len(self.test_configs)})"
-                    )
+                logger.info(
+                    f"Starting {test_config.test_type} test cycle "
+                    f"(test type {test_type_index}/{len(self.test_configs)})"
+                )
 
                 cycle_start = utc_now()
-                cycle_result = await self._run_test_cycle(effective_config, context, test_type_index)
+                cycle_result = await self._run_test_cycle(test_config, context, test_type_index)
                 cycle_end = utc_now()
-                total_iterations_used += cycle_result.iterations
 
                 cycle_result.duration_seconds = (cycle_end - cycle_start).total_seconds()
                 results.append(cycle_result)
