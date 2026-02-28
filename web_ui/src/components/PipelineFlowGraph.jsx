@@ -94,7 +94,9 @@ export default function PipelineFlowGraph({
   const [edges, setEdges, onEdgesChange] = useEdgesState([])
   const [hoveredNode, setHoveredNode] = useState(null)
   const [layoutReady, setLayoutReady] = useState(false)
-  const prevNodesCountRef = useRef(0)
+  // Tracks the node IDs from the last layout pass to distinguish structural
+  // changes (new/removed nodes) from data-only updates (status/label changes).
+  const prevNodeIdsRef = useRef(new Set())
 
   // Merge caller overrides with canonical defaults so every param is always defined.
   // Memoized so the reference is stable — prevents LayoutController's param-change
@@ -104,21 +106,42 @@ export default function PipelineFlowGraph({
     [layoutOptions]
   )
 
-  // Phase 1: set raw unpositioned nodes for React Flow to render and measure
+  // Phase 1: set raw unpositioned nodes for React Flow to render and measure.
+  //
+  // Structural changes (new or removed node IDs): hide the graph while ReactFlow
+  // remeasures and LayoutController repositions — prevents the DOMException that
+  // occurs when unpositioned nodes replace positioned ones while the graph is live.
+  //
+  // Data-only updates (same node IDs, status/label changes): update node data
+  // in-place preserving existing positions; graph stays visible, no layout needed.
   useEffect(() => {
     if (!rawBuild || rawBuild.nodes.length === 0) {
-      prevNodesCountRef.current = 0
+      prevNodeIdsRef.current = new Set()
       setNodes([])
       setEdges([])
       setLayoutReady(false)
       return
     }
-    // Hide graph only on fresh start; keep visible for incremental live updates.
-    if (prevNodesCountRef.current === 0) {
+
+    const newNodeIds = new Set(rawBuild.nodes.map(n => n.id))
+    const prevNodeIds = prevNodeIdsRef.current
+    const structurallyChanged =
+      prevNodeIds.size !== newNodeIds.size ||
+      rawBuild.nodes.some(n => !prevNodeIds.has(n.id))
+
+    prevNodeIdsRef.current = newNodeIds
+
+    if (structurallyChanged) {
       setLayoutReady(false)
+      setNodes(rawBuild.nodes)
+    } else {
+      // Same node IDs — update data in-place so positions are preserved.
+      const newDataById = new Map(rawBuild.nodes.map(n => [n.id, n.data]))
+      setNodes(prev => prev.map(node => {
+        const newData = newDataById.get(node.id)
+        return newData ? { ...node, data: newData } : node
+      }))
     }
-    prevNodesCountRef.current = rawBuild.nodes.length
-    setNodes(rawBuild.nodes)
   }, [rawBuild, setNodes, setEdges])
 
   // Inject draggable/toggle callbacks after layout — passed to LayoutController
