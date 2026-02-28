@@ -40,6 +40,7 @@ export default function LayoutController({
   const { getNodes, setViewport, fitView } = useReactFlow()
   const nodesInitialized = useNodesInitialized()
   const layoutDone = useRef(false)
+  const isFirstLayout = useRef(true)
 
   // Stable refs — let callbacks read current values without being recreated
   const rawBuildRef = useRef(rawBuild)
@@ -65,24 +66,24 @@ export default function LayoutController({
    *
    * 'center': delegates to React Flow's built-in fitView.
    */
-  const applyAlignedFitView = useCallback((nodes) => {
+  const applyAlignedFitView = useCallback((nodes, duration = 300) => {
     const align = fitViewAlignRef.current
 
     if (!align || align === 'center') {
-      fitView({ padding: 0.1, duration: 300 })
+      fitView({ padding: 0.1, duration })
       return
     }
 
     // Only root-level nodes have absolute positions in the canvas
     const rootNodes = nodes.filter(n => !n.parentId)
     if (rootNodes.length === 0) {
-      fitView({ padding: 0.1, duration: 300 })
+      fitView({ padding: 0.1, duration })
       return
     }
 
     const { width: containerW, height: containerH } = storeApi.getState()
     if (!containerW || !containerH) {
-      fitView({ padding: 0.1, duration: 300 })
+      fitView({ padding: 0.1, duration })
       return
     }
 
@@ -100,7 +101,7 @@ export default function LayoutController({
 
     const graphWidth = maxX - minX
     if (graphWidth <= 0) {
-      fitView({ padding: 0.1, duration: 300 })
+      fitView({ padding: 0.1, duration })
       return
     }
 
@@ -113,7 +114,7 @@ export default function LayoutController({
       ? containerH - padding - maxY * zoom
       : padding - minY * zoom
 
-    setViewport({ x, y, zoom }, { duration: 300 })
+    setViewport({ x, y, zoom }, { duration })
   }, [fitView, setViewport, storeApi])
 
   // Core layout runner — stable identity, reads mutable state via refs
@@ -142,12 +143,15 @@ export default function LayoutController({
     layoutDone.current = true
     lastFinalNodesRef.current = finalNodes
     onLayoutDoneRef.current?.(finalNodes)
-    setTimeout(() => applyAlignedFitView(finalNodes), 50)
+    const duration = isFirstLayout.current ? 0 : 300
+    isFirstLayout.current = false
+    setTimeout(() => applyAlignedFitView(finalNodes, duration), 50)
   }, [getNodes, setNodes, setEdges, applyAlignedFitView])
 
   // Reset layout flag whenever rawBuild changes (parent has just set new raw nodes)
   useEffect(() => {
     layoutDone.current = false
+    isFirstLayout.current = true
   }, [rawBuild])
 
   // Phase 2: all current nodes measured → apply layout

@@ -93,6 +93,7 @@ export default function PipelineFlowGraph({
   const [nodes, setNodes, onNodesChange] = useNodesState([])
   const [edges, setEdges, onEdgesChange] = useEdgesState([])
   const [hoveredNode, setHoveredNode] = useState(null)
+  const [layoutReady, setLayoutReady] = useState(false)
 
   // Merge caller overrides with canonical defaults so every param is always defined.
   // Memoized so the reference is stable — prevents LayoutController's param-change
@@ -109,6 +110,7 @@ export default function PipelineFlowGraph({
       setEdges([])
       return
     }
+    setLayoutReady(false)
     setNodes(rawBuild.nodes)
   }, [rawBuild, setNodes, setEdges])
 
@@ -129,6 +131,11 @@ export default function PipelineFlowGraph({
       return nodesDraggable ? { ...node, draggable: true } : node
     })
   }, [nodesDraggable, allowResizing, onToggleCycle])
+
+  const handleLayoutDone = useCallback((finalNodes) => {
+    setLayoutReady(true)
+    onLayoutDone?.(finalNodes)
+  }, [onLayoutDone])
 
   const onNodeMouseEnter = useCallback((event, node) => setHoveredNode(node), [])
   const onNodeMouseLeave = useCallback(() => setHoveredNode(null), [])
@@ -153,7 +160,7 @@ export default function PipelineFlowGraph({
           <p className="text-gh-fg-muted">{emptyMessage}</p>
         </div>
       ) : (
-        <>
+        <div style={{ opacity: layoutReady ? 1 : 0, transition: 'opacity 0.15s ease', height: '100%' }}>
           <ReactFlow
             nodes={nodes}
             edges={edges}
@@ -178,7 +185,7 @@ export default function PipelineFlowGraph({
               finalizeNodes={finalizeNodes}
               setNodes={setNodes}
               setEdges={setEdges}
-              onLayoutDone={onLayoutDone}
+              onLayoutDone={handleLayoutDone}
               containerHeight={height}
               fitViewAlign={fitViewAlign}
             />
@@ -192,7 +199,7 @@ export default function PipelineFlowGraph({
               <div className="text-xs text-gh-fg-muted">{hoveredNode.data.metadata}</div>
             </div>
           )}
-        </>
+        </div>
       )}
 
       <style>{`

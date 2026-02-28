@@ -1,5 +1,5 @@
 import { createFileRoute } from '@tanstack/react-router'
-import { RefreshCw, AlertCircle, XCircle } from 'lucide-react'
+import { RefreshCw, ChevronDown, ChevronUp } from 'lucide-react'
 import Header from '../components/Header'
 import NavigationTabs from '../components/NavigationTabs'
 import PipelineFlowGraph from '../components/PipelineFlowGraph'
@@ -31,7 +31,7 @@ function PipelineRunView() {
   const [loadingEvents, setLoadingEvents] = useState(false)
   const [completedLoadedCount, setCompletedLoadedCount] = useState(0)
   const [hasMoreCompleted, setHasMoreCompleted] = useState(true)
-  const [legendOpen, setLegendOpen] = useState(true)
+  const [legendOpen, setLegendOpen] = useState(false)
   const [rawBuild, setRawBuild] = useState(null)
   const [cycles, setCycles] = useState(new Map())
   const [showKillModal, setShowKillModal] = useState(false)
@@ -519,44 +519,22 @@ function PipelineRunView() {
               {/* Content Area */}
               <div className="flex-1 min-h-0 flex">
                 {contentTab === 'graph' ? (
-                  <div className="flex gap-4 flex-1 min-h-0">
-                    <div className="flex-1 min-h-0">
-                      <PipelineFlowGraph
-                        rawBuild={rawBuild}
-                        onToggleCycle={handleToggleCycle}
-                        nodesDraggable={selectedPipelineRun.status !== 'active'}
-                        allowResizing={selectedPipelineRun.status !== 'active'}
-                        minZoom={0.5}
-                        maxZoom={1.5}
-                        height="100%"
-                        loading={loadingEvents}
-                        emptyMessage="No events found for this pipeline run"
-                        fitViewAlign={selectedPipelineRun.status === 'active' ? 'bottom' : 'top'}
-                      />
-                    </div>
-
-                    {/* Collapsible Legend Panel */}
-                    <div className={`transition-all duration-300 ${legendOpen ? 'w-64' : 'w-10'} bg-gh-canvas border border-gh-border rounded-md flex-shrink-0 flex flex-col`}>
-                      <div className="flex items-center justify-between p-3 border-b border-gh-border flex-shrink-0">
-                        {legendOpen && <h3 className="text-sm font-semibold">Legend</h3>}
-                        <button
-                          onClick={() => setLegendOpen(!legendOpen)}
-                          className="p-1 hover:bg-gh-canvas-subtle rounded transition-colors"
-                          title={legendOpen ? 'Collapse legend' : 'Expand legend'}
-                        >
-                          {legendOpen ? (
-                            <XCircle className="w-4 h-4" />
-                          ) : (
-                            <AlertCircle className="w-4 h-4" />
-                          )}
-                        </button>
-                      </div>
-
+                  <div className="flex flex-col gap-2 flex-1 min-h-0">
+                    {/* Collapsible Legend — top bar */}
+                    <div className="flex-shrink-0 bg-gh-canvas border border-gh-border rounded-md">
+                      <button
+                        onClick={() => setLegendOpen(!legendOpen)}
+                        className="flex items-center gap-2 w-full px-3 py-2 hover:bg-gh-canvas-subtle rounded-md transition-colors"
+                        title={legendOpen ? 'Collapse legend' : 'Expand legend'}
+                      >
+                        {legendOpen ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
+                        <h3 className="text-sm font-semibold">Legend</h3>
+                      </button>
                       {legendOpen && (
-                        <div className="p-3 space-y-4 overflow-y-auto">
+                        <div className="px-3 pb-3 flex gap-8 flex-wrap border-t border-gh-border pt-3">
                           <div>
                             <h4 className="text-xs font-semibold mb-2 text-gh-fg-muted">Pipeline States</h4>
-                            <div className="space-y-2 text-xs">
+                            <div className="flex flex-wrap gap-x-4 gap-y-1.5 text-xs">
                               <div className="flex items-center gap-2">
                                 <div className="w-4 h-4 rounded flex-shrink-0" style={{ background: '#10b981' }}></div>
                                 <span>Pipeline Started</span>
@@ -589,10 +567,9 @@ function PipelineRunView() {
                               </div>
                             </div>
                           </div>
-
                           <div>
                             <h4 className="text-xs font-semibold mb-2 text-gh-fg-muted">Decision Categories</h4>
-                            <div className="space-y-2 text-xs">
+                            <div className="flex flex-wrap gap-x-4 gap-y-1.5 text-xs">
                               <div className="flex items-center gap-2">
                                 <div className="w-4 h-4 rounded flex-shrink-0" style={{ background: '#3b82f6' }}></div>
                                 <span>Routing</span>
@@ -629,6 +606,22 @@ function PipelineRunView() {
                           </div>
                         </div>
                       )}
+                    </div>
+
+                    {/* Graph */}
+                    <div className="flex-1 min-h-0">
+                      <PipelineFlowGraph
+                        rawBuild={rawBuild}
+                        onToggleCycle={handleToggleCycle}
+                        nodesDraggable={selectedPipelineRun.status !== 'active'}
+                        allowResizing={selectedPipelineRun.status !== 'active'}
+                        minZoom={0.5}
+                        maxZoom={1.5}
+                        height="100%"
+                        loading={loadingEvents}
+                        emptyMessage="No events found for this pipeline run"
+                        fitViewAlign={selectedPipelineRun.status === 'active' ? 'bottom' : 'top'}
+                      />
                     </div>
                   </div>
                 ) : (
