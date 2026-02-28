@@ -274,6 +274,185 @@ function groupRepairTestCycles(cycleEvents, boundary, agentExecutions) {
 }
 
 /**
+ * Infer synthetic close events for any open cycles, working deepest-first.
+ *
+ * Nesting order (deepest → outermost):
+ *   Sub-cycles (test_execution, fix_cycle) → Test cycles → Repair cycles → Review cycles
+ *
+ * For each unclosed cycle a synthetic close event is created with:
+ *   - timestamp = earliest valid upper bound (next sibling's start, parent's end, last event + 1 ms)
+ *   - _inferred: true  (flag for downstream renderers)
+ *   - all other fields copied from the matching open event
+ *
+ * Returns the augmented sorted array; the original is not mutated.
+ */
+function inferMissingCloseEvents(sortedEvents) {
+  if (!sortedEvents.length) return sortedEvents
+
+  const synthetic = []
+  const lastMs = new Date(sortedEvents[sortedEvents.length - 1].timestamp).getTime()
+
+  function makeSyntheticClose(template, eventType, timestampMs, overrides = {}) {
+    return { ...template, event_type: eventType, timestamp: new Date(timestampMs).toISOString(), _inferred: true, ...overrides }
+  }
+
+  // Earliest ms strictly greater than startMs from the candidate list.
+  // Falls back to lastMs + 1 when no valid candidate exists.
+  function closestUpperBound(startMs, ...candidates) {
+    const valid = candidates.filter(ms => ms != null && ms > startMs)
+    return valid.length > 0 ? Math.min(...valid) : lastMs + 1
+  }
+
+  // Snapshot of real + synthetic events sorted chronologically (rebuilt each phase).
+  function snapshot() {
+    return [...sortedEvents, ...synthetic].sort(
+      (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
+    )
+  }
+
+  // ── Phase 1: Review cycles ────────────────────────────────────────────────
+  {
+    const reviewStarts = sortedEvents.filter(
+      e => e.event_category === 'decision' && e.event_type === 'review_cycle_started'
+    )
+    const reviewEnds = sortedEvents.filter(
+      e => e.event_category === 'decision' && e.event_type === 'review_cycle_completed'
+    )
+    reviewStarts.forEach((start, idx) => {
+      if (reviewEnds[idx]) return
+      const startMs = new Date(start.timestamp).getTime()
+      const nextStart = reviewStarts[idx + 1]
+      synthetic.push(makeSyntheticClose(
+        start,
+        'review_cycle_completed',
+        closestUpperBound(startMs, nextStart ? new Date(nextStart.timestamp).getTime() : null)
+      ))
+    })
+  }
+
+  // ── Phase 2: Repair cycles ────────────────────────────────────────────────
+  const repairStarts = sortedEvents.filter(
+    e => e.event_category === 'agent_lifecycle' &&
+         e.event_type === 'agent_initialized' &&
+         e.agent === 'repair_cycle'
+  )
+  {
+    repairStarts.forEach((startEvent, idx) => {
+      const startMs = new Date(startEvent.timestamp).getTime()
+      const hasEnd = sortedEvents.some(
+        e => e.event_category === 'agent_lifecycle' &&
+             (e.event_type === 'agent_completed' || e.event_type === 'agent_failed') &&
+             e.agent === 'repair_cycle' &&
+             new Date(e.timestamp).getTime() > startMs
+      )
+      if (hasEnd) return
+      const nextRepairStart = repairStarts[idx + 1]
+      synthetic.push(makeSyntheticClose(
+        startEvent,
+        'agent_completed',
+        closestUpperBound(startMs, nextRepairStart ? new Date(nextRepairStart.timestamp).getTime() : null),
+        { event_category: 'agent_lifecycle', agent: 'repair_cycle', success: null, error: null, duration_ms: null }
+      ))
+    })
+  }
+
+  // ── Phase 3: Test cycles within repair cycles ─────────────────────────────
+  // (uses Phase 2 synthetic repair-cycle ends via snapshot)
+  {
+    const stream = snapshot()
+    repairStarts.forEach(repairStart => {
+      const repairStartMs = new Date(repairStart.timestamp).getTime()
+      const repairEnd = stream.find(
+        e => e.event_category === 'agent_lifecycle' &&
+             (e.event_type === 'agent_completed' || e.event_type === 'agent_failed') &&
+             e.agent === 'repair_cycle' &&
+             new Date(e.timestamp).getTime() > repairStartMs
+      )
+      const repairEndMs = repairEnd ? new Date(repairEnd.timestamp).getTime() : lastMs + 1
+
+      const tcStarts = sortedEvents.filter(e => {
+        const t = new Date(e.timestamp).getTime()
+        return t >= repairStartMs && t <= repairEndMs && e.event_type === 'repair_cycle_test_cycle_started'
+      })
+      const tcEnds = sortedEvents.filter(e => {
+        const t = new Date(e.timestamp).getTime()
+        return t >= repairStartMs && t <= repairEndMs && e.event_type === 'repair_cycle_test_cycle_completed'
+      })
+
+      tcStarts.forEach((tcStart, idx) => {
+        if (tcEnds[idx]) return
+        const tcStartMs = new Date(tcStart.timestamp).getTime()
+        const nextTcStart = tcStarts[idx + 1]
+        synthetic.push(makeSyntheticClose(
+          tcStart,
+          'repair_cycle_test_cycle_completed',
+          closestUpperBound(tcStartMs, nextTcStart ? new Date(nextTcStart.timestamp).getTime() : null, repairEndMs)
+        ))
+      })
+    })
+  }
+
+  // ── Phase 4: Sub-cycles within test cycles ────────────────────────────────
+  // (uses Phase 2 + 3 synthetic ends via snapshot)
+  {
+    const stream = snapshot()
+    repairStarts.forEach(repairStart => {
+      const repairStartMs = new Date(repairStart.timestamp).getTime()
+      const repairEnd = stream.find(
+        e => e.event_category === 'agent_lifecycle' &&
+             (e.event_type === 'agent_completed' || e.event_type === 'agent_failed') &&
+             e.agent === 'repair_cycle' &&
+             new Date(e.timestamp).getTime() > repairStartMs
+      )
+      const repairEndMs = repairEnd ? new Date(repairEnd.timestamp).getTime() : lastMs + 1
+
+      const allTcStarts = sortedEvents.filter(e => {
+        const t = new Date(e.timestamp).getTime()
+        return t >= repairStartMs && t <= repairEndMs && e.event_type === 'repair_cycle_test_cycle_started'
+      })
+      const allTcEnds = stream.filter(e => {
+        const t = new Date(e.timestamp).getTime()
+        return t >= repairStartMs && t <= repairEndMs && e.event_type === 'repair_cycle_test_cycle_completed'
+      })
+
+      allTcStarts.forEach((tcStart, idx) => {
+        const tcStartMs = new Date(tcStart.timestamp).getTime()
+        const tcEnd = allTcEnds[idx] || null
+        const tcEndMs = tcEnd ? new Date(tcEnd.timestamp).getTime() : repairEndMs
+
+        REPAIR_SUB_CYCLE_REGISTRY.forEach(({ startEventType, endEventType }) => {
+          const scStarts = sortedEvents.filter(e => {
+            const t = new Date(e.timestamp).getTime()
+            return t > tcStartMs && t < tcEndMs && e.event_type === startEventType
+          })
+          const scEnds = sortedEvents.filter(e => {
+            const t = new Date(e.timestamp).getTime()
+            return t > tcStartMs && t < tcEndMs && e.event_type === endEventType
+          })
+
+          scStarts.forEach((scStart, scIdx) => {
+            if (scEnds[scIdx]) return
+            const scStartMs = new Date(scStart.timestamp).getTime()
+            const nextScStart = scStarts[scIdx + 1]
+            synthetic.push(makeSyntheticClose(
+              scStart,
+              endEventType,
+              closestUpperBound(scStartMs, nextScStart ? new Date(nextScStart.timestamp).getTime() : null, tcEndMs)
+            ))
+          })
+        })
+      })
+    })
+  }
+
+  if (!synthetic.length) return sortedEvents
+
+  return [...sortedEvents, ...synthetic].sort(
+    (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
+  )
+}
+
+/**
  * Process all pipeline run events into a structured PipelineGraph model.
  *
  * @param {Array} events          - All pipeline run events (unsorted)
@@ -290,8 +469,10 @@ export function processEvents(events, workflowConfig = null) {
     }
   }
 
-  // Sort events chronologically
-  const sorted = [...events].sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp))
+  // Sort events chronologically, then infer synthetic close events for any open cycles
+  const sorted = inferMissingCloseEvents(
+    [...events].sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp))
+  )
 
   // Build agent execution map (needed for iteration grouping)
   const agentExecutions = buildAgentExecutionMap(sorted)
