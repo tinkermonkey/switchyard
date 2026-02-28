@@ -66,7 +66,7 @@ function groupIterationColumns(subCycles, directChildren, subCycleSizes, opts) {
   // column. Events in the gap between column N's end and column N+1's start are "opener" events
   // for iteration N+1 (e.g. repair_cycle_iteration markers) and belong to column N+1.
   directChildren.forEach(child => {
-    const childMs = new Date(child.data?.timestamp || 0).getTime()
+    const childMs = new Date(child.data?.timestamp || child.data?.startTime || 0).getTime()
     let assignedCol = iterNums[iterNums.length - 1] // default: last column
     for (let i = 0; i < iterNums.length; i++) {
       const n = iterNums[i]
@@ -389,8 +389,8 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
         let childY = iterHeaderHeight + iterPadding
         // Sort items within each column chronologically
         const sortedItems = [...col.items].sort((a, b) => {
-          const aTs = a.node.data?.startEvent?.timestamp || a.node.data?.timestamp || ''
-          const bTs = b.node.data?.startEvent?.timestamp || b.node.data?.timestamp || ''
+          const aTs = a.node.data?.startEvent?.timestamp || a.node.data?.timestamp || a.node.data?.startTime || ''
+          const bTs = b.node.data?.startEvent?.timestamp || b.node.data?.timestamp || b.node.data?.startTime || ''
           return new Date(aTs) - new Date(bTs)
         })
         sortedItems.forEach(({ node, h, w }) => {
