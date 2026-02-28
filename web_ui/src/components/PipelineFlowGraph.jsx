@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useMemo } from 'react'
 import {
   ReactFlow,
   Controls,
@@ -90,8 +90,12 @@ export default function PipelineFlowGraph({
   const [hoveredNode, setHoveredNode] = useState(null)
 
   // Merge caller overrides with canonical defaults so every param is always defined.
-  // This ensures that improvements to DEFAULT_LAYOUT_OPTIONS are reflected everywhere.
-  const mergedLayoutOptions = { ...DEFAULT_LAYOUT_OPTIONS, ...layoutOptions }
+  // Memoized so the reference is stable — prevents LayoutController's param-change
+  // effect from firing on every render when layout options haven't actually changed.
+  const mergedLayoutOptions = useMemo(
+    () => ({ ...DEFAULT_LAYOUT_OPTIONS, ...layoutOptions }),
+    [layoutOptions]
+  )
 
   // Phase 1: set raw unpositioned nodes for React Flow to render and measure
   useEffect(() => {
