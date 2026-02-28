@@ -1,5 +1,5 @@
 import { createFileRoute } from '@tanstack/react-router'
-import { RefreshCw, ChevronDown, ChevronUp } from 'lucide-react'
+import { RefreshCw } from 'lucide-react'
 import Header from '../components/Header'
 import NavigationTabs from '../components/NavigationTabs'
 import PipelineFlowGraph from '../components/PipelineFlowGraph'
@@ -31,7 +31,6 @@ function PipelineRunView() {
   const [loadingEvents, setLoadingEvents] = useState(false)
   const [completedLoadedCount, setCompletedLoadedCount] = useState(0)
   const [hasMoreCompleted, setHasMoreCompleted] = useState(true)
-  const [legendOpen, setLegendOpen] = useState(false)
   const [rawBuild, setRawBuild] = useState(null)
   const [cycles, setCycles] = useState(new Map())
   const [showKillModal, setShowKillModal] = useState(false)
@@ -519,110 +518,19 @@ function PipelineRunView() {
               {/* Content Area */}
               <div className="flex-1 min-h-0 flex">
                 {contentTab === 'graph' ? (
-                  <div className="flex flex-col gap-2 flex-1 min-h-0">
-                    {/* Collapsible Legend — top bar */}
-                    <div className="flex-shrink-0 bg-gh-canvas border border-gh-border rounded-md">
-                      <button
-                        onClick={() => setLegendOpen(!legendOpen)}
-                        className="flex items-center gap-2 w-full px-3 py-2 hover:bg-gh-canvas-subtle rounded-md transition-colors"
-                        title={legendOpen ? 'Collapse legend' : 'Expand legend'}
-                      >
-                        {legendOpen ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
-                        <h3 className="text-sm font-semibold">Legend</h3>
-                      </button>
-                      {legendOpen && (
-                        <div className="px-3 pb-3 flex gap-8 flex-wrap border-t border-gh-border pt-3">
-                          <div>
-                            <h4 className="text-xs font-semibold mb-2 text-gh-fg-muted">Pipeline States</h4>
-                            <div className="flex flex-wrap gap-x-4 gap-y-1.5 text-xs">
-                              <div className="flex items-center gap-2">
-                                <div className="w-4 h-4 rounded flex-shrink-0" style={{ background: '#10b981' }}></div>
-                                <span>Pipeline Started</span>
-                              </div>
-                              <div className="flex items-center gap-2">
-                                <div className="w-4 h-4 rounded flex-shrink-0" style={{ background: '#1f6feb' }}></div>
-                                <span>Agent Running</span>
-                              </div>
-                              <div className="flex items-center gap-2">
-                                <div className="w-4 h-4 rounded flex-shrink-0" style={{ background: '#238636' }}></div>
-                                <span>Agent Completed</span>
-                              </div>
-                              <div className="flex items-center gap-2">
-                                <div className="w-4 h-4 rounded flex-shrink-0" style={{ background: '#da3633' }}></div>
-                                <span>Agent Failed</span>
-                              </div>
-                              <div className="flex items-center gap-2">
-                                <div className="w-4 h-4 rounded flex-shrink-0" style={{ background: '#6366f1' }}></div>
-                                <span>Pipeline Completed</span>
-                              </div>
-                              <div className="flex items-center gap-2">
-                                <div className="w-4 h-4 rounded border-2 flex-shrink-0" style={{ borderColor: '#58a6ff', background: '#1f6feb' }}>
-                                  <div style={{
-                                    height: '100%',
-                                    backgroundImage: 'linear-gradient(45deg, rgba(255,255,255,.2) 25%, transparent 25%)',
-                                    backgroundSize: '4px 4px',
-                                  }}></div>
-                                </div>
-                                <span>Active (Candy Stripe)</span>
-                              </div>
-                            </div>
-                          </div>
-                          <div>
-                            <h4 className="text-xs font-semibold mb-2 text-gh-fg-muted">Decision Categories</h4>
-                            <div className="flex flex-wrap gap-x-4 gap-y-1.5 text-xs">
-                              <div className="flex items-center gap-2">
-                                <div className="w-4 h-4 rounded flex-shrink-0" style={{ background: '#3b82f6' }}></div>
-                                <span>Routing</span>
-                              </div>
-                              <div className="flex items-center gap-2">
-                                <div className="w-4 h-4 rounded flex-shrink-0" style={{ background: '#10b981' }}></div>
-                                <span>Progression</span>
-                              </div>
-                              <div className="flex items-center gap-2">
-                                <div className="w-4 h-4 rounded flex-shrink-0" style={{ background: '#8b5cf6' }}></div>
-                                <span>Review Cycle</span>
-                              </div>
-                              <div className="flex items-center gap-2">
-                                <div className="w-4 h-4 rounded flex-shrink-0" style={{ background: '#f59e0b' }}></div>
-                                <span>Feedback</span>
-                              </div>
-                              <div className="flex items-center gap-2">
-                                <div className="w-4 h-4 rounded flex-shrink-0" style={{ background: '#ef4444' }}></div>
-                                <span>Error Handling</span>
-                              </div>
-                              <div className="flex items-center gap-2">
-                                <div className="w-4 h-4 rounded flex-shrink-0" style={{ background: '#06b6d4' }}></div>
-                                <span>Task Management</span>
-                              </div>
-                              <div className="flex items-center gap-2">
-                                <div className="w-4 h-4 rounded flex-shrink-0" style={{ background: '#84cc16' }}></div>
-                                <span>Branch Management</span>
-                              </div>
-                              <div className="flex items-center gap-2">
-                                <div className="w-4 h-4 rounded flex-shrink-0" style={{ background: '#ec4899' }}></div>
-                                <span>Conversational</span>
-                              </div>
-                            </div>
-                          </div>
-                        </div>
-                      )}
-                    </div>
-
-                    {/* Graph */}
-                    <div className="flex-1 min-h-0">
-                      <PipelineFlowGraph
-                        rawBuild={rawBuild}
-                        onToggleCycle={handleToggleCycle}
-                        nodesDraggable={selectedPipelineRun.status !== 'active'}
-                        allowResizing={selectedPipelineRun.status !== 'active'}
-                        minZoom={0.5}
-                        maxZoom={1.5}
-                        height="100%"
-                        loading={loadingEvents}
-                        emptyMessage="No events found for this pipeline run"
-                        fitViewAlign={selectedPipelineRun.status === 'active' ? 'bottom' : 'top'}
-                      />
-                    </div>
+                  <div className="flex-1 min-h-0">
+                    <PipelineFlowGraph
+                      rawBuild={rawBuild}
+                      onToggleCycle={handleToggleCycle}
+                      nodesDraggable={selectedPipelineRun.status !== 'active'}
+                      allowResizing={selectedPipelineRun.status !== 'active'}
+                      minZoom={0.5}
+                      maxZoom={1.5}
+                      height="100%"
+                      loading={loadingEvents}
+                      emptyMessage="No events found for this pipeline run"
+                      fitViewAlign={selectedPipelineRun.status === 'active' ? 'bottom' : 'top'}
+                    />
                   </div>
                 ) : (
                   <div className="flex-1 overflow-auto">
