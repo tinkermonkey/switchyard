@@ -925,14 +925,18 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
 
   // ── Pass 5: Position grandchildren within iteration containers ────────────
   // Uses cumulative measured heights for accurate vertical stacking.
+  // Children are horizontally centered within the iteration container.
   iterContainers.forEach(iter => {
     const children = childrenByIter.get(iter.id) || []
+    const iterSize = iterSizes.get(iter.id) || { width: nodeWidth + iterPadding * 2 }
     let childY = iterHeaderHeight + iterPadding
     // Preserve insertion order (chronological — buildFlowchart.js inserts them that way)
     children.forEach(child => {
+      const childWidth = child.measured?.width ?? nodeWidth
+      const centeredX = (iterSize.width - childWidth) / 2
       positionedNodes.set(child.id, {
         ...child,
-        position: { x: iterPadding, y: childY },
+        position: { x: centeredX, y: childY },
       })
       childY += (child.measured?.height ?? nodeHeight) + innerVertSpacing
     })
