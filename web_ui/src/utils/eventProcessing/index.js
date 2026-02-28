@@ -142,9 +142,78 @@ function groupReviewCycleIterations(cycleEvents, boundary, agentExecutions) {
   })
 }
 
+// Registry of sub-cycle types recognised within a test cycle.
+// Each entry drives automatic boundary detection via _started/_completed event pairs.
+const REPAIR_SUB_CYCLE_REGISTRY = [
+  {
+    startEventType: 'repair_cycle_test_execution_started',
+    endEventType:   'repair_cycle_test_execution_completed',
+    cycleType:      'test_execution',
+    label:          'Test Execution',
+  },
+  {
+    startEventType: 'repair_cycle_fix_cycle_started',
+    endEventType:   'repair_cycle_fix_cycle_completed',
+    cycleType:      'fix_cycle',
+    label:          'Fix Cycle',
+  },
+]
+
+/**
+ * Group events within a time window into sub-cycles using a registry entry.
+ */
+function groupSubCycles(events, registryEntry, agentExecutions) {
+  const { startEventType, endEventType, cycleType, label } = registryEntry
+  const starts = events.filter(e => e.event_type === startEventType)
+  const ends   = events.filter(e => e.event_type === endEventType)
+
+  return starts.map((startEvent, idx) => {
+    const endEvent  = ends[idx] || null
+    const startMs   = new Date(startEvent.timestamp).getTime()
+    const endMs     = endEvent ? new Date(endEvent.timestamp).getTime() : Infinity
+    const subEvents = events.filter(e => {
+      const t = new Date(e.timestamp).getTime()
+      return t > startMs && t < endMs
+    })
+    const subAgentExecs = []
+    agentExecutions.forEach((executions, agent) => {
+      executions.forEach((exec, executionIndex) => {
+        const execMs = new Date(exec.startTime).getTime()
+        if (execMs >= startMs && execMs <= endMs)
+          subAgentExecs.push({ agent, execution: exec, executionIndex })
+      })
+    })
+    return {
+      number: idx + 1,
+      cycleType,
+      label: `${label} ${idx + 1}`,
+      startEvent,
+      endEvent,
+      events: subEvents,
+      agentExecutions: subAgentExecs,
+    }
+  })
+}
+
+const TEST_TYPE_LABELS = {
+  unit: 'Unit Tests',
+  integration: 'Integration Tests',
+  e2e: 'E2E Tests',
+  ci: 'CI Tests',
+  compilation: 'Compilation',
+  'pre-commit': 'Pre-commit',
+  storybook: 'Storybook',
+}
+
+function formatTestType(testType) {
+  return TEST_TYPE_LABELS[testType] ||
+    testType.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase())
+}
+
 /**
  * Group events within a repair cycle into test cycles.
  * Each test cycle is bounded by repair_cycle_test_cycle_started / repair_cycle_test_cycle_completed.
+ * Each test cycle is further split into sub-cycles using REPAIR_SUB_CYCLE_REGISTRY.
  *
  * @param {Array} cycleEvents  - All events within the repair cycle's time range (sorted)
  * @param {Object} boundary    - { startEvent, endEvent }
@@ -153,17 +222,32 @@ function groupReviewCycleIterations(cycleEvents, boundary, agentExecutions) {
  */
 function groupRepairTestCycles(cycleEvents, boundary, agentExecutions) {
   const tcStarts = cycleEvents.filter(e => e.event_type === 'repair_cycle_test_cycle_started')
-  const tcEnds = cycleEvents.filter(e => e.event_type === 'repair_cycle_test_cycle_completed')
+  const tcEnds   = cycleEvents.filter(e => e.event_type === 'repair_cycle_test_cycle_completed')
 
   return tcStarts.map((tcStart, idx) => {
-    const tcEnd = tcEnds[idx] || null
+    const tcEnd     = tcEnds[idx] || null
     const tcStartMs = new Date(tcStart.timestamp).getTime()
-    const tcEndMs = tcEnd ? new Date(tcEnd.timestamp).getTime() : Infinity
+    const tcEndMs   = tcEnd ? new Date(tcEnd.timestamp).getTime() : Infinity
 
-    // Events between the test cycle markers (excluding the markers themselves)
+    // All events strictly between the test cycle markers
     const events = cycleEvents.filter(e => {
       const t = new Date(e.timestamp).getTime()
       return t > tcStartMs && t < tcEndMs
+    })
+
+    // Detect sub-cycles generically from registry
+    const subCycles = REPAIR_SUB_CYCLE_REGISTRY.flatMap(entry =>
+      groupSubCycles(events, entry, agentExecutions)
+    )
+
+    // Residual events: not inside any sub-cycle boundary
+    const subCycleTimeRanges = subCycles.map(sc => ({
+      startMs: new Date(sc.startEvent.timestamp).getTime(),
+      endMs:   sc.endEvent ? new Date(sc.endEvent.timestamp).getTime() : Infinity,
+    }))
+    const residualEvents = events.filter(e => {
+      const t = new Date(e.timestamp).getTime()
+      return !subCycleTimeRanges.some(r => t >= r.startMs && t <= r.endMs)
     })
 
     // Agent executions within this test cycle's window
@@ -177,11 +261,14 @@ function groupRepairTestCycles(cycleEvents, boundary, agentExecutions) {
       })
     })
 
+    const rawTestType = tcStart.inputs?.test_type ?? tcStart.test_type
     return {
       number: idx + 1,
+      testType: rawTestType ? formatTestType(rawTestType) : `Test Cycle ${idx + 1}`,
       startEvent: tcStart,
-      endEvent: tcEnd,
-      events,
+      endEvent:   tcEnd,
+      subCycles,
+      events: residualEvents,
       agentExecutions: tcAgentExecs,
     }
   })

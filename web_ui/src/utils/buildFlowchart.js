@@ -277,13 +277,9 @@ export function buildFlowchart({
       if (isCollapsed) {
         leafChain.push({ id: cycle.id, timestamp: cycle.startEvent?.timestamp })
       } else if (cycle.testCycles) {
-        // Expanded: add test cycle containers + grandchildren
+        // Expanded: add test cycle containers + sub-cycle containers + events
         cycle.testCycles.forEach(tc => {
           const tcId = `${cycle.id}-tc-${tc.number}`
-
-          const allTcEvents = [tc.startEvent, ...tc.events, tc.endEvent]
-            .filter(Boolean)
-            .sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp))
 
           const tcNode = {
             id: tcId,
@@ -292,8 +288,7 @@ export function buildFlowchart({
             position: { x: 0, y: 0 },
             data: {
               iterationNumber: tc.number,
-              label: `Test Cycle ${tc.number}`,
-              eventCount: allTcEvents.length,
+              label: tc.testType,
             },
             style: { width: 0, height: 0 }, // sized by applyCycleLayout
             measured: { width: 1, height: 1 },
@@ -301,9 +296,40 @@ export function buildFlowchart({
           }
           newNodes.push(tcNode)
 
-          allTcEvents.forEach(event => {
-            processEventToNode(event, tcId, tcId)
+          // Create sub-cycle containers and collect events with their target parent
+          const allEntries = []
+          tc.subCycles.forEach(sc => {
+            const scId = `${tcId}-${sc.cycleType}-${sc.number}`
+            newNodes.push({
+              id: scId,
+              type: 'subCycleContainer',
+              parentId: tcId,
+              position: { x: 0, y: 0 },
+              data: {
+                label: sc.label,
+                cycleType: sc.cycleType,
+                iterationNumber: sc.number,
+                startEvent: sc.startEvent,
+                endEvent: sc.endEvent,
+              },
+              style: { width: 0, height: 0 },
+              measured: { width: 1, height: 1 },
+              draggable: false,
+            })
+            ;[sc.startEvent, ...sc.events, sc.endEvent].filter(Boolean).forEach(event => {
+              allEntries.push({ event, parentId: scId })
+            })
           })
+
+          // Residual events go directly under the test cycle container
+          ;[tc.startEvent, ...tc.events, tc.endEvent].filter(Boolean).forEach(event => {
+            allEntries.push({ event, parentId: tcId })
+          })
+
+          // Process all events in chronological order for correct leafChain sequencing
+          allEntries
+            .sort((a, b) => new Date(a.event.timestamp) - new Date(b.event.timestamp))
+            .forEach(({ event, parentId }) => processEventToNode(event, parentId, parentId))
         })
       }
     }

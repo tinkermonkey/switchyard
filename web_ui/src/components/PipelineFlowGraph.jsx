@@ -43,6 +43,7 @@ const nodeTypes = {
   reviewCycleContainer: ReviewCycleContainerNode,
   repairCycleContainer: RepairCycleContainerNode,
   iterationContainer: IterationContainerNode,
+  subCycleContainer: IterationContainerNode,  // same component, styled via cycleType data prop
 }
 
 const edgeTypes = {

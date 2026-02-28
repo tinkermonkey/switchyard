@@ -51,11 +51,16 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
     n => (n.type === 'reviewCycleContainer' || n.type === 'repairCycleContainer') && !n.parentId
   )
   const iterContainers = nodes.filter(n => n.type === 'iterationContainer')
+  const subCycleContainers = nodes.filter(n => n.type === 'subCycleContainer')
+  // Direct pipelineEvent children of iterationContainers (residual events not inside sub-cycles)
   const grandchildren = nodes.filter(n => n.parentId && n.type === 'pipelineEvent' &&
     iterContainers.some(ic => ic.id === n.parentId))
   // Direct pipelineEvent children of cycle containers (review_cycle_started / completed)
   const directCycleChildren = nodes.filter(n => n.parentId && n.type === 'pipelineEvent' &&
     cycleContainers.some(cc => cc.id === n.parentId))
+  // pipelineEvent children of subCycleContainers
+  const subCycleLeaves = nodes.filter(n => n.parentId && n.type === 'pipelineEvent' &&
+    subCycleContainers.some(sc => sc.id === n.parentId))
 
   // Build lookup maps
   const itersByParent = new Map()   // cycleId → [iterationContainer]
@@ -65,11 +70,25 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
     itersByParent.get(pid).push(iter)
   })
 
-  const childrenByIter = new Map()  // iterId → [grandchild pipelineEvent]
+  const childrenByIter = new Map()  // iterId → [direct pipelineEvent grandchild]
   grandchildren.forEach(child => {
     const pid = child.parentId
     if (!childrenByIter.has(pid)) childrenByIter.set(pid, [])
     childrenByIter.get(pid).push(child)
+  })
+
+  const subCyclesByIter = new Map()  // iterId → [subCycleContainer]
+  subCycleContainers.forEach(sc => {
+    const pid = sc.parentId
+    if (!subCyclesByIter.has(pid)) subCyclesByIter.set(pid, [])
+    subCyclesByIter.get(pid).push(sc)
+  })
+
+  const leavesBySubCycle = new Map()  // subCycleId → [pipelineEvent]
+  subCycleLeaves.forEach(leaf => {
+    const pid = leaf.parentId
+    if (!leavesBySubCycle.has(pid)) leavesBySubCycle.set(pid, [])
+    leavesBySubCycle.get(pid).push(leaf)
   })
 
   const directChildrenByCycle = new Map()  // cycleId → [pipelineEvent]
@@ -79,22 +98,39 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
     directChildrenByCycle.get(pid).push(child)
   })
 
+  // ── Pass 0: Size subCycleContainers (bottom-up) ───────────────────────────
+  const subCycleSizes = new Map()
+  subCycleContainers.forEach(sc => {
+    const leaves = leavesBySubCycle.get(sc.id) || []
+    const n = leaves.length
+    const totalLeafH = leaves.reduce((sum, c) => sum + (c.measured?.height ?? nodeHeight), 0)
+    const maxLeafW = n > 0 ? Math.max(...leaves.map(c => c.measured?.width ?? nodeWidth)) : nodeWidth
+    const height = iterHeaderHeight + iterPadding * 2 + totalLeafH + Math.max(0, n - 1) * innerVertSpacing
+    const width = maxLeafW + iterPadding * 2
+    subCycleSizes.set(sc.id, { width, height })
+  })
+
   // ── Pass 1: Size iteration / test-cycle containers (bottom-up) ───────────
   // Uses node.measured dimensions when available (two-phase layout), falls back to params.
   const iterSizes = new Map()
   iterContainers.forEach(iter => {
-    const children = childrenByIter.get(iter.id) || []
-    const n = children.length
-    const totalChildHeight = children.reduce(
-      (sum, c) => sum + (c.measured?.height ?? nodeHeight), 0
-    )
-    const maxChildWidth = n > 0
-      ? Math.max(...children.map(c => c.measured?.width ?? nodeWidth))
-      : nodeWidth
-    const height = iterHeaderHeight + iterPadding * 2 +
-      totalChildHeight +
-      Math.max(0, n - 1) * innerVertSpacing
-    const width = maxChildWidth + iterPadding * 2
+    const directChildren = childrenByIter.get(iter.id) || []
+    const subCycles = subCyclesByIter.get(iter.id) || []
+
+    // Combine direct pipelineEvent children and sub-cycle containers for sizing
+    const allChildren = [
+      ...directChildren.map(c => ({ w: c.measured?.width ?? nodeWidth, h: c.measured?.height ?? nodeHeight })),
+      ...subCycles.map(sc => {
+        const sz = subCycleSizes.get(sc.id) || { width: nodeWidth, height: nodeHeight }
+        return { w: sz.width, h: sz.height }
+      }),
+    ]
+
+    const n = allChildren.length
+    const totalH = allChildren.reduce((sum, c) => sum + c.h, 0)
+    const maxW = n > 0 ? Math.max(...allChildren.map(c => c.w)) : nodeWidth
+    const height = iterHeaderHeight + iterPadding * 2 + totalH + Math.max(0, n - 1) * innerVertSpacing
+    const width = maxW + iterPadding * 2
     iterSizes.set(iter.id, { width, height })
   })
 
@@ -222,35 +258,71 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
     }
   })
 
-  // ── Pass 5: Position grandchildren within iteration containers ────────────
-  // Uses cumulative measured heights for accurate vertical stacking.
-  // Children are horizontally centered within the iteration container.
+  // ── Pass 5: Position children of iteration containers (chronological order, mixed types) ─
+  // Handles both direct pipelineEvent children (residuals) and subCycleContainers.
   iterContainers.forEach(iter => {
-    const children = childrenByIter.get(iter.id) || []
+    const directChildren = childrenByIter.get(iter.id) || []
+    const subCycles = subCyclesByIter.get(iter.id) || []
     const iterSize = iterSizes.get(iter.id) || { width: nodeWidth + iterPadding * 2 }
+
+    // Sort all children chronologically
+    const allChildren = [
+      ...directChildren.map(c => ({ node: c, ts: c.data?.timestamp || c.data?.startTime || '' })),
+      ...subCycles.map(sc => ({ node: sc, ts: sc.data?.startEvent?.timestamp || '' })),
+    ].sort((a, b) => new Date(a.ts) - new Date(b.ts))
+
     let childY = iterHeaderHeight + iterPadding
-    // Preserve insertion order (chronological — buildFlowchart.js inserts them that way)
-    children.forEach(child => {
-      const childWidth = child.measured?.width ?? nodeWidth
-      const centeredX = (iterSize.width - childWidth) / 2
-      positionedNodes.set(child.id, {
-        ...child,
-        position: { x: centeredX, y: childY },
+    allChildren.forEach(({ node }) => {
+      if (node.type === 'subCycleContainer') {
+        const sz = subCycleSizes.get(node.id) || { width: nodeWidth, height: nodeHeight }
+        const centeredX = (iterSize.width - sz.width) / 2
+        positionedNodes.set(node.id, {
+          ...node,
+          position: { x: centeredX, y: childY },
+          style: { ...node.style, width: sz.width, height: sz.height },
+        })
+        childY += sz.height + innerVertSpacing
+      } else {
+        const childW = node.measured?.width ?? nodeWidth
+        const childH = node.measured?.height ?? nodeHeight
+        positionedNodes.set(node.id, {
+          ...node,
+          position: { x: (iterSize.width - childW) / 2, y: childY },
+        })
+        childY += childH + innerVertSpacing
+      }
+    })
+  })
+
+  // ── Pass 6: Position pipelineEvent leaves within subCycleContainers ───────
+  subCycleContainers.forEach(sc => {
+    const leaves = leavesBySubCycle.get(sc.id) || []
+    const scSize = subCycleSizes.get(sc.id) || { width: nodeWidth + iterPadding * 2 }
+    let leafY = iterHeaderHeight + iterPadding
+    leaves.forEach(leaf => {
+      const leafW = leaf.measured?.width ?? nodeWidth
+      positionedNodes.set(leaf.id, {
+        ...leaf,
+        position: { x: (scSize.width - leafW) / 2, y: leafY },
       })
-      childY += (child.measured?.height ?? nodeHeight) + innerVertSpacing
+      leafY += (leaf.measured?.height ?? nodeHeight) + innerVertSpacing
     })
   })
 
   // ── Collect and order final nodes (parents before children) ──────────────
+  // Order: root → cycleContainers → iterContainers → direct children → subCycleContainers → subCycleLeaves
   const parentNodes = nodes.filter(n => !n.parentId).map(n => positionedNodes.get(n.id) ?? n)
-  const childNodes = nodes.filter(n => n.parentId).map(n => positionedNodes.get(n.id) ?? n)
+  const iterContainerNodes = iterContainers.map(n => positionedNodes.get(n.id) ?? n)
+  const directChildrenNodes = [...directCycleChildren, ...grandchildren].map(n => positionedNodes.get(n.id) ?? n)
+  const subCycleContainerNodes = subCycleContainers.map(n => positionedNodes.get(n.id) ?? n)
+  const subCycleLeafNodes = subCycleLeaves.map(n => positionedNodes.get(n.id) ?? n)
 
   const cycleNodes = nodes.filter(
     n => n.type === 'reviewCycleContainer' || n.type === 'repairCycleContainer'
   ).map(n => positionedNodes.get(n.id) ?? n)
 
   return {
-    nodes: [...parentNodes, ...childNodes],
+    nodes: [...parentNodes, ...iterContainerNodes, ...directChildrenNodes, ...subCycleContainerNodes, ...subCycleLeafNodes],
     cycleNodes,
     edges,
   }
