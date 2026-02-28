@@ -1,5 +1,5 @@
 import { useEffect, useRef, useCallback } from 'react'
-import { useNodesInitialized, useReactFlow } from '@xyflow/react'
+import { useNodesInitialized, useReactFlow, useStoreApi } from '@xyflow/react'
 import { applyCycleLayout, updateEdgesForCycles } from '../utils/cycleLayout'
 
 /**
@@ -16,10 +16,15 @@ import { applyCycleLayout, updateEdgesForCycles } from '../utils/cycleLayout'
  *   setNodes        from useNodesState
  *   setEdges        from useEdgesState
  *   onLayoutDone    optional (finalNodes) => void  — called after each layout pass
- *   containerHeight optional — the height of the ReactFlow container (number or string).
- *                   When this changes after initial layout (e.g. dynamic chartHeight in
- *                   pipeline-run), fitView is re-called so the graph stays centred in the
- *                   newly-sized container.
+ *   containerHeight optional — when this changes after initial layout, fitView is re-called
+ *                   so the graph stays in view after a container resize.
+ *   fitViewAlign    'center' | 'top' | 'bottom' (default 'center')
+ *                   Controls the initial viewport framing after layout:
+ *                     'top'    — aligns to the top of the graph (first events visible);
+ *                                zoom is set to fit the full graph width.
+ *                     'bottom' — aligns to the bottom of the graph (most recent events);
+ *                                same width-fitting zoom.
+ *                     'center' — standard React Flow fitView (centers all content).
  */
 export default function LayoutController({
   rawBuild,
@@ -29,21 +34,87 @@ export default function LayoutController({
   setEdges,
   onLayoutDone,
   containerHeight,
+  fitViewAlign = 'center',
 }) {
-  const { getNodes, fitView } = useReactFlow()
+  const storeApi = useStoreApi()
+  const { getNodes, setViewport, fitView } = useReactFlow()
   const nodesInitialized = useNodesInitialized()
   const layoutDone = useRef(false)
 
-  // Stable refs — let runLayout read current values without being recreated
+  // Stable refs — let callbacks read current values without being recreated
   const rawBuildRef = useRef(rawBuild)
   const layoutOptionsRef = useRef(layoutOptions)
   const finalizeNodesRef = useRef(finalizeNodes)
   const onLayoutDoneRef = useRef(onLayoutDone)
+  const fitViewAlignRef = useRef(fitViewAlign)
+  const lastFinalNodesRef = useRef([])
 
   useEffect(() => { rawBuildRef.current = rawBuild }, [rawBuild])
   useEffect(() => { layoutOptionsRef.current = layoutOptions }, [layoutOptions])
   useEffect(() => { finalizeNodesRef.current = finalizeNodes }, [finalizeNodes])
   useEffect(() => { onLayoutDoneRef.current = onLayoutDone }, [onLayoutDone])
+  useEffect(() => { fitViewAlignRef.current = fitViewAlign }, [fitViewAlign])
+
+  /**
+   * Positions the viewport after layout based on fitViewAlign.
+   *
+   * 'top' / 'bottom': fits the graph width into the container (zoom) and aligns
+   * the viewport to the top or bottom of the root-node bounding box. The bounding
+   * box is derived from root-level nodes (absolute positions) only — child nodes
+   * are positioned relative to their parent so they don't need separate handling.
+   *
+   * 'center': delegates to React Flow's built-in fitView.
+   */
+  const applyAlignedFitView = useCallback((nodes) => {
+    const align = fitViewAlignRef.current
+
+    if (!align || align === 'center') {
+      fitView({ padding: 0.1, duration: 300 })
+      return
+    }
+
+    // Only root-level nodes have absolute positions in the canvas
+    const rootNodes = nodes.filter(n => !n.parentId)
+    if (rootNodes.length === 0) {
+      fitView({ padding: 0.1, duration: 300 })
+      return
+    }
+
+    const { width: containerW, height: containerH } = storeApi.getState()
+    if (!containerW || !containerH) {
+      fitView({ padding: 0.1, duration: 300 })
+      return
+    }
+
+    const padding = 40
+
+    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity
+    rootNodes.forEach(node => {
+      const w = node.style?.width ?? node.measured?.width ?? 250
+      const h = node.style?.height ?? node.measured?.height ?? 80
+      minX = Math.min(minX, node.position.x)
+      maxX = Math.max(maxX, node.position.x + w)
+      minY = Math.min(minY, node.position.y)
+      maxY = Math.max(maxY, node.position.y + h)
+    })
+
+    const graphWidth = maxX - minX
+    if (graphWidth <= 0) {
+      fitView({ padding: 0.1, duration: 300 })
+      return
+    }
+
+    // Zoom to fit the full graph width, clamped to sane limits
+    const zoom = Math.max(0.3, Math.min(2, (containerW - padding * 2) / graphWidth))
+    // Horizontally center the graph
+    const x = (containerW - graphWidth * zoom) / 2 - minX * zoom
+    // Vertically align to top or bottom
+    const y = align === 'bottom'
+      ? containerH - padding - maxY * zoom
+      : padding - minY * zoom
+
+    setViewport({ x, y, zoom }, { duration: 300 })
+  }, [fitView, setViewport, storeApi])
 
   // Core layout runner — stable identity, reads mutable state via refs
   const runLayout = useCallback(() => {
@@ -69,9 +140,10 @@ export default function LayoutController({
     setNodes(finalNodes)
     setEdges(finalEdges)
     layoutDone.current = true
+    lastFinalNodesRef.current = finalNodes
     onLayoutDoneRef.current?.(finalNodes)
-    setTimeout(() => fitView({ padding: 0.1, duration: 300 }), 50)
-  }, [getNodes, setNodes, setEdges, fitView])
+    setTimeout(() => applyAlignedFitView(finalNodes), 50)
+  }, [getNodes, setNodes, setEdges, applyAlignedFitView])
 
   // Reset layout flag whenever rawBuild changes (parent has just set new raw nodes)
   useEffect(() => {
@@ -90,13 +162,11 @@ export default function LayoutController({
     runLayout()
   }, [layoutOptions, runLayout])
 
-  // Re-fit view when the container is resized after layout (e.g. dynamic chartHeight
-  // in pipeline-run grows after onLayoutDone fires). React Flow's ResizeObserver
-  // processes the container size change asynchronously, so we give it a short delay.
+  // Re-fit view when the container is resized after layout.
   useEffect(() => {
     if (!layoutDone.current) return
-    setTimeout(() => fitView({ padding: 0.1, duration: 300 }), 50)
-  }, [containerHeight, fitView])
+    setTimeout(() => applyAlignedFitView(lastFinalNodesRef.current), 50)
+  }, [containerHeight, applyAlignedFitView])
 
   return null
 }

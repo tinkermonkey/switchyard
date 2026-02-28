@@ -71,6 +71,9 @@ const CYCLE_CONTAINER_TYPES = ['cycleBounding', 'reviewCycleContainer', 'repairC
  *   loading         - Show loading spinner instead of graph (default: false)
  *   emptyMessage    - Message shown when there are no nodes to display
  *   onLayoutDone    - Optional callback(finalNodes) after layout completes
+ *   fitViewAlign    - 'center' | 'top' | 'bottom' — initial viewport framing after layout.
+ *                    'top' shows the first events; 'bottom' shows the most recent events;
+ *                    both fit to graph width for zoom. Defaults to 'center'.
  */
 export default function PipelineFlowGraph({
   rawBuild,
@@ -84,6 +87,7 @@ export default function PipelineFlowGraph({
   loading = false,
   emptyMessage = 'No events found',
   onLayoutDone,
+  fitViewAlign = 'center',
 }) {
   const [nodes, setNodes, onNodesChange] = useNodesState([])
   const [edges, setEdges, onEdgesChange] = useEdgesState([])
@@ -175,6 +179,7 @@ export default function PipelineFlowGraph({
               setEdges={setEdges}
               onLayoutDone={onLayoutDone}
               containerHeight={height}
+              fitViewAlign={fitViewAlign}
             />
             <Background />
             <Controls />
