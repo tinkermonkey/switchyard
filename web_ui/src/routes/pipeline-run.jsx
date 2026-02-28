@@ -1,47 +1,27 @@
 import { createFileRoute } from '@tanstack/react-router'
-import { RefreshCw, Activity, CheckCircle, XCircle, AlertCircle, Lock, Unlock, Clock } from 'lucide-react'
+import { RefreshCw, AlertCircle, XCircle } from 'lucide-react'
 import Header from '../components/Header'
 import NavigationTabs from '../components/NavigationTabs'
 import PipelineFlowGraph from '../components/PipelineFlowGraph'
+import PipelineRunEventLog from '../components/PipelineRunEventLog'
+import PipelineRunSidebar from '../components/PipelineRunSidebar'
+import PipelineRunHeader from '../components/PipelineRunHeader'
 import ConfirmationModal from '../components/ConfirmationModal'
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
+import { useNavigate } from '@tanstack/react-router'
 import { useSocket } from '../contexts/SocketContext'
-import { formatDuration } from '../utils/stateHelpers'
 import { toggleCycleCollapsed } from '../utils/cycleLayout'
 import { mergePipelineRunEvents, mergeArrayByIdStable } from '../utils/eventMerging'
 import { buildFlowchart as buildFlowchartUtil } from '../utils/buildFlowchart'
 import { processEvents } from '../utils/eventProcessing/index.js'
 
-/**
- * Render lock status badge for a pipeline run
- */
-const LockStatusBadge = ({ lockStatus, lockHolderIssue, currentIssue }) => {
-  if (lockStatus === 'holding_lock') {
-    return (
-      <div className="flex items-center gap-1 text-xs text-green-400 bg-green-900/20 border border-green-700/30 px-2 py-0.5 rounded">
-        <Lock className="w-3 h-3" />
-        <span>Holding Lock</span>
-      </div>
-    )
-  } else if (lockStatus === 'waiting_for_lock') {
-    return (
-      <div className="flex items-center gap-1 text-xs text-yellow-400 bg-yellow-900/20 border border-yellow-700/30 px-2 py-0.5 rounded">
-        <Clock className="w-3 h-3" />
-        <span>Waiting (#{lockHolderIssue})</span>
-      </div>
-    )
-  } else if (lockStatus === 'no_lock') {
-    return (
-      <div className="flex items-center gap-1 text-xs text-blue-400 bg-blue-900/20 border border-blue-700/30 px-2 py-0.5 rounded">
-        <Unlock className="w-3 h-3" />
-        <span>No Lock</span>
-      </div>
-    )
-  }
-  return null
-}
-
 function PipelineRunView() {
+  const navigate = useNavigate()
+  const searchParams = Route.useSearch()
+  const selectedTab = searchParams.tab
+  const urlRunId = searchParams.runId
+  const contentTab = searchParams.contentTab
+
   const [activePipelineRuns, setActivePipelineRuns] = useState([])
   const [completedPipelineRuns, setCompletedPipelineRuns] = useState([])
   const [selectedPipelineRun, setSelectedPipelineRun] = useState(null)
@@ -50,8 +30,7 @@ function PipelineRunView() {
   const [loading, setLoading] = useState(true)
   const [loadingCompleted, setLoadingCompleted] = useState(false)
   const [loadingEvents, setLoadingEvents] = useState(false)
-  const [selectedTab, setSelectedTab] = useState('active')
-  const [completedOffset, setCompletedOffset] = useState(0)
+  const [completedLoadedCount, setCompletedLoadedCount] = useState(0)
   const [hasMoreCompleted, setHasMoreCompleted] = useState(true)
   const [legendOpen, setLegendOpen] = useState(true)
   const [rawBuild, setRawBuild] = useState(null)
@@ -59,102 +38,201 @@ function PipelineRunView() {
   const [showKillModal, setShowKillModal] = useState(false)
   const completedLimit = 10
   const { events: socketEvents } = useSocket()
+
+  // Refs to track state without causing re-renders
+  const selectedPipelineRunRef = useRef(selectedPipelineRun)
+  const selectedTabRef = useRef(selectedTab)
+  const isFetchingActiveRef = useRef(false)
+  const isFetchingCompletedRef = useRef(false)
+  const completedLoadedCountRef = useRef(0)
   const socketEventsRef = useRef(socketEvents)
+  const previousActiveRunIdsRef = useRef(new Set())
+  const processedEventIdsRef = useRef(new Set())
+  const lastProcessedTimestampRef = useRef(0)
+
+  useEffect(() => { selectedPipelineRunRef.current = selectedPipelineRun }, [selectedPipelineRun])
+  useEffect(() => { selectedTabRef.current = selectedTab }, [selectedTab])
+  useEffect(() => { completedLoadedCountRef.current = completedLoadedCount }, [completedLoadedCount])
   useEffect(() => { socketEventsRef.current = socketEvents }, [socketEvents])
 
-  // Fetch active pipeline runs
-  const fetchActivePipelineRuns = useCallback(async (isInitialLoad = false) => {
-    try {
-      if (isInitialLoad) {
-        setLoading(true)
+  // URL navigation helpers
+  const updateUrlParams = useCallback((updates, replaceHistory = true) => {
+    navigate({
+      search: (prev) => ({ ...prev, ...updates }),
+      replace: replaceHistory,
+    })
+  }, [navigate])
+
+  const handleTabChange = useCallback((newTab) => {
+    const newList = newTab === 'active' ? activePipelineRuns : completedPipelineRuns
+    const currentRun = selectedPipelineRunRef.current
+    const runExistsInNewTab = currentRun && newList.find(r => r.id === currentRun.id)
+    if (runExistsInNewTab) {
+      updateUrlParams({ tab: newTab }, true)
+    } else {
+      updateUrlParams({ tab: newTab, runId: undefined }, true)
+    }
+  }, [updateUrlParams, activePipelineRuns, completedPipelineRuns])
+
+  const handleSelectRun = useCallback((run) => {
+    updateUrlParams({ runId: run.id }, false)
+  }, [updateUrlParams])
+
+  const handleDeselectRun = useCallback(() => {
+    updateUrlParams({ runId: undefined }, true)
+  }, [updateUrlParams])
+
+  // Sync selectedPipelineRun from URL
+  useEffect(() => {
+    if (urlRunId) {
+      const list = selectedTab === 'active' ? activePipelineRuns : completedPipelineRuns
+      const run = list.find(r => r.id === urlRunId)
+
+      if (run) {
+        setSelectedPipelineRun(run)
+      } else {
+        const activeRun = activePipelineRuns.find(r => r.id === urlRunId)
+        const completedRun = completedPipelineRuns.find(r => r.id === urlRunId)
+
+        if (activeRun && selectedTab !== 'active') {
+          setSelectedPipelineRun(activeRun)
+          updateUrlParams({ tab: 'active' }, true)
+        } else if (completedRun && selectedTab !== 'completed') {
+          setSelectedPipelineRun(completedRun)
+          updateUrlParams({ tab: 'completed' }, true)
+        } else {
+          setSelectedPipelineRun(null)
+          handleDeselectRun()
+        }
       }
+    } else {
+      const list = selectedTab === 'active' ? activePipelineRuns : completedPipelineRuns
+      if (list.length > 0 && !selectedPipelineRunRef.current) {
+        const firstRun = list[0]
+        setSelectedPipelineRun(firstRun)
+        updateUrlParams({ runId: firstRun.id }, true)
+      } else if (list.length === 0) {
+        setSelectedPipelineRun(null)
+      }
+    }
+  }, [urlRunId, selectedTab, activePipelineRuns, completedPipelineRuns, updateUrlParams, handleDeselectRun])
+
+  // Handle Active→Completed transition
+  useEffect(() => {
+    if (selectedPipelineRun && selectedTab === 'active' && urlRunId) {
+      const currentActiveIds = new Set(activePipelineRuns.map(r => r.id))
+      const completedIds = new Set(completedPipelineRuns.map(r => r.id))
+      const runMovedToCompleted =
+        !currentActiveIds.has(selectedPipelineRun.id) &&
+        completedIds.has(selectedPipelineRun.id) &&
+        previousActiveRunIdsRef.current.has(selectedPipelineRun.id)
+
+      if (runMovedToCompleted) {
+        setSelectedPipelineRun(null)
+        handleDeselectRun()
+      }
+    }
+    previousActiveRunIdsRef.current = new Set(activePipelineRuns.map(r => r.id))
+  }, [activePipelineRuns, completedPipelineRuns, selectedPipelineRun, selectedTab, urlRunId, handleDeselectRun])
+
+  // Fetch active pipeline runs — stable (no deps), ref-guarded
+  const fetchActivePipelineRuns = useCallback(async (isInitialLoad = false) => {
+    if (isFetchingActiveRef.current) return
+
+    try {
+      isFetchingActiveRef.current = true
+      if (isInitialLoad) setLoading(true)
+
       const response = await fetch('/active-pipeline-runs')
       const data = await response.json()
 
       if (data.success) {
-        console.log('[PipelineRun] Fetched active pipeline runs:', data.runs)
-        data.runs.forEach(run => {
-          console.log(`[PipelineRun] Run ${run.id.substring(0, 8)}: started_at=${run.started_at}, status=${run.status}`)
-        })
-        setActivePipelineRuns(current => mergeArrayByIdStable(current, data.runs))
-
-        if (!selectedPipelineRun && data.runs.length > 0) {
-          setSelectedPipelineRun(data.runs[0])
-        }
-
-        if (selectedPipelineRun?.status === 'active') {
-          const stillActive = data.runs.find(r => r.id === selectedPipelineRun.id)
-          if (!stillActive) {
-            try {
-              const completedRes = await fetch('/completed-pipeline-runs?limit=10&offset=0')
-              const completedData = await completedRes.json()
-              if (completedData.success) {
-                const updated = completedData.runs.find(r => r.id === selectedPipelineRun.id)
-                if (updated) {
-                  setSelectedPipelineRun(updated)
-                }
-              }
-            } catch (e) {
-              // Non-critical: status will sync on next manual refresh
+        setActivePipelineRuns(currentRuns => {
+          const mergedRuns = mergeArrayByIdStable(currentRuns, data.runs)
+          setSelectedPipelineRun(currentSelected => {
+            if (currentSelected) {
+              const updatedRun = mergedRuns.find(run => run.id === currentSelected.id)
+              if (updatedRun) return updatedRun
             }
-          }
-        }
+            return currentSelected
+          })
+          return mergedRuns
+        })
       }
     } catch (error) {
       console.error('Error fetching active pipeline runs:', error)
     } finally {
-      if (isInitialLoad) {
-        setLoading(false)
-      }
+      if (isInitialLoad) setLoading(false)
+      isFetchingActiveRef.current = false
     }
-  }, [selectedPipelineRun])
+  }, [])
 
-  // Fetch completed pipeline runs with pagination
-  const fetchCompletedPipelineRuns = useCallback(async (offset = 0, append = false) => {
+  // Fetch completed pipeline runs — stable, ref-guarded
+  const fetchCompletedPipelineRuns = useCallback(async (offset = 0, append = false, customLimit = null) => {
+    if (isFetchingCompletedRef.current) return
+
     try {
+      isFetchingCompletedRef.current = true
       setLoadingCompleted(true)
-      const response = await fetch(`/completed-pipeline-runs?limit=${completedLimit}&offset=${offset}`)
+
+      const limit = customLimit || completedLimit
+      const response = await fetch(`/completed-pipeline-runs?limit=${limit}&offset=${offset}`)
       const data = await response.json()
 
       if (data.success) {
-        console.log('[PipelineRun] Fetched completed pipeline runs:', data.runs.length)
-        setCompletedPipelineRuns(current => {
-          const combinedRuns = append ? [...current, ...data.runs] : data.runs
-          return mergeArrayByIdStable(append ? current : [], combinedRuns)
-        })
-        setHasMoreCompleted(data.runs.length === completedLimit)
+        let isInitialLoad = false
 
-        if (!selectedPipelineRun && data.runs.length > 0 && selectedTab === 'completed') {
-          setSelectedPipelineRun(data.runs[0])
+        setCompletedPipelineRuns(currentCompleted => {
+          isInitialLoad = currentCompleted.length === 0 && data.runs.length > 0
+
+          let mergedRuns
+          if (append) {
+            const combined = [...currentCompleted, ...data.runs]
+            mergedRuns = mergeArrayByIdStable(currentCompleted, combined)
+          } else {
+            mergedRuns = mergeArrayByIdStable(currentCompleted, data.runs)
+          }
+
+          setSelectedPipelineRun(currentSelected => {
+            if (currentSelected) {
+              const updatedRun = mergedRuns.find(run => run.id === currentSelected.id)
+              if (updatedRun) return updatedRun
+            }
+            return currentSelected
+          })
+
+          return mergedRuns
+        })
+
+        if (append) {
+          setCompletedLoadedCount(prev => prev + data.runs.length)
+          setHasMoreCompleted(data.runs.length === completedLimit)
+        } else if (isInitialLoad) {
+          setCompletedLoadedCount(data.runs.length)
+          setHasMoreCompleted(data.runs.length === completedLimit)
         }
       }
     } catch (error) {
       console.error('Error fetching completed pipeline runs:', error)
     } finally {
       setLoadingCompleted(false)
+      isFetchingCompletedRef.current = false
     }
-  }, [selectedPipelineRun, selectedTab, completedLimit])
+  }, [completedLimit])
 
-  // Load more completed runs
   const loadMoreCompleted = useCallback(() => {
-    const newOffset = completedOffset + completedLimit
-    setCompletedOffset(newOffset)
-    fetchCompletedPipelineRuns(newOffset, true)
-  }, [completedOffset, completedLimit, fetchCompletedPipelineRuns])
+    fetchCompletedPipelineRuns(completedLoadedCount, true)
+  }, [completedLoadedCount, fetchCompletedPipelineRuns])
 
-  // Fetch workflow configuration for selected pipeline run
+  // Fetch workflow configuration
   const fetchWorkflowConfig = useCallback(async (project, board) => {
     if (!project || !board) return
-
     try {
       const response = await fetch(`/api/workflow-config/${project}/${board}`)
       const data = await response.json()
-
       if (data.success) {
-        console.log(`📋 [Pipeline Run] Loaded workflow config for ${project}/${board}:`, data.workflow)
         setWorkflowConfig(data.workflow)
       } else {
-        console.error(`Failed to load workflow config: ${data.error}`)
         setWorkflowConfig(null)
       }
     } catch (error) {
@@ -166,23 +244,22 @@ function PipelineRunView() {
   // Fetch events for selected pipeline run
   const fetchPipelineRunEvents = useCallback(async (pipelineRunId) => {
     if (!pipelineRunId) return
-
     try {
       setLoadingEvents(true)
       const response = await fetch(`/pipeline-run-events?pipeline_run_id=${pipelineRunId}`)
       const data = await response.json()
 
       if (data.success) {
-        setPipelineRunEvents(current => {
-          const eventsWithKeys = data.events.map((event, idx) => ({
+        setPipelineRunEvents(currentEvents => {
+          const newEventsWithKeys = data.events.map((event, idx) => ({
             ...event,
-            _key: event.id || event.event_id || `${event.timestamp}_${idx}`
+            _key: event.id || `${event.timestamp}_${idx}`
           }))
-          const currentEventsWithKeys = current.map((event, idx) => ({
+          const currentEventsWithKeys = currentEvents.map((event, idx) => ({
             ...event,
-            _key: event.id || event.event_id || event._key || `${event.timestamp}_${idx}`
+            _key: event.id || event._key || `${event.timestamp}_${idx}`
           }))
-          return mergeArrayByIdStable(currentEventsWithKeys, eventsWithKeys, '_key')
+          return mergeArrayByIdStable(currentEventsWithKeys, newEventsWithKeys, '_key')
         })
       }
     } catch (error) {
@@ -192,7 +269,6 @@ function PipelineRunView() {
     }
   }, [])
 
-  // Kill pipeline run
   const handleKillRun = useCallback(() => {
     if (!selectedPipelineRun) return
     setShowKillModal(true)
@@ -200,17 +276,13 @@ function PipelineRunView() {
 
   const confirmKillRun = useCallback(async () => {
     if (!selectedPipelineRun) return
-
     try {
-      const response = await fetch(`/pipeline-runs/${selectedPipelineRun.id}/kill`, {
-        method: 'POST'
-      })
+      const response = await fetch(`/pipeline-runs/${selectedPipelineRun.id}/kill`, { method: 'POST' })
       const data = await response.json()
-
       if (data.success) {
         fetchActivePipelineRuns()
         fetchCompletedPipelineRuns(0, false)
-        setSelectedTab('completed')
+        handleTabChange('completed')
       } else {
         alert(`Failed to kill run: ${data.error}`)
       }
@@ -218,21 +290,63 @@ function PipelineRunView() {
       console.error('Error killing pipeline run:', error)
       alert('Error killing pipeline run')
     }
-  }, [selectedPipelineRun, fetchActivePipelineRuns, fetchCompletedPipelineRuns])
+  }, [selectedPipelineRun, fetchActivePipelineRuns, fetchCompletedPipelineRuns, handleTabChange])
 
-  // Handle cycle collapse/expand toggle
   const handleToggleCycle = useCallback((cycleId) => {
     setCycles(prevCycles => toggleCycleCollapsed(prevCycles, cycleId))
   }, [])
 
-  // Merge API events with live WebSocket events
+  // Merge API events with live WebSocket events (full, unfiltered)
   const mergedEvents = useMemo(() => {
     if (!selectedPipelineRun) return []
-    if (selectedPipelineRun.status !== 'active') return pipelineRunEvents
     return mergePipelineRunEvents(pipelineRunEvents, socketEvents, selectedPipelineRun)
   }, [pipelineRunEvents, socketEvents, selectedPipelineRun])
 
-  // Build raw (unpositioned) flowchart from events — layout is handled by LayoutController
+  // Filtered events for event log tab (exclude Claude streaming)
+  const eventLogEvents = useMemo(() => {
+    const claudeStreamEventTypes = new Set([
+      'claude_stream', 'claude_stream_event', 'text_output', 'text_delta',
+      'tool_call', 'tool_use', 'tool_result', 'input_json_delta',
+      'message_start', 'message_delta', 'message_stop',
+      'content_block_start', 'content_block_delta', 'content_block_stop',
+    ])
+    return mergedEvents.filter(event => {
+      if (event.event_category === 'claude_api') return false
+      if (claudeStreamEventTypes.has(event.event_type)) return false
+      if (event.raw_event) {
+        const rawEventType = event.raw_event?.event?.type || event.raw_event?.type
+        if (claudeStreamEventTypes.has(rawEventType)) return false
+      }
+      return true
+    })
+  }, [mergedEvents])
+
+  // Find latest agent execution ID
+  const latestAgentExecutionId = useMemo(() => {
+    if (!mergedEvents || mergedEvents.length === 0) return null
+    const agentInitEvents = mergedEvents.filter(event => event.event_type === 'agent_initialized')
+    if (agentInitEvents.length === 0) return null
+    return agentInitEvents[0].agent_execution_id || null
+  }, [mergedEvents])
+
+  // Determine if currently in conversational loop
+  const isConversational = useMemo(() => {
+    if (!mergedEvents || mergedEvents.length === 0) return false
+    const sortedEvents = [...mergedEvents].sort((a, b) =>
+      new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
+    )
+    for (const event of sortedEvents) {
+      if (['conversational_loop_started', 'feedback_listening_started', 'conversational_loop_resumed'].includes(event.event_type)) {
+        return true
+      }
+      if (['feedback_listening_stopped', 'conversational_loop_paused', 'pipeline_stage_transition', 'agent_completed'].includes(event.event_type)) {
+        return false
+      }
+    }
+    return false
+  }, [mergedEvents])
+
+  // Build raw (unpositioned) flowchart
   const buildRawFlowchart = useCallback(() => {
     if (!mergedEvents.length || !selectedPipelineRun) {
       setRawBuild(null)
@@ -258,18 +372,55 @@ function PipelineRunView() {
     setRawBuild(result)
   }, [mergedEvents, selectedPipelineRun, cycles, workflowConfig])
 
+  const handleDownloadDebugData = useCallback(() => {
+    if (!selectedPipelineRun) return
+    const debugData = {
+      pipelineRun: selectedPipelineRun,
+      events: pipelineRunEvents,
+      workflowConfig,
+      cycles: Array.from(cycles.entries()).map(([id, data]) => ({
+        id,
+        ...data,
+        agentExecutions: data.agentExecutions?.map(e => ({
+          agent: e.agent,
+          taskId: e.execution?.taskId || e.taskId,
+        })),
+      })),
+      timestamp: new Date().toISOString(),
+    }
+    const blob = new Blob([JSON.stringify(debugData, null, 2)], { type: 'application/json' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `pipeline-run-${selectedPipelineRun.id.substring(0, 8)}-debug.json`
+    a.click()
+    URL.revokeObjectURL(url)
+  }, [selectedPipelineRun, pipelineRunEvents, workflowConfig, cycles])
+
   // Initial load
   useEffect(() => {
     fetchActivePipelineRuns(true)
     fetchCompletedPipelineRuns(0, false)
-  }, [])
+  }, [fetchActivePipelineRuns, fetchCompletedPipelineRuns])
 
-  // Fetch data when tab changes
+  // Periodic refresh every 10 seconds
+  useEffect(() => {
+    const intervalId = setInterval(() => {
+      fetchActivePipelineRuns(false)
+      if (selectedTabRef.current === 'completed' && completedLoadedCountRef.current > 0) {
+        const itemsToRefresh = Math.max(completedLoadedCountRef.current, completedLimit)
+        fetchCompletedPipelineRuns(0, false, itemsToRefresh)
+      }
+    }, 10000)
+    return () => clearInterval(intervalId)
+  }, [fetchActivePipelineRuns, fetchCompletedPipelineRuns, completedLimit])
+
+  // Fetch completed runs when switching to completed tab
   useEffect(() => {
     if (selectedTab === 'completed' && completedPipelineRuns.length === 0) {
       fetchCompletedPipelineRuns(0, false)
     }
-  }, [selectedTab])
+  }, [selectedTab, completedPipelineRuns.length, fetchCompletedPipelineRuns])
 
   // Load events when pipeline run selected
   useEffect(() => {
@@ -292,15 +443,13 @@ function PipelineRunView() {
     setCycles(prevCycles => {
       const merged = new Map(newCycleMap)
       prevCycles.forEach((prev, id) => {
-        if (merged.has(id)) {
-          merged.get(id).isCollapsed = prev.isCollapsed
-        }
+        if (merged.has(id)) merged.get(id).isCollapsed = prev.isCollapsed
       })
       return merged
     })
   }, [mergedEvents])
 
-  // Rebuild flowchart when events or socket events change
+  // Rebuild flowchart when events or config change
   useEffect(() => {
     buildRawFlowchart()
   }, [buildRawFlowchart])
@@ -308,15 +457,47 @@ function PipelineRunView() {
   // Update on socket events
   useEffect(() => {
     if (socketEvents.length > 0) {
-      const latestEvent = socketEvents[socketEvents.length - 1]
-      if (['agent_initialized', 'agent_completed', 'agent_failed'].includes(latestEvent.event_type)) {
-        if (selectedPipelineRun?.status === 'active') {
-          fetchPipelineRunEvents(selectedPipelineRun.id)
+      const latestEvent = socketEvents[0]
+      const eventId = latestEvent.event_id || `${latestEvent.timestamp}_${latestEvent.event_type}`
+
+      if (processedEventIdsRef.current.has(eventId)) return
+
+      let eventTimestamp = 0
+      if (latestEvent.timestamp) {
+        if (typeof latestEvent.timestamp === 'number') {
+          eventTimestamp = latestEvent.timestamp > 10000000000
+            ? latestEvent.timestamp / 1000
+            : latestEvent.timestamp
+        } else if (typeof latestEvent.timestamp === 'string') {
+          const date = new Date(latestEvent.timestamp)
+          if (!isNaN(date.getTime())) eventTimestamp = date.getTime() / 1000
+        }
+      }
+
+      if (eventTimestamp <= lastProcessedTimestampRef.current) return
+
+      processedEventIdsRef.current.add(eventId)
+      if (processedEventIdsRef.current.size > 1000) {
+        const entries = Array.from(processedEventIdsRef.current)
+        processedEventIdsRef.current = new Set(entries.slice(-500))
+      }
+      lastProcessedTimestampRef.current = eventTimestamp
+
+      const pipelineEventTypes = [
+        'agent_initialized', 'agent_completed', 'agent_failed',
+        'pipeline_stage_started', 'pipeline_stage_completed',
+        'review_cycle_started', 'review_cycle_completed',
+      ]
+
+      if (pipelineEventTypes.includes(latestEvent.event_type)) {
+        if (selectedPipelineRunRef.current) {
+          fetchPipelineRunEvents(selectedPipelineRunRef.current.id)
         }
         fetchActivePipelineRuns(false)
+        fetchCompletedPipelineRuns(0, false)
       }
     }
-  }, [socketEvents])
+  }, [socketEvents, fetchPipelineRunEvents, fetchActivePipelineRuns, fetchCompletedPipelineRuns])
 
   return (
     <div className="h-screen flex flex-col p-5 bg-gh-canvas text-gh-fg">
@@ -325,7 +506,7 @@ function PipelineRunView() {
       <div className="flex items-center justify-between my-3 flex-shrink-0">
         <NavigationTabs />
         <button
-          onClick={fetchActivePipelineRuns}
+          onClick={() => fetchActivePipelineRuns(true)}
           disabled={loading}
           className="px-4 py-2 bg-gh-canvas-subtle border border-gh-border rounded-md hover:bg-gh-border-muted transition-colors text-sm"
         >
@@ -335,349 +516,186 @@ function PipelineRunView() {
       </div>
 
       <div className="flex gap-4 flex-1 min-h-0">
-        {/* Pipeline Run Selector */}
-        <div className="w-64 flex-shrink-0 bg-gh-canvas-subtle rounded-md border border-gh-border p-4 overflow-y-auto">
-          <h3 className="text-lg font-semibold mb-3">Pipeline Runs</h3>
+        <PipelineRunSidebar
+          activePipelineRuns={activePipelineRuns}
+          completedPipelineRuns={completedPipelineRuns}
+          selectedPipelineRun={selectedPipelineRun}
+          loading={loading}
+          loadingCompleted={loadingCompleted}
+          hasMoreCompleted={hasMoreCompleted}
+          selectedTab={selectedTab}
+          onSelectRun={handleSelectRun}
+          onTabChange={handleTabChange}
+          onLoadMore={loadMoreCompleted}
+        />
 
-          {/* Tabs */}
-          <div className="flex gap-2 mb-4 border-b border-gh-border">
-            <button
-              onClick={() => setSelectedTab('active')}
-              className={`px-3 py-2 text-sm font-medium border-b-2 transition-colors ${
-                selectedTab === 'active'
-                  ? 'border-gh-accent-emphasis text-gh-accent-fg'
-                  : 'border-transparent text-gh-fg-muted hover:text-gh-fg hover:border-gh-border-muted'
-              }`}
-            >
-              Active
-            </button>
-            <button
-              onClick={() => setSelectedTab('completed')}
-              className={`px-3 py-2 text-sm font-medium border-b-2 transition-colors ${
-                selectedTab === 'completed'
-                  ? 'border-gh-accent-emphasis text-gh-accent-fg'
-                  : 'border-transparent text-gh-fg-muted hover:text-gh-fg hover:border-gh-border-muted'
-              }`}
-            >
-              Completed
-            </button>
-          </div>
-
-          {/* Active Pipeline Runs */}
-          {selectedTab === 'active' && (
+        {/* Main Content Area */}
+        <div className="flex-1 bg-gh-canvas-subtle rounded-md border border-gh-border p-4 flex flex-col min-h-0">
+          {selectedPipelineRun ? (
             <>
-              {loading ? (
-                <p className="text-gh-fg-muted text-sm">Loading...</p>
-              ) : activePipelineRuns.length === 0 ? (
-                <div className="text-center py-8">
-                  <Activity className="w-8 h-8 mx-auto mb-2 opacity-50" />
-                  <p className="text-gh-fg-muted text-sm">No active pipeline runs</p>
-                </div>
-              ) : (
-                <div className="space-y-2">
-                  {activePipelineRuns.map(run => (
-                    <button
-                      key={run.id}
-                      onClick={() => setSelectedPipelineRun(run)}
-                      className={`w-full text-left p-3 rounded border transition-colors ${
-                        selectedPipelineRun?.id === run.id
-                          ? 'bg-gh-accent-emphasis border-gh-accent-emphasis text-white'
-                          : 'bg-gh-canvas border-gh-border hover:border-gh-border-muted'
-                      }`}
-                    >
-                      <div className="font-semibold text-sm truncate">
-                        {run.issue_title}
-                      </div>
-                      <div className="text-xs mt-1 opacity-75">
-                        {run.project} #{run.issue_number}
-                      </div>
-                      <div className="text-xs mt-1 opacity-75 font-mono">
-                        ID: {run.id.substring(0, 8)}...
-                      </div>
-                      <div className="text-xs mt-1 opacity-75">
-                        Started {formatDuration(run.started_at)} ago
-                      </div>
-                      {run.lock_status && (
-                        <div className="mt-2">
-                          <LockStatusBadge
-                            lockStatus={run.lock_status}
-                            lockHolderIssue={run.lock_holder_issue}
-                            currentIssue={run.issue_number}
-                          />
-                        </div>
-                      )}
-                    </button>
-                  ))}
-                </div>
-              )}
-            </>
-          )}
+              <PipelineRunHeader
+                pipelineRun={selectedPipelineRun}
+                latestAgentExecutionId={latestAgentExecutionId}
+                isConversational={isConversational}
+                onKillRun={handleKillRun}
+                onDownloadDebugData={handleDownloadDebugData}
+              />
 
-          {/* Completed Pipeline Runs */}
-          {selectedTab === 'completed' && (
-            <>
-              {loadingCompleted && completedPipelineRuns.length === 0 ? (
-                <p className="text-gh-fg-muted text-sm">Loading...</p>
-              ) : completedPipelineRuns.length === 0 ? (
-                <div className="text-center py-8">
-                  <CheckCircle className="w-8 h-8 mx-auto mb-2 opacity-50" />
-                  <p className="text-gh-fg-muted text-sm">No completed pipeline runs</p>
-                </div>
-              ) : (
-                <>
-                  <div className="space-y-2">
-                    {completedPipelineRuns.map(run => (
-                      <button
-                        key={run.id}
-                        onClick={() => setSelectedPipelineRun(run)}
-                        className={`w-full text-left p-3 rounded border transition-colors ${
-                          selectedPipelineRun?.id === run.id
-                            ? 'bg-gh-accent-emphasis border-gh-accent-emphasis text-white'
-                            : 'bg-gh-canvas border-gh-border hover:border-gh-border-muted'
-                        }`}
-                      >
-                        <div className="font-semibold text-sm truncate">
-                          {run.issue_title}
-                        </div>
-                        <div className="text-xs mt-1 opacity-75">
-                          {run.project} #{run.issue_number}
-                        </div>
-                        <div className="text-xs mt-1 opacity-75 font-mono">
-                          ID: {run.id.substring(0, 8)}...
-                        </div>
-                        <div className="text-xs mt-1 opacity-75">
-                          {run.ended_at ? (
-                            <>Completed {formatDuration(run.ended_at)} ago</>
+              {/* Content Tab Switcher */}
+              <div className="flex border-b border-gh-border mb-4 flex-shrink-0">
+                <button
+                  onClick={() => updateUrlParams({ contentTab: 'graph' }, true)}
+                  className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors ${
+                    contentTab === 'graph'
+                      ? 'border-gh-accent-emphasis text-gh-accent-fg'
+                      : 'border-transparent text-gh-fg-muted hover:text-gh-fg hover:border-gh-border-muted'
+                  }`}
+                >
+                  Graph
+                </button>
+                <button
+                  onClick={() => updateUrlParams({ contentTab: 'log' }, true)}
+                  className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors ${
+                    contentTab === 'log'
+                      ? 'border-gh-accent-emphasis text-gh-accent-fg'
+                      : 'border-transparent text-gh-fg-muted hover:text-gh-fg hover:border-gh-border-muted'
+                  }`}
+                >
+                  Event Log
+                </button>
+              </div>
+
+              {/* Content Area */}
+              <div className="flex-1 min-h-0 flex">
+                {contentTab === 'graph' ? (
+                  <div className="flex gap-4 flex-1 min-h-0">
+                    <div className="flex-1 min-h-0">
+                      <PipelineFlowGraph
+                        rawBuild={rawBuild}
+                        onToggleCycle={handleToggleCycle}
+                        nodesDraggable={selectedPipelineRun.status !== 'active'}
+                        allowResizing={selectedPipelineRun.status !== 'active'}
+                        minZoom={0.5}
+                        maxZoom={1.5}
+                        height="100%"
+                        loading={loadingEvents}
+                        emptyMessage="No events found for this pipeline run"
+                        fitViewAlign={selectedPipelineRun.status === 'active' ? 'bottom' : 'top'}
+                      />
+                    </div>
+
+                    {/* Collapsible Legend Panel */}
+                    <div className={`transition-all duration-300 ${legendOpen ? 'w-64' : 'w-10'} bg-gh-canvas border border-gh-border rounded-md flex-shrink-0 flex flex-col`}>
+                      <div className="flex items-center justify-between p-3 border-b border-gh-border flex-shrink-0">
+                        {legendOpen && <h3 className="text-sm font-semibold">Legend</h3>}
+                        <button
+                          onClick={() => setLegendOpen(!legendOpen)}
+                          className="p-1 hover:bg-gh-canvas-subtle rounded transition-colors"
+                          title={legendOpen ? 'Collapse legend' : 'Expand legend'}
+                        >
+                          {legendOpen ? (
+                            <XCircle className="w-4 h-4" />
                           ) : (
-                            <>Started {formatDuration(run.started_at)} ago</>
+                            <AlertCircle className="w-4 h-4" />
                           )}
-                        </div>
-                        {run.duration && (
-                          <div className="text-xs mt-1 opacity-75">
-                            Duration: {Math.floor(run.duration / 60)}m {Math.floor(run.duration % 60)}s
+                        </button>
+                      </div>
+
+                      {legendOpen && (
+                        <div className="p-3 space-y-4 overflow-y-auto">
+                          <div>
+                            <h4 className="text-xs font-semibold mb-2 text-gh-fg-muted">Pipeline States</h4>
+                            <div className="space-y-2 text-xs">
+                              <div className="flex items-center gap-2">
+                                <div className="w-4 h-4 rounded flex-shrink-0" style={{ background: '#10b981' }}></div>
+                                <span>Pipeline Started</span>
+                              </div>
+                              <div className="flex items-center gap-2">
+                                <div className="w-4 h-4 rounded flex-shrink-0" style={{ background: '#1f6feb' }}></div>
+                                <span>Agent Running</span>
+                              </div>
+                              <div className="flex items-center gap-2">
+                                <div className="w-4 h-4 rounded flex-shrink-0" style={{ background: '#238636' }}></div>
+                                <span>Agent Completed</span>
+                              </div>
+                              <div className="flex items-center gap-2">
+                                <div className="w-4 h-4 rounded flex-shrink-0" style={{ background: '#da3633' }}></div>
+                                <span>Agent Failed</span>
+                              </div>
+                              <div className="flex items-center gap-2">
+                                <div className="w-4 h-4 rounded flex-shrink-0" style={{ background: '#6366f1' }}></div>
+                                <span>Pipeline Completed</span>
+                              </div>
+                              <div className="flex items-center gap-2">
+                                <div className="w-4 h-4 rounded border-2 flex-shrink-0" style={{ borderColor: '#58a6ff', background: '#1f6feb' }}>
+                                  <div style={{
+                                    height: '100%',
+                                    backgroundImage: 'linear-gradient(45deg, rgba(255,255,255,.2) 25%, transparent 25%)',
+                                    backgroundSize: '4px 4px',
+                                  }}></div>
+                                </div>
+                                <span>Active (Candy Stripe)</span>
+                              </div>
+                            </div>
                           </div>
-                        )}
-                      </button>
-                    ))}
-                  </div>
 
-                  {/* Load More Button */}
-                  {hasMoreCompleted && (
-                    <button
-                      onClick={loadMoreCompleted}
-                      disabled={loadingCompleted}
-                      className="w-full mt-3 px-4 py-2 bg-gh-canvas border border-gh-border rounded-md hover:bg-gh-border-muted transition-colors text-sm disabled:opacity-50"
-                    >
-                      {loadingCompleted ? (
-                        <>
-                          <RefreshCw className="inline w-4 h-4 mr-2 animate-spin" />
-                          Loading...
-                        </>
-                      ) : (
-                        'Load More'
-                      )}
-                    </button>
-                  )}
-                </>
-              )}
-            </>
-          )}
-        </div>
-
-        {/* Pipeline Run Flowchart */}
-        <div className="flex-1 bg-gh-canvas-subtle rounded-md border border-gh-border p-4 flex gap-4 min-h-0">
-          <div className="flex-1 flex flex-col min-h-0">
-            {selectedPipelineRun ? (
-              <>
-                <div className="mb-4 flex items-start justify-between flex-shrink-0">
-                  <div>
-                    <div className="flex items-center gap-3">
-                      <h2 className="text-xl font-semibold">{selectedPipelineRun.issue_title}</h2>
-                      {selectedPipelineRun.lock_status && (
-                        <LockStatusBadge
-                          lockStatus={selectedPipelineRun.lock_status}
-                          lockHolderIssue={selectedPipelineRun.lock_holder_issue}
-                          currentIssue={selectedPipelineRun.issue_number}
-                        />
+                          <div>
+                            <h4 className="text-xs font-semibold mb-2 text-gh-fg-muted">Decision Categories</h4>
+                            <div className="space-y-2 text-xs">
+                              <div className="flex items-center gap-2">
+                                <div className="w-4 h-4 rounded flex-shrink-0" style={{ background: '#3b82f6' }}></div>
+                                <span>Routing</span>
+                              </div>
+                              <div className="flex items-center gap-2">
+                                <div className="w-4 h-4 rounded flex-shrink-0" style={{ background: '#10b981' }}></div>
+                                <span>Progression</span>
+                              </div>
+                              <div className="flex items-center gap-2">
+                                <div className="w-4 h-4 rounded flex-shrink-0" style={{ background: '#8b5cf6' }}></div>
+                                <span>Review Cycle</span>
+                              </div>
+                              <div className="flex items-center gap-2">
+                                <div className="w-4 h-4 rounded flex-shrink-0" style={{ background: '#f59e0b' }}></div>
+                                <span>Feedback</span>
+                              </div>
+                              <div className="flex items-center gap-2">
+                                <div className="w-4 h-4 rounded flex-shrink-0" style={{ background: '#ef4444' }}></div>
+                                <span>Error Handling</span>
+                              </div>
+                              <div className="flex items-center gap-2">
+                                <div className="w-4 h-4 rounded flex-shrink-0" style={{ background: '#06b6d4' }}></div>
+                                <span>Task Management</span>
+                              </div>
+                              <div className="flex items-center gap-2">
+                                <div className="w-4 h-4 rounded flex-shrink-0" style={{ background: '#84cc16' }}></div>
+                                <span>Branch Management</span>
+                              </div>
+                              <div className="flex items-center gap-2">
+                                <div className="w-4 h-4 rounded flex-shrink-0" style={{ background: '#ec4899' }}></div>
+                                <span>Conversational</span>
+                              </div>
+                            </div>
+                          </div>
+                        </div>
                       )}
                     </div>
-                    <p className="text-sm text-gh-fg-muted mt-1">
-                      {selectedPipelineRun.project} • Issue #{selectedPipelineRun.issue_number} • Board: {selectedPipelineRun.board}
-                    </p>
-                    <p className="text-sm text-gh-fg-muted">
-                      Started: {new Date(selectedPipelineRun.started_at).toLocaleString()}
-                      {selectedPipelineRun.ended_at && ` • Ended: ${new Date(selectedPipelineRun.ended_at).toLocaleString()}`}
-                    </p>
-                    {selectedPipelineRun.lock_status === 'waiting_for_lock' && selectedPipelineRun.blocked_by_issue && (
-                      <div className="mt-2 text-xs text-yellow-400 bg-yellow-900/10 border border-yellow-700/20 px-3 py-2 rounded">
-                        ⚠️ This pipeline is waiting for lock currently held by issue #{selectedPipelineRun.blocked_by_issue}
-                      </div>
-                    )}
                   </div>
-
-                  <div className="flex gap-2">
-                    {selectedPipelineRun.status === 'active' && (
-                      <button
-                        onClick={handleKillRun}
-                        className="px-3 py-1 text-xs bg-red-900/20 border border-red-800 text-red-400 rounded hover:bg-red-900/40 transition-colors whitespace-nowrap flex items-center gap-1"
-                        title="Kill this pipeline run"
-                      >
-                        <XCircle className="w-3 h-3" />
-                        Kill Run
-                      </button>
-                    )}
-
-                    {/* Debug: Download Data Button */}
-                    <button
-                      onClick={() => {
-                        const debugData = {
-                          pipelineRun: selectedPipelineRun,
-                          events: pipelineRunEvents,
-                          workflowConfig: workflowConfig,
-                          cycles: Array.from(cycles.entries()).map(([id, data]) => ({
-                            id,
-                            ...data,
-                            agentExecutions: data.agentExecutions?.map(e => ({
-                              agent: e.agent,
-                              taskId: e.execution?.taskId || e.taskId
-                            }))
-                          })),
-                          timestamp: new Date().toISOString()
-                        }
-                        const blob = new Blob([JSON.stringify(debugData, null, 2)], { type: 'application/json' })
-                        const url = URL.createObjectURL(blob)
-                        const a = document.createElement('a')
-                        a.href = url
-                        a.download = `pipeline-run-${selectedPipelineRun.id.substring(0, 8)}-debug.json`
-                        a.click()
-                        URL.revokeObjectURL(url)
-                        console.log('📥 Downloaded debug data')
-                      }}
-                      className="px-3 py-1 text-xs bg-gh-canvas-subtle border border-gh-border rounded hover:bg-gh-border-muted transition-colors whitespace-nowrap"
-                      title="Download debug data as JSON"
-                    >
-                      📥 Download Debug Data
-                    </button>
-                  </div>
-                </div>
-
-                <div className="flex-1 min-h-0 overflow-hidden">
-                  <PipelineFlowGraph
-                    rawBuild={rawBuild}
-                    onToggleCycle={handleToggleCycle}
-                    nodesDraggable={selectedPipelineRun.status !== 'active'}
-                    allowResizing={selectedPipelineRun.status !== 'active'}
-                    minZoom={0.5}
-                    maxZoom={1.5}
-                    height="100%"
-                    loading={loadingEvents}
-                    emptyMessage="No events found for this pipeline run"
-                    fitViewAlign={selectedPipelineRun.status === 'active' ? 'bottom' : 'top'}
-                  />
-                </div>
-              </>
-            ) : (
-              <div className="flex items-center justify-center h-full">
-                <p className="text-gh-fg-muted">Select a pipeline run to view its flowchart</p>
-              </div>
-            )}
-          </div>
-
-          {/* Collapsible Legend Panel */}
-          <div className={`transition-all duration-300 ${legendOpen ? 'w-64' : 'w-10'} bg-gh-canvas border border-gh-border rounded-md`}>
-            <div className="flex items-center justify-between p-3 border-b border-gh-border">
-              {legendOpen && <h3 className="text-sm font-semibold">Legend</h3>}
-              <button
-                onClick={() => setLegendOpen(!legendOpen)}
-                className="p-1 hover:bg-gh-canvas-subtle rounded transition-colors"
-                title={legendOpen ? 'Collapse legend' : 'Expand legend'}
-              >
-                {legendOpen ? (
-                  <XCircle className="w-4 h-4" />
                 ) : (
-                  <AlertCircle className="w-4 h-4" />
+                  <div className="flex-1 overflow-auto">
+                    <PipelineRunEventLog
+                      pipelineRun={selectedPipelineRun}
+                      events={eventLogEvents}
+                      isActive={selectedPipelineRun?.status === 'active'}
+                    />
+                  </div>
                 )}
-              </button>
-            </div>
-
-            {legendOpen && (
-              <div className="p-3 space-y-4 overflow-y-auto">
-                <div>
-                  <h4 className="text-xs font-semibold mb-2 text-gh-fg-muted">Pipeline States</h4>
-                  <div className="space-y-2 text-xs">
-                    <div className="flex items-center gap-2">
-                      <div className="w-4 h-4 rounded flex-shrink-0" style={{ background: '#10b981' }}></div>
-                      <span>Pipeline Started</span>
-                    </div>
-                    <div className="flex items-center gap-2">
-                      <div className="w-4 h-4 rounded flex-shrink-0" style={{ background: '#1f6feb' }}></div>
-                      <span>Agent Running</span>
-                    </div>
-                    <div className="flex items-center gap-2">
-                      <div className="w-4 h-4 rounded flex-shrink-0" style={{ background: '#238636' }}></div>
-                      <span>Agent Completed</span>
-                    </div>
-                    <div className="flex items-center gap-2">
-                      <div className="w-4 h-4 rounded flex-shrink-0" style={{ background: '#da3633' }}></div>
-                      <span>Agent Failed</span>
-                    </div>
-                    <div className="flex items-center gap-2">
-                      <div className="w-4 h-4 rounded flex-shrink-0" style={{ background: '#6366f1' }}></div>
-                      <span>Pipeline Completed</span>
-                    </div>
-                    <div className="flex items-center gap-2">
-                      <div className="w-4 h-4 rounded border-2 flex-shrink-0" style={{ borderColor: '#58a6ff', background: '#1f6feb' }}>
-                        <div style={{
-                          height: '100%',
-                          backgroundImage: 'linear-gradient(45deg, rgba(255,255,255,.2) 25%, transparent 25%)',
-                          backgroundSize: '4px 4px',
-                        }}></div>
-                      </div>
-                      <span>Active (Candy Stripe)</span>
-                    </div>
-                  </div>
-                </div>
-
-                <div>
-                  <h4 className="text-xs font-semibold mb-2 text-gh-fg-muted">Decision Categories</h4>
-                  <div className="space-y-2 text-xs">
-                    <div className="flex items-center gap-2">
-                      <div className="w-4 h-4 rounded flex-shrink-0" style={{ background: '#3b82f6' }}></div>
-                      <span>Routing</span>
-                    </div>
-                    <div className="flex items-center gap-2">
-                      <div className="w-4 h-4 rounded flex-shrink-0" style={{ background: '#10b981' }}></div>
-                      <span>Progression</span>
-                    </div>
-                    <div className="flex items-center gap-2">
-                      <div className="w-4 h-4 rounded flex-shrink-0" style={{ background: '#8b5cf6' }}></div>
-                      <span>Review Cycle</span>
-                    </div>
-                    <div className="flex items-center gap-2">
-                      <div className="w-4 h-4 rounded flex-shrink-0" style={{ background: '#f59e0b' }}></div>
-                      <span>Feedback</span>
-                    </div>
-                    <div className="flex items-center gap-2">
-                      <div className="w-4 h-4 rounded flex-shrink-0" style={{ background: '#ef4444' }}></div>
-                      <span>Error Handling</span>
-                    </div>
-                    <div className="flex items-center gap-2">
-                      <div className="w-4 h-4 rounded flex-shrink-0" style={{ background: '#06b6d4' }}></div>
-                      <span>Task Management</span>
-                    </div>
-                    <div className="flex items-center gap-2">
-                      <div className="w-4 h-4 rounded flex-shrink-0" style={{ background: '#84cc16' }}></div>
-                      <span>Branch Management</span>
-                    </div>
-                    <div className="flex items-center gap-2">
-                      <div className="w-4 h-4 rounded flex-shrink-0" style={{ background: '#ec4899' }}></div>
-                      <span>Conversational</span>
-                    </div>
-                  </div>
-                </div>
               </div>
-            )}
-          </div>
+            </>
+          ) : (
+            <div className="flex items-center justify-center h-full">
+              <p className="text-gh-fg-muted">Select a pipeline run to view details</p>
+            </div>
+          )}
         </div>
       </div>
 
@@ -696,4 +714,11 @@ function PipelineRunView() {
 
 export const Route = createFileRoute('/pipeline-run')({
   component: PipelineRunView,
+  validateSearch: (search) => {
+    return {
+      runId: typeof search.runId === 'string' ? search.runId : undefined,
+      tab: search.tab === 'completed' ? 'completed' : 'active',
+      contentTab: search.contentTab === 'log' ? 'log' : 'graph',
+    }
+  },
 })

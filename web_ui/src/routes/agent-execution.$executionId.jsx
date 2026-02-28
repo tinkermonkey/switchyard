@@ -673,12 +673,12 @@ function AgentExecutionView() {
         <div className="mt-3 mb-3 p-3 bg-gh-canvas-subtle rounded-md border border-gh-border">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-3">
-              {/* Back to Pipeline Run Debug link */}
+              {/* Back to Pipeline Runs link */}
               <Link
-                to="/pipeline-run-debug"
+                to="/pipeline-run"
                 search={{ runId: pipelineRunId, tab: pipelineTab }}
                 className="flex items-center gap-1.5 px-3 py-2 bg-gh-canvas border border-gh-border rounded hover:bg-gh-border-muted transition-colors text-sm"
-                title="Back to Pipeline Run Debug"
+                title="Back to Pipeline Runs"
               >
                 <ArrowLeft className="w-4 h-4" />
                 <span>Pipeline Runs</span>
@@ -921,10 +921,10 @@ function AgentExecutionView() {
                 <div className="text-sm">
                   <span className="text-gh-fg-muted">Pipeline Run ID:</span>
                   <Link
-                    to="/pipeline-run-debug"
+                    to="/pipeline-run"
                     search={{ runId: pipelineRunId }}
                     className="ml-2 font-mono text-xs text-gh-accent-fg hover:underline"
-                    title="View pipeline run in debug view"
+                    title="View pipeline run"
                   >
                     {pipelineRunId}
                   </Link>
