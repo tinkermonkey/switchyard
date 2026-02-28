@@ -133,6 +133,9 @@ export function buildFlowchart({
    * Returns the node id if a node was created, or null.
    */
   function processEventToNode(event, idPrefix, parentId = null) {
+    // Inferred close events are synthetic bounds only — never render as nodes
+    if (event._inferred) return null
+
     let node = null
 
     if (event.event_category === 'decision') {
@@ -248,7 +251,8 @@ export function buildFlowchart({
         })
 
         // review_cycle_completed → direct child, rightmost (after iterations)
-        if (cycle.endEvent) {
+        // Skip if inferred — synthetic bounds are not shown as nodes
+        if (cycle.endEvent && !cycle.endEvent._inferred) {
           const endId = `${cycle.id}-end`
           const endNode = makeDecisionNode(cycle.endEvent, endId, cycle.id)
           newNodes.push(endNode)
