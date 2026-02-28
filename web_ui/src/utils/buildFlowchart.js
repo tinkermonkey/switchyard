@@ -1,21 +1,27 @@
 import { MarkerType } from '@xyflow/react'
 import { processEvents } from './eventProcessing/index.js'
+import { getNodeType } from '../components/nodes/EVENT_TYPE_MAP.js'
 
 /**
  * Builds React Flow nodes and edges from pipeline run events.
  *
  * Node hierarchy produced:
  *   Root level (no parentId):
- *     - pipelineEvent: prelude / postlude standalone events + pipeline_created/completed
+ *     - pipelineStarted / pipelineCompleted: static pipeline boundary nodes
+ *     - <event-specific type>: prelude / postlude standalone decision/agent events
  *     - reviewCycleContainer: one per review cycle
  *     - repairCycleContainer: one per repair cycle
  *
  *   Level 2 (parentId = cycle container):
- *     - pipelineEvent: review_cycle_started, review_cycle_completed (direct children of review cycle)
+ *     - reviewCycleStarted / reviewCycleCompleted: direct children of review cycle
  *     - iterationContainer: one per review iteration or repair test cycle
  *
  *   Level 3 (parentId = iterationContainer):
- *     - pipelineEvent: all events within the iteration / test cycle
+ *     - <event-specific type>: all events within the iteration / test cycle
+ *
+ *   Node types are resolved via getNodeType() from nodes/EVENT_TYPE_MAP.js.
+ *   Each type maps to a dedicated leaf component in nodes/. Unknown types fall
+ *   back to 'pipelineEvent' (the base PipelineEventNode component).
  *
  * IMPORTANT: parent nodes must appear before their children in the returned array
  * (React Flow requirement for correct rendering).
@@ -81,7 +87,7 @@ export function buildFlowchart({
 
     const node = {
       id,
-      type: 'pipelineEvent',
+      type: getNodeType(event.event_type),
       position: { x: 0, y: 0 },
       data: {
         label: event.event_type.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase()),
@@ -111,7 +117,7 @@ export function buildFlowchart({
 
     const node = {
       id,
-      type: 'pipelineEvent',
+      type: 'agentExecution',
       position: { x: 0, y: 0 },
       data: {
         label: agent.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase()),
@@ -161,7 +167,7 @@ export function buildFlowchart({
   // ── 2. Pipeline started node ──────────────────────────────────────────────
   newNodes.push({
     id: 'created',
-    type: 'pipelineEvent',
+    type: 'pipelineStarted',
     position: { x: 0, y: 0 },
     data: {
       label: 'Pipeline Started',
@@ -352,7 +358,7 @@ export function buildFlowchart({
   if (selectedPipelineRun.status === 'completed') {
     newNodes.push({
       id: 'completed',
-      type: 'pipelineEvent',
+      type: 'pipelineCompleted',
       position: { x: 0, y: 0 },
       data: {
         label: 'Pipeline Completed',

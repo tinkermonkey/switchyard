@@ -9,12 +9,12 @@ import {
 import '@xyflow/react/dist/style.css'
 import { RefreshCw } from 'lucide-react'
 import CycleBoundingNode from './CycleBoundingNode'
-import PipelineEventNode from './PipelineEventNode'
 import ReviewCycleContainerNode from './ReviewCycleContainerNode'
 import RepairCycleContainerNode from './RepairCycleContainerNode'
 import IterationContainerNode from './IterationContainerNode'
 import LayoutController from './LayoutController'
 import SmartPipelineEdge from './SmartPipelineEdge'
+import { eventNodeTypes } from './nodes/index.js'
 
 /**
  * Canonical layout options — the single source of truth for graph layout parameters.
@@ -38,12 +38,16 @@ export const DEFAULT_LAYOUT_OPTIONS = {
 }
 
 const nodeTypes = {
-  pipelineEvent: PipelineEventNode,
+  // Container / structural nodes (not event-type-specific)
   cycleBounding: CycleBoundingNode,
   reviewCycleContainer: ReviewCycleContainerNode,
   repairCycleContainer: RepairCycleContainerNode,
   iterationContainer: IterationContainerNode,
   subCycleContainer: IterationContainerNode,  // same component, styled via cycleType data prop
+
+  // Event nodes — one component per event type, with 'pipelineEvent' as fallback.
+  // Sourced from nodes/index.js; mapping defined in nodes/EVENT_TYPE_MAP.js.
+  ...eventNodeTypes,
 }
 
 const edgeTypes = {
