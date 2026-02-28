@@ -33,21 +33,17 @@ const edgeTypes = {
 const CYCLE_CONTAINER_TYPES = ['cycleBounding', 'reviewCycleContainer', 'repairCycleContainer']
 
 const DEFAULT_PARAMS = {
-  nodeWidth: 250,
-  nodeHeight: 80,
   horizontalSpacing: 150,
-  verticalSpacing: 120,
+  innerVertSpacing: 20,
   cycleGap: 100,
   cyclePadding: 40,
   viewportWidth: 1200,
 }
 
 const PARAM_LABELS = {
-  nodeWidth: 'Node Width',
-  nodeHeight: 'Node Height',
   horizontalSpacing: 'H Spacing (within cycle)',
-  verticalSpacing: 'V Spacing (between items)',
-  cycleGap: 'Cycle Gap',
+  innerVertSpacing: 'V Spacing (within iteration)',
+  cycleGap: 'V Spacing (between cycles)',
   cyclePadding: 'Cycle Padding',
   viewportWidth: 'Viewport Width',
 }

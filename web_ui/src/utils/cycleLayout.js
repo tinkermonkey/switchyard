@@ -855,7 +855,7 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
         position: { x: centerXPosition - size.width / 2, y: currentY },
         style: { ...node.style, width: size.width, height: size.height },
       })
-      currentY += size.height + cycleGap + verticalSpacing
+      currentY += size.height + cycleGap
     } else {
       const w = node.measured?.width ?? nodeWidth
       const h = node.measured?.height ?? nodeHeight
