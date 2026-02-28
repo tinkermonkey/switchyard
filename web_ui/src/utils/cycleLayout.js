@@ -16,6 +16,88 @@
 const DEBUG_CYCLE_LAYOUT = false
 
 /**
+ * Groups sub-cycle and direct-child nodes into per-iteration columns.
+ * Returns null if there are no subCycles (callers fall back to vertical layout).
+ * Returns Map<iterationNumber, { items: [{node, h, w}], totalH, maxW }>
+ *
+ * @param {Array}  subCycles      - subCycleContainer nodes for this iteration container
+ * @param {Array}  directChildren - direct pipelineEvent grandchildren (residuals)
+ * @param {Map}    subCycleSizes  - subCycleId → {width, height}
+ * @param {Object} opts           - { nodeWidth, nodeHeight, innerVertSpacing }
+ */
+function groupIterationColumns(subCycles, directChildren, subCycleSizes, opts) {
+  const { nodeWidth, nodeHeight, innerVertSpacing } = opts
+  if (!subCycles.length) return null
+
+  // Unique iteration numbers derived from sub-cycles, sorted ascending
+  const iterNums = [...new Set(subCycles.map(sc => sc.data.iterationNumber))].sort((a, b) => a - b)
+
+  // Earliest timestamp per iteration column (used to assign residual direct children)
+  const colStartMs = new Map()
+  iterNums.forEach(n => {
+    const scForN = subCycles.filter(sc => sc.data.iterationNumber === n)
+    const minMs = Math.min(...scForN.map(sc => new Date(sc.data.startEvent?.timestamp || 0).getTime()))
+    colStartMs.set(n, minMs)
+  })
+
+  // Build columns: each column holds sub-cycles for that iteration number
+  const columns = new Map()
+  iterNums.forEach(n => {
+    const scForN = subCycles
+      .filter(sc => sc.data.iterationNumber === n)
+      .sort((a, b) =>
+        new Date(a.data.startEvent?.timestamp || 0) - new Date(b.data.startEvent?.timestamp || 0)
+      )
+    const items = scForN.map(sc => {
+      const sz = subCycleSizes.get(sc.id) || { width: nodeWidth, height: nodeHeight }
+      return { node: sc, h: sz.height, w: sz.width }
+    })
+    columns.set(n, { items })
+  })
+
+  // Assign residual direct children to columns by timestamp proximity
+  directChildren.forEach(child => {
+    const childMs = new Date(child.data?.timestamp || 0).getTime()
+    let assignedCol = iterNums[iterNums.length - 1] // default: last column
+    for (let i = 0; i < iterNums.length; i++) {
+      const startMs = colStartMs.get(iterNums[i])
+      const nextStartMs = i + 1 < iterNums.length ? colStartMs.get(iterNums[i + 1]) : Infinity
+      if (childMs >= startMs - 60_000 && childMs < nextStartMs) {
+        assignedCol = iterNums[i]
+        break
+      }
+    }
+    const col = columns.get(assignedCol)
+    if (col) {
+      col.items.push({
+        node: child,
+        h: child.measured?.height ?? nodeHeight,
+        w: child.measured?.width ?? nodeWidth,
+      })
+    }
+  })
+
+  // Compute totalH and maxW per column
+  columns.forEach(col => {
+    const { items } = col
+    col.totalH =
+      items.reduce((sum, item) => sum + item.h, 0) +
+      Math.max(0, items.length - 1) * innerVertSpacing
+    col.maxW = items.length > 0 ? Math.max(...items.map(item => item.w)) : nodeWidth
+  })
+
+  // Staircase Y offsets: each column starts where the previous column ended,
+  // so edges between consecutive columns always flow downward (never backward).
+  let cumStartY = 0
+  columns.forEach(col => {
+    col.startY = cumStartY
+    cumStartY += col.totalH + innerVertSpacing
+  })
+
+  return columns
+}
+
+/**
  * Positions pipeline nodes using a 3-level layout hierarchy:
  *   Root level  → reviewCycleContainer / repairCycleContainer / standalone pipelineEvent nodes
  *   Level 2     → iterationContainer nodes (children of cycle containers)
@@ -39,6 +121,7 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
     iterHeaderHeight = 24, // height of the iteration pill label
     iterPadding = 20,      // padding inside iteration container (top & bottom)
     innerVertSpacing = 20, // vertical gap between grandchildren
+    innerHorizSpacing = 60, // horizontal gap between iteration columns
     containerHeaderHeight = 36, // height of cycle container header bar
     viewportWidth = 1200,
     centerX = null,
@@ -98,6 +181,15 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
     directChildrenByCycle.get(pid).push(child)
   })
 
+  // Identify iterationContainers that are children of repairCycleContainers
+  // (these are test-cycle containers whose sub-cycles should use column layout)
+  const repairCycleIds = new Set(
+    cycleContainers.filter(cc => cc.type === 'repairCycleContainer').map(cc => cc.id)
+  )
+  const repairTestCycleIds = new Set(
+    iterContainers.filter(ic => repairCycleIds.has(ic.parentId)).map(ic => ic.id)
+  )
+
   // ── Pass 0: Size subCycleContainers (bottom-up) ───────────────────────────
   const subCycleSizes = new Map()
   subCycleContainers.forEach(sc => {
@@ -117,7 +209,27 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
     const directChildren = childrenByIter.get(iter.id) || []
     const subCycles = subCyclesByIter.get(iter.id) || []
 
-    // Combine direct pipelineEvent children and sub-cycle containers for sizing
+    // Repair test-cycle containers use horizontal column layout (one column per iteration number)
+    if (repairTestCycleIds.has(iter.id)) {
+      const columns = groupIterationColumns(subCycles, directChildren, subCycleSizes, {
+        nodeWidth, nodeHeight, innerVertSpacing,
+      })
+      if (columns) {
+        const colValues = [...columns.values()]
+        const numColumns = colValues.length
+        const totalColWidth = colValues.reduce((sum, col) => sum + col.maxW, 0)
+        // Height is the full staircase stack (sum of all column heights + spacings between them)
+        const totalStackedH =
+          colValues.reduce((sum, col) => sum + col.totalH, 0) +
+          Math.max(0, numColumns - 1) * innerVertSpacing
+        const width = iterPadding * 2 + totalColWidth + (numColumns - 1) * innerHorizSpacing
+        const height = iterHeaderHeight + iterPadding * 2 + totalStackedH
+        iterSizes.set(iter.id, { width, height, columns })
+        return
+      }
+    }
+
+    // Default: vertical stack sizing
     const allChildren = [
       ...directChildren.map(c => ({ w: c.measured?.width ?? nodeWidth, h: c.measured?.height ?? nodeHeight })),
       ...subCycles.map(sc => {
@@ -261,9 +373,43 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
   // ── Pass 5: Position children of iteration containers (chronological order, mixed types) ─
   // Handles both direct pipelineEvent children (residuals) and subCycleContainers.
   iterContainers.forEach(iter => {
+    const iterSize = iterSizes.get(iter.id) || { width: nodeWidth + iterPadding * 2 }
+
+    // Repair test-cycle containers: column layout (one column per iteration number)
+    if (repairTestCycleIds.has(iter.id) && iterSize.columns) {
+      let colX = iterPadding
+      iterSize.columns.forEach(col => {
+        let childY = iterHeaderHeight + iterPadding + col.startY
+        // Sort items within each column chronologically
+        const sortedItems = [...col.items].sort((a, b) => {
+          const aTs = a.node.data?.startEvent?.timestamp || a.node.data?.timestamp || ''
+          const bTs = b.node.data?.startEvent?.timestamp || b.node.data?.timestamp || ''
+          return new Date(aTs) - new Date(bTs)
+        })
+        sortedItems.forEach(({ node, h, w }) => {
+          if (node.type === 'subCycleContainer') {
+            const sz = subCycleSizes.get(node.id) || { width: w, height: h }
+            positionedNodes.set(node.id, {
+              ...node,
+              position: { x: colX + (col.maxW - sz.width) / 2, y: childY },
+              style: { ...node.style, width: sz.width, height: sz.height },
+            })
+          } else {
+            positionedNodes.set(node.id, {
+              ...node,
+              position: { x: colX + (col.maxW - w) / 2, y: childY },
+            })
+          }
+          childY += h + innerVertSpacing
+        })
+        colX += col.maxW + innerHorizSpacing
+      })
+      return
+    }
+
+    // Default: vertical stack layout
     const directChildren = childrenByIter.get(iter.id) || []
     const subCycles = subCyclesByIter.get(iter.id) || []
-    const iterSize = iterSizes.get(iter.id) || { width: nodeWidth + iterPadding * 2 }
 
     // Sort all children chronologically
     const allChildren = [

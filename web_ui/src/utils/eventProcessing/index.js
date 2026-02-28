@@ -67,29 +67,28 @@ function findReviewCycles(sortedEvents) {
 }
 
 /**
- * Find repair cycle boundary.
- * Repair cycles are bounded by agent_initialized / agent_completed events for agent='repair_cycle'.
- * Returns {startEvent, endEvent} or null if no repair cycle found.
+ * Find all repair cycle boundaries.
+ * Repair cycles are bounded by agent_initialized / agent_completed (or agent_failed) events for agent='repair_cycle'.
+ * Returns [{startEvent, endEvent}] — one entry per repair cycle. endEvent is null if in-progress.
  */
-function findRepairCycle(sortedEvents) {
-  const startEvent = sortedEvents.find(
+function findRepairCycles(sortedEvents) {
+  const startEvents = sortedEvents.filter(
     e =>
       e.event_category === 'agent_lifecycle' &&
       e.event_type === 'agent_initialized' &&
       e.agent === 'repair_cycle'
   )
-  if (!startEvent) return null
-
-  const startMs = new Date(startEvent.timestamp).getTime()
-  const endEvent = sortedEvents.find(
-    e =>
-      e.event_category === 'agent_lifecycle' &&
-      e.event_type === 'agent_completed' &&
-      e.agent === 'repair_cycle' &&
-      new Date(e.timestamp).getTime() > startMs
-  )
-
-  return { startEvent, endEvent }
+  return startEvents.map(startEvent => {
+    const startMs = new Date(startEvent.timestamp).getTime()
+    const endEvent = sortedEvents.find(
+      e =>
+        e.event_category === 'agent_lifecycle' &&
+        (e.event_type === 'agent_completed' || e.event_type === 'agent_failed') &&
+        e.agent === 'repair_cycle' &&
+        new Date(e.timestamp).getTime() > startMs
+    )
+    return { startEvent, endEvent }
+  })
 }
 
 /**
@@ -299,7 +298,7 @@ export function processEvents(events, workflowConfig = null) {
 
   // Detect cycle boundaries
   const reviewCycleBoundaries = findReviewCycles(sorted)
-  const repairCycleBoundary = findRepairCycle(sorted)
+  const repairCycleBoundaries = findRepairCycles(sorted)
 
   // Compute the earliest/latest cycle timestamps for prelude/postlude splitting
   let firstCycleStartMs = Infinity
@@ -312,14 +311,12 @@ export function processEvents(events, workflowConfig = null) {
     lastCycleEndMs = Math.max(lastCycleEndMs, eMs)
   })
 
-  if (repairCycleBoundary) {
-    const sMs = new Date(repairCycleBoundary.startEvent.timestamp).getTime()
-    const eMs = repairCycleBoundary.endEvent
-      ? new Date(repairCycleBoundary.endEvent.timestamp).getTime()
-      : sMs
+  repairCycleBoundaries.forEach(({ startEvent, endEvent }) => {
+    const sMs = new Date(startEvent.timestamp).getTime()
+    const eMs = endEvent ? new Date(endEvent.timestamp).getTime() : sMs
     firstCycleStartMs = Math.min(firstCycleStartMs, sMs)
     lastCycleEndMs = Math.max(lastCycleEndMs, eMs)
-  }
+  })
 
   const noCycles = firstCycleStartMs === Infinity
 
@@ -358,8 +355,8 @@ export function processEvents(events, workflowConfig = null) {
     })
   })
 
-  if (repairCycleBoundary) {
-    const { startEvent, endEvent } = repairCycleBoundary
+  repairCycleBoundaries.forEach((boundary, idx) => {
+    const { startEvent, endEvent } = boundary
     const cycleStartMs = new Date(startEvent.timestamp).getTime()
     const cycleEndMs = endEvent ? new Date(endEvent.timestamp).getTime() : Date.now()
 
@@ -368,17 +365,22 @@ export function processEvents(events, workflowConfig = null) {
       return t >= cycleStartMs && t <= cycleEndMs
     })
 
-    const testCycles = groupRepairTestCycles(cycleEvents, repairCycleBoundary, agentExecutions)
+    const testCycles = groupRepairTestCycles(cycleEvents, boundary, agentExecutions)
 
     cycles.push({
-      id: 'repair_cycle_1',
+      id: `repair_cycle_${idx + 1}`,
       type: 'repair_cycle',
       startEvent,
       endEvent,
       testCycles,
       isCollapsed: false,
     })
-  }
+  })
+
+  // Sort all cycles chronologically (review and repair cycles may interleave)
+  cycles.sort((a, b) =>
+    new Date(a.startEvent.timestamp).getTime() - new Date(b.startEvent.timestamp).getTime()
+  )
 
   return {
     prelude: { events: preludeEvents },
