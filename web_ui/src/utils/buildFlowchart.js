@@ -119,6 +119,7 @@ export function buildFlowchart({
         status: execution.status,
         metadata: isActive ? 'Running' : execution.status,
         isActive,
+        startTime: event.timestamp,
       },
       draggable: false,
     }
