@@ -1,5 +1,7 @@
+import { useState, useEffect } from 'react'
 import { Lock, Unlock, Clock, XCircle, ArrowRight, MessageSquare } from 'lucide-react'
 import { useNavigate } from '@tanstack/react-router'
+import TokenUsagePanel from './TokenUsagePanel'
 
 const LockStatusBadge = ({ lockStatus, lockHolderIssue }) => {
   if (lockStatus === 'holding_lock') {
@@ -35,6 +37,17 @@ export default function PipelineRunHeader({
   onDownloadDebugData,
 }) {
   const navigate = useNavigate()
+  const [pipelineRunLogs, setPipelineRunLogs] = useState([])
+
+  useEffect(() => {
+    if (!pipelineRun?.id) return
+    let cancelled = false
+    fetch(`/api/pipeline-run/${pipelineRun.id}/token-usage`)
+      .then(r => r.json())
+      .then(data => { if (!cancelled && data.success) setPipelineRunLogs(data.logs || []) })
+      .catch(err => console.error('[PipelineRunHeader] token-usage fetch error:', err))
+    return () => { cancelled = true }
+  }, [pipelineRun?.id])
 
   if (!pipelineRun) return null
 
@@ -93,6 +106,8 @@ export default function PipelineRunHeader({
           </button>
         </div>
       </div>
+
+      <TokenUsagePanel logs={pipelineRunLogs} />
 
       {pipelineRun.lock_status === 'waiting_for_lock' && pipelineRun.blocked_by_issue && (
         <div className="mt-2 text-xs text-yellow-400 bg-yellow-900/10 border border-yellow-700/20 px-3 py-2 rounded">

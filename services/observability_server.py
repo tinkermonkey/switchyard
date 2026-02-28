@@ -1608,6 +1608,54 @@ def get_agent_execution(execution_id):
             'error': str(e)
         }), 500
 
+@app.route('/api/pipeline-run/<pipeline_run_id>/token-usage')
+def get_pipeline_run_token_usage(pipeline_run_id):
+    try:
+        logs = []
+        try:
+            logs_result = es_client.search(
+                index='claude-streams-*',
+                body={
+                    'query': {'term': {'pipeline_run_id': pipeline_run_id}},
+                    'sort': [{'timestamp': 'asc'}],
+                    'size': 10000
+                }
+            )
+            seen_keys = set()
+            for hit in logs_result['hits']['hits']:
+                log_data = hit['_source']
+                timestamp = log_data.get('timestamp', '')
+                agent = log_data.get('agent', '')
+                task_id = log_data.get('task_id', '')
+                event_type = log_data.get('event_type', '')
+                event = log_data.get('event') or log_data.get('raw_event', {}).get('event', {})
+                msg_type = event.get('type', '') if isinstance(event, dict) else ''
+                msg_id = ''
+                msg_model = ''
+                if isinstance(event, dict) and isinstance(event.get('message'), dict):
+                    msg_id = event['message'].get('id', '')
+                    msg_model = event['message'].get('model', '')
+                content_hash = f"{msg_type}-{msg_id}-{msg_model}"
+                key = f"{timestamp}-{agent}-{task_id}-{event_type}-{content_hash}"
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                logs.append(log_data)
+        except Exception as e:
+            if 'index_not_found_exception' in str(e).lower():
+                return jsonify({'success': True, 'logs': [], 'pipeline_run_id': pipeline_run_id, 'log_count': 0})
+            raise
+
+        return jsonify({
+            'success': True,
+            'logs': logs,
+            'pipeline_run_id': pipeline_run_id,
+            'log_count': len(logs)
+        })
+    except Exception as e:
+        logger.error(f"Error fetching pipeline run token usage: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
 @app.route('/api/metrics/agents', methods=['GET'])
 def get_agent_metrics():
     """
