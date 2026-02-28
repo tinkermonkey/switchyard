@@ -32,12 +32,18 @@ function groupIterationColumns(subCycles, directChildren, subCycleSizes, opts) {
   // Unique iteration numbers derived from sub-cycles, sorted ascending
   const iterNums = [...new Set(subCycles.map(sc => sc.data.iterationNumber))].sort((a, b) => a - b)
 
-  // Earliest timestamp per iteration column (used to assign residual direct children)
+  // Earliest start and latest end timestamp per column (for direct-child assignment)
   const colStartMs = new Map()
+  const colEndMs = new Map()
   iterNums.forEach(n => {
     const scForN = subCycles.filter(sc => sc.data.iterationNumber === n)
-    const minMs = Math.min(...scForN.map(sc => new Date(sc.data.startEvent?.timestamp || 0).getTime()))
-    colStartMs.set(n, minMs)
+    const minStart = Math.min(...scForN.map(sc => new Date(sc.data.startEvent?.timestamp || 0).getTime()))
+    const maxEnd = Math.max(...scForN.map(sc =>
+      sc.data.endEvent ? new Date(sc.data.endEvent.timestamp).getTime()
+                       : new Date(sc.data.startEvent?.timestamp || 0).getTime()
+    ))
+    colStartMs.set(n, minStart)
+    colEndMs.set(n, maxEnd)
   })
 
   // Build columns: each column holds sub-cycles for that iteration number
@@ -55,15 +61,27 @@ function groupIterationColumns(subCycles, directChildren, subCycleSizes, opts) {
     columns.set(n, { items })
   })
 
-  // Assign residual direct children to columns by timestamp proximity
+  // Assign residual direct children to columns.
+  // Events within a column's active span (with 60s look-behind for preamble events) go to that
+  // column. Events in the gap between column N's end and column N+1's start are "opener" events
+  // for iteration N+1 (e.g. repair_cycle_iteration markers) and belong to column N+1.
   directChildren.forEach(child => {
     const childMs = new Date(child.data?.timestamp || 0).getTime()
     let assignedCol = iterNums[iterNums.length - 1] // default: last column
     for (let i = 0; i < iterNums.length; i++) {
-      const startMs = colStartMs.get(iterNums[i])
-      const nextStartMs = i + 1 < iterNums.length ? colStartMs.get(iterNums[i + 1]) : Infinity
-      if (childMs >= startMs - 60_000 && childMs < nextStartMs) {
-        assignedCol = iterNums[i]
+      const n = iterNums[i]
+      const nextN = i + 1 < iterNums.length ? iterNums[i + 1] : null
+      const thisStart = colStartMs.get(n)
+      const thisEnd = colEndMs.get(n)
+      const nextStart = nextN !== null ? colStartMs.get(nextN) : Infinity
+      // Within this column's active time span (60s look-behind covers preamble events)
+      if (childMs >= thisStart - 60_000 && childMs <= thisEnd) {
+        assignedCol = n
+        break
+      }
+      // In the gap between this column and the next → opener for the next iteration
+      if (nextN !== null && childMs > thisEnd && childMs < nextStart) {
+        assignedCol = nextN
         break
       }
     }
@@ -84,14 +102,6 @@ function groupIterationColumns(subCycles, directChildren, subCycleSizes, opts) {
       items.reduce((sum, item) => sum + item.h, 0) +
       Math.max(0, items.length - 1) * innerVertSpacing
     col.maxW = items.length > 0 ? Math.max(...items.map(item => item.w)) : nodeWidth
-  })
-
-  // Staircase Y offsets: each column starts where the previous column ended,
-  // so edges between consecutive columns always flow downward (never backward).
-  let cumStartY = 0
-  columns.forEach(col => {
-    col.startY = cumStartY
-    cumStartY += col.totalH + innerVertSpacing
   })
 
   return columns
@@ -218,12 +228,9 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
         const colValues = [...columns.values()]
         const numColumns = colValues.length
         const totalColWidth = colValues.reduce((sum, col) => sum + col.maxW, 0)
-        // Height is the full staircase stack (sum of all column heights + spacings between them)
-        const totalStackedH =
-          colValues.reduce((sum, col) => sum + col.totalH, 0) +
-          Math.max(0, numColumns - 1) * innerVertSpacing
+        const maxColHeight = Math.max(...colValues.map(col => col.totalH), 0)
         const width = iterPadding * 2 + totalColWidth + (numColumns - 1) * innerHorizSpacing
-        const height = iterHeaderHeight + iterPadding * 2 + totalStackedH
+        const height = iterHeaderHeight + iterPadding * 2 + maxColHeight
         iterSizes.set(iter.id, { width, height, columns })
         return
       }
@@ -379,7 +386,7 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
     if (repairTestCycleIds.has(iter.id) && iterSize.columns) {
       let colX = iterPadding
       iterSize.columns.forEach(col => {
-        let childY = iterHeaderHeight + iterPadding + col.startY
+        let childY = iterHeaderHeight + iterPadding
         // Sort items within each column chronologically
         const sortedItems = [...col.items].sort((a, b) => {
           const aTs = a.node.data?.startEvent?.timestamp || a.node.data?.timestamp || ''
