@@ -404,7 +404,8 @@ class PipelineProgression:
             pipeline_run_manager.end_pipeline_run(
                 project=project_name,
                 issue_number=issue_number,
-                reason=f"Issue reached exit column '{exit_column}'"
+                reason=f"Issue reached exit column '{exit_column}'",
+                outcome="success"
             )
             
             # Process next waiting issue

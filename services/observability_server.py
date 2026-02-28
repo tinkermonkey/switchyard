@@ -984,7 +984,8 @@ def kill_pipeline_run(pipeline_run_id):
         success = pipeline_run_manager.end_pipeline_run(
             project=project,
             issue_number=issue_number,
-            reason="Killed by user via Web UI"
+            reason="Killed by user via Web UI",
+            outcome="failed"
         )
 
         if not success:
@@ -994,8 +995,10 @@ def kill_pipeline_run(pipeline_run_id):
             # Force update in Elasticsearch using the run details we fetched earlier
             # This handles "zombie" runs that exist in ES but not in Redis
             try:
+                run_data = pipeline_run.to_dict()
+                run_data['outcome'] = 'failed'
                 pipeline_run_manager._end_run_in_elasticsearch(
-                    pipeline_run.to_dict(),
+                    run_data,
                     "Killed by user via Web UI (forced update)"
                 )
                 success = True # Mark as success since we updated ES

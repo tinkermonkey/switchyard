@@ -1,6 +1,6 @@
-import { memo, useRef, useLayoutEffect, useEffect, useMemo } from 'react'
+import { memo, useRef, useLayoutEffect, useEffect, useMemo, useState } from 'react'
 import { RefreshCw, Activity, CheckCircle } from 'lucide-react'
-import { formatDuration } from '../utils/stateHelpers'
+import { formatDuration, formatRunDuration } from '../utils/stateHelpers'
 
 // Memoized run list item — only re-renders when run object or selection changes
 const PipelineRunItem = memo(({ run, isSelected, onClick }) => {
@@ -31,7 +31,7 @@ const PipelineRunItem = memo(({ run, isSelected, onClick }) => {
       </div>
       {run.duration && (
         <div className="text-xs mt-1 opacity-75">
-          Duration: {Math.floor(run.duration / 60)}m {Math.floor(run.duration % 60)}s
+          Duration: {formatRunDuration(run.duration)}
         </div>
       )}
     </button>
@@ -49,59 +49,68 @@ export default function PipelineRunSidebar({
   loading,
   loadingCompleted,
   hasMoreCompleted,
-  selectedTab,
   onSelectRun,
-  onTabChange,
   onLoadMore,
 }) {
-  const activeListScrollRef = useRef(null)
   const completedListScrollRef = useRef(null)
-  const savedActiveScrollPos = useRef(0)
   const savedCompletedScrollPos = useRef(0)
 
-  // Continuously save scroll position to handle updates
+  // Internal filter state
+  const [projectFilter, setProjectFilter] = useState('')
+  const [boardFilter, setBoardFilter] = useState('')
+  const [outcomeFilter, setOutcomeFilter] = useState('')
+
+  // Save completed scroll position continuously
   useEffect(() => {
-    const activeEl = activeListScrollRef.current
-    const completedEl = completedListScrollRef.current
+    const el = completedListScrollRef.current
+    if (!el) return
+    const handleScroll = () => { savedCompletedScrollPos.current = el.scrollTop }
+    el.addEventListener('scroll', handleScroll, { passive: true })
+    return () => el.removeEventListener('scroll', handleScroll)
+  }, [])
 
-    const handleActiveScroll = () => {
-      if (activeEl) savedActiveScrollPos.current = activeEl.scrollTop
-    }
-    const handleCompletedScroll = () => {
-      if (completedEl) savedCompletedScrollPos.current = completedEl.scrollTop
-    }
-
-    if (activeEl) activeEl.addEventListener('scroll', handleActiveScroll, { passive: true })
-    if (completedEl) completedEl.addEventListener('scroll', handleCompletedScroll, { passive: true })
-
-    return () => {
-      if (activeEl) activeEl.removeEventListener('scroll', handleActiveScroll)
-      if (completedEl) completedEl.removeEventListener('scroll', handleCompletedScroll)
-    }
-  }, [selectedTab])
-
-  // Restore scroll position after render (before paint)
+  // Restore completed scroll position after render
   useLayoutEffect(() => {
-    const scrollEl = activeListScrollRef.current
-    const savedPos = savedActiveScrollPos.current
-    if (scrollEl && savedPos >= 0) {
-      scrollEl.scrollTop = savedPos
-      requestAnimationFrame(() => {
-        if (scrollEl && scrollEl.scrollTop !== savedPos) scrollEl.scrollTop = savedPos
-      })
-    }
-  }, [activePipelineRuns])
-
-  useLayoutEffect(() => {
-    const scrollEl = completedListScrollRef.current
+    const el = completedListScrollRef.current
     const savedPos = savedCompletedScrollPos.current
-    if (scrollEl && savedPos >= 0) {
-      scrollEl.scrollTop = savedPos
+    if (el && savedPos >= 0) {
+      el.scrollTop = savedPos
       requestAnimationFrame(() => {
-        if (scrollEl && scrollEl.scrollTop !== savedPos) scrollEl.scrollTop = savedPos
+        if (el && el.scrollTop !== savedPos) el.scrollTop = savedPos
       })
     }
   }, [completedPipelineRuns])
+
+  // Derive filter options from loaded completed runs
+  const projectOptions = useMemo(() => {
+    const values = [...new Set(completedPipelineRuns.map(r => r.project).filter(Boolean))]
+    return values.sort()
+  }, [completedPipelineRuns])
+
+  const boardOptions = useMemo(() => {
+    const values = [...new Set(completedPipelineRuns.map(r => r.board).filter(Boolean))]
+    return values.sort()
+  }, [completedPipelineRuns])
+
+  const outcomeOptions = useMemo(() => {
+    const values = [...new Set(completedPipelineRuns.map(r => r.outcome).filter(Boolean))]
+    const hasUnknown = completedPipelineRuns.some(r => !r.outcome)
+    if (hasUnknown) values.push('unknown')
+    return values.sort()
+  }, [completedPipelineRuns])
+
+  // Filtered completed runs (client-side)
+  const filteredCompleted = useMemo(() => {
+    return completedPipelineRuns.filter(run => {
+      if (projectFilter && run.project !== projectFilter) return false
+      if (boardFilter && run.board !== boardFilter) return false
+      if (outcomeFilter) {
+        if (outcomeFilter === 'unknown') return !run.outcome
+        return run.outcome === outcomeFilter
+      }
+      return true
+    })
+  }, [completedPipelineRuns, projectFilter, boardFilter, outcomeFilter])
 
   const activeRunsList = useMemo(() => {
     return activePipelineRuns.map(run => (
@@ -115,7 +124,7 @@ export default function PipelineRunSidebar({
   }, [activePipelineRuns, selectedPipelineRun, onSelectRun])
 
   const completedRunsList = useMemo(() => {
-    return completedPipelineRuns.map(run => (
+    return filteredCompleted.map(run => (
       <PipelineRunItem
         key={run.id}
         run={run}
@@ -123,98 +132,128 @@ export default function PipelineRunSidebar({
         onClick={() => onSelectRun(run)}
       />
     ))
-  }, [completedPipelineRuns, selectedPipelineRun, onSelectRun])
+  }, [filteredCompleted, selectedPipelineRun, onSelectRun])
+
+  const hasActiveFilters = projectFilter || boardFilter || outcomeFilter
 
   return (
     <div className="w-64 flex-shrink-0 bg-gh-canvas-subtle rounded-md border border-gh-border p-4 flex flex-col min-h-0">
       <h3 className="text-lg font-semibold mb-3 flex-shrink-0">Pipeline Runs</h3>
 
-      {/* Active / Completed tab switcher */}
-      <div className="flex gap-2 mb-4 border-b border-gh-border flex-shrink-0">
-        <button
-          onClick={() => onTabChange('active')}
-          className={`px-3 py-2 text-sm font-medium border-b-2 transition-colors ${
-            selectedTab === 'active'
-              ? 'border-gh-accent-emphasis text-gh-accent-fg'
-              : 'border-transparent text-gh-fg-muted hover:text-gh-fg hover:border-gh-border-muted'
-          }`}
-        >
-          Active
-        </button>
-        <button
-          onClick={() => onTabChange('completed')}
-          className={`px-3 py-2 text-sm font-medium border-b-2 transition-colors ${
-            selectedTab === 'completed'
-              ? 'border-gh-accent-emphasis text-gh-accent-fg'
-              : 'border-transparent text-gh-fg-muted hover:text-gh-fg hover:border-gh-border-muted'
-          }`}
-        >
-          Completed
-        </button>
+      {/* Active section */}
+      <div className="flex-shrink-0">
+        <div className="flex items-center gap-2 mb-2">
+          <Activity className="w-4 h-4 text-gh-fg-muted" />
+          <span className="text-sm font-medium">Active</span>
+          {activePipelineRuns.length > 0 && (
+            <span className="ml-auto text-xs bg-gh-accent-emphasis text-white rounded-full px-1.5 py-0.5 leading-none">
+              {activePipelineRuns.length}
+            </span>
+          )}
+        </div>
+
+        {loading ? (
+          <p className="text-gh-fg-muted text-xs px-1 mb-2">Loading...</p>
+        ) : activePipelineRuns.length === 0 ? (
+          <p className="text-gh-fg-muted text-xs px-1 mb-2">No active runs</p>
+        ) : (
+          <div className="space-y-2 max-h-40 overflow-y-auto overscroll-contain mb-2" style={{ scrollBehavior: 'auto' }}>
+            {activeRunsList}
+          </div>
+        )}
       </div>
 
-      {/* Active Pipeline Runs */}
-      {selectedTab === 'active' && (
-        <div className="flex flex-col flex-1 min-h-0">
-          {loading ? (
-            <p className="text-gh-fg-muted text-sm">Loading...</p>
-          ) : activePipelineRuns.length === 0 ? (
-            <div className="text-center py-8">
-              <Activity className="w-8 h-8 mx-auto mb-2 opacity-50" />
-              <p className="text-gh-fg-muted text-sm">No active pipeline runs</p>
-            </div>
-          ) : (
+      <div className="border-t border-gh-border my-2 flex-shrink-0" />
+
+      {/* Completed section */}
+      <div className="flex flex-col flex-1 min-h-0">
+        <div className="flex items-center gap-2 mb-2 flex-shrink-0">
+          <CheckCircle className="w-4 h-4 text-gh-fg-muted" />
+          <span className="text-sm font-medium">Completed</span>
+          {completedPipelineRuns.length > 0 && (
+            <span className="ml-auto text-xs bg-gh-canvas border border-gh-border rounded-full px-1.5 py-0.5 leading-none text-gh-fg-muted">
+              {hasActiveFilters ? `${filteredCompleted.length}/` : ''}{completedPipelineRuns.length}
+            </span>
+          )}
+        </div>
+
+        {/* Filters */}
+        {completedPipelineRuns.length > 0 && (
+          <div className="flex flex-col gap-1 mb-2 flex-shrink-0">
+            {projectOptions.length > 1 && (
+              <select
+                value={projectFilter}
+                onChange={e => setProjectFilter(e.target.value)}
+                className="w-full text-xs bg-gh-canvas border border-gh-border rounded px-2 py-1 text-gh-fg"
+              >
+                <option value="">Project</option>
+                {projectOptions.map(p => (
+                  <option key={p} value={p}>{p}</option>
+                ))}
+              </select>
+            )}
+            {boardOptions.length > 1 && (
+              <select
+                value={boardFilter}
+                onChange={e => setBoardFilter(e.target.value)}
+                className="w-full text-xs bg-gh-canvas border border-gh-border rounded px-2 py-1 text-gh-fg"
+              >
+                <option value="">Board</option>
+                {boardOptions.map(b => (
+                  <option key={b} value={b}>{b}</option>
+                ))}
+              </select>
+            )}
+            {outcomeOptions.length > 0 && (
+              <select
+                value={outcomeFilter}
+                onChange={e => setOutcomeFilter(e.target.value)}
+                className="w-full text-xs bg-gh-canvas border border-gh-border rounded px-2 py-1 text-gh-fg"
+              >
+                <option value="">Outcome</option>
+                {outcomeOptions.map(o => (
+                  <option key={o} value={o}>{o.charAt(0).toUpperCase() + o.slice(1)}</option>
+                ))}
+              </select>
+            )}
+          </div>
+        )}
+
+        {loadingCompleted && completedPipelineRuns.length === 0 ? (
+          <p className="text-gh-fg-muted text-xs px-1">Loading...</p>
+        ) : filteredCompleted.length === 0 ? (
+          <p className="text-gh-fg-muted text-xs px-1">
+            {hasActiveFilters ? 'No runs match filters' : 'No completed runs'}
+          </p>
+        ) : (
+          <>
             <div
-              ref={activeListScrollRef}
+              ref={completedListScrollRef}
               className="space-y-2 overflow-y-auto overscroll-contain flex-1"
               style={{ scrollBehavior: 'auto' }}
             >
-              {activeRunsList}
+              {completedRunsList}
             </div>
-          )}
-        </div>
-      )}
 
-      {/* Completed Pipeline Runs */}
-      {selectedTab === 'completed' && (
-        <div className="flex flex-col flex-1 min-h-0">
-          {loadingCompleted && completedPipelineRuns.length === 0 ? (
-            <p className="text-gh-fg-muted text-sm">Loading...</p>
-          ) : completedPipelineRuns.length === 0 ? (
-            <div className="text-center py-8">
-              <CheckCircle className="w-8 h-8 mx-auto mb-2 opacity-50" />
-              <p className="text-gh-fg-muted text-sm">No completed pipeline runs</p>
-            </div>
-          ) : (
-            <>
-              <div
-                ref={completedListScrollRef}
-                className="space-y-2 overflow-y-auto overscroll-contain flex-1"
-                style={{ scrollBehavior: 'auto' }}
+            {hasMoreCompleted && !hasActiveFilters && (
+              <button
+                onClick={onLoadMore}
+                disabled={loadingCompleted}
+                className="w-full mt-3 px-4 py-2 bg-gh-canvas border border-gh-border rounded-md hover:bg-gh-border-muted transition-colors text-sm disabled:opacity-50 flex-shrink-0"
               >
-                {completedRunsList}
-              </div>
-
-              {hasMoreCompleted && (
-                <button
-                  onClick={onLoadMore}
-                  disabled={loadingCompleted}
-                  className="w-full mt-3 px-4 py-2 bg-gh-canvas border border-gh-border rounded-md hover:bg-gh-border-muted transition-colors text-sm disabled:opacity-50 flex-shrink-0"
-                >
-                  {loadingCompleted ? (
-                    <>
-                      <RefreshCw className="inline w-4 h-4 mr-2 animate-spin" />
-                      Loading...
-                    </>
-                  ) : (
-                    'Load More'
-                  )}
-                </button>
-              )}
-            </>
-          )}
-        </div>
-      )}
+                {loadingCompleted ? (
+                  <>
+                    <RefreshCw className="inline w-4 h-4 mr-2 animate-spin" />
+                    Loading...
+                  </>
+                ) : (
+                  'Load More'
+                )}
+              </button>
+            )}
+          </>
+        )}
+      </div>
     </div>
   )
 }

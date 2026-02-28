@@ -71,7 +71,8 @@ PIPELINE_RUNS_TEMPLATE = {
                 "board": {"type": "keyword"},
                 "started_at": {"type": "date"},
                 "ended_at": {"type": "date"},
-                "status": {"type": "keyword"}
+                "status": {"type": "keyword"},
+                "outcome": {"type": "keyword"}
             }
         }
     },
@@ -97,6 +98,7 @@ class PipelineRun:
     ended_at: Optional[str] = None
     status: str = "active"  # active, completed
     discussion_id: Optional[str] = None  # GitHub discussion node ID for context continuity
+    outcome: Optional[str] = None  # success, failed, or None for unknown
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for storage"""
@@ -616,7 +618,8 @@ class PipelineRunManager:
         project: str,
         issue_number: int,
         reason: Optional[str] = None,
-        retain_lock: bool = False
+        retain_lock: bool = False,
+        outcome: Optional[str] = None
     ) -> bool:
         """
         End an active pipeline run
@@ -644,6 +647,7 @@ class PipelineRunManager:
         # Mark as completed
         pipeline_run.ended_at = datetime.utcnow().isoformat() + 'Z'
         pipeline_run.status = "completed"
+        pipeline_run.outcome = outcome
 
         # Set cancellation signal so in-flight repair cycles stop
         try:
@@ -1348,7 +1352,7 @@ class PipelineRunManager:
             logger.error(f"Error querying issue column: {e}")
             return None
     
-    def _end_run_in_elasticsearch(self, run_data: Dict[str, Any], reason: str, index: Optional[str] = None):
+    def _end_run_in_elasticsearch(self, run_data: Dict[str, Any], reason: str, index: Optional[str] = None, outcome: Optional[str] = None):
         """
         End a pipeline run directly in Elasticsearch (cleanup helper)
 
@@ -1356,11 +1360,14 @@ class PipelineRunManager:
             run_data: Pipeline run data from Elasticsearch
             reason: Reason for ending (for logging)
             index: Optional index name where the document exists (if not provided, uses started_at or today's index)
+            outcome: Optional outcome ('success', 'failed', etc.)
         """
         try:
             pipeline_run_id = run_data['id']
             run_data['ended_at'] = datetime.utcnow().isoformat() + 'Z'
             run_data['status'] = 'completed'
+            if outcome is not None:
+                run_data['outcome'] = outcome
 
             # Use the provided index (where the document was found) or derive from started_at
             target_index = index

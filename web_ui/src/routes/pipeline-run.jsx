@@ -18,7 +18,6 @@ import { processEvents } from '../utils/eventProcessing/index.js'
 function PipelineRunView() {
   const navigate = useNavigate()
   const searchParams = Route.useSearch()
-  const selectedTab = searchParams.tab
   const urlRunId = searchParams.runId
   const contentTab = searchParams.contentTab
 
@@ -41,7 +40,6 @@ function PipelineRunView() {
 
   // Refs to track state without causing re-renders
   const selectedPipelineRunRef = useRef(selectedPipelineRun)
-  const selectedTabRef = useRef(selectedTab)
   const isFetchingActiveRef = useRef(false)
   const isFetchingCompletedRef = useRef(false)
   const completedLoadedCountRef = useRef(0)
@@ -51,7 +49,6 @@ function PipelineRunView() {
   const lastProcessedTimestampRef = useRef(0)
 
   useEffect(() => { selectedPipelineRunRef.current = selectedPipelineRun }, [selectedPipelineRun])
-  useEffect(() => { selectedTabRef.current = selectedTab }, [selectedTab])
   useEffect(() => { completedLoadedCountRef.current = completedLoadedCount }, [completedLoadedCount])
   useEffect(() => { socketEventsRef.current = socketEvents }, [socketEvents])
 
@@ -62,17 +59,6 @@ function PipelineRunView() {
       replace: replaceHistory,
     })
   }, [navigate])
-
-  const handleTabChange = useCallback((newTab) => {
-    const newList = newTab === 'active' ? activePipelineRuns : completedPipelineRuns
-    const currentRun = selectedPipelineRunRef.current
-    const runExistsInNewTab = currentRun && newList.find(r => r.id === currentRun.id)
-    if (runExistsInNewTab) {
-      updateUrlParams({ tab: newTab }, true)
-    } else {
-      updateUrlParams({ tab: newTab, runId: undefined }, true)
-    }
-  }, [updateUrlParams, activePipelineRuns, completedPipelineRuns])
 
   const handleSelectRun = useCallback((run) => {
     updateUrlParams({ runId: run.id }, false)
@@ -85,55 +71,30 @@ function PipelineRunView() {
   // Sync selectedPipelineRun from URL
   useEffect(() => {
     if (urlRunId) {
-      const list = selectedTab === 'active' ? activePipelineRuns : completedPipelineRuns
-      const run = list.find(r => r.id === urlRunId)
+      const run = activePipelineRuns.find(r => r.id === urlRunId)
+        || completedPipelineRuns.find(r => r.id === urlRunId)
 
       if (run) {
         setSelectedPipelineRun(run)
       } else {
-        const activeRun = activePipelineRuns.find(r => r.id === urlRunId)
-        const completedRun = completedPipelineRuns.find(r => r.id === urlRunId)
-
-        if (activeRun && selectedTab !== 'active') {
-          setSelectedPipelineRun(activeRun)
-          updateUrlParams({ tab: 'active' }, true)
-        } else if (completedRun && selectedTab !== 'completed') {
-          setSelectedPipelineRun(completedRun)
-          updateUrlParams({ tab: 'completed' }, true)
-        } else {
-          setSelectedPipelineRun(null)
-          handleDeselectRun()
-        }
-      }
-    } else {
-      const list = selectedTab === 'active' ? activePipelineRuns : completedPipelineRuns
-      if (list.length > 0 && !selectedPipelineRunRef.current) {
-        const firstRun = list[0]
-        setSelectedPipelineRun(firstRun)
-        updateUrlParams({ runId: firstRun.id }, true)
-      } else if (list.length === 0) {
-        setSelectedPipelineRun(null)
-      }
-    }
-  }, [urlRunId, selectedTab, activePipelineRuns, completedPipelineRuns, updateUrlParams, handleDeselectRun])
-
-  // Handle Active→Completed transition
-  useEffect(() => {
-    if (selectedPipelineRun && selectedTab === 'active' && urlRunId) {
-      const currentActiveIds = new Set(activePipelineRuns.map(r => r.id))
-      const completedIds = new Set(completedPipelineRuns.map(r => r.id))
-      const runMovedToCompleted =
-        !currentActiveIds.has(selectedPipelineRun.id) &&
-        completedIds.has(selectedPipelineRun.id) &&
-        previousActiveRunIdsRef.current.has(selectedPipelineRun.id)
-
-      if (runMovedToCompleted) {
         setSelectedPipelineRun(null)
         handleDeselectRun()
       }
+    } else {
+      if (!selectedPipelineRunRef.current) {
+        const firstRun = activePipelineRuns[0] || completedPipelineRuns[0]
+        if (firstRun) {
+          setSelectedPipelineRun(firstRun)
+          updateUrlParams({ runId: firstRun.id }, true)
+        }
+      }
     }
+  }, [urlRunId, activePipelineRuns, completedPipelineRuns, updateUrlParams, handleDeselectRun])
+
+  // Track previous active run IDs (for transition detection)
+  useEffect(() => {
     previousActiveRunIdsRef.current = new Set(activePipelineRuns.map(r => r.id))
-  }, [activePipelineRuns, completedPipelineRuns, selectedPipelineRun, selectedTab, urlRunId, handleDeselectRun])
+  }, [activePipelineRuns])
 
   // Fetch active pipeline runs — stable (no deps), ref-guarded
   const fetchActivePipelineRuns = useCallback(async (isInitialLoad = false) => {
@@ -282,7 +243,6 @@ function PipelineRunView() {
       if (data.success) {
         fetchActivePipelineRuns()
         fetchCompletedPipelineRuns(0, false)
-        handleTabChange('completed')
       } else {
         alert(`Failed to kill run: ${data.error}`)
       }
@@ -290,7 +250,7 @@ function PipelineRunView() {
       console.error('Error killing pipeline run:', error)
       alert('Error killing pipeline run')
     }
-  }, [selectedPipelineRun, fetchActivePipelineRuns, fetchCompletedPipelineRuns, handleTabChange])
+  }, [selectedPipelineRun, fetchActivePipelineRuns, fetchCompletedPipelineRuns])
 
   const handleToggleCycle = useCallback((cycleId) => {
     setCycles(prevCycles => toggleCycleCollapsed(prevCycles, cycleId))
@@ -407,20 +367,13 @@ function PipelineRunView() {
   useEffect(() => {
     const intervalId = setInterval(() => {
       fetchActivePipelineRuns(false)
-      if (selectedTabRef.current === 'completed' && completedLoadedCountRef.current > 0) {
+      if (completedLoadedCountRef.current > 0) {
         const itemsToRefresh = Math.max(completedLoadedCountRef.current, completedLimit)
         fetchCompletedPipelineRuns(0, false, itemsToRefresh)
       }
     }, 10000)
     return () => clearInterval(intervalId)
   }, [fetchActivePipelineRuns, fetchCompletedPipelineRuns, completedLimit])
-
-  // Fetch completed runs when switching to completed tab
-  useEffect(() => {
-    if (selectedTab === 'completed' && completedPipelineRuns.length === 0) {
-      fetchCompletedPipelineRuns(0, false)
-    }
-  }, [selectedTab, completedPipelineRuns.length, fetchCompletedPipelineRuns])
 
   // Load events when pipeline run selected
   useEffect(() => {
@@ -523,9 +476,7 @@ function PipelineRunView() {
           loading={loading}
           loadingCompleted={loadingCompleted}
           hasMoreCompleted={hasMoreCompleted}
-          selectedTab={selectedTab}
           onSelectRun={handleSelectRun}
-          onTabChange={handleTabChange}
           onLoadMore={loadMoreCompleted}
         />
 
@@ -717,7 +668,6 @@ export const Route = createFileRoute('/pipeline-run')({
   validateSearch: (search) => {
     return {
       runId: typeof search.runId === 'string' ? search.runId : undefined,
-      tab: search.tab === 'completed' ? 'completed' : 'active',
       contentTab: search.contentTab === 'log' ? 'log' : 'graph',
     }
   },

@@ -133,18 +133,40 @@ export function getRuntimeMs(startedAt) {
  */
 export function formatDuration(startedAt) {
   const diffMs = getRuntimeMs(startedAt)
-  
+
   if (diffMs === 0) {
     return '0s'
   }
-  
-  const diffMins = Math.floor(diffMs / 60000)
-  const diffSecs = Math.floor((diffMs % 60000) / 1000)
 
-  if (diffMins > 0) {
-    return `${diffMins}m ${diffSecs}s`
-  }
-  return `${diffSecs}s`
+  const totalSecs = Math.floor(diffMs / 1000)
+  const days = Math.floor(totalSecs / 86400)
+  const hours = Math.floor((totalSecs % 86400) / 3600)
+  const mins = Math.floor((totalSecs % 3600) / 60)
+  const secs = totalSecs % 60
+
+  if (days >= 1) return `${days}d ${hours}h`
+  if (hours >= 1) return `${hours}h ${mins}m`
+  if (mins >= 1) return `${mins}m ${secs}s`
+  return `${secs}s`
+}
+
+/**
+ * Format a fixed duration given in seconds
+ * @param {number} seconds - Duration in seconds
+ * @returns {string} Formatted duration
+ */
+export function formatRunDuration(seconds) {
+  if (!seconds || seconds <= 0) return '0s'
+
+  const days = Math.floor(seconds / 86400)
+  const hours = Math.floor((seconds % 86400) / 3600)
+  const mins = Math.floor((seconds % 3600) / 60)
+  const secs = Math.floor(seconds % 60)
+
+  if (days >= 1) return `${days}d ${hours}h`
+  if (hours >= 1) return `${hours}h ${mins}m`
+  if (mins >= 1) return `${mins}m ${secs}s`
+  return `${secs}s`
 }
 
 /**
