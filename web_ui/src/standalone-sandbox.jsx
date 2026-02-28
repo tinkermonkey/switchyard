@@ -1,45 +1,12 @@
 import { Upload, RotateCcw } from 'lucide-react'
-import CycleBoundingNode from './components/CycleBoundingNode'
-import PipelineEventNode from './components/PipelineEventNode'
-import ReviewCycleContainerNode from './components/ReviewCycleContainerNode'
-import RepairCycleContainerNode from './components/RepairCycleContainerNode'
-import IterationContainerNode from './components/IterationContainerNode'
-import LayoutController from './components/LayoutController'
-import SmartPipelineEdge from './components/SmartPipelineEdge'
+import PipelineFlowGraph, { DEFAULT_LAYOUT_OPTIONS } from './components/PipelineFlowGraph'
 import { useState, useEffect, useCallback } from 'react'
-import {
-  ReactFlow,
-  Controls,
-  Background,
-  useNodesState,
-  useEdgesState,
-} from '@xyflow/react'
-import '@xyflow/react/dist/style.css'
 import { toggleCycleCollapsed } from './utils/cycleLayout'
 import { buildFlowchart } from './utils/buildFlowchart'
 
-const nodeTypes = {
-  pipelineEvent: PipelineEventNode,
-  cycleBounding: CycleBoundingNode,
-  reviewCycleContainer: ReviewCycleContainerNode,
-  repairCycleContainer: RepairCycleContainerNode,
-  iterationContainer: IterationContainerNode,
-}
-
-const edgeTypes = {
-  smart: SmartPipelineEdge,
-}
-
-const CYCLE_CONTAINER_TYPES = ['cycleBounding', 'reviewCycleContainer', 'repairCycleContainer']
-
-const DEFAULT_PARAMS = {
-  horizontalSpacing: 150,
-  innerVertSpacing: 20,
-  cycleGap: 100,
-  cyclePadding: 40,
-  viewportWidth: 1200,
-}
-
+// Human-readable labels for the layout parameter sliders.
+// Only keys present here will show as sliders; the rest of DEFAULT_LAYOUT_OPTIONS
+// are still passed to the layout algorithm as invisible defaults.
 const PARAM_LABELS = {
   horizontalSpacing: 'H Spacing (within cycle)',
   innerVertSpacing: 'V Spacing (within iteration)',
@@ -50,13 +17,11 @@ const PARAM_LABELS = {
 
 export default function StandaloneSandbox() {
   const [debugData, setDebugData] = useState(null)
-  const [layoutParams, setLayoutParams] = useState(DEFAULT_PARAMS)
+  const [layoutParams, setLayoutParams] = useState(DEFAULT_LAYOUT_OPTIONS)
   const [cycles, setCycles] = useState(new Map())
   const [isDragOver, setIsDragOver] = useState(false)
   const [error, setError] = useState(null)
   const [rawBuild, setRawBuild] = useState(null)
-  const [nodes, setNodes, onNodesChange] = useNodesState([])
-  const [edges, setEdges, onEdgesChange] = useEdgesState([])
 
   const handleToggleCycle = useCallback((cycleId) => {
     setCycles(prev => toggleCycleCollapsed(prev, cycleId))
@@ -123,34 +88,6 @@ export default function StandaloneSandbox() {
     setRawBuild(result)
   }, [debugData, cycles])
 
-  // Phase 1: set raw unpositioned nodes for React Flow to render and measure
-  useEffect(() => {
-    if (!rawBuild || rawBuild.nodes.length === 0) {
-      setNodes([])
-      setEdges([])
-      return
-    }
-    setNodes(rawBuild.nodes)
-  }, [rawBuild, setNodes, setEdges])
-
-  // Callback to inject draggable/toggle props after layout (passed to LayoutController)
-  const finalizeNodes = useCallback((layoutedNodes) => {
-    return layoutedNodes.map(node => {
-      if (CYCLE_CONTAINER_TYPES.includes(node.type)) {
-        return {
-          ...node,
-          draggable: true,
-          data: {
-            ...node.data,
-            onToggleCollapse: handleToggleCycle,
-            isResizable: node.type === 'cycleBounding',
-          },
-        }
-      }
-      return { ...node, draggable: true }
-    })
-  }, [handleToggleCycle])
-
   const handleParamChange = useCallback((key, value) => {
     const parsed = parseInt(value, 10)
     setLayoutParams(prev => ({ ...prev, [key]: isNaN(parsed) ? 0 : parsed }))
@@ -209,7 +146,7 @@ export default function StandaloneSandbox() {
           <div>
             <h3 className="text-sm font-semibold mb-3">Layout Parameters</h3>
             <div className="space-y-3">
-              {Object.entries(layoutParams).map(([key, value]) => (
+              {Object.keys(PARAM_LABELS).map(key => [key, layoutParams[key]]).map(([key, value]) => (
                 <div key={key}>
                   <label className="text-xs text-gh-fg-muted block mb-1">
                     {PARAM_LABELS[key] || key}
@@ -228,7 +165,7 @@ export default function StandaloneSandbox() {
 
           {/* Reset Button */}
           <button
-            onClick={() => setLayoutParams(DEFAULT_PARAMS)}
+            onClick={() => setLayoutParams(DEFAULT_LAYOUT_OPTIONS)}
             className="px-4 py-2 bg-gh-canvas border border-gh-border rounded-md hover:bg-gh-border-muted transition-colors text-sm flex items-center justify-center gap-2"
           >
             <RotateCcw className="w-4 h-4" />
@@ -246,47 +183,17 @@ export default function StandaloneSandbox() {
                 Use the "📥 Download Debug Data" button on Pipeline Run Graphs
               </p>
             </div>
-          ) : nodes.length === 0 ? (
-            <div className="flex items-center justify-center h-full text-gh-fg-muted">
-              <p>No renderable events found in the debug data</p>
-            </div>
           ) : (
-            <ReactFlow
-              nodes={nodes}
-              edges={edges}
-              onNodesChange={onNodesChange}
-              onEdgesChange={onEdgesChange}
-              nodeTypes={nodeTypes}
-              edgeTypes={edgeTypes}
-              nodesDraggable={true}
-              nodesConnectable={false}
-              fitView
-              fitViewOptions={{ padding: 0.05 }}
-              minZoom={0.3}
-              maxZoom={2}
-              zoomOnScroll={false}
-              panOnScroll={true}
-            >
-              <LayoutController
-                rawBuild={rawBuild}
-                layoutOptions={layoutParams}
-                finalizeNodes={finalizeNodes}
-                setNodes={setNodes}
-                setEdges={setEdges}
-              />
-              <Background />
-              <Controls />
-            </ReactFlow>
+            <PipelineFlowGraph
+              rawBuild={rawBuild}
+              onToggleCycle={handleToggleCycle}
+              layoutOptions={layoutParams}
+              height="100%"
+              emptyMessage="No renderable events found in the debug data"
+            />
           )}
         </div>
       </div>
-
-      <style>{`
-        @keyframes stripes {
-          0%   { background-position: 0 0; }
-          100% { background-position: 1rem 1rem; }
-        }
-      `}</style>
     </div>
   )
 }
