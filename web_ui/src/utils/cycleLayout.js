@@ -1,16 +1,31 @@
 /**
  * Custom layout algorithm for pipeline runs.
  *
- * Positions nodes using a 3-level hierarchy:
- *   Root level  → reviewCycleContainer / repairCycleContainer / standalone pipelineEvent nodes
+ * Positions nodes using a 3–4 level hierarchy:
+ *   Root level  → reviewCycleContainer / repairCycleContainer / standalone event nodes
  *   Level 2     → iterationContainer nodes (children of cycle containers)
- *   Level 3     → pipelineEvent grandchildren inside iteration containers
+ *   Level 3     → event grandchildren inside iteration containers; subCycleContainer (repair cycles)
+ *   Level 4     → event leaves inside subCycleContainers (repair cycles only)
  *
  * Entry points used by the rest of the app:
  *   applyCycleLayout      — main layout function, called by LayoutController
  *   toggleCycleCollapsed  — collapses/expands a cycle container
  *   updateEdgesForCycles  — redirects edges when cycles are collapsed
  */
+
+/**
+ * Node types that are structural containers, not renderable pipeline events.
+ * Any node whose type is NOT in this set is treated as a leaf event node by the layout engine.
+ * This replaces the previous hard-coded `n.type === 'pipelineEvent'` checks, which broke
+ * when the event nodes were given granular per-event-type strings.
+ */
+const CONTAINER_TYPES = new Set([
+  'reviewCycleContainer',
+  'repairCycleContainer',
+  'iterationContainer',
+  'subCycleContainer',
+  'cycleBounding',
+])
 
 // Debug logging control - set to true to enable verbose console logging
 const DEBUG_CYCLE_LAYOUT = false
@@ -108,10 +123,11 @@ function groupIterationColumns(subCycles, directChildren, subCycleSizes, opts) {
 }
 
 /**
- * Positions pipeline nodes using a 3-level layout hierarchy:
- *   Root level  → reviewCycleContainer / repairCycleContainer / standalone pipelineEvent nodes
+ * Positions pipeline nodes using a 3–4 level layout hierarchy:
+ *   Root level  → reviewCycleContainer / repairCycleContainer / standalone event nodes
  *   Level 2     → iterationContainer nodes (children of cycle containers)
- *   Level 3     → pipelineEvent grandchildren inside iteration containers
+ *   Level 3     → event grandchildren inside iteration containers; subCycleContainer (repair cycles)
+ *   Level 4     → event leaves inside subCycleContainers (repair cycles only)
  *
  * @param {Array}  nodes   - React Flow nodes (may have parentId set)
  * @param {Array}  edges   - React Flow edges
@@ -145,14 +161,14 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
   )
   const iterContainers = nodes.filter(n => n.type === 'iterationContainer')
   const subCycleContainers = nodes.filter(n => n.type === 'subCycleContainer')
-  // Direct pipelineEvent children of iterationContainers (residual events not inside sub-cycles)
-  const grandchildren = nodes.filter(n => n.parentId && n.type === 'pipelineEvent' &&
+  // Leaf event children of iterationContainers (residual events not inside sub-cycles)
+  const grandchildren = nodes.filter(n => n.parentId && !CONTAINER_TYPES.has(n.type) &&
     iterContainers.some(ic => ic.id === n.parentId))
-  // Direct pipelineEvent children of cycle containers (review_cycle_started / completed)
-  const directCycleChildren = nodes.filter(n => n.parentId && n.type === 'pipelineEvent' &&
+  // Leaf event children of cycle containers (e.g. reviewCycleStarted / reviewCycleCompleted)
+  const directCycleChildren = nodes.filter(n => n.parentId && !CONTAINER_TYPES.has(n.type) &&
     cycleContainers.some(cc => cc.id === n.parentId))
-  // pipelineEvent children of subCycleContainers
-  const subCycleLeaves = nodes.filter(n => n.parentId && n.type === 'pipelineEvent' &&
+  // Leaf event children of subCycleContainers
+  const subCycleLeaves = nodes.filter(n => n.parentId && !CONTAINER_TYPES.has(n.type) &&
     subCycleContainers.some(sc => sc.id === n.parentId))
 
   // Build lookup maps

@@ -104,7 +104,7 @@
  *   │   ├── BranchConflictDetectedNode   branch_conflict_detected
  *   │   ├── BranchStaleDetectedNode      branch_stale_detected
  *   │   └── BranchSelectionEscalatedNode branch_selection_escalated
- *   ├── issue/IssueManagementNode
+ *   ├── issue/IssueManagementNode (cyan issue family)
  *   │   ├── SubIssueCreatedNode         sub_issue_created
  *   │   └── SubIssueCreationFailedNode  sub_issue_creation_failed
  *   └── system/SystemOperationsNode (slate system family)
@@ -116,11 +116,27 @@
  *       ├── EmptyOutputDetectedNode       empty_output_detected
  *       └── ContainerResultRecoveredNode  container_result_recovered
  */
+/**
+ * Backend event types intentionally NOT mapped here because buildFlowchart.js
+ * filters them out before reaching getNodeType() — they never render as graph nodes:
+ *
+ *   agent_lifecycle (except agent_initialized):
+ *     task_received, agent_started, agent_completed, agent_failed
+ *
+ *   Infrastructure / telemetry:
+ *     prompt_constructed, claude_api_call_started, claude_api_call_completed,
+ *     claude_api_call_failed, container_launch_started, container_launch_succeeded,
+ *     container_launch_failed, container_execution_started, container_execution_completed,
+ *     container_execution_failed, response_chunk_received, response_processing_started,
+ *     response_processing_completed, tool_execution_started, tool_execution_completed,
+ *     performance_metric, token_usage
+ *
+ * Note: pipeline_created and pipeline_completed are NOT emitted as backend events.
+ * Those boundary nodes are constructed statically in buildFlowchart.js from
+ * selectedPipelineRun metadata and assigned type 'pipelineStarted'/'pipelineCompleted'
+ * directly — getNodeType() is never called for them.
+ */
 export const EVENT_TYPE_MAP = {
-  // ── Pipeline lifecycle (static nodes, constructed directly in buildFlowchart.js) ──
-  pipeline_created:   'pipelineStarted',
-  pipeline_completed: 'pipelineCompleted',
-
   // ── Agent execution ──────────────────────────────────────────────────────────────
   agent_initialized: 'agentExecution',
 

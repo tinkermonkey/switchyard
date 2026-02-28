@@ -13,11 +13,16 @@ import { getNodeType } from '../components/nodes/EVENT_TYPE_MAP.js'
  *     - repairCycleContainer: one per repair cycle
  *
  *   Level 2 (parentId = cycle container):
- *     - reviewCycleStarted / reviewCycleCompleted: direct children of review cycle
- *     - iterationContainer: one per review iteration or repair test cycle
+ *     - reviewCycleStarted / reviewCycleCompleted: direct event children of review cycle
+ *     - iterationContainer: one per review iteration (review cycles)
+ *     - iterationContainer: one per test cycle (repair cycles)
  *
  *   Level 3 (parentId = iterationContainer):
- *     - <event-specific type>: all events within the iteration / test cycle
+ *     - <event-specific type>: events within review iterations
+ *     - subCycleContainer: one per fix/warning/systemic/container sub-cycle (repair cycles only)
+ *
+ *   Level 4 (parentId = subCycleContainer, repair cycles only):
+ *     - <event-specific type>: events within each sub-cycle
  *
  *   Node types are resolved via getNodeType() from nodes/EVENT_TYPE_MAP.js.
  *   Each type maps to a dedicated leaf component in nodes/. Unknown types fall
@@ -90,7 +95,9 @@ export function buildFlowchart({
       type: getNodeType(event.event_type),
       position: { x: 0, y: 0 },
       data: {
-        label: event.event_type.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase()),
+        label: event.event_type
+          ? event.event_type.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase())
+          : 'Unknown Event',
         type: 'decision_event',
         metadata: metadataParts.join(' • '),
         decision_category: event.decision_category,

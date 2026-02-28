@@ -1,8 +1,16 @@
 import { Activity, CheckCircle, XCircle } from 'lucide-react'
 import PipelineEventNode from '../PipelineEventNode'
 
+const KNOWN_STATUSES = new Set(['running', 'completed', 'failed', undefined])
+
 export default function AgentExecutionNode({ data }) {
+  if (!data) return null
   const { status, isActive } = data
+
+  if (process.env.NODE_ENV !== 'production' && status !== undefined && !KNOWN_STATUSES.has(status)) {
+    console.warn(`AgentExecutionNode: unrecognised status "${status}" — add a style mapping or update KNOWN_STATUSES`)
+  }
+
   let nodeStyle, icon
   if (isActive || status === 'running') {
     nodeStyle = { background: '#1f6feb', borderColor: '#58a6ff', color: '#fff', border: '3px solid #58a6ff' }

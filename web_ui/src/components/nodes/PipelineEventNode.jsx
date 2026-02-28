@@ -11,8 +11,13 @@ import { Handle, Position } from '@xyflow/react'
  * nodeTypes map, so unknown event types degrade gracefully with a neutral style.
  *
  * Composition pattern — each level wraps the one above:
- *   ReactFlow → LeafNode(data) → IntermediaryNode(data, nodeStyle?, icon?)
- *             → … → PipelineEventNode(data, nodeStyle, icon)
+ *   ReactFlow → LeafNode({ data })
+ *             → IntermediaryNode({ data, nodeStyle?, icon? })
+ *             → … → PipelineEventNode({ data, nodeStyle, icon })
+ *
+ * Leaves only accept { data } from ReactFlow. They construct their own nodeStyle
+ * and icon and pass them down. Intermediaries merge their DEFAULT_STYLE with any
+ * incoming nodeStyle override, allowing sub-families to override parent colours.
  *
  * Props:
  *   data        - ReactFlow node data (label, metadata, isActive)
@@ -20,6 +25,7 @@ import { Handle, Position } from '@xyflow/react'
  *   icon        - ReactNode rendered to the left of the label
  */
 export default function PipelineEventNode({ data, nodeStyle, icon }) {
+  if (!data) return null
   const { label, metadata, isActive } = data
 
   const style = {
