@@ -8,6 +8,7 @@ import ReviewCycleContainerNode from '../components/ReviewCycleContainerNode'
 import RepairCycleContainerNode from '../components/RepairCycleContainerNode'
 import IterationContainerNode from '../components/IterationContainerNode'
 import LayoutController from '../components/LayoutController'
+import SmartPipelineEdge from '../components/SmartPipelineEdge'
 import ConfirmationModal from '../components/ConfirmationModal'
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import {
@@ -31,6 +32,10 @@ const nodeTypes = {
   reviewCycleContainer: ReviewCycleContainerNode,
   repairCycleContainer: RepairCycleContainerNode,
   iterationContainer: IterationContainerNode,
+}
+
+const edgeTypes = {
+  smart: SmartPipelineEdge,
 }
 
 const CYCLE_CONTAINER_TYPES = ['cycleBounding', 'reviewCycleContainer', 'repairCycleContainer']
@@ -666,6 +671,7 @@ function PipelineRunView() {
                       onNodeMouseEnter={onNodeMouseEnter}
                       onNodeMouseLeave={onNodeMouseLeave}
                       nodeTypes={nodeTypes}
+                      edgeTypes={edgeTypes}
                       nodesDraggable={selectedPipelineRun?.status !== 'active'}
                       nodesConnectable={false}
                       fitView

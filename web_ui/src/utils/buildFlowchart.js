@@ -341,7 +341,7 @@ export function buildFlowchart({
         id: `edge-${source}-${target}`,
         source,
         target,
-        type: 'smoothstep',
+        type: 'smart',
         markerEnd: { type: MarkerType.ArrowClosed, color: '#6e7681' },
         style: { stroke: '#6e7681' },
       })

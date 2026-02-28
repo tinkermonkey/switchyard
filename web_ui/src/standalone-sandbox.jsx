@@ -5,6 +5,7 @@ import ReviewCycleContainerNode from './components/ReviewCycleContainerNode'
 import RepairCycleContainerNode from './components/RepairCycleContainerNode'
 import IterationContainerNode from './components/IterationContainerNode'
 import LayoutController from './components/LayoutController'
+import SmartPipelineEdge from './components/SmartPipelineEdge'
 import { useState, useEffect, useCallback } from 'react'
 import {
   ReactFlow,
@@ -23,6 +24,10 @@ const nodeTypes = {
   reviewCycleContainer: ReviewCycleContainerNode,
   repairCycleContainer: RepairCycleContainerNode,
   iterationContainer: IterationContainerNode,
+}
+
+const edgeTypes = {
+  smart: SmartPipelineEdge,
 }
 
 const CYCLE_CONTAINER_TYPES = ['cycleBounding', 'reviewCycleContainer', 'repairCycleContainer']
@@ -256,6 +261,7 @@ export default function StandaloneSandbox() {
               onNodesChange={onNodesChange}
               onEdgesChange={onEdgesChange}
               nodeTypes={nodeTypes}
+              edgeTypes={edgeTypes}
               nodesDraggable={true}
               nodesConnectable={false}
               fitView

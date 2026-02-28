@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "@dagrejs/dagre": "^1.1.5",
+    "@jalez/react-flow-smart-edge": "^4.0.0",
     "node-fetch": "^3.3.2",
     "react": "^19.1.1",
     "react-dom": "^19.1.1"
