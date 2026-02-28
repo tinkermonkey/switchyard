@@ -174,6 +174,7 @@ export default function PipelineFlowGraph({
               setNodes={setNodes}
               setEdges={setEdges}
               onLayoutDone={onLayoutDone}
+              containerHeight={height}
             />
             <Background />
             <Controls />

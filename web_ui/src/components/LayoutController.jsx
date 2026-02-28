@@ -10,12 +10,16 @@ import { applyCycleLayout, updateEdgesForCycles } from '../utils/cycleLayout'
  *   Phase 2 (here):   reads node.measured dimensions → runs applyCycleLayout → sets final nodes
  *
  * Props:
- *   rawBuild      { nodes, edges, agentExecutions, updatedCycles } from buildFlowchart
- *   layoutOptions  params object passed to applyCycleLayout
- *   finalizeNodes  (layoutedNodes) => finalNodes  — caller injects draggable/callbacks
- *   setNodes       from useNodesState
- *   setEdges       from useEdgesState
- *   onLayoutDone   optional (finalNodes) => void  — called after each layout pass
+ *   rawBuild        { nodes, edges, agentExecutions, updatedCycles } from buildFlowchart
+ *   layoutOptions   params object passed to applyCycleLayout
+ *   finalizeNodes   (layoutedNodes) => finalNodes  — caller injects draggable/callbacks
+ *   setNodes        from useNodesState
+ *   setEdges        from useEdgesState
+ *   onLayoutDone    optional (finalNodes) => void  — called after each layout pass
+ *   containerHeight optional — the height of the ReactFlow container (number or string).
+ *                   When this changes after initial layout (e.g. dynamic chartHeight in
+ *                   pipeline-run), fitView is re-called so the graph stays centred in the
+ *                   newly-sized container.
  */
 export default function LayoutController({
   rawBuild,
@@ -24,6 +28,7 @@ export default function LayoutController({
   setNodes,
   setEdges,
   onLayoutDone,
+  containerHeight,
 }) {
   const { getNodes, fitView } = useReactFlow()
   const nodesInitialized = useNodesInitialized()
@@ -84,6 +89,14 @@ export default function LayoutController({
     if (!rawBuildRef.current || !layoutDone.current) return
     runLayout()
   }, [layoutOptions, runLayout])
+
+  // Re-fit view when the container is resized after layout (e.g. dynamic chartHeight
+  // in pipeline-run grows after onLayoutDone fires). React Flow's ResizeObserver
+  // processes the container size change asynchronously, so we give it a short delay.
+  useEffect(() => {
+    if (!layoutDone.current) return
+    setTimeout(() => fitView({ padding: 0.1, duration: 300 }), 50)
+  }, [containerHeight, fitView])
 
   return null
 }
