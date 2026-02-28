@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useMemo } from 'react'
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import {
   ReactFlow,
   Controls,
@@ -94,6 +94,7 @@ export default function PipelineFlowGraph({
   const [edges, setEdges, onEdgesChange] = useEdgesState([])
   const [hoveredNode, setHoveredNode] = useState(null)
   const [layoutReady, setLayoutReady] = useState(false)
+  const prevNodesCountRef = useRef(0)
 
   // Merge caller overrides with canonical defaults so every param is always defined.
   // Memoized so the reference is stable — prevents LayoutController's param-change
@@ -106,11 +107,17 @@ export default function PipelineFlowGraph({
   // Phase 1: set raw unpositioned nodes for React Flow to render and measure
   useEffect(() => {
     if (!rawBuild || rawBuild.nodes.length === 0) {
+      prevNodesCountRef.current = 0
       setNodes([])
       setEdges([])
+      setLayoutReady(false)
       return
     }
-    setLayoutReady(false)
+    // Hide graph only on fresh start; keep visible for incremental live updates.
+    if (prevNodesCountRef.current === 0) {
+      setLayoutReady(false)
+    }
+    prevNodesCountRef.current = rawBuild.nodes.length
     setNodes(rawBuild.nodes)
   }, [rawBuild, setNodes, setEdges])
 

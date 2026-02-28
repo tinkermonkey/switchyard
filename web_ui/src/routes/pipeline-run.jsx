@@ -305,12 +305,12 @@ function PipelineRunView() {
     return false
   }, [mergedEvents])
 
-  // Build raw (unpositioned) flowchart
+  // Throttle ref for rawBuild updates (≤ 2/sec during heavy socket activity)
+  const rawBuildThrottleRef = useRef({ timer: null, lastRun: 0, pendingFn: null })
+
+  // Build raw (unpositioned) flowchart — pure, returns result
   const buildRawFlowchart = useCallback(() => {
-    if (!mergedEvents.length || !selectedPipelineRun) {
-      setRawBuild(null)
-      return
-    }
+    if (!mergedEvents.length || !selectedPipelineRun) return null
 
     const activeAgents = new Set()
     socketEventsRef.current
@@ -320,15 +320,13 @@ function PipelineRunView() {
       .filter(e => ['agent_completed', 'agent_failed'].includes(e.event_type))
       .forEach(e => activeAgents.delete(e.agent))
 
-    const result = buildFlowchartUtil({
+    return buildFlowchartUtil({
       events: mergedEvents,
       existingCycles: cycles,
       workflowConfig,
       selectedPipelineRun,
       activeAgentNames: activeAgents,
     })
-
-    setRawBuild(result)
   }, [mergedEvents, selectedPipelineRun, cycles, workflowConfig])
 
   const handleDownloadDebugData = useCallback(() => {
@@ -401,10 +399,36 @@ function PipelineRunView() {
     })
   }, [mergedEvents])
 
-  // Rebuild flowchart when events or config change
+  // Rebuild flowchart when events or config change — throttled to ≤ 2/sec
   useEffect(() => {
-    buildRawFlowchart()
+    const throttle = rawBuildThrottleRef.current
+    throttle.pendingFn = buildRawFlowchart  // always points to latest fn
+
+    const now = Date.now()
+    const elapsed = now - throttle.lastRun
+
+    if (elapsed >= 500) {
+      // Leading edge — apply immediately
+      throttle.lastRun = now
+      setRawBuild(buildRawFlowchart() ?? null)
+    } else if (!throttle.timer) {
+      // Within window — schedule trailing update
+      throttle.timer = setTimeout(() => {
+        throttle.timer = null
+        throttle.lastRun = Date.now()
+        setRawBuild(throttle.pendingFn?.() ?? null)
+      }, 500 - elapsed)
+    }
+    // else: timer already scheduled; pendingFn updated above
   }, [buildRawFlowchart])
+
+  // Cleanup throttle timer on unmount
+  useEffect(() => {
+    return () => {
+      const { timer } = rawBuildThrottleRef.current
+      if (timer) clearTimeout(timer)
+    }
+  }, [])
 
   // Update on socket events
   useEffect(() => {
