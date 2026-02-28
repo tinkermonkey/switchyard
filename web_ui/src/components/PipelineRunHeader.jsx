@@ -73,7 +73,7 @@ export default function PipelineRunHeader({
           </p>
         </div>
 
-        <div className="flex gap-2 flex-shrink-0">
+        <div className="flex divide-x divide-gh-border border border-gh-border rounded overflow-hidden flex-shrink-0">
           {latestAgentExecutionId && (
             <button
               onClick={() => navigate({
@@ -81,16 +81,16 @@ export default function PipelineRunHeader({
                 params: { executionId: latestAgentExecutionId },
                 search: { autoAdvance: true },
               })}
-              className="inline-flex items-center gap-2 px-3 py-1.5 text-sm bg-gh-canvas border border-gh-border rounded hover:bg-gh-border-muted transition-colors whitespace-nowrap"
+              className="inline-flex items-center gap-2 px-3 py-1.5 text-sm bg-gh-canvas hover:bg-gh-border-muted transition-colors whitespace-nowrap"
             >
-              <span>View Latest Agent Execution</span>
               <ArrowRight className="w-4 h-4" />
+              <span>View Execution</span>
             </button>
           )}
           {pipelineRun.status === 'active' && (
             <button
               onClick={onKillRun}
-              className="px-3 py-1.5 text-sm bg-red-900/20 border border-red-800 text-red-400 rounded hover:bg-red-900/40 transition-colors whitespace-nowrap flex items-center gap-1"
+              className="inline-flex items-center gap-2 px-3 py-1.5 text-sm bg-gh-canvas hover:bg-gh-border-muted transition-colors whitespace-nowrap text-red-400"
               title="Kill this pipeline run"
             >
               <XCircle className="w-4 h-4" />
@@ -99,7 +99,7 @@ export default function PipelineRunHeader({
           )}
           <button
             onClick={onDownloadDebugData}
-            className="px-3 py-1.5 text-sm bg-gh-canvas-subtle border border-gh-border rounded hover:bg-gh-border-muted transition-colors whitespace-nowrap"
+            className="inline-flex items-center gap-2 px-3 py-1.5 text-sm bg-gh-canvas hover:bg-gh-border-muted transition-colors whitespace-nowrap"
             title="Download debug data as JSON"
           >
             📥 Download
