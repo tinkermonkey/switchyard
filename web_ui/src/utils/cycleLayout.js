@@ -33,7 +33,7 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
     nodeHeight = 80,
     horizontalSpacing = 150,
     verticalSpacing = 120,
-    cycleGap = 40,
+    cycleGap = 100,
     cyclePadding = 40,
     // Iteration / grandchild layout constants
     iterHeaderHeight = 24, // height of the iteration pill label
@@ -274,27 +274,6 @@ export function toggleCycleCollapsed(cycles, cycleId) {
   }
   
   return updatedCycles
-}
-
-/**
- * Filters edges to hide edges connected to collapsed cycle nodes
- * @param {Array} edges - All edges
- * @param {Map} cycles - Map of cycles
- * @returns {Array} Filtered edges
- */
-export function filterEdgesForCollapsedCycles(edges, cycles) {
-  return edges.filter(edge => {
-    // Check if source or target is inside a collapsed cycle
-    for (const [agent, cycleData] of cycles.entries()) {
-      if (cycleData.isCollapsed) {
-        const cyclePrefix = `agent-${agent}-`
-        if (edge.source.startsWith(cyclePrefix) || edge.target.startsWith(cyclePrefix)) {
-          return false // Hide edge
-        }
-      }
-    }
-    return true // Show edge
-  })
 }
 
 /**
