@@ -53,7 +53,6 @@ function PipelineRunView() {
   const [selectedTab, setSelectedTab] = useState('active')
   const [completedOffset, setCompletedOffset] = useState(0)
   const [hasMoreCompleted, setHasMoreCompleted] = useState(true)
-  const [chartHeight, setChartHeight] = useState(600)
   const [legendOpen, setLegendOpen] = useState(true)
   const [rawBuild, setRawBuild] = useState(null)
   const [cycles, setCycles] = useState(new Map())
@@ -259,12 +258,6 @@ function PipelineRunView() {
     setRawBuild(result)
   }, [mergedEvents, selectedPipelineRun, cycles, workflowConfig])
 
-  // Compute chart height after layout is applied
-  const onLayoutDone = useCallback((finalNodes) => {
-    const maxY = Math.max(...finalNodes.map(n => n.position.y + (n.style?.height ?? 80)))
-    setChartHeight(Math.max(600, maxY + 100))
-  }, [])
-
   // Initial load
   useEffect(() => {
     fetchActivePipelineRuns(true)
@@ -326,10 +319,10 @@ function PipelineRunView() {
   }, [socketEvents])
 
   return (
-    <div className="min-h-screen p-5 bg-gh-canvas text-gh-fg">
+    <div className="h-screen flex flex-col p-5 bg-gh-canvas text-gh-fg">
       <Header />
 
-      <div className="flex items-center justify-between my-3">
+      <div className="flex items-center justify-between my-3 flex-shrink-0">
         <NavigationTabs />
         <button
           onClick={fetchActivePipelineRuns}
@@ -341,9 +334,9 @@ function PipelineRunView() {
         </button>
       </div>
 
-      <div className="flex gap-4">
+      <div className="flex gap-4 flex-1 min-h-0">
         {/* Pipeline Run Selector */}
-        <div className="w-64 bg-gh-canvas-subtle rounded-md border border-gh-border p-4">
+        <div className="w-64 flex-shrink-0 bg-gh-canvas-subtle rounded-md border border-gh-border p-4 overflow-y-auto">
           <h3 className="text-lg font-semibold mb-3">Pipeline Runs</h3>
 
           {/* Tabs */}
@@ -492,11 +485,11 @@ function PipelineRunView() {
         </div>
 
         {/* Pipeline Run Flowchart */}
-        <div className="flex-1 bg-gh-canvas-subtle rounded-md border border-gh-border p-4 flex gap-4">
-          <div className="flex-1">
+        <div className="flex-1 bg-gh-canvas-subtle rounded-md border border-gh-border p-4 flex gap-4 min-h-0">
+          <div className="flex-1 flex flex-col min-h-0">
             {selectedPipelineRun ? (
               <>
-                <div className="mb-4 flex items-start justify-between">
+                <div className="mb-4 flex items-start justify-between flex-shrink-0">
                   <div>
                     <div className="flex items-center gap-3">
                       <h2 className="text-xl font-semibold">{selectedPipelineRun.issue_title}</h2>
@@ -568,21 +561,22 @@ function PipelineRunView() {
                   </div>
                 </div>
 
-                <PipelineFlowGraph
-                  rawBuild={rawBuild}
-                  onToggleCycle={handleToggleCycle}
-                  nodesDraggable={selectedPipelineRun.status !== 'active'}
-                  allowResizing={selectedPipelineRun.status !== 'active'}
-                  minZoom={0.5}
-                  maxZoom={1.5}
-                  height={chartHeight}
-                  loading={loadingEvents}
-                  emptyMessage="No events found for this pipeline run"
-                  onLayoutDone={onLayoutDone}
-                />
+                <div className="flex-1 min-h-0 overflow-hidden">
+                  <PipelineFlowGraph
+                    rawBuild={rawBuild}
+                    onToggleCycle={handleToggleCycle}
+                    nodesDraggable={selectedPipelineRun.status !== 'active'}
+                    allowResizing={selectedPipelineRun.status !== 'active'}
+                    minZoom={0.5}
+                    maxZoom={1.5}
+                    height="100%"
+                    loading={loadingEvents}
+                    emptyMessage="No events found for this pipeline run"
+                  />
+                </div>
               </>
             ) : (
-              <div className="flex items-center justify-center h-96">
+              <div className="flex items-center justify-center h-full">
                 <p className="text-gh-fg-muted">Select a pipeline run to view its flowchart</p>
               </div>
             )}
@@ -606,7 +600,7 @@ function PipelineRunView() {
             </div>
 
             {legendOpen && (
-              <div className="p-3 space-y-4 overflow-y-auto" style={{ maxHeight: `${chartHeight}px` }}>
+              <div className="p-3 space-y-4 overflow-y-auto">
                 <div>
                   <h4 className="text-xs font-semibold mb-2 text-gh-fg-muted">Pipeline States</h4>
                   <div className="space-y-2 text-xs">
