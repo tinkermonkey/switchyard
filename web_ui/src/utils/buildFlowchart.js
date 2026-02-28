@@ -119,6 +119,7 @@ export function buildFlowchart({
         status: execution.status,
         metadata: isActive ? 'Running' : execution.status,
         isActive,
+        startTime: event.timestamp,
       },
       draggable: false,
     }
@@ -224,6 +225,7 @@ export function buildFlowchart({
             type: 'iterationContainer',
             parentId: cycle.id,
             position: { x: 0, y: 0 },
+            zIndex: 1,
             data: {
               iterationNumber: iteration.number,
               label: `Iteration ${iteration.number}`,
@@ -286,6 +288,7 @@ export function buildFlowchart({
             type: 'iterationContainer',
             parentId: cycle.id,
             position: { x: 0, y: 0 },
+            zIndex: 1,
             data: {
               iterationNumber: tc.number,
               label: tc.testType,
@@ -305,6 +308,7 @@ export function buildFlowchart({
               type: 'subCycleContainer',
               parentId: tcId,
               position: { x: 0, y: 0 },
+              zIndex: 1,
               data: {
                 label: sc.label,
                 cycleType: sc.cycleType,

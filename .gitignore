@@ -42,6 +42,9 @@ temp/
 *.tmp
 *.backup
 
+# Apple!!!
+.DS_Store
+
 # But DO track these:
 !config/pipelines.yaml
 !config/agents.yaml
