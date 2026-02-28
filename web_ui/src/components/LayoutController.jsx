@@ -47,6 +47,14 @@ export default function LayoutController({
     const measuredNodes = getNodes()
     if (measuredNodes.length === 0) return
 
+    // Guard: ensure measured nodes belong to the current rawBuild.
+    // If rawBuild changed but Phase 1 hasn't run yet, getNodes() still returns
+    // the previous layout's nodes — bail out so the correct Phase 2 fires later.
+    const rawNodeIds = new Set(rb.nodes.map(n => n.id))
+    if (measuredNodes.length !== rawNodeIds.size || !measuredNodes.every(n => rawNodeIds.has(n.id))) {
+      return
+    }
+
     const { nodes: layoutedNodes } = applyCycleLayout(
       measuredNodes, rb.edges, rb.updatedCycles, layoutOptionsRef.current
     )

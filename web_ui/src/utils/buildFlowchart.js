@@ -194,6 +194,9 @@ export function buildFlowchart({
           endTime: cycle.endEvent?.timestamp,
         },
         style: { width: 0, height: 0 }, // sized by applyCycleLayout
+        // Non-zero measured prevents RF's updateNodeInternals (which requires width>0) from
+        // blocking nodesInitialized. Phase 2 overwrites with correct style dimensions.
+        measured: { width: 1, height: 1 },
         draggable: false,
       }
       newNodes.push(rcNode)
@@ -227,6 +230,7 @@ export function buildFlowchart({
               eventCount: iteration.events.length + 1,
             },
             style: { width: 0, height: 0 }, // sized by applyCycleLayout
+            measured: { width: 1, height: 1 },
             draggable: false,
           }
           newNodes.push(iterNode)
@@ -265,6 +269,7 @@ export function buildFlowchart({
           endTime: cycle.endEvent?.timestamp,
         },
         style: { width: 0, height: 0 }, // sized by applyCycleLayout
+        measured: { width: 1, height: 1 },
         draggable: false,
       }
       newNodes.push(rpcNode)
@@ -291,6 +296,7 @@ export function buildFlowchart({
               eventCount: allTcEvents.length,
             },
             style: { width: 0, height: 0 }, // sized by applyCycleLayout
+            measured: { width: 1, height: 1 },
             draggable: false,
           }
           newNodes.push(tcNode)
