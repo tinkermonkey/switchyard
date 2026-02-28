@@ -22,6 +22,7 @@ export default function StandaloneSandbox() {
   const [isDragOver, setIsDragOver] = useState(false)
   const [error, setError] = useState(null)
   const [rawBuild, setRawBuild] = useState(null)
+  const [nodesDraggable, setNodesDraggable] = useState(false)
 
   const handleToggleCycle = useCallback((cycleId) => {
     setCycles(prev => toggleCycleCollapsed(prev, cycleId))
@@ -142,6 +143,20 @@ export default function StandaloneSandbox() {
             </div>
           )}
 
+          {/* Interaction Controls */}
+          <div>
+            <h3 className="text-sm font-semibold mb-3">Interaction</h3>
+            <label className="flex items-center gap-2 text-sm cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={nodesDraggable}
+                onChange={(e) => setNodesDraggable(e.target.checked)}
+                className="w-4 h-4 accent-gh-accent-primary"
+              />
+              Draggable &amp; resizable nodes
+            </label>
+          </div>
+
           {/* Layout Parameters */}
           <div>
             <h3 className="text-sm font-semibold mb-3">Layout Parameters</h3>
@@ -188,6 +203,8 @@ export default function StandaloneSandbox() {
               rawBuild={rawBuild}
               onToggleCycle={handleToggleCycle}
               layoutOptions={layoutParams}
+              nodesDraggable={nodesDraggable}
+              allowResizing={nodesDraggable}
               height="100%"
               emptyMessage="No renderable events found in the debug data"
             />
