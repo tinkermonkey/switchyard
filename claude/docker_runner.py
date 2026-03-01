@@ -656,7 +656,7 @@ class DockerAgentRunner:
         ])
         
         # Pass PIPELINE_RUN_ID if available in context (for event tracking)
-        pipeline_run_id = context.get('pipeline_run_id')
+        pipeline_run_id = task_context.get('pipeline_run_id') or context.get('pipeline_run_id')
         if pipeline_run_id:
             cmd.extend(['-e', f'PIPELINE_RUN_ID={pipeline_run_id}'])
             logger.info(f"Passing PIPELINE_RUN_ID={pipeline_run_id} to agent container")
