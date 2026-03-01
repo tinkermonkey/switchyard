@@ -242,17 +242,11 @@ function PipelineRunView() {
       const data = await response.json()
 
       if (data.success) {
-        setPipelineRunEvents(currentEvents => {
-          const newEventsWithKeys = data.events.map((event, idx) => ({
-            ...event,
-            _key: event.id || `${event.timestamp}_${idx}`
-          }))
-          const currentEventsWithKeys = currentEvents.map((event, idx) => ({
-            ...event,
-            _key: event.id || event._key || `${event.timestamp}_${idx}`
-          }))
-          return mergeArrayByIdStable(currentEventsWithKeys, newEventsWithKeys, '_key')
-        })
+        const newEventsWithKeys = data.events.map((event, idx) => ({
+          ...event,
+          _key: event.id || `${event.timestamp}_${idx}`
+        }))
+        setPipelineRunEvents(newEventsWithKeys)
       }
     } catch (error) {
       console.error('Error fetching pipeline run events:', error)
@@ -346,10 +340,12 @@ function PipelineRunView() {
 
     const activeAgents = new Set()
     socketEventsRef.current
-      .filter(e => e.event_type === 'agent_initialized')
+      .filter(e => e.event_type === 'agent_initialized' &&
+        (e.pipeline_run_id || e.data?.pipeline_run_id) === selectedPipelineRun.id)
       .forEach(e => activeAgents.add(e.agent))
     socketEventsRef.current
-      .filter(e => ['agent_completed', 'agent_failed'].includes(e.event_type))
+      .filter(e => ['agent_completed', 'agent_failed'].includes(e.event_type) &&
+        (e.pipeline_run_id || e.data?.pipeline_run_id) === selectedPipelineRun.id)
       .forEach(e => activeAgents.delete(e.agent))
 
     return buildFlowchartUtil({
@@ -406,6 +402,7 @@ function PipelineRunView() {
   // Load events when pipeline run selected
   useEffect(() => {
     if (selectedPipelineRun) {
+      setPipelineRunEvents([])
       fetchPipelineRunEvents(selectedPipelineRun.id)
       fetchWorkflowConfig(selectedPipelineRun.project, selectedPipelineRun.board)
     }
