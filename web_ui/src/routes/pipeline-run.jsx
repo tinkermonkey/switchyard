@@ -1,5 +1,5 @@
 import { createFileRoute } from '@tanstack/react-router'
-import { RefreshCw } from 'lucide-react'
+import { RefreshCw, Minimize2 } from 'lucide-react'
 import Header from '../components/Header'
 import NavigationTabs from '../components/NavigationTabs'
 import PipelineFlowGraph from '../components/PipelineFlowGraph'
@@ -34,6 +34,7 @@ function PipelineRunView() {
   const [rawBuild, setRawBuild] = useState(null)
   const [cycles, setCycles] = useState(new Map())
   const [showKillModal, setShowKillModal] = useState(false)
+  const [isFullscreen, setIsFullscreen] = useState(false)
   const [activeFilters, setActiveFilters] = useState({ project: '', board: '', outcome: '' })
   const [filterOptions, setFilterOptions] = useState({ projects: [], boards: [], outcomes: [] })
   const completedLimit = 10
@@ -277,6 +278,8 @@ function PipelineRunView() {
     }
   }, [selectedPipelineRun, fetchActivePipelineRuns, fetchCompletedPipelineRuns])
 
+  const toggleFullscreen = useCallback(() => setIsFullscreen(prev => !prev), [])
+
   const handleToggleCycle = useCallback((cycleId) => {
     setCycles(prevCycles => toggleCycleCollapsed(prevCycles, cycleId))
   }, [])
@@ -519,22 +522,34 @@ function PipelineRunView() {
       </div>
 
       <div className="flex gap-4 flex-1 min-h-0">
-        <PipelineRunSidebar
-          activePipelineRuns={activePipelineRuns}
-          completedPipelineRuns={completedPipelineRuns}
-          selectedPipelineRun={selectedPipelineRun}
-          loading={loading}
-          loadingCompleted={loadingCompleted}
-          hasMoreCompleted={hasMoreCompleted}
-          onSelectRun={handleSelectRun}
-          onLoadMore={loadMoreCompleted}
-          activeFilters={activeFilters}
-          onFiltersChange={setActiveFilters}
-          filterOptions={filterOptions}
-        />
+        {!isFullscreen && (
+          <PipelineRunSidebar
+            activePipelineRuns={activePipelineRuns}
+            completedPipelineRuns={completedPipelineRuns}
+            selectedPipelineRun={selectedPipelineRun}
+            loading={loading}
+            loadingCompleted={loadingCompleted}
+            hasMoreCompleted={hasMoreCompleted}
+            onSelectRun={handleSelectRun}
+            onLoadMore={loadMoreCompleted}
+            activeFilters={activeFilters}
+            onFiltersChange={setActiveFilters}
+            filterOptions={filterOptions}
+            onToggleFullscreen={toggleFullscreen}
+          />
+        )}
 
         {/* Main Content Area */}
-        <div className="flex-1 bg-gh-canvas-subtle rounded-md border border-gh-border p-4 flex flex-col min-h-0">
+        <div className={`relative bg-gh-canvas-subtle border border-gh-border p-4 flex flex-col ${isFullscreen ? 'fixed inset-0 z-50 rounded-none' : 'flex-1 min-h-0 rounded-md'}`}>
+          {isFullscreen && (
+            <button
+              onClick={toggleFullscreen}
+              className="absolute top-3 right-3 z-10 p-1.5 rounded bg-gh-canvas border border-gh-border hover:bg-gh-border-muted transition-colors text-gh-fg-muted hover:text-gh-fg"
+              title="Exit fullscreen"
+            >
+              <Minimize2 className="w-4 h-4" />
+            </button>
+          )}
           {selectedPipelineRun ? (
             <>
               <PipelineRunHeader

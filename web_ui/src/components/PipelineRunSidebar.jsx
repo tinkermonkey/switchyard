@@ -1,5 +1,5 @@
 import { memo, useRef, useLayoutEffect, useEffect, useMemo } from 'react'
-import { RefreshCw, Activity, CheckCircle } from 'lucide-react'
+import { RefreshCw, Activity, CheckCircle, Maximize2 } from 'lucide-react'
 import { formatDuration, formatRunDuration } from '../utils/stateHelpers'
 
 // Memoized run list item — only re-renders when run object or selection changes
@@ -54,6 +54,7 @@ export default function PipelineRunSidebar({
   activeFilters,
   onFiltersChange,
   filterOptions,
+  onToggleFullscreen,
 }) {
   const completedListScrollRef = useRef(null)
   const savedCompletedScrollPos = useRef(0)
@@ -108,7 +109,16 @@ export default function PipelineRunSidebar({
 
   return (
     <div className="w-64 flex-shrink-0 bg-gh-canvas-subtle rounded-md border border-gh-border p-4 flex flex-col min-h-0">
-      <h3 className="text-lg font-semibold mb-3 flex-shrink-0">Pipeline Runs</h3>
+      <div className="flex items-center gap-2 mb-3 flex-shrink-0">
+        <button
+          onClick={onToggleFullscreen}
+          className="p-1 rounded hover:bg-gh-border-muted transition-colors text-gh-fg-muted hover:text-gh-fg"
+          title="Expand to fullscreen"
+        >
+          <Maximize2 className="w-4 h-4" />
+        </button>
+        <h3 className="text-lg font-semibold">Pipeline Runs</h3>
+      </div>
 
       {/* Active section */}
       <div className="flex-shrink-0">
