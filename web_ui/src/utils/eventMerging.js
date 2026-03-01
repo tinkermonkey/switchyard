@@ -163,78 +163,35 @@ export const mergePipelineRunEvents = (apiEvents, webSocketEvents, pipelineRun) 
   const startTimestamp = normalizeTimestamp(pipelineRun.started_at)
   const endTimestamp = pipelineRun.ended_at ? normalizeTimestamp(pipelineRun.ended_at) : null
 
-  console.log('[EventMerging] mergePipelineRunEvents called:', {
-    pipelineRunId: pipelineRunId.substring(0, 8),
-    apiEventsCount: apiEvents.length,
-    webSocketEventsCount: webSocketEvents.length,
-    startTimestamp,
-    endTimestamp
-  })
+  // Build a dedup key set from API events.
+  // WebSocket events lack event_id in their ES-indexed counterparts, so use a
+  // composite key: timestamp + event_type + task_id — unique for all real events.
+  const apiEventKeys = new Set(
+    apiEvents.map(e => `${e.timestamp}_${e.event_type}_${e.task_id || ''}`)
+  )
 
-  // Start with API events as baseline
-  let events = [...apiEvents]
-
-  // Find the latest timestamp in API events to avoid duplicates
-  const lastApiEventTimestamp = apiEvents.length > 0
-    ? Math.max(...apiEvents.map(event => normalizeTimestamp(event.timestamp) || 0))
-    : startTimestamp
-
-  console.log('[EventMerging] Last API event timestamp:', lastApiEventTimestamp)
-
-  // Filter WebSocket events for this pipeline run that are newer than API events
+  // Filter WebSocket events for this pipeline run, excluding any already present
+  // in the API snapshot.
   const newWebSocketEvents = webSocketEvents.filter(event => {
-    // Check if event is related to this pipeline run
-    // Pipeline run events have pipeline_run_id in their data or at top level
     const eventPipelineRunId = event.data?.pipeline_run_id || event.pipeline_run_id
-
-    // Log events for debugging (only first 3)
-    if (webSocketEvents.indexOf(event) < 3) {
-      console.log('[EventMerging] Checking WebSocket event:', {
-        event_type: event.event_type,
-        eventPipelineRunId: eventPipelineRunId?.substring(0, 8),
-        targetPipelineRunId: pipelineRunId.substring(0, 8),
-        matches: eventPipelineRunId === pipelineRunId,
-        timestamp: normalizeTimestamp(event.timestamp)
-      })
-    }
-
     if (eventPipelineRunId !== pipelineRunId) return false
 
     const eventTimestamp = normalizeTimestamp(event.timestamp)
     if (!eventTimestamp || !startTimestamp) return false
     if (eventTimestamp < startTimestamp) return false
     if (endTimestamp && eventTimestamp > endTimestamp) return false
-    // Only include events AFTER the last API event to avoid duplicates
-    if (eventTimestamp <= lastApiEventTimestamp) {
-      console.log('[EventMerging] Filtering out duplicate event:', {
-        event_type: event.event_type,
-        eventTimestamp,
-        lastApiEventTimestamp
-      })
-      return false
-    }
-    return true
+
+    const key = `${event.timestamp}_${event.event_type}_${event.task_id || ''}`
+    return !apiEventKeys.has(key)
   })
 
-  console.log('[EventMerging] Filtered WebSocket events:', {
-    filteredCount: newWebSocketEvents.length,
-    sampleEvents: newWebSocketEvents.slice(0, 3).map(e => ({
-      event_type: e.event_type,
-      timestamp: normalizeTimestamp(e.timestamp)
-    }))
-  })
+  const events = [...apiEvents, ...newWebSocketEvents]
 
-  // WebSocket events are already in the correct format, just append them
-  events = [...events, ...newWebSocketEvents]
-
-  // Sort by timestamp
   events.sort((a, b) => {
     const tsA = normalizeTimestamp(a.timestamp) || 0
     const tsB = normalizeTimestamp(b.timestamp) || 0
     return tsA - tsB
   })
-
-  console.log('[EventMerging] Final merged events count:', events.length)
 
   return events
 }

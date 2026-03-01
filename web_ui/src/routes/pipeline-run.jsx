@@ -495,14 +495,11 @@ function PipelineRunView() {
       ]
 
       if (pipelineEventTypes.includes(latestEvent.event_type)) {
-        if (selectedPipelineRunRef.current) {
-          fetchPipelineRunEvents(selectedPipelineRunRef.current.id)
-        }
         fetchActivePipelineRuns(false)
         fetchCompletedPipelineRuns(0, false, null, activeFiltersRef.current)
       }
     }
-  }, [socketEvents, fetchPipelineRunEvents, fetchActivePipelineRuns, fetchCompletedPipelineRuns])
+  }, [socketEvents, fetchActivePipelineRuns, fetchCompletedPipelineRuns])
 
   return (
     <div className="h-screen flex flex-col p-5 bg-gh-canvas text-gh-fg">
