@@ -584,44 +584,19 @@ function PipelineRunEventLog({ pipelineRun, events: initialEvents = [], isActive
     return [...events].sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp))
   }, [events])
   
-  if (!pipelineRun) {
-    return (
-      <div className="flex items-center justify-center h-96 text-gh-fg-muted">
-        Select a pipeline run to view events
-      </div>
-    )
-  }
-  
+  if (!pipelineRun) return null
+
   return (
-    <div className="bg-gh-canvas-subtle rounded-md border border-gh-border">
-      <div className="p-4 border-b border-gh-border">
-        <h2 className="text-xl font-semibold">{pipelineRun.issue_title}</h2>
-        <p className="text-sm text-gh-fg-muted mt-1">
-          {pipelineRun.project} • Issue #{pipelineRun.issue_number} • Board: {pipelineRun.board} • Status: {pipelineRun.status}  • ID {pipelineRun.id}
-        </p>
-        <p className="text-sm text-gh-fg-muted">
-          Started: {new Date(pipelineRun.started_at).toLocaleString()}
-          {pipelineRun.ended_at && ` • Ended: ${new Date(pipelineRun.ended_at).toLocaleString()}`}
-        </p>
-        <div className="mt-2 flex items-center gap-2">
-          <div className={`w-2 h-2 rounded-full ${isActive ? 'bg-green-500 animate-pulse' : 'bg-gray-500'}`} />
-          <span className="text-xs text-gh-fg-muted">
-            {isActive ? 'Active - Live Updating' : 'Completed'} • {sortedEvents.length} events
-          </span>
+    <div>
+      {sortedEvents.length === 0 ? (
+        <div className="flex items-center justify-center h-96 text-gh-fg-muted">
+          No events found for this pipeline run
         </div>
-      </div>
-      
-      <div className="">
-        {sortedEvents.length === 0 ? (
-          <div className="flex items-center justify-center h-96 text-gh-fg-muted">
-            No events found for this pipeline run
-          </div>
-        ) : (
-          <div className="relative">
-            {sortedEvents.map(event => getEventComponent(event, handleIconClick))}
-          </div>
-        )}
-      </div>
+      ) : (
+        <div className="relative">
+          {sortedEvents.map(event => getEventComponent(event, handleIconClick))}
+        </div>
+      )}
 
       {/* Event JSON Modal */}
       {selectedEventForModal && (

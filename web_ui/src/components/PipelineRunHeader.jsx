@@ -65,12 +65,18 @@ export default function PipelineRunHeader({
             )}
           </div>
           <p className="text-sm text-gh-fg-muted mt-1">
-            {pipelineRun.project} • Issue #{pipelineRun.issue_number} • Board: {pipelineRun.board}
+            {pipelineRun.project} • Issue #{pipelineRun.issue_number} • Board: {pipelineRun.board} • Status: {pipelineRun.status} • ID: {pipelineRun.id}
           </p>
           <p className="text-sm text-gh-fg-muted">
             Started: {new Date(pipelineRun.started_at).toLocaleString()}
             {pipelineRun.ended_at && ` • Ended: ${new Date(pipelineRun.ended_at).toLocaleString()}`}
           </p>
+          <div className="mt-1 flex items-center gap-2">
+            <div className={`w-2 h-2 rounded-full ${pipelineRun.status === 'active' ? 'bg-green-500 animate-pulse' : 'bg-gray-500'}`} />
+            <span className="text-xs text-gh-fg-muted">
+              {pipelineRun.status === 'active' ? 'Active - Live Updating' : 'Completed'}
+            </span>
+          </div>
         </div>
 
         <div className="flex divide-x divide-gh-border border border-gh-border rounded overflow-hidden flex-shrink-0">
