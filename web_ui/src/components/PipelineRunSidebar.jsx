@@ -1,4 +1,4 @@
-import { memo, useRef, useLayoutEffect, useEffect, useMemo, useState } from 'react'
+import { memo, useRef, useLayoutEffect, useEffect, useMemo } from 'react'
 import { RefreshCw, Activity, CheckCircle } from 'lucide-react'
 import { formatDuration, formatRunDuration } from '../utils/stateHelpers'
 
@@ -51,14 +51,15 @@ export default function PipelineRunSidebar({
   hasMoreCompleted,
   onSelectRun,
   onLoadMore,
+  activeFilters,
+  onFiltersChange,
+  filterOptions,
 }) {
   const completedListScrollRef = useRef(null)
   const savedCompletedScrollPos = useRef(0)
 
-  // Internal filter state
-  const [projectFilter, setProjectFilter] = useState('')
-  const [boardFilter, setBoardFilter] = useState('')
-  const [outcomeFilter, setOutcomeFilter] = useState('')
+  const { project: projectFilter, board: boardFilter, outcome: outcomeFilter } = activeFilters
+  const { projects: projectOptions, boards: boardOptions, outcomes: outcomeOptions } = filterOptions
 
   // Save completed scroll position continuously
   useEffect(() => {
@@ -81,37 +82,6 @@ export default function PipelineRunSidebar({
     }
   }, [completedPipelineRuns])
 
-  // Derive filter options from loaded completed runs
-  const projectOptions = useMemo(() => {
-    const values = [...new Set(completedPipelineRuns.map(r => r.project).filter(Boolean))]
-    return values.sort()
-  }, [completedPipelineRuns])
-
-  const boardOptions = useMemo(() => {
-    const values = [...new Set(completedPipelineRuns.map(r => r.board).filter(Boolean))]
-    return values.sort()
-  }, [completedPipelineRuns])
-
-  const outcomeOptions = useMemo(() => {
-    const values = [...new Set(completedPipelineRuns.map(r => r.outcome).filter(Boolean))]
-    const hasUnknown = completedPipelineRuns.some(r => !r.outcome)
-    if (hasUnknown) values.push('unknown')
-    return values.sort()
-  }, [completedPipelineRuns])
-
-  // Filtered completed runs (client-side)
-  const filteredCompleted = useMemo(() => {
-    return completedPipelineRuns.filter(run => {
-      if (projectFilter && run.project !== projectFilter) return false
-      if (boardFilter && run.board !== boardFilter) return false
-      if (outcomeFilter) {
-        if (outcomeFilter === 'unknown') return !run.outcome
-        return run.outcome === outcomeFilter
-      }
-      return true
-    })
-  }, [completedPipelineRuns, projectFilter, boardFilter, outcomeFilter])
-
   const activeRunsList = useMemo(() => {
     return activePipelineRuns.map(run => (
       <PipelineRunItem
@@ -124,7 +94,7 @@ export default function PipelineRunSidebar({
   }, [activePipelineRuns, selectedPipelineRun, onSelectRun])
 
   const completedRunsList = useMemo(() => {
-    return filteredCompleted.map(run => (
+    return completedPipelineRuns.map(run => (
       <PipelineRunItem
         key={run.id}
         run={run}
@@ -132,7 +102,7 @@ export default function PipelineRunSidebar({
         onClick={() => onSelectRun(run)}
       />
     ))
-  }, [filteredCompleted, selectedPipelineRun, onSelectRun])
+  }, [completedPipelineRuns, selectedPipelineRun, onSelectRun])
 
   const hasActiveFilters = projectFilter || boardFilter || outcomeFilter
 
@@ -172,18 +142,18 @@ export default function PipelineRunSidebar({
           <span className="text-sm font-medium">Completed</span>
           {completedPipelineRuns.length > 0 && (
             <span className="ml-auto text-xs bg-gh-canvas border border-gh-border rounded-full px-1.5 py-0.5 leading-none text-gh-fg-muted">
-              {hasActiveFilters ? `${filteredCompleted.length}/` : ''}{completedPipelineRuns.length}
+              {completedPipelineRuns.length}
             </span>
           )}
         </div>
 
         {/* Filters */}
-        {completedPipelineRuns.length > 0 && (
+        {(projectOptions.length > 1 || boardOptions.length > 1 || outcomeOptions.length > 0) && (
           <div className="flex flex-col gap-1 mb-2 flex-shrink-0">
             {projectOptions.length > 1 && (
               <select
                 value={projectFilter}
-                onChange={e => setProjectFilter(e.target.value)}
+                onChange={e => onFiltersChange({ ...activeFilters, project: e.target.value })}
                 className="w-full text-xs bg-gh-canvas border border-gh-border rounded px-2 py-1 text-gh-fg"
               >
                 <option value="">Project</option>
@@ -195,7 +165,7 @@ export default function PipelineRunSidebar({
             {boardOptions.length > 1 && (
               <select
                 value={boardFilter}
-                onChange={e => setBoardFilter(e.target.value)}
+                onChange={e => onFiltersChange({ ...activeFilters, board: e.target.value })}
                 className="w-full text-xs bg-gh-canvas border border-gh-border rounded px-2 py-1 text-gh-fg"
               >
                 <option value="">Board</option>
@@ -207,7 +177,7 @@ export default function PipelineRunSidebar({
             {outcomeOptions.length > 0 && (
               <select
                 value={outcomeFilter}
-                onChange={e => setOutcomeFilter(e.target.value)}
+                onChange={e => onFiltersChange({ ...activeFilters, outcome: e.target.value })}
                 className="w-full text-xs bg-gh-canvas border border-gh-border rounded px-2 py-1 text-gh-fg"
               >
                 <option value="">Outcome</option>
@@ -221,7 +191,7 @@ export default function PipelineRunSidebar({
 
         {loadingCompleted && completedPipelineRuns.length === 0 ? (
           <p className="text-gh-fg-muted text-xs px-1">Loading...</p>
-        ) : filteredCompleted.length === 0 ? (
+        ) : completedPipelineRuns.length === 0 ? (
           <p className="text-gh-fg-muted text-xs px-1">
             {hasActiveFilters ? 'No runs match filters' : 'No completed runs'}
           </p>
@@ -235,7 +205,7 @@ export default function PipelineRunSidebar({
               {completedRunsList}
             </div>
 
-            {hasMoreCompleted && !hasActiveFilters && (
+            {hasMoreCompleted && (
               <button
                 onClick={onLoadMore}
                 disabled={loadingCompleted}

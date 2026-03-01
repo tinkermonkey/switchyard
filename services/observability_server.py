@@ -1246,22 +1246,31 @@ def get_active_agents_from_pipelines():
 
 @app.route('/completed-pipeline-runs')
 def get_completed_pipeline_runs():
-    """Get completed pipeline runs with pagination"""
+    """Get completed pipeline runs with pagination and optional filters"""
     try:
         # Get pagination parameters
         limit = int(request.args.get('limit', 10))
         offset = int(request.args.get('offset', 0))
-        
+        project = request.args.get('project', None)
+        board = request.args.get('board', None)
+        outcome = request.args.get('outcome', None)
+
         # Cap limit to prevent excessive queries
         limit = min(limit, 100)
-        
+
+        filter_clauses = [{"term": {"status": "completed"}}]
+        if project:
+            filter_clauses.append({"term": {"project": project}})
+        if board:
+            filter_clauses.append({"term": {"board": board}})
+        if outcome == 'unknown':
+            filter_clauses.append({"bool": {"must_not": {"exists": {"field": "outcome"}}}})
+        elif outcome:
+            filter_clauses.append({"term": {"outcome": outcome}})
+
         # Query Elasticsearch for completed pipeline runs
         query = {
-            "query": {
-                "term": {
-                    "status": "completed"
-                }
-            },
+            "query": {"bool": {"filter": filter_clauses}},
             "sort": [{"ended_at": "desc"}],
             "from": offset,
             "size": limit

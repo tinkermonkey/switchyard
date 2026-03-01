@@ -34,6 +34,8 @@ function PipelineRunView() {
   const [rawBuild, setRawBuild] = useState(null)
   const [cycles, setCycles] = useState(new Map())
   const [showKillModal, setShowKillModal] = useState(false)
+  const [activeFilters, setActiveFilters] = useState({ project: '', board: '', outcome: '' })
+  const [filterOptions, setFilterOptions] = useState({ projects: [], boards: [], outcomes: [] })
   const completedLimit = 10
   const { events: socketEvents } = useSocket()
 
@@ -46,10 +48,20 @@ function PipelineRunView() {
   const previousActiveRunIdsRef = useRef(new Set())
   const processedEventIdsRef = useRef(new Set())
   const lastProcessedTimestampRef = useRef(0)
+  const activeFiltersRef = useRef(activeFilters)
 
   useEffect(() => { selectedPipelineRunRef.current = selectedPipelineRun }, [selectedPipelineRun])
   useEffect(() => { completedLoadedCountRef.current = completedLoadedCount }, [completedLoadedCount])
   useEffect(() => { socketEventsRef.current = socketEvents }, [socketEvents])
+  useEffect(() => { activeFiltersRef.current = activeFilters }, [activeFilters])
+
+  // Re-fetch completed runs when filters change
+  useEffect(() => {
+    setCompletedPipelineRuns([])
+    setCompletedLoadedCount(0)
+    setHasMoreCompleted(true)
+    fetchCompletedPipelineRuns(0, false, null, activeFilters)
+  }, [activeFilters]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // URL navigation helpers
   const updateUrlParams = useCallback((updates, replaceHistory = true) => {
@@ -128,15 +140,21 @@ function PipelineRunView() {
   }, [])
 
   // Fetch completed pipeline runs — stable, ref-guarded
-  const fetchCompletedPipelineRuns = useCallback(async (offset = 0, append = false, customLimit = null) => {
+  const fetchCompletedPipelineRuns = useCallback(async (offset = 0, append = false, customLimit = null, filters = null) => {
     if (isFetchingCompletedRef.current) return
+
+    const resolvedFilters = filters ?? activeFiltersRef.current
 
     try {
       isFetchingCompletedRef.current = true
       setLoadingCompleted(true)
 
       const limit = customLimit || completedLimit
-      const response = await fetch(`/completed-pipeline-runs?limit=${limit}&offset=${offset}`)
+      const params = new URLSearchParams({ limit, offset })
+      if (resolvedFilters.project) params.set('project', resolvedFilters.project)
+      if (resolvedFilters.board) params.set('board', resolvedFilters.board)
+      if (resolvedFilters.outcome) params.set('outcome', resolvedFilters.outcome)
+      const response = await fetch(`/completed-pipeline-runs?${params}`)
       const data = await response.json()
 
       if (data.success) {
@@ -164,6 +182,17 @@ function PipelineRunView() {
           return mergedRuns
         })
 
+        // Accumulate filter option values from returned runs
+        setFilterOptions(prev => ({
+          projects: [...new Set([...prev.projects, ...data.runs.map(r => r.project).filter(Boolean)])].sort(),
+          boards: [...new Set([...prev.boards, ...data.runs.map(r => r.board).filter(Boolean)])].sort(),
+          outcomes: [...new Set([
+            ...prev.outcomes,
+            ...data.runs.map(r => r.outcome).filter(Boolean),
+            ...(data.runs.some(r => !r.outcome) ? ['unknown'] : []),
+          ])].sort(),
+        }))
+
         if (append) {
           setCompletedLoadedCount(prev => prev + data.runs.length)
           setHasMoreCompleted(data.runs.length === completedLimit)
@@ -181,7 +210,7 @@ function PipelineRunView() {
   }, [completedLimit])
 
   const loadMoreCompleted = useCallback(() => {
-    fetchCompletedPipelineRuns(completedLoadedCount, true)
+    fetchCompletedPipelineRuns(completedLoadedCount, true, null, activeFiltersRef.current)
   }, [completedLoadedCount, fetchCompletedPipelineRuns])
 
   // Fetch workflow configuration
@@ -501,6 +530,9 @@ function PipelineRunView() {
           hasMoreCompleted={hasMoreCompleted}
           onSelectRun={handleSelectRun}
           onLoadMore={loadMoreCompleted}
+          activeFilters={activeFilters}
+          onFiltersChange={setActiveFilters}
+          filterOptions={filterOptions}
         />
 
         {/* Main Content Area */}
