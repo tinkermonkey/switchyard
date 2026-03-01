@@ -98,12 +98,16 @@ class WorkBreakdownAgent(AnalysisAgent):
         Suppresses the default raw-output GitHub post from docker_runner and
         instead posts a clean summary comment listing the created sub-issues.
         """
-        # Suppress docker_runner's automatic GitHub post — we post our own
-        # summary comment after issue creation rather than the raw JSON output.
+        # Suppress docker_runner's automatic GitHub post — we own all posting
+        # from this point: either a clean creation summary or an error note.
+        # Setting output_posted=True also blocks the agent_executor fallback path.
         task_context = context.get('context', {})
         task_context['suppress_github_post'] = True
 
         context = await super().execute(context)
+
+        # Block agent_executor's fallback posting path regardless of outcome.
+        context['output_posted'] = True
 
         # Re-fetch task_context after super() (it may have been mutated)
         task_context = context.get('context', {})
@@ -113,9 +117,8 @@ class WorkBreakdownAgent(AnalysisAgent):
 
         # Only create/manage sub-issues in initial mode or when explicitly requested
         if mode == 'initial' or self._should_manage_sub_issues(task_context):
+            project_name = task_context.get('project', 'unknown')
             try:
-                project_name = task_context.get('project', 'unknown')
-
                 markdown_output = context.get('markdown_analysis', '')
                 sub_issues = self._parse_sub_issues_from_output(markdown_output)
 
@@ -132,12 +135,23 @@ class WorkBreakdownAgent(AnalysisAgent):
                     if created_issues:
                         self._post_creation_summary(task_context, created_issues, project_name)
                         self._advance_parent_to_in_development(task_context, project_name)
+                    else:
+                        self._post_error_comment(
+                            task_context, project_name,
+                            "Work breakdown ran but no sub-issues were created. "
+                            "The agent may have returned an empty list."
+                        )
                 else:
-                    logger.warning("No sub-issues parsed from agent output")
+                    self._post_error_comment(
+                        task_context, project_name,
+                        "Work breakdown ran but could not parse any sub-issues from the agent output. "
+                        "Please review the agent logs and re-run."
+                    )
 
             except Exception as e:
                 logger.error(f"Failed to create sub-issues: {e}", exc_info=True)
                 context['sub_issue_creation_error'] = str(e)
+                self._post_error_comment(task_context, project_name, f"Work breakdown failed: {e}")
 
         return context
 
@@ -268,25 +282,39 @@ class WorkBreakdownAgent(AnalysisAgent):
         created_issues: List[Dict[str, Any]],
         project_name: str,
     ) -> None:
+        """Post a clean bullet-list comment listing the created sub-issues."""
+        lines = [f"**Work Breakdown Complete** — created {len(created_issues)} sub-issue(s):\n"]
+        for issue in created_issues:
+            number = issue.get('number', '?')
+            title = issue.get('title', 'Untitled')
+            url = issue.get('url', '')
+            deps = (issue.get('dependencies') or 'None').strip()
+            link = f"[{title}]({url})" if url else title
+            dep_note = f" *(depends on {deps})*" if deps.lower() != 'none' else ''
+            lines.append(f"- #{number} {link}{dep_note}")
+        self._post_comment(task_context, project_name, '\n'.join(lines))
+
+    def _post_error_comment(
+        self,
+        task_context: Dict[str, Any],
+        project_name: str,
+        message: str,
+    ) -> None:
+        """Post a warning comment when sub-issue creation cannot complete."""
+        self._post_comment(task_context, project_name, f"**Work Breakdown Warning**: {message}")
+
+    def _post_comment(
+        self,
+        task_context: Dict[str, Any],
+        project_name: str,
+        body: str,
+    ) -> None:
         """
-        Post a clean summary comment to the discussion or issue listing the
-        sub-issues that were created.  This replaces the raw agent output that
-        docker_runner would otherwise post.
+        Post a comment to the discussion or issue associated with this task.
+        This is the single posting path used by both summary and error comments,
+        replacing the raw agent output that docker_runner would otherwise post.
         """
         try:
-            lines = [f"**Work Breakdown Complete** — created {len(created_issues)} sub-issue(s):\n"]
-            for issue in created_issues:
-                number = issue.get('number', '?')
-                title = issue.get('title', 'Untitled')
-                url = issue.get('url', '')
-                deps = (issue.get('dependencies') or 'None').strip()
-
-                link = f"[{title}]({url})" if url else title
-                dep_note = f" *(depends on {deps})*" if deps.lower() != 'none' else ''
-                lines.append(f"- #{number} {link}{dep_note}")
-
-            body = '\n'.join(lines)
-
             workspace_type = task_context.get('workspace_type', 'issues')
             if workspace_type == 'discussions':
                 discussion_id = task_context.get('discussion_id')
@@ -294,23 +322,19 @@ class WorkBreakdownAgent(AnalysisAgent):
                     from services.github_discussions import GitHubDiscussions
                     GitHubDiscussions().add_discussion_comment(discussion_id, body)
                 else:
-                    logger.warning("No discussion_id in task_context — cannot post creation summary")
+                    logger.warning("No discussion_id in task_context — cannot post comment")
             else:
                 import subprocess as sp
-                try:
-                    project_config = self.config_manager.get_project_config(project_name)
-                    github_config = project_config.github
-                    repo = f"{github_config['org']}/{github_config['repo']}"
-                    issue_number = task_context.get('issue_number')
-                    sp.run(
-                        ['gh', 'issue', 'comment', str(issue_number), '--repo', repo, '--body', body],
-                        check=True, capture_output=True, text=True,
-                    )
-                except Exception as e:
-                    logger.warning(f"Failed to post issue comment: {e}")
-
+                project_config = self.config_manager.get_project_config(project_name)
+                github_config = project_config.github
+                repo = f"{github_config['org']}/{github_config['repo']}"
+                issue_number = task_context.get('issue_number')
+                sp.run(
+                    ['gh', 'issue', 'comment', str(issue_number), '--repo', repo, '--body', body],
+                    check=True, capture_output=True, text=True,
+                )
         except Exception as e:
-            logger.error(f"Failed to post creation summary: {e}", exc_info=True)
+            logger.error(f"Failed to post comment: {e}", exc_info=True)
 
     def _should_manage_sub_issues(self, task_context: Dict[str, Any]) -> bool:
         """Determine if this execution should manage sub-issues"""
