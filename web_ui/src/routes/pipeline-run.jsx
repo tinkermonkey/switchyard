@@ -241,7 +241,7 @@ function PipelineRunView() {
       const response = await fetch(`/pipeline-run-events?pipeline_run_id=${pipelineRunId}`)
       const data = await response.json()
 
-      if (data.success) {
+      if (data.success && selectedPipelineRunRef.current?.id === pipelineRunId) {
         const newEventsWithKeys = data.events.map((event, idx) => ({
           ...event,
           _key: event.id || `${event.timestamp}_${idx}`
@@ -399,14 +399,16 @@ function PipelineRunView() {
     return () => clearInterval(intervalId)
   }, [fetchActivePipelineRuns, fetchCompletedPipelineRuns, completedLimit])
 
-  // Load events when pipeline run selected
+  // Load events when pipeline run selection changes (keyed on id to avoid refetching on metadata updates)
+  const selectedRunId = selectedPipelineRun?.id
   useEffect(() => {
-    if (selectedPipelineRun) {
+    if (selectedRunId) {
       setPipelineRunEvents([])
-      fetchPipelineRunEvents(selectedPipelineRun.id)
-      fetchWorkflowConfig(selectedPipelineRun.project, selectedPipelineRun.board)
+      fetchPipelineRunEvents(selectedRunId)
+      const run = selectedPipelineRunRef.current
+      if (run) fetchWorkflowConfig(run.project, run.board)
     }
-  }, [selectedPipelineRun, fetchPipelineRunEvents, fetchWorkflowConfig])
+  }, [selectedRunId, fetchPipelineRunEvents, fetchWorkflowConfig])
 
   // Detect and update cycles when events change
   useEffect(() => {
