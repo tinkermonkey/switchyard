@@ -632,6 +632,8 @@ Make sure to:
         import subprocess
         import json as json_lib
 
+        pipeline_run_id = task_context.get('pipeline_run_id')
+
         # Get project configuration
         project_config = self.config_manager.get_project_config(project_name)
         github_config = project_config.github
@@ -931,7 +933,7 @@ Make sure to:
                                     'phase': sub_issue['phase'],
                                     'order_in_phase': idx,
                                 },
-                                pipeline_run_id=None  # Work breakdown runs standalone
+                                pipeline_run_id=pipeline_run_id
                             )
 
                 created_issues.append({
@@ -944,7 +946,7 @@ Make sure to:
                 logger.info(f"Created sub-issue #{issue_number}: {sub_issue['title']}")
 
             except Exception as e:
-                logger.error(f"Failed to create sub-issue '{sub_issue['title']}': {e}")
+                logger.error(f"Failed to create sub-issue '{sub_issue['title']}': {e}", exc_info=True)
 
                 # Emit FAILURE event
                 obs = task_context.get('observability')
@@ -961,7 +963,7 @@ Make sure to:
                             'phase': sub_issue['phase'],
                             'order_in_phase': idx,
                         },
-                        pipeline_run_id=None
+                        pipeline_run_id=pipeline_run_id
                     )
                 # Continue with other issues
 
