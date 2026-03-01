@@ -98,9 +98,15 @@ export default function PipelineFlowGraph({
   const [edges, setEdges, onEdgesChange] = useEdgesState([])
   const [hoveredNode, setHoveredNode] = useState(null)
   const [layoutReady, setLayoutReady] = useState(false)
+  // Increments only on structural changes; LayoutController uses this (not rawBuild)
+  // to decide when to reset and re-run layout.
+  const [structuralVersion, setStructuralVersion] = useState(0)
   // Tracks the node IDs from the last layout pass to distinguish structural
   // changes (new/removed nodes) from data-only updates (status/label changes).
   const prevNodeIdsRef = useRef(new Set())
+  // True once the graph has completed its first layout — used to detect incremental
+  // updates vs. a fresh initial draw.
+  const hasLayoutedOnceRef = useRef(false)
 
   // Merge caller overrides with canonical defaults so every param is always defined.
   // Memoized so the reference is stable — prevents LayoutController's param-change
@@ -112,15 +118,19 @@ export default function PipelineFlowGraph({
 
   // Phase 1: set raw unpositioned nodes for React Flow to render and measure.
   //
-  // Structural changes (new or removed node IDs): hide the graph while ReactFlow
-  // remeasures and LayoutController repositions — prevents the DOMException that
-  // occurs when unpositioned nodes replace positioned ones while the graph is live.
+  // Structural changes (new or removed node IDs):
+  //   - Incremental update (layout already done + some nodes are shared with previous set):
+  //     Merge existing positions into incoming nodes so they don't jump to {0,0}. Graph stays
+  //     visible throughout; LayoutController re-runs layout for new nodes only.
+  //   - Initial draw or completely new graph (no node overlap with previous set):
+  //     Hide the graph while ReactFlow remeasures and LayoutController repositions.
   //
   // Data-only updates (same node IDs, status/label changes): update node data
   // in-place preserving existing positions; graph stays visible, no layout needed.
   useEffect(() => {
     if (!rawBuild || rawBuild.nodes.length === 0) {
       prevNodeIdsRef.current = new Set()
+      hasLayoutedOnceRef.current = false
       setNodes([])
       setEdges([])
       setLayoutReady(false)
@@ -136,8 +146,25 @@ export default function PipelineFlowGraph({
     prevNodeIdsRef.current = newNodeIds
 
     if (structurallyChanged) {
-      setLayoutReady(false)
-      setNodes(rawBuild.nodes)
+      const anyOverlap = prevNodeIds.size > 0 && rawBuild.nodes.some(n => prevNodeIds.has(n.id))
+      const isIncrementalUpdate = hasLayoutedOnceRef.current && anyOverlap
+
+      if (isIncrementalUpdate) {
+        // Keep graph visible — carry existing positions forward so nodes don't flash to {0,0}.
+        setNodes(prev => {
+          const existingPositions = new Map(prev.map(n => [n.id, n.position]))
+          return rawBuild.nodes.map(n => ({
+            ...n,
+            position: existingPositions.get(n.id) ?? { x: 0, y: 0 },
+          }))
+        })
+      } else {
+        // Initial draw or completely new graph — hide and re-layout from scratch.
+        hasLayoutedOnceRef.current = false
+        setLayoutReady(false)
+        setNodes(rawBuild.nodes)
+      }
+      setStructuralVersion(v => v + 1)
     } else {
       // Same node IDs — update data in-place so positions are preserved.
       const newDataById = new Map(rawBuild.nodes.map(n => [n.id, n.data]))
@@ -167,6 +194,7 @@ export default function PipelineFlowGraph({
   }, [nodesDraggable, allowResizing, onToggleCycle])
 
   const handleLayoutDone = useCallback((finalNodes) => {
+    hasLayoutedOnceRef.current = true
     setLayoutReady(true)
     onLayoutDone?.(finalNodes)
   }, [onLayoutDone])
@@ -215,6 +243,7 @@ export default function PipelineFlowGraph({
           >
             <LayoutController
               rawBuild={rawBuild}
+              structuralVersion={structuralVersion}
               layoutOptions={mergedLayoutOptions}
               finalizeNodes={finalizeNodes}
               setNodes={setNodes}

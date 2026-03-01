@@ -28,6 +28,7 @@ import { applyCycleLayout, updateEdgesForCycles } from '../utils/cycleLayout'
  */
 export default function LayoutController({
   rawBuild,
+  structuralVersion,
   layoutOptions,
   finalizeNodes,
   setNodes,
@@ -148,17 +149,34 @@ export default function LayoutController({
     setTimeout(() => applyAlignedFitView(finalNodes, duration), 50)
   }, [getNodes, setNodes, setEdges, applyAlignedFitView])
 
-  // Reset layout flag whenever rawBuild changes (parent has just set new raw nodes)
+  // Reset layout flag on structural changes (new/removed nodes) so Phase 2 re-runs.
+  // isFirstLayout is intentionally NOT reset here — it stays false after the first
+  // layout so all subsequent layouts animate (300ms) rather than snapping (0ms).
+  // IMPORTANT: this effect must be declared before the data-only edge effect below —
+  // both fire in the same commit when rawBuild and structuralVersion change together,
+  // and the data-only effect relies on reading layoutDone.current === false.
   useEffect(() => {
     layoutDone.current = false
-    isFirstLayout.current = true
-  }, [rawBuild])
+  }, [structuralVersion])
 
-  // Phase 2: all current nodes measured → apply layout
+  // Data-only update: edges may carry agent execution state that changes without
+  // structural changes. Keep them current without re-running the full layout.
+  // Reads layoutDone.current at runtime — intentionally non-reactive; relies on the
+  // [structuralVersion] effect above having already set it to false for structural changes.
+  useEffect(() => {
+    if (!rawBuild || !layoutDone.current) return
+    const finalEdges = updateEdgesForCycles(rawBuild.edges, rawBuild.updatedCycles, rawBuild.agentExecutions)
+    setEdges(finalEdges)
+  }, [rawBuild, setEdges])
+
+  // Phase 2: all current nodes measured → apply layout.
+  // structuralVersion is included so this re-evaluates when new nodes are added to an
+  // already-visible graph (nodesInitialized may stay true across the update, meaning
+  // the dependency would not change without structuralVersion).
   useEffect(() => {
     if (!nodesInitialized || layoutDone.current) return
     runLayout()
-  }, [nodesInitialized, runLayout])
+  }, [nodesInitialized, runLayout, structuralVersion])
 
   // Re-layout when layout params change (nodes are already rendered and measured)
   useEffect(() => {
