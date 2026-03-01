@@ -6,21 +6,21 @@ import TokenUsagePanel from './TokenUsagePanel'
 const LockStatusBadge = ({ lockStatus, lockHolderIssue }) => {
   if (lockStatus === 'holding_lock') {
     return (
-      <div className="flex items-center gap-1 text-xs text-green-400 bg-green-900/20 border border-green-700/30 px-2 py-0.5 rounded">
+      <div className="flex items-center gap-1 text-xs text-green-600 bg-white/20 dark:text-green-400 dark:bg-green-900/20 border border-green-700/30 px-2 py-0.5 rounded">
         <Lock className="w-3 h-3" />
         <span>Holding Lock</span>
       </div>
     )
   } else if (lockStatus === 'waiting_for_lock') {
     return (
-      <div className="flex items-center gap-1 text-xs text-yellow-400 bg-yellow-900/20 border border-yellow-700/30 px-2 py-0.5 rounded">
+      <div className="flex items-center gap-1 text-xs text-yellow-400 bg-yellow-900/20 dark:text-yellow-400 dark:bg-yellow-900/20 border border-yellow-700/30 px-2 py-0.5 rounded">
         <Clock className="w-3 h-3" />
         <span>Waiting (#{lockHolderIssue})</span>
       </div>
     )
   } else if (lockStatus === 'no_lock') {
     return (
-      <div className="flex items-center gap-1 text-xs text-blue-400 bg-blue-900/20 border border-blue-700/30 px-2 py-0.5 rounded">
+      <div className="flex items-center gap-1 text-xs text-blue-400 bg-blue-900/20 dark:text-blue-400 dark:bg-blue-900/20 border border-blue-700/30 px-2 py-0.5 rounded">
         <Unlock className="w-3 h-3" />
         <span>No Lock</span>
       </div>
