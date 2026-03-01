@@ -98,6 +98,7 @@ class RepairTestRunConfig:
     max_iterations: int = 5  # Max test-fix-validate iterations
     review_warnings: bool = True  # Whether to review and fix warnings
     max_file_iterations: int = 3  # Max times to attempt fixing a single file
+    systemic_analysis_threshold: int = 15  # Re-run systemic analysis when failure count exceeds this
 
 
 @dataclass
@@ -215,7 +216,7 @@ class RepairCycleStage(PipelineStage):
         self.max_total_agent_calls = max_total_agent_calls
         self.checkpoint_interval = checkpoint_interval
         self._agent_call_count = 0
-        self._systemic_analysis_done_for: set = set()
+        self._systemic_analysis_last_run: dict = {}  # test_type -> iteration it last ran
 
     @staticmethod
     def _sanitize_filename(filename: str) -> str:
@@ -558,11 +559,26 @@ class RepairCycleStage(PipelineStage):
             logger.info(f"Found failures in {len(grouped_failures)} files: " f"{list(grouped_failures.keys())}")
 
             # --- SYSTEMIC ANALYSIS BLOCK ---
-            # Once per test type, check for systemic root causes before dispatching
-            # expensive per-file fix calls. Each test type (compilation, unit, etc.)
-            # can have distinct systemic/environment issues specific to it.
-            if config.test_type not in self._systemic_analysis_done_for:
-                self._systemic_analysis_done_for.add(config.test_type)
+            # Run before dispatching per-file fixes when:
+            #   - First time we encounter failures for this test type, OR
+            #   - Failure count exceeds threshold (catches bulk issues on any iteration)
+            # Never runs twice in the same iteration (last_run tracks by iteration number).
+            total_failures = len(test_result.failures)
+            last_systemic_run = self._systemic_analysis_last_run.get(config.test_type, -1)
+            run_systemic = (
+                last_systemic_run == -1  # never run for this test type
+                or (
+                    total_failures > config.systemic_analysis_threshold
+                    and last_systemic_run < test_cycle_iteration  # not already run this iteration
+                )
+            )
+            if run_systemic:
+                self._systemic_analysis_last_run[config.test_type] = test_cycle_iteration
+                if last_systemic_run != -1:
+                    logger.info(
+                        f"Re-running systemic analysis: {total_failures} failures exceed "
+                        f"threshold of {config.systemic_analysis_threshold}"
+                    )
                 analysis = await self._analyze_systemic_failures(
                     test_result, grouped_failures, config, context
                 )
