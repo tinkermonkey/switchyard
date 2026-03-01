@@ -54,7 +54,7 @@ class WorkBreakdownAgent(AnalysisAgent):
     def output_sections(self) -> List[str]:
         return [
             "Work Breakdown Summary",
-            "Sub-Issues Created",
+            "Sub-Issues to Create",
             "Dependencies",
             "Next Steps"
         ]
