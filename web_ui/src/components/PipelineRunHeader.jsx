@@ -63,10 +63,14 @@ export default function PipelineRunHeader({
     return formatDuration(pipelineRun.started_at)
   }
 
-  const handleCopyId = () => {
-    navigator.clipboard.writeText(pipelineRun.id)
-    setCopied(true)
-    setTimeout(() => setCopied(false), 1500)
+  const handleCopyId = async () => {
+    try {
+      await navigator.clipboard.writeText(pipelineRun.id)
+      setCopied(true)
+      setTimeout(() => setCopied(false), 1500)
+    } catch {
+      // Clipboard API unavailable or not in secure context
+    }
   }
 
   const isActive = pipelineRun.status === 'active'
