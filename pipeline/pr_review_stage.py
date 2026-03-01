@@ -18,6 +18,7 @@ from services.agent_executor import get_agent_executor
 from config.manager import ConfigManager
 from config.state_manager import GitHubStateManager
 from state_management.pr_review_state_manager import pr_review_state_manager
+from agents.utils import parse_json_block
 from agents.non_retryable import NonRetryableAgentError
 from monitoring.timestamp_utils import utc_now, utc_isoformat
 from monitoring.observability import EventType
@@ -1598,33 +1599,10 @@ Rules:
 
     def _parse_consolidated_findings(self, text: str) -> List[Dict[str, Any]]:
         """Parse JSON-encoded consolidation output into issue specs (one per functional group)."""
-        json_text = text.strip()
-
-        # Strip code fences defensively — agent may wrap despite instructions
-        if json_text.startswith('```'):
-            json_text = re.sub(r'^```[a-z]*\s*\n?', '', json_text)
-            json_text = re.sub(r'\n?```\s*$', '', json_text).strip()
-
-        data = None
-        try:
-            data = json.loads(json_text)
-        except json.JSONDecodeError:
-            # Fallback: agent may have added prose before/after the JSON object.
-            # raw_decode starts at the first '{' and parses exactly one JSON value,
-            # ignoring any trailing content — avoids the greedy-regex pitfall where
-            # a '}' in trailing prose causes the extracted substring to be unparseable.
-            first_brace = json_text.find('{')
-            if first_brace >= 0:
-                try:
-                    data, _ = json.JSONDecoder().raw_decode(json_text, first_brace)
-                except json.JSONDecodeError:
-                    pass
+        data = parse_json_block(text, first_delimiter='{')
 
         if data is None:
-            logger.warning(
-                "Could not parse consolidation output as JSON; creating no issues. "
-                f"Output excerpt: {json_text[:200]!r}"
-            )
+            logger.warning("Could not parse consolidation output as JSON; creating no issues.")
             return []
 
         groups = data.get('groups', [])

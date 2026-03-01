@@ -1305,7 +1305,8 @@ class DockerAgentRunner:
                 # This uses durable stores (YAML state) to look up workspace routing, so it
                 # works identically for both fresh executions and recovered-after-restart ones.
                 output_posted = False
-                if 'issue_number' in context.get('context', {}):
+                task_context_check = context.get('context', {})
+                if 'issue_number' in task_context_check and not task_context_check.get('suppress_github_post'):
                     try:
                         task_context = context.get('context', {})
                         issue_number = task_context['issue_number']

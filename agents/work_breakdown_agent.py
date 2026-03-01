@@ -14,6 +14,7 @@ Key responsibilities:
 
 from typing import Dict, Any, List, Optional
 from agents.base_analysis_agent import AnalysisAgent
+from agents.utils import parse_json_block
 from config.manager import ConfigManager
 from config.state_manager import GitHubStateManager
 from monitoring.decision_events import DecisionEventEmitter
@@ -52,12 +53,9 @@ class WorkBreakdownAgent(AnalysisAgent):
 
     @property
     def output_sections(self) -> List[str]:
-        return [
-            "Work Breakdown Summary",
-            "Sub-Issues to Create",
-            "Dependencies",
-            "Next Steps"
-        ]
+        # Output format is fully controlled by sub_issue_instructions in
+        # _build_initial_prompt — no generic sections needed here.
+        return []
 
     # ==================================================================================
     # OPTIONAL CUSTOMIZATIONS - Agent-specific guidelines
@@ -97,13 +95,17 @@ class WorkBreakdownAgent(AnalysisAgent):
         """
         Execute work breakdown with sub-issue creation.
 
-        This overrides the base execute() to add sub-issue creation functionality
-        while maintaining the standard discussion posting behavior.
+        Suppresses the default raw-output GitHub post from docker_runner and
+        instead posts a clean summary comment listing the created sub-issues.
         """
-        # First, run the standard maker agent execution (creates discussion post)
+        # Suppress docker_runner's automatic GitHub post — we post our own
+        # summary comment after issue creation rather than the raw JSON output.
+        task_context = context.get('context', {})
+        task_context['suppress_github_post'] = True
+
         context = await super().execute(context)
 
-        # Extract task context
+        # Re-fetch task_context after super() (it may have been mutated)
         task_context = context.get('context', {})
 
         # Determine execution mode
@@ -112,34 +114,29 @@ class WorkBreakdownAgent(AnalysisAgent):
         # Only create/manage sub-issues in initial mode or when explicitly requested
         if mode == 'initial' or self._should_manage_sub_issues(task_context):
             try:
-                # Get project configuration
                 project_name = task_context.get('project', 'unknown')
 
-                # Parse the markdown analysis to extract sub-issue specifications
                 markdown_output = context.get('markdown_analysis', '')
                 sub_issues = self._parse_sub_issues_from_output(markdown_output)
 
                 if sub_issues:
-                    # Create sub-issues in GitHub
                     created_issues = await self._create_sub_issues(
                         sub_issues,
                         task_context,
                         project_name
                     )
 
-                    # Store created issue info in context
                     context['created_sub_issues'] = created_issues
                     logger.info(f"Created {len(created_issues)} sub-issues for {project_name}")
 
-                    # Auto-advance parent from "Work Breakdown" to "In Development"
                     if created_issues:
+                        self._post_creation_summary(task_context, created_issues, project_name)
                         self._advance_parent_to_in_development(task_context, project_name)
                 else:
                     logger.warning("No sub-issues parsed from agent output")
 
             except Exception as e:
                 logger.error(f"Failed to create sub-issues: {e}", exc_info=True)
-                # Don't fail the entire task - the discussion post is still valuable
                 context['sub_issue_creation_error'] = str(e)
 
         return context
@@ -265,6 +262,56 @@ class WorkBreakdownAgent(AnalysisAgent):
         except Exception as e:
             logger.error(f"Failed to auto-advance parent to 'In Development': {e}", exc_info=True)
 
+    def _post_creation_summary(
+        self,
+        task_context: Dict[str, Any],
+        created_issues: List[Dict[str, Any]],
+        project_name: str,
+    ) -> None:
+        """
+        Post a clean summary comment to the discussion or issue listing the
+        sub-issues that were created.  This replaces the raw agent output that
+        docker_runner would otherwise post.
+        """
+        try:
+            lines = [f"**Work Breakdown Complete** — created {len(created_issues)} sub-issue(s):\n"]
+            for issue in created_issues:
+                number = issue.get('number', '?')
+                title = issue.get('title', 'Untitled')
+                url = issue.get('url', '')
+                deps = (issue.get('dependencies') or 'None').strip()
+
+                link = f"[{title}]({url})" if url else title
+                dep_note = f" *(depends on {deps})*" if deps.lower() != 'none' else ''
+                lines.append(f"- #{number} {link}{dep_note}")
+
+            body = '\n'.join(lines)
+
+            workspace_type = task_context.get('workspace_type', 'issues')
+            if workspace_type == 'discussions':
+                discussion_id = task_context.get('discussion_id')
+                if discussion_id:
+                    from services.github_discussions import GitHubDiscussions
+                    GitHubDiscussions().add_discussion_comment(discussion_id, body)
+                else:
+                    logger.warning("No discussion_id in task_context — cannot post creation summary")
+            else:
+                import subprocess as sp
+                try:
+                    project_config = self.config_manager.get_project_config(project_name)
+                    github_config = project_config.github
+                    repo = f"{github_config['org']}/{github_config['repo']}"
+                    issue_number = task_context.get('issue_number')
+                    sp.run(
+                        ['gh', 'issue', 'comment', str(issue_number), '--repo', repo, '--body', body],
+                        check=True, capture_output=True, text=True,
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to post issue comment: {e}")
+
+        except Exception as e:
+            logger.error(f"Failed to post creation summary: {e}", exc_info=True)
+
     def _should_manage_sub_issues(self, task_context: Dict[str, Any]) -> bool:
         """Determine if this execution should manage sub-issues"""
         # Check for conversational mode with sub-issue management keywords
@@ -370,57 +417,10 @@ class WorkBreakdownAgent(AnalysisAgent):
 
         sub_issue_instructions = f"""
 
-## CRITICAL: Sub-Issue Output Format
+## Output Format
 
-After your analysis, produce TWO things in order:
-
-### 1. Human-readable phases under `## Sub-Issues to Create`
-
-```
-## Sub-Issues to Create
-
-### Phase 1: [Phase Title]
-
-**Title**: Phase 1: [Concise description]
-
-**Description**:
-Brief overview of this phase's goals.
-
-**Requirements**:
-- [Specific requirement from business analyst]
-- [Another requirement]
-
-**Design Guidance**:
-- [Specific architecture/design direction]
-- [Technical constraints or patterns to follow]
-- [Relevant API endpoints or signatures]
-- [Data model details for this phase]
-- [Component interaction details]
-- [All relevant technical details, guidance, and context from the architecture design]
-
-**Acceptance Criteria**:
-- [ ] [Testable criterion from test plan]
-- [ ] [Another criterion]
-- [ ] [Code is reviewed and approved]
-
-**Dependencies**: None (or list phase numbers: "Phase 2, Phase 3")
-
-**Parent Issue**: #{parent_issue_number}
-
-{discussion_reference}
-
----
-
-### Phase 2: [Next Phase Title]
-[... same structure ...]
-```
-
-### 2. A JSON data block under `## Sub-Issue JSON`
-
-This is what creates the actual GitHub issues — it must be complete and valid JSON.
-
-```
-## Sub-Issue JSON
+Output ONLY a ```json code block containing an array of sub-issue objects.
+Do not add any other text before or after the JSON.
 
 ```json
 [
@@ -437,27 +437,30 @@ This is what creates the actual GitHub issues — it must be complete and valid 
   }},
   {{
     "title": "Phase 2: [Concise description]",
-    ...
+    "description": "...",
+    "requirements": "...",
+    "design_guidance": "...",
+    "acceptance_criteria": "...",
+    "dependencies": "Phase 1",
+    "parent_issue": "#{parent_issue_number}",
+    "discussion": "{discussion_reference_json}",
+    "phase": "Phase 2: [Concise description]"
   }}
 ]
 ```
-```
 
-**JSON rules**:
-- One object per phase, in dependency order
+**Rules**:
+- One object per phase, ordered by dependency (foundational work first)
 - `requirements`, `design_guidance`, and `acceptance_criteria` are multi-line markdown strings — use `\\n` for newlines within each JSON string value
-- `dependencies`: `"None"` or phase titles like `"Phase 1, Phase 2"`
+- `dependencies`: `"None"` or phase titles like `"Phase 1"` or `"Phase 1, Phase 2"`
 - The JSON array must be syntactically valid
 
-Each sub-issue will be created as a sub-task of issue #{parent_issue_number} and placed in the SDLC board's Backlog column, ordered by dependency.
-
-Make sure to:
+**Content requirements**:
 1. Extract phases from the software architect's design (or create logical phases if not explicit)
 2. Break work into smaller chunks if phases are too large
-3. **CRITICAL**: Pull specific requirements from the business analyst's work and specific design guidance from the software architect.
-4. **CRITICAL**: Include detailed technical specifications (API signatures, data models, component interactions) in the Design Guidance section. The sub-issue must be self-contained.
-5. Order phases by dependencies (foundational work first)
-6. Keep titles concise and descriptive
+3. **CRITICAL**: Pull specific requirements from the business analyst's work and specific design guidance from the software architect
+4. **CRITICAL**: Include detailed technical specifications (API signatures, data models, component interactions) in `design_guidance` — the sub-issue must be self-contained
+5. Keep titles concise and descriptive
 """
 
         return base_prompt + sub_issue_instructions
@@ -485,10 +488,9 @@ Make sure to:
         """
         Extract sub-issue specs from a ```json code block in the output.
 
-        Scans all ```json blocks from last to first (the data block appears after
-        human-readable content), validating each as a list of phase objects with a
-        'title' field. Uses raw_decode as a fallback within each block in case Claude
-        adds trailing commentary inside the fence.
+        Scans all ```json blocks from last to first (since the data block appears
+        at the end of output), using parse_json_block() on each one. Validates
+        that the result is a list of phase objects before accepting it.
 
         Returns None if no valid block is found so the caller can fall back to
         markdown parsing.
@@ -497,25 +499,12 @@ Make sure to:
         if not blocks:
             return None
 
-        for json_text in reversed(blocks):
-            json_text = json_text.strip()
-            data = None
-
-            try:
-                data = json.loads(json_text)
-            except json.JSONDecodeError:
-                first_bracket = json_text.find('[')
-                if first_bracket >= 0:
-                    try:
-                        data, _ = json.JSONDecoder().raw_decode(json_text, first_bracket)
-                    except json.JSONDecodeError:
-                        pass
-
+        for block_text in reversed(blocks):
+            data = parse_json_block(block_text, first_delimiter='[')
             if not isinstance(data, list):
                 continue
             if not all(isinstance(item, dict) and item.get('title') for item in data):
                 continue
-
             return self._json_items_to_sub_issues(data)
 
         return None
