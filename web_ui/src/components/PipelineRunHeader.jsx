@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react'
-import { Lock, Unlock, Clock, XCircle, ArrowRight, MessageSquare, Copy } from 'lucide-react'
+import { Lock, Unlock, Clock, XCircle, ArrowRight, MessageSquare, Copy, Maximize2, Minimize2 } from 'lucide-react'
 import { useNavigate } from '@tanstack/react-router'
 import TokenUsagePanel from './TokenUsagePanel'
 import { formatDuration, formatRunDuration } from '../utils/stateHelpers'
@@ -36,6 +36,8 @@ export default function PipelineRunHeader({
   isConversational,
   onKillRun,
   onDownloadDebugData,
+  isFullscreen,
+  onToggleFullscreen,
 }) {
   const navigate = useNavigate()
   const [pipelineRunLogs, setPipelineRunLogs] = useState([])
@@ -195,6 +197,15 @@ export default function PipelineRunHeader({
           >
             📥 Download
           </button>
+          {onToggleFullscreen && (
+            <button
+              onClick={onToggleFullscreen}
+              className="inline-flex items-center gap-2 px-3 py-1.5 text-sm bg-gh-canvas hover:bg-gh-border-muted transition-colors whitespace-nowrap"
+              title={isFullscreen ? 'Exit fullscreen' : 'Expand to fullscreen'}
+            >
+              {isFullscreen ? <Minimize2 className="w-4 h-4" /> : <Maximize2 className="w-4 h-4" />}
+            </button>
+          )}
         </div>
       </div>
 

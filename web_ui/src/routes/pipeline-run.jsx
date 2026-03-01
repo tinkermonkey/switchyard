@@ -1,5 +1,5 @@
 import { createFileRoute } from '@tanstack/react-router'
-import { RefreshCw, Minimize2 } from 'lucide-react'
+import { RefreshCw } from 'lucide-react'
 import Header from '../components/Header'
 import NavigationTabs from '../components/NavigationTabs'
 import PipelineFlowGraph from '../components/PipelineFlowGraph'
@@ -507,49 +507,39 @@ function PipelineRunView() {
 
   return (
     <div className="h-screen flex flex-col p-5 bg-gh-canvas text-gh-fg">
-      <Header />
+      {!isFullscreen && <Header />}
 
-      <div className="flex items-center justify-between my-3 flex-shrink-0">
-        <NavigationTabs />
-        <button
-          onClick={() => fetchActivePipelineRuns(true)}
-          disabled={loading}
-          className="px-4 py-2 bg-gh-canvas-subtle border border-gh-border rounded-md hover:bg-gh-border-muted transition-colors text-sm"
-        >
-          <RefreshCw className={`inline w-4 h-4 mr-2 ${loading ? 'animate-spin' : ''}`} />
-          Refresh
-        </button>
-      </div>
+      {!isFullscreen && (
+        <div className="flex items-center justify-between my-3 flex-shrink-0">
+          <NavigationTabs />
+          <button
+            onClick={() => fetchActivePipelineRuns(true)}
+            disabled={loading}
+            className="px-4 py-2 bg-gh-canvas-subtle border border-gh-border rounded-md hover:bg-gh-border-muted transition-colors text-sm"
+          >
+            <RefreshCw className={`inline w-4 h-4 mr-2 ${loading ? 'animate-spin' : ''}`} />
+            Refresh
+          </button>
+        </div>
+      )}
 
-      <div className="flex gap-4 flex-1 min-h-0">
-        {!isFullscreen && (
-          <PipelineRunSidebar
-            activePipelineRuns={activePipelineRuns}
-            completedPipelineRuns={completedPipelineRuns}
-            selectedPipelineRun={selectedPipelineRun}
-            loading={loading}
-            loadingCompleted={loadingCompleted}
-            hasMoreCompleted={hasMoreCompleted}
-            onSelectRun={handleSelectRun}
-            onLoadMore={loadMoreCompleted}
-            activeFilters={activeFilters}
-            onFiltersChange={setActiveFilters}
-            filterOptions={filterOptions}
-            onToggleFullscreen={toggleFullscreen}
-          />
-        )}
+      <div className={`flex gap-4 ${isFullscreen ? 'fixed inset-0 z-50 p-5 bg-gh-canvas' : 'flex-1 min-h-0'}`}>
+        <PipelineRunSidebar
+          activePipelineRuns={activePipelineRuns}
+          completedPipelineRuns={completedPipelineRuns}
+          selectedPipelineRun={selectedPipelineRun}
+          loading={loading}
+          loadingCompleted={loadingCompleted}
+          hasMoreCompleted={hasMoreCompleted}
+          onSelectRun={handleSelectRun}
+          onLoadMore={loadMoreCompleted}
+          activeFilters={activeFilters}
+          onFiltersChange={setActiveFilters}
+          filterOptions={filterOptions}
+        />
 
         {/* Main Content Area */}
-        <div className={`relative bg-gh-canvas-subtle border border-gh-border p-4 flex flex-col ${isFullscreen ? 'fixed inset-0 z-50 rounded-none' : 'flex-1 min-h-0 rounded-md'}`}>
-          {isFullscreen && (
-            <button
-              onClick={toggleFullscreen}
-              className="absolute top-3 right-3 z-10 p-1.5 rounded bg-gh-canvas border border-gh-border hover:bg-gh-border-muted transition-colors text-gh-fg-muted hover:text-gh-fg"
-              title="Exit fullscreen"
-            >
-              <Minimize2 className="w-4 h-4" />
-            </button>
-          )}
+        <div className="relative bg-gh-canvas-subtle border border-gh-border p-4 flex flex-col flex-1 min-h-0 rounded-md">
           {selectedPipelineRun ? (
             <>
               <PipelineRunHeader
@@ -558,6 +548,8 @@ function PipelineRunView() {
                 isConversational={isConversational}
                 onKillRun={handleKillRun}
                 onDownloadDebugData={handleDownloadDebugData}
+                isFullscreen={isFullscreen}
+                onToggleFullscreen={toggleFullscreen}
               />
 
               {/* Content Tab Switcher */}
