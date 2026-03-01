@@ -6,9 +6,12 @@ import apiClient from './api'
 export const systemApi = {
   /**
    * Get system health status
+   * Always returns parsed JSON even for non-2xx responses (e.g. 503 when unhealthy),
+   * so the UI can display actual health state rather than a generic error.
    */
   async getHealth() {
-    return apiClient.get('/health')
+    const response = await fetch('/health')
+    return response.json()
   },
 
   /**

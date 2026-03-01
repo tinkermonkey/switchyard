@@ -335,10 +335,8 @@ def health():
     import json
 
     # Get last health check result from Redis (cross-process shared state)
-    redis_client = None
     try:
-        redis_client = redis.Redis(host='redis', port=6379, decode_responses=True)
-        health_json = redis_client.get('orchestrator:health')
+        health_json = redis_client_raw.get('orchestrator:health')
 
         if health_json is None:
             # No health check has run yet
@@ -442,6 +440,7 @@ def health():
 
         response_data = {
             'status': status,
+            'message': health_data.get('message', 'System is unhealthy') if status == 'unhealthy' else None,
             'connected_clients': len(connected_clients),
             'orchestrator': health_data
         }
