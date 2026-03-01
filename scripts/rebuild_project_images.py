@@ -13,18 +13,18 @@ Options:
     --with-agents          Queue dev environment setup/verification agents
     --regenerate-agents    Regenerate project-specific agents/skills before rebuilding
     --dry-run              Show what would be done without executing
-    --update-state         Update dev container state to VERIFIED after successful builds
+    --no-update-state      Skip updating dev container state to VERIFIED after successful builds
     -h, --help             Show this help message
 
 Examples:
-    # Rebuild all project images
+    # Rebuild all project images (state updated to VERIFIED by default)
     python scripts/rebuild_project_images.py
 
     # Rebuild specific project
     python scripts/rebuild_project_images.py --project context-studio
 
-    # Rebuild with state update
-    python scripts/rebuild_project_images.py --update-state
+    # Rebuild without updating state
+    python scripts/rebuild_project_images.py --no-update-state
 
     # Rebuild and trigger dev environment agents
     python scripts/rebuild_project_images.py --with-agents
@@ -369,7 +369,7 @@ def rebuild_all_projects(args):
             results[project] = rebuild_project_image(
                 project,
                 dry_run=args.dry_run,
-                update_state=args.update_state
+                update_state=not args.no_update_state
             )
 
         # Report summary
@@ -429,14 +429,14 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Rebuild all project images
+  # Rebuild all project images (state updated to VERIFIED by default)
   python scripts/rebuild_project_images.py
 
   # Rebuild specific project
   python scripts/rebuild_project_images.py --project context-studio
 
-  # Rebuild and update state
-  python scripts/rebuild_project_images.py --update-state
+  # Rebuild without updating state
+  python scripts/rebuild_project_images.py --no-update-state
 
   # Rebuild and trigger dev environment agents
   python scripts/rebuild_project_images.py --with-agents
@@ -471,16 +471,16 @@ Examples:
     )
 
     parser.add_argument(
-        '--update-state',
+        '--no-update-state',
         action='store_true',
-        help='Update dev container state to VERIFIED after successful builds (only with direct rebuilds)'
+        help='Skip updating dev container state to VERIFIED after successful builds'
     )
 
     args = parser.parse_args()
 
     # Validate argument combinations
-    if args.update_state and args.with_agents:
-        logger.warning("--update-state is ignored when using --with-agents (agents manage state automatically)")
+    if args.no_update_state and args.with_agents:
+        logger.warning("--no-update-state is ignored when using --with-agents (agents manage state automatically)")
 
     # Run rebuild
     try:
