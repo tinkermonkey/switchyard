@@ -46,7 +46,8 @@ async def validate_task_can_run(task, logger) -> Dict[str, Any]:
         return {
             'can_run': False,
             'reason': f"Dev container setup currently in progress for '{task.project}'",
-            'needs_dev_setup': False
+            'needs_dev_setup': False,
+            'defer': True,
         }
     elif status == DevContainerStatus.BLOCKED:
         return {
@@ -331,31 +332,34 @@ async def process_task_integrated(task, state_manager, logger):
                 f"{base_message}. Agent '{task.agent}' requires a Docker development environment. "
                 f"The system will automatically setup the environment and retry this task."
             )
+        elif validation_result.get('defer'):
+            user_message = (
+                f"{base_message}. Agent '{task.agent}' will be retried automatically once setup completes."
+            )
         else:
             user_message = (
                 f"{base_message}. Agent '{task.agent}' cannot execute until this is resolved. "
                 f"Please check the project configuration or wait for setup to complete."
             )
 
-        # EMIT DECISION EVENT: Error encountered
-        decision_events.emit_error_decision(
-            error_type='TaskValidationError',
-            error_message=user_message,
-            context={
-                'task_id': task.id,
-                'agent': task.agent,
-                'issue_number': issue_number,
-                'board': board_name,
-                'requires_dev_container': True
-            },
-            recovery_action='queue_dev_environment_setup' if validation_result.get('needs_dev_setup') else 'block_task',
-            success=validation_result.get('needs_dev_setup', False),
-            project=task.project,
-            pipeline_run_id=pipeline_run_id
-        )
-        
         # Queue dev_environment_setup task if needed
         if validation_result.get('needs_dev_setup'):
+            # EMIT DECISION EVENT: queuing setup
+            decision_events.emit_error_decision(
+                error_type='TaskValidationError',
+                error_message=user_message,
+                context={
+                    'task_id': task.id,
+                    'agent': task.agent,
+                    'issue_number': issue_number,
+                    'board': board_name,
+                    'requires_dev_container': True
+                },
+                recovery_action='queue_dev_environment_setup',
+                success=False,
+                project=task.project,
+                pipeline_run_id=pipeline_run_id
+            )
             try:
                 await queue_dev_environment_setup(task.project, logger)
 
@@ -398,6 +402,71 @@ async def process_task_integrated(task, state_manager, logger):
                     project=task.project,
                     pipeline_run_id=pipeline_run_id
                 )
+
+        elif validation_result.get('defer'):
+            # Dev container setup is already in progress — re-enqueue the task so it
+            # will be picked up again once the container is ready, instead of being dropped.
+            try:
+                from task_queue.task_manager import TaskQueue
+                defer_queue = TaskQueue(use_redis=True)
+                defer_queue.enqueue(task)
+                logger.info(
+                    f"Deferred task {task.id} ({task.agent}) for {task.project} — "
+                    f"re-enqueued to retry after dev container setup completes"
+                )
+                decision_events.emit_error_decision(
+                    error_type='TaskValidationError',
+                    error_message=user_message,
+                    context={
+                        'task_id': task.id,
+                        'agent': task.agent,
+                        'issue_number': issue_number,
+                        'board': board_name,
+                        'requires_dev_container': True,
+                        'deferred': True,
+                    },
+                    recovery_action='task_deferred',
+                    success=True,
+                    project=task.project,
+                    pipeline_run_id=pipeline_run_id
+                )
+            except Exception as defer_error:
+                logger.error(
+                    f"Failed to re-enqueue deferred task {task.id} for {task.project}: {defer_error}. "
+                    f"Task will be lost — dev container setup in progress."
+                )
+                decision_events.emit_error_decision(
+                    error_type='TaskDeferralFailure',
+                    error_message=f"Failed to re-enqueue task after dev container in-progress block: {defer_error}",
+                    context={
+                        'task_id': task.id,
+                        'agent': task.agent,
+                        'issue_number': issue_number,
+                        'board': board_name
+                    },
+                    recovery_action='block_task',
+                    success=False,
+                    project=task.project,
+                    pipeline_run_id=pipeline_run_id
+                )
+
+        else:
+            # Permanent block (e.g. BLOCKED status) — emit and drop
+            decision_events.emit_error_decision(
+                error_type='TaskValidationError',
+                error_message=user_message,
+                context={
+                    'task_id': task.id,
+                    'agent': task.agent,
+                    'issue_number': issue_number,
+                    'board': board_name,
+                    'requires_dev_container': True
+                },
+                recovery_action='block_task',
+                success=False,
+                project=task.project,
+                pipeline_run_id=pipeline_run_id
+            )
 
         from agents.non_retryable import NonRetryableAgentError
         raise NonRetryableAgentError(f"Task blocked: {user_message}")
