@@ -561,6 +561,7 @@ class RepairCycleStage(PipelineStage):
             # --- SYSTEMIC ANALYSIS BLOCK ---
             # Run once per test type — the first time we encounter failures for this type.
             # Subsequent iterations skip this block (the set guards against repeated analysis).
+            systemic_fix_ran_this_iteration = False
             if config.test_type not in self._systemic_analysis_done_for:
                 self._systemic_analysis_done_for.add(config.test_type)
                 analysis = await self._analyze_systemic_failures(
@@ -579,6 +580,7 @@ class RepairCycleStage(PipelineStage):
                     test_result = await self._run_systemic_fix_sub_cycle(
                         analysis, config, context, test_cycle_iteration, test_type_index
                     )
+                    systemic_fix_ran_this_iteration = True
                     if not test_result.has_failures():
                         continue  # Back to top of test cycle loop (success path)
                     grouped_failures = test_result.group_failures_by_file()
@@ -587,9 +589,14 @@ class RepairCycleStage(PipelineStage):
             # --- THRESHOLD SYSTEMIC FIX ---
             # When failure count exceeds the threshold, dispatch the systemic fix agent
             # with a broad diagnostic prompt rather than grinding through per-file fixes.
-            # Runs independently of (and after) the analysis-driven systemic fix above.
-            if test_result.has_failures() and len(test_result.failures) >= config.systemic_analysis_threshold:
-                failure_count = len(test_result.failures)
+            # Runs on any iteration where the threshold is met, unless the analysis block
+            # already ran a systemic fix this iteration (which would be redundant).
+            if (
+                not systemic_fix_ran_this_iteration
+                and grouped_failures
+                and test_result.failed >= config.systemic_analysis_threshold
+            ):
+                failure_count = test_result.failed
                 file_count = len(grouped_failures)
                 failure_lines = []
                 for file, failures in grouped_failures.items():
