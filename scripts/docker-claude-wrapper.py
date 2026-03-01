@@ -16,6 +16,7 @@ Environment Variables:
     TASK_ID: Task ID (required)
     PROJECT: Project name (required)
     ISSUE_NUMBER: Issue number (required)
+    PIPELINE_RUN_ID: Pipeline run ID (optional, included in stream events for ES queries)
 """
 
 import sys
@@ -38,6 +39,7 @@ class ClaudeWrapper:
         self.task_id = os.environ.get('TASK_ID', 'unknown')
         self.project = os.environ.get('PROJECT', 'unknown')
         self.issue_number = os.environ.get('ISSUE_NUMBER', 'unknown')
+        self.pipeline_run_id = os.environ.get('PIPELINE_RUN_ID', '')
 
         # State
         self.redis_client: Optional[any] = None
@@ -127,6 +129,7 @@ class ClaudeWrapper:
                 'task_id': self.task_id,
                 'project': self.project,
                 'issue_number': self.issue_number,
+                'pipeline_run_id': self.pipeline_run_id,
                 'timestamp': event.get('timestamp', time.time()),
                 'event': event
             }
