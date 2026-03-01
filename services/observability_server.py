@@ -1020,25 +1020,40 @@ def kill_pipeline_run(pipeline_run_id):
             'error': str(e)
         }), 500
 
-def _get_board_url(project_name: str, board_name: str) -> Optional[str]:
-    """Look up the GitHub Projects v2 URL for a board from the project's github_state.yaml."""
+def _load_github_state(project_name: str) -> dict:
+    """Load the github_state.yaml for a project, returning the inner github_state dict."""
     try:
         state_file = Path(f'state/projects/{project_name}/github_state.yaml')
         if not state_file.exists():
-            return None
+            return {}
         with open(state_file) as f:
             data = yaml.safe_load(f)
-        state = data.get('github_state', {})
-        org = state.get('org')
-        boards = state.get('boards', {})
-        if not org or board_name not in boards:
-            return None
-        project_number = boards[board_name].get('project_number')
-        if not project_number:
-            return None
-        return f'https://github.com/orgs/{org}/projects/{project_number}'
+        return data.get('github_state', {})
     except Exception:
+        return {}
+
+
+def _get_board_url(project_name: str, board_name: str) -> Optional[str]:
+    """Look up the GitHub Projects v2 URL for a board from the project's github_state.yaml."""
+    state = _load_github_state(project_name)
+    org = state.get('org')
+    boards = state.get('boards', {})
+    if not org or board_name not in boards:
         return None
+    project_number = boards[board_name].get('project_number')
+    if not project_number:
+        return None
+    return f'https://github.com/orgs/{org}/projects/{project_number}'
+
+
+def _get_repo_url(project_name: str) -> Optional[str]:
+    """Return the GitHub repo HTML URL for a project from github_state.yaml."""
+    state = _load_github_state(project_name)
+    org = state.get('org')
+    repo = state.get('repo')
+    if not org or not repo:
+        return None
+    return f'https://github.com/{org}/{repo}'
 
 
 @app.route('/active-pipeline-runs')
@@ -1092,6 +1107,11 @@ def get_active_pipeline_runs():
                 run_data['lock_holder_issue'] = None
 
             run_data['board_url'] = _get_board_url(project, board) if project and board else None
+            repo_url = _get_repo_url(project) if project else None
+            run_data['repo_url'] = repo_url
+            # Backfill issue_url for runs stored before url was fetched from GitHub
+            if not run_data.get('issue_url') and repo_url and run_data.get('issue_number'):
+                run_data['issue_url'] = f"{repo_url}/issues/{run_data['issue_number']}"
             runs.append(run_data)
 
         return jsonify({
@@ -1318,6 +1338,11 @@ def get_completed_pipeline_runs():
             project = run_data.get('project')
             board = run_data.get('board')
             run_data['board_url'] = _get_board_url(project, board) if project and board else None
+            repo_url = _get_repo_url(project) if project else None
+            run_data['repo_url'] = repo_url
+            # Backfill issue_url for runs stored before url was fetched from GitHub
+            if not run_data.get('issue_url') and repo_url and run_data.get('issue_number'):
+                run_data['issue_url'] = f"{repo_url}/issues/{run_data['issue_number']}"
             runs.append(run_data)
         
         return jsonify({

@@ -812,7 +812,7 @@ class ProjectMonitor:
         """Fetch full issue details from GitHub"""
         try:
             result = subprocess.run(
-                ['gh', 'issue', 'view', str(issue_number), '--repo', f"{org}/{repository}", '--json', 'title,body,labels,state,author,createdAt,updatedAt'],
+                ['gh', 'issue', 'view', str(issue_number), '--repo', f"{org}/{repository}", '--json', 'title,body,labels,state,author,createdAt,updatedAt,url'],
                 capture_output=True, text=True, check=True
             )
             return json.loads(result.stdout)
@@ -4630,10 +4630,11 @@ The automated test-fix-validate cycle has failed and requires manual interventio
                     if not overall_success:
                         # Post detailed failure summary to GitHub issue
                         try:
+                            org = project_config.github.get('org', '')
                             self._post_repair_cycle_failure_summary(
                                 project_name=project_name,
                                 issue_number=issue_number,
-                                repository=repository,
+                                repository=f"{org}/{repository}" if org else repository,
                                 failure_summary=error_message or "Unknown error",
                                 exit_code=exit_code if exit_code is not None else -1,
                                 container_name=container_name

@@ -53,10 +53,7 @@ export default function PipelineRunHeader({
 
   if (!pipelineRun) return null
 
-  // Derive repo URL from issue_url (strip /issues/<number>)
-  const repoUrl = pipelineRun.issue_url
-    ? pipelineRun.issue_url.replace(/\/issues\/\d+.*$/, '')
-    : null
+  const repoUrl = pipelineRun.repo_url || null
 
   const getDuration = () => {
     if (pipelineRun.duration) return formatRunDuration(pipelineRun.duration)
@@ -112,7 +109,7 @@ export default function PipelineRunHeader({
       label: 'ID',
       value: (
         <span className="flex items-center gap-1 font-mono">
-          <span>{pipelineRun.id.substring(0, 8)}…</span>
+          <span>{pipelineRun.id}</span>
           <button
             onClick={handleCopyId}
             className="text-gh-fg-muted hover:text-gh-fg transition-colors"
