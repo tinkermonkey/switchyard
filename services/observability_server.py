@@ -10,7 +10,8 @@ import asyncio
 import json
 import logging
 import redis
-from typing import List
+import yaml
+from typing import List, Optional
 from flask import Flask, request, jsonify
 from flask_socketio import SocketIO, emit
 from flask_cors import CORS
@@ -1019,6 +1020,27 @@ def kill_pipeline_run(pipeline_run_id):
             'error': str(e)
         }), 500
 
+def _get_board_url(project_name: str, board_name: str) -> Optional[str]:
+    """Look up the GitHub Projects v2 URL for a board from the project's github_state.yaml."""
+    try:
+        state_file = Path(f'state/projects/{project_name}/github_state.yaml')
+        if not state_file.exists():
+            return None
+        with open(state_file) as f:
+            data = yaml.safe_load(f)
+        state = data.get('github_state', {})
+        org = state.get('org')
+        boards = state.get('boards', {})
+        if not org or board_name not in boards:
+            return None
+        project_number = boards[board_name].get('project_number')
+        if not project_number:
+            return None
+        return f'https://github.com/orgs/{org}/projects/{project_number}'
+    except Exception:
+        return None
+
+
 @app.route('/active-pipeline-runs')
 def get_active_pipeline_runs():
     """Get all currently active pipeline runs with lock status"""
@@ -1069,6 +1091,7 @@ def get_active_pipeline_runs():
                 run_data['lock_status'] = 'unknown'
                 run_data['lock_holder_issue'] = None
 
+            run_data['board_url'] = _get_board_url(project, board) if project and board else None
             runs.append(run_data)
 
         return jsonify({
@@ -1291,7 +1314,10 @@ def get_completed_pipeline_runs():
                     run_data['duration'] = duration
                 except Exception as e:
                     logger.warning(f"Error calculating duration: {e}")
-            
+
+            project = run_data.get('project')
+            board = run_data.get('board')
+            run_data['board_url'] = _get_board_url(project, board) if project and board else None
             runs.append(run_data)
         
         return jsonify({

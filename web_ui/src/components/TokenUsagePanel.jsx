@@ -145,7 +145,7 @@ export default function TokenUsagePanel({ logs, promptText }) {
   if (!tokenUsage.hasData) return null
 
   return (
-    <div className="mb-3 bg-gh-canvas-subtle rounded-md border border-gh-border">
+    <div className="my-2 bg-gh-canvas-subtle rounded-md border border-gh-border">
       <button
         onClick={() => setIsUsageExpanded(!isUsageExpanded)}
         className="w-full flex items-center justify-between p-3 hover:bg-gh-border-muted transition-colors rounded-md"
