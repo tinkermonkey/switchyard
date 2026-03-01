@@ -88,7 +88,9 @@ function PipelineRunView() {
 
       if (run) {
         setSelectedPipelineRun(run)
-      } else {
+      } else if (!loading && !loadingCompleted) {
+        // Only deselect once both fetches have settled — "not found" during
+        // initial load just means the data hasn't arrived yet.
         setSelectedPipelineRun(null)
         handleDeselectRun()
       }
@@ -101,7 +103,7 @@ function PipelineRunView() {
         }
       }
     }
-  }, [urlRunId, activePipelineRuns, completedPipelineRuns, updateUrlParams, handleDeselectRun])
+  }, [urlRunId, activePipelineRuns, completedPipelineRuns, updateUrlParams, handleDeselectRun, loading, loadingCompleted])
 
   // Track previous active run IDs (for transition detection)
   useEffect(() => {
