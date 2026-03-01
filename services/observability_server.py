@@ -1249,14 +1249,11 @@ def get_completed_pipeline_runs():
     """Get completed pipeline runs with pagination and optional filters"""
     try:
         # Get pagination parameters
-        limit = int(request.args.get('limit', 10))
-        offset = int(request.args.get('offset', 0))
+        limit = max(1, min(int(request.args.get('limit', 10)), 100))
+        offset = max(0, int(request.args.get('offset', 0)))
         project = request.args.get('project', None)
         board = request.args.get('board', None)
         outcome = request.args.get('outcome', None)
-
-        # Cap limit to prevent excessive queries
-        limit = min(limit, 100)
 
         filter_clauses = [{"term": {"status": "completed"}}]
         if project:

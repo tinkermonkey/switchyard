@@ -55,11 +55,12 @@ function PipelineRunView() {
   useEffect(() => { socketEventsRef.current = socketEvents }, [socketEvents])
   useEffect(() => { activeFiltersRef.current = activeFilters }, [activeFilters])
 
-  // Re-fetch completed runs when filters change
+  // Re-fetch completed runs when filters change (also handles initial mount)
   useEffect(() => {
     setCompletedPipelineRuns([])
     setCompletedLoadedCount(0)
     setHasMoreCompleted(true)
+    setFilterOptions({ projects: [], boards: [], outcomes: [] })
     fetchCompletedPipelineRuns(0, false, null, activeFilters)
   }, [activeFilters]) // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -270,7 +271,7 @@ function PipelineRunView() {
       const data = await response.json()
       if (data.success) {
         fetchActivePipelineRuns()
-        fetchCompletedPipelineRuns(0, false)
+        fetchCompletedPipelineRuns(0, false, null, activeFiltersRef.current)
       } else {
         alert(`Failed to kill run: ${data.error}`)
       }
@@ -383,11 +384,10 @@ function PipelineRunView() {
     URL.revokeObjectURL(url)
   }, [selectedPipelineRun, pipelineRunEvents, workflowConfig, cycles])
 
-  // Initial load
+  // Initial load (completed runs handled by the activeFilters effect above)
   useEffect(() => {
     fetchActivePipelineRuns(true)
-    fetchCompletedPipelineRuns(0, false)
-  }, [fetchActivePipelineRuns, fetchCompletedPipelineRuns])
+  }, [fetchActivePipelineRuns])
 
   // Periodic refresh every 10 seconds
   useEffect(() => {
@@ -395,7 +395,7 @@ function PipelineRunView() {
       fetchActivePipelineRuns(false)
       if (completedLoadedCountRef.current > 0) {
         const itemsToRefresh = Math.max(completedLoadedCountRef.current, completedLimit)
-        fetchCompletedPipelineRuns(0, false, itemsToRefresh)
+        fetchCompletedPipelineRuns(0, false, itemsToRefresh, activeFiltersRef.current)
       }
     }, 10000)
     return () => clearInterval(intervalId)
@@ -499,7 +499,7 @@ function PipelineRunView() {
           fetchPipelineRunEvents(selectedPipelineRunRef.current.id)
         }
         fetchActivePipelineRuns(false)
-        fetchCompletedPipelineRuns(0, false)
+        fetchCompletedPipelineRuns(0, false, null, activeFiltersRef.current)
       }
     }
   }, [socketEvents, fetchPipelineRunEvents, fetchActivePipelineRuns, fetchCompletedPipelineRuns])
