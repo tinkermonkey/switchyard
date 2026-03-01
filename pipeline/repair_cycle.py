@@ -584,6 +584,41 @@ class RepairCycleStage(PipelineStage):
                     grouped_failures = test_result.group_failures_by_file()
             # --- END SYSTEMIC ANALYSIS BLOCK ---
 
+            # --- THRESHOLD SYSTEMIC FIX ---
+            # When failure count exceeds the threshold, dispatch the systemic fix agent
+            # with a broad diagnostic prompt rather than grinding through per-file fixes.
+            # Runs independently of (and after) the analysis-driven systemic fix above.
+            if test_result.has_failures() and len(test_result.failures) >= config.systemic_analysis_threshold:
+                failure_count = len(test_result.failures)
+                file_count = len(grouped_failures)
+                failure_lines = []
+                for file, failures in grouped_failures.items():
+                    failure_lines.append(f"File: {file} ({len(failures)} failures)")
+                    for f in failures[:5]:
+                        failure_lines.append(f"  - [{f.test}] {f.message[:200]}")
+                    if len(failures) > 5:
+                        failure_lines.append(f"  ... and {len(failures) - 5} more")
+                failure_summary = "\n".join(failure_lines)
+                threshold_analysis = SystemicAnalysisResult(
+                    has_env_issues=False,
+                    env_issue_description="",
+                    has_systemic_code_issues=True,
+                    systemic_issue_description=(
+                        f"There are {failure_count} {config.test_type} test failures across {file_count} files. "
+                        f"Analyze all failures to identify the root cause(s) and apply a comprehensive fix "
+                        f"to resolve all failing tests.\n\nFailure details:\n{failure_summary}"
+                    ),
+                    affected_files=list(grouped_failures.keys()),
+                    raw_json={},
+                )
+                test_result = await self._run_systemic_fix_sub_cycle(
+                    threshold_analysis, config, context, test_cycle_iteration, test_type_index
+                )
+                if not test_result.has_failures():
+                    continue  # Back to top of test cycle loop (success path)
+                grouped_failures = test_result.group_failures_by_file()
+            # --- END THRESHOLD SYSTEMIC FIX ---
+
             # Emit fix cycle started event
             if obs:
                 obs.emit(
