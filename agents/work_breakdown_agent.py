@@ -363,16 +363,18 @@ class WorkBreakdownAgent(AnalysisAgent):
         # Add sub-issue formatting instructions
         # Build discussion reference based on what we have
         discussion_reference = ""
+        discussion_reference_json = ""
         if discussion_number != 'unknown':
             discussion_reference = f"**Discussion**: This work is detailed in discussion [{discussion_number}]({discussion_url})"
+            discussion_reference_json = f"This work is detailed in discussion [{discussion_number}]({discussion_url})"
 
         sub_issue_instructions = f"""
 
-## CRITICAL: Sub-Issue Creation Format
+## CRITICAL: Sub-Issue Output Format
 
-After your analysis, you MUST include a structured section for sub-issues to create.
+After your analysis, produce TWO things in order:
 
-Format your sub-issues section EXACTLY like this:
+### 1. Human-readable phases under `## Sub-Issues to Create`
 
 ```
 ## Sub-Issues to Create
@@ -413,12 +415,39 @@ Brief overview of this phase's goals.
 [... same structure ...]
 ```
 
-**IMPORTANT FORMATTING RULES**:
-1. Use `### Phase N: [Title]` for each phase header
-2. Use `**Field**: Value` for metadata fields
-3. Separate phases with `---`
-4. Ensure the section starts with `## Sub-Issues to Create`
+### 2. A JSON data block under `## Sub-Issue JSON`
 
+This is what creates the actual GitHub issues — it must be complete and valid JSON.
+
+```
+## Sub-Issue JSON
+
+```json
+[
+  {{
+    "title": "Phase 1: [Concise description]",
+    "description": "Brief overview of this phase's goals.",
+    "requirements": "- Specific requirement 1\\n- Specific requirement 2",
+    "design_guidance": "- Technical detail 1\\n- API signature or data model",
+    "acceptance_criteria": "- [ ] Testable criterion\\n- [ ] Code is reviewed and approved",
+    "dependencies": "None",
+    "parent_issue": "#{parent_issue_number}",
+    "discussion": "{discussion_reference_json}",
+    "phase": "Phase 1: [Concise description]"
+  }},
+  {{
+    "title": "Phase 2: [Concise description]",
+    ...
+  }}
+]
+```
+```
+
+**JSON rules**:
+- One object per phase, in dependency order
+- `requirements`, `design_guidance`, and `acceptance_criteria` are multi-line markdown strings — use `\\n` for newlines within each JSON string value
+- `dependencies`: `"None"` or phase titles like `"Phase 1, Phase 2"`
+- The JSON array must be syntactically valid
 
 Each sub-issue will be created as a sub-task of issue #{parent_issue_number} and placed in the SDLC board's Backlog column, ordered by dependency.
 
@@ -441,25 +470,132 @@ Make sure to:
         """
         Parse sub-issue specifications from the agent's markdown output.
 
-        Looks for the "Sub-Issues to Create" section and extracts structured data.
+        Tries to extract a JSON data block first (primary path). Falls back to
+        markdown field parsing if no valid JSON block is found.
+        """
+        json_sub_issues = self._extract_json_sub_issues(markdown)
+        if json_sub_issues is not None:
+            logger.info(f"Parsed {len(json_sub_issues)} sub-issues from JSON block")
+            return json_sub_issues
+
+        logger.warning("JSON sub-issue block not found or malformed, falling back to markdown parsing")
+        return self._parse_sub_issues_from_markdown(markdown)
+
+    def _extract_json_sub_issues(self, markdown: str) -> Optional[List[Dict[str, Any]]]:
+        """
+        Extract sub-issue specs from a ```json code block in the output.
+
+        Scans all ```json blocks from last to first (the data block appears after
+        human-readable content), validating each as a list of phase objects with a
+        'title' field. Uses raw_decode as a fallback within each block in case Claude
+        adds trailing commentary inside the fence.
+
+        Returns None if no valid block is found so the caller can fall back to
+        markdown parsing.
+        """
+        blocks = re.findall(r'```json\s*\n(.*?)\n```', markdown, re.DOTALL | re.IGNORECASE)
+        if not blocks:
+            return None
+
+        for json_text in reversed(blocks):
+            json_text = json_text.strip()
+            data = None
+
+            try:
+                data = json.loads(json_text)
+            except json.JSONDecodeError:
+                first_bracket = json_text.find('[')
+                if first_bracket >= 0:
+                    try:
+                        data, _ = json.JSONDecoder().raw_decode(json_text, first_bracket)
+                    except json.JSONDecodeError:
+                        pass
+
+            if not isinstance(data, list):
+                continue
+            if not all(isinstance(item, dict) and item.get('title') for item in data):
+                continue
+
+            return self._json_items_to_sub_issues(data)
+
+        return None
+
+    def _json_items_to_sub_issues(self, items: list) -> List[Dict[str, Any]]:
+        """Convert parsed JSON phase objects to the sub-issue dict format."""
+        sub_issues = []
+        for item in items:
+            title = (item.get('title') or '').strip()
+            if not title:
+                logger.warning(f"Skipping JSON sub-issue with no title: {item!r}")
+                continue
+
+            description = (item.get('description') or '').strip()
+            requirements = (item.get('requirements') or '').strip()
+            design_guidance = (item.get('design_guidance') or '').strip()
+            acceptance_criteria = (item.get('acceptance_criteria') or '').strip()
+            dependencies = (item.get('dependencies') or 'None').strip()
+            parent_issue = (item.get('parent_issue') or '').strip()
+            discussion_link = (item.get('discussion') or '').strip()
+            phase = (item.get('phase') or title).strip()
+
+            body_parts = []
+            if description:
+                body_parts.append(description)
+                body_parts.append('')
+            if requirements:
+                body_parts.append('## Requirements')
+                body_parts.append(requirements)
+                body_parts.append('')
+            if design_guidance:
+                body_parts.append('## Design Guidance')
+                body_parts.append(design_guidance)
+                body_parts.append('')
+            if acceptance_criteria:
+                body_parts.append('## Acceptance Criteria')
+                body_parts.append(acceptance_criteria)
+                body_parts.append('')
+            if dependencies and dependencies.lower() != 'none':
+                body_parts.append('## Dependencies')
+                body_parts.append(dependencies)
+                body_parts.append('')
+            if parent_issue:
+                body_parts.append('## Parent Issue')
+                body_parts.append(f'Part of {parent_issue}')
+                body_parts.append('')
+            if discussion_link:
+                body_parts.append('## Discussion')
+                body_parts.append(discussion_link)
+
+            sub_issues.append({
+                'title': title,
+                'body': '\n'.join(body_parts),
+                'dependencies': dependencies,
+                'parent_issue': parent_issue,
+                'phase': phase,
+            })
+        return sub_issues
+
+    def _parse_sub_issues_from_markdown(self, markdown: str) -> List[Dict[str, Any]]:
+        """
+        Fallback: parse sub-issue specs from the human-readable markdown section.
+
+        Looks for the "Sub-Issues to Create" section and extracts structured data
+        using **Field**: value markers. Less reliable than JSON parsing — used only
+        when no valid JSON block is present in the output.
         """
         sub_issues = []
 
-        # Extract the sub-issues section using code-fence-aware parsing.
-        # The previous regex approach failed when ## headers appeared inside
-        # code blocks (e.g., changelog examples), prematurely truncating the section.
+        # Extract the sub-issues section using code-fence-aware parsing so that
+        # ## headers inside fenced code blocks don't prematurely end the section.
         section_content = self._extract_sub_issues_section(markdown)
 
         if not section_content:
             logger.warning("No 'Sub-Issues to Create' section found in output")
             return sub_issues
 
-        # Split by phase markers using code-fence-aware parsing
         phases = self._split_phases(section_content)
 
         for phase_title, phase_content in phases:
-
-            # Extract fields - capture full content including formatting
             title = self._extract_field(phase_content, 'Title', default=phase_title)
             description = self._extract_field(phase_content, 'Description')
             requirements = self._extract_field(phase_content, 'Requirements')
@@ -469,40 +605,32 @@ Make sure to:
             parent_issue = self._extract_field(phase_content, 'Parent Issue')
             discussion_link = self._extract_field(phase_content, 'Discussion')
 
-            # Build sub-issue body
             body_parts = []
-
             if description:
                 body_parts.append(description)
-                body_parts.append("")
-
+                body_parts.append('')
             if requirements:
-                body_parts.append("## Requirements")
+                body_parts.append('## Requirements')
                 body_parts.append(requirements)
-                body_parts.append("")
-
+                body_parts.append('')
             if design_guidance:
-                body_parts.append("## Design Guidance")
+                body_parts.append('## Design Guidance')
                 body_parts.append(design_guidance)
-                body_parts.append("")
-
+                body_parts.append('')
             if acceptance_criteria:
-                body_parts.append("## Acceptance Criteria")
+                body_parts.append('## Acceptance Criteria')
                 body_parts.append(acceptance_criteria)
-                body_parts.append("")
-
+                body_parts.append('')
             if dependencies and dependencies.lower() != 'none':
-                body_parts.append(f"## Dependencies")
-                body_parts.append(f"{dependencies}")
-                body_parts.append("")
-
+                body_parts.append('## Dependencies')
+                body_parts.append(dependencies)
+                body_parts.append('')
             if parent_issue:
-                body_parts.append(f"## Parent Issue")
-                body_parts.append(f"Part of {parent_issue}")
-                body_parts.append("")
-
+                body_parts.append('## Parent Issue')
+                body_parts.append(f'Part of {parent_issue}')
+                body_parts.append('')
             if discussion_link:
-                body_parts.append(f"## Discussion")
+                body_parts.append('## Discussion')
                 body_parts.append(discussion_link)
 
             sub_issues.append({
@@ -510,10 +638,10 @@ Make sure to:
                 'body': '\n'.join(body_parts),
                 'dependencies': dependencies,
                 'parent_issue': parent_issue,
-                'phase': phase_title
+                'phase': phase_title,
             })
 
-        logger.info(f"Parsed {len(sub_issues)} sub-issues from output")
+        logger.info(f"Parsed {len(sub_issues)} sub-issues from markdown")
         return sub_issues
 
     @staticmethod
