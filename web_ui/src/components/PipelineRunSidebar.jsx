@@ -127,7 +127,7 @@ export default function PipelineRunSidebar({
         ) : activePipelineRuns.length === 0 ? (
           <p className="text-gh-fg-muted text-xs px-1 mb-2">No active runs</p>
         ) : (
-          <div className="space-y-2 max-h-40 overflow-y-auto overscroll-contain mb-2" style={{ scrollBehavior: 'auto' }}>
+          <div className="space-y-2 mb-2">
             {activeRunsList}
           </div>
         )}
