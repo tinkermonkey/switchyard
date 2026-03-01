@@ -1034,16 +1034,35 @@ def _load_github_state(project_name: str) -> dict:
 
 
 def _get_board_url(project_name: str, board_name: str) -> Optional[str]:
-    """Look up the GitHub Projects v2 URL for a board from the project's github_state.yaml."""
+    """Look up the GitHub Projects v2 URL for a board.
+
+    Reads the stored URL from github_state.yaml (written during reconciliation).
+    Falls back to querying the GitHub API for state files that predate URL storage,
+    which also correctly handles user vs organization project URL formats.
+    """
     state = _load_github_state(project_name)
     org = state.get('org')
     boards = state.get('boards', {})
     if not org or board_name not in boards:
         return None
-    project_number = boards[board_name].get('project_number')
+    board = boards[board_name]
+    # Prefer the URL stored during reconciliation (correct user/org format)
+    if board.get('url'):
+        return board['url']
+    # Fall back to live lookup for state files that predate URL storage
+    project_number = board.get('project_number')
     if not project_number:
         return None
-    return f'https://github.com/orgs/{org}/projects/{project_number}'
+    try:
+        from services.github_owner_utils import get_projects_list_for_owner
+        projects = get_projects_list_for_owner(org)
+        if projects:
+            for project in projects:
+                if project.get('number') == project_number:
+                    return project.get('url')
+    except Exception:
+        pass
+    return None
 
 
 def _get_repo_url(project_name: str) -> Optional[str]:

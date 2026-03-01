@@ -39,6 +39,7 @@ class GitHubBoard:
     name: str
     columns: List[GitHubColumn]
     status_field_id: Optional[str] = None  # GraphQL field ID for the Status field
+    url: Optional[str] = None  # GitHub Projects v2 HTML URL
 
     def __post_init__(self):
         """Validate board state after initialization"""
@@ -136,7 +137,8 @@ class GitHubStateManager:
                     node_id=board_data['node_id'],
                     name=board_name,
                     columns=columns,
-                    status_field_id=board_data.get('status_field_id')
+                    status_field_id=board_data.get('status_field_id'),
+                    url=board_data.get('url')
                 )
 
             # Parse issue/discussion links
@@ -188,6 +190,8 @@ class GitHubStateManager:
             }
             if board.status_field_id:
                 board_dict['status_field_id'] = board.status_field_id
+            if board.url:
+                board_dict['url'] = board.url
             boards_data[board_name] = board_dict
 
         # Convert issue/discussion links to serializable format
@@ -304,7 +308,8 @@ class GitHubStateManager:
     def update_board_state(self, project_name: str, board_name: str,
                           project_number: int, project_id: str, node_id: str,
                           columns: List[Dict[str, str]],
-                          status_field_id: Optional[str] = None):
+                          status_field_id: Optional[str] = None,
+                          url: Optional[str] = None):
         """Update board state with GitHub API response data
 
         Args:
@@ -338,7 +343,8 @@ class GitHubStateManager:
             node_id=node_id,
             name=board_name,
             columns=github_columns,
-            status_field_id=status_field_id
+            status_field_id=status_field_id,
+            url=url
         )
 
         state.last_sync = datetime.utcnow().isoformat() + 'Z'

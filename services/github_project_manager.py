@@ -188,7 +188,8 @@ class GitHubProjectManager:
                         discovered_board['id'],
                         discovered_board['node_id'],
                         columns,
-                        status_field_id=status_field_id
+                        status_field_id=status_field_id,
+                        url=discovered_board.get('url')
                     )
                     logger.info(f"Discovered and updated board: {pipeline_config.board_name}")
                     return True
@@ -255,7 +256,8 @@ class GitHubProjectManager:
                         existing_board.project_id,
                         existing_board.node_id,
                         columns,
-                        status_field_id=status_field_id
+                        status_field_id=status_field_id,
+                        url=existing_board.url
                     )
                     logger.info(f"Updated {len(columns)} columns for board: {pipeline_config.board_name}")
 
@@ -298,6 +300,7 @@ class GitHubProjectManager:
             project_id = project_data.get('id')
             project_number = project_data.get('number')
             node_id = project_data.get('node_id')
+            project_url = project_data.get('url')
 
             logger.info(f"Created project board: {pipeline_config.board_name} (#{project_number})")
 
@@ -333,7 +336,8 @@ class GitHubProjectManager:
                 project_id,
                 node_id,
                 columns,
-                status_field_id=status_field_id
+                status_field_id=status_field_id,
+                url=project_url
             )
 
             return {
@@ -789,7 +793,8 @@ class GitHubProjectManager:
                         'number': project.get('number'),
                         'id': project.get('id'),
                         'node_id': project.get('id'),  # Use same ID for node_id
-                        'title': project.get('title')
+                        'title': project.get('title'),
+                        'url': project.get('url'),
                     }
 
             logger.debug(f"No existing board found with title: {title}")
