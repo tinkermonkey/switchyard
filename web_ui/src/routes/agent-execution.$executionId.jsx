@@ -497,8 +497,6 @@ function AgentExecutionView() {
   const { lastTodoWrite, lastTextMessage, lastToolCall, previousToolCall, previousToolResult, inputPrompt } = agentState
   const todoStats = getTodoStats(lastTodoWrite?.todos)
   const isExecuting = executionData?.status === 'running'
-  const pipelineTab = pipelineExecutions.some(e => e.status === 'running') ? 'active' : 'completed'
-  
   if (loading) {
     return (
       <div className="min-h-screen p-5 bg-gh-canvas text-gh-fg">
@@ -535,7 +533,7 @@ function AgentExecutionView() {
               {/* Back to Pipeline Runs link */}
               <Link
                 to="/pipeline-run"
-                search={{ runId: pipelineRunId, tab: pipelineTab }}
+                search={{ runId: pipelineRunId }}
                 className="flex items-center gap-1.5 px-3 py-2 bg-gh-canvas border border-gh-border rounded hover:bg-gh-border-muted transition-colors text-sm"
                 title="Back to Pipeline Runs"
               >
