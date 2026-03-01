@@ -18,13 +18,15 @@ import { applyCycleLayout, updateEdgesForCycles } from '../utils/cycleLayout'
  *   onLayoutDone    optional (finalNodes) => void  — called after each layout pass
  *   containerHeight optional — when this changes after initial layout, fitView is re-called
  *                   so the graph stays in view after a container resize.
- *   fitViewAlign    'center' | 'top' | 'bottom' (default 'center')
+ *   fitViewAlign    'center' | 'top' | 'bottom' | 'active-node' (default 'center')
  *                   Controls the initial viewport framing after layout:
- *                     'top'    — aligns to the top of the graph (first events visible);
- *                                zoom is set to fit the full graph width.
- *                     'bottom' — aligns to the bottom of the graph (most recent events);
- *                                same width-fitting zoom.
- *                     'center' — standard React Flow fitView (centers all content).
+ *                     'top'         — aligns to the top of the graph (first events visible);
+ *                                     zoom is set to fit the full graph width.
+ *                     'bottom'      — aligns to the bottom of the graph (most recent events);
+ *                                     same width-fitting zoom.
+ *                     'center'      — standard React Flow fitView (centers all content).
+ *                     'active-node' — centres on the node with data.isActive === true;
+ *                                     falls back to 'bottom' if no active node is found.
  */
 export default function LayoutController({
   rawBuild,
@@ -75,6 +77,15 @@ export default function LayoutController({
       return
     }
 
+    // Centre on the in-progress node if one exists; fall through to 'bottom' if not.
+    if (align === 'active-node') {
+      const activeNode = nodes.find(n => n.data?.isActive)
+      if (activeNode) {
+        fitView({ nodes: [{ id: activeNode.id }], padding: 0.5, maxZoom: 1, duration })
+        return
+      }
+    }
+
     // Only root-level nodes have absolute positions in the canvas
     const rootNodes = nodes.filter(n => !n.parentId)
     if (rootNodes.length === 0) {
@@ -110,8 +121,8 @@ export default function LayoutController({
     const zoom = Math.max(0.3, Math.min(2, (containerW - padding * 2) / graphWidth))
     // Horizontally center the graph
     const x = (containerW - graphWidth * zoom) / 2 - minX * zoom
-    // Vertically align to top or bottom
-    const y = align === 'bottom'
+    // Vertically align to top or bottom ('active-node' fallthrough treats as 'bottom')
+    const y = (align === 'bottom' || align === 'active-node')
       ? containerH - padding - maxY * zoom
       : padding - minY * zoom
 
