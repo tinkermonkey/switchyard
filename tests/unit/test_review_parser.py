@@ -684,5 +684,77 @@ Please address Must Fix and Should Fix items, then request re-review.
         assert len(result.findings) >= 6
 
 
+class TestAdvisorySection:
+    """Test that Advisory/FYI sections are treated as low severity and never block approval"""
+
+    def test_advisory_items_are_low_severity(self, parser):
+        """Advisory section items must parse as low severity, not high"""
+        review = """
+### Status
+**APPROVED**
+
+### Issues Found
+
+#### Critical (Must Fix)
+None
+
+#### High Priority (Should Fix)
+None
+
+#### Advisory (Out of Scope / FYI)
+- **Pre-existing gap**: Validator not wired into model — noted but out of scope for this PR
+- **Cosmetic**: Use `raise ... from None` to suppress exception chain
+
+### Summary
+Implementation is clean and addresses all requirements.
+        """
+
+        result = parser.parse_review(review)
+
+        assert result.status == ReviewStatus.APPROVED
+        assert result.high_severity_count == 0
+        assert result.blocking_count == 0
+        # Advisory items should still appear as findings (for informational logging), at low severity
+        advisory_findings = [f for f in result.findings if f.severity == 'low']
+        assert len(advisory_findings) >= 1
+
+    def test_advisory_does_not_override_approved_status(self, parser):
+        """APPROVED + Advisory items only = remains APPROVED, not CHANGES_REQUESTED"""
+        review = """
+### Status
+**APPROVED**
+
+#### Advisory (Out of Scope / FYI)
+- **FYI**: Consider extracting this logic in a follow-up
+
+### Summary
+No issues in scope. Advisory note for future reference.
+        """
+
+        result = parser.parse_review(review)
+
+        assert result.status == ReviewStatus.APPROVED
+        assert result.high_severity_count == 0
+
+    def test_approved_with_high_priority_items_detected(self, parser):
+        """Parser should correctly count high_severity even when status is APPROVED (safety net input)"""
+        review = """
+### Status
+**APPROVED**
+
+#### High Priority (Should Fix)
+- **Validation not wired**: validate_embedding_dimension not called from ChunkVector
+
+### Summary
+Approved despite high priority finding.
+        """
+
+        result = parser.parse_review(review)
+
+        # Parser returns what the reviewer said; the safety net in review_cycle.py overrides
+        assert result.status == ReviewStatus.APPROVED
+        assert result.high_severity_count == 1  # The safety net catches this
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v', '-s'])

@@ -252,6 +252,7 @@ class ReviewParser:
         lines = text.split('\n')
         current_finding = None
         current_section_severity = None  # Track severity from section headers
+        current_section_is_ceiling = False  # True for advisory sections: severity is a cap, not a floor
 
         for line in lines:
             line = line.strip()
@@ -267,12 +268,19 @@ class ReviewParser:
             if emoji_or_text_header_match:
                 section_title = emoji_or_text_header_match.group(1).strip()
                 current_section_severity = self._extract_severity(section_title)
+                current_section_is_ceiling = False
                 continue
 
             # Case 2: Markdown header with severity keywords (e.g., "### Blocking Issues")
             markdown_header_match = re.match(r'^#{1,6}\s+(.+)', line)
             if markdown_header_match:
                 section_title = markdown_header_match.group(1).strip()
+                # Advisory/FYI sections cap findings at low severity — items cannot escalate
+                if re.search(r'(?i)\b(?:advisory|out\s+of\s+scope|fyi|notes?)\b', section_title):
+                    current_section_severity = 'low'
+                    current_section_is_ceiling = True
+                    continue
+                current_section_is_ceiling = False
                 severity = self._extract_severity(section_title)
                 if severity != 'medium':  # Has a severity keyword (blocking/high/low)
                     current_section_severity = severity
@@ -290,14 +298,17 @@ class ReviewParser:
                 # Extract severity from finding text
                 finding_severity = self._extract_severity(finding_text)
 
-                # Use section severity if it's higher priority than finding severity
-                # Priority order: blocking > high > medium > low
+                # Determine effective severity:
+                # - Advisory sections act as a ceiling: cap at section severity (low)
+                # - Other sections act as a floor: use whichever is higher
                 severity_priority = {'blocking': 4, 'high': 3, 'medium': 2, 'low': 1}
                 section_priority = severity_priority.get(current_section_severity, 0)
                 finding_priority = severity_priority.get(finding_severity, 0)
 
-                # Use the higher priority severity
-                if section_priority > finding_priority:
+                if current_section_is_ceiling:
+                    # Cap at section severity (advisory items cannot escalate beyond low)
+                    severity = current_section_severity if section_priority <= finding_priority else finding_severity
+                elif section_priority > finding_priority:
                     severity = current_section_severity
                 else:
                     severity = finding_severity
