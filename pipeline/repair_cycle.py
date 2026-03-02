@@ -578,7 +578,8 @@ class RepairCycleStage(PipelineStage):
 
                 if analysis.has_systemic_code_issues:
                     test_result = await self._run_systemic_fix_sub_cycle(
-                        analysis, config, context, test_cycle_iteration, test_type_index
+                        analysis, test_result, grouped_failures, config, context,
+                        test_cycle_iteration, test_type_index,
                     )
                     systemic_fix_ran_this_iteration = True
                     if not test_result.has_failures():
@@ -596,30 +597,17 @@ class RepairCycleStage(PipelineStage):
                 and grouped_failures
                 and test_result.failed >= config.systemic_analysis_threshold
             ):
-                failure_count = test_result.failed
-                file_count = len(grouped_failures)
-                failure_lines = []
-                for file, failures in grouped_failures.items():
-                    failure_lines.append(f"File: {file} ({len(failures)} failures)")
-                    for f in failures[:5]:
-                        failure_lines.append(f"  - [{f.test}] {f.message[:200]}")
-                    if len(failures) > 5:
-                        failure_lines.append(f"  ... and {len(failures) - 5} more")
-                failure_summary = "\n".join(failure_lines)
                 threshold_analysis = SystemicAnalysisResult(
                     has_env_issues=False,
                     env_issue_description="",
                     has_systemic_code_issues=True,
-                    systemic_issue_description=(
-                        f"There are {failure_count} {config.test_type} test failures across {file_count} files. "
-                        f"Analyze all failures to identify the root cause(s) and apply a comprehensive fix "
-                        f"to resolve all failing tests.\n\nFailure details:\n{failure_summary}"
-                    ),
-                    affected_files=list(grouped_failures.keys()),
+                    systemic_issue_description="",  # digest built from live failure data
+                    affected_files=[],
                     raw_json={},
                 )
                 test_result = await self._run_systemic_fix_sub_cycle(
-                    threshold_analysis, config, context, test_cycle_iteration, test_type_index
+                    threshold_analysis, test_result, grouped_failures, config, context,
+                    test_cycle_iteration, test_type_index,
                 )
                 if not test_result.has_failures():
                     continue  # Back to top of test cycle loop (success path)
@@ -1904,9 +1892,68 @@ If the failures appear to be isolated per-file issues with different root causes
 
         return last_test_result
 
+    @staticmethod
+    def _build_failure_digest(
+        test_result: "RepairTestResult",
+        grouped_failures: Dict[str, List["RepairTestFailure"]],
+        max_error_types: int = 10,
+        examples_per_type: int = 3,
+        max_top_files: int = 15,
+    ) -> str:
+        """
+        Build a compact, stratified summary of test failures for the systemic fix prompt.
+
+        Groups by error type to show the pattern landscape, then lists the most-affected
+        files by count. Keeps total output bounded regardless of total failure count.
+        """
+        lines = [
+            f"Total failures: {test_result.failed} across {len(grouped_failures)} files",
+            "",
+        ]
+
+        # Group failures by error type (f.test field, e.g. "mypy[arg-type]")
+        by_type: Dict[str, List["RepairTestFailure"]] = {}
+        for failures in grouped_failures.values():
+            for f in failures:
+                by_type.setdefault(f.test, []).append(f)
+
+        sorted_types = sorted(by_type.items(), key=lambda kv: len(kv[1]), reverse=True)
+
+        lines.append("## Error types (by frequency)")
+        shown_types = 0
+        for error_type, type_failures in sorted_types:
+            if shown_types >= max_error_types:
+                remaining = len(sorted_types) - shown_types
+                lines.append(f"  ... and {remaining} more error type(s)")
+                break
+            lines.append(f"  {error_type}: {len(type_failures)} occurrences")
+            seen_files: set = set()
+            examples_shown = 0
+            for f in type_failures:
+                if f.file not in seen_files and examples_shown < examples_per_type:
+                    lines.append(f"    e.g. {f.file}: {f.message[:150]}")
+                    seen_files.add(f.file)
+                    examples_shown += 1
+            shown_types += 1
+
+        # Top files by failure count
+        top_files = sorted(grouped_failures.items(), key=lambda kv: len(kv[1]), reverse=True)
+        lines.append("")
+        lines.append(f"## Most affected files (top {min(max_top_files, len(top_files))} of {len(grouped_failures)})")
+        for file, failures in top_files[:max_top_files]:
+            type_counts: Dict[str, int] = {}
+            for f in failures:
+                type_counts[f.test] = type_counts.get(f.test, 0) + 1
+            type_summary = ", ".join(f"{t}×{c}" for t, c in sorted(type_counts.items(), key=lambda x: -x[1])[:3])
+            lines.append(f"  {file}: {len(failures)} failures ({type_summary})")
+
+        return "\n".join(lines)
+
     async def _run_systemic_fix_sub_cycle(
         self,
         analysis: SystemicAnalysisResult,
+        initial_test_result: "RepairTestResult",
+        initial_grouped_failures: Dict[str, List["RepairTestFailure"]],
         config: "RepairTestRunConfig",
         context: Dict[str, Any],
         test_cycle_iteration: int,
@@ -1915,9 +1962,9 @@ If the failures appear to be isolated per-file issues with different root causes
         """
         Apply a global fix for a systemic code issue across all affected files.
 
-        Dispatches a single SSE per attempt with all affected files and the
-        systemic issue description. Loops up to MAX_SYSTEMIC_SUB_CYCLES times
-        if tests still fail after each attempt.
+        Each attempt receives an open-ended prompt built from the current failure
+        state — not a predetermined file list — so the agent greps for all affected
+        files itself and adapts as failures are resolved between attempts.
 
         Returns the last RepairTestResult obtained, so _run_test_cycle() can
         use it directly without a redundant test re-run.
@@ -1936,19 +1983,15 @@ If the failures appear to be isolated per-file issues with different root causes
                 {
                     "test_type": config.test_type,
                     "systemic_issue_description": analysis.systemic_issue_description,
-                    "affected_files_count": len(analysis.affected_files),
+                    "affected_files_count": len(initial_grouped_failures),
                 },
                 pipeline_run_id=pipeline_run_id,
             )
 
-        files_list = (
-            "\n".join(f"- {f}" for f in analysis.affected_files)
-            if analysis.affected_files
-            else "(all failing files)"
-        )
-
         last_test_result = None
         attempts_made = 0
+        current_test_result = initial_test_result
+        current_grouped = initial_grouped_failures
 
         for attempt in range(MAX_SYSTEMIC_SUB_CYCLES):
             attempts_made = attempt + 1
@@ -1958,27 +2001,43 @@ If the failures appear to be isolated per-file issues with different root causes
                 logger.error("Circuit breaker triggered during systemic fix sub-cycle")
                 break
 
-            logger.info(
-                f"Systemic fix sub-cycle attempt {attempts_made}/{MAX_SYSTEMIC_SUB_CYCLES}: "
-                f"{analysis.systemic_issue_description[:100]}"
+            failure_digest = self._build_failure_digest(current_test_result, current_grouped)
+            known_pattern = (
+                f"\n\nAnalysis has identified the likely root cause:\n{analysis.systemic_issue_description}"
+                if analysis.systemic_issue_description
+                else ""
+            )
+            attempt_note = (
+                f"\n\nThis is attempt {attempts_made}/{MAX_SYSTEMIC_SUB_CYCLES}. "
+                f"Focus on the remaining failures shown above."
+                if attempts_made > 1
+                else ""
             )
 
-            direct_prompt = f"""Apply a global fix for a systemic code issue across multiple files.
+            logger.info(
+                f"Systemic fix sub-cycle attempt {attempts_made}/{MAX_SYSTEMIC_SUB_CYCLES}: "
+                f"{current_test_result.failed} {config.test_type} failures remaining"
+            )
 
-Issue: {analysis.systemic_issue_description}
+            direct_prompt = f"""Your goal is to fix ALL failing {config.test_type} tests in this project. Every failure listed below must pass before you are done.{known_pattern}
 
-Affected files:
-{files_list}
+## Current failure state
+{failure_digest}{attempt_note}
 
-Apply the fix to ALL affected files. Use targeted search-and-replace, sed, or direct edits as appropriate.
-Focus on applying the same fix consistently across all files rather than analyzing each individually."""
+## How to approach this
+1. Examine representative failing files to understand the root cause. The failure state above shows a sample — the full set of affected files may be larger.
+2. Use grep or glob to discover every file in the project that exhibits the same pattern, not just the ones listed above.
+3. Apply fixes comprehensively across all affected files. Prefer bulk approaches (scripted edits, sed, ast-based transforms) over editing files one at a time.
+4. After fixing, run the {config.test_type} checks to measure progress. Repeat until all failures are resolved."""
 
+            task_description = (
+                f"Fix {current_test_result.failed} {config.test_type} failures"
+                + (f": {analysis.systemic_issue_description[:80]}" if analysis.systemic_issue_description else "")
+            )
             task_context = {
                 **context,
                 "pipeline_run_id": pipeline_run_id,
-                "task_description": (
-                    f"Apply systemic fix: {analysis.systemic_issue_description[:100]}"
-                ),
+                "task_description": task_description,
                 "timeout": config.timeout,
                 "skip_workspace_prep": True,
                 "review_cycle": None,
@@ -2007,12 +2066,14 @@ Focus on applying the same fix consistently across all files rather than analyzi
                 )
                 # Continue to test run — partial fix may still have helped
 
-            # Re-run tests to evaluate the fix
+            # Re-run tests to evaluate the fix; update state for next attempt
             last_test_result = await self._run_tests(
                 config, context, test_cycle_iteration, test_type_index
             )
             if not last_test_result.has_failures():
                 break  # Fix resolved all failures
+            current_test_result = last_test_result
+            current_grouped = last_test_result.group_failures_by_file()
 
         if obs:
             obs.emit(
