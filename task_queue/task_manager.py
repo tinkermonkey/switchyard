@@ -107,20 +107,29 @@ class TaskQueue:
         """Dequeue task using Redis"""
         for priority in TaskPriority:
             queue_name = f"tasks:{priority.name.lower()}"
-            task_id = self.redis_client.rpop(queue_name)
 
-            if task_id:
+            # Scan up to the current queue length so deferred tasks pushed back to
+            # the head don't cause an infinite loop, and ready tasks behind a
+            # deferred one are still returned on this call.
+            queue_len = self.redis_client.llen(queue_name)
+            skipped = 0
+
+            while skipped < queue_len:
+                task_id = self.redis_client.rpop(queue_name)
+                if not task_id:
+                    break
+
                 task_data = self.redis_client.hgetall(f"task:{task_id}")
 
                 # Check not_before: if the task is deferred until a future time, push it
-                # back to the head of its queue and skip it so the worker can sleep
-                # rather than spin-waiting on a blocked task.
+                # back to the head of its queue and keep scanning for a ready task.
                 not_before = task_data.get('not_before') or ''
                 if not_before:
                     try:
                         nb_dt = datetime.fromisoformat(not_before)
                         if nb_dt > datetime.now(timezone.utc):
                             self.redis_client.lpush(queue_name, task_id)
+                            skipped += 1
                             continue
                     except ValueError:
                         pass  # Malformed not_before — treat as no restriction
@@ -141,15 +150,40 @@ class TaskQueue:
 
     def _dequeue_fallback(self) -> Optional[Task]:
         """Dequeue task using in-memory fallback"""
-        # Check queues in priority order
+        now = datetime.now(timezone.utc)
         for priority in TaskPriority:
             q = self.fallback_queues[priority]
-            if not q.empty():
-                try:
-                    priority_value, timestamp, task = q.get_nowait()
-                    return task
-                except queue.Empty:
-                    continue
+            if q.empty():
+                continue
+
+            # Drain the queue, skip deferred tasks, return the first ready one.
+            deferred = []
+            result = None
+            try:
+                while True:
+                    try:
+                        priority_value, timestamp, task = q.get_nowait()
+                    except queue.Empty:
+                        break
+
+                    if task.not_before:
+                        try:
+                            nb_dt = datetime.fromisoformat(task.not_before)
+                            if nb_dt > now:
+                                deferred.append((priority_value, timestamp, task))
+                                continue
+                        except ValueError:
+                            pass  # Malformed not_before — treat as no restriction
+
+                    result = task
+                    break
+            finally:
+                for item in deferred:
+                    q.put(item)
+
+            if result:
+                return result
+
         return None
     
     def get_pending_tasks(self, agent: str = None) -> list:

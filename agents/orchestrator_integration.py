@@ -425,6 +425,23 @@ async def process_task_integrated(task, state_manager, logger):
                     f"Deferred task {task.id} ({task.agent}) for {task.project} — "
                     f"re-enqueued with 30s delay, will retry after dev container setup completes"
                 )
+                decision_events.emit_error_decision(
+                    error_type='TaskValidationError',
+                    error_message=user_message,
+                    context={
+                        'task_id': task.id,
+                        'agent': task.agent,
+                        'issue_number': issue_number,
+                        'board': board_name,
+                        'requires_dev_container': True,
+                        'deferred': True,
+                        'retry_after_seconds': 30,
+                    },
+                    recovery_action='task_deferred',
+                    success=True,
+                    project=task.project,
+                    pipeline_run_id=pipeline_run_id
+                )
             except Exception as defer_error:
                 logger.error(
                     f"Failed to re-enqueue deferred task {task.id} for {task.project}: {defer_error}. "
