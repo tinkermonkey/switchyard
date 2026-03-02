@@ -98,6 +98,38 @@ def _save_repair_cycle_context(
     return str(context_file)
 
 
+def _is_repair_cycle_stalled(pipeline_run_id: str, stall_seconds: int = 3600) -> bool:
+    """
+    Returns True if no events have been emitted for this pipeline run in the last stall_seconds.
+
+    Queries both decision-events and agent-events indices for the most recent timestamp.
+    Fails open (returns False) if Elasticsearch is unavailable, so a transient ES outage
+    never kills a healthy repair cycle.
+    """
+    try:
+        import requests
+        from datetime import datetime, timezone
+        resp = requests.get(
+            "http://elasticsearch:9200/decision-events-*,agent-events-*/_search",
+            json={
+                "query": {"term": {"pipeline_run_id": pipeline_run_id}},
+                "sort": [{"timestamp": "desc"}],
+                "size": 1,
+                "_source": ["timestamp"],
+            },
+            timeout=10,
+        )
+        hits = resp.json().get("hits", {}).get("hits", [])
+        if not hits:
+            return True
+        last_ts = datetime.fromisoformat(hits[0]["_source"]["timestamp"].replace("Z", "+00:00"))
+        age = (datetime.now(timezone.utc) - last_ts).total_seconds()
+        return age > stall_seconds
+    except Exception as e:
+        logger.warning(f"Could not check repair cycle liveness for {pipeline_run_id}: {e}")
+        return False  # fail open: don't kill if we can't verify
+
+
 def _launch_repair_cycle_container(
     project_name: str,
     issue_number: int,
@@ -4297,16 +4329,60 @@ The automated test-fix-validate cycle has failed and requires manual interventio
             try:
                 logger.info(f"Starting container monitor for {container_name}")
                 
-                # Wait for container to finish
-                wait_cmd = ['docker', 'wait', container_name]
-                result = subprocess.run(
-                    wait_cmd,
-                    capture_output=True,
+                # Wait for container to finish, checking for progress every hour.
+                # If no events are emitted for a full hour the cycle is considered stalled
+                # and the container is killed. There is no upper bound on total runtime —
+                # a slow but progressing repair cycle is allowed to run to completion.
+                process = subprocess.Popen(
+                    ['docker', 'wait', container_name],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
                     text=True,
-                    timeout=7200  # 2 hour max
                 )
-                
-                exit_code = int(result.stdout.strip()) if result.stdout.strip() else 2
+                while True:
+                    try:
+                        process.wait(timeout=3600)  # check every hour
+                        exit_code = int(process.stdout.read().strip() or 2)
+                        break
+                    except subprocess.TimeoutExpired:
+                        if _is_repair_cycle_stalled(pipeline_run_id, stall_seconds=3600):
+                            logger.error(
+                                f"Container {container_name} stalled: no events for over 1 hour"
+                            )
+                            error_message = "Repair cycle stalled: no events for over 1 hour"
+                            overall_success = False
+                            try:
+                                subprocess.run(['docker', 'kill', container_name], timeout=30)
+                            except Exception as kill_err:
+                                logger.error(f"Failed to kill stalled container: {kill_err}")
+                            process.wait()  # let docker wait return after kill
+                            try:
+                                from monitoring.observability import get_observability_manager
+                                obs_manager = get_observability_manager()
+                                obs_manager.emit_repair_cycle_container_killed(
+                                    project=project_name,
+                                    issue_number=issue_number,
+                                    container_name=container_name,
+                                    reason="Stalled: no events for over 1 hour",
+                                    pipeline_run_id=pipeline_run_id,
+                                )
+                                obs_manager.emit_repair_cycle_container_completed(
+                                    project=project_name,
+                                    issue_number=issue_number,
+                                    container_name=container_name,
+                                    success=False,
+                                    total_agent_calls=0,
+                                    duration_seconds=0,
+                                    pipeline_run_id=pipeline_run_id,
+                                )
+                            except Exception as e:
+                                logger.warning(f"Failed to emit stall events: {e}")
+                            break
+                        logger.info(
+                            f"Repair cycle {container_name} still active, "
+                            f"waiting another hour..."
+                        )
+
                 logger.info(f"Container {container_name} exited with code {exit_code}")
 
                 # Log additional context for debugging termination
@@ -4535,46 +4611,6 @@ The automated test-fix-validate cycle has failed and requires manual interventio
                 
                 loop.close()
                 
-            except subprocess.TimeoutExpired:
-                logger.error(f"Container {container_name} timed out after 2 hours")
-                error_message = "Container timed out after 2 hours"
-                overall_success = False
-
-                # Emit container killed event
-                try:
-                    from monitoring.observability import get_observability_manager
-                    obs_manager = get_observability_manager()
-                    obs_manager.emit_repair_cycle_container_killed(
-                        project=project_name,
-                        issue_number=issue_number,
-                        container_name=container_name,
-                        reason="Exceeded 2 hour time limit",
-                        pipeline_run_id=pipeline_run_id
-                    )
-                except Exception as e:
-                    logger.warning(f"Failed to emit container killed event: {e}")
-
-                # Emit container completed event (failure)
-                try:
-                    from monitoring.observability import get_observability_manager
-                    obs_manager = get_observability_manager()
-                    obs_manager.emit_repair_cycle_container_completed(
-                        project=project_name,
-                        issue_number=issue_number,
-                        container_name=container_name,
-                        success=False,
-                        total_agent_calls=0,
-                        duration_seconds=7200.0,  # 2 hours
-                        pipeline_run_id=pipeline_run_id
-                    )
-                except Exception as e:
-                    logger.warning(f"Failed to emit container completed event: {e}")
-
-                # Kill container
-                try:
-                    subprocess.run(['docker', 'kill', container_name], timeout=30)
-                except Exception as e:
-                    logger.error(f"Failed to kill timed-out container: {e}")
             except Exception as e:
                 logger.error(f"Error monitoring container: {e}", exc_info=True)
                 error_message = f"Monitoring thread error: {str(e)}"
