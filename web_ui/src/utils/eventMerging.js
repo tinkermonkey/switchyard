@@ -148,9 +148,9 @@ export const mergeAgentExecutionEvents = (apiLogs, webSocketEvents, executionDat
   return logs
 }
 
-// Agent lifecycle event types — all others are treated as decision events.
+// Agent lifecycle event types — mirrors the backend's _is_agent_lifecycle_event() set.
 const AGENT_LIFECYCLE_EVENT_TYPES = new Set([
-  'agent_initialized', 'agent_started', 'agent_completed', 'agent_failed', 'task_received',
+  'agent_initialized', 'agent_started', 'agent_completed', 'agent_failed',
 ])
 
 // Claude stream / API event types — filtered out of the graph and event log.
@@ -165,6 +165,14 @@ const CLAUDE_STREAM_EVENT_TYPES = new Set([
  * Infer event_category for a WebSocket event that lacks it.
  * API events always have event_category set by the server; WebSocket events
  * (from Redis pub/sub) do not. Without a category the graph builder ignores them.
+ *
+ * Events received via the 'decision_event' socket channel are already stamped
+ * with event_category:'decision' by SocketContext, so they never reach this path.
+ * Events via the 'agent_event' channel are either lifecycle events (the four agent
+ * lifecycle types) or decision events — the backend's routing puts everything else
+ * from orchestrator:agent_events into that channel, and the backend classifies all
+ * non-lifecycle, non-stream events as decision events. The default-to-'decision'
+ * is therefore correct for any agent_event that isn't a lifecycle type.
  */
 function inferEventCategory(event) {
   if (event.event_category) return event

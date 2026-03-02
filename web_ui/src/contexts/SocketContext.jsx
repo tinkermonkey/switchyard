@@ -116,7 +116,9 @@ export function SocketProvider({ children }) {
     })
 
     socketInstance.on('decision_event', (event) => {
-      setEvents(prev => [event, ...prev].slice(0, 50))
+      // Stamp the category at the source so mergePipelineRunEvents doesn't need
+      // to infer it: the channel name is the ground truth for these events.
+      setEvents(prev => [{ ...event, event_category: 'decision' }, ...prev].slice(0, 50))
       updateStatsFromEvent(event)
     })
 
