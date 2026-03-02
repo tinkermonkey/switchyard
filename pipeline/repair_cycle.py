@@ -572,6 +572,48 @@ class RepairCycleStage(PipelineStage):
                     test_result = await self._run_env_rebuild_sub_cycle(
                         analysis, config, context, test_cycle_iteration, test_type_index
                     )
+                    # Guard against infrastructure/env sentinels returned from the sub-cycle
+                    env_rebuild_infra = [
+                        f for f in test_result.failures
+                        if f.file in ("__env__", "__infrastructure__")
+                    ]
+                    if env_rebuild_infra:
+                        error_msg = f"Infrastructure failure in env rebuild: {env_rebuild_infra[0].message}"
+                        logger.error(error_msg)
+                        if obs:
+                            obs.emit(
+                                EventType.REPAIR_CYCLE_TEST_CYCLE_COMPLETED,
+                                "repair_cycle", task_id, project,
+                                {
+                                    "test_type": config.test_type,
+                                    "test_type_index": test_type_index,
+                                    "passed": 0,
+                                    "test_cycle_iterations": test_cycle_iteration,
+                                    "error": error_msg,
+                                },
+                                pipeline_run_id=pipeline_run_id,
+                            )
+                            obs.emit(
+                                EventType.REPAIR_CYCLE_COMPLETED,
+                                "repair_cycle", task_id, project,
+                                {
+                                    "test_type": config.test_type,
+                                    "test_type_index": test_type_index,
+                                    "passed": 0,
+                                    "test_cycle_iterations": test_cycle_iteration,
+                                    "error": error_msg,
+                                },
+                                pipeline_run_id=pipeline_run_id,
+                            )
+                        return CycleResult(
+                            test_type=config.test_type,
+                            passed=False,
+                            iterations=test_cycle_iteration,
+                            final_result=test_result,
+                            error=error_msg,
+                            files_fixed=files_fixed,
+                            warnings_reviewed=warnings_reviewed,
+                        )
                     if not test_result.has_failures():
                         continue  # Back to top of test cycle loop (success path)
                     grouped_failures = test_result.group_failures_by_file()
@@ -585,12 +627,39 @@ class RepairCycleStage(PipelineStage):
                     # Guard against infrastructure failures returned from the sub-cycle
                     sub_cycle_infra = [f for f in test_result.failures if f.file == "__infrastructure__"]
                     if sub_cycle_infra:
+                        error_msg = f"Infrastructure failure in systemic sub-cycle: {sub_cycle_infra[0].message}"
+                        logger.error(error_msg)
+                        if obs:
+                            obs.emit(
+                                EventType.REPAIR_CYCLE_TEST_CYCLE_COMPLETED,
+                                "repair_cycle", task_id, project,
+                                {
+                                    "test_type": config.test_type,
+                                    "test_type_index": test_type_index,
+                                    "passed": 0,
+                                    "test_cycle_iterations": test_cycle_iteration,
+                                    "error": error_msg,
+                                },
+                                pipeline_run_id=pipeline_run_id,
+                            )
+                            obs.emit(
+                                EventType.REPAIR_CYCLE_COMPLETED,
+                                "repair_cycle", task_id, project,
+                                {
+                                    "test_type": config.test_type,
+                                    "test_type_index": test_type_index,
+                                    "passed": 0,
+                                    "test_cycle_iterations": test_cycle_iteration,
+                                    "error": error_msg,
+                                },
+                                pipeline_run_id=pipeline_run_id,
+                            )
                         return CycleResult(
                             test_type=config.test_type,
                             passed=False,
                             iterations=test_cycle_iteration,
                             final_result=test_result,
-                            error=f"Infrastructure failure in systemic sub-cycle: {sub_cycle_infra[0].message}",
+                            error=error_msg,
                             files_fixed=files_fixed,
                             warnings_reviewed=warnings_reviewed,
                         )
@@ -624,12 +693,39 @@ class RepairCycleStage(PipelineStage):
                 # Guard against infrastructure failures returned from the sub-cycle
                 threshold_infra = [f for f in test_result.failures if f.file == "__infrastructure__"]
                 if threshold_infra:
+                    error_msg = f"Infrastructure failure in threshold systemic sub-cycle: {threshold_infra[0].message}"
+                    logger.error(error_msg)
+                    if obs:
+                        obs.emit(
+                            EventType.REPAIR_CYCLE_TEST_CYCLE_COMPLETED,
+                            "repair_cycle", task_id, project,
+                            {
+                                "test_type": config.test_type,
+                                "test_type_index": test_type_index,
+                                "passed": 0,
+                                "test_cycle_iterations": test_cycle_iteration,
+                                "error": error_msg,
+                            },
+                            pipeline_run_id=pipeline_run_id,
+                        )
+                        obs.emit(
+                            EventType.REPAIR_CYCLE_COMPLETED,
+                            "repair_cycle", task_id, project,
+                            {
+                                "test_type": config.test_type,
+                                "test_type_index": test_type_index,
+                                "passed": 0,
+                                "test_cycle_iterations": test_cycle_iteration,
+                                "error": error_msg,
+                            },
+                            pipeline_run_id=pipeline_run_id,
+                        )
                     return CycleResult(
                         test_type=config.test_type,
                         passed=False,
                         iterations=test_cycle_iteration,
                         final_result=test_result,
-                        error=f"Infrastructure failure in threshold systemic sub-cycle: {threshold_infra[0].message}",
+                        error=error_msg,
                         files_fixed=files_fixed,
                         warnings_reviewed=warnings_reviewed,
                     )
@@ -2021,18 +2117,26 @@ If the failures appear to be isolated per-file issues with different root causes
         for attempt in range(MAX_SYSTEMIC_SUB_CYCLES):
             attempts_made = attempt + 1
 
-            # Check circuit breaker before each attempt
+            # Check circuit breaker before each attempt; hitting the limit terminates the sub-cycle immediately
             if self._agent_call_count >= self.max_total_agent_calls:
                 logger.error(
                     f"Circuit breaker triggered during systemic fix sub-cycle for "
                     f"{project}/{task_id}: agent_call_count={self._agent_call_count} "
                     f">= max={self.max_total_agent_calls}"
                 )
+                # Preserve real failure state so the caller doesn't receive a misleading sentinel
+                last_test_result = current_test_result
                 break
 
             failure_digest = self._build_failure_digest(current_test_result, current_grouped)
             # Guard against None if JSON parser returns null for this field
-            description = (analysis.systemic_issue_description or "").strip()
+            raw_description = analysis.systemic_issue_description
+            if raw_description is None:
+                logger.warning(
+                    f"systemic_issue_description is None for {project}/{task_id} — "
+                    f"root cause hint will be omitted from the fix prompt"
+                )
+            description = (raw_description or "").strip()
             known_pattern = (
                 f"\n\nAnalysis has identified the likely root cause:\n{description}"
                 if description
@@ -2091,9 +2195,10 @@ If the failures appear to be isolated per-file issues with different root causes
 
             except CancellationError:
                 raise
-            except (ImportError, AttributeError) as e:
-                # Non-retryable: agent executor module is missing or its interface
-                # does not match the call site. Neither condition improves on retry.
+            except (ImportError, AttributeError, TypeError) as e:
+                # Non-retryable: agent executor module is missing, its interface does
+                # not match the call site, or arguments are wrong type. None of these
+                # conditions improve on retry.
                 logger.error(
                     f"Systemic fix agent executor unavailable on attempt {attempts_made}: {e}",
                     exc_info=True,
