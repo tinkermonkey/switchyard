@@ -38,6 +38,7 @@ export default function LayoutController({
   onLayoutDone,
   containerHeight,
   fitViewAlign = 'center',
+  nodeSizeCache,
 }) {
   const storeApi = useStoreApi()
   const { getNodes, setViewport, fitView } = useReactFlow()
@@ -133,16 +134,27 @@ export default function LayoutController({
   const runLayout = useCallback(() => {
     const rb = rawBuildRef.current
     if (!rb || rb.nodes.length === 0) return
-    const measuredNodes = getNodes()
-    if (measuredNodes.length === 0) return
+    const rawMeasuredNodes = getNodes()
+    if (rawMeasuredNodes.length === 0) return
 
     // Guard: ensure measured nodes belong to the current rawBuild.
     // If rawBuild changed but Phase 1 hasn't run yet, getNodes() still returns
     // the previous layout's nodes — bail out so the correct Phase 2 fires later.
     const rawNodeIds = new Set(rb.nodes.map(n => n.id))
-    if (measuredNodes.length !== rawNodeIds.size || !measuredNodes.every(n => rawNodeIds.has(n.id))) {
+    if (rawMeasuredNodes.length !== rawNodeIds.size || !rawMeasuredNodes.every(n => rawNodeIds.has(n.id))) {
       return
     }
+
+    // Enrich each node with its cached measurement so applyCycleLayout always has
+    // accurate sizes. Cached values are captured via onNodesChange dimension events
+    // and survive across setNodes calls where node.measured may not yet be repopulated.
+    const sizeCache = nodeSizeCache?.current
+    const measuredNodes = sizeCache
+      ? rawMeasuredNodes.map(node => {
+          const cached = sizeCache.get(node.id)
+          return cached ? { ...node, measured: { ...(node.measured ?? {}), ...cached } } : node
+        })
+      : rawMeasuredNodes
 
     const { nodes: layoutedNodes } = applyCycleLayout(
       measuredNodes, rb.edges, rb.updatedCycles, layoutOptionsRef.current

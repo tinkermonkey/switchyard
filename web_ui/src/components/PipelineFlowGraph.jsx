@@ -108,6 +108,10 @@ export default function PipelineFlowGraph({
   // True once the graph has completed its first layout — used to detect incremental
   // updates vs. a fresh initial draw.
   const hasLayoutedOnceRef = useRef(false)
+  // Persistent cache of node measurements: nodeId → { width, height }.
+  // Updated via onNodesChange dimension events so the layout function always has
+  // accurate sizes even when node.measured hasn't been (re-)populated yet.
+  const nodeSizeCacheRef = useRef(new Map())
 
   // Merge caller overrides with canonical defaults so every param is always defined.
   // Memoized so the reference is stable — prevents LayoutController's param-change
@@ -162,6 +166,7 @@ export default function PipelineFlowGraph({
       } else {
         // Initial draw or completely new graph — hide and re-layout from scratch.
         hasLayoutedOnceRef.current = false
+        nodeSizeCacheRef.current = new Map()
         setLayoutReady(false)
         setNodes(rawBuild.nodes)
       }
@@ -203,6 +208,21 @@ export default function PipelineFlowGraph({
   const onNodeMouseEnter = useCallback((event, node) => setHoveredNode(node), [])
   const onNodeMouseLeave = useCallback(() => setHoveredNode(null), [])
 
+  // Intercept React Flow's dimension-change events to populate the persistent size cache.
+  // This runs before the layout so applyCycleLayout always has accurate measurements,
+  // even if node.measured hasn't been (re-)populated yet after a setNodes call.
+  const handleNodesChange = useCallback((changes) => {
+    changes.forEach(change => {
+      if (change.type === 'dimensions' && change.dimensions) {
+        nodeSizeCacheRef.current.set(change.id, {
+          width: change.dimensions.width,
+          height: change.dimensions.height,
+        })
+      }
+    })
+    onNodesChange(changes)
+  }, [onNodesChange])
+
   const containerStyle = {
     height: typeof height === 'number' ? `${height}px` : height,
     position: 'relative',
@@ -227,7 +247,7 @@ export default function PipelineFlowGraph({
           <ReactFlow
             nodes={nodes}
             edges={edges}
-            onNodesChange={onNodesChange}
+            onNodesChange={handleNodesChange}
             onEdgesChange={onEdgesChange}
             onNodeMouseEnter={onNodeMouseEnter}
             onNodeMouseLeave={onNodeMouseLeave}
@@ -252,6 +272,7 @@ export default function PipelineFlowGraph({
               onLayoutDone={handleLayoutDone}
               containerHeight={height}
               fitViewAlign={fitViewAlign}
+              nodeSizeCache={nodeSizeCacheRef}
             />
             <Background />
             <Controls />
