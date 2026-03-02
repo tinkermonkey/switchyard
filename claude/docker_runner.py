@@ -1004,6 +1004,7 @@ class DockerAgentRunner:
         agent = context.get('agent', 'unknown')
         task_id = context.get('task_id', 'unknown')
         project = context.get('project', 'unknown')
+        pipeline_run_id = context.get('pipeline_run_id')
 
         # Initialize timing (always needed, even if obs is None)
         import time
@@ -1011,7 +1012,8 @@ class DockerAgentRunner:
 
         # Emit events
         if obs:
-            obs.emit_claude_call_started(agent, task_id, project, claude_model)
+            obs.emit_claude_call_started(agent, task_id, project, claude_model,
+                                         pipeline_run_id=pipeline_run_id)
             obs.emit_container_launch_started(agent, task_id, project, container_name, image_name)
 
         try:

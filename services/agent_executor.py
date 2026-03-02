@@ -97,14 +97,15 @@ class AgentExecutor:
                     exc_info=True
                 )
 
-        # Emit task received event
-        self.obs.emit_task_received(agent_name, task_id, project_name, task_context,
-                                    execution_type=execution_type)
-
         # Extract pipeline_run_id from task_context for event tracking
         pipeline_run_id = task_context.get('pipeline_run_id')
         logger.info(f"[DIAGNOSTIC] Extracted pipeline_run_id from task_context: {pipeline_run_id} (type: {type(pipeline_run_id)})")
         logger.info(f"[DIAGNOSTIC] Full task_context keys: {list(task_context.keys())}")
+
+        # Emit task received event
+        self.obs.emit_task_received(agent_name, task_id, project_name, task_context,
+                                    execution_type=execution_type,
+                                    pipeline_run_id=pipeline_run_id)
 
         # Build execution context with ALL required fields
         # NOTE: Stream callback removed - docker-claude-wrapper.py handles all Claude log streaming

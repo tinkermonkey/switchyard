@@ -1850,7 +1850,7 @@ class ProjectMonitor:
                 # Get or create pipeline run early so we can tag all events
                 # Fetch issue details for pipeline run
                 issue_data_early = self.get_issue_details(repository, issue_number, project_config.github['org'])
-                pipeline_run = self.pipeline_run_manager.get_or_create_pipeline_run(
+                pipeline_run, pipeline_run_was_created = self.pipeline_run_manager.get_or_create_pipeline_run(
                     issue_number=issue_number,
                     issue_title=issue_data_early.get('title', f'Issue #{issue_number}'),
                     issue_url=issue_data_early.get('url', ''),
@@ -2470,7 +2470,8 @@ class ProjectMonitor:
                     return self._start_pr_review_for_issue(
                         project_name, board_name, issue_number, status,
                         repository, project_config, pipeline_config,
-                        workflow_template, column, current_stage_config
+                        workflow_template, column, current_stage_config,
+                        phantom_run_was_created=pipeline_run_was_created
                     )
 
                 # Fetch context from previous workflow stage (workspace-aware)
@@ -2578,6 +2579,17 @@ class ProjectMonitor:
                     issue_number=issue_number,
                     reason=f"Issue moved to no-agent column '{status}'"
                 )
+
+                # Reset PR review cycle when moved to Backlog — signals human intent to restart
+                if status.lower() == 'backlog':
+                    from state_management.pr_review_state_manager import pr_review_state_manager
+                    review_count = pr_review_state_manager.get_review_count(project_name, issue_number)
+                    if review_count > 0:
+                        pr_review_state_manager.reset_review_count(project_name, issue_number)
+                        logger.info(
+                            f"Reset PR review cycle for {project_name} issue #{issue_number} "
+                            f"(was {review_count}/3) — issue moved to Backlog by human"
+                        )
 
                 return None
 
@@ -3804,7 +3816,7 @@ class ProjectMonitor:
                 return None
 
             # Get or create pipeline run before starting the thread
-            pipeline_run = self.pipeline_run_manager.get_or_create_pipeline_run(
+            pipeline_run, _ = self.pipeline_run_manager.get_or_create_pipeline_run(
                 issue_number=issue_number,
                 issue_title=issue_data.get('title', f'Issue #{issue_number}'),
                 issue_url=issue_data.get('url', ''),
@@ -4771,7 +4783,8 @@ The automated test-fix-validate cycle has failed and requires manual interventio
         pipeline_config,
         workflow_template,
         column,
-        stage_config
+        stage_config,
+        phantom_run_was_created: bool = False
     ) -> Optional[str]:
         """Start PR review stage for an issue in a background thread.
 
@@ -4790,6 +4803,22 @@ The automated test-fix-validate cycle has failed and requires manual interventio
                     f"Active execution already exists for {project_name}/#{issue_number}. "
                     f"Skipping duplicate PR review launch."
                 )
+                # End any phantom pipeline run that was freshly created before this duplicate
+                # check fired — otherwise it lingers as an "active" run in Redis and becomes
+                # a stale pipeline_run_id source on the next orchestrator restart.
+                if phantom_run_was_created:
+                    try:
+                        self.pipeline_run_manager.end_pipeline_run(
+                            project=project_name,
+                            issue_number=issue_number,
+                            reason="Duplicate PR review execution detected - ending phantom run",
+                            retain_lock=True  # Keep lock since the real execution is still active
+                        )
+                        logger.info(
+                            f"Ended phantom pipeline run for issue #{issue_number} (duplicate skip)"
+                        )
+                    except Exception as e:
+                        logger.warning(f"Failed to end phantom pipeline run: {e}")
                 return stage_config.stage
 
             # Acquire pipeline lock if not already held.
@@ -4836,7 +4865,7 @@ The automated test-fix-validate cycle has failed and requires manual interventio
                 discussion_id = state_manager.get_discussion_for_issue(project_name, issue_number)
 
             # Get or create pipeline run
-            pipeline_run = self.pipeline_run_manager.get_or_create_pipeline_run(
+            pipeline_run, _ = self.pipeline_run_manager.get_or_create_pipeline_run(
                 issue_number=issue_number,
                 issue_title=issue_data.get('title', f'Issue #{issue_number}'),
                 issue_url=issue_data.get('url', ''),
@@ -4945,6 +4974,21 @@ The automated test-fix-validate cycle has failed and requires manual interventio
                         project_name=project_name,
                         error=str(e)
                     )
+
+                    # End the pipeline run so it doesn't remain "active" in Redis.
+                    # retain_lock=True for cycle limit errors (human must intervene before re-triggering),
+                    # retain_lock=False for other errors (allow re-trigger on next poll).
+                    from agents.non_retryable import NonRetryableAgentError
+                    _retain = isinstance(e, NonRetryableAgentError)
+                    try:
+                        self.pipeline_run_manager.end_pipeline_run(
+                            project=project_name,
+                            issue_number=issue_number,
+                            reason=f"PR review stage exception: {type(e).__name__}",
+                            retain_lock=_retain
+                        )
+                    except Exception as end_err:
+                        logger.warning(f"Failed to end pipeline run after PR review failure: {end_err}")
 
                     # Post failure comment to GitHub
                     try:
@@ -5122,7 +5166,7 @@ The automated test-fix-validate cycle has failed and requires manual interventio
             checkpoint_interval = stage_config.checkpoint_interval or 5
 
             # Get or create pipeline run
-            pipeline_run = self.pipeline_run_manager.get_or_create_pipeline_run(
+            pipeline_run, _ = self.pipeline_run_manager.get_or_create_pipeline_run(
                 issue_number=issue_number,
                 issue_title=issue_data.get('title', f'Issue #{issue_number}'),
                 issue_url=issue_data.get('url', ''),

@@ -95,7 +95,7 @@ def project_monitor(mock_config_manager):
         'previous_output': 'Code implementation completed'
     })
     monitor.pipeline_run_manager = Mock()
-    monitor.pipeline_run_manager.get_or_create_pipeline_run.return_value = Mock(id='test-run-123')
+    monitor.pipeline_run_manager.get_or_create_pipeline_run.return_value = (Mock(id='test-run-123'), False)
     monitor.pipeline_run_manager.end_pipeline_run = Mock()
 
     return monitor

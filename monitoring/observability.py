@@ -624,13 +624,14 @@ class ObservabilityManager:
                 logger.error(f"Failed to index prompt_constructed event to Elasticsearch: {e}")
 
     def emit_claude_call_started(self, agent: str, task_id: str, project: str,
-                                 model: str, input_tokens: Optional[int] = None):
+                                 model: str, input_tokens: Optional[int] = None,
+                                 pipeline_run_id: Optional[str] = None):
         """Emit Claude API call started event"""
         self.emit(EventType.CLAUDE_API_CALL_STARTED, agent, task_id, project, {
             'model': model,
             'input_tokens': input_tokens,
             'start_time': datetime.utcnow().isoformat() + 'Z'
-        })
+        }, pipeline_run_id=pipeline_run_id)
 
     def emit_claude_call_completed(self, agent: str, task_id: str, project: str,
                                    duration_ms: float, input_tokens: int,

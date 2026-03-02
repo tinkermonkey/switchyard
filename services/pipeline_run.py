@@ -365,7 +365,7 @@ class PipelineRunManager:
         project: str,
         board: str,
         discussion_id: Optional[str] = None
-    ) -> PipelineRun:
+    ) -> tuple['PipelineRun', bool]:
         """
         Get existing active pipeline run or create a new one
 
@@ -384,7 +384,8 @@ class PipelineRunManager:
             discussion_id: Optional GitHub discussion node ID for context continuity
 
         Returns:
-            PipelineRun instance (existing or new)
+            Tuple of (PipelineRun instance, was_created) where was_created=True means
+            a new run was just created, False means an existing active run was returned.
         """
         # Use a lock to prevent race conditions when creating runs
         lock_key = f"{self.redis_prefix}:lock:{project}:{issue_number}"
@@ -400,7 +401,7 @@ class PipelineRunManager:
                         f"Using existing pipeline run {existing.id} for "
                         f"{project} issue #{issue_number}"
                     )
-                    return existing
+                    return existing, False
                 
                 # Redis doesn't have an active run, but Elasticsearch might have old ones
                 # Query Elasticsearch for any active runs for this issue
@@ -464,7 +465,7 @@ class PipelineRunManager:
                     )
 
                 # Create new run
-                return self.create_pipeline_run(
+                new_run = self.create_pipeline_run(
                     issue_number=issue_number,
                     issue_title=issue_title,
                     issue_url=issue_url,
@@ -472,12 +473,13 @@ class PipelineRunManager:
                     board=board,
                     discussion_id=discussion_id
                 )
+                return new_run, True
         except redis.exceptions.LockError:
             logger.warning(f"Could not acquire lock for pipeline run creation: {project} #{issue_number}")
             # Fallback: try to get existing one last time
             existing = self.get_active_pipeline_run(project, issue_number)
             if existing:
-                return existing
+                return existing, False
             
             # If we can't get lock and no existing run, proceed with creation anyway
             # This is a best-effort fallback
@@ -490,13 +492,14 @@ class PipelineRunManager:
                     f"Failed to clear stale cancellation signal for {project} issue #{issue_number}: {e}. "
                     f"Agents dispatched for this pipeline run may be immediately cancelled."
                 )
-            return self.create_pipeline_run(
+            new_run = self.create_pipeline_run(
                 issue_number=issue_number,
                 issue_title=issue_title,
                 issue_url=issue_url,
                 project=project,
                 board=board
             )
+            return new_run, True
 
     def get_pipeline_run(self, pipeline_run_id: str) -> Optional['PipelineRun']:
         """
@@ -592,7 +595,7 @@ class PipelineRunManager:
                 )
 
             # Get or create pipeline run (returns existing if active)
-            pipeline_run = self.get_or_create_pipeline_run(
+            pipeline_run, _ = self.get_or_create_pipeline_run(
                 issue_number=issue_number,
                 issue_title=issue_title,
                 issue_url=issue_url,

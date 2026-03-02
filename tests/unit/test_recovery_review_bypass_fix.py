@@ -174,7 +174,7 @@ class TestPipelineRunCancellationSignal:
         mock_run.id = "new-run-456"
 
         with patch('services.cancellation.get_cancellation_signal', return_value=mock_signal), \
-             patch.object(manager, 'get_or_create_pipeline_run', return_value=mock_run):
+             patch.object(manager, 'get_or_create_pipeline_run', return_value=(mock_run, False)):
             result = manager.ensure_pipeline_run_for_task(
                 project="proj", board="dev_board", issue_number=42
             )
