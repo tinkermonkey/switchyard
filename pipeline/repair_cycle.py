@@ -1885,7 +1885,11 @@ If the failures appear to be isolated per-file issues with different root causes
 
             # Check circuit breaker before each rebuild attempt
             if self._agent_call_count >= self.max_total_agent_calls:
-                logger.error("Circuit breaker triggered during env rebuild sub-cycle")
+                logger.error(
+                    f"Circuit breaker triggered during env rebuild sub-cycle for "
+                    f"{project}/{task_id}: agent_call_count={self._agent_call_count} "
+                    f">= max={self.max_total_agent_calls}"
+                )
                 break
 
             logger.info(
@@ -2114,6 +2118,20 @@ If the failures appear to be isolated per-file issues with different root causes
         current_test_result = initial_test_result
         current_grouped = initial_grouped_failures
 
+        # Compute once — analysis does not change between attempts
+        raw_description = analysis.systemic_issue_description
+        if raw_description is None:
+            logger.warning(
+                f"systemic_issue_description is None for {project}/{task_id} — "
+                f"root cause hint will be omitted from the fix prompt"
+            )
+        description = (raw_description or "").strip()
+        known_pattern = (
+            f"\n\nAnalysis has identified the likely root cause:\n{description}"
+            if description
+            else ""
+        )
+
         for attempt in range(MAX_SYSTEMIC_SUB_CYCLES):
             attempts_made = attempt + 1
 
@@ -2129,19 +2147,6 @@ If the failures appear to be isolated per-file issues with different root causes
                 break
 
             failure_digest = self._build_failure_digest(current_test_result, current_grouped)
-            # Guard against None if JSON parser returns null for this field
-            raw_description = analysis.systemic_issue_description
-            if raw_description is None:
-                logger.warning(
-                    f"systemic_issue_description is None for {project}/{task_id} — "
-                    f"root cause hint will be omitted from the fix prompt"
-                )
-            description = (raw_description or "").strip()
-            known_pattern = (
-                f"\n\nAnalysis has identified the likely root cause:\n{description}"
-                if description
-                else ""
-            )
             attempt_note = (
                 f"\n\nThis is attempt {attempts_made}/{MAX_SYSTEMIC_SUB_CYCLES}. "
                 f"Focus on the remaining failures shown above."
