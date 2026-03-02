@@ -276,7 +276,7 @@ class ReviewParser:
             if markdown_header_match:
                 section_title = markdown_header_match.group(1).strip()
                 # Advisory/FYI sections cap findings at low severity — items cannot escalate
-                if re.search(r'(?i)\b(?:advisory|out\s+of\s+scope|fyi|notes?)\b', section_title):
+                if re.search(r'(?i)\b(?:advisory|out\s+of\s+scope|fyi)\b', section_title):
                     current_section_severity = 'low'
                     current_section_is_ceiling = True
                     continue

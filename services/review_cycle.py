@@ -944,10 +944,11 @@ class ReviewCycleExecutor:
             # The reviewer prompt explicitly forbids this combination; if it occurs anyway,
             # override to CHANGES_REQUESTED so the findings are not silently dropped.
             if (review_result.status == ReviewStatus.APPROVED
-                    and review_result.high_severity_count > 0):
+                    and (review_result.high_severity_count > 0 or review_result.blocking_count > 0)):
                 logger.warning(
-                    f"Reviewer returned APPROVED with {review_result.high_severity_count} high-severity "
-                    f"finding(s) — overriding to CHANGES_REQUESTED so findings are not lost"
+                    f"Reviewer returned APPROVED with {review_result.blocking_count} blocking and "
+                    f"{review_result.high_severity_count} high-severity finding(s) — "
+                    f"overriding to CHANGES_REQUESTED so findings are not lost"
                 )
                 review_result.status = ReviewStatus.CHANGES_REQUESTED
 

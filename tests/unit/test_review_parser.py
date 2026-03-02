@@ -755,6 +755,41 @@ Approved despite high priority finding.
         assert result.status == ReviewStatus.APPROVED
         assert result.high_severity_count == 1  # The safety net catches this
 
+    def test_approved_with_blocking_items_detected(self, parser):
+        """Parser should correctly count blocking even when status is APPROVED (safety net input)"""
+        review = """
+### Status
+**APPROVED**
+
+#### Critical (Must Fix)
+- **Security**: SQL injection vulnerability in query builder
+
+### Summary
+Approved despite critical finding.
+        """
+
+        result = parser.parse_review(review)
+
+        assert result.status == ReviewStatus.APPROVED
+        assert result.blocking_count == 1  # The safety net catches this
+
+    def test_notes_header_is_not_advisory_ceiling(self, parser):
+        """'Implementation Notes' or similar headers must NOT cap finding severity to low"""
+        review = """
+### Status
+**CHANGES NEEDED**
+
+#### Implementation Notes
+- **Security**: Missing input validation on user-facing endpoint
+- **Critical gap**: Database migration will lose existing data
+        """
+
+        result = parser.parse_review(review)
+
+        # Findings under "Implementation Notes" must not be silently downgraded
+        high_or_blocking = [f for f in result.findings if f.severity in ('high', 'blocking')]
+        assert len(high_or_blocking) >= 1
+
 
 if __name__ == '__main__':
     pytest.main([__file__, '-v', '-s'])
