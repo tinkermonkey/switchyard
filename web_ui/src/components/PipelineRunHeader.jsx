@@ -76,8 +76,8 @@ export default function PipelineRunHeader({
   const statusLabel = isActive
     ? 'Active'
     : (pipelineRun.outcome
-        ? pipelineRun.outcome.charAt(0).toUpperCase() + pipelineRun.outcome.slice(1)
-        : 'Completed')
+      ? pipelineRun.outcome.charAt(0).toUpperCase() + pipelineRun.outcome.slice(1)
+      : 'Completed')
 
   const metaCols = [
     {
@@ -144,6 +144,47 @@ export default function PipelineRunHeader({
                 lockHolderIssue={pipelineRun.lock_holder_issue}
               />
             )}
+            <div className="flex divide-x divide-gh-border border border-gh-border rounded overflow-hidden flex-shrink-0">
+              {onToggleFullscreen && (
+                <button
+                  onClick={onToggleFullscreen}
+                  className="inline-flex items-center gap-2 px-3 py-1.5 text-sm bg-gh-canvas hover:bg-gh-border-muted transition-colors whitespace-nowrap"
+                  title={isFullscreen ? 'Exit fullscreen' : 'Expand to fullscreen'}
+                >
+                  {isFullscreen ? <Minimize2 className="w-4 h-4" /> : <Maximize2 className="w-4 h-4" />}
+                </button>
+              )}
+              {latestAgentExecutionId && (
+                <button
+                  onClick={() => navigate({
+                    to: '/agent-execution/$executionId',
+                    params: { executionId: latestAgentExecutionId },
+                    search: { autoAdvance: true },
+                  })}
+                  className="inline-flex items-center gap-2 px-3 py-1.5 text-sm bg-gh-canvas hover:bg-gh-border-muted transition-colors whitespace-nowrap"
+                >
+                  <ArrowRight className="w-4 h-4" />
+                  <span>View Execution</span>
+                </button>
+              )}
+              {pipelineRun.status === 'active' && (
+                <button
+                  onClick={onKillRun}
+                  className="inline-flex items-center gap-2 px-3 py-1.5 text-sm bg-gh-canvas hover:bg-gh-border-muted transition-colors whitespace-nowrap text-red-400"
+                  title="Kill this pipeline run"
+                >
+                  <XCircle className="w-4 h-4" />
+                  Kill Run
+                </button>
+              )}
+              <button
+                onClick={onDownloadDebugData}
+                className="inline-flex items-center gap-2 px-3 py-1.5 text-sm bg-gh-canvas hover:bg-gh-border-muted transition-colors whitespace-nowrap"
+                title="Download debug data as JSON"
+              >
+                📥 Download
+              </button>
+            </div>
           </div>
 
           <div className="overflow-x-auto">
@@ -166,47 +207,6 @@ export default function PipelineRunHeader({
           </div>
         </div>
 
-        <div className="flex divide-x divide-gh-border border border-gh-border rounded overflow-hidden flex-shrink-0">
-          {latestAgentExecutionId && (
-            <button
-              onClick={() => navigate({
-                to: '/agent-execution/$executionId',
-                params: { executionId: latestAgentExecutionId },
-                search: { autoAdvance: true },
-              })}
-              className="inline-flex items-center gap-2 px-3 py-1.5 text-sm bg-gh-canvas hover:bg-gh-border-muted transition-colors whitespace-nowrap"
-            >
-              <ArrowRight className="w-4 h-4" />
-              <span>View Execution</span>
-            </button>
-          )}
-          {pipelineRun.status === 'active' && (
-            <button
-              onClick={onKillRun}
-              className="inline-flex items-center gap-2 px-3 py-1.5 text-sm bg-gh-canvas hover:bg-gh-border-muted transition-colors whitespace-nowrap text-red-400"
-              title="Kill this pipeline run"
-            >
-              <XCircle className="w-4 h-4" />
-              Kill Run
-            </button>
-          )}
-          <button
-            onClick={onDownloadDebugData}
-            className="inline-flex items-center gap-2 px-3 py-1.5 text-sm bg-gh-canvas hover:bg-gh-border-muted transition-colors whitespace-nowrap"
-            title="Download debug data as JSON"
-          >
-            📥 Download
-          </button>
-          {onToggleFullscreen && (
-            <button
-              onClick={onToggleFullscreen}
-              className="inline-flex items-center gap-2 px-3 py-1.5 text-sm bg-gh-canvas hover:bg-gh-border-muted transition-colors whitespace-nowrap"
-              title={isFullscreen ? 'Exit fullscreen' : 'Expand to fullscreen'}
-            >
-              {isFullscreen ? <Minimize2 className="w-4 h-4" /> : <Maximize2 className="w-4 h-4" />}
-            </button>
-          )}
-        </div>
       </div>
 
       <div className="">
