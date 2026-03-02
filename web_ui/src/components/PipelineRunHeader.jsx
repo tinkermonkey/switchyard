@@ -42,6 +42,13 @@ export default function PipelineRunHeader({
   const navigate = useNavigate()
   const [pipelineRunLogs, setPipelineRunLogs] = useState([])
   const [copied, setCopied] = useState(false)
+  const [, setTick] = useState(0)
+
+  useEffect(() => {
+    if (pipelineRun?.duration || pipelineRun?.status !== 'active') return
+    const id = setInterval(() => setTick(t => t + 1), 1000)
+    return () => clearInterval(id)
+  }, [pipelineRun?.duration, pipelineRun?.status])
 
   useEffect(() => {
     if (!pipelineRun?.id) return
@@ -144,7 +151,7 @@ export default function PipelineRunHeader({
                 lockHolderIssue={pipelineRun.lock_holder_issue}
               />
             )}
-            <div className="flex divide-x divide-gh-border border border-gh-border rounded overflow-hidden flex-shrink-0">
+            <div className="flex divide-x divide-gh-border border border-gh-border rounded overflow-hidden flex-shrink-0 ml-auto">
               {onToggleFullscreen && (
                 <button
                   onClick={onToggleFullscreen}
