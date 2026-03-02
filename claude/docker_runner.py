@@ -2206,6 +2206,32 @@ class DockerAgentRunner:
                         )
 
                         if current_column and getattr(current_column, 'type', None) == 'review':
+                            # If the recovered container was the reviewer agent, process the verdict.
+                            # Pattern: asyncio.run() from a thread is the established approach here
+                            # (same as project_monitor.py calling resume_active_cycles).
+                            if (
+                                exit_code == 0
+                                and output
+                                and getattr(current_column, 'agent', None) == agent
+                            ):
+                                try:
+                                    from services.review_cycle import review_cycle_executor
+                                    asyncio.run(
+                                        review_cycle_executor.process_recovered_reviewer_output(
+                                            project, issue_number, output
+                                        )
+                                    )
+                                    logger.info(
+                                        f"Processed recovered reviewer verdict for "
+                                        f"{agent} on {project} issue #{issue_number}"
+                                    )
+                                except Exception as e:
+                                    logger.error(
+                                        f"Failed to process recovered reviewer verdict for "
+                                        f"{project} issue #{issue_number}: {e}",
+                                        exc_info=True
+                                    )
+
                             logger.info(
                                 f"Skipping auto-advance for recovered container: "
                                 f"column '{column}' is a review cycle column. "

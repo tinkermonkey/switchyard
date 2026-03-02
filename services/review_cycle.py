@@ -2787,6 +2787,101 @@ _Escalated by Claude Code Orchestrator_
             logger.info(f"No next column after {current_column.name}, staying in current")
             return current_column.name
 
+    async def process_recovered_reviewer_output(
+        self,
+        project_name: str,
+        issue_number: int,
+        reviewer_output: str,
+    ) -> None:
+        """
+        Process the verdict from a reviewer agent that completed via container
+        recovery (after orchestrator restart).
+
+        The normal path processes the verdict inline in _execute_review_loop()
+        immediately after the reviewer returns. When a restart occurs while the
+        reviewer container is running, recovery posts the output to GitHub but
+        skips verdict processing. This method fills that gap.
+        """
+        logger.info(
+            f"Processing recovered reviewer output for {project_name} issue #{issue_number}"
+        )
+
+        # 1. Resolve active cycle (in-memory first, then disk fallback)
+        cycle_state = self.active_cycles.get(issue_number)
+        if cycle_state is None or cycle_state.project_name != project_name:
+            loaded = self._load_active_cycles(project_name)
+            cycle_state = next(
+                (c for c in loaded if c.issue_number == issue_number), None
+            )
+            if cycle_state:
+                self.active_cycles[issue_number] = cycle_state
+
+        if not cycle_state:
+            logger.warning(
+                f"process_recovered_reviewer_output: no active review cycle "
+                f"for {project_name} issue #{issue_number} — skipping"
+            )
+            return
+
+        # 2. Acquire per-issue execution lock (prevents race with project monitor poll)
+        lock = self._get_cycle_lock(issue_number)
+        if not lock.acquire(blocking=False):
+            logger.warning(
+                f"Review cycle lock already held for {project_name} issue "
+                f"#{issue_number} — skipping recovered reviewer processing"
+            )
+            return
+
+        try:
+            # 3. Determine the correct iteration number.
+            #    _execute_review_loop() increments current_iteration BEFORE running
+            #    the reviewer, but saves state AFTER it returns. If the restart
+            #    happened during reviewer execution, the on-disk current_iteration is
+            #    still the pre-increment value (e.g. 0). Use
+            #    max(current_iteration, len(review_outputs)+1) to get iteration 1
+            #    regardless of whether the increment was persisted.
+            target_iteration = max(
+                cycle_state.current_iteration,
+                len(cycle_state.review_outputs) + 1
+            )
+
+            # Idempotency guard: skip if review output already recorded
+            if any(r['iteration'] == target_iteration for r in cycle_state.review_outputs):
+                logger.info(
+                    f"Reviewer output for iteration {target_iteration} already "
+                    f"recorded for {project_name} issue #{issue_number} — skipping"
+                )
+                return
+
+            # 4. Persist reviewer output and update iteration counter.
+            #    Set status to 'reviewer_working' so that if _continue_cycle_from_review
+            #    crashes, the next resume_active_cycles() (lines 540-559) will correctly
+            #    detect "reviewer completed, needs processing" and retry.
+            cycle_state.review_outputs.append({
+                'iteration': target_iteration,
+                'output': reviewer_output,
+                'timestamp': datetime.now().isoformat(),
+            })
+            cycle_state.current_iteration = target_iteration
+            cycle_state.status = 'reviewer_working'
+            self._save_cycle_state(cycle_state)
+
+            logger.info(
+                f"Stored recovered reviewer output for {project_name} issue "
+                f"#{issue_number} (iteration {target_iteration})"
+            )
+
+            # 5. Load org from project config
+            from config.manager import config_manager
+            project_config = config_manager.get_project_config(project_name)
+            org = project_config.github.get('org', '') if project_config else ''
+
+            # 6. Process verdict via the existing path
+            await self._continue_cycle_from_review(cycle_state, org)
+
+        finally:
+            lock.release()
+
 
 # Global executor instance
 review_cycle_executor = ReviewCycleExecutor()
