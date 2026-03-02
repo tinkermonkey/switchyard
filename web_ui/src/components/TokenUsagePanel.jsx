@@ -21,11 +21,11 @@ export default function TokenUsagePanel({ logs, promptText }) {
     if (!logs || logs.length === 0) return { hasData: false }
 
     let firstInput = null
-    let cumulativeLastInput = 0
+    let peakEffectiveInput = 0
     let totalOutputTokens = 0
-    let lastCacheRead = 0
-    let lastCacheCreation = 0
-    let lastDirectInput = 0
+    let peakCacheRead = 0
+    let peakCacheCreation = 0
+    let peakDirectInput = 0
     const modelsUsed = new Set()
     const toolCallCounts = {}
     const toolIdToName = {}
@@ -61,11 +61,11 @@ export default function TokenUsagePanel({ logs, promptText }) {
         const outputTokens = usage.output_tokens || 0
 
         if (firstInput === null) firstInput = effectiveInput
-        cumulativeLastInput = effectiveInput
+        peakEffectiveInput = effectiveInput
         totalOutputTokens += outputTokens
-        lastCacheRead = cacheRead
-        lastCacheCreation = cacheCreation
-        lastDirectInput = inputDirect
+        peakCacheRead = cacheRead
+        peakCacheCreation = cacheCreation
+        peakDirectInput = inputDirect
 
         if (prevEffectiveInput !== null && prevTurnTools.length > 0) {
           const delta = Math.max(0, effectiveInput - prevEffectiveInput)
@@ -108,8 +108,8 @@ export default function TokenUsagePanel({ logs, promptText }) {
     }
 
     const promptLength = promptText?.length || 0
-    const peakContext = cumulativeLastInput
-    const contextGrowth = cumulativeLastInput - (firstInput || 0)
+    const peakContext = peakEffectiveInput
+    const contextGrowth = peakEffectiveInput - (firstInput || 0)
 
     return {
       hasData: firstInput !== null,
@@ -117,10 +117,10 @@ export default function TokenUsagePanel({ logs, promptText }) {
       peakContext,
       contextGrowth,
       totalOutput: totalOutputTokens,
-      totalCacheRead: lastCacheRead,
-      totalCacheCreation: lastCacheCreation,
-      totalDirectInput: lastDirectInput,
-      totalAll: cumulativeLastInput + totalOutputTokens,
+      peakCacheRead,
+      peakCacheCreation,
+      peakDirectInput,
+      totalAll: peakEffectiveInput + totalOutputTokens,
       promptLength,
       modelsUsed: Array.from(modelsUsed),
       toolsAvailable: tokenToolsAvailable,
@@ -199,22 +199,22 @@ export default function TokenUsagePanel({ logs, promptText }) {
                 </tr>
                 <tr>
                   <td className="text-gh-fg-muted py-0.5 pl-3 text-xs">↳ direct input</td>
-                  <td className="text-right font-mono text-xs">{formatTokenCount(tokenUsage.totalDirectInput)}</td>
+                  <td className="text-right font-mono text-xs">{formatTokenCount(tokenUsage.peakDirectInput)}</td>
                 </tr>
                 <tr>
                   <td className="text-gh-fg-muted py-0.5 pl-3 text-xs">↳ cache reads</td>
-                  <td className="text-right font-mono text-xs">{formatTokenCount(tokenUsage.totalCacheRead)}</td>
+                  <td className="text-right font-mono text-xs">{formatTokenCount(tokenUsage.peakCacheRead)}</td>
                 </tr>
                 <tr>
                   <td className="text-gh-fg-muted py-0.5 pl-3 text-xs">↳ cache writes</td>
-                  <td className="text-right font-mono text-xs">{formatTokenCount(tokenUsage.totalCacheCreation)}</td>
+                  <td className="text-right font-mono text-xs">{formatTokenCount(tokenUsage.peakCacheCreation)}</td>
                 </tr>
                 <tr className="border-t border-gh-border">
                   <td className="text-gh-fg-muted py-0.5">Output</td>
                   <td className="text-right font-mono">{formatTokenCount(tokenUsage.totalOutput)}</td>
                 </tr>
                 <tr className="border-t border-gh-border">
-                  <td className="text-gh-fg font-semibold py-0.5">Grand total</td>
+                  <td className="text-gh-fg font-semibold py-0.5">Peak ctx + output</td>
                   <td className="text-right font-mono font-semibold">{formatTokenCount(tokenUsage.totalAll)}</td>
                 </tr>
                 {tokenUsage.promptLength > 0 && (
