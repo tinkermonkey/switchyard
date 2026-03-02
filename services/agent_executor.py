@@ -1232,28 +1232,34 @@ class AgentExecutor:
                 pass
 
             # Create verifier task with reference to setup output
+            verifier_context = {
+                'issue': task_context.get('issue', {
+                    'title': f'Verify development environment for {project_name}',
+                    'body': 'Auto-triggered: Verify Docker image after setup completion',
+                    'number': 0
+                }),
+                'issue_number': task_context.get('issue_number', 0),
+                'board': task_context.get('board', 'system'),
+                'column': verifier_column,  # Pass the column so auto-advance works
+                'project': project_name,
+                'repository': project_name,
+                'automated_setup': True,
+                'auto_triggered': True,
+                'skip_workspace_prep': True,  # Verifier checks Docker image, no issue branch needed
+                'use_docker': False,  # Verifier also runs locally
+                'previous_stage_output': 'Setup agent completed successfully'
+            }
+            # Propagate pipeline_run_id from setup task so verifier events are
+            # visible to the repair cycle's stall-detection query.
+            if task_context.get('pipeline_run_id'):
+                verifier_context['pipeline_run_id'] = task_context['pipeline_run_id']
+
             task = Task(
                 id=str(uuid.uuid4()),
                 agent="dev_environment_verifier",
                 project=project_name,
                 priority=TaskPriority.HIGH,
-                context={
-                    'issue': task_context.get('issue', {
-                        'title': f'Verify development environment for {project_name}',
-                        'body': 'Auto-triggered: Verify Docker image after setup completion',
-                        'number': 0
-                    }),
-                    'issue_number': task_context.get('issue_number', 0),
-                    'board': task_context.get('board', 'system'),
-                    'column': verifier_column,  # Pass the column so auto-advance works
-                    'project': project_name,
-                    'repository': project_name,
-                    'automated_setup': True,
-                    'auto_triggered': True,
-                    'skip_workspace_prep': True,  # Verifier checks Docker image, no issue branch needed
-                    'use_docker': False,  # Verifier also runs locally
-                    'previous_stage_output': 'Setup agent completed successfully'
-                },
+                context=verifier_context,
                 created_at=utc_isoformat()
             )
 

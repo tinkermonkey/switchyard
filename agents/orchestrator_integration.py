@@ -63,7 +63,7 @@ async def validate_task_can_run(task, logger) -> Dict[str, Any]:
         }
 
 
-async def queue_dev_environment_setup(project: str, logger, change_description: str = ""):
+async def queue_dev_environment_setup(project: str, logger, change_description: str = "", pipeline_run_id: str = None):
     """
     Queue a dev_environment_setup task for a project.
 
@@ -76,6 +76,8 @@ async def queue_dev_environment_setup(project: str, logger, change_description: 
         change_description: Optional description of what env changes are needed,
             injected into the task issue body so the setup agent receives specific
             instructions (e.g. from systemic failure analysis).
+        pipeline_run_id: If provided, tags the setup (and subsequent verifier) task
+            with this ID so their events appear in stall-detection queries.
     """
     from task_queue.task_manager import Task, TaskPriority, TaskQueue
     from services.dev_container_state import dev_container_state, DevContainerStatus
@@ -106,26 +108,30 @@ async def queue_dev_environment_setup(project: str, logger, change_description: 
             else base_body
         )
 
+        context = {
+            'issue': {
+                'title': f'Development environment setup for {project}',
+                'body': issue_body,
+                'number': 0
+            },
+            'issue_number': 0,
+            'board': 'system',
+            'project': project,
+            'repository': project,
+            'automated_setup': True,
+            'auto_triggered': True,
+            'skip_workspace_prep': True,  # System task — no feature branch needed
+            'use_docker': False  # Run locally in orchestrator environment
+        }
+        if pipeline_run_id:
+            context['pipeline_run_id'] = pipeline_run_id
+
         task = Task(
             id=str(uuid.uuid4()),
             agent="dev_environment_setup",
             project=project,
             priority=TaskPriority.HIGH,
-            context={
-                'issue': {
-                    'title': f'Development environment setup for {project}',
-                    'body': issue_body,
-                    'number': 0
-                },
-                'issue_number': 0,
-                'board': 'system',
-                'project': project,
-                'repository': project,
-                'automated_setup': True,
-                'auto_triggered': True,
-                'skip_workspace_prep': True,  # System task — no feature branch needed
-                'use_docker': False  # Run locally in orchestrator environment
-            },
+            context=context,
             created_at=datetime.now().isoformat()
         )
 
@@ -404,31 +410,20 @@ async def process_task_integrated(task, state_manager, logger):
                 )
 
         elif validation_result.get('defer'):
-            # Dev container setup is already in progress — re-enqueue the task so it
-            # will be picked up again once the container is ready, instead of being dropped.
+            # Dev container setup is already in progress — re-enqueue the task with a
+            # delay so it will be picked up again once the container is ready, instead of
+            # being dropped or spinning in a tight busy-loop.
             try:
                 from task_queue.task_manager import TaskQueue
+                from datetime import datetime, timezone, timedelta
                 defer_queue = TaskQueue(use_redis=True)
+                task.not_before = (
+                    datetime.now(timezone.utc) + timedelta(seconds=30)
+                ).isoformat()
                 defer_queue.enqueue(task)
                 logger.info(
                     f"Deferred task {task.id} ({task.agent}) for {task.project} — "
-                    f"re-enqueued to retry after dev container setup completes"
-                )
-                decision_events.emit_error_decision(
-                    error_type='TaskValidationError',
-                    error_message=user_message,
-                    context={
-                        'task_id': task.id,
-                        'agent': task.agent,
-                        'issue_number': issue_number,
-                        'board': board_name,
-                        'requires_dev_container': True,
-                        'deferred': True,
-                    },
-                    recovery_action='task_deferred',
-                    success=True,
-                    project=task.project,
-                    pipeline_run_id=pipeline_run_id
+                    f"re-enqueued with 30s delay, will retry after dev container setup completes"
                 )
             except Exception as defer_error:
                 logger.error(

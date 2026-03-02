@@ -1905,10 +1905,14 @@ If the failures appear to be isolated per-file issues with different root causes
                     error_message=f"Reset for systemic env fix: {analysis.env_issue_description[:200]}",
                 )
 
-                # Queue dev environment setup with the change description
+                # Queue dev environment setup with the change description, tagged with
+                # this pipeline_run_id so setup/verifier events are visible to the
+                # stall-detection query in _monitor_repair_cycle_container.
                 from agents.orchestrator_integration import queue_dev_environment_setup
                 await queue_dev_environment_setup(
-                    project, logger, change_description=analysis.env_issue_description
+                    project, logger,
+                    change_description=analysis.env_issue_description,
+                    pipeline_run_id=pipeline_run_id,
                 )
 
             except CancellationError:
@@ -1917,13 +1921,15 @@ If the failures appear to be isolated per-file issues with different root causes
                 logger.error(f"Env rebuild setup failed on attempt {attempts_made}: {e}", exc_info=True)
                 break
 
-            # Poll until VERIFIED, BLOCKED, or timeout
-            poll_timeout = config.timeout // 2
+            # Poll until VERIFIED, BLOCKED, or cancellation. No timer here — the
+            # overall 1-hour stall check in _monitor_repair_cycle_container handles
+            # runaway cases, and image builds can legitimately take longer than any
+            # test-type timeout.
             poll_interval = 30
             elapsed = 0
             final_status = None
 
-            while elapsed < poll_timeout:
+            while True:
                 await asyncio.sleep(poll_interval)
                 elapsed += poll_interval
 
@@ -1955,26 +1961,11 @@ If the failures appear to be isolated per-file issues with different root causes
                     break  # All tests pass — done
                 # Tests still failing after rebuild; try again (up to MAX attempts)
             else:
-                # BLOCKED or timeout — stop retrying
+                # BLOCKED — stop retrying
                 logger.warning(
-                    f"Env rebuild ended with status={final_status} for {project} "
+                    f"Env rebuild ended with status=BLOCKED for {project} "
                     f"after {elapsed}s, stopping sub-cycle"
                 )
-                # If we timed out (final_status is None), the dev container may still be
-                # in IN_PROGRESS from when we queued the setup agent. Reset to UNVERIFIED
-                # so future pipeline executions aren't blocked by a stale in_progress state.
-                if final_status is None:
-                    current = dev_container_state.get_status(project)
-                    if current == DevContainerStatus.IN_PROGRESS:
-                        logger.warning(
-                            f"Env rebuild timed out for {project} with container still "
-                            f"IN_PROGRESS — resetting to UNVERIFIED to unblock future runs"
-                        )
-                        dev_container_state.set_status(
-                            project,
-                            DevContainerStatus.UNVERIFIED,
-                            error_message="Reset after env rebuild polling timeout",
-                        )
                 break
 
         if obs:

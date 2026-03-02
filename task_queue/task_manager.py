@@ -5,7 +5,7 @@ import logging
 from typing import Dict, Any, Optional
 from dataclasses import dataclass, asdict
 from enum import Enum
-from datetime import datetime
+from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +23,7 @@ class Task:
     context: Dict[str, Any]
     created_at: str
     status: str = "pending"
+    not_before: Optional[str] = None  # ISO8601 UTC timestamp; dequeue skips task until this time
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -77,7 +78,8 @@ class TaskQueue:
             'priority': task.priority.name,  # Convert enum to string
             'context': json.dumps(task.context),  # Properly serialize dict
             'created_at': task.created_at,
-            'status': task.status
+            'status': task.status,
+            'not_before': task.not_before or '',
         }
 
         self.redis_client.hset(
@@ -110,6 +112,19 @@ class TaskQueue:
             if task_id:
                 task_data = self.redis_client.hgetall(f"task:{task_id}")
 
+                # Check not_before: if the task is deferred until a future time, push it
+                # back to the head of its queue and skip it so the worker can sleep
+                # rather than spin-waiting on a blocked task.
+                not_before = task_data.get('not_before') or ''
+                if not_before:
+                    try:
+                        nb_dt = datetime.fromisoformat(not_before)
+                        if nb_dt > datetime.now(timezone.utc):
+                            self.redis_client.lpush(queue_name, task_id)
+                            continue
+                    except ValueError:
+                        pass  # Malformed not_before — treat as no restriction
+
                 # Reconstruct Task object with proper types
                 return Task(
                     id=task_data['id'],
@@ -118,7 +133,8 @@ class TaskQueue:
                     priority=TaskPriority[task_data['priority']],  # Convert back to enum
                     context=json.loads(task_data['context']),  # Safely deserialize dict
                     created_at=task_data['created_at'],
-                    status=task_data['status']
+                    status=task_data['status'],
+                    not_before=not_before or None,
                 )
 
         return None
@@ -161,7 +177,8 @@ class TaskQueue:
                         priority=TaskPriority[task_data['priority']],
                         context=json.loads(task_data['context']),
                         created_at=task_data['created_at'],
-                        status=task_data['status']
+                        status=task_data['status'],
+                        not_before=task_data.get('not_before') or None,
                     )
                     tasks.append(task)
 
