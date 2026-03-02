@@ -582,6 +582,18 @@ class RepairCycleStage(PipelineStage):
                         test_cycle_iteration, test_type_index,
                     )
                     systemic_fix_ran_this_iteration = True
+                    # Guard against infrastructure failures returned from the sub-cycle
+                    sub_cycle_infra = [f for f in test_result.failures if f.file == "__infrastructure__"]
+                    if sub_cycle_infra:
+                        return CycleResult(
+                            test_type=config.test_type,
+                            passed=False,
+                            iterations=test_cycle_iteration,
+                            final_result=test_result,
+                            error=f"Infrastructure failure in systemic sub-cycle: {sub_cycle_infra[0].message}",
+                            files_fixed=files_fixed,
+                            warnings_reviewed=warnings_reviewed,
+                        )
                     if not test_result.has_failures():
                         continue  # Back to top of test cycle loop (success path)
                     grouped_failures = test_result.group_failures_by_file()
@@ -609,6 +621,18 @@ class RepairCycleStage(PipelineStage):
                     threshold_analysis, test_result, grouped_failures, config, context,
                     test_cycle_iteration, test_type_index,
                 )
+                # Guard against infrastructure failures returned from the sub-cycle
+                threshold_infra = [f for f in test_result.failures if f.file == "__infrastructure__"]
+                if threshold_infra:
+                    return CycleResult(
+                        test_type=config.test_type,
+                        passed=False,
+                        iterations=test_cycle_iteration,
+                        final_result=test_result,
+                        error=f"Infrastructure failure in threshold systemic sub-cycle: {threshold_infra[0].message}",
+                        files_fixed=files_fixed,
+                        warnings_reviewed=warnings_reviewed,
+                    )
                 if not test_result.has_failures():
                     continue  # Back to top of test cycle loop (success path)
                 grouped_failures = test_result.group_failures_by_file()
@@ -2007,7 +2031,8 @@ If the failures appear to be isolated per-file issues with different root causes
                 break
 
             failure_digest = self._build_failure_digest(current_test_result, current_grouped)
-            description = analysis.systemic_issue_description.strip()
+            # Guard against None if JSON parser returns null for this field
+            description = (analysis.systemic_issue_description or "").strip()
             known_pattern = (
                 f"\n\nAnalysis has identified the likely root cause:\n{description}"
                 if description
@@ -2066,16 +2091,21 @@ If the failures appear to be isolated per-file issues with different root causes
 
             except CancellationError:
                 raise
-            except (ImportError, AttributeError, TypeError) as e:
-                # Infrastructure/programming error — will not improve on retry
+            except (ImportError, AttributeError) as e:
+                # Non-retryable: agent executor module is missing or its interface
+                # does not match the call site. Neither condition improves on retry.
                 logger.error(
                     f"Systemic fix agent executor unavailable on attempt {attempts_made}: {e}",
                     exc_info=True,
                 )
+                # Preserve real failure state so the caller doesn't misread a stale result
+                last_test_result = current_test_result
                 break
             except Exception as e:
                 logger.error(
-                    f"Systemic fix attempt {attempts_made} agent execution failed: {e}",
+                    f"Systemic fix attempt {attempts_made}/{MAX_SYSTEMIC_SUB_CYCLES} agent "
+                    f"execution failed for {project}/{task_id} "
+                    f"(pipeline_run_id={pipeline_run_id}, test_type={config.test_type}): {e}",
                     exc_info=True,
                 )
                 # Continue to test run — partial fix may still have helped
@@ -2085,15 +2115,12 @@ If the failures appear to be isolated per-file issues with different root causes
                 config, context, test_cycle_iteration, test_type_index
             )
 
-            # Detect infrastructure failure disguised as zero failed count
-            is_infra_failure = not last_test_result.has_failures() and any(
-                f.file.startswith("__") for f in last_test_result.failures
-            )
-            if is_infra_failure:
+            # Detect infrastructure failure (indicated by __infrastructure__ sentinel file)
+            infra_failures = [f for f in last_test_result.failures if f.file == "__infrastructure__"]
+            if infra_failures:
                 logger.error(
                     f"Test runner returned infrastructure failure on attempt {attempts_made}; "
-                    f"cannot evaluate fix outcome: "
-                    f"{last_test_result.failures[0].message if last_test_result.failures else 'no detail'}"
+                    f"cannot evaluate fix outcome: {infra_failures[0].message}"
                 )
                 break
 
