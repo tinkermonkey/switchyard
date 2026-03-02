@@ -39,7 +39,7 @@ class TestReviewCycleThreading:
         
         # Create mock pipeline run manager
         mock_pipeline_mgr = Mock()
-        mock_pipeline_mgr.get_or_create_pipeline_run.return_value = mock_run
+        mock_pipeline_mgr.get_or_create_pipeline_run.return_value = (mock_run, False)
         
         with patch('services.project_monitor.ConfigManager', return_value=mock_config_manager), \
              patch('config.state_manager.state_manager', mock_state_manager), \
@@ -138,7 +138,7 @@ class TestReviewCycleThreading:
         
         # Create mock pipeline run manager
         mock_pipeline_mgr = Mock()
-        mock_pipeline_mgr.get_or_create_pipeline_run.return_value = mock_run
+        mock_pipeline_mgr.get_or_create_pipeline_run.return_value = (mock_run, False)
         
         # Mock the review cycle executor
         async def mock_start_review_cycle(*args, **kwargs):
@@ -309,7 +309,7 @@ class TestReviewCycleThreading:
         mock_run.id = 'run-2003'
         
         mock_pipeline_mgr = Mock()
-        mock_pipeline_mgr.get_or_create_pipeline_run.return_value = mock_run
+        mock_pipeline_mgr.get_or_create_pipeline_run.return_value = (mock_run, False)
         
         # Mock GitHub integration
         mock_github_integration = Mock()
@@ -405,7 +405,7 @@ class TestReviewCycleThreading:
         mock_run.id = 'run-2004'
         
         mock_pipeline_mgr = Mock()
-        mock_pipeline_mgr.get_or_create_pipeline_run.return_value = mock_run
+        mock_pipeline_mgr.get_or_create_pipeline_run.return_value = (mock_run, False)
         
         # Mock review cycle to raise an error
         async def mock_review_cycle_error(*args, **kwargs):
@@ -501,7 +501,7 @@ class TestReviewCycleThreading:
         mock_run.id = 'run-2005-unique-id'
         
         mock_pipeline_mgr = Mock()
-        mock_pipeline_mgr.get_or_create_pipeline_run.return_value = mock_run
+        mock_pipeline_mgr.get_or_create_pipeline_run.return_value = (mock_run, False)
         
         with patch('services.project_monitor.ConfigManager', return_value=mock_config_manager), \
              patch('config.state_manager.state_manager', mock_state_manager), \
@@ -589,7 +589,7 @@ class TestReviewCycleThreadingEdgeCases:
             run = Mock()
             run.id = f'run-{issue_number}'
             pipeline_runs_created.append(run.id)
-            return run
+            return (run, True)
         
         mock_pipeline_mgr = Mock()
         mock_pipeline_mgr.get_or_create_pipeline_run.side_effect = track_pipeline_run

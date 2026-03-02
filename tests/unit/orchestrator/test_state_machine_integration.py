@@ -50,7 +50,7 @@ class TestSimpleAgentExecution:
             # Setup pipeline run
             mock_run = Mock()
             mock_run.id = 'pipeline-run-2000'
-            mock_pipeline_mgr.return_value.get_or_create_pipeline_run.return_value = mock_run
+            mock_pipeline_mgr.return_value.get_or_create_pipeline_run.return_value = (mock_run, False)
             
             # Mock subprocess for GitHub API calls
             # First call gets project item ID, second call updates the field
@@ -344,7 +344,7 @@ class TestMultiStagePipeline:
             
             mock_run = Mock()
             mock_run.id = 'pipeline-run-2200'
-            mock_pipeline_mgr.return_value.get_or_create_pipeline_run.return_value = mock_run
+            mock_pipeline_mgr.return_value.get_or_create_pipeline_run.return_value = (mock_run, False)
             
             from services.project_monitor import ProjectMonitor
             from services.review_cycle import ReviewCycleExecutor
@@ -450,7 +450,7 @@ class TestComplexScenarios:
             
             mock_run = Mock()
             mock_run.id = 'pipeline-run-batch'
-            mock_pipeline_mgr.return_value.get_or_create_pipeline_run.return_value = mock_run
+            mock_pipeline_mgr.return_value.get_or_create_pipeline_run.return_value = (mock_run, False)
             
             from services.project_monitor import ProjectMonitor
             monitor = ProjectMonitor(task_queue=mock_task_queue, config_manager=mock_config_manager)
@@ -600,7 +600,7 @@ class TestComplexScenarios:
             
             mock_run = Mock()
             mock_run.id = pipeline_run_id
-            mock_pipeline_mgr.return_value.get_or_create_pipeline_run.return_value = mock_run
+            mock_pipeline_mgr.return_value.get_or_create_pipeline_run.return_value = (mock_run, False)
             
             from services.project_monitor import ProjectMonitor
             from services.pipeline_progression import PipelineProgression

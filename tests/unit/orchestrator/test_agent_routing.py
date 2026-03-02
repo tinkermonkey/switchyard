@@ -39,7 +39,7 @@ class TestAgentRouting:
             # Mock pipeline run manager
             mock_run = Mock()
             mock_run.id = 'run-123'
-            mock_pipeline_mgr.return_value.get_or_create_pipeline_run.return_value = mock_run
+            mock_pipeline_mgr.return_value.get_or_create_pipeline_run.return_value = (mock_run, False)
             
             from services.project_monitor import ProjectMonitor
             monitor = ProjectMonitor(task_queue=mock_task_queue, config_manager=mock_config_manager)
@@ -114,7 +114,7 @@ class TestAgentRouting:
             
             mock_run = Mock()
             mock_run.id = 'run-123'
-            mock_pipeline_mgr.return_value.get_or_create_pipeline_run.return_value = mock_run
+            mock_pipeline_mgr.return_value.get_or_create_pipeline_run.return_value = (mock_run, False)
             
             from services.project_monitor import ProjectMonitor
             monitor = ProjectMonitor(task_queue=mock_task_queue, config_manager=mock_config_manager)
@@ -161,7 +161,7 @@ class TestAgentRouting:
             
             mock_run = Mock()
             mock_run.id = 'run-123'
-            mock_pipeline_mgr.return_value.get_or_create_pipeline_run.return_value = mock_run
+            mock_pipeline_mgr.return_value.get_or_create_pipeline_run.return_value = (mock_run, False)
             
             from services.project_monitor import ProjectMonitor
             monitor = ProjectMonitor(task_queue=mock_task_queue, config_manager=mock_config_manager)
@@ -201,7 +201,7 @@ class TestAgentRouting:
             
             mock_run = Mock()
             mock_run.id = 'run-123'
-            mock_pipeline_mgr.return_value.get_or_create_pipeline_run.return_value = mock_run
+            mock_pipeline_mgr.return_value.get_or_create_pipeline_run.return_value = (mock_run, False)
             
             from services.project_monitor import ProjectMonitor
             monitor = ProjectMonitor(task_queue=mock_task_queue, config_manager=mock_config_manager)
@@ -248,7 +248,7 @@ class TestAgentRoutingWithWorkspaceTypes:
             
             mock_run = Mock()
             mock_run.id = 'run-123'
-            mock_pipeline_mgr.return_value.get_or_create_pipeline_run.return_value = mock_run
+            mock_pipeline_mgr.return_value.get_or_create_pipeline_run.return_value = (mock_run, False)
             
             from services.project_monitor import ProjectMonitor
             monitor = ProjectMonitor(task_queue=mock_task_queue, config_manager=mock_config_manager)
@@ -285,7 +285,7 @@ class TestPipelineRunTracking:
             # Mock pipeline run
             mock_run = Mock()
             mock_run.id = 'pipeline-run-400'
-            mock_pipeline_mgr.return_value.get_or_create_pipeline_run.return_value = mock_run
+            mock_pipeline_mgr.return_value.get_or_create_pipeline_run.return_value = (mock_run, False)
             
             from services.project_monitor import ProjectMonitor
             monitor = ProjectMonitor(task_queue=mock_task_queue, config_manager=mock_config_manager)

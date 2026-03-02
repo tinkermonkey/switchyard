@@ -140,7 +140,7 @@ class TestGitHubStatusProcessing:
             
             mock_run = Mock()
             mock_run.id = 'run-1300'
-            mock_pipeline_mgr.return_value.get_or_create_pipeline_run.return_value = mock_run
+            mock_pipeline_mgr.return_value.get_or_create_pipeline_run.return_value = (mock_run, False)
             
             from services.project_monitor import ProjectMonitor
             monitor = ProjectMonitor(task_queue=mock_task_queue, config_manager=mock_config_manager)
@@ -178,7 +178,7 @@ class TestGitHubStatusProcessing:
             
             mock_run = Mock()
             mock_run.id = 'run-batch'
-            mock_pipeline_mgr.return_value.get_or_create_pipeline_run.return_value = mock_run
+            mock_pipeline_mgr.return_value.get_or_create_pipeline_run.return_value = (mock_run, False)
             
             from services.project_monitor import ProjectMonitor
             monitor = ProjectMonitor(task_queue=mock_task_queue, config_manager=mock_config_manager)
