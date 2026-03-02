@@ -22,7 +22,7 @@ export default function TokenUsagePanel({ logs, promptText }) {
 
     let firstInput = null
     let cumulativeLastInput = 0
-    let cumulativeLastOutput = 0
+    let totalOutputTokens = 0
     let lastCacheRead = 0
     let lastCacheCreation = 0
     let lastDirectInput = 0
@@ -62,7 +62,7 @@ export default function TokenUsagePanel({ logs, promptText }) {
 
         if (firstInput === null) firstInput = effectiveInput
         cumulativeLastInput = effectiveInput
-        cumulativeLastOutput = outputTokens
+        totalOutputTokens += outputTokens
         lastCacheRead = cacheRead
         lastCacheCreation = cacheCreation
         lastDirectInput = inputDirect
@@ -116,11 +116,11 @@ export default function TokenUsagePanel({ logs, promptText }) {
       initialInput: firstInput || 0,
       peakContext,
       contextGrowth,
-      totalOutput: cumulativeLastOutput,
+      totalOutput: totalOutputTokens,
       totalCacheRead: lastCacheRead,
       totalCacheCreation: lastCacheCreation,
       totalDirectInput: lastDirectInput,
-      totalAll: cumulativeLastInput + cumulativeLastOutput,
+      totalAll: cumulativeLastInput + totalOutputTokens,
       promptLength,
       modelsUsed: Array.from(modelsUsed),
       toolsAvailable: tokenToolsAvailable,
