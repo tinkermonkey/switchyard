@@ -1931,7 +1931,8 @@ If the failures appear to be isolated per-file issues with different root causes
             examples_shown = 0
             for f in type_failures:
                 if f.file not in seen_files and examples_shown < examples_per_type:
-                    lines.append(f"    e.g. {f.file}: {f.message[:150]}")
+                    msg = f.message[:147] + "..." if len(f.message) > 150 else f.message
+                    lines.append(f"    e.g. {f.file}: {msg}")
                     seen_files.add(f.file)
                     examples_shown += 1
             shown_types += 1
@@ -1998,13 +1999,18 @@ If the failures appear to be isolated per-file issues with different root causes
 
             # Check circuit breaker before each attempt
             if self._agent_call_count >= self.max_total_agent_calls:
-                logger.error("Circuit breaker triggered during systemic fix sub-cycle")
+                logger.error(
+                    f"Circuit breaker triggered during systemic fix sub-cycle for "
+                    f"{project}/{task_id}: agent_call_count={self._agent_call_count} "
+                    f">= max={self.max_total_agent_calls}"
+                )
                 break
 
             failure_digest = self._build_failure_digest(current_test_result, current_grouped)
+            description = analysis.systemic_issue_description.strip()
             known_pattern = (
-                f"\n\nAnalysis has identified the likely root cause:\n{analysis.systemic_issue_description}"
-                if analysis.systemic_issue_description
+                f"\n\nAnalysis has identified the likely root cause:\n{description}"
+                if description
                 else ""
             )
             attempt_note = (
@@ -2060,9 +2066,17 @@ If the failures appear to be isolated per-file issues with different root causes
 
             except CancellationError:
                 raise
+            except (ImportError, AttributeError, TypeError) as e:
+                # Infrastructure/programming error — will not improve on retry
+                logger.error(
+                    f"Systemic fix agent executor unavailable on attempt {attempts_made}: {e}",
+                    exc_info=True,
+                )
+                break
             except Exception as e:
                 logger.error(
-                    f"Systemic fix attempt {attempts_made} failed: {e}", exc_info=True
+                    f"Systemic fix attempt {attempts_made} agent execution failed: {e}",
+                    exc_info=True,
                 )
                 # Continue to test run — partial fix may still have helped
 
@@ -2070,6 +2084,19 @@ If the failures appear to be isolated per-file issues with different root causes
             last_test_result = await self._run_tests(
                 config, context, test_cycle_iteration, test_type_index
             )
+
+            # Detect infrastructure failure disguised as zero failed count
+            is_infra_failure = not last_test_result.has_failures() and any(
+                f.file.startswith("__") for f in last_test_result.failures
+            )
+            if is_infra_failure:
+                logger.error(
+                    f"Test runner returned infrastructure failure on attempt {attempts_made}; "
+                    f"cannot evaluate fix outcome: "
+                    f"{last_test_result.failures[0].message if last_test_result.failures else 'no detail'}"
+                )
+                break
+
             if not last_test_result.has_failures():
                 break  # Fix resolved all failures
             current_test_result = last_test_result

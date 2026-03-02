@@ -438,7 +438,7 @@ class TestSystemicFailureDetection:
                 )
                 if analysis.has_systemic_code_issues:
                     test_result = await stage._run_systemic_fix_sub_cycle(
-                        analysis, config, {}, 1, 1
+                        analysis, test_result, grouped, config, {}, 1, 1
                     )
                     grouped = test_result.group_failures_by_file()
 
@@ -547,3 +547,130 @@ class TestSystemicFailureDetection:
         assert result.has_env_issues is False
         assert result.has_systemic_code_issues is False
         assert result.affected_files == []
+
+
+class TestBuildFailureDigest:
+    """Tests for RepairCycleStage._build_failure_digest (pure static method)."""
+
+    def _f(self, file: str, test: str = "test-error", message: str = "error msg") -> RepairTestFailure:
+        return RepairTestFailure(file=file, test=test, message=message)
+
+    def _result(self, failed: int) -> RepairTestResult:
+        return RepairTestResult(
+            test_type="unit",
+            iteration=1,
+            passed=0,
+            failed=failed,
+            warnings=0,
+            failures=[],
+            warning_list=[],
+            raw_output="",
+            timestamp="2026-01-01T00:00:00Z",
+        )
+
+    def test_basic_structure(self):
+        """Output contains header, error-types section, and files section."""
+        grouped = {
+            "src/a.py": [self._f("src/a.py", "type-error", "expected int got str")],
+            "src/b.py": [self._f("src/b.py", "import-error", "cannot import foo")],
+        }
+        digest = RepairCycleStage._build_failure_digest(self._result(2), grouped)
+
+        assert "Total failures: 2 across 2 files" in digest
+        assert "## Error types (by frequency)" in digest
+        assert "## Most affected files" in digest
+        assert "src/a.py" in digest
+        assert "src/b.py" in digest
+
+    def test_error_types_sorted_by_frequency(self):
+        """Error types appear in descending frequency order."""
+        grouped = {
+            "src/a.py": [self._f("src/a.py", "rare-error")],
+            "src/b.py": [self._f("src/b.py", "common-error")],
+            "src/c.py": [self._f("src/c.py", "common-error")],
+        }
+        digest = RepairCycleStage._build_failure_digest(self._result(3), grouped)
+
+        assert digest.index("common-error") < digest.index("rare-error")
+
+    def test_error_type_truncation_emits_overflow_line(self):
+        """When there are more than max_error_types, an overflow line is appended."""
+        grouped = {f"src/f{i}.py": [self._f(f"src/f{i}.py", f"err-{i}")] for i in range(12)}
+        digest = RepairCycleStage._build_failure_digest(
+            self._result(12), grouped, max_error_types=10
+        )
+
+        assert "... and 2 more error type(s)" in digest
+
+    def test_examples_deduplicated_by_file(self):
+        """The same file is not shown twice as an example for one error type."""
+        grouped = {
+            "src/a.py": [
+                self._f("src/a.py", "type-error", "msg 1"),
+                self._f("src/a.py", "type-error", "msg 2"),
+                self._f("src/a.py", "type-error", "msg 3"),
+            ],
+        }
+        digest = RepairCycleStage._build_failure_digest(
+            self._result(3), grouped, examples_per_type=3
+        )
+
+        assert digest.count("e.g. src/a.py") == 1
+
+    def test_top_files_truncated_at_max(self):
+        """Header reflects capped count; only max_top_files entries appear in section."""
+        grouped = {f"src/f{i}.py": [self._f(f"src/f{i}.py")] for i in range(20)}
+        digest = RepairCycleStage._build_failure_digest(
+            self._result(20), grouped, max_top_files=15
+        )
+
+        assert "top 15 of 20" in digest
+
+    def test_files_sorted_by_failure_count(self):
+        """File with more failures appears before file with fewer in the files section."""
+        grouped = {
+            "src/small.py": [self._f("src/small.py")],
+            "src/large.py": [self._f("src/large.py", f"e{i}") for i in range(5)],
+        }
+        digest = RepairCycleStage._build_failure_digest(self._result(6), grouped)
+
+        # Scope assertion to the "Most affected files" section only
+        files_section = digest[digest.index("## Most affected files"):]
+        assert files_section.index("src/large.py") < files_section.index("src/small.py")
+
+    def test_long_message_truncated_with_ellipsis(self):
+        """Messages longer than 150 chars are truncated and end with '...'."""
+        long_msg = "x" * 200
+        grouped = {"src/a.py": [self._f("src/a.py", message=long_msg)]}
+        digest = RepairCycleStage._build_failure_digest(self._result(1), grouped)
+
+        assert "x" * 200 not in digest
+        assert "x" * 147 + "..." in digest
+
+    def test_short_message_not_truncated(self):
+        """Messages at or under 150 chars are shown verbatim."""
+        msg = "short error message"
+        grouped = {"src/a.py": [self._f("src/a.py", message=msg)]}
+        digest = RepairCycleStage._build_failure_digest(self._result(1), grouped)
+
+        assert msg in digest
+        assert "..." not in digest
+
+    def test_empty_grouped_failures(self):
+        """Empty grouped_failures produces valid output without raising."""
+        digest = RepairCycleStage._build_failure_digest(self._result(0), {})
+
+        assert "Total failures: 0 across 0 files" in digest
+        assert "## Error types (by frequency)" in digest
+        assert "## Most affected files (top 0 of 0)" in digest
+
+    def test_infrastructure_sentinel_appears_in_digest(self):
+        """__infrastructure__ sentinel entries appear in the digest output."""
+        grouped = {
+            "__infrastructure__": [
+                self._f("__infrastructure__", "test_execution_failure", "Docker crashed")
+            ],
+        }
+        digest = RepairCycleStage._build_failure_digest(self._result(0), grouped)
+
+        assert "__infrastructure__" in digest
