@@ -119,9 +119,10 @@ def _is_repair_cycle_stalled(pipeline_run_id: str, stall_seconds: int = 3600) ->
             },
             timeout=10,
         )
+        resp.raise_for_status()
         hits = resp.json().get("hits", {}).get("hits", [])
         if not hits:
-            return True
+            return False  # no events yet — cycle may still be starting up
         last_ts = datetime.fromisoformat(hits[0]["_source"]["timestamp"].replace("Z", "+00:00"))
         age = (datetime.now(timezone.utc) - last_ts).total_seconds()
         return age > stall_seconds
@@ -4325,6 +4326,7 @@ The automated test-fix-validate cycle has failed and requires manual interventio
             error_message = None
             pipeline_run_ended = False
             next_column = None  # Initialize to prevent NameError in PR ready check
+            loop = None
 
             try:
                 logger.info(f"Starting container monitor for {container_name}")
@@ -4345,17 +4347,22 @@ The automated test-fix-validate cycle has failed and requires manual interventio
                         exit_code = int(process.stdout.read().strip() or 2)
                         break
                     except subprocess.TimeoutExpired:
-                        if _is_repair_cycle_stalled(pipeline_run_id, stall_seconds=3600):
+                        if pipeline_run_id and _is_repair_cycle_stalled(pipeline_run_id, stall_seconds=3600):
                             logger.error(
                                 f"Container {container_name} stalled: no events for over 1 hour"
                             )
                             error_message = "Repair cycle stalled: no events for over 1 hour"
                             overall_success = False
+                            exit_code = -1
                             try:
                                 subprocess.run(['docker', 'kill', container_name], timeout=30)
                             except Exception as kill_err:
                                 logger.error(f"Failed to kill stalled container: {kill_err}")
-                            process.wait()  # let docker wait return after kill
+                            try:
+                                process.wait(timeout=60)
+                            except subprocess.TimeoutExpired:
+                                process.kill()
+                                process.wait()
                             try:
                                 from monitoring.observability import get_observability_manager
                                 obs_manager = get_observability_manager()
@@ -4377,7 +4384,7 @@ The automated test-fix-validate cycle has failed and requires manual interventio
                                 )
                             except Exception as e:
                                 logger.warning(f"Failed to emit stall events: {e}")
-                            break
+                            return  # triggers finally; skips Redis load, summary post, auto-advance
                         logger.info(
                             f"Repair cycle {container_name} still active, "
                             f"waiting another hour..."
@@ -4608,9 +4615,10 @@ The automated test-fix-validate cycle has failed and requires manual interventio
                         logger.debug(f"Cleared Redis tracking key: {redis_key}")
                 except Exception as e:
                     logger.warning(f"Failed to clear Redis tracking: {e}")
-                
-                loop.close()
-                
+
+                if loop is not None:
+                    loop.close()
+
             except Exception as e:
                 logger.error(f"Error monitoring container: {e}", exc_info=True)
                 error_message = f"Monitoring thread error: {str(e)}"
