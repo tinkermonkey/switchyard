@@ -115,6 +115,11 @@ export function SocketProvider({ children }) {
       updateStatsFromEvent(event)
     })
 
+    socketInstance.on('decision_event', (event) => {
+      setEvents(prev => [event, ...prev].slice(0, 50))
+      updateStatsFromEvent(event)
+    })
+
     socketInstance.on('claude_stream_event', (data) => {
       /*
       console.log('[SocketContext] Received claude_stream_event:', {

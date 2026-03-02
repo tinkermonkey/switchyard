@@ -309,12 +309,13 @@ function PipelineRunView() {
     })
   }, [mergedEvents])
 
-  // Find latest agent execution ID
+  // Find latest agent execution ID — mergedEvents is sorted ascending, so the last
+  // agent_initialized event is the most recently started agent execution.
   const latestAgentExecutionId = useMemo(() => {
     if (!mergedEvents || mergedEvents.length === 0) return null
     const agentInitEvents = mergedEvents.filter(event => event.event_type === 'agent_initialized')
     if (agentInitEvents.length === 0) return null
-    return agentInitEvents[0].agent_execution_id || null
+    return agentInitEvents.at(-1).agent_execution_id || null
   }, [mergedEvents])
 
   // Determine if currently in conversational loop

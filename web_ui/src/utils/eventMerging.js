@@ -148,9 +148,38 @@ export const mergeAgentExecutionEvents = (apiLogs, webSocketEvents, executionDat
   return logs
 }
 
+// Agent lifecycle event types — all others are treated as decision events.
+const AGENT_LIFECYCLE_EVENT_TYPES = new Set([
+  'agent_initialized', 'agent_started', 'agent_completed', 'agent_failed', 'task_received',
+])
+
+// Claude stream / API event types — filtered out of the graph and event log.
+const CLAUDE_STREAM_EVENT_TYPES = new Set([
+  'claude_stream', 'claude_stream_event', 'text_output', 'text_delta',
+  'tool_call', 'tool_use', 'tool_result', 'input_json_delta',
+  'message_start', 'message_delta', 'message_stop',
+  'content_block_start', 'content_block_delta', 'content_block_stop',
+])
+
+/**
+ * Infer event_category for a WebSocket event that lacks it.
+ * API events always have event_category set by the server; WebSocket events
+ * (from Redis pub/sub) do not. Without a category the graph builder ignores them.
+ */
+function inferEventCategory(event) {
+  if (event.event_category) return event
+  if (AGENT_LIFECYCLE_EVENT_TYPES.has(event.event_type)) {
+    return { ...event, event_category: 'agent_lifecycle' }
+  }
+  if (CLAUDE_STREAM_EVENT_TYPES.has(event.event_type)) {
+    return { ...event, event_category: 'claude_api' }
+  }
+  return { ...event, event_category: 'decision' }
+}
+
 /**
  * Merge API events with live WebSocket events for pipeline runs
- * 
+ *
  * @param {Array} apiEvents - Events from API response
  * @param {Array} webSocketEvents - Live WebSocket events
  * @param {Object} pipelineRun - Pipeline run metadata (id, started_at, ended_at)
@@ -185,7 +214,10 @@ export const mergePipelineRunEvents = (apiEvents, webSocketEvents, pipelineRun) 
     return !apiEventKeys.has(key)
   })
 
-  const events = [...apiEvents, ...newWebSocketEvents]
+  // Normalise event_category for WebSocket events — API events already have it set by the
+  // server, but WebSocket events come from Redis pub/sub without it. Without a category the
+  // event processing pipeline (processEvents / buildFlowchart) ignores them entirely.
+  const events = [...apiEvents, ...newWebSocketEvents.map(inferEventCategory)]
 
   events.sort((a, b) => {
     const tsA = normalizeTimestamp(a.timestamp) || 0
