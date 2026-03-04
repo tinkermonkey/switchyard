@@ -35,6 +35,11 @@ export const DEFAULT_LAYOUT_OPTIONS = {
   cycleGap: 100,
   cyclePadding: 40,
   viewportWidth: 1200,
+  iterHeaderHeight: 24,
+  iterPadding: 20,
+  innerVertSpacing: 20,
+  innerHorizSpacing: 60,
+  containerHeaderHeight: 36,
 }
 
 const nodeTypes = {
@@ -155,12 +160,16 @@ export default function PipelineFlowGraph({
       const isIncrementalUpdate = hasLayoutedOnceRef.current && anyOverlap
 
       if (isIncrementalUpdate) {
-        // Keep graph visible — carry existing positions forward so nodes don't flash to {0,0}.
+        // Keep graph visible — carry existing positions and styles forward so container nodes
+        // don't lose their computed dimensions (style.width/height) while LayoutController
+        // re-runs. Without this, SmartPipelineEdge falls back to 200px obstacle widths.
         setNodes(prev => {
           const existingPositions = new Map(prev.map(n => [n.id, n.position]))
+          const existingStyles = new Map(prev.map(n => [n.id, n.style]))
           return rawBuild.nodes.map(n => ({
             ...n,
             position: existingPositions.get(n.id) ?? { x: 0, y: 0 },
+            style: existingStyles.get(n.id) ?? n.style,
           }))
         })
       } else {
@@ -255,8 +264,6 @@ export default function PipelineFlowGraph({
             edgeTypes={edgeTypes}
             nodesDraggable={nodesDraggable}
             nodesConnectable={false}
-            fitView
-            fitViewOptions={{ padding: 0.05 }}
             minZoom={minZoom}
             maxZoom={maxZoom}
             zoomOnScroll={false}
