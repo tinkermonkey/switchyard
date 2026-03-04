@@ -277,6 +277,20 @@ class RepairCycleStage(PipelineStage):
                 pipeline_run_id=pipeline_run_id,
             )
 
+        if obs:
+            obs.emit(
+                EventType.REPAIR_CYCLE_STARTED,
+                "repair_cycle",
+                task_id,
+                project,
+                {
+                    "test_types": [tc.test_type for tc in self.test_configs],
+                    "agent_name": self.agent_name,
+                    "max_total_agent_calls": self.max_total_agent_calls,
+                },
+                pipeline_run_id=pipeline_run_id,
+            )
+
         results = []
         error_message = None
 
@@ -332,6 +346,23 @@ class RepairCycleStage(PipelineStage):
 
             overall_success = all(r.passed for r in results)
 
+            # Emit stage-level completion event
+            if obs:
+                obs.emit(
+                    EventType.REPAIR_CYCLE_COMPLETED,
+                    "repair_cycle",
+                    task_id,
+                    project,
+                    {
+                        "overall_success": overall_success,
+                        "total_test_types": len(results),
+                        "total_agent_calls": self._agent_call_count,
+                        "duration_seconds": duration,
+                        "error": error_message if not overall_success else None,
+                    },
+                    pipeline_run_id=pipeline_run_id,
+                )
+
             # Emit agent completed event
             if obs:
                 obs.emit_agent_completed(
@@ -361,6 +392,18 @@ class RepairCycleStage(PipelineStage):
             duration_ms = duration * 1000
 
             if obs:
+                obs.emit(
+                    EventType.REPAIR_CYCLE_FAILED,
+                    "repair_cycle",
+                    task_id,
+                    project,
+                    {
+                        "error": str(e),
+                        "error_type": type(e).__name__,
+                        "duration_seconds": duration,
+                    },
+                    pipeline_run_id=pipeline_run_id,
+                )
                 obs.emit_agent_completed(
                     "repair_cycle", task_id, project, duration_ms, False, error=str(e), pipeline_run_id=pipeline_run_id, output="Cycle failed due to exception"
                 )
@@ -456,6 +499,20 @@ class RepairCycleStage(PipelineStage):
             # Check circuit breaker
             if self._agent_call_count >= self.max_total_agent_calls:
                 logger.error(f"Circuit breaker triggered: max agent calls " f"({self.max_total_agent_calls}) reached")
+                if obs:
+                    obs.emit(
+                        EventType.CIRCUIT_BREAKER_OPENED,
+                        "repair_cycle",
+                        task_id,
+                        project,
+                        {
+                            "test_type": config.test_type,
+                            "agent_call_count": self._agent_call_count,
+                            "max_total_agent_calls": self.max_total_agent_calls,
+                            "context": "main_test_cycle",
+                        },
+                        pipeline_run_id=pipeline_run_id,
+                    )
                 # Completion event is emitted by the caller (execute())
                 return CycleResult(
                     test_type=config.test_type,
@@ -495,19 +552,19 @@ class RepairCycleStage(PipelineStage):
                         pipeline_run_id=pipeline_run_id,
                     )
                 
-                # Emit cycle completed event with infrastructure failure
+                # Emit cycle failed event with infrastructure failure
                 if obs:
                     obs.emit(
-                        EventType.REPAIR_CYCLE_COMPLETED,
+                        EventType.REPAIR_CYCLE_FAILED,
                         "repair_cycle",
                         task_id,
                         project,
                         {
                             "test_type": config.test_type,
                             "test_type_index": test_type_index,
-                            "passed": 0,  # Convert bool to int for ES schema
                             "test_cycle_iterations": test_cycle_iteration,
                             "error": f"Infrastructure failure: {infrastructure_failures[0].message}",
+                            "error_type": "infrastructure_failure",
                         },
                         pipeline_run_id=pipeline_run_id,
                     )
@@ -539,6 +596,20 @@ class RepairCycleStage(PipelineStage):
                     # If warning fixes broke tests, continue loop
                     if test_result.has_failures():
                         logger.warning("Warning fixes introduced test failures, continuing loop")
+                        if obs:
+                            obs.emit(
+                                EventType.ERROR_ENCOUNTERED,
+                                "repair_cycle",
+                                task_id,
+                                project,
+                                {
+                                    "test_type": config.test_type,
+                                    "error_type": "warning_fix_introduced_failures",
+                                    "new_failure_count": test_result.failed,
+                                    "test_cycle_iteration": test_cycle_iteration,
+                                },
+                                pipeline_run_id=pipeline_run_id,
+                            )
                         continue
 
                 # Success!
@@ -594,14 +665,14 @@ class RepairCycleStage(PipelineStage):
                                 pipeline_run_id=pipeline_run_id,
                             )
                             obs.emit(
-                                EventType.REPAIR_CYCLE_COMPLETED,
+                                EventType.REPAIR_CYCLE_FAILED,
                                 "repair_cycle", task_id, project,
                                 {
                                     "test_type": config.test_type,
                                     "test_type_index": test_type_index,
-                                    "passed": 0,
                                     "test_cycle_iterations": test_cycle_iteration,
                                     "error": error_msg,
+                                    "error_type": "env_rebuild_infrastructure_failure",
                                 },
                                 pipeline_run_id=pipeline_run_id,
                             )
@@ -643,14 +714,14 @@ class RepairCycleStage(PipelineStage):
                                 pipeline_run_id=pipeline_run_id,
                             )
                             obs.emit(
-                                EventType.REPAIR_CYCLE_COMPLETED,
+                                EventType.REPAIR_CYCLE_FAILED,
                                 "repair_cycle", task_id, project,
                                 {
                                     "test_type": config.test_type,
                                     "test_type_index": test_type_index,
-                                    "passed": 0,
                                     "test_cycle_iterations": test_cycle_iteration,
                                     "error": error_msg,
+                                    "error_type": "systemic_fix_infrastructure_failure",
                                 },
                                 pipeline_run_id=pipeline_run_id,
                             )
@@ -689,6 +760,7 @@ class RepairCycleStage(PipelineStage):
                 test_result = await self._run_systemic_fix_sub_cycle(
                     threshold_analysis, test_result, grouped_failures, config, context,
                     test_cycle_iteration, test_type_index,
+                    trigger="threshold",
                 )
                 # Guard against infrastructure failures returned from the sub-cycle
                 threshold_infra = [f for f in test_result.failures if f.file == "__infrastructure__"]
@@ -709,14 +781,14 @@ class RepairCycleStage(PipelineStage):
                             pipeline_run_id=pipeline_run_id,
                         )
                         obs.emit(
-                            EventType.REPAIR_CYCLE_COMPLETED,
+                            EventType.REPAIR_CYCLE_FAILED,
                             "repair_cycle", task_id, project,
                             {
                                 "test_type": config.test_type,
                                 "test_type_index": test_type_index,
-                                "passed": 0,
                                 "test_cycle_iterations": test_cycle_iteration,
                                 "error": error_msg,
+                                "error_type": "threshold_systemic_fix_infrastructure_failure",
                             },
                             pipeline_run_id=pipeline_run_id,
                         )
@@ -1107,6 +1179,21 @@ Be mindful of environment setup steps like installing dependencies and activatin
                     # Retry with more explicit instructions
                     logger.info(f"Retrying with enhanced instructions...")
                     task_context["direct_prompt"] += f"\n\nPREVIOUS ATTEMPT FAILED: {error_msg}\nPlease ensure you return ONLY the JSON object with no additional text."
+                    if obs:
+                        obs.emit(
+                            EventType.RETRY_ATTEMPTED,
+                            "repair_cycle_test",
+                            f"{task_id}_test_iter{test_cycle_iteration}",
+                            project,
+                            {
+                                "test_type": config.test_type,
+                                "attempt": attempt + 1,
+                                "max_retries": max_retries,
+                                "reason": "json_parse_failure",
+                                "error": error_msg,
+                            },
+                            pipeline_run_id=pipeline_run_id,
+                        )
                     continue
                 else:
                     # Max retries reached - this is a critical failure
@@ -1139,6 +1226,21 @@ Be mindful of environment setup steps like installing dependencies and activatin
                 
                 if attempt < max_retries:
                     logger.info("Retrying test execution...")
+                    if obs:
+                        obs.emit(
+                            EventType.RETRY_ATTEMPTED,
+                            "repair_cycle_test",
+                            f"{task_id}_test_iter{test_cycle_iteration}",
+                            project,
+                            {
+                                "test_type": config.test_type,
+                                "attempt": attempt + 1,
+                                "max_retries": max_retries,
+                                "reason": "execution_failure",
+                                "error": str(e),
+                            },
+                            pipeline_run_id=pipeline_run_id,
+                        )
                     continue
                 else:
                     # Max retries reached - return infrastructure failure
@@ -1890,6 +1992,21 @@ If the failures appear to be isolated per-file issues with different root causes
                     f"{project}/{task_id}: agent_call_count={self._agent_call_count} "
                     f">= max={self.max_total_agent_calls}"
                 )
+                if obs:
+                    obs.emit(
+                        EventType.CIRCUIT_BREAKER_OPENED,
+                        "repair_cycle",
+                        task_id,
+                        project,
+                        {
+                            "test_type": config.test_type,
+                            "agent_call_count": self._agent_call_count,
+                            "max_total_agent_calls": self.max_total_agent_calls,
+                            "context": "env_rebuild_sub_cycle",
+                            "attempt": attempts_made,
+                        },
+                        pipeline_run_id=pipeline_run_id,
+                    )
                 break
 
             logger.info(
@@ -1919,6 +2036,20 @@ If the failures appear to be isolated per-file issues with different root causes
                 raise
             except Exception as e:
                 logger.error(f"Env rebuild setup failed on attempt {attempts_made}: {e}", exc_info=True)
+                if obs:
+                    obs.emit(
+                        EventType.ERROR_ENCOUNTERED,
+                        "repair_cycle",
+                        task_id,
+                        project,
+                        {
+                            "test_type": config.test_type,
+                            "error_type": "env_rebuild_setup_failed",
+                            "error": str(e),
+                            "attempt": attempts_made,
+                        },
+                        pipeline_run_id=pipeline_run_id,
+                    )
                 break
 
             # Poll until VERIFIED, BLOCKED, or cancellation. No timer here — the
@@ -1966,6 +2097,20 @@ If the failures appear to be isolated per-file issues with different root causes
                     f"Env rebuild ended with status=BLOCKED for {project} "
                     f"after {elapsed}s, stopping sub-cycle"
                 )
+                if obs:
+                    obs.emit(
+                        EventType.ERROR_ENCOUNTERED,
+                        "repair_cycle",
+                        task_id,
+                        project,
+                        {
+                            "test_type": config.test_type,
+                            "error_type": "env_rebuild_blocked",
+                            "elapsed_seconds": elapsed,
+                            "attempt": attempts_made,
+                        },
+                        pipeline_run_id=pipeline_run_id,
+                    )
                 break
 
         if obs:
@@ -2074,6 +2219,7 @@ If the failures appear to be isolated per-file issues with different root causes
         context: Dict[str, Any],
         test_cycle_iteration: int,
         test_type_index: int,
+        trigger: str = "analysis",
     ) -> "RepairTestResult":
         """
         Apply a global fix for a systemic code issue across all affected files.
@@ -2081,6 +2227,10 @@ If the failures appear to be isolated per-file issues with different root causes
         Each attempt receives an open-ended prompt built from the current failure
         state — not a predetermined file list — so the agent greps for all affected
         files itself and adapts as failures are resolved between attempts.
+
+        Args:
+            trigger: What caused this sub-cycle — "analysis" (first-failure systemic
+                     analysis) or "threshold" (failure count exceeded threshold).
 
         Returns the last RepairTestResult obtained, so _run_test_cycle() can
         use it directly without a redundant test re-run.
@@ -2100,6 +2250,7 @@ If the failures appear to be isolated per-file issues with different root causes
                     "test_type": config.test_type,
                     "systemic_issue_description": analysis.systemic_issue_description,
                     "affected_files_count": len(initial_grouped_failures),
+                    "trigger": trigger,
                 },
                 pipeline_run_id=pipeline_run_id,
             )
@@ -2133,6 +2284,21 @@ If the failures appear to be isolated per-file issues with different root causes
                     f"{project}/{task_id}: agent_call_count={self._agent_call_count} "
                     f">= max={self.max_total_agent_calls}"
                 )
+                if obs:
+                    obs.emit(
+                        EventType.CIRCUIT_BREAKER_OPENED,
+                        "repair_cycle",
+                        task_id,
+                        project,
+                        {
+                            "test_type": config.test_type,
+                            "agent_call_count": self._agent_call_count,
+                            "max_total_agent_calls": self.max_total_agent_calls,
+                            "context": "systemic_fix_sub_cycle",
+                            "attempt": attempts_made,
+                        },
+                        pipeline_run_id=pipeline_run_id,
+                    )
                 # Preserve real failure state so the caller doesn't receive a misleading sentinel
                 last_test_result = current_test_result
                 break
