@@ -471,14 +471,22 @@ class ReviewCycleExecutor:
                                 github = self._get_github_integration(cycle_state)
                                 issue_data = await github.get_issue_details(cycle_state.issue_number, cycle_state.repository)
 
-                                # Execute the review loop
+                                # Execute the review loop and capture result for column progression
                                 # Note: _execute_review_loop will increment iteration at the start
-                                await self._execute_review_loop(
+                                result = await self._execute_review_loop(
                                     cycle_state,
                                     column,
                                     issue_data,
                                     org
                                 )
+
+                                # Move the issue to the next column if the cycle completed with approval
+                                if result:
+                                    _, next_col_name = result
+                                    if next_col_name and next_col_name != column.name:
+                                        await self._advance_issue_after_review_approval(
+                                            cycle_state, column.name, next_col_name
+                                        )
                             else:
                                 logger.error(f"Could not find column config for reviewer {cycle_state.reviewer_agent}")
                         except Exception as e:
@@ -931,10 +939,10 @@ class ReviewCycleExecutor:
             # Get necessary context
             project_config = config_manager.get_project_config(cycle_state.project_name)
             workflow_template = config_manager.get_project_workflow(cycle_state.project_name, cycle_state.board_name)
-            column = next((c for c in workflow_template.columns if c.type == 'review'), None)
+            column = next((c for c in workflow_template.columns if c.agent == cycle_state.reviewer_agent), None)
 
             if not column:
-                logger.error(f"No review column found for {cycle_state.board_name}")
+                logger.error(f"No column found for reviewer agent {cycle_state.reviewer_agent} in {cycle_state.board_name}")
                 return
 
             github = self._get_github_integration(cycle_state)
@@ -977,6 +985,14 @@ class ReviewCycleExecutor:
                 # PR status is managed by feature_branch_manager.finalize_workspace()
                 # which checks if ALL sub-issues are complete before marking PR ready.
                 # The review cycle only approves individual code changes, not the entire PR.
+
+                # Advance the issue to the next column (recovery path — project_monitor won't do this)
+                if column.auto_advance_on_approval:
+                    next_col_name = self._get_next_column_name(column, cycle_state.project_name, cycle_state.board_name)
+                    if next_col_name and next_col_name != column.name:
+                        await self._advance_issue_after_review_approval(
+                            cycle_state, column.name, next_col_name
+                        )
 
             elif review_result.status == ReviewStatus.CHANGES_REQUESTED:
                 logger.info(f"Changes requested, executing maker for revision")
@@ -2798,6 +2814,47 @@ _Escalated by Claude Code Orchestrator_
         else:
             logger.info(f"No next column after {current_column.name}, staying in current")
             return current_column.name
+
+    async def _advance_issue_after_review_approval(
+        self, cycle_state, current_column_name: str, next_column_name: str
+    ):
+        """Move the issue to the next column after review approval.
+
+        Used in recovery paths (resume_active_cycles / _continue_cycle_from_review) where
+        project_monitor is not involved and won't perform the progression itself.
+        """
+        try:
+            from services.pipeline_progression import PipelineProgression
+            from task_queue.task_manager import TaskQueue
+
+            task_queue = TaskQueue()
+            progression = PipelineProgression(task_queue)
+            logger.info(
+                f"Recovery: advancing issue #{cycle_state.issue_number} "
+                f"from {current_column_name} to {next_column_name} after review approval"
+            )
+            result = progression.move_issue_to_column(
+                project_name=cycle_state.project_name,
+                board_name=cycle_state.board_name,
+                issue_number=cycle_state.issue_number,
+                target_column=next_column_name,
+                trigger='review_cycle_completion'
+            )
+            if result:
+                logger.info(
+                    f"Successfully moved issue #{cycle_state.issue_number} to {next_column_name}"
+                )
+            else:
+                logger.error(
+                    f"Failed to move issue #{cycle_state.issue_number} to {next_column_name} "
+                    f"after review approval (move_issue_to_column returned False)"
+                )
+        except Exception as e:
+            logger.error(
+                f"Error advancing issue #{cycle_state.issue_number} to {next_column_name} "
+                f"after review approval: {e}",
+                exc_info=True
+            )
 
     async def process_recovered_reviewer_output(
         self,
