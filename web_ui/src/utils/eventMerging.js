@@ -201,11 +201,15 @@ export const mergePipelineRunEvents = (apiEvents, webSocketEvents, pipelineRun) 
   const endTimestamp = pipelineRun.ended_at ? normalizeTimestamp(pipelineRun.ended_at) : null
 
   // Build a dedup key set from API events.
-  // Prefer event.id (ES document _id) when present — it is stable and unique.
-  // Fall back to composite key: timestamp + event_type + task_id.
-  const apiEventKeys = new Set(
-    apiEvents.map(e => e.id || `${e.timestamp}_${e.event_type}_${e.task_id || ''}`)
-  )
+  // Always include the composite key so WebSocket events (which come from Redis
+  // pub/sub and lack an ES document id) can still be matched against API events.
+  // Also include event.id when present so polling-returned duplicates are caught
+  // even if their composite key differs (e.g., sub-millisecond timestamp drift).
+  const apiEventKeys = new Set()
+  apiEvents.forEach(e => {
+    apiEventKeys.add(`${e.timestamp}_${e.event_type}_${e.task_id || ''}`)
+    if (e.id) apiEventKeys.add(e.id)
+  })
 
   // Filter WebSocket events for this pipeline run, excluding any already present
   // in the API snapshot.
@@ -218,8 +222,9 @@ export const mergePipelineRunEvents = (apiEvents, webSocketEvents, pipelineRun) 
     if (eventTimestamp < startTimestamp) return false
     if (endTimestamp && eventTimestamp > endTimestamp) return false
 
-    const key = event.id || `${event.timestamp}_${event.event_type}_${event.task_id || ''}`
-    return !apiEventKeys.has(key)
+    // WebSocket events lack id — always check composite key; check id too if present.
+    const compositeKey = `${event.timestamp}_${event.event_type}_${event.task_id || ''}`
+    return !apiEventKeys.has(compositeKey) && (!event.id || !apiEventKeys.has(event.id))
   })
 
   // Normalise event_category for WebSocket events — API events already have it set by the

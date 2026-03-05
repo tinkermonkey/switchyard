@@ -52,6 +52,7 @@ function PipelineRunView() {
   const activeFiltersRef = useRef(activeFilters)
   const urlRunIdRef = useRef(urlRunId)
   const eventRefreshTimerRef = useRef(null)
+  const prevUrlRunIdRef = useRef(urlRunId)
 
   useEffect(() => { selectedPipelineRunRef.current = selectedPipelineRun }, [selectedPipelineRun])
   useEffect(() => { completedLoadedCountRef.current = completedLoadedCount }, [completedLoadedCount])
@@ -245,7 +246,7 @@ function PipelineRunView() {
       const response = await fetch(`/pipeline-run-events?pipeline_run_id=${pipelineRunId}`)
       const data = await response.json()
 
-      if (data.success && (selectedPipelineRunRef.current?.id === pipelineRunId || urlRunIdRef.current === pipelineRunId)) {
+      if (data.success && urlRunIdRef.current === pipelineRunId) {
         const newEventsWithKeys = data.events.map((event, idx) => ({
           ...event,
           _key: event.id || `${event.timestamp}_${idx}`
@@ -411,8 +412,14 @@ function PipelineRunView() {
 
   // Prefetch events immediately from the URL param — don't wait for run metadata
   // to resolve from the run list. This eliminates the blank period on page reload.
+  // Clear events when switching to a *different* run so stale graph/log data from
+  // the previous run is not shown while the new fetch is in flight.
   useEffect(() => {
     if (!urlRunId) return
+    if (urlRunId !== prevUrlRunIdRef.current) {
+      setPipelineRunEvents([])
+      prevUrlRunIdRef.current = urlRunId
+    }
     fetchPipelineRunEvents(urlRunId)
   }, [urlRunId, fetchPipelineRunEvents])
 
