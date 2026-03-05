@@ -201,10 +201,10 @@ export const mergePipelineRunEvents = (apiEvents, webSocketEvents, pipelineRun) 
   const endTimestamp = pipelineRun.ended_at ? normalizeTimestamp(pipelineRun.ended_at) : null
 
   // Build a dedup key set from API events.
-  // WebSocket events lack event_id in their ES-indexed counterparts, so use a
-  // composite key: timestamp + event_type + task_id — unique for all real events.
+  // Prefer event.id (ES document _id) when present — it is stable and unique.
+  // Fall back to composite key: timestamp + event_type + task_id.
   const apiEventKeys = new Set(
-    apiEvents.map(e => `${e.timestamp}_${e.event_type}_${e.task_id || ''}`)
+    apiEvents.map(e => e.id || `${e.timestamp}_${e.event_type}_${e.task_id || ''}`)
   )
 
   // Filter WebSocket events for this pipeline run, excluding any already present
@@ -218,7 +218,7 @@ export const mergePipelineRunEvents = (apiEvents, webSocketEvents, pipelineRun) 
     if (eventTimestamp < startTimestamp) return false
     if (endTimestamp && eventTimestamp > endTimestamp) return false
 
-    const key = `${event.timestamp}_${event.event_type}_${event.task_id || ''}`
+    const key = event.id || `${event.timestamp}_${event.event_type}_${event.task_id || ''}`
     return !apiEventKeys.has(key)
   })
 

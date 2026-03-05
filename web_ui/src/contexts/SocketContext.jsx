@@ -22,7 +22,7 @@ export function SocketProvider({ children }) {
   // Load history and calculate initial stats
   const loadHistoryAndStats = () => {
     // Load event history
-    fetch('/history?count=50')
+    fetch('/history?count=200')
       .then(res => res.json())
       .then(data => {
         if (data.success && data.events) {
@@ -111,14 +111,14 @@ export function SocketProvider({ children }) {
     })
 
     socketInstance.on('agent_event', (event) => {
-      setEvents(prev => [event, ...prev].slice(0, 50))
+      setEvents(prev => [event, ...prev].slice(0, 200))
       updateStatsFromEvent(event)
     })
 
     socketInstance.on('decision_event', (event) => {
       // Stamp the category at the source so mergePipelineRunEvents doesn't need
       // to infer it: the channel name is the ground truth for these events.
-      setEvents(prev => [{ ...event, event_category: 'decision' }, ...prev].slice(0, 50))
+      setEvents(prev => [{ ...event, event_category: 'decision' }, ...prev].slice(0, 200))
       updateStatsFromEvent(event)
     })
 

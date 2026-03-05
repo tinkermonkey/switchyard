@@ -50,11 +50,14 @@ function PipelineRunView() {
   const processedEventIdsRef = useRef(new Set())
   const lastProcessedTimestampRef = useRef(0)
   const activeFiltersRef = useRef(activeFilters)
+  const urlRunIdRef = useRef(urlRunId)
+  const eventRefreshTimerRef = useRef(null)
 
   useEffect(() => { selectedPipelineRunRef.current = selectedPipelineRun }, [selectedPipelineRun])
   useEffect(() => { completedLoadedCountRef.current = completedLoadedCount }, [completedLoadedCount])
   useEffect(() => { socketEventsRef.current = socketEvents }, [socketEvents])
   useEffect(() => { activeFiltersRef.current = activeFilters }, [activeFilters])
+  useEffect(() => { urlRunIdRef.current = urlRunId }, [urlRunId])
 
   // Re-fetch completed runs when filters change (also handles initial mount)
   useEffect(() => {
@@ -242,7 +245,7 @@ function PipelineRunView() {
       const response = await fetch(`/pipeline-run-events?pipeline_run_id=${pipelineRunId}`)
       const data = await response.json()
 
-      if (data.success && selectedPipelineRunRef.current?.id === pipelineRunId) {
+      if (data.success && (selectedPipelineRunRef.current?.id === pipelineRunId || urlRunIdRef.current === pipelineRunId)) {
         const newEventsWithKeys = data.events.map((event, idx) => ({
           ...event,
           _key: event.id || `${event.timestamp}_${idx}`
@@ -315,7 +318,8 @@ function PipelineRunView() {
     if (!mergedEvents || mergedEvents.length === 0) return null
     const agentInitEvents = mergedEvents.filter(event => event.event_type === 'agent_initialized')
     if (agentInitEvents.length === 0) return null
-    return agentInitEvents.at(-1).agent_execution_id || null
+    const ev = agentInitEvents.at(-1)
+    return ev.agent_execution_id || ev.data?.agent_execution_id || null
   }, [mergedEvents])
 
   // Determine if currently in conversational loop
@@ -403,16 +407,37 @@ function PipelineRunView() {
     return () => clearInterval(intervalId)
   }, [fetchActivePipelineRuns, fetchCompletedPipelineRuns, completedLimit])
 
-  // Load events when pipeline run selection changes (keyed on id to avoid refetching on metadata updates)
   const selectedRunId = selectedPipelineRun?.id
+
+  // Prefetch events immediately from the URL param — don't wait for run metadata
+  // to resolve from the run list. This eliminates the blank period on page reload.
+  useEffect(() => {
+    if (!urlRunId) return
+    fetchPipelineRunEvents(urlRunId)
+  }, [urlRunId, fetchPipelineRunEvents])
+
+  // Load workflow config when run selection changes (keyed on id to avoid refetching on metadata updates).
+  // Events are handled by the urlRunId effect above — don't clear or re-fetch here to avoid
+  // a flash of empty content when switching between runs.
   useEffect(() => {
     if (selectedRunId) {
-      setPipelineRunEvents([])
-      fetchPipelineRunEvents(selectedRunId)
       const run = selectedPipelineRunRef.current
       if (run) fetchWorkflowConfig(run.project, run.board)
     }
-  }, [selectedRunId, fetchPipelineRunEvents, fetchWorkflowConfig])
+  }, [selectedRunId, fetchWorkflowConfig])
+
+  // Periodic polling for active run events — self-heals every 8s if socket events are missed
+  useEffect(() => {
+    if (!selectedRunId) return
+    const run = activePipelineRuns.find(r => r.id === selectedRunId)
+    if (!run || run.status !== 'active') return
+
+    const intervalId = setInterval(() => {
+      fetchPipelineRunEvents(selectedRunId)
+    }, 8000)
+
+    return () => clearInterval(intervalId)
+  }, [selectedRunId, activePipelineRuns, fetchPipelineRunEvents])
 
   // Detect and update cycles when events change
   useEffect(() => {
@@ -456,11 +481,12 @@ function PipelineRunView() {
     // else: timer already scheduled; pendingFn updated above
   }, [buildRawFlowchart])
 
-  // Cleanup throttle timer on unmount
+  // Cleanup timers on unmount
   useEffect(() => {
     return () => {
       const { timer } = rawBuildThrottleRef.current
       if (timer) clearTimeout(timer)
+      if (eventRefreshTimerRef.current) clearTimeout(eventRefreshTimerRef.current)
     }
   }, [])
 
@@ -503,8 +529,18 @@ function PipelineRunView() {
         fetchActivePipelineRuns(false)
         fetchCompletedPipelineRuns(0, false, null, activeFiltersRef.current)
       }
+
+      // Debounced re-fetch of the event list when a socket event belongs to the
+      // currently viewed run. Coalesces rapid bursts into a single fetch.
+      const eventRunId = latestEvent.pipeline_run_id || latestEvent.data?.pipeline_run_id
+      if (eventRunId && eventRunId === urlRunIdRef.current) {
+        clearTimeout(eventRefreshTimerRef.current)
+        eventRefreshTimerRef.current = setTimeout(() => {
+          fetchPipelineRunEvents(urlRunIdRef.current)
+        }, 800)
+      }
     }
-  }, [socketEvents, fetchActivePipelineRuns, fetchCompletedPipelineRuns])
+  }, [socketEvents, fetchActivePipelineRuns, fetchCompletedPipelineRuns, fetchPipelineRunEvents])
 
   return (
     <div className="h-screen flex flex-col p-5 bg-gh-canvas text-gh-fg">
@@ -596,11 +632,17 @@ function PipelineRunView() {
                   </div>
                 ) : (
                   <div className="flex-1 overflow-auto">
-                    <PipelineRunEventLog
-                      pipelineRun={selectedPipelineRun}
-                      events={eventLogEvents}
-                      isActive={selectedPipelineRun?.status === 'active'}
-                    />
+                    {loadingEvents ? (
+                      <div className="flex items-center justify-center h-32 text-gh-fg-muted text-sm">
+                        Loading events…
+                      </div>
+                    ) : (
+                      <PipelineRunEventLog
+                        pipelineRun={selectedPipelineRun}
+                        events={eventLogEvents}
+                        isActive={selectedPipelineRun?.status === 'active'}
+                      />
+                    )}
                   </div>
                 )}
               </div>
