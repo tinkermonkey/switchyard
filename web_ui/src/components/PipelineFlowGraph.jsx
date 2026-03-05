@@ -11,6 +11,8 @@ import { RefreshCw } from 'lucide-react'
 import CycleBoundingNode from './CycleBoundingNode'
 import ReviewCycleContainerNode from './ReviewCycleContainerNode'
 import RepairCycleContainerNode from './RepairCycleContainerNode'
+import PRReviewCycleContainerNode from './PRReviewCycleContainerNode'
+import ConversationalLoopContainerNode from './ConversationalLoopContainerNode'
 import IterationContainerNode from './IterationContainerNode'
 import LayoutController from './LayoutController'
 import SmartPipelineEdge from './SmartPipelineEdge'
@@ -47,6 +49,8 @@ const nodeTypes = {
   cycleBounding: CycleBoundingNode,
   reviewCycleContainer: ReviewCycleContainerNode,
   repairCycleContainer: RepairCycleContainerNode,
+  prReviewCycleContainer: PRReviewCycleContainerNode,
+  conversationalLoopContainer: ConversationalLoopContainerNode,
   iterationContainer: IterationContainerNode,
   subCycleContainer: IterationContainerNode,  // same component, styled via cycleType data prop
 
@@ -59,7 +63,13 @@ const edgeTypes = {
   smart: SmartPipelineEdge,
 }
 
-const CYCLE_CONTAINER_TYPES = ['cycleBounding', 'reviewCycleContainer', 'repairCycleContainer']
+const CYCLE_CONTAINER_TYPES = [
+  'cycleBounding',
+  'reviewCycleContainer',
+  'repairCycleContainer',
+  'prReviewCycleContainer',
+  'conversationalLoopContainer',
+]
 
 /**
  * Shared pipeline flow graph component used by both the /pipeline-run view and the

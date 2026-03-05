@@ -1,9 +1,12 @@
 import { memo } from 'react'
 
 const ACCENT_COLORS = {
-  test_execution: { border: 'rgba(16,185,129,0.6)', bg: 'rgba(16,185,129,0.08)', pill: '#10b981' },
-  fix_cycle:      { border: 'rgba(217,119,6,0.6)',  bg: 'rgba(217,119,6,0.10)',  pill: '#d97706' },
-  default:        { border: 'rgba(99,102,241,0.6)', bg: 'rgba(99,102,241,0.12)', pill: '#6366f1' },
+  test_execution:    { border: 'rgba(16,185,129,0.6)',  bg: 'rgba(16,185,129,0.08)',  pill: '#10b981' },
+  fix_cycle:         { border: 'rgba(217,119,6,0.6)',   bg: 'rgba(217,119,6,0.10)',   pill: '#d97706' },
+  warning_review:    { border: 'rgba(245,158,11,0.6)',  bg: 'rgba(245,158,11,0.10)',  pill: '#f59e0b' },
+  systemic_analysis: { border: 'rgba(139,92,246,0.6)',  bg: 'rgba(139,92,246,0.12)',  pill: '#8b5cf6' },
+  systemic_fix:      { border: 'rgba(167,139,250,0.6)', bg: 'rgba(167,139,250,0.12)', pill: '#a78bfa' },
+  default:           { border: 'rgba(99,102,241,0.6)',  bg: 'rgba(99,102,241,0.12)',  pill: '#6366f1' },
 }
 
 /**

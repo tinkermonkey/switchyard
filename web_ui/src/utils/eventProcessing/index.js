@@ -6,7 +6,7 @@
  * processEvents(events, workflowConfig) → PipelineGraph:
  * {
  *   prelude:  { events: [] },   // events strictly before first cycle's startTime
- *   cycles:   [...],            // review_cycle and repair_cycle entries
+ *   cycles:   [...],            // review_cycle, repair_cycle, pr_review_cycle, conversational_loop entries
  *   postlude: { events: [] },   // events after last cycle's endTime
  *   agentExecutions: Map,       // agent → [execution]
  * }
@@ -63,6 +63,74 @@ function findReviewCycles(sortedEvents) {
   return starts.map((start, idx) => ({
     startEvent: start,
     endEvent: ends[idx] || null,
+  }))
+}
+
+/**
+ * Find PR review cycle boundaries from decision events.
+ * Returns [{startEvent, endEvent}] — one entry per pr_review_stage_started/completed pair.
+ */
+function findPRReviewCycles(sortedEvents) {
+  const starts = sortedEvents.filter(
+    e => e.event_category === 'decision' && e.event_type === 'pr_review_stage_started'
+  )
+  const ends = sortedEvents.filter(
+    e => e.event_category === 'decision' && e.event_type === 'pr_review_stage_completed'
+  )
+  return starts.map((start, idx) => ({
+    startEvent: start,
+    endEvent: ends[idx] || null,
+  }))
+}
+
+/**
+ * Group events within a PR review cycle into phases.
+ * Each phase starts at a pr_review_phase_started event and ends just before the next
+ * phase start (or at the cycle's end event).
+ */
+function groupPRReviewPhases(cycleEvents, boundary) {
+  const { endEvent } = boundary
+  const phaseMarkers = cycleEvents.filter(e => e.event_type === 'pr_review_phase_started')
+
+  return phaseMarkers.map((phaseEvent, idx) => {
+    const phaseStartMs = new Date(phaseEvent.timestamp).getTime()
+    const nextMarker = phaseMarkers[idx + 1]
+    const phaseEndMs = nextMarker
+      ? new Date(nextMarker.timestamp).getTime()
+      : endEvent
+      ? new Date(endEvent.timestamp).getTime()
+      : Infinity
+
+    const events = cycleEvents.filter(e => {
+      const t = new Date(e.timestamp).getTime()
+      return t > phaseStartMs && t < phaseEndMs
+    })
+
+    return {
+      number: idx + 1,
+      startEvent: phaseEvent,
+      events,
+    }
+  })
+}
+
+/**
+ * Find conversational loop boundaries.
+ * Each loop is opened by conversational_loop_started or conversational_loop_resumed
+ * and closed by the next conversational_loop_paused.
+ * Returns [{startEvent, endEvent}] — endEvent is null if in-progress.
+ */
+function findConversationalLoops(sortedEvents) {
+  const opens = sortedEvents.filter(
+    e => e.event_category === 'decision' &&
+         (e.event_type === 'conversational_loop_started' || e.event_type === 'conversational_loop_resumed')
+  )
+  const closes = sortedEvents.filter(
+    e => e.event_category === 'decision' && e.event_type === 'conversational_loop_paused'
+  )
+  return opens.map((openEvent, idx) => ({
+    startEvent: openEvent,
+    endEvent: closes[idx] || null,
   }))
 }
 
@@ -155,6 +223,24 @@ const REPAIR_SUB_CYCLE_REGISTRY = [
     endEventType:   'repair_cycle_fix_cycle_completed',
     cycleType:      'fix_cycle',
     label:          'Fix Cycle',
+  },
+  {
+    startEventType: 'repair_cycle_warning_review_started',
+    endEventType:   'repair_cycle_warning_review_completed',
+    cycleType:      'warning_review',
+    label:          'Warning Review',
+  },
+  {
+    startEventType: 'repair_cycle_systemic_analysis_started',
+    endEventType:   'repair_cycle_systemic_analysis_completed',
+    cycleType:      'systemic_analysis',
+    label:          'Systemic Analysis',
+  },
+  {
+    startEventType: 'repair_cycle_systemic_fix_started',
+    endEventType:   'repair_cycle_systemic_fix_completed',
+    cycleType:      'systemic_fix',
+    label:          'Systemic Fix',
   },
 ]
 
@@ -330,6 +416,47 @@ function inferMissingCloseEvents(sortedEvents) {
     })
   }
 
+  // ── Phase 1b: PR review stages ───────────────────────────────────────────
+  {
+    const prStarts = sortedEvents.filter(
+      e => e.event_category === 'decision' && e.event_type === 'pr_review_stage_started'
+    )
+    const prEnds = sortedEvents.filter(
+      e => e.event_category === 'decision' && e.event_type === 'pr_review_stage_completed'
+    )
+    prStarts.forEach((start, idx) => {
+      if (prEnds[idx]) return
+      const startMs = new Date(start.timestamp).getTime()
+      const nextStart = prStarts[idx + 1]
+      synthetic.push(makeSyntheticClose(
+        start,
+        'pr_review_stage_completed',
+        closestUpperBound(startMs, nextStart ? new Date(nextStart.timestamp).getTime() : null)
+      ))
+    })
+  }
+
+  // ── Phase 1c: Conversational loops ───────────────────────────────────────
+  {
+    const loopOpens = sortedEvents.filter(
+      e => e.event_category === 'decision' &&
+           (e.event_type === 'conversational_loop_started' || e.event_type === 'conversational_loop_resumed')
+    )
+    const loopCloses = sortedEvents.filter(
+      e => e.event_category === 'decision' && e.event_type === 'conversational_loop_paused'
+    )
+    loopOpens.forEach((open, idx) => {
+      if (loopCloses[idx]) return
+      const openMs = new Date(open.timestamp).getTime()
+      const nextOpen = loopOpens[idx + 1]
+      synthetic.push(makeSyntheticClose(
+        open,
+        'conversational_loop_paused',
+        closestUpperBound(openMs, nextOpen ? new Date(nextOpen.timestamp).getTime() : null)
+      ))
+    })
+  }
+
   // ── Phase 2: Repair cycles ────────────────────────────────────────────────
   const repairStarts = sortedEvents.filter(
     e => e.event_category === 'agent_lifecycle' &&
@@ -480,6 +607,8 @@ export function processEvents(events, workflowConfig = null) {
   // Detect cycle boundaries
   const reviewCycleBoundaries = findReviewCycles(sorted)
   const repairCycleBoundaries = findRepairCycles(sorted)
+  const prReviewCycleBoundaries = findPRReviewCycles(sorted)
+  const conversationalLoopBoundaries = findConversationalLoops(sorted)
 
   // Compute the earliest/latest cycle timestamps for prelude/postlude splitting
   let firstCycleStartMs = Infinity
@@ -493,6 +622,20 @@ export function processEvents(events, workflowConfig = null) {
   })
 
   repairCycleBoundaries.forEach(({ startEvent, endEvent }) => {
+    const sMs = new Date(startEvent.timestamp).getTime()
+    const eMs = endEvent ? new Date(endEvent.timestamp).getTime() : sMs
+    firstCycleStartMs = Math.min(firstCycleStartMs, sMs)
+    lastCycleEndMs = Math.max(lastCycleEndMs, eMs)
+  })
+
+  prReviewCycleBoundaries.forEach(({ startEvent, endEvent }) => {
+    const sMs = new Date(startEvent.timestamp).getTime()
+    const eMs = endEvent ? new Date(endEvent.timestamp).getTime() : sMs
+    firstCycleStartMs = Math.min(firstCycleStartMs, sMs)
+    lastCycleEndMs = Math.max(lastCycleEndMs, eMs)
+  })
+
+  conversationalLoopBoundaries.forEach(({ startEvent, endEvent }) => {
     const sMs = new Date(startEvent.timestamp).getTime()
     const eMs = endEvent ? new Date(endEvent.timestamp).getTime() : sMs
     firstCycleStartMs = Math.min(firstCycleStartMs, sMs)
@@ -548,12 +691,72 @@ export function processEvents(events, workflowConfig = null) {
 
     const testCycles = groupRepairTestCycles(cycleEvents, boundary, agentExecutions)
 
+    // Events in the repair cycle window that fall outside any test-cycle boundary
+    const allTcWindows = testCycles.map(tc => ({
+      startMs: new Date(tc.startEvent.timestamp).getTime(),
+      endMs:   tc.endEvent ? new Date(tc.endEvent.timestamp).getTime() : Infinity,
+    }))
+    const residualEvents = cycleEvents.filter(e => {
+      const t = new Date(e.timestamp).getTime()
+      return !allTcWindows.some(w => t >= w.startMs && t <= w.endMs)
+    })
+
     cycles.push({
       id: `repair_cycle_${idx + 1}`,
       type: 'repair_cycle',
       startEvent,
       endEvent,
       testCycles,
+      events: residualEvents,
+      isCollapsed: false,
+    })
+  })
+
+  prReviewCycleBoundaries.forEach((boundary, idx) => {
+    const { startEvent, endEvent } = boundary
+    const cycleStartMs = new Date(startEvent.timestamp).getTime()
+    const cycleEndMs = endEvent ? new Date(endEvent.timestamp).getTime() : Date.now()
+
+    const cycleEvents = sorted.filter(e => {
+      const t = new Date(e.timestamp).getTime()
+      return t >= cycleStartMs && t <= cycleEndMs
+    })
+
+    const phases = groupPRReviewPhases(cycleEvents, boundary)
+
+    cycles.push({
+      id: `pr_review_cycle_${idx + 1}`,
+      type: 'pr_review_cycle',
+      startEvent,
+      endEvent,
+      phases,
+      isCollapsed: false,
+    })
+  })
+
+  conversationalLoopBoundaries.forEach((boundary, idx) => {
+    const { startEvent, endEvent } = boundary
+    const cycleStartMs = new Date(startEvent.timestamp).getTime()
+    const cycleEndMs = endEvent ? new Date(endEvent.timestamp).getTime() : Date.now()
+
+    const cycleEvents = sorted.filter(e => {
+      const t = new Date(e.timestamp).getTime()
+      return t >= cycleStartMs && t <= cycleEndMs
+    })
+
+    // Child events: everything inside the loop window except the open/close markers themselves
+    const childEvents = cycleEvents.filter(
+      e => e.event_type !== 'conversational_loop_started' &&
+           e.event_type !== 'conversational_loop_resumed' &&
+           e.event_type !== 'conversational_loop_paused'
+    )
+
+    cycles.push({
+      id: `conversational_loop_${idx + 1}`,
+      type: 'conversational_loop',
+      startEvent,
+      endEvent,
+      events: childEvents,
       isCollapsed: false,
     })
   })

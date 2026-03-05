@@ -11,11 +11,16 @@ import { getNodeType } from '../components/nodes/EVENT_TYPE_MAP.js'
  *     - <event-specific type>: prelude / postlude standalone decision/agent events
  *     - reviewCycleContainer: one per review cycle
  *     - repairCycleContainer: one per repair cycle
+ *     - prReviewCycleContainer: one per PR review stage
+ *     - conversationalLoopContainer: one per conversational loop
  *
  *   Level 2 (parentId = cycle container):
  *     - reviewCycleStarted / reviewCycleCompleted: direct event children of review cycle
  *     - iterationContainer: one per review iteration (review cycles)
  *     - iterationContainer: one per test cycle (repair cycles)
+ *     - iterationContainer: one per phase (PR review cycles)
+ *     - <event-specific type>: direct event children of repair cycle (residuals outside test cycles)
+ *     - <event-specific type>: direct event children of conversational loop
  *
  *   Level 3 (parentId = iterationContainer):
  *     - <event-specific type>: events within review iterations
@@ -296,7 +301,16 @@ export function buildFlowchart({
       if (isCollapsed) {
         leafChain.push({ id: cycle.id, timestamp: cycle.startEvent?.timestamp })
       } else if (cycle.testCycles) {
-        // Expanded: add test cycle containers + sub-cycle containers + events
+        // Collect ALL entries (repair-level residuals + tc-level events) for one
+        // chronological sort so leafChain sequencing is correct across the whole cycle.
+        const allRepairEntries = []
+
+        // Repair-level residual events → direct children of the repair cycle container
+        ;(cycle.events ?? []).forEach(event => {
+          allRepairEntries.push({ event, parentId: cycle.id })
+        })
+
+        // Test cycle containers + their sub-cycles + events
         cycle.testCycles.forEach(tc => {
           const tcId = `${cycle.id}-tc-${tc.number}`
 
@@ -316,8 +330,7 @@ export function buildFlowchart({
           }
           newNodes.push(tcNode)
 
-          // Create sub-cycle containers and collect events with their target parent
-          const allEntries = []
+          // Create sub-cycle containers and collect their events
           tc.subCycles.forEach(sc => {
             const scId = `${tcId}-${sc.cycleType}-${sc.number}`
             newNodes.push({
@@ -338,20 +351,135 @@ export function buildFlowchart({
               draggable: false,
             })
             ;[sc.startEvent, ...sc.events, sc.endEvent].filter(Boolean).forEach(event => {
-              allEntries.push({ event, parentId: scId })
+              allRepairEntries.push({ event, parentId: scId })
             })
           })
 
-          // Residual events go directly under the test cycle container
+          // Residual events within the test cycle go directly under the tc container
           ;[tc.startEvent, ...tc.events, tc.endEvent].filter(Boolean).forEach(event => {
-            allEntries.push({ event, parentId: tcId })
+            allRepairEntries.push({ event, parentId: tcId })
           })
-
-          // Process all events in chronological order for correct leafChain sequencing
-          allEntries
-            .sort((a, b) => new Date(a.event.timestamp) - new Date(b.event.timestamp))
-            .forEach(({ event, parentId }) => processEventToNode(event, parentId, parentId))
         })
+
+        // Process all events in chronological order for correct leafChain sequencing
+        allRepairEntries
+          .sort((a, b) => new Date(a.event.timestamp) - new Date(b.event.timestamp))
+          .forEach(({ event, parentId }) => processEventToNode(event, parentId, parentId))
+      }
+    } else if (cycle.type === 'pr_review_cycle') {
+      // ── PR review cycle container ───────────────────────────────────────
+      const prNode = {
+        id: cycle.id,
+        type: 'prReviewCycleContainer',
+        position: { x: 0, y: 0 },
+        data: {
+          cycleId: cycle.id,
+          label: 'PR Review',
+          iterationCount: cycle.phases?.length ?? 0,
+          isCollapsed,
+          onToggleCollapse: null, // injected by caller
+          startTime: cycle.startEvent?.timestamp,
+          endTime: cycle.endEvent?.timestamp,
+        },
+        style: { width: 0, height: 0 }, // sized by applyCycleLayout
+        measured: { width: 1, height: 1 },
+        draggable: false,
+      }
+      newNodes.push(prNode)
+
+      if (isCollapsed) {
+        leafChain.push({ id: cycle.id, timestamp: cycle.startEvent?.timestamp })
+      } else {
+        // pr_review_stage_started → direct child, leftmost
+        if (cycle.startEvent) {
+          const startId = `${cycle.id}-start`
+          const startNode = makeDecisionNode(cycle.startEvent, startId, cycle.id)
+          newNodes.push(startNode)
+          leafChain.push({ id: startId, timestamp: cycle.startEvent.timestamp })
+        }
+
+        // Phase containers
+        ;(cycle.phases ?? []).forEach(phase => {
+          const phaseId = `${cycle.id}-phase-${phase.number}`
+
+          const phaseNode = {
+            id: phaseId,
+            type: 'iterationContainer',
+            parentId: cycle.id,
+            position: { x: 0, y: 0 },
+            zIndex: 1,
+            data: {
+              iterationNumber: phase.number,
+              label: `Phase ${phase.number}`,
+              eventCount: phase.events.length + 1,
+            },
+            style: { width: 0, height: 0 }, // sized by applyCycleLayout
+            measured: { width: 1, height: 1 },
+            draggable: false,
+          }
+          newNodes.push(phaseNode)
+
+          const allPhaseEvents = [phase.startEvent, ...phase.events]
+            .filter(Boolean)
+            .sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp))
+
+          allPhaseEvents.forEach(event => {
+            processEventToNode(event, phaseId, phaseId)
+          })
+        })
+
+        // pr_review_stage_completed → direct child, rightmost
+        if (cycle.endEvent && !cycle.endEvent._inferred) {
+          const endId = `${cycle.id}-end`
+          const endNode = makeDecisionNode(cycle.endEvent, endId, cycle.id)
+          newNodes.push(endNode)
+          leafChain.push({ id: endId, timestamp: cycle.endEvent.timestamp })
+        }
+      }
+    } else if (cycle.type === 'conversational_loop') {
+      // ── Conversational loop container ───────────────────────────────────
+      const clNode = {
+        id: cycle.id,
+        type: 'conversationalLoopContainer',
+        position: { x: 0, y: 0 },
+        data: {
+          cycleId: cycle.id,
+          label: 'Conversation',
+          iterationCount: cycle.events?.length ?? 0,
+          isCollapsed,
+          onToggleCollapse: null, // injected by caller
+          startTime: cycle.startEvent?.timestamp,
+          endTime: cycle.endEvent?.timestamp,
+        },
+        style: { width: 0, height: 0 }, // sized by applyCycleLayout
+        measured: { width: 1, height: 1 },
+        draggable: false,
+      }
+      newNodes.push(clNode)
+
+      if (isCollapsed) {
+        leafChain.push({ id: cycle.id, timestamp: cycle.startEvent?.timestamp })
+      } else {
+        // Loop open event → direct child, leftmost
+        if (cycle.startEvent) {
+          const startId = `${cycle.id}-start`
+          const startNode = makeDecisionNode(cycle.startEvent, startId, cycle.id)
+          newNodes.push(startNode)
+          leafChain.push({ id: startId, timestamp: cycle.startEvent.timestamp })
+        }
+
+        // Child events (flat — no iteration containers)
+        ;(cycle.events ?? [])
+          .sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp))
+          .forEach(event => processEventToNode(event, cycle.id, cycle.id))
+
+        // Loop close event → direct child, rightmost
+        if (cycle.endEvent && !cycle.endEvent._inferred) {
+          const endId = `${cycle.id}-end`
+          const endNode = makeDecisionNode(cycle.endEvent, endId, cycle.id)
+          newNodes.push(endNode)
+          leafChain.push({ id: endId, timestamp: cycle.endEvent.timestamp })
+        }
       }
     }
   })
