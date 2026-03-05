@@ -169,7 +169,12 @@ def _launch_repair_cycle_container(
         # Get Docker runner for path detection
         docker_runner = DockerAgentRunner()
         host_workspace_path = docker_runner._detect_host_workspace_path()
-        
+        # Detect host home from the orchestrator's mountinfo (where SSH key IS mounted).
+        # This must be done here (orchestrator context), not inside the repair cycle
+        # container, which has no SSH mount and would fall back to /home/orchestrator —
+        # an empty directory on the host with no SSH keys.
+        host_home_path = DockerAgentRunner._detect_host_home_path()
+
         # Get environment variables
         from config.environment import load_environment
         env = load_environment()
@@ -199,8 +204,8 @@ def _launch_repair_cycle_container(
             # Mount Docker socket (for launching agent containers)
             '-v', '/var/run/docker.sock:/var/run/docker.sock',
             # Mount GitHub App private key directory (if it exists)
-            '-v', f'{os.path.expanduser("~")}/.orchestrator:/home/orchestrator/.orchestrator:ro',
-            
+            '-v', f'{host_home_path}/.orchestrator:/home/orchestrator/.orchestrator:ro',
+
             # Environment variables
             '-e', f'REDIS_HOST={env.redis_url.split("://")[1].split(":")[0]}',
             '-e', 'ELASTICSEARCH_HOST=elasticsearch',  # Elasticsearch host for observability events
@@ -209,7 +214,7 @@ def _launch_repair_cycle_container(
             '-e', f'GITHUB_TOKEN={env.github_token.get_secret_value() if env.github_token else ""}',
             '-e', f'GH_TOKEN={env.github_token.get_secret_value() if env.github_token else ""}',  # For gh CLI
             '-e', f'HOST_WORKSPACE_PATH={host_workspace_path}',  # Pass host workspace path for Docker-in-Docker
-            '-e', f'HOST_HOME={os.path.expanduser("~")}',  # Pass host home for SSH/git mounts
+            '-e', f'HOST_HOME={host_home_path}',  # Pass host home for SSH/git mounts
             '-e', 'PYTHONUNBUFFERED=1',  # Ensure logs are flushed
             '-e', f'PIPELINE_RUN_ID={pipeline_run_id}',  # Pass pipeline_run_id for event tracking
             
