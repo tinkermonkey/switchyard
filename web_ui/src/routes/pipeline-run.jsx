@@ -51,7 +51,6 @@ function PipelineRunView() {
   const lastProcessedTimestampRef = useRef(0)
   const activeFiltersRef = useRef(activeFilters)
   const urlRunIdRef = useRef(urlRunId)
-  const eventRefreshTimerRef = useRef(null)
   const prevUrlRunIdRef = useRef(urlRunId)
 
   useEffect(() => { selectedPipelineRunRef.current = selectedPipelineRun }, [selectedPipelineRun])
@@ -238,11 +237,13 @@ function PipelineRunView() {
     }
   }, [])
 
-  // Fetch events for selected pipeline run
-  const fetchPipelineRunEvents = useCallback(async (pipelineRunId) => {
+  // Fetch events for selected pipeline run.
+  // Pass { silent: true } for background refreshes to avoid showing the spinner
+  // and hiding the graph — only the initial load per run should set loadingEvents.
+  const fetchPipelineRunEvents = useCallback(async (pipelineRunId, { silent = false } = {}) => {
     if (!pipelineRunId) return
     try {
-      setLoadingEvents(true)
+      if (!silent) setLoadingEvents(true)
       const response = await fetch(`/pipeline-run-events?pipeline_run_id=${pipelineRunId}`)
       const data = await response.json()
 
@@ -256,7 +257,7 @@ function PipelineRunView() {
     } catch (error) {
       console.error('Error fetching pipeline run events:', error)
     } finally {
-      setLoadingEvents(false)
+      if (!silent) setLoadingEvents(false)
     }
   }, [])
 
@@ -433,18 +434,21 @@ function PipelineRunView() {
     }
   }, [selectedRunId, fetchWorkflowConfig])
 
-  // Periodic polling for active run events — self-heals every 8s if socket events are missed
+  // Periodic polling for active run events — silent fallback every 30s if socket events are missed.
+  // WebSocket is the primary update path; this only catches gaps in socket delivery.
+  // Status is checked inside the callback via ref so this effect is not coupled to
+  // activePipelineRuns — the timer runs a stable 30s cycle keyed only on selectedRunId.
   useEffect(() => {
     if (!selectedRunId) return
-    const run = activePipelineRuns.find(r => r.id === selectedRunId)
-    if (!run || run.status !== 'active') return
 
     const intervalId = setInterval(() => {
-      fetchPipelineRunEvents(selectedRunId)
-    }, 8000)
+      if (selectedPipelineRunRef.current?.status === 'active') {
+        fetchPipelineRunEvents(selectedRunId, { silent: true })
+      }
+    }, 30000)
 
     return () => clearInterval(intervalId)
-  }, [selectedRunId, activePipelineRuns, fetchPipelineRunEvents])
+  }, [selectedRunId, fetchPipelineRunEvents])
 
   // Detect and update cycles when events change
   useEffect(() => {
@@ -493,7 +497,6 @@ function PipelineRunView() {
     return () => {
       const { timer } = rawBuildThrottleRef.current
       if (timer) clearTimeout(timer)
-      if (eventRefreshTimerRef.current) clearTimeout(eventRefreshTimerRef.current)
     }
   }, [])
 
@@ -536,18 +539,11 @@ function PipelineRunView() {
         fetchActivePipelineRuns(false)
         fetchCompletedPipelineRuns(0, false, null, activeFiltersRef.current)
       }
-
-      // Debounced re-fetch of the event list when a socket event belongs to the
-      // currently viewed run. Coalesces rapid bursts into a single fetch.
-      const eventRunId = latestEvent.pipeline_run_id || latestEvent.data?.pipeline_run_id
-      if (eventRunId && eventRunId === urlRunIdRef.current) {
-        clearTimeout(eventRefreshTimerRef.current)
-        eventRefreshTimerRef.current = setTimeout(() => {
-          fetchPipelineRunEvents(urlRunIdRef.current)
-        }, 800)
-      }
+      // Note: no API refetch here for run events — socket events are merged into
+      // mergedEvents directly via mergePipelineRunEvents. The 30s silent poll
+      // handles any gaps in socket delivery as a fallback.
     }
-  }, [socketEvents, fetchActivePipelineRuns, fetchCompletedPipelineRuns, fetchPipelineRunEvents])
+  }, [socketEvents, fetchActivePipelineRuns, fetchCompletedPipelineRuns])
 
   return (
     <div className="h-screen flex flex-col p-5 bg-gh-canvas text-gh-fg">
