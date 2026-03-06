@@ -5159,7 +5159,7 @@ The automated test-fix-validate cycle has failed and requires manual interventio
                     max_iterations=test_type_config.get('max_iterations', 5),
                     review_warnings=test_type_config.get('review_warnings', True),
                     max_file_iterations=test_type_config.get('max_file_iterations', 3),
-                    systemic_analysis_threshold=test_type_config.get('systemic_analysis_threshold', 15)
+                    systemic_analysis_threshold=test_type_config.get('systemic_analysis_threshold', 6)
                 ))
 
             if not test_configs:

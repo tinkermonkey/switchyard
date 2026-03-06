@@ -96,7 +96,7 @@ class RepairTestRunConfig:
     max_iterations: int = 5  # Max test-fix-validate iterations
     review_warnings: bool = True  # Whether to review and fix warnings
     max_file_iterations: int = 3  # Max times to attempt fixing a single file
-    systemic_analysis_threshold: int = 15  # Re-run systemic analysis when failure count exceeds this
+    systemic_analysis_threshold: int = 6  # Re-run systemic analysis when failure count exceeds this
 
 
 @dataclass

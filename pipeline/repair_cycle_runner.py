@@ -143,7 +143,7 @@ class RepairCycleRunner:
                     max_iterations=tc.get('max_iterations', 5),
                     review_warnings=tc.get('review_warnings', True),
                     max_file_iterations=tc.get('max_file_iterations', 3),
-                    systemic_analysis_threshold=tc.get('systemic_analysis_threshold', 15)
+                    systemic_analysis_threshold=tc.get('systemic_analysis_threshold', 6)
                 ))
 
             if not test_configs:
