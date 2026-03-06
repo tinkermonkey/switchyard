@@ -199,7 +199,6 @@ class TestRepairCycleCancellationCheck:
 
         config = RepairTestRunConfig(
             test_type="unit",
-            timeout=600,
             max_iterations=5,
         )
 
@@ -236,7 +235,7 @@ class TestRepairCycleCancellationCheck:
         from pipeline.repair_cycle import RepairCycleStage, RepairTestRunConfig, RepairTestResult, RepairTestFailure
         from services.cancellation import CancellationError
 
-        config = RepairTestRunConfig(test_type="unit", timeout=600)
+        config = RepairTestRunConfig(test_type="unit")
 
         stage = RepairCycleStage.__new__(RepairCycleStage)
         stage.test_configs = [config]
@@ -277,7 +276,7 @@ class TestRepairCycleCancellationCheck:
         from pipeline.repair_cycle import RepairCycleStage, RepairTestRunConfig, RepairTestResult, RepairTestWarning
         from services.cancellation import CancellationError
 
-        config = RepairTestRunConfig(test_type="unit", timeout=600, review_warnings=True)
+        config = RepairTestRunConfig(test_type="unit", review_warnings=True)
 
         stage = RepairCycleStage.__new__(RepairCycleStage)
         stage.test_configs = [config]

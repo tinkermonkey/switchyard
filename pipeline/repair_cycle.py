@@ -446,7 +446,7 @@ class RepairCycleStage(PipelineStage):
                     "total_test_types": len(self.test_configs),  # Total test types to run
                     "max_iterations": config.max_iterations,
                     "review_warnings": config.review_warnings,
-                        },
+                },
                 pipeline_run_id=pipeline_run_id,
             )
         
@@ -904,7 +904,7 @@ class RepairCycleStage(PipelineStage):
                     "test_type_index": test_type_index,  # Which test type in sequence
                     "test_cycle_iteration": test_cycle_iteration,  # Which iteration of this test type
                     "max_test_cycle_iterations": config.max_iterations,
-                        },
+                },
                 pipeline_run_id=pipeline_run_id,
             )
 
@@ -1024,15 +1024,19 @@ Follow these steps exactly:
         elif config.test_type == "unit":
             direct_prompt = """Run ONLY unit tests for this project. Do NOT run integration, e2e, or performance tests.
 
-1. Identify the test framework and unit test location by inspecting config files (pytest.ini, pyproject.toml, package.json, etc.)
+1. Identify the test framework and unit test location by inspecting the project structure and config files
+   (pytest.ini, pyproject.toml, package.json, etc.)
 
-2. Run unit tests only, excluding slow/integration/e2e/performance suites:
-   - **Python (pytest)**: Check pytest.ini/pyproject.toml for test directories and markers.
-     Run: `pytest` (respects pytest.ini defaults) — OR if the config does not already exclude
-     integration/performance/slow tests, use: `pytest -m "not integration and not e2e and not performance and not slow"`
+2. Determine the correct scope — prefer directory-based scoping over marker-based:
+   - **Python (pytest)**:
+     a. Check whether a dedicated unit test directory exists (e.g. tests/unit_tests/, tests/unit/, src/tests/).
+        If it exists, run: `pytest <unit_test_dir>/`
+        This is the most reliable way to avoid accidentally running integration or performance tests.
+     b. If tests are NOT separated by directory, check pytest.ini/pyproject.toml markers and run:
+        `pytest -m "not integration and not e2e and not performance and not slow"`
      Always run from the project root so pytest.ini is picked up.
    - **TypeScript/JavaScript**: `npm test` or `npx vitest run` or `npx jest --testPathPattern=unit`
-     (use the configured test script, exclude integration test directories if separate)
+     (use the configured test script; if a unit/ directory exists, target it directly)
    - **Other**: use the project's configured unit test command
 
 3. Save the full output to /tmp/unit_test_results.txt for reference.
@@ -1045,11 +1049,14 @@ Follow these steps exactly:
         elif config.test_type == "integration":
             direct_prompt = """Run ONLY integration tests for this project. Do NOT run unit, e2e, or performance tests.
 
-1. Identify the test framework and integration test location by inspecting config files.
+1. Identify the test framework and integration test location by inspecting the project structure and
+   config files.
 
-2. Run integration tests only:
-   - **Python (pytest)**: `pytest -m integration` — OR run the integration test directory directly
-     if tests are organised by directory (e.g. `pytest tests/integration_tests/`).
+2. Determine the correct scope — prefer directory-based scoping:
+   - **Python (pytest)**:
+     a. Check whether a dedicated integration test directory exists (e.g. tests/integration_tests/,
+        tests/integration/). If it exists, run: `pytest <integration_test_dir>/`
+     b. If tests are NOT separated by directory, use the marker: `pytest -m integration`
      Always run from the project root so pytest.ini is picked up.
    - **TypeScript/JavaScript**: use the configured integration test script or directory.
 
@@ -1366,7 +1373,7 @@ Be mindful of environment setup steps like installing dependencies and activatin
                 **context,
                 "pipeline_run_id": pipeline_run_id,  # Ensure pipeline_run_id flows through
                 "task_description": f"Fix failures in {test_file}",
-                    # Skip workspace preparation - repair cycle already runs in prepared workspace
+                # Skip workspace preparation - repair cycle already runs in prepared workspace
                 "skip_workspace_prep": True,
                 # Clear review_cycle context to avoid iteration count confusion from previous review cycles
                 "review_cycle": None,
@@ -1513,7 +1520,7 @@ Be mindful of environment setup steps like installing dependencies and activatin
                 **context,
                 "pipeline_run_id": pipeline_run_id,  # Ensure pipeline_run_id flows through
                 "task_description": f"Review warnings in {source_file}",
-                    # Skip workspace preparation - repair cycle already runs in prepared workspace
+                # Skip workspace preparation - repair cycle already runs in prepared workspace
                 "skip_workspace_prep": True,
                 # Clear review_cycle context to avoid iteration count confusion from previous review cycles
                 "review_cycle": None,
@@ -2363,7 +2370,7 @@ If the failures appear to be isolated per-file issues with different root causes
                 **context,
                 "pipeline_run_id": pipeline_run_id,
                 "task_description": task_description,
-                    "skip_workspace_prep": True,
+                "skip_workspace_prep": True,
                 "review_cycle": None,
                 "direct_prompt": direct_prompt,
             }
