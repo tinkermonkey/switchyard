@@ -233,8 +233,14 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
   const _clT1 = performance.now() // categorise + lookup maps done
 
   // ── Pass 0: Size subCycleContainers (bottom-up) ───────────────────────────
+  const COLLAPSED_WIDTH = 280
+  const COLLAPSED_HEIGHT = 100
   const subCycleSizes = new Map()
   subCycleContainers.forEach(sc => {
+    if (sc.data?.isCollapsed) {
+      subCycleSizes.set(sc.id, { width: COLLAPSED_WIDTH, height: COLLAPSED_HEIGHT })
+      return
+    }
     const leaves = leavesBySubCycle.get(sc.id) || []
     const n = leaves.length
     const totalLeafH = leaves.reduce((sum, c) => sum + (c.measured?.height ?? nodeHeight), 0)
@@ -250,6 +256,10 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
   // Uses node.measured dimensions when available (two-phase layout), falls back to params.
   const iterSizes = new Map()
   iterContainers.forEach(iter => {
+    if (iter.data?.isCollapsed) {
+      iterSizes.set(iter.id, { width: COLLAPSED_WIDTH, height: COLLAPSED_HEIGHT })
+      return
+    }
     const directChildren = childrenByIter.get(iter.id) || []
     const subCycles = subCyclesByIter.get(iter.id) || []
 

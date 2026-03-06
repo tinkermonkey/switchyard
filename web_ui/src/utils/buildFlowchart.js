@@ -243,6 +243,9 @@ export function buildFlowchart({
         // Iterations
         cycle.iterations.forEach(iteration => {
           const iterId = `${cycle.id}-iter-${iteration.number}`
+          const iterState = existingCycles.get(iterId)
+          const iterCollapsed = iterState?.isCollapsed ?? true  // default: collapsed
+          updatedCycles.set(iterId, { isCollapsed: iterCollapsed })
 
           const iterNode = {
             id: iterId,
@@ -251,9 +254,13 @@ export function buildFlowchart({
             position: { x: 0, y: 0 },
             zIndex: 1,
             data: {
+              cycleId: iterId,
+              cycleType: 'review',
               iterationNumber: iteration.number,
               label: `Iteration ${iteration.number}`,
-              eventCount: iteration.events.length + 1,
+              iterationCount: iteration.events.length + 1,
+              isCollapsed: iterCollapsed,
+              onToggleCollapse: null, // injected by caller
             },
             style: { width: 0, height: 0 }, // sized by applyCycleLayout
             measured: { width: 1, height: 1 },
@@ -261,14 +268,18 @@ export function buildFlowchart({
           }
           newNodes.push(iterNode)
 
-          // Grandchildren: startEvent then the other events, chronologically
-          const allIterEvents = [iteration.startEvent, ...iteration.events]
-            .filter(Boolean)
-            .sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp))
+          if (iterCollapsed) {
+            leafChain.push({ id: iterId, timestamp: iteration.startEvent?.timestamp })
+          } else {
+            // Grandchildren: startEvent then the other events, chronologically
+            const allIterEvents = [iteration.startEvent, ...iteration.events]
+              .filter(Boolean)
+              .sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp))
 
-          allIterEvents.forEach(event => {
-            processEventToNode(event, iterId, iterId)
-          })
+            allIterEvents.forEach(event => {
+              processEventToNode(event, iterId, iterId)
+            })
+          }
         })
 
         // review_cycle_completed → direct child, rightmost (after iterations)
@@ -306,16 +317,27 @@ export function buildFlowchart({
       } else if (cycle.testCycles) {
         // Collect ALL entries (repair-level residuals + tc-level events) for one
         // chronological sort so leafChain sequencing is correct across the whole cycle.
+        // Entries are either { event, parentId, timestamp } or { containerId, timestamp }
+        // for collapsed containers that go directly into the leafChain.
         const allRepairEntries = []
 
-        // Repair-level residual events → direct children of the repair cycle container
-        ;(cycle.events ?? []).forEach(event => {
-          allRepairEntries.push({ event, parentId: cycle.id })
-        })
+        // Repair-level residual events → direct children of the repair cycle container.
+        // Exclude startEvent (repair_cycle agent_initialized) — it is the container
+        // boundary marker and is already represented by the repairCycleContainer node
+        // itself. Rendering it as a child produces a misleading "Repair Cycle / failed"
+        // node (the agent execution's final status) in the first slot of the container.
+        ;(cycle.events ?? [])
+          .filter(e => e !== cycle.startEvent)
+          .forEach(event => {
+            allRepairEntries.push({ event, parentId: cycle.id, timestamp: event.timestamp })
+          })
 
         // Test cycle containers + their sub-cycles + events
         cycle.testCycles.forEach(tc => {
           const tcId = `${cycle.id}-tc-${tc.number}`
+          const tcState = existingCycles.get(tcId)
+          const tcCollapsed = tcState?.isCollapsed ?? true  // default: collapsed
+          updatedCycles.set(tcId, { isCollapsed: tcCollapsed })
 
           const tcNode = {
             id: tcId,
@@ -324,8 +346,13 @@ export function buildFlowchart({
             position: { x: 0, y: 0 },
             zIndex: 1,
             data: {
+              cycleId: tcId,
+              cycleType: 'repair',
               iterationNumber: tc.number,
               label: tc.testType,
+              iterationCount: tc.subCycles.length,
+              isCollapsed: tcCollapsed,
+              onToggleCollapse: null, // injected by caller
             },
             style: { width: 0, height: 0 }, // sized by applyCycleLayout
             measured: { width: 1, height: 1 },
@@ -333,41 +360,64 @@ export function buildFlowchart({
           }
           newNodes.push(tcNode)
 
-          // Create sub-cycle containers and collect their events
-          tc.subCycles.forEach(sc => {
-            const scId = `${tcId}-${sc.cycleType}-${sc.number}`
-            newNodes.push({
-              id: scId,
-              type: 'subCycleContainer',
-              parentId: tcId,
-              position: { x: 0, y: 0 },
-              zIndex: 1,
-              data: {
-                label: sc.label,
-                cycleType: sc.cycleType,
-                iterationNumber: sc.number,
-                startEvent: sc.startEvent,
-                endEvent: sc.endEvent,
-              },
-              style: { width: 0, height: 0 },
-              measured: { width: 1, height: 1 },
-              draggable: false,
-            })
-            ;[sc.startEvent, ...sc.events, sc.endEvent].filter(Boolean).forEach(event => {
-              allRepairEntries.push({ event, parentId: scId })
-            })
-          })
+          if (tcCollapsed) {
+            allRepairEntries.push({ containerId: tcId, timestamp: tc.startEvent?.timestamp ?? 0 })
+          } else {
+            // Create sub-cycle containers and collect their events
+            tc.subCycles.forEach(sc => {
+              const scId = `${tcId}-${sc.cycleType}-${sc.number}`
+              const scState = existingCycles.get(scId)
+              const scCollapsed = scState?.isCollapsed ?? true  // default: collapsed
+              updatedCycles.set(scId, { isCollapsed: scCollapsed })
 
-          // Residual events within the test cycle go directly under the tc container
-          ;[tc.startEvent, ...tc.events, tc.endEvent].filter(Boolean).forEach(event => {
-            allRepairEntries.push({ event, parentId: tcId })
-          })
+              newNodes.push({
+                id: scId,
+                type: 'subCycleContainer',
+                parentId: tcId,
+                position: { x: 0, y: 0 },
+                zIndex: 1,
+                data: {
+                  cycleId: scId,
+                  label: sc.label,
+                  cycleType: sc.cycleType,
+                  iterationNumber: sc.number,
+                  iterationCount: sc.events.length,
+                  startEvent: sc.startEvent,
+                  endEvent: sc.endEvent,
+                  isCollapsed: scCollapsed,
+                  onToggleCollapse: null, // injected by caller
+                },
+                style: { width: 0, height: 0 },
+                measured: { width: 1, height: 1 },
+                draggable: false,
+              })
+
+              if (scCollapsed) {
+                allRepairEntries.push({ containerId: scId, timestamp: sc.startEvent?.timestamp ?? 0 })
+              } else {
+                ;[sc.startEvent, ...sc.events, sc.endEvent].filter(Boolean).forEach(event => {
+                  allRepairEntries.push({ event, parentId: scId, timestamp: event.timestamp })
+                })
+              }
+            })
+
+            // Residual events within the test cycle go directly under the tc container
+            ;[tc.startEvent, ...tc.events, tc.endEvent].filter(Boolean).forEach(event => {
+              allRepairEntries.push({ event, parentId: tcId, timestamp: event.timestamp })
+            })
+          }
         })
 
-        // Process all events in chronological order for correct leafChain sequencing
+        // Process all entries in chronological order for correct leafChain sequencing
         allRepairEntries
-          .sort((a, b) => new Date(a.event.timestamp) - new Date(b.event.timestamp))
-          .forEach(({ event, parentId }) => processEventToNode(event, parentId, parentId))
+          .sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp))
+          .forEach(entry => {
+            if (entry.containerId) {
+              leafChain.push({ id: entry.containerId, timestamp: entry.timestamp })
+            } else {
+              processEventToNode(entry.event, entry.parentId, entry.parentId)
+            }
+          })
       }
     } else if (cycle.type === 'pr_review_cycle') {
       // ── PR review cycle container ───────────────────────────────────────
@@ -404,6 +454,9 @@ export function buildFlowchart({
         // Phase containers
         ;(cycle.phases ?? []).forEach(phase => {
           const phaseId = `${cycle.id}-phase-${phase.number}`
+          const phaseState = existingCycles.get(phaseId)
+          const phaseCollapsed = phaseState?.isCollapsed ?? true  // default: collapsed
+          updatedCycles.set(phaseId, { isCollapsed: phaseCollapsed })
 
           const phaseNode = {
             id: phaseId,
@@ -412,9 +465,13 @@ export function buildFlowchart({
             position: { x: 0, y: 0 },
             zIndex: 1,
             data: {
+              cycleId: phaseId,
+              cycleType: 'pr_review',
               iterationNumber: phase.number,
               label: `Phase ${phase.number}`,
-              eventCount: phase.events.length + 1,
+              iterationCount: phase.events.length + 1,
+              isCollapsed: phaseCollapsed,
+              onToggleCollapse: null, // injected by caller
             },
             style: { width: 0, height: 0 }, // sized by applyCycleLayout
             measured: { width: 1, height: 1 },
@@ -422,13 +479,17 @@ export function buildFlowchart({
           }
           newNodes.push(phaseNode)
 
-          const allPhaseEvents = [phase.startEvent, ...phase.events]
-            .filter(Boolean)
-            .sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp))
+          if (phaseCollapsed) {
+            leafChain.push({ id: phaseId, timestamp: phase.startEvent?.timestamp })
+          } else {
+            const allPhaseEvents = [phase.startEvent, ...phase.events]
+              .filter(Boolean)
+              .sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp))
 
-          allPhaseEvents.forEach(event => {
-            processEventToNode(event, phaseId, phaseId)
-          })
+            allPhaseEvents.forEach(event => {
+              processEventToNode(event, phaseId, phaseId)
+            })
+          }
         })
 
         // pr_review_stage_completed → direct child, rightmost

@@ -8,14 +8,9 @@ import {
 } from '@xyflow/react'
 import '@xyflow/react/dist/style.css'
 import { RefreshCw } from 'lucide-react'
-import CycleBoundingNode from './CycleBoundingNode'
-import ReviewCycleContainerNode from './ReviewCycleContainerNode'
-import RepairCycleContainerNode from './RepairCycleContainerNode'
-import PRReviewCycleContainerNode from './PRReviewCycleContainerNode'
-import ConversationalLoopContainerNode from './ConversationalLoopContainerNode'
-import IterationContainerNode from './IterationContainerNode'
 import LayoutController from './LayoutController'
 import SmartPipelineEdge from './SmartPipelineEdge'
+import { containerNodeTypes } from './containers/index.js'
 import { eventNodeTypes } from './nodes/index.js'
 
 /**
@@ -37,7 +32,7 @@ export const DEFAULT_LAYOUT_OPTIONS = {
   cycleGap: 100,
   cyclePadding: 40,
   viewportWidth: 1200,
-  iterHeaderHeight: 24,
+  iterHeaderHeight: 30,
   iterPadding: 20,
   innerVertSpacing: 20,
   innerHorizSpacing: 60,
@@ -45,14 +40,9 @@ export const DEFAULT_LAYOUT_OPTIONS = {
 }
 
 const nodeTypes = {
-  // Container / structural nodes (not event-type-specific)
-  cycleBounding: CycleBoundingNode,
-  reviewCycleContainer: ReviewCycleContainerNode,
-  repairCycleContainer: RepairCycleContainerNode,
-  prReviewCycleContainer: PRReviewCycleContainerNode,
-  conversationalLoopContainer: ConversationalLoopContainerNode,
-  iterationContainer: IterationContainerNode,
-  subCycleContainer: IterationContainerNode,  // same component, styled via cycleType data prop
+  // Container / structural nodes (not event-type-specific).
+  // Sourced from containers/index.js.
+  ...containerNodeTypes,
 
   // Event nodes — one component per event type, with 'pipelineEvent' as fallback.
   // Sourced from nodes/index.js; mapping defined in nodes/EVENT_TYPE_MAP.js.
@@ -63,13 +53,7 @@ const edgeTypes = {
   smart: SmartPipelineEdge,
 }
 
-const CYCLE_CONTAINER_TYPES = [
-  'cycleBounding',
-  'reviewCycleContainer',
-  'repairCycleContainer',
-  'prReviewCycleContainer',
-  'conversationalLoopContainer',
-]
+const CYCLE_CONTAINER_TYPES = Object.keys(containerNodeTypes)
 
 /**
  * Shared pipeline flow graph component used by both the /pipeline-run view and the
