@@ -21,7 +21,6 @@ Usage:
     test_configs = [
         RepairTestRunConfig(
             test_type="unit",
-            timeout=600,
             max_iterations=5,
             review_warnings=True
         )
@@ -59,7 +58,7 @@ CRITICAL: You MUST return ONLY valid JSON in this EXACT format (no markdown, no 
 {
     "passed": <number of passing checks or tests>,
     "failed": <number of failing checks or tests>,
-    "warnings": <number of warnings (0 if none)>,
+    "warnings": <number of items in warning_list (must equal len(warning_list), 0 if empty)>,
     "failures": [
         {"file": "<file path>", "test": "<check or test name>", "message": "<failure message>"},
         ...
@@ -94,7 +93,6 @@ class RepairTestRunConfig:
     """Configuration for a single test type run cycle"""
 
     test_type: str
-    timeout: int = 900  # Timeout in seconds
     max_iterations: int = 5  # Max test-fix-validate iterations
     review_warnings: bool = True  # Whether to review and fix warnings
     max_file_iterations: int = 3  # Max times to attempt fixing a single file
@@ -137,8 +135,8 @@ class RepairTestResult:
         return self.failed > 0
 
     def has_warnings(self) -> bool:
-        """Check if there are any warnings"""
-        return self.warnings > 0
+        """Check if there are actionable warnings to review"""
+        return len(self.warning_list) > 0
 
     def group_failures_by_file(self) -> Dict[str, List[RepairTestFailure]]:
         """Group failures by test file"""
@@ -448,8 +446,7 @@ class RepairCycleStage(PipelineStage):
                     "total_test_types": len(self.test_configs),  # Total test types to run
                     "max_iterations": config.max_iterations,
                     "review_warnings": config.review_warnings,
-                    "timeout": config.timeout,
-                },
+                        },
                 pipeline_run_id=pipeline_run_id,
             )
         
@@ -585,13 +582,14 @@ class RepairCycleStage(PipelineStage):
 
                 # Step 3: Handle warnings if configured
                 if config.review_warnings and test_result.has_warnings():
-                    logger.info(f"Reviewing {test_result.warnings} warnings")
+                    logger.info(f"Reviewing {len(test_result.warning_list)} warnings")
                     warnings_fixed = await self._handle_warnings(test_result, config, context)
                     warnings_reviewed += warnings_fixed
 
-                    # Re-run tests after fixing warnings
-                    logger.info("Re-running tests after warning fixes")
-                    test_result = await self._run_tests(config, context, test_cycle_iteration, test_type_index)
+                    # Re-run tests only if warning fixes were actually applied
+                    if warnings_fixed > 0:
+                        logger.info("Re-running tests after warning fixes")
+                        test_result = await self._run_tests(config, context, test_cycle_iteration, test_type_index)
 
                     # If warning fixes broke tests, continue loop
                     if test_result.has_failures():
@@ -906,8 +904,7 @@ class RepairCycleStage(PipelineStage):
                     "test_type_index": test_type_index,  # Which test type in sequence
                     "test_cycle_iteration": test_cycle_iteration,  # Which iteration of this test type
                     "max_test_cycle_iterations": config.max_iterations,
-                    "timeout": config.timeout,
-                },
+                        },
                 pipeline_run_id=pipeline_run_id,
             )
 
@@ -955,9 +952,8 @@ Your goal is to identify and report compilation errors and linting violations so
 4. Return structured results. Each distinct hook failure is a separate entry. Use the hook name as "test" and the file it failed on (if reported) as "file"; use the hook name as "file" if no specific file is identified.""" + _TEST_OUTPUT_FORMAT
 
         elif config.test_type == "ci":
-            # Calculate a safe polling deadline from the configured timeout, leaving
-            # buffer for the JSON response. Agent needs to know when to stop gracefully.
-            poll_deadline_minutes = max(5, (config.timeout - 120) // 60)
+            # Allow ~25 minutes for CI polling before timing out gracefully.
+            poll_deadline_minutes = 25
             direct_prompt = f"""Check whether CI (continuous integration) is passing for this project's current branch.
 
 You have approximately {poll_deadline_minutes} minutes to complete this check before your session times out.
@@ -1025,6 +1021,42 @@ Follow these steps exactly:
 4. Return structured results. Each failing story test is a separate failure entry.
    Use the story file path as "file", the story/test name as "test", and the error message as "message".""" + _TEST_OUTPUT_FORMAT
 
+        elif config.test_type == "unit":
+            direct_prompt = """Run ONLY unit tests for this project. Do NOT run integration, e2e, or performance tests.
+
+1. Identify the test framework and unit test location by inspecting config files (pytest.ini, pyproject.toml, package.json, etc.)
+
+2. Run unit tests only, excluding slow/integration/e2e/performance suites:
+   - **Python (pytest)**: Check pytest.ini/pyproject.toml for test directories and markers.
+     Run: `pytest` (respects pytest.ini defaults) — OR if the config does not already exclude
+     integration/performance/slow tests, use: `pytest -m "not integration and not e2e and not performance and not slow"`
+     Always run from the project root so pytest.ini is picked up.
+   - **TypeScript/JavaScript**: `npm test` or `npx vitest run` or `npx jest --testPathPattern=unit`
+     (use the configured test script, exclude integration test directories if separate)
+   - **Other**: use the project's configured unit test command
+
+3. Save the full output to /tmp/unit_test_results.txt for reference.
+
+4. Count only ACTUAL test failures in "failures" — not log lines that contain the word ERROR or FAILED.
+   Count only ACTIONABLE warnings in "warning_list" (e.g. deprecation warnings in test code that
+   should be fixed) — not expected log-level WARNING messages from the application under test.
+   Set "warnings" to exactly len(warning_list).""" + _TEST_OUTPUT_FORMAT
+
+        elif config.test_type == "integration":
+            direct_prompt = """Run ONLY integration tests for this project. Do NOT run unit, e2e, or performance tests.
+
+1. Identify the test framework and integration test location by inspecting config files.
+
+2. Run integration tests only:
+   - **Python (pytest)**: `pytest -m integration` — OR run the integration test directory directly
+     if tests are organised by directory (e.g. `pytest tests/integration_tests/`).
+     Always run from the project root so pytest.ini is picked up.
+   - **TypeScript/JavaScript**: use the configured integration test script or directory.
+
+3. Save the full output to /tmp/integration_test_results.txt for reference.
+
+4. Count only ACTUAL test failures. Set "warnings" to exactly len(warning_list).""" + _TEST_OUTPUT_FORMAT
+
         else:
             direct_prompt = f"""Run all {config.test_type} tests for this project.
 
@@ -1043,7 +1075,6 @@ Be mindful of environment setup steps like installing dependencies and activatin
             **context,
             "pipeline_run_id": pipeline_run_id,  # Ensure pipeline_run_id flows through
             "task_description": f"Run {config.test_type} tests (test cycle iteration {test_cycle_iteration})",
-            "timeout": config.timeout,
             # Skip workspace preparation - repair cycle already runs in prepared workspace
             "skip_workspace_prep": True,
             # Clear review_cycle context to avoid iteration count confusion from previous review cycles
@@ -1335,8 +1366,7 @@ Be mindful of environment setup steps like installing dependencies and activatin
                 **context,
                 "pipeline_run_id": pipeline_run_id,  # Ensure pipeline_run_id flows through
                 "task_description": f"Fix failures in {test_file}",
-                "timeout": config.timeout,
-                # Skip workspace preparation - repair cycle already runs in prepared workspace
+                    # Skip workspace preparation - repair cycle already runs in prepared workspace
                 "skip_workspace_prep": True,
                 # Clear review_cycle context to avoid iteration count confusion from previous review cycles
                 "review_cycle": None,
@@ -1483,8 +1513,7 @@ Be mindful of environment setup steps like installing dependencies and activatin
                 **context,
                 "pipeline_run_id": pipeline_run_id,  # Ensure pipeline_run_id flows through
                 "task_description": f"Review warnings in {source_file}",
-                "timeout": config.timeout,
-                # Skip workspace preparation - repair cycle already runs in prepared workspace
+                    # Skip workspace preparation - repair cycle already runs in prepared workspace
                 "skip_workspace_prep": True,
                 # Clear review_cycle context to avoid iteration count confusion from previous review cycles
                 "review_cycle": None,
@@ -1816,7 +1845,6 @@ If the failures appear to be isolated per-file issues with different root causes
             **context,
             "pipeline_run_id": pipeline_run_id,
             "task_description": f"Analyze systemic failures in {config.test_type} tests",
-            "timeout": min(config.timeout, 300),  # Cap at 5 minutes for analysis
             "skip_workspace_prep": True,
             "review_cycle": None,
             "direct_prompt": direct_prompt,
@@ -2335,8 +2363,7 @@ If the failures appear to be isolated per-file issues with different root causes
                 **context,
                 "pipeline_run_id": pipeline_run_id,
                 "task_description": task_description,
-                "timeout": config.timeout,
-                "skip_workspace_prep": True,
+                    "skip_workspace_prep": True,
                 "review_cycle": None,
                 "direct_prompt": direct_prompt,
             }

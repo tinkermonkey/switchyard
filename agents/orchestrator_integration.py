@@ -216,7 +216,6 @@ def create_stage_from_config(stage_config, project_name: str) -> PipelineStage:
                 test_type = test_type_config['type']
                 test_configs.append(RepairTestRunConfig(
                     test_type=test_type,
-                    timeout=test_type_config.get('timeout', 600),
                     max_iterations=test_type_config.get('max_iterations', 5),
                     review_warnings=test_type_config.get('review_warnings', True),
                     max_file_iterations=test_type_config.get('max_file_iterations', 3)

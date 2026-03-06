@@ -140,7 +140,6 @@ class RepairCycleRunner:
                 test_type = tc['test_type']
                 test_configs.append(RepairTestRunConfig(
                     test_type=test_type,
-                    timeout=tc.get('timeout', 600),
                     max_iterations=tc.get('max_iterations', 5),
                     review_warnings=tc.get('review_warnings', True),
                     max_file_iterations=tc.get('max_file_iterations', 3)
