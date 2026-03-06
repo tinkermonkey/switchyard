@@ -52,10 +52,10 @@ def _save_repair_cycle_context(
     for tc in test_configs:
         serialized_configs.append({
             'test_type': tc.test_type,
-            'timeout': tc.timeout,
             'max_iterations': tc.max_iterations,
             'review_warnings': tc.review_warnings,
-            'max_file_iterations': tc.max_file_iterations
+            'max_file_iterations': tc.max_file_iterations,
+            'systemic_analysis_threshold': tc.systemic_analysis_threshold
         })
     
     # Build context for container
