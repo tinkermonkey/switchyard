@@ -191,7 +191,7 @@ export default function RepairCycleStatus({ events }) {
         case 'agent_completed': // Fallback if repair_cycle_completed is not distinct
           if (data.agent_name === 'repair_cycle' || eventType === 'repair_cycle_completed') {
             cycleState.endTime = timestamp
-            cycleState.overallSuccess = data.success || data.passed
+            cycleState.overallSuccess = data.overall_success ?? data.success ?? data.passed ?? null
             cycleState.error = data.error
           }
           break
