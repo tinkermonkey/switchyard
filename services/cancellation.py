@@ -76,8 +76,18 @@ class CancellationSignal:
 
     def is_cancelled(self, project: str, issue_number: int) -> bool:
         """Check if an issue has been cancelled."""
-        # Check in-memory first (fast path)
+        # Check in-memory first (fast path), but validate against Redis when available
+        # so that TTL-expired signals don't linger in memory indefinitely.
         if (project, issue_number) in self._in_memory:
+            redis_client = self._get_redis()
+            if redis_client:
+                try:
+                    if not redis_client.exists(self._key(project, issue_number)):
+                        # Redis TTL expired — stale in-memory entry; evict it
+                        self._in_memory.discard((project, issue_number))
+                        return False
+                except Exception as e:
+                    logger.warning(f"Failed to validate cancellation signal in Redis: {e}")
             return True
 
         # Check Redis
