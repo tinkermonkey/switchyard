@@ -142,7 +142,6 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
     nodeWidth = 250,
     nodeHeight = 80,
     horizontalSpacing = 150,
-    verticalSpacing = 120,
     cycleGap = 100,
     cyclePadding = 40,
     // Iteration / grandchild layout constants
@@ -245,8 +244,8 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
     const n = leaves.length
     const totalLeafH = leaves.reduce((sum, c) => sum + (c.measured?.height ?? nodeHeight), 0)
     const maxLeafW = n > 0 ? Math.max(...leaves.map(c => c.measured?.width ?? nodeWidth)) : nodeWidth
-    const height = iterHeaderHeight + iterPadding * 2 + totalLeafH + Math.max(0, n - 1) * innerVertSpacing
-    const width = maxLeafW + iterPadding * 2
+    const height = iterHeaderHeight + cyclePadding * 2 + totalLeafH + Math.max(0, n - 1) * innerVertSpacing
+    const width = maxLeafW + cyclePadding * 2
     subCycleSizes.set(sc.id, { width, height })
   })
 
@@ -273,8 +272,8 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
         const numColumns = colValues.length
         const totalColWidth = colValues.reduce((sum, col) => sum + col.maxW, 0)
         const maxColHeight = Math.max(...colValues.map(col => col.totalH), 0)
-        const width = iterPadding * 2 + totalColWidth + (numColumns - 1) * innerHorizSpacing
-        const height = iterHeaderHeight + iterPadding * 2 + maxColHeight
+        const width = cyclePadding * 2 + totalColWidth + (numColumns - 1) * innerHorizSpacing
+        const height = iterHeaderHeight + cyclePadding * 2 + maxColHeight
         iterSizes.set(iter.id, { width, height, columns })
         return
       }
@@ -368,18 +367,17 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
   // (buildFlowchart.js inserts them in chronological order)
   // Uses node.measured dimensions when available (two-phase layout).
   const positionedNodes = new Map()  // id → fully positioned node
-  const nodeGap = Math.max(16, verticalSpacing - nodeHeight)  // gap between consecutive nodes
-
   // Process all root-level nodes (no parentId) in array order, which is chronological
   const rootLayoutNodes = nodes.filter(n => !n.parentId)
+  const isRootCycleType = (type) =>
+    type === 'reviewCycleContainer' ||
+    type === 'repairCycleContainer' ||
+    type === 'prReviewCycleContainer' ||
+    type === 'conversationalLoopContainer'
   let currentY = 100
-  rootLayoutNodes.forEach(node => {
-    if (
-      node.type === 'reviewCycleContainer' ||
-      node.type === 'repairCycleContainer' ||
-      node.type === 'prReviewCycleContainer' ||
-      node.type === 'conversationalLoopContainer'
-    ) {
+  rootLayoutNodes.forEach((node, index) => {
+    const nextNode = rootLayoutNodes[index + 1]
+    if (isRootCycleType(node.type)) {
       const size = cycleSizes.get(node.id) || { width: 500, height: 200 }
       positionedNodes.set(node.id, {
         ...node,
@@ -394,7 +392,8 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
         ...node,
         position: { x: centerXPosition - w / 2, y: currentY },
       })
-      currentY += h + nodeGap
+      // Use cycleGap when next item is a cycle container, otherwise innerVertSpacing
+      currentY += h + (nextNode && isRootCycleType(nextNode.type) ? cycleGap : innerVertSpacing)
     }
   })
 
@@ -497,9 +496,9 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
 
     // Repair test-cycle containers: column layout (one column per iteration number)
     if (repairTestCycleIds.has(iter.id) && iterSize.columns) {
-      let colX = iterPadding
+      let colX = cyclePadding
       iterSize.columns.forEach(col => {
-        let childY = iterHeaderHeight + iterPadding
+        let childY = iterHeaderHeight + cyclePadding
         // Sort items within each column chronologically
         const sortedItems = [...col.items].sort((a, b) => {
           const aTs = a.node.data?.startEvent?.timestamp || a.node.data?.timestamp || a.node.data?.startTime || ''
@@ -565,8 +564,8 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
   // ── Pass 6: Position pipelineEvent leaves within subCycleContainers ───────
   subCycleContainers.forEach(sc => {
     const leaves = leavesBySubCycle.get(sc.id) || []
-    const scSize = subCycleSizes.get(sc.id) || { width: nodeWidth + iterPadding * 2 }
-    let leafY = iterHeaderHeight + iterPadding
+    const scSize = subCycleSizes.get(sc.id) || { width: nodeWidth + cyclePadding * 2 }
+    let leafY = iterHeaderHeight + cyclePadding
     leaves.forEach(leaf => {
       const leafW = leaf.measured?.width ?? nodeWidth
       positionedNodes.set(leaf.id, {

@@ -9,7 +9,7 @@ import { buildFlowchart } from './utils/buildFlowchart'
 // are still passed to the layout algorithm as invisible defaults.
 const PARAM_LABELS = {
   horizontalSpacing: 'H Spacing (within cycle)',
-  innerVertSpacing: 'V Spacing (within iteration)',
+  innerVertSpacing: 'Node V Spacing',
   cycleGap: 'V Spacing (between cycles)',
   cyclePadding: 'Cycle Padding',
   viewportWidth: 'Viewport Width',
