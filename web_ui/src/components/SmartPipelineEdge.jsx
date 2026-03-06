@@ -22,13 +22,16 @@ import {
  * 3. Excludes only COMMON ancestors of source and target.
  *    A container that encloses BOTH endpoints is transit space — the edge
  *    lives inside it, so it must not be an obstacle.
- *    A container that encloses only ONE endpoint (e.g. the iteration container
- *    the source is in but the target is not) stays as an obstacle. The
- *    library's guaranteeWalkablePath() punches a walkable tunnel out of it
- *    in the handle direction, so A* can still start/end inside such a
- *    container and will route around its walls everywhere else.
+ *    A container that encloses only ONE endpoint stays as an obstacle.
+ *
+ * 4. Culls to a padded bounding box around the edge path.
+ *    Nodes far from the source→target corridor cannot block the route and
+ *    only inflate the A* search space. Keeping only nodes whose bounding
+ *    boxes intersect the padded corridor reduces obstacle count from
+ *    O(all nodes) to O(nearby nodes), cutting A* cost dramatically on
+ *    large graphs where most nodes are irrelevant to any given edge.
  */
-function buildObstacleNodes(allNodes, sourceId, targetId) {
+function buildObstacleNodes(allNodes, sourceId, targetId, sourceX, sourceY, targetX, targetY) {
   const nodeMap = new Map(allNodes.map(n => [n.id, n]))
   const absCache = new Map()
 
@@ -58,11 +61,29 @@ function buildObstacleNodes(allNodes, sourceId, targetId) {
 
   // Only exempt containers that are ancestors of BOTH source and target —
   // i.e. containers that fully enclose the entire edge path.
-  // Containers enclosing only one endpoint remain obstacles; the library's
-  // guaranteeWalkablePath() handles punching the exit/entry tunnel.
   const sourceAncs = ancestorIdSet(sourceId)
   const targetAncs = ancestorIdSet(targetId)
   const exemptIds = new Set([...sourceAncs].filter(id => targetAncs.has(id)))
+
+  // Padded bounding box of the edge's source→target corridor.
+  // 300px padding ensures nodes that jut into the path from outside the
+  // direct bbox are still included as obstacles.
+  const BBOX_PAD = 300
+  const bboxMinX = Math.min(sourceX, targetX) - BBOX_PAD
+  const bboxMaxX = Math.max(sourceX, targetX) + BBOX_PAD
+  const bboxMinY = Math.min(sourceY, targetY) - BBOX_PAD
+  const bboxMaxY = Math.max(sourceY, targetY) + BBOX_PAD
+
+  // Source/target and their direct parents must always be included so the
+  // library can guarantee a walkable entry/exit tunnel even for nodes that
+  // fall outside the padded bbox (e.g. handles at the very edge of the box).
+  const sourceNode = nodeMap.get(sourceId)
+  const targetNode = nodeMap.get(targetId)
+  const alwaysInclude = new Set([
+    sourceId, targetId,
+    ...(sourceNode?.parentId ? [sourceNode.parentId] : []),
+    ...(targetNode?.parentId ? [targetNode.parentId] : []),
+  ])
 
   return allNodes
     .filter(n => !exemptIds.has(n.id))
@@ -76,6 +97,13 @@ function buildObstacleNodes(allNodes, sourceId, targetId) {
         ? n.measured.height
         : (n.style?.height || 80)
       return { ...n, position: absolutePos(n), width, height }
+    })
+    .filter(n => {
+      if (alwaysInclude.has(n.id)) return true
+      // Include only nodes whose bounding box overlaps the padded edge corridor
+      const { x, y } = n.position
+      return x < bboxMaxX && x + n.width > bboxMinX &&
+             y < bboxMaxY && y + n.height > bboxMinY
     })
 }
 
@@ -234,9 +262,9 @@ function SmartPipelineEdgeInner(props) {
 
   // Recompute obstacle list only when node geometry or this edge's endpoints change.
   const obstacleNodes = useMemo(
-    () => buildObstacleNodes(allNodes, source, target),
+    () => buildObstacleNodes(allNodes, source, target, sourceX, sourceY, targetX, targetY),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [geometryKey, source, target]
+    [geometryKey, source, target, sourceX, sourceY, targetX, targetY]
   )
 
   // Recompute A* path only when edge handle positions or obstacles change.
@@ -251,7 +279,7 @@ function SmartPipelineEdgeInner(props) {
     nodes: obstacleNodes,
     options: {
       nodePadding: 12,
-      gridRatio: 10,
+      gridRatio: 20,
       drawEdge: drawSmartEdge,
       generatePath: pathfindingJumpPointNoDiagonal,
     },
