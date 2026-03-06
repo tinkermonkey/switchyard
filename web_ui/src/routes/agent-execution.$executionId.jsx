@@ -1,20 +1,13 @@
-import { createFileRoute, useNavigate, Link } from '@tanstack/react-router'
+import { createFileRoute, useNavigate } from '@tanstack/react-router'
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
-import { RefreshCw, CheckCircle2, Circle, PlayCircle, ChevronDown, ChevronUp, ChevronLeft, ChevronRight, ArrowLeft } from 'lucide-react'
+import { RefreshCw } from 'lucide-react'
 import Header from '../components/Header'
-import NavigationTabs from '../components/NavigationTabs'
 import LiveLogs from '../components/LiveLogs'
 import { useSocket } from '../contexts/SocketContext'
-import ReactMarkdown from 'react-markdown'
-import remarkGfm from 'remark-gfm'
 import { normalizeTimestamp, formatTimestamp, mergeAgentExecutionEvents, mergeObjectStable, mergeArrayByIdStable } from '../utils/eventMerging'
-import RepairCycleStatus from '../components/RepairCycleStatus'
 import TokenUsagePanel from '../components/TokenUsagePanel'
-
-  const formatAgentName = (agentName) => {
-    if (!agentName || typeof agentName !== 'string' || agentName.trim() === '') return 'Unknown Agent'
-    return agentName.split('_').map(word => word.charAt(0).toUpperCase() + word.slice(1)).join(' ')
-  }
+import AgentExecutionNavBar from '../components/AgentExecutionNavBar'
+import AgentExecutionState from '../components/AgentExecutionState'
 
 function AgentExecutionView() {
   const { executionId } = Route.useParams()
@@ -26,9 +19,6 @@ function AgentExecutionView() {
   const [promptEvent, setPromptEvent] = useState(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
-  const [isMessageExpanded, setIsMessageExpanded] = useState(false)
-  const [isPromptExpanded, setIsPromptExpanded] = useState(false)
-  const [isPreviousResultExpanded, setIsPreviousResultExpanded] = useState(false)
   const [autoScroll, setAutoScroll] = useState(true)
 
   // Agent execution navigation state
@@ -133,7 +123,7 @@ function AgentExecutionView() {
         console.log('[AgentExecution] Found pipeline executions:', executions.length)
         // Use stable merge to prevent unnecessary re-renders
         setPipelineExecutions(current => mergeArrayByIdStable(current, executions, 'execution_id'))
-        
+
         // Store all pipeline events for repair cycle status
         if (data.events) {
           setPipelineEvents(data.events)
@@ -269,11 +259,11 @@ function AgentExecutionView() {
     if (!executionData) {
       return { executionEvents: [], agentState: {}, mergedLogs: [], mergedPipelineEvents: [] }
     }
-    
+
     const agent = executionData.agent
     const startTimestamp = normalizeTimestamp(executionData.started_at)
     const endTimestamp = executionData.ended_at ? normalizeTimestamp(executionData.ended_at) : null
-    
+
     console.log('[AgentExecution] useMemo triggered:', {
       agent,
       executionLogsCount: executionLogs.length,
@@ -281,16 +271,16 @@ function AgentExecutionView() {
       startTimestamp,
       endTimestamp
     })
-    
+
     // Use shared utility to merge API logs with WebSocket events
     const logs = mergeAgentExecutionEvents(executionLogs, allLogs, executionData)
-    
+
     console.log('[AgentExecution] Merged logs:', {
       mergedCount: logs.length,
       apiLogsCount: executionLogs.length,
       newLogsFromWebSocket: logs.length - executionLogs.length
     })
-    
+
     // Filter events for this execution (for display purposes only, not for state)
     const filteredEvents = allLogs.filter(event => {
       if (event.agent !== agent) return false
@@ -316,35 +306,35 @@ function AgentExecutionView() {
         // Check if event belongs to this pipeline run
         const eventRunId = event.pipeline_run_id || (event.data && event.data.pipeline_run_id)
         if (eventRunId !== pipelineRunId) return false
-        
+
         // Check if it's newer than historical data
         const eventTimestamp = normalizeTimestamp(event.timestamp)
         return eventTimestamp > lastHistTimestamp
       })
-      
+
       if (livePipelineEvents.length > 0) {
         pipelineEventsList = [...pipelineEventsList, ...livePipelineEvents]
       }
     }
-    
+
     // Build agent state from merged logs (API + WebSocket)
     let lastTodoWrite = null
     let lastTextMessage = null
     let lastToolCall = null
     let previousToolCall = null
     let previousToolResult = null
-    
+
     // Process merged logs in reverse (most recent first) to find latest states
     for (let i = logs.length - 1; i >= 0; i--) {
       const log = logs[i]
       const event = log.raw_event?.event
       const normalizedLogTimestamp = normalizeTimestamp(log.timestamp)
-      
+
       if (event?.type === 'assistant' && event?.message?.content) {
         const contents = Array.isArray(event.message.content)
           ? event.message.content
           : [event.message.content]
-        
+
         for (const item of contents) {
           if (item.type === 'text' && !lastTextMessage && item.text?.trim()) {
             lastTextMessage = {
@@ -379,25 +369,25 @@ function AgentExecutionView() {
           }
         }
       }
-      
+
       if (lastTodoWrite && lastTextMessage && lastToolCall && previousToolCall) break
     }
-    
+
     // Find tool result for previous tool call
     if (previousToolCall) {
       for (let i = logs.length - 1; i >= 0; i--) {
         const log = logs[i]
         const event = log.raw_event?.event
         const normalizedLogTimestamp = normalizeTimestamp(log.timestamp)
-        
+
         const isBeforeOrAtLastToolCall = normalizedLogTimestamp && lastToolCall.timestamp && normalizedLogTimestamp <= lastToolCall.timestamp
         const isAfterOrAtPreviousToolCall = normalizedLogTimestamp && previousToolCall.timestamp && normalizedLogTimestamp >= previousToolCall.timestamp
-        
+
         if (isBeforeOrAtLastToolCall && isAfterOrAtPreviousToolCall && event?.type === 'user' && event?.message?.content) {
           const contents = Array.isArray(event.message.content)
             ? event.message.content
             : [event.message.content]
-          
+
           for (const item of contents) {
             if (item.type === 'tool_result') {
               const timeDiff = Math.abs(normalizedLogTimestamp - previousToolCall.timestamp)
@@ -415,7 +405,7 @@ function AgentExecutionView() {
         }
       }
     }
-    
+
     // Use prompt_event from API response instead of searching events
     let inputPrompt = null
     if (promptEvent && promptEvent.raw_event?.data?.prompt) {
@@ -428,7 +418,7 @@ function AgentExecutionView() {
         }
       }
     }
-    
+
     return {
       executionEvents: filteredEvents,
       agentState: {
@@ -444,59 +434,6 @@ function AgentExecutionView() {
     }
   }, [executionData, executionLogs, allLogs, promptEvent, pipelineEvents, pipelineRunId])
 
-  const formatToolCall = (toolCall) => {
-    if (!toolCall) return null
-    
-    const { name, input } = toolCall
-    
-    switch (name) {
-      case 'Bash':
-        return `${input.command || ''}`
-      case 'Read':
-        return `${input.file_path || ''}`
-      case 'Grep':
-        return `"${input.pattern || ''}" in ${input.path || '.'}`
-      case 'Edit':
-        return `${input.file_path || ''}`
-      case 'Write':
-        return `${input.file_path || ''}`
-      case 'Glob':
-        return `${input.pattern || ''}`
-      default:
-        return input.description || JSON.stringify(input)
-    }
-  }
-  
-  const getTodoStats = (todos) => {
-    if (!todos || todos.length === 0) return { total: 0, completed: 0, inProgress: 0, pending: 0 }
-    
-    const completed = todos.filter(t => t.status === 'completed').length
-    const inProgress = todos.filter(t => t.status === 'in_progress').length
-    const pending = todos.filter(t => t.status === 'pending').length
-    
-    return { total: todos.length, completed, inProgress, pending }
-  }
-  
-  const getStatusIndicator = () => {
-    if (!executionData) {
-      return { color: 'bg-gh-fg-muted', label: 'Unknown' }
-    }
-    if (executionData.status === 'failed') {
-      return { color: 'bg-gh-danger', label: 'Failed' }
-    }
-    if (executionData.status === 'completed') {
-      return { color: 'bg-gh-success', label: 'Completed' }
-    }
-    if (executionData.status === 'running') {
-      return { color: 'bg-gh-success', label: 'Running' }
-    }
-    return { color: 'bg-gh-fg-muted', label: 'Idle' }
-  }
-
-  const status = getStatusIndicator()
-  const { lastTodoWrite, lastTextMessage, lastToolCall, previousToolCall, previousToolResult, inputPrompt } = agentState
-  const todoStats = getTodoStats(lastTodoWrite?.todos)
-  const isExecuting = executionData?.status === 'running'
   if (loading) {
     return (
       <div className="min-h-screen p-5 bg-gh-canvas text-gh-fg">
@@ -506,7 +443,7 @@ function AgentExecutionView() {
       </div>
     )
   }
-  
+
   if (error || !executionData) {
     return (
       <div className="min-h-screen p-5 bg-gh-canvas text-gh-fg">
@@ -519,642 +456,32 @@ function AgentExecutionView() {
       </div>
     )
   }
-  
+
   return (
     <div className="min-h-screen p-5 bg-gh-canvas text-gh-fg">
 
       <Header />
 
-      {/* Agent Execution Navigation Header */}
-      {pipelineExecutions.length > 0 && currentExecutionIndex >= 0 && (
-        <div className="mt-3 mb-3 p-3 bg-gh-canvas-subtle rounded-md border border-gh-border">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-3">
-              {/* Back to Pipeline Runs link */}
-              <Link
-                to="/pipeline-run"
-                search={{ runId: pipelineRunId }}
-                className="flex items-center gap-1.5 px-3 py-2 bg-gh-canvas border border-gh-border rounded hover:bg-gh-border-muted transition-colors text-sm"
-                title="Back to Pipeline Runs"
-              >
-                <ArrowLeft className="w-4 h-4" />
-                <span>Pipeline Runs</span>
-              </Link>
-
-              {/* Navigation buttons */}
-              <div className="flex gap-1 pl-3 border-l border-gh-border">
-                <button
-                  onClick={handlePreviousExecution}
-                  disabled={currentExecutionIndex === 0}
-                  className="p-2 bg-gh-canvas border border-gh-border rounded hover:bg-gh-border-muted transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
-                  title="Previous agent execution"
-                >
-                  <ChevronLeft className="w-4 h-4" />
-                </button>
-                <button
-                  onClick={handleNextExecution}
-                  disabled={currentExecutionIndex === pipelineExecutions.length - 1}
-                  className="p-2 bg-gh-canvas border border-gh-border rounded hover:bg-gh-border-muted transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
-                  title="Next agent execution"
-                >
-                  <ChevronRight className="w-4 h-4" />
-                </button>
-              </div>
-
-              {/* Execution counter and agent info */}
-              <div className="flex items-center gap-2 pl-2 border-l border-gh-border">
-                <span className="text-sm font-mono font-semibold">
-                  {currentExecutionIndex + 1} / {pipelineExecutions.length}
-                </span>
-                <span className="text-gh-fg-muted">·</span>
-                <span className="text-sm font-medium">
-                  {formatAgentName(executionData.agent)}
-                </span>
-                <span
-                  className={`text-xs px-2 py-0.5 rounded-full ${
-                    executionData.status === 'completed'
-                      ? 'bg-green-900/30 text-green-400'
-                      : executionData.status === 'failed'
-                      ? 'bg-red-900/30 text-red-400'
-                      : 'bg-blue-900/30 text-blue-400'
-                  }`}
-                >
-                  {executionData.status}
-                </span>
-              </div>
-
-              {/* Auto-advance checkbox */}
-              <label className="flex items-center gap-2 cursor-pointer pl-2 border-l border-gh-border">
-                <input
-                  type="checkbox"
-                  checked={autoAdvance}
-                  onChange={handleAutoAdvanceToggle}
-                  className="w-4 h-4 rounded border-gh-border bg-gh-canvas text-gh-accent-emphasis focus:ring-2 focus:ring-gh-accent-emphasis focus:ring-offset-0"
-                />
-                <span className="text-sm">Auto-advance</span>
-              </label>
-            </div>
-          </div>
-        </div>
-      )}
+      <AgentExecutionNavBar
+        pipelineRunId={pipelineRunId}
+        pipelineExecutions={pipelineExecutions}
+        currentExecutionIndex={currentExecutionIndex}
+        executionData={executionData}
+        autoAdvance={autoAdvance}
+        onPrevious={handlePreviousExecution}
+        onNext={handleNextExecution}
+        onAutoAdvanceToggle={handleAutoAdvanceToggle}
+      />
 
       <TokenUsagePanel logs={mergedLogs} promptText={agentState.inputPrompt?.text} />
 
-      {/* Agent State Section - Replicated from AgentState component */}
-      <div className="bg-gh-canvas-subtle rounded-md border border-gh-border mb-5">
-        <div className="p-4 border-b border-gh-border flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            <h2 className="text-gh-accent-primary text-base font-semibold">Agent Execution</h2>
-            <span className="text-lg font-semibold text-gh-fg">
-              {formatAgentName(executionData.agent)}
-            </span>
-            {executionData.branch_name && (
-              <span className="px-2 py-1 bg-gh-canvas border border-gh-border rounded text-xs font-mono">
-                {executionData.branch_name}
-              </span>
-            )}
-          </div>
-          <div className="flex items-center gap-2">
-            <div className={`w-2.5 h-2.5 ${status.color} rounded-full ${isExecuting ? 'animate-pulse' : ''}`}></div>
-            <span className="text-sm text-gh-fg-muted">
-              {status.label}
-            </span>
-          </div>
-        </div>
-        
-        <div className="p-4">
-          <div className="grid grid-cols-2 gap-4 mb-4">
-            <div className="space-y-2">
-              {pipelineRunId && (
-                <div className="text-sm">
-                  <span className="text-gh-fg-muted">Pipeline Run ID:</span>
-                  <Link
-                    to="/pipeline-run"
-                    search={{ runId: pipelineRunId }}
-                    className="ml-2 font-mono text-xs text-gh-accent-fg hover:underline"
-                    title="View pipeline run"
-                  >
-                    {pipelineRunId}
-                  </Link>
-                </div>
-              )}
-              <div className="text-sm">
-                <span className="text-gh-fg-muted">Execution ID:</span>
-                <span className="ml-2 font-mono text-xs">{executionId}</span>
-              </div>
-              <div className="text-sm">
-                <span className="text-gh-fg-muted">Task ID:</span>
-                <span className="ml-2 font-mono text-xs">{executionData.task_id}</span>
-              </div>
-              <div className="text-sm">
-                <span className="text-gh-fg-muted">Project:</span>
-                <span className="ml-2">{executionData.project}</span>
-              </div>
-              {/* Agent Routing Decision section (fix agent name display) */}
-              {executionData.agent && (
-                <div className="text-sm mt-2">
-                  <span className="text-gh-fg-muted">Selected agent:</span>
-                  <span className="ml-2 font-mono text-xs">{formatAgentName(executionData.agent)}</span>
-                </div>
-              )}
-              {!executionData.agent && (
-                <div className="text-sm mt-2">
-                  <span className="text-gh-fg-muted">Selected agent:</span>
-                  <span className="ml-2 font-mono text-xs">Unknown Agent</span>
-                </div>
-              )}
-            </div>
-            <div className="space-y-2">
-              <div className="text-sm">
-                <span className="text-gh-fg-muted">Started:</span>
-                <span className="ml-2">{new Date(executionData.started_at).toLocaleString()}</span>
-              </div>
-              {executionData.ended_at && (
-                <div className="text-sm">
-                  <span className="text-gh-fg-muted">Ended:</span>
-                  <span className="ml-2">{new Date(executionData.ended_at).toLocaleString()}</span>
-                </div>
-              )}
-              {executionData.duration && (
-                <div className="text-sm">
-                  <span className="text-gh-fg-muted">Duration:</span>
-                  <span className="ml-2">{Math.floor(executionData.duration / 60)}m {Math.floor(executionData.duration % 60)}s</span>
-                </div>
-              )}
-            </div>
-          </div>
-          
-          {/* When completed, use two-row layout */}
-          {executionData.status === 'completed' ? (
-            <div className="space-y-4">
-              {/* First row: Input Prompt and Latest Message side-by-side */}
-              {inputPrompt && lastTextMessage && (
-                <div className="flex gap-4">
-                  {/* Input Prompt - 50% width */}
-                  <div className="flex-1 min-w-0 bg-gh-canvas rounded-md border border-gh-border p-3">
-                    <div className="flex items-center justify-between mb-2">
-                      <div className="flex items-center gap-2">
-                        <h3 className="text-sm font-semibold text-gh-fg">Input Prompt</h3>
-                        <span className="text-xs text-gh-fg-muted">
-                          {formatTimestamp(inputPrompt.timestamp)}
-                        </span>
-                      </div>
-                      <button
-                        onClick={() => setIsPromptExpanded(!isPromptExpanded)}
-                        className="text-gh-accent-primary hover:bg-gh-border-muted rounded p-1 transition-colors"
-                        title={isPromptExpanded ? 'Collapse' : 'Expand'}
-                      >
-                        {isPromptExpanded ? (
-                          <ChevronUp className="w-4 h-4" />
-                        ) : (
-                          <ChevronDown className="w-4 h-4" />
-                        )}
-                      </button>
-                    </div>
-                    <div className="relative">
-                      <div
-                        className={`prose prose-sm prose-invert font-mono text-xs max-w-none transition-all break-words ${
-                          isPromptExpanded ? '' : 'max-h-[200px] overflow-y-auto'
-                        }`}
-                        style={{ overflowWrap: 'break-word' }}
-                      >
-                        <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                          {inputPrompt.text}
-                        </ReactMarkdown>
-                      </div>
-                      {!isPromptExpanded && inputPrompt.text.length > 500 && (
-                        <div className="absolute bottom-0 left-0 right-0 h-12 bg-gradient-to-t from-gh-canvas via-gh-canvas/80 to-transparent pointer-events-none" />
-                      )}
-                    </div>
-                  </div>
-
-                  {/* Latest Message - 50% width */}
-                  <div className="flex-1 min-w-0 bg-gh-canvas rounded-md border border-gh-border p-3">
-                    <div className="flex items-center justify-between mb-2">
-                      <div className="flex items-center gap-2">
-                        <h3 className="text-sm font-semibold text-gh-fg">Latest Message</h3>
-                        <span className="text-xs text-gh-fg-muted">
-                          {formatTimestamp(lastTextMessage.timestamp)}
-                        </span>
-                      </div>
-                      <button
-                        onClick={() => setIsMessageExpanded(!isMessageExpanded)}
-                        className="text-gh-accent-primary hover:bg-gh-border-muted rounded p-1 transition-colors"
-                        title={isMessageExpanded ? 'Collapse' : 'Expand'}
-                      >
-                        {isMessageExpanded ? (
-                          <ChevronUp className="w-4 h-4" />
-                        ) : (
-                          <ChevronDown className="w-4 h-4" />
-                        )}
-                      </button>
-                    </div>
-                    <div className="relative">
-                      <div
-                        className={`prose prose-sm prose-invert font-mono text-xs max-w-none transition-all break-words ${
-                          isMessageExpanded ? '' : 'max-h-[200px] overflow-y-auto'
-                        }`}
-                        style={{ overflowWrap: 'break-word' }}
-                      >
-                        <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                          {lastTextMessage.text}
-                        </ReactMarkdown>
-                      </div>
-                      {!isMessageExpanded && lastTextMessage.text.length > 500 && (
-                        <div className="absolute bottom-0 left-0 right-0 h-12 bg-gradient-to-t from-gh-canvas via-gh-canvas/80 to-transparent pointer-events-none" />
-                      )}
-                    </div>
-                  </div>
-                </div>
-              )}
-
-              {/* Second row: Tool calls/results (left 70%) and Current Tasks (right 30%) */}
-              <div className="flex gap-4">
-                {/* Left side - Tool calls and results */}
-                <div className="flex-[7] min-w-0 space-y-4">
-                  {lastToolCall && (
-                    <div className="bg-gh-canvas rounded-md border border-gh-border p-3">
-                      <div className="flex items-center gap-2 mb-2">
-                        <h3 className="text-sm font-semibold text-gh-fg">Latest Tool Call</h3>
-                        <span className="text-xs text-gh-fg-muted">
-                          {formatTimestamp(lastToolCall.timestamp)}
-                        </span>
-                      </div>
-                      <div className="flex items-center gap-2">
-                        <span className="px-2 py-1 bg-gh-warning rounded text-xs font-semibold text-white shrink-0">
-                          {lastToolCall.name}
-                        </span>
-                        <span className="text-sm text-gh-fg font-mono break-all whitespace-pre-wrap">
-                          {formatToolCall(lastToolCall)}
-                        </span>
-                      </div>
-                    </div>
-                  )}
-
-                  {previousToolCall && (
-                    <div className="bg-gh-canvas rounded-md border border-gh-border p-3">
-                      <div className="flex items-center gap-2 mb-2">
-                        <h3 className="text-sm font-semibold text-gh-fg">Previous Tool Call</h3>
-                        <span className="text-xs text-gh-fg-muted">
-                          {formatTimestamp(previousToolCall.timestamp)}
-                        </span>
-                      </div>
-                      <div className="flex items-center gap-2">
-                        <span className="px-2 py-1 bg-gh-warning rounded text-xs font-semibold text-white shrink-0">
-                          {previousToolCall.name}
-                        </span>
-                        <span className="text-sm text-gh-fg font-mono break-all whitespace-pre-wrap">
-                          {formatToolCall(previousToolCall)}
-                        </span>
-                      </div>
-                    </div>
-                  )}
-
-                  {previousToolResult && (
-                    <div className="bg-gh-canvas rounded-md border border-gh-border p-3">
-                      <div className="flex items-center justify-between mb-2">
-                        <div className="flex items-center gap-2">
-                          <h3 className="text-sm font-semibold text-gh-fg">Previous Tool Result</h3>
-                          <span className="text-xs text-gh-fg-muted">
-                            {formatTimestamp(previousToolResult.timestamp)}
-                          </span>
-                        </div>
-                        <button
-                          onClick={() => setIsPreviousResultExpanded(!isPreviousResultExpanded)}
-                          className="text-gh-accent-primary hover:bg-gh-border-muted rounded p-1 transition-colors"
-                          title={isPreviousResultExpanded ? 'Collapse' : 'Expand'}
-                        >
-                          {isPreviousResultExpanded ? (
-                            <ChevronUp className="w-4 h-4" />
-                          ) : (
-                            <ChevronDown className="w-4 h-4" />
-                          )}
-                        </button>
-                      </div>
-                      <div className="relative">
-                        <div
-                          className={`prose prose-sm prose-invert font-mono text-xs max-w-none transition-all break-words ${
-                            isPreviousResultExpanded ? '' : 'max-h-[200px] overflow-y-auto'
-                          }`}
-                          style={{ overflowWrap: 'break-word' }}
-                        >
-                          {typeof previousToolResult.content === 'string' ? (
-                            <pre className="whitespace-pre-wrap break-words" style={{ overflowWrap: 'break-word' }}>{previousToolResult.content}</pre>
-                          ) : (
-                            <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                              {JSON.stringify(previousToolResult.content, null, 2)}
-                            </ReactMarkdown>
-                          )}
-                        </div>
-                        {!isPreviousResultExpanded && JSON.stringify(previousToolResult.content).length > 500 && (
-                          <div className="absolute bottom-0 left-0 right-0 h-12 bg-gradient-to-t from-gh-canvas via-gh-canvas/80 to-transparent pointer-events-none" />
-                        )}
-                      </div>
-                    </div>
-                  )}
-                </div>
-
-                {/* Right side - Current Tasks */}
-                <div className="flex-[3] min-w-0">
-                  {executionData.trigger_source?.startsWith('repair_cycle') && (
-                    <RepairCycleStatus events={mergedPipelineEvents} />
-                  )}
-                  <div className="bg-gh-canvas rounded-md border border-gh-border p-3">
-                    <div className="mb-3">
-                      <div className="flex items-center justify-between mb-1">
-                        <div className="flex items-center gap-2">
-                          <h3 className="text-sm font-semibold text-gh-fg">Current Tasks</h3>
-                          {lastTodoWrite && (
-                            <span className="text-xs text-gh-fg-muted">
-                              {formatTimestamp(lastTodoWrite.timestamp)}
-                            </span>
-                          )}
-                        </div>
-                        {lastTodoWrite && lastTodoWrite.todos.length > 0 && (
-                          <span className="text-xs text-gh-success">
-                            {todoStats.completed}/{todoStats.total}
-                          </span>
-                        )}
-                      </div>
-                    </div>
-                    {lastTodoWrite && lastTodoWrite.todos.length > 0 ? (
-                      <div className="space-y-2">
-                        {lastTodoWrite.todos.map((todo, idx) => {
-                          const isCompleted = todo.status === 'completed'
-                          const isInProgress = todo.status === 'in_progress'
-
-                          return (
-                            <div
-                              key={idx}
-                              className={`flex items-start gap-2 p-2 rounded ${
-                                isInProgress ? 'bg-gh-warning-subtle border border-gh-warning' : ''
-                              }`}
-                            >
-                              {isCompleted ? (
-                                <CheckCircle2 className="w-4 h-4 mt-0.5 text-gh-success flex-shrink-0" />
-                              ) : isInProgress ? (
-                                <PlayCircle className="w-4 h-4 mt-0.5 text-gh-warning flex-shrink-0" />
-                              ) : (
-                                <Circle className="w-4 h-4 mt-0.5 text-gh-fg-muted flex-shrink-0" />
-                              )}
-                              <span
-                                className={`text-sm ${
-                                  isCompleted
-                                    ? 'line-through text-gh-fg-muted'
-                                    : isInProgress
-                                    ? 'text-gh-fg font-medium'
-                                    : 'text-gh-fg'
-                                }`}
-                              >
-                                {todo.content}
-                              </span>
-                            </div>
-                          )
-                        })}
-                      </div>
-                    ) : (
-                      <div className="text-center text-gh-fg-muted text-sm py-4">
-                        No current task list
-                      </div>
-                    )}
-                  </div>
-                </div>
-              </div>
-            </div>
-          ) : (
-            /* When not completed, use original layout */
-            <div className="flex gap-4">
-              {/* Left column - 70% width */}
-              <div className="flex-[7] min-w-0 space-y-4">
-                {inputPrompt && (
-                  <div className="bg-gh-canvas rounded-md border border-gh-border p-3">
-                    <div className="flex items-center justify-between mb-2">
-                      <div className="flex items-center gap-2">
-                        <h3 className="text-sm font-semibold text-gh-fg">Input Prompt</h3>
-                        <span className="text-xs text-gh-fg-muted">
-                          {formatTimestamp(inputPrompt.timestamp)}
-                        </span>
-                      </div>
-                      <button
-                        onClick={() => setIsPromptExpanded(!isPromptExpanded)}
-                        className="text-gh-accent-primary hover:bg-gh-border-muted rounded p-1 transition-colors"
-                        title={isPromptExpanded ? 'Collapse' : 'Expand'}
-                      >
-                        {isPromptExpanded ? (
-                          <ChevronUp className="w-4 h-4" />
-                        ) : (
-                          <ChevronDown className="w-4 h-4" />
-                        )}
-                      </button>
-                    </div>
-                    <div className="relative">
-                      <div
-                        className={`prose prose-sm prose-invert font-mono text-xs max-w-none transition-all break-words ${
-                          isPromptExpanded ? '' : 'max-h-[200px] overflow-y-auto'
-                        }`}
-                        style={{ overflowWrap: 'break-word' }}
-                      >
-                        <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                          {inputPrompt.text}
-                        </ReactMarkdown>
-                      </div>
-                      {!isPromptExpanded && inputPrompt.text.length > 500 && (
-                        <div className="absolute bottom-0 left-0 right-0 h-12 bg-gradient-to-t from-gh-canvas via-gh-canvas/80 to-transparent pointer-events-none" />
-                      )}
-                    </div>
-                  </div>
-                )}
-
-                {lastTextMessage && (
-                  <div className="bg-gh-canvas rounded-md border border-gh-border p-3">
-                    <div className="flex items-center justify-between mb-2">
-                      <div className="flex items-center gap-2">
-                        <h3 className="text-sm font-semibold text-gh-fg">Latest Message</h3>
-                        <span className="text-xs text-gh-fg-muted">
-                          {formatTimestamp(lastTextMessage.timestamp)}
-                        </span>
-                      </div>
-                      <button
-                        onClick={() => setIsMessageExpanded(!isMessageExpanded)}
-                        className="text-gh-accent-primary hover:bg-gh-border-muted rounded p-1 transition-colors"
-                        title={isMessageExpanded ? 'Collapse' : 'Expand'}
-                      >
-                        {isMessageExpanded ? (
-                          <ChevronUp className="w-4 h-4" />
-                        ) : (
-                          <ChevronDown className="w-4 h-4" />
-                        )}
-                      </button>
-                    </div>
-                    <div className="relative">
-                      <div
-                        className={`prose prose-sm prose-invert font-mono text-xs max-w-none transition-all break-words ${
-                          isMessageExpanded ? '' : 'max-h-[200px] overflow-y-auto'
-                        }`}
-                        style={{ overflowWrap: 'break-word' }}
-                      >
-                        <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                          {lastTextMessage.text}
-                        </ReactMarkdown>
-                      </div>
-                      {!isMessageExpanded && lastTextMessage.text.length > 500 && (
-                        <div className="absolute bottom-0 left-0 right-0 h-12 bg-gradient-to-t from-gh-canvas via-gh-canvas/80 to-transparent pointer-events-none" />
-                      )}
-                    </div>
-                  </div>
-                )}
-
-                {lastToolCall && (
-                  <div className="bg-gh-canvas rounded-md border border-gh-border p-3">
-                    <div className="flex items-center gap-2 mb-2">
-                      <h3 className="text-sm font-semibold text-gh-fg">Latest Tool Call</h3>
-                      <span className="text-xs text-gh-fg-muted">
-                        {formatTimestamp(lastToolCall.timestamp)}
-                      </span>
-                    </div>
-                    <div className="flex items-center gap-2">
-                      <span className="px-2 py-1 bg-gh-warning rounded text-xs font-semibold text-white shrink-0">
-                        {lastToolCall.name}
-                      </span>
-                      <span className="text-sm text-gh-fg font-mono break-all whitespace-pre-wrap">
-                        {formatToolCall(lastToolCall)}
-                      </span>
-                    </div>
-                  </div>
-                )}
-
-                {previousToolCall && (
-                  <div className="bg-gh-canvas rounded-md border border-gh-border p-3">
-                    <div className="flex items-center gap-2 mb-2">
-                      <h3 className="text-sm font-semibold text-gh-fg">Previous Tool Call</h3>
-                      <span className="text-xs text-gh-fg-muted">
-                        {formatTimestamp(previousToolCall.timestamp)}
-                      </span>
-                    </div>
-                    <div className="flex items-center gap-2">
-                      <span className="px-2 py-1 bg-gh-warning rounded text-xs font-semibold text-white shrink-0">
-                        {previousToolCall.name}
-                      </span>
-                      <span className="text-sm text-gh-fg font-mono break-all whitespace-pre-wrap">
-                        {formatToolCall(previousToolCall)}
-                      </span>
-                    </div>
-                  </div>
-                )}
-
-                {previousToolResult && (
-                  <div className="bg-gh-canvas rounded-md border border-gh-border p-3">
-                    <div className="flex items-center justify-between mb-2">
-                      <div className="flex items-center gap-2">
-                        <h3 className="text-sm font-semibold text-gh-fg">Previous Tool Result</h3>
-                        <span className="text-xs text-gh-fg-muted">
-                          {formatTimestamp(previousToolResult.timestamp)}
-                        </span>
-                      </div>
-                      <button
-                        onClick={() => setIsPreviousResultExpanded(!isPreviousResultExpanded)}
-                        className="text-gh-accent-primary hover:bg-gh-border-muted rounded p-1 transition-colors"
-                        title={isPreviousResultExpanded ? 'Collapse' : 'Expand'}
-                      >
-                        {isPreviousResultExpanded ? (
-                          <ChevronUp className="w-4 h-4" />
-                        ) : (
-                          <ChevronDown className="w-4 h-4" />
-                        )}
-                      </button>
-                    </div>
-                    <div className="relative">
-                      <div
-                        className={`prose prose-sm prose-invert font-mono text-xs max-w-none transition-all break-words ${
-                          isPreviousResultExpanded ? '' : 'max-h-[200px] overflow-y-auto'
-                        }`}
-                        style={{ overflowWrap: 'break-word' }}
-                      >
-                        {typeof previousToolResult.content === 'string' ? (
-                          <pre className="whitespace-pre-wrap break-words" style={{ overflowWrap: 'break-word' }}>{previousToolResult.content}</pre>
-                        ) : (
-                          <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                            {JSON.stringify(previousToolResult.content, null, 2)}
-                          </ReactMarkdown>
-                        )}
-                      </div>
-                      {!isPreviousResultExpanded && JSON.stringify(previousToolResult.content).length > 500 && (
-                        <div className="absolute bottom-0 left-0 right-0 h-12 bg-gradient-to-t from-gh-canvas via-gh-canvas/80 to-transparent pointer-events-none" />
-                      )}
-                    </div>
-                  </div>
-                )}
-              </div>
-
-              {/* Right column - 30% width */}
-              <div className="flex-[3] min-w-0">
-                {executionData.trigger_source?.startsWith('repair_cycle') && (
-                  <RepairCycleStatus events={mergedPipelineEvents} />
-                )}
-                <div className="bg-gh-canvas rounded-md border border-gh-border p-3">
-                  <div className="mb-3">
-                    <div className="flex items-center justify-between mb-1">
-                      <div className="flex items-center gap-2">
-                        <h3 className="text-sm font-semibold text-gh-fg">Current Tasks</h3>
-                        {lastTodoWrite && (
-                          <span className="text-xs text-gh-fg-muted">
-                            {formatTimestamp(lastTodoWrite.timestamp)}
-                          </span>
-                        )}
-                      </div>
-                      {lastTodoWrite && lastTodoWrite.todos.length > 0 && (
-                        <span className="text-xs text-gh-success">
-                          {todoStats.completed}/{todoStats.total}
-                        </span>
-                      )}
-                    </div>
-                  </div>
-                  {lastTodoWrite && lastTodoWrite.todos.length > 0 ? (
-                    <div className="space-y-2">
-                      {lastTodoWrite.todos.map((todo, idx) => {
-                        const isCompleted = todo.status === 'completed'
-                        const isInProgress = todo.status === 'in_progress'
-
-                        return (
-                          <div
-                            key={idx}
-                            className={`flex items-start gap-2 p-2 rounded ${
-                              isInProgress ? 'bg-gh-warning-subtle border border-gh-warning' : ''
-                            }`}
-                          >
-                            {isCompleted ? (
-                              <CheckCircle2 className="w-4 h-4 mt-0.5 text-gh-success flex-shrink-0" />
-                            ) : isInProgress ? (
-                              <PlayCircle className="w-4 h-4 mt-0.5 text-gh-warning flex-shrink-0" />
-                            ) : (
-                              <Circle className="w-4 h-4 mt-0.5 text-gh-fg-muted flex-shrink-0" />
-                            )}
-                            <span
-                              className={`text-sm ${
-                                isCompleted
-                                  ? 'line-through text-gh-fg-muted'
-                                  : isInProgress
-                                  ? 'text-gh-fg font-medium'
-                                  : 'text-gh-fg'
-                              }`}
-                            >
-                              {todo.content}
-                            </span>
-                          </div>
-                        )
-                      })}
-                    </div>
-                  ) : (
-                    <div className="text-center text-gh-fg-muted text-sm py-4">
-                      No current task list
-                    </div>
-                  )}
-                </div>
-              </div>
-            </div>
-          )}
-        </div>
-      </div>
+      <AgentExecutionState
+        executionId={executionId}
+        executionData={executionData}
+        pipelineRunId={pipelineRunId}
+        agentState={agentState}
+        mergedPipelineEvents={mergedPipelineEvents}
+      />
 
       {/* Live Logs Section */}
       <LiveLogs
