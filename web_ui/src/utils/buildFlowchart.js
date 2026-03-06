@@ -1,6 +1,6 @@
 import { MarkerType } from '@xyflow/react'
 import { processEvents } from './eventProcessing/index.js'
-import { getNodeType } from '../components/nodes/EVENT_TYPE_MAP.js'
+import { getNodeType, HIDDEN_BY_DEFAULT_TYPES } from '../components/nodes/EVENT_TYPE_MAP.js'
 
 /**
  * Builds React Flow nodes and edges from pipeline run events.
@@ -98,9 +98,10 @@ export function buildFlowchart({
       metadataParts.push(reason.length > maxLen ? reason.substring(0, maxLen) + '…' : reason)
     }
 
+    const nodeType = getNodeType(event.event_type)
     const node = {
       id,
-      type: getNodeType(event.event_type),
+      type: nodeType,
       position: { x: 0, y: 0 },
       data: {
         label: event.event_type
@@ -110,6 +111,7 @@ export function buildFlowchart({
         metadata: metadataParts.join(' • '),
         decision_category: event.decision_category,
         timestamp: event.timestamp,
+        ...(HIDDEN_BY_DEFAULT_TYPES.has(nodeType) && { defaultHidden: true }),
       },
       draggable: false,
     }

@@ -190,11 +190,12 @@ export default function PipelineFlowGraph({
       }
       setStructuralVersion(v => v + 1)
     } else {
-      // Same node IDs — update data in-place so positions are preserved.
-      const newDataById = new Map(rawBuild.nodes.map(n => [n.id, n.data]))
+      // Same node IDs — update data and hidden in-place so positions are preserved.
+      const newNodeById = new Map(rawBuild.nodes.map(n => [n.id, n]))
       setNodes(prev => prev.map(node => {
-        const newData = newDataById.get(node.id)
-        return newData ? { ...node, data: newData } : node
+        const newNode = newNodeById.get(node.id)
+        if (!newNode) return node
+        return { ...node, data: newNode.data, hidden: newNode.hidden ?? false }
       }))
       // Signal LayoutController to re-run layout after React Flow re-measures the updated
       // nodes — picks up any dimension changes caused by the data update.

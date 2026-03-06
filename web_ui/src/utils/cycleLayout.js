@@ -174,15 +174,21 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
   const cycleContainerIds = new Set(cycleContainers.map(n => n.id))
   const subCycleContainerIds = new Set(subCycleContainers.map(n => n.id))
 
-  // Leaf event children of iterationContainers (residual events not inside sub-cycles)
-  const grandchildren = nodes.filter(n => n.parentId && !CONTAINER_TYPES.has(n.type) &&
+  // All leaf event children (used in the final output collection)
+  const allGrandchildren = nodes.filter(n => n.parentId && !CONTAINER_TYPES.has(n.type) &&
     iterContainerIds.has(n.parentId))
-  // Leaf event children of cycle containers (e.g. reviewCycleStarted / reviewCycleCompleted)
-  const directCycleChildren = nodes.filter(n => n.parentId && !CONTAINER_TYPES.has(n.type) &&
+  const allDirectCycleChildren = nodes.filter(n => n.parentId && !CONTAINER_TYPES.has(n.type) &&
     cycleContainerIds.has(n.parentId))
-  // Leaf event children of subCycleContainers
-  const subCycleLeaves = nodes.filter(n => n.parentId && !CONTAINER_TYPES.has(n.type) &&
+  const allSubCycleLeaves = nodes.filter(n => n.parentId && !CONTAINER_TYPES.has(n.type) &&
     subCycleContainerIds.has(n.parentId))
+
+  // Visible-only subsets — hidden nodes are excluded from sizing and positioning
+  // so containers are correctly sized around what is actually rendered.
+  // Hidden nodes are still passed through in the collect phase at their default
+  // position {x:0, y:0} so React Flow can handle edge routing.
+  const grandchildren = allGrandchildren.filter(n => !n.hidden)
+  const directCycleChildren = allDirectCycleChildren.filter(n => !n.hidden)
+  const subCycleLeaves = allSubCycleLeaves.filter(n => !n.hidden)
 
   // Build lookup maps
   const itersByParent = new Map()   // cycleId → [iterationContainer]
@@ -582,9 +588,9 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
   // Order: root → cycleContainers → iterContainers → direct children → subCycleContainers → subCycleLeaves
   const parentNodes = nodes.filter(n => !n.parentId).map(n => positionedNodes.get(n.id) ?? n)
   const iterContainerNodes = iterContainers.map(n => positionedNodes.get(n.id) ?? n)
-  const directChildrenNodes = [...directCycleChildren, ...grandchildren].map(n => positionedNodes.get(n.id) ?? n)
+  const directChildrenNodes = [...allDirectCycleChildren, ...allGrandchildren].map(n => positionedNodes.get(n.id) ?? n)
   const subCycleContainerNodes = subCycleContainers.map(n => positionedNodes.get(n.id) ?? n)
-  const subCycleLeafNodes = subCycleLeaves.map(n => positionedNodes.get(n.id) ?? n)
+  const subCycleLeafNodes = allSubCycleLeaves.map(n => positionedNodes.get(n.id) ?? n)
 
   const cycleNodes = nodes.filter(
     n => n.type === 'reviewCycleContainer' ||

@@ -1,6 +1,6 @@
 import { Upload, RotateCcw, Download } from 'lucide-react'
 import PipelineFlowGraph, { DEFAULT_LAYOUT_OPTIONS } from './components/PipelineFlowGraph'
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useMemo } from 'react'
 import { toggleCycleCollapsed } from './utils/cycleLayout'
 import { buildFlowchart } from './utils/buildFlowchart'
 
@@ -24,6 +24,7 @@ export default function StandaloneSandbox() {
   const [rawBuild, setRawBuild] = useState(null)
   const [nodesDraggable, setNodesDraggable] = useState(false)
   const [processedModel, setProcessedModel] = useState(null)
+  const [showAllNodes, setShowAllNodes] = useState(false)
 
   const handleToggleCycle = useCallback((cycleId) => {
     setCycles(prev => toggleCycleCollapsed(prev, cycleId))
@@ -118,6 +119,17 @@ export default function StandaloneSandbox() {
     URL.revokeObjectURL(url)
   }, [processedModel, debugData])
 
+  // Apply per-node visibility: hide defaultHidden nodes unless showAllNodes is on
+  const visibleRawBuild = useMemo(() => {
+    if (!rawBuild || showAllNodes) return rawBuild
+    return {
+      ...rawBuild,
+      nodes: rawBuild.nodes.map(node =>
+        node.data?.defaultHidden ? { ...node, hidden: true } : node
+      ),
+    }
+  }, [rawBuild, showAllNodes])
+
   const handleParamChange = useCallback((key, value) => {
     const parsed = parseInt(value, 10)
     setLayoutParams(prev => ({ ...prev, [key]: isNaN(parsed) ? 0 : parsed }))
@@ -175,15 +187,26 @@ export default function StandaloneSandbox() {
           {/* Interaction Controls */}
           <div>
             <h3 className="text-sm font-semibold mb-3">Interaction</h3>
-            <label className="flex items-center gap-2 text-sm cursor-pointer select-none">
-              <input
-                type="checkbox"
-                checked={nodesDraggable}
-                onChange={(e) => setNodesDraggable(e.target.checked)}
-                className="w-4 h-4 accent-gh-accent-primary"
-              />
-              Draggable &amp; resizable nodes
-            </label>
+            <div className="space-y-2">
+              <label className="flex items-center gap-2 text-sm cursor-pointer select-none">
+                <input
+                  type="checkbox"
+                  checked={nodesDraggable}
+                  onChange={(e) => setNodesDraggable(e.target.checked)}
+                  className="w-4 h-4 accent-gh-accent-primary"
+                />
+                Draggable &amp; resizable nodes
+              </label>
+              <label className="flex items-center gap-2 text-sm cursor-pointer select-none">
+                <input
+                  type="checkbox"
+                  checked={showAllNodes}
+                  onChange={(e) => setShowAllNodes(e.target.checked)}
+                  className="w-4 h-4 accent-gh-accent-primary"
+                />
+                Show all nodes
+              </label>
+            </div>
           </div>
 
           {/* Layout Parameters */}
@@ -239,7 +262,7 @@ export default function StandaloneSandbox() {
             </div>
           ) : (
             <PipelineFlowGraph
-              rawBuild={rawBuild}
+              rawBuild={visibleRawBuild}
               onToggleCycle={handleToggleCycle}
               layoutOptions={layoutParams}
               nodesDraggable={nodesDraggable}

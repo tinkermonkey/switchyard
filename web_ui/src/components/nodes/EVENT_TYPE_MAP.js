@@ -263,3 +263,52 @@ export const EVENT_TYPE_MAP = {
 export function getNodeType(eventType) {
   return EVENT_TYPE_MAP[eventType] ?? 'pipelineEvent'
 }
+
+/**
+ * Node types that are hidden by default (cycle boundary events).
+ * These nodes exist in the graph for edge routing but are not rendered unless
+ * the user explicitly enables full visibility (e.g. "Show all nodes" toggle).
+ */
+export const HIDDEN_BY_DEFAULT_TYPES = new Set([
+  // Review cycle boundaries
+  'reviewCycleStarted',
+  'reviewCycleCompleted',
+
+  // Repair cycle boundaries
+  'repairCycleCompleted',
+  'repairCycleFailed',
+
+  // Repair cycle — test sub-family boundaries
+  'repairCycleTestCycleStarted',
+  'repairCycleTestCycleCompleted',
+
+  // Repair cycle — fix sub-family boundaries
+  'repairCycleFixCycleStarted',
+  'repairCycleFixCycleCompleted',
+
+  // Repair cycle — warning review boundaries
+  'repairCycleWarningReviewStarted',
+  'repairCycleWarningReviewCompleted',
+  'repairCycleWarningReviewFailed',
+
+  // Repair cycle — systemic boundaries
+  'repairCycleSystemicAnalysisStarted',
+  'repairCycleSystemicAnalysisCompleted',
+  'repairCycleSystemicFixStarted',
+  'repairCycleSystemicFixCompleted',
+
+  // Repair cycle — container lifecycle boundaries
+  'repairCycleContainerStarted',
+  'repairCycleContainerCompleted',
+  'repairCycleContainerKilled',
+
+  // PR review boundaries
+  'prReviewStageStarted',
+  'prReviewStageCompleted',
+  'prReviewPhaseStarted',
+  'prReviewPhaseCompleted',
+  'prReviewPhaseFailed',
+
+  // Conversational loop boundaries
+  'conversationalLoopStarted',
+])
