@@ -55,9 +55,12 @@ export function buildFlowchart({
     return { nodes: [], edges: [], agentExecutions: new Map(), updatedCycles: new Map() }
   }
 
+  const _bfT0 = performance.now()
+
   // ── 1. Process events into structured model ──────────────────────────────
   const model = processEvents(events, workflowConfig)
   const { prelude, cycles, postlude, agentExecutions } = model
+  const _bfT1 = performance.now()
 
   // Merge collapse state from existing cycles (preserve user's open/closed choices)
   const updatedCycles = new Map()
@@ -525,6 +528,14 @@ export function buildFlowchart({
 
   // ── 8. Ensure correct React Flow node ordering (parents before children) ──
   // newNodes is already built parents-first (containers added before their children above).
+
+  const _bfTEnd = performance.now()
+  console.log(
+    `[PerfGraph] buildFlowchart: ${(_bfTEnd - _bfT0).toFixed(1)}ms` +
+    ` | nodes:${newNodes.length} edges:${newEdges.length} leafChain:${leafChain.length}` +
+    ` | processEvents:${(_bfT1 - _bfT0).toFixed(1)}ms` +
+    ` | nodeBuild:${(_bfTEnd - _bfT1).toFixed(1)}ms`
+  )
 
   return { nodes: newNodes, edges: newEdges, agentExecutions, updatedCycles, model }
 }

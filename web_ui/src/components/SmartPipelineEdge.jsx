@@ -175,10 +175,17 @@ function drawSmartEdge(source, target, path) {
   return d
 }
 
+let _edgeRenderCount = 0
+let _edgeTotalMs = 0
+let _edgeLogTimer = null
+
 export default function SmartPipelineEdge(props) {
   const { sourcePosition, targetPosition, sourceX, sourceY, targetX, targetY, source, target } = props
   const allNodes = useNodes()
+
+  const _t0 = performance.now()
   const obstacleNodes = buildObstacleNodes(allNodes, source, target)
+  const _t1 = performance.now()
 
   const result = getSmartEdge({
     sourcePosition,
@@ -195,6 +202,25 @@ export default function SmartPipelineEdge(props) {
       generatePath: pathfindingJumpPointNoDiagonal,
     },
   })
+
+  const _t2 = performance.now()
+  _edgeRenderCount++
+  _edgeTotalMs += (_t2 - _t0)
+
+  // Batch-log edge render stats once per animation frame to avoid console flood
+  if (!_edgeLogTimer) {
+    _edgeLogTimer = setTimeout(() => {
+      console.log(
+        `[PerfGraph] SmartPipelineEdge batch: ${_edgeRenderCount} edges rendered` +
+        ` | total:${_edgeTotalMs.toFixed(1)}ms avg:${(_edgeTotalMs / _edgeRenderCount).toFixed(1)}ms/edge` +
+        ` | obstacles per edge: ${allNodes.length}` +
+        ` | last edge obstacleNodes:${(_t1 - _t0).toFixed(1)}ms pathfind:${(_t2 - _t1).toFixed(1)}ms`
+      )
+      _edgeRenderCount = 0
+      _edgeTotalMs = 0
+      _edgeLogTimer = null
+    }, 0)
+  }
 
   if (result === null) {
     return <SmoothStepEdge {...props} />

@@ -612,6 +612,8 @@ export function processEvents(events, workflowConfig = null) {
     }
   }
 
+  const _t0 = performance.now()
+
   // Pre-cache timestamp ms values to avoid repeated Date parsing across filter/sort loops
   const tsMs = new Map()
   const getMs = (ts) => {
@@ -623,15 +625,18 @@ export function processEvents(events, workflowConfig = null) {
   const sorted = inferMissingCloseEvents(
     [...events].sort((a, b) => getMs(a.timestamp) - getMs(b.timestamp))
   )
+  const _t1 = performance.now()
 
   // Build agent execution map (needed for iteration grouping)
   const agentExecutions = buildAgentExecutionMap(sorted)
+  const _t2 = performance.now()
 
   // Detect cycle boundaries
   const reviewCycleBoundaries = findReviewCycles(sorted)
   const repairCycleBoundaries = findRepairCycles(sorted)
   const prReviewCycleBoundaries = findPRReviewCycles(sorted)
   const conversationalLoopBoundaries = findConversationalLoops(sorted)
+  const _t3 = performance.now()
 
   // Compute the earliest/latest cycle timestamps for prelude/postlude splitting
   let firstCycleStartMs = Infinity
@@ -787,6 +792,16 @@ export function processEvents(events, workflowConfig = null) {
   // Sort all cycles chronologically (review and repair cycles may interleave)
   cycles.sort((a, b) =>
     new Date(a.startEvent.timestamp).getTime() - new Date(b.startEvent.timestamp).getTime()
+  )
+
+  const _tEnd = performance.now()
+  console.log(
+    `[PerfGraph] processEvents: ${(_tEnd - _t0).toFixed(1)}ms` +
+    ` | in:${events.length} sorted:${sorted.length} cycles:${cycles.length}` +
+    ` | sort+infer:${(_t1 - _t0).toFixed(1)}ms` +
+    ` | agentMap:${(_t2 - _t1).toFixed(1)}ms` +
+    ` | boundaries:${(_t3 - _t2).toFixed(1)}ms` +
+    ` | cycleBuild:${(_tEnd - _t3).toFixed(1)}ms`
   )
 
   return {

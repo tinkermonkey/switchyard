@@ -136,6 +136,7 @@ export default function LayoutController({
   // skipFitView: when true, skips the viewport pan/zoom after layout so the user's
   // current viewport is preserved (used for data-only re-layouts).
   const runLayout = useCallback((skipFitView = false) => {
+    const _rlT0 = performance.now()
     const rb = rawBuildRef.current
     if (!rb || rb.nodes.length === 0) return
     const rawMeasuredNodes = getNodes()
@@ -171,17 +172,34 @@ export default function LayoutController({
         })
       : rawMeasuredNodes
 
+    const _rlT1 = performance.now()
     const { nodes: layoutedNodes } = applyCycleLayout(
       measuredNodes, rb.edges, rb.updatedCycles, layoutOptionsRef.current
     )
+    const _rlT2 = performance.now()
     const finalNodes = finalizeNodesRef.current(layoutedNodes)
+    const _rlT3 = performance.now()
     const finalEdges = updateEdgesForCycles(rb.edges, rb.updatedCycles, rb.agentExecutions)
+    const _rlT4 = performance.now()
 
     setNodes(finalNodes)
     setEdges(finalEdges)
+    const _rlT5 = performance.now()
+
     layoutDone.current = true
     lastFinalNodesRef.current = finalNodes
     onLayoutDoneRef.current?.(finalNodes)
+
+    console.log(
+      `[PerfGraph] runLayout: ${(_rlT5 - _rlT0).toFixed(1)}ms` +
+      ` | nodes:${finalNodes.length} edges:${finalEdges.length}` +
+      ` | guards:${(_rlT1 - _rlT0).toFixed(1)}ms` +
+      ` | applyCycleLayout:${(_rlT2 - _rlT1).toFixed(1)}ms` +
+      ` | finalizeNodes:${(_rlT3 - _rlT2).toFixed(1)}ms` +
+      ` | updateEdges:${(_rlT4 - _rlT3).toFixed(1)}ms` +
+      ` | setNodes+setEdges:${(_rlT5 - _rlT4).toFixed(1)}ms`
+    )
+
     if (!skipFitView) {
       const duration = isFirstLayout.current ? 0 : 300
       isFirstLayout.current = false

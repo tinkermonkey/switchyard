@@ -156,6 +156,7 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
   } = options
 
   const centerXPosition = centerX !== null ? centerX : viewportWidth / 2
+  const _clT0 = performance.now()
 
   // Categorise nodes by type and parent relationship
   const cycleContainers = nodes.filter(
@@ -229,6 +230,8 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
     iterContainers.filter(ic => repairCycleIds.has(ic.parentId)).map(ic => ic.id)
   )
 
+  const _clT1 = performance.now() // categorise + lookup maps done
+
   // ── Pass 0: Size subCycleContainers (bottom-up) ───────────────────────────
   const subCycleSizes = new Map()
   subCycleContainers.forEach(sc => {
@@ -240,6 +243,8 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
     const width = maxLeafW + iterPadding * 2
     subCycleSizes.set(sc.id, { width, height })
   })
+
+  const _clT2 = performance.now() // pass 0 done
 
   // ── Pass 1: Size iteration / test-cycle containers (bottom-up) ───────────
   // Uses node.measured dimensions when available (two-phase layout), falls back to params.
@@ -281,6 +286,8 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
     const width = maxW + iterPadding * 2
     iterSizes.set(iter.id, { width, height })
   })
+
+  const _clT3 = performance.now() // pass 1 done
 
   // ── Pass 2: Size cycle containers ────────────────────────────────────────
   const cycleSizes = new Map()
@@ -344,6 +351,8 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
     }
   })
 
+  const _clT4 = performance.now() // pass 2 done
+
   // ── Pass 3: Position root-level items vertically ─────────────────────────
   // Root items = all nodes without parentId, in the order they appear in the array
   // (buildFlowchart.js inserts them in chronological order)
@@ -378,6 +387,8 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
       currentY += h + nodeGap
     }
   })
+
+  const _clT5 = performance.now() // pass 3 done
 
   // ── Pass 4: Position cycle container children ─────────────────────────────
   cycleContainers.forEach(cc => {
@@ -467,6 +478,8 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
     }
   })
 
+  const _clT6 = performance.now() // pass 4 done
+
   // ── Pass 5: Position children of iteration containers (chronological order, mixed types) ─
   // Handles both direct pipelineEvent children (residuals) and subCycleContainers.
   iterContainers.forEach(iter => {
@@ -537,6 +550,8 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
     })
   })
 
+  const _clT7 = performance.now() // pass 5 done
+
   // ── Pass 6: Position pipelineEvent leaves within subCycleContainers ───────
   subCycleContainers.forEach(sc => {
     const leaves = leavesBySubCycle.get(sc.id) || []
@@ -552,6 +567,8 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
     })
   })
 
+  const _clT8 = performance.now() // pass 6 done
+
   // ── Collect and order final nodes (parents before children) ──────────────
   // Order: root → cycleContainers → iterContainers → direct children → subCycleContainers → subCycleLeaves
   const parentNodes = nodes.filter(n => !n.parentId).map(n => positionedNodes.get(n.id) ?? n)
@@ -566,6 +583,22 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
          n.type === 'prReviewCycleContainer' ||
          n.type === 'conversationalLoopContainer'
   ).map(n => positionedNodes.get(n.id) ?? n)
+
+  const _clTEnd = performance.now()
+  const _fmt = (a, b) => `${(b - a).toFixed(1)}ms`
+  console.log(
+    `[PerfGraph] applyCycleLayout: ${_fmt(_clT0, _clTEnd)}` +
+    ` | nodes:${nodes.length} (cycle:${cycleContainers.length} iter:${iterContainers.length} sc:${subCycleContainers.length} leaf:${grandchildren.length + subCycleLeaves.length + directCycleChildren.length})` +
+    ` | categorise:${_fmt(_clT0, _clT1)}` +
+    ` | P0(scSize):${_fmt(_clT1, _clT2)}` +
+    ` | P1(iterSize):${_fmt(_clT2, _clT3)}` +
+    ` | P2(cycleSize):${_fmt(_clT3, _clT4)}` +
+    ` | P3(rootPos):${_fmt(_clT4, _clT5)}` +
+    ` | P4(cycleChildren):${_fmt(_clT5, _clT6)}` +
+    ` | P5(iterChildren):${_fmt(_clT6, _clT7)}` +
+    ` | P6(scLeaves):${_fmt(_clT7, _clT8)}` +
+    ` | collect:${_fmt(_clT8, _clTEnd)}`
+  )
 
   return {
     nodes: [...parentNodes, ...iterContainerNodes, ...directChildrenNodes, ...subCycleContainerNodes, ...subCycleLeafNodes],

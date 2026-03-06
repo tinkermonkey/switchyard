@@ -462,7 +462,10 @@ function PipelineRunView() {
   useEffect(() => {
     if (!graphEvents.length) return
 
+    console.log(`[PerfGraph] cycles-effect START (${graphEvents.length} graphEvents)`)
+    const _ceT0 = performance.now()
     const model = processEvents(graphEvents)
+    console.log(`[PerfGraph] cycles-effect processEvents: ${(performance.now() - _ceT0).toFixed(1)}ms → ${model.cycles.length} cycles`)
     const newCycleMap = new Map()
     model.cycles.forEach(cycle => {
       newCycleMap.set(cycle.id, { isCollapsed: false })
@@ -488,13 +491,19 @@ function PipelineRunView() {
     if (elapsed >= 500) {
       // Leading edge — apply immediately
       throttle.lastRun = now
-      setRawBuild(buildRawFlowchart() ?? null)
+      const _t0 = performance.now()
+      const result = buildRawFlowchart() ?? null
+      console.log(`[PerfGraph] buildRawFlowchart (leading): ${(performance.now() - _t0).toFixed(1)}ms → nodes:${result?.nodes?.length ?? 0} edges:${result?.edges?.length ?? 0}`)
+      setRawBuild(result)
     } else if (!throttle.timer) {
       // Within window — schedule trailing update
       throttle.timer = setTimeout(() => {
         throttle.timer = null
         throttle.lastRun = Date.now()
-        setRawBuild(throttle.pendingFn?.() ?? null)
+        const _t0 = performance.now()
+        const result = throttle.pendingFn?.() ?? null
+        console.log(`[PerfGraph] buildRawFlowchart (trailing): ${(performance.now() - _t0).toFixed(1)}ms → nodes:${result?.nodes?.length ?? 0} edges:${result?.edges?.length ?? 0}`)
+        setRawBuild(result)
       }, 500 - elapsed)
     }
     // else: timer already scheduled; pendingFn updated above
