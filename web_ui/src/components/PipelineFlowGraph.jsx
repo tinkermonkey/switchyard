@@ -120,6 +120,10 @@ export default function PipelineFlowGraph({
   // Increments on data-only changes (same node IDs, status/label updates); LayoutController
   // uses this to re-run layout with fresh measurements without resetting the viewport.
   const [dataVersion, setDataVersion] = useState(0)
+  // Increments each time React Flow fires dimension events for rendered nodes.
+  // LayoutController's Phase 2 depends on this so it can retry layout after nodes
+  // are re-measured following a structural update (e.g. run switch with shared IDs).
+  const [measurementVersion, setMeasurementVersion] = useState(0)
   // Tracks the node IDs from the last layout pass to distinguish structural
   // changes (new/removed nodes) from data-only updates (status/label changes).
   const prevNodeIdsRef = useRef(new Set())
@@ -176,6 +180,14 @@ export default function PipelineFlowGraph({
         // Keep graph visible — carry existing positions and styles forward so container nodes
         // don't lose their computed dimensions (style.width/height) while LayoutController
         // re-runs. Without this, SmartPipelineEdge falls back to 200px obstacle widths.
+        //
+        // Clear the size cache so runLayout() won't use stale measurements from the
+        // previous layout pass. ReactFlow may keep nodesInitialized=true across the
+        // setNodes call (same IDs are already "initialized"), meaning Phase 2 fires
+        // before re-measurement. Without clearing, runLayout() would proceed with the
+        // old run's cached sizes. By clearing here, runLayout() bails on missing cache
+        // entries and retries once measurementVersion increments (dimension events fire).
+        nodeSizeCacheRef.current = new Map()
         setNodes(prev => {
           const existingPositions = new Map(prev.map(n => [n.id, n.position]))
           const existingStyles = new Map(prev.map(n => [n.id, n.style]))
@@ -237,14 +249,20 @@ export default function PipelineFlowGraph({
   // This runs before the layout so applyCycleLayout always has accurate measurements,
   // even if node.measured hasn't been (re-)populated yet after a setNodes call.
   const handleNodesChange = useCallback((changes) => {
+    let gotDimensions = false
     changes.forEach(change => {
       if (change.type === 'dimensions' && change.dimensions) {
         nodeSizeCacheRef.current.set(change.id, {
           width: change.dimensions.width,
           height: change.dimensions.height,
         })
+        gotDimensions = true
       }
     })
+    // Signal LayoutController that fresh measurements are available. When a structural
+    // change clears the cache, Phase 2 bails (missing entries) and waits for this
+    // counter to change before retrying layout with the new node dimensions.
+    if (gotDimensions) setMeasurementVersion(v => v + 1)
     onNodesChange(changes)
   }, [onNodesChange])
 
@@ -289,6 +307,7 @@ export default function PipelineFlowGraph({
               rawBuild={rawBuild}
               structuralVersion={structuralVersion}
               dataVersion={dataVersion}
+              measurementVersion={measurementVersion}
               layoutOptions={mergedLayoutOptions}
               finalizeNodes={finalizeNodes}
               setNodes={setNodes}

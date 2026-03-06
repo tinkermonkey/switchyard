@@ -32,6 +32,7 @@ export default function LayoutController({
   rawBuild,
   structuralVersion,
   dataVersion,
+  measurementVersion,
   layoutOptions,
   finalizeNodes,
   setNodes,
@@ -148,10 +149,21 @@ export default function LayoutController({
       return
     }
 
+    // Guard: bail if any node lacks a measurement. This catches the case where a
+    // structural change (e.g. run switch with shared node IDs) fires Phase 2 before
+    // ReactFlow has re-measured the new nodes. When the cache is cleared on a structural
+    // change, this returns without setting layoutDone so Phase 2 retries automatically
+    // once the next measurementVersion increment arrives (dimension events have fired).
+    const sizeCache = nodeSizeCache?.current
+    if (sizeCache && rawMeasuredNodes.some(n =>
+      !sizeCache.has(n.id) && !(n.measured?.width && n.measured?.height)
+    )) {
+      return
+    }
+
     // Enrich each node with its cached measurement so applyCycleLayout always has
     // accurate sizes. Cached values are captured via onNodesChange dimension events
     // and survive across setNodes calls where node.measured may not yet be repopulated.
-    const sizeCache = nodeSizeCache?.current
     const measuredNodes = sizeCache
       ? rawMeasuredNodes.map(node => {
           const cached = sizeCache.get(node.id)
@@ -210,13 +222,15 @@ export default function LayoutController({
   }, [dataVersion, runLayout])
 
   // Phase 2: all current nodes measured → apply layout.
-  // structuralVersion is included so this re-evaluates when new nodes are added to an
-  // already-visible graph (nodesInitialized may stay true across the update, meaning
-  // the dependency would not change without structuralVersion).
+  // structuralVersion: re-evaluates when new nodes are added to an already-visible graph
+  //   (nodesInitialized may stay true across the update when node IDs are shared).
+  // measurementVersion: re-evaluates when dimension events fire. If runLayout() bailed
+  //   on missing cache entries (nodes not yet re-measured after a structural change),
+  //   this ensures Phase 2 retries once fresh measurements have been captured.
   useEffect(() => {
     if (!nodesInitialized || layoutDone.current) return
     runLayout()
-  }, [nodesInitialized, runLayout, structuralVersion])
+  }, [nodesInitialized, runLayout, structuralVersion, measurementVersion])
 
   // Re-layout when layout params change (nodes are already rendered and measured)
   useEffect(() => {
