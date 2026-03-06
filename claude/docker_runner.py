@@ -2265,37 +2265,39 @@ class DockerAgentRunner:
                             break  # Skip auto-advance, review cycle owns progression
 
                         if current_column and getattr(current_column, 'auto_advance_on_approval', False):
-                            current_index = workflow_template.columns.index(current_column)
-                            if current_index + 1 < len(workflow_template.columns):
-                                next_column = workflow_template.columns[current_index + 1]
+                            logger.info(
+                                f"Auto-advancing recovered container issue #{issue_number} "
+                                f"from {column} to next stage"
+                            )
 
+                            from services.pipeline_progression import PipelineProgression
+                            from task_queue.task_manager import TaskQueue
+
+                            task_queue = TaskQueue()
+                            progression_service = PipelineProgression(task_queue)
+
+                            repository = project_config.github['repo']
+                            issue_data = progression_service._get_issue_details(
+                                repository, issue_number, project_config.github['org']
+                            )
+
+                            advanced = progression_service.progress_to_next_stage(
+                                project_name=project,
+                                board_name=pipeline.board_name,
+                                issue_number=issue_number,
+                                current_column=column,
+                                repository=repository,
+                                issue_data=issue_data
+                            )
+
+                            if advanced:
                                 logger.info(
-                                    f"Auto-advancing recovered container issue #{issue_number} "
-                                    f"from {column} to {next_column.name}"
+                                    f"Successfully auto-advanced issue #{issue_number} to next stage"
                                 )
-
-                                from services.pipeline_progression import PipelineProgression
-                                from task_queue.task_manager import TaskQueue
-
-                                task_queue = TaskQueue()
-                                progression_service = PipelineProgression(task_queue)
-
-                                moved = progression_service.move_issue_to_column(
-                                    project_name=project,
-                                    board_name=pipeline.board_name,
-                                    issue_number=issue_number,
-                                    target_column=next_column.name,
-                                    trigger='recovered_container_auto_advance'
+                            else:
+                                logger.warning(
+                                    f"Failed to auto-advance issue #{issue_number} to next stage"
                                 )
-
-                                if moved:
-                                    logger.info(
-                                        f"Successfully auto-advanced issue #{issue_number} to {next_column.name}"
-                                    )
-                                else:
-                                    logger.warning(
-                                        f"Failed to auto-advance issue #{issue_number} to {next_column.name}"
-                                    )
                             break  # Found the column's pipeline, stop searching
                 except Exception as e:
                     logger.error(f"Error during recovered container auto-advancement: {e}")

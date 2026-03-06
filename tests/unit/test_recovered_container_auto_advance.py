@@ -70,7 +70,7 @@ class TestRecoveredContainerAutoAdvance:
 
     @patch('claude.docker_runner.subprocess')
     def test_auto_advances_on_success(self, mock_subprocess, runner, mock_column_with_auto_advance, mock_next_column):
-        """When exit_code=0 and column has auto_advance, should move to next column."""
+        """When exit_code=0 and column has auto_advance, should call progress_to_next_stage."""
         mock_config, mock_workflow = _build_mocks(
             [mock_column_with_auto_advance, mock_next_column]
         )
@@ -86,7 +86,8 @@ class TestRecoveredContainerAutoAdvance:
             mock_cm.get_workflow_template.return_value = mock_workflow
             MockGitHub.return_value.post_agent_output = AsyncMock()
             mock_progression = MockProgression.return_value
-            mock_progression.move_issue_to_column.return_value = True
+            mock_progression._get_issue_details.return_value = {'title': 'Issue #42', 'body': ''}
+            mock_progression.progress_to_next_stage.return_value = True
 
             runner._process_recovered_container_completion(
                 container_name="claude-agent-test-proj-task_123",
@@ -99,12 +100,13 @@ class TestRecoveredContainerAutoAdvance:
                 column="Documentation"
             )
 
-            mock_progression.move_issue_to_column.assert_called_once_with(
+            mock_progression.progress_to_next_stage.assert_called_once_with(
                 project_name="test-proj",
                 board_name="Planning & Design",
                 issue_number=42,
-                target_column="Done",
-                trigger='recovered_container_auto_advance'
+                current_column="Documentation",
+                repository="test-repo",
+                issue_data={'title': 'Issue #42', 'body': ''}
             )
 
     @patch('claude.docker_runner.subprocess')
@@ -137,7 +139,7 @@ class TestRecoveredContainerAutoAdvance:
                 column="Documentation"
             )
 
-            mock_progression.move_issue_to_column.assert_not_called()
+            mock_progression.progress_to_next_stage.assert_not_called()
 
     @patch('claude.docker_runner.subprocess')
     def test_no_auto_advance_when_column_unknown(self, mock_subprocess, runner):
@@ -168,7 +170,7 @@ class TestRecoveredContainerAutoAdvance:
                 column="unknown"
             )
 
-            mock_progression.move_issue_to_column.assert_not_called()
+            mock_progression.progress_to_next_stage.assert_not_called()
 
     @patch('claude.docker_runner.subprocess')
     def test_no_auto_advance_when_column_disabled(self, mock_subprocess, runner, mock_column_without_auto_advance, mock_next_column):
@@ -200,7 +202,7 @@ class TestRecoveredContainerAutoAdvance:
                 column="In Review"
             )
 
-            mock_progression.move_issue_to_column.assert_not_called()
+            mock_progression.progress_to_next_stage.assert_not_called()
 
     @patch('claude.docker_runner.subprocess')
     def test_auto_advance_error_does_not_propagate(self, mock_subprocess, runner, mock_column_with_auto_advance, mock_next_column):
@@ -234,7 +236,7 @@ class TestRecoveredContainerAutoAdvance:
 
     @patch('claude.docker_runner.subprocess')
     def test_no_auto_advance_when_last_column(self, mock_subprocess, runner, mock_column_with_auto_advance):
-        """When current column is the last one, should not attempt to advance."""
+        """When current column is the last one, progress_to_next_stage handles it gracefully."""
         mock_config, mock_workflow = _build_mocks(
             [mock_column_with_auto_advance]  # Only one column — no next column
         )
@@ -250,6 +252,8 @@ class TestRecoveredContainerAutoAdvance:
             mock_cm.get_workflow_template.return_value = mock_workflow
             MockGitHub.return_value.post_agent_output = AsyncMock()
             mock_progression = MockProgression.return_value
+            mock_progression._get_issue_details.return_value = {'title': 'Issue #42', 'body': ''}
+            mock_progression.progress_to_next_stage.return_value = False  # No next column
 
             runner._process_recovered_container_completion(
                 container_name="claude-agent-test-proj-task_123",
@@ -262,4 +266,5 @@ class TestRecoveredContainerAutoAdvance:
                 column="Documentation"
             )
 
-            mock_progression.move_issue_to_column.assert_not_called()
+            # progress_to_next_stage is called; it returns False when there's no next column
+            mock_progression.progress_to_next_stage.assert_called_once()
