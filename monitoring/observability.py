@@ -6,6 +6,7 @@ Provides event streaming for web UI observation of agent execution
 import json
 import redis
 import logging
+import time
 import uuid
 from typing import Dict, Any, Optional
 from datetime import datetime
@@ -25,11 +26,12 @@ def es_index_with_retry(es, index: str, document: dict, doc_id=None, max_retries
 
     Extra keyword arguments (e.g. refresh=True) are forwarded to es.index().
     """
-    import time
-    last_exc = None
+    if max_retries < 1:
+        raise ValueError(f"max_retries must be >= 1, got {max_retries}")
     call_kwargs = {'index': index, 'document': document, **kwargs}
     if doc_id is not None:
         call_kwargs['id'] = doc_id
+    last_exc: Exception = RuntimeError("es_index_with_retry: no attempts made")
     for attempt in range(max_retries):
         try:
             es.index(**call_kwargs)

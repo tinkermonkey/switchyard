@@ -1190,7 +1190,10 @@ class DockerAgentRunner:
                 logger.error(
                     f"Container {container_name} exceeded hard timeout of {hard_timeout}s, killing..."
                 )
-                subprocess.run(['docker', 'kill', container_name], capture_output=True, timeout=30)
+                try:
+                    subprocess.run(['docker', 'kill', container_name], capture_output=True, timeout=30)
+                except Exception as kill_err:
+                    logger.warning(f"docker kill failed for {container_name}: {kill_err}")
                 # Re-wait briefly to collect the exit code after kill
                 try:
                     wait_result = subprocess.run(
