@@ -295,6 +295,14 @@ function PipelineRunView() {
     return mergePipelineRunEvents(pipelineRunEvents, socketEvents, selectedPipelineRun)
   }, [pipelineRunEvents, socketEvents, selectedPipelineRun])
 
+  // Graph events: exclude claude_log streaming events — never used for cycle detection
+  // or node building. Large runs have 80%+ claude_log events; filtering here prevents
+  // processEvents / buildFlowchart from sorting and scanning thousands of irrelevant events.
+  const graphEvents = useMemo(() =>
+    mergedEvents.filter(e => e.event_category !== 'claude_log'),
+    [mergedEvents]
+  )
+
   // Filtered events for event log tab (exclude Claude streaming)
   const eventLogEvents = useMemo(() => {
     const claudeStreamEventTypes = new Set([
@@ -314,20 +322,20 @@ function PipelineRunView() {
     })
   }, [mergedEvents])
 
-  // Find latest agent execution ID — mergedEvents is sorted ascending, so the last
+  // Find latest agent execution ID — graphEvents is sorted ascending, so the last
   // agent_initialized event is the most recently started agent execution.
   const latestAgentExecutionId = useMemo(() => {
-    if (!mergedEvents || mergedEvents.length === 0) return null
-    const agentInitEvents = mergedEvents.filter(event => event.event_type === 'agent_initialized')
+    if (!graphEvents || graphEvents.length === 0) return null
+    const agentInitEvents = graphEvents.filter(event => event.event_type === 'agent_initialized')
     if (agentInitEvents.length === 0) return null
     const ev = agentInitEvents.at(-1)
     return ev.agent_execution_id || ev.data?.agent_execution_id || null
-  }, [mergedEvents])
+  }, [graphEvents])
 
   // Determine if currently in conversational loop
   const isConversational = useMemo(() => {
-    if (!mergedEvents || mergedEvents.length === 0) return false
-    const sortedEvents = [...mergedEvents].sort((a, b) =>
+    if (!graphEvents || graphEvents.length === 0) return false
+    const sortedEvents = [...graphEvents].sort((a, b) =>
       new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
     )
     for (const event of sortedEvents) {
@@ -339,14 +347,14 @@ function PipelineRunView() {
       }
     }
     return false
-  }, [mergedEvents])
+  }, [graphEvents])
 
   // Throttle ref for rawBuild updates (≤ 2/sec during heavy socket activity)
   const rawBuildThrottleRef = useRef({ timer: null, lastRun: 0, pendingFn: null })
 
   // Build raw (unpositioned) flowchart — pure, returns result
   const buildRawFlowchart = useCallback(() => {
-    if (!mergedEvents.length || !selectedPipelineRun) return null
+    if (!graphEvents.length || !selectedPipelineRun) return null
 
     const activeAgents = new Set()
     socketEventsRef.current
@@ -359,13 +367,13 @@ function PipelineRunView() {
       .forEach(e => activeAgents.delete(e.agent))
 
     return buildFlowchartUtil({
-      events: mergedEvents,
+      events: graphEvents,
       existingCycles: cycles,
       workflowConfig,
       selectedPipelineRun,
       activeAgentNames: activeAgents,
     })
-  }, [mergedEvents, selectedPipelineRun, cycles, workflowConfig])
+  }, [graphEvents, selectedPipelineRun, cycles, workflowConfig])
 
   const handleDownloadDebugData = useCallback(() => {
     if (!selectedPipelineRun) return
@@ -452,9 +460,9 @@ function PipelineRunView() {
 
   // Detect and update cycles when events change
   useEffect(() => {
-    if (!mergedEvents.length) return
+    if (!graphEvents.length) return
 
-    const model = processEvents(mergedEvents)
+    const model = processEvents(graphEvents)
     const newCycleMap = new Map()
     model.cycles.forEach(cycle => {
       newCycleMap.set(cycle.id, { isCollapsed: false })
@@ -467,7 +475,7 @@ function PipelineRunView() {
       })
       return merged
     })
-  }, [mergedEvents])
+  }, [graphEvents])
 
   // Rebuild flowchart when events or config change — throttled to ≤ 2/sec
   useEffect(() => {

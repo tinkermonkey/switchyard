@@ -168,15 +168,21 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
   )
   const iterContainers = nodes.filter(n => n.type === 'iterationContainer')
   const subCycleContainers = nodes.filter(n => n.type === 'subCycleContainer')
+
+  // Build ID sets for O(1) parent lookups instead of O(n) .some() scans
+  const iterContainerIds = new Set(iterContainers.map(n => n.id))
+  const cycleContainerIds = new Set(cycleContainers.map(n => n.id))
+  const subCycleContainerIds = new Set(subCycleContainers.map(n => n.id))
+
   // Leaf event children of iterationContainers (residual events not inside sub-cycles)
   const grandchildren = nodes.filter(n => n.parentId && !CONTAINER_TYPES.has(n.type) &&
-    iterContainers.some(ic => ic.id === n.parentId))
+    iterContainerIds.has(n.parentId))
   // Leaf event children of cycle containers (e.g. reviewCycleStarted / reviewCycleCompleted)
   const directCycleChildren = nodes.filter(n => n.parentId && !CONTAINER_TYPES.has(n.type) &&
-    cycleContainers.some(cc => cc.id === n.parentId))
+    cycleContainerIds.has(n.parentId))
   // Leaf event children of subCycleContainers
   const subCycleLeaves = nodes.filter(n => n.parentId && !CONTAINER_TYPES.has(n.type) &&
-    subCycleContainers.some(sc => sc.id === n.parentId))
+    subCycleContainerIds.has(n.parentId))
 
   // Build lookup maps
   const itersByParent = new Map()   // cycleId → [iterationContainer]

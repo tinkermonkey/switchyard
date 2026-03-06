@@ -1,4 +1,4 @@
-import { Upload, RotateCcw } from 'lucide-react'
+import { Upload, RotateCcw, Download } from 'lucide-react'
 import PipelineFlowGraph, { DEFAULT_LAYOUT_OPTIONS } from './components/PipelineFlowGraph'
 import { useState, useEffect, useCallback } from 'react'
 import { toggleCycleCollapsed } from './utils/cycleLayout'
@@ -23,6 +23,7 @@ export default function StandaloneSandbox() {
   const [error, setError] = useState(null)
   const [rawBuild, setRawBuild] = useState(null)
   const [nodesDraggable, setNodesDraggable] = useState(false)
+  const [processedModel, setProcessedModel] = useState(null)
 
   const handleToggleCycle = useCallback((cycleId) => {
     setCycles(prev => toggleCycleCollapsed(prev, cycleId))
@@ -62,6 +63,7 @@ export default function StandaloneSandbox() {
   useEffect(() => {
     setCycles(new Map())
     setRawBuild(null)
+    setProcessedModel(null)
   }, [debugData])
 
   // Build raw (unpositioned) flowchart whenever data or cycles change
@@ -70,8 +72,12 @@ export default function StandaloneSandbox() {
     const { pipelineRun, events, workflowConfig } = debugData
     if (!pipelineRun || !events) return
 
+    // Exclude claude_log streaming events — irrelevant to graph building, but can
+    // account for 80%+ of events in large runs and cause layout thread exhaustion.
+    const graphEvents = events.filter(e => e.event_category !== 'claude_log')
+
     const result = buildFlowchart({
-      events,
+      events: graphEvents,
       existingCycles: cycles,
       workflowConfig: workflowConfig || null,
       selectedPipelineRun: pipelineRun,
@@ -87,7 +93,30 @@ export default function StandaloneSandbox() {
     }
 
     setRawBuild(result)
+    setProcessedModel(result.model ?? null)
   }, [debugData, cycles])
+
+  const handleDownloadProcessed = useCallback(() => {
+    if (!processedModel || !debugData) return
+    const { prelude, cycles, postlude, agentExecutions } = processedModel
+    const serializable = {
+      pipelineRun: debugData.pipelineRun,
+      prelude,
+      cycles: [...(cycles?.values?.() ?? cycles ?? [])],
+      postlude,
+      agentExecutions: agentExecutions instanceof Map
+        ? Object.fromEntries(agentExecutions)
+        : agentExecutions,
+    }
+    const blob = new Blob([JSON.stringify(serializable, null, 2)], { type: 'application/json' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    const runId = debugData.pipelineRun?.pipeline_run_id ?? 'pipeline'
+    a.download = `${runId}-processed.json`
+    a.click()
+    URL.revokeObjectURL(url)
+  }, [processedModel, debugData])
 
   const handleParamChange = useCallback((key, value) => {
     const parsed = parseInt(value, 10)
@@ -185,6 +214,16 @@ export default function StandaloneSandbox() {
           >
             <RotateCcw className="w-4 h-4" />
             Reset to Defaults
+          </button>
+
+          {/* Download Processed Data */}
+          <button
+            onClick={handleDownloadProcessed}
+            disabled={!processedModel}
+            className="px-4 py-2 bg-gh-canvas border border-gh-border rounded-md hover:bg-gh-border-muted transition-colors text-sm flex items-center justify-center gap-2 disabled:opacity-40 disabled:cursor-not-allowed"
+          >
+            <Download className="w-4 h-4" />
+            Download Processed Data
           </button>
         </div>
 

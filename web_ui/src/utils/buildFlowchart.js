@@ -526,5 +526,5 @@ export function buildFlowchart({
   // ── 8. Ensure correct React Flow node ordering (parents before children) ──
   // newNodes is already built parents-first (containers added before their children above).
 
-  return { nodes: newNodes, edges: newEdges, agentExecutions, updatedCycles }
+  return { nodes: newNodes, edges: newEdges, agentExecutions, updatedCycles, model }
 }

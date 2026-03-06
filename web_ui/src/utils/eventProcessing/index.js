@@ -321,9 +321,25 @@ function groupRepairTestCycles(cycleEvents, boundary, agentExecutions) {
     })
 
     // Detect sub-cycles generically from registry
-    const subCycles = REPAIR_SUB_CYCLE_REGISTRY.flatMap(entry =>
+    const allSubCycles = REPAIR_SUB_CYCLE_REGISTRY.flatMap(entry =>
       groupSubCycles(events, entry, agentExecutions)
     )
+
+    // Filter out test_execution sub-cycles that start inside another sub-cycle's window.
+    // Those executions are internal runs triggered by that sub-cycle (e.g. systemic_fix),
+    // not independent top-level iterations of this test cycle.
+    const nonTestExecRanges = allSubCycles
+      .filter(sc => sc.cycleType !== 'test_execution')
+      .map(sc => ({
+        startMs: new Date(sc.startEvent.timestamp).getTime(),
+        endMs: sc.endEvent ? new Date(sc.endEvent.timestamp).getTime() : Infinity,
+      }))
+
+    const subCycles = allSubCycles.filter(sc => {
+      if (sc.cycleType !== 'test_execution') return true
+      const startMs = new Date(sc.startEvent.timestamp).getTime()
+      return !nonTestExecRanges.some(r => startMs > r.startMs && startMs < r.endMs)
+    })
 
     // Residual events: not inside any sub-cycle boundary
     const subCycleTimeRanges = subCycles.map(sc => ({
@@ -484,9 +500,9 @@ function inferMissingCloseEvents(sortedEvents) {
   }
 
   // ── Phase 3: Test cycles within repair cycles ─────────────────────────────
-  // (uses Phase 2 synthetic repair-cycle ends via snapshot)
+  // (uses Phase 2 synthetic repair-cycle ends; snapshot includes any Phase 2 additions)
   {
-    const stream = snapshot()
+    const stream = synthetic.length > 0 ? snapshot() : sortedEvents
     repairStarts.forEach(repairStart => {
       const repairStartMs = new Date(repairStart.timestamp).getTime()
       const repairEnd = stream.find(
@@ -596,9 +612,16 @@ export function processEvents(events, workflowConfig = null) {
     }
   }
 
+  // Pre-cache timestamp ms values to avoid repeated Date parsing across filter/sort loops
+  const tsMs = new Map()
+  const getMs = (ts) => {
+    if (!tsMs.has(ts)) tsMs.set(ts, new Date(ts).getTime())
+    return tsMs.get(ts)
+  }
+
   // Sort events chronologically, then infer synthetic close events for any open cycles
   const sorted = inferMissingCloseEvents(
-    [...events].sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp))
+    [...events].sort((a, b) => getMs(a.timestamp) - getMs(b.timestamp))
   )
 
   // Build agent execution map (needed for iteration grouping)
@@ -615,29 +638,29 @@ export function processEvents(events, workflowConfig = null) {
   let lastCycleEndMs = -Infinity
 
   reviewCycleBoundaries.forEach(({ startEvent, endEvent }) => {
-    const sMs = new Date(startEvent.timestamp).getTime()
-    const eMs = endEvent ? new Date(endEvent.timestamp).getTime() : sMs
+    const sMs = getMs(startEvent.timestamp)
+    const eMs = endEvent ? getMs(endEvent.timestamp) : sMs
     firstCycleStartMs = Math.min(firstCycleStartMs, sMs)
     lastCycleEndMs = Math.max(lastCycleEndMs, eMs)
   })
 
   repairCycleBoundaries.forEach(({ startEvent, endEvent }) => {
-    const sMs = new Date(startEvent.timestamp).getTime()
-    const eMs = endEvent ? new Date(endEvent.timestamp).getTime() : sMs
+    const sMs = getMs(startEvent.timestamp)
+    const eMs = endEvent ? getMs(endEvent.timestamp) : sMs
     firstCycleStartMs = Math.min(firstCycleStartMs, sMs)
     lastCycleEndMs = Math.max(lastCycleEndMs, eMs)
   })
 
   prReviewCycleBoundaries.forEach(({ startEvent, endEvent }) => {
-    const sMs = new Date(startEvent.timestamp).getTime()
-    const eMs = endEvent ? new Date(endEvent.timestamp).getTime() : sMs
+    const sMs = getMs(startEvent.timestamp)
+    const eMs = endEvent ? getMs(endEvent.timestamp) : sMs
     firstCycleStartMs = Math.min(firstCycleStartMs, sMs)
     lastCycleEndMs = Math.max(lastCycleEndMs, eMs)
   })
 
   conversationalLoopBoundaries.forEach(({ startEvent, endEvent }) => {
-    const sMs = new Date(startEvent.timestamp).getTime()
-    const eMs = endEvent ? new Date(endEvent.timestamp).getTime() : sMs
+    const sMs = getMs(startEvent.timestamp)
+    const eMs = endEvent ? getMs(endEvent.timestamp) : sMs
     firstCycleStartMs = Math.min(firstCycleStartMs, sMs)
     lastCycleEndMs = Math.max(lastCycleEndMs, eMs)
   })
@@ -647,23 +670,23 @@ export function processEvents(events, workflowConfig = null) {
   // Prelude: events strictly before the first cycle's startTime
   const preludeEvents = noCycles
     ? sorted
-    : sorted.filter(e => new Date(e.timestamp).getTime() < firstCycleStartMs)
+    : sorted.filter(e => getMs(e.timestamp) < firstCycleStartMs)
 
   // Postlude: events strictly after the last cycle's endTime
   const postludeEvents = noCycles
     ? []
-    : sorted.filter(e => new Date(e.timestamp).getTime() > lastCycleEndMs)
+    : sorted.filter(e => getMs(e.timestamp) > lastCycleEndMs)
 
   // Build cycles
   const cycles = []
 
   reviewCycleBoundaries.forEach((boundary, idx) => {
     const { startEvent, endEvent } = boundary
-    const cycleStartMs = new Date(startEvent.timestamp).getTime()
-    const cycleEndMs = endEvent ? new Date(endEvent.timestamp).getTime() : Date.now()
+    const cycleStartMs = getMs(startEvent.timestamp)
+    const cycleEndMs = endEvent ? getMs(endEvent.timestamp) : Date.now()
 
     const cycleEvents = sorted.filter(e => {
-      const t = new Date(e.timestamp).getTime()
+      const t = getMs(e.timestamp)
       return t >= cycleStartMs && t <= cycleEndMs
     })
 
@@ -681,11 +704,11 @@ export function processEvents(events, workflowConfig = null) {
 
   repairCycleBoundaries.forEach((boundary, idx) => {
     const { startEvent, endEvent } = boundary
-    const cycleStartMs = new Date(startEvent.timestamp).getTime()
-    const cycleEndMs = endEvent ? new Date(endEvent.timestamp).getTime() : Date.now()
+    const cycleStartMs = getMs(startEvent.timestamp)
+    const cycleEndMs = endEvent ? getMs(endEvent.timestamp) : Date.now()
 
     const cycleEvents = sorted.filter(e => {
-      const t = new Date(e.timestamp).getTime()
+      const t = getMs(e.timestamp)
       return t >= cycleStartMs && t <= cycleEndMs
     })
 
@@ -693,11 +716,11 @@ export function processEvents(events, workflowConfig = null) {
 
     // Events in the repair cycle window that fall outside any test-cycle boundary
     const allTcWindows = testCycles.map(tc => ({
-      startMs: new Date(tc.startEvent.timestamp).getTime(),
-      endMs:   tc.endEvent ? new Date(tc.endEvent.timestamp).getTime() : Infinity,
+      startMs: getMs(tc.startEvent.timestamp),
+      endMs:   tc.endEvent ? getMs(tc.endEvent.timestamp) : Infinity,
     }))
     const residualEvents = cycleEvents.filter(e => {
-      const t = new Date(e.timestamp).getTime()
+      const t = getMs(e.timestamp)
       return !allTcWindows.some(w => t >= w.startMs && t <= w.endMs)
     })
 
@@ -714,11 +737,11 @@ export function processEvents(events, workflowConfig = null) {
 
   prReviewCycleBoundaries.forEach((boundary, idx) => {
     const { startEvent, endEvent } = boundary
-    const cycleStartMs = new Date(startEvent.timestamp).getTime()
-    const cycleEndMs = endEvent ? new Date(endEvent.timestamp).getTime() : Date.now()
+    const cycleStartMs = getMs(startEvent.timestamp)
+    const cycleEndMs = endEvent ? getMs(endEvent.timestamp) : Date.now()
 
     const cycleEvents = sorted.filter(e => {
-      const t = new Date(e.timestamp).getTime()
+      const t = getMs(e.timestamp)
       return t >= cycleStartMs && t <= cycleEndMs
     })
 
@@ -736,11 +759,11 @@ export function processEvents(events, workflowConfig = null) {
 
   conversationalLoopBoundaries.forEach((boundary, idx) => {
     const { startEvent, endEvent } = boundary
-    const cycleStartMs = new Date(startEvent.timestamp).getTime()
-    const cycleEndMs = endEvent ? new Date(endEvent.timestamp).getTime() : Date.now()
+    const cycleStartMs = getMs(startEvent.timestamp)
+    const cycleEndMs = endEvent ? getMs(endEvent.timestamp) : Date.now()
 
     const cycleEvents = sorted.filter(e => {
-      const t = new Date(e.timestamp).getTime()
+      const t = getMs(e.timestamp)
       return t >= cycleStartMs && t <= cycleEndMs
     })
 
