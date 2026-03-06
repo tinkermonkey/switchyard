@@ -16,6 +16,7 @@ import json
 from typing import Dict, Any, List
 from datetime import datetime, timedelta, date
 from elasticsearch import Elasticsearch
+from monitoring.observability import es_index_with_retry
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 import random
@@ -513,12 +514,7 @@ class PatternDailyAggregator:
             # Store in Elasticsearch (use date + type as document ID for idempotency)
             doc_id = f"{date.today().isoformat()}_{analysis_type}"
 
-            self.es.index(
-                index="pattern-insights",
-                id=doc_id,
-                body=insight_doc,
-                refresh=True
-            )
+            es_index_with_retry(self.es, "pattern-insights", insight_doc, doc_id=doc_id, refresh=True)
 
             if pattern_candidates:
                 self.total_pattern_candidates += len(pattern_candidates)

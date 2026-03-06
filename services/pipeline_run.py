@@ -13,6 +13,7 @@ from typing import Optional, Dict, Any
 from datetime import datetime
 from dataclasses import dataclass, asdict
 from elasticsearch import Elasticsearch
+from monitoring.observability import es_index_with_retry
 
 logger = logging.getLogger(__name__)
 
@@ -440,11 +441,7 @@ class PipelineRunManager:
                                 # Update in the same index where it was found
                                 # Extract the index from the hit's _index field
                                 old_index = hit['_index']
-                                self.es.index(
-                                    index=old_index,
-                                    id=old_run_id,
-                                    document=old_run_data
-                                )
+                                es_index_with_retry(self.es, old_index, old_run_data, doc_id=old_run_id)
                                 
                                 logger.info(
                                     f"Ended orphaned pipeline run {old_run_id} for "
@@ -956,11 +953,7 @@ class PipelineRunManager:
             except Exception as e:
                 logger.warning(f"Could not parse started_at '{pipeline_run.started_at}', using current date for index: {e}")
 
-            self.es.index(
-                index=index_name,
-                id=pipeline_run.id,
-                document=pipeline_run.to_dict()
-            )
+            es_index_with_retry(self.es, index_name, pipeline_run.to_dict(), doc_id=pipeline_run.id)
             logger.debug(f"Persisted pipeline run {pipeline_run.id} to {index_name}")
         except Exception as e:
             logger.error(f"Failed to persist pipeline run to Elasticsearch: {e}")
@@ -1387,12 +1380,8 @@ class PipelineRunManager:
             if not target_index:
                 target_index = self._get_es_index_name()
 
-            self.es.index(
-                index=target_index,
-                id=pipeline_run_id,
-                document=run_data
-            )
-            
+            es_index_with_retry(self.es, target_index, run_data, doc_id=pipeline_run_id)
+
             # Also clean up Redis if it exists
             redis_key = self._get_redis_key(pipeline_run_id)
             if self.redis.exists(redis_key):

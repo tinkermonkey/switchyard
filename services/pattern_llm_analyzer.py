@@ -11,6 +11,7 @@ import json
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timedelta
 from elasticsearch import Elasticsearch
+from monitoring.observability import es_index_with_retry
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 import anthropic
@@ -449,11 +450,7 @@ Be direct and technical. Focus on preventing the specific error pattern."""
                 "llm_cost_usd": analysis.get('llm_cost_usd')
             }
 
-            self.es.index(
-                index="pattern-llm-analysis",
-                body=doc,
-                refresh=True
-            )
+            es_index_with_retry(self.es, "pattern-llm-analysis", doc, refresh=True)
 
             self.total_proposals += 1
             logger.info(f"Stored LLM analysis for pattern '{pattern['pattern_name']}'")

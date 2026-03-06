@@ -16,6 +16,32 @@ from monitoring.timestamp_utils import utc_now, utc_isoformat
 
 logger = logging.getLogger(__name__)
 
+
+def es_index_with_retry(es, index: str, document: dict, doc_id=None, max_retries: int = 3, **kwargs) -> None:
+    """Index a document in Elasticsearch, retrying on transient failures.
+
+    Raises the last exception if all retries are exhausted so callers can
+    decide whether to log-and-continue or propagate.
+
+    Extra keyword arguments (e.g. refresh=True) are forwarded to es.index().
+    """
+    import time
+    last_exc = None
+    call_kwargs = {'index': index, 'document': document, **kwargs}
+    if doc_id is not None:
+        call_kwargs['id'] = doc_id
+    for attempt in range(max_retries):
+        try:
+            es.index(**call_kwargs)
+            return
+        except Exception as exc:
+            last_exc = exc
+            if attempt < max_retries - 1:
+                logger.warning(f"ES index to {index} failed (attempt {attempt + 1}/{max_retries}), retrying: {exc}")
+                time.sleep(2 ** attempt)  # 1s, 2s backoff
+    raise last_exc
+
+
 # ILM Policy for decision events (7-day retention)
 DECISION_EVENTS_ILM_POLICY = {
     "policy": {
@@ -505,7 +531,7 @@ class ObservabilityManager:
                         logger.info(f"[DIAGNOSTIC] Writing {event.event_type} to ES with pipeline_run_id: {pipeline_run_id} (is None: {pipeline_run_id is None}), project: {project}")
                     
                     # Index the document
-                    self.es.index(index=index_name, document=doc)
+                    es_index_with_retry(self.es, index_name, doc)
                     logger.info(f"Indexed decision event {event_type.value} to {index_name}")
                 except Exception as e:
                     logger.error(f"Failed to index decision event to Elasticsearch: {e}")
@@ -532,7 +558,7 @@ class ObservabilityManager:
                     }
                     
                     # Index the document
-                    self.es.index(index=index_name, document=doc)
+                    es_index_with_retry(self.es, index_name, doc)
                     logger.info(f"Indexed agent lifecycle event {event_type.value} to {index_name}")
                 except Exception as e:
                     logger.error(f"Failed to index agent lifecycle event to Elasticsearch: {e}")
@@ -619,7 +645,7 @@ class ObservabilityManager:
                         }
                     },
                 }
-                self.es.index(index=index_name, document=doc)
+                es_index_with_retry(self.es, index_name, doc)
             except Exception as e:
                 logger.error(f"Failed to index prompt_constructed event to Elasticsearch: {e}")
 
@@ -753,7 +779,7 @@ class ObservabilityManager:
             }
 
             # Index the document
-            self.es.index(index=index_name, document=doc)
+            es_index_with_retry(self.es, index_name, doc)
             logger.debug(f"Indexed Claude stream event to {index_name} for {agent}/{task_id}")
         except Exception as e:
             logger.error(f"Failed to index Claude stream event to Elasticsearch: {e}")

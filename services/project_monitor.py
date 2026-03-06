@@ -102,15 +102,15 @@ def _is_repair_cycle_stalled(pipeline_run_id: str, stall_seconds: int = 3600) ->
     """
     Returns True if no events have been emitted for this pipeline run in the last stall_seconds.
 
-    Queries both decision-events and agent-events indices for the most recent timestamp.
-    Fails open (returns False) if Elasticsearch is unavailable, so a transient ES outage
-    never kills a healthy repair cycle.
+    Queries decision-events, agent-events, AND claude-streams so that activity from
+    inner agent containers (which only emit to claude-streams) keeps the repair cycle
+    alive.  Fails open (returns False) if Elasticsearch is unavailable.
     """
     try:
         import requests
         from datetime import datetime, timezone
         resp = requests.get(
-            "http://elasticsearch:9200/decision-events-*,agent-events-*/_search",
+            "http://elasticsearch:9200/decision-events-*,agent-events-*,claude-streams-*/_search",
             json={
                 "query": {"term": {"pipeline_run_id": pipeline_run_id}},
                 "sort": [{"timestamp": "desc"}],
@@ -129,6 +129,36 @@ def _is_repair_cycle_stalled(pipeline_run_id: str, stall_seconds: int = 3600) ->
     except Exception as e:
         logger.warning(f"Could not check repair cycle liveness for {pipeline_run_id}: {e}")
         return False  # fail open: don't kill if we can't verify
+
+
+def _kill_child_agent_containers(pipeline_run_id: str) -> None:
+    """Kill any claude-agent containers still registered for this pipeline run.
+
+    When the outer repair-cycle container is killed due to a stall, the inner
+    agent container it spawned keeps running because it is a sibling (not a
+    child) in Docker.  This function scans the Redis agent-container registry
+    and kills every container whose pipeline_run_id matches.
+    """
+    try:
+        import redis as redis_lib
+        rc = redis_lib.Redis(host='redis', port=6379, decode_responses=True)
+        cursor = 0
+        while True:
+            cursor, keys = rc.scan(cursor, match='agent:container:claude-agent-*', count=200)
+            for key in keys:
+                try:
+                    entry_run_id = rc.hget(key, 'pipeline_run_id')
+                    if entry_run_id != pipeline_run_id:
+                        continue
+                    container_name = rc.hget(key, 'container_name') or key.removeprefix('agent:container:')
+                    logger.info(f"Killing child container {container_name} for stalled pipeline run {pipeline_run_id}")
+                    subprocess.run(['docker', 'kill', container_name], timeout=30, capture_output=True)
+                except Exception as inner_err:
+                    logger.warning(f"Failed to kill child container from key {key}: {inner_err}")
+            if cursor == 0:
+                break
+    except Exception as e:
+        logger.warning(f"Failed to kill child agent containers for {pipeline_run_id}: {e}")
 
 
 def _launch_repair_cycle_container(
@@ -4375,6 +4405,9 @@ The automated test-fix-validate cycle has failed and requires manual interventio
                                 subprocess.run(['docker', 'kill', container_name], timeout=30)
                             except Exception as kill_err:
                                 logger.error(f"Failed to kill stalled container: {kill_err}")
+                            # Kill any inner agent containers spawned by this repair cycle
+                            if pipeline_run_id:
+                                _kill_child_agent_containers(pipeline_run_id)
                             try:
                                 process.wait(timeout=60)
                             except subprocess.TimeoutExpired:

@@ -11,6 +11,7 @@ import json
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timedelta
 from elasticsearch import Elasticsearch
+from monitoring.observability import es_index_with_retry
 from elasticsearch.helpers import scan
 
 from services.github_discussions import GitHubDiscussions
@@ -359,11 +360,7 @@ _🤖 This discussion was automatically created by the Pattern Detection System.
         }
 
         try:
-            self.es.index(
-                index="pattern-github-tracking",
-                body=doc,
-                refresh=True
-            )
+            es_index_with_retry(self.es, "pattern-github-tracking", doc, refresh=True)
         except Exception as e:
             logger.error(f"Error recording GitHub discussion: {e}")
 
@@ -628,11 +625,7 @@ _🤖 This issue was automatically created from an approved pattern detection di
                 "created_at": datetime.utcnow().isoformat() + 'Z'
             }
 
-            self.es.index(
-                index="pattern-github-tracking",
-                body=issue_doc,
-                refresh=True
-            )
+            es_index_with_retry(self.es, "pattern-github-tracking", issue_doc, refresh=True)
 
             # Mark discussion as resolved
             self.es.update(

@@ -775,6 +775,10 @@ class AgentExecutor:
             context['use_docker'] = agent_config.requires_docker
             logger.info(f"Agent {agent_name} requires_docker={agent_config.requires_docker}, overriding task context")
 
+        # Pass the hard timeout into context so docker_runner can enforce it
+        if hasattr(agent_config, 'timeout') and agent_config.timeout:
+            context['agent_hard_timeout'] = agent_config.timeout
+
         return context
 
     async def _post_agent_output_to_github(

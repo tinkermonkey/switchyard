@@ -131,7 +131,7 @@ agents:
   senior_software_engineer:
     description: "Software development and implementation"
     model: "claude-haiku-4-5"
-    timeout: 1800
+    timeout: 10800  # 3-hour hard limit; enforced by docker wait timeout in docker_runner
     retries: 3
     circuit_breaker:
       failure_threshold: 6

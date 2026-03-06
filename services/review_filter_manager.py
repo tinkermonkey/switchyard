@@ -9,6 +9,7 @@ import hashlib
 from typing import Dict, Any, List, Optional
 from datetime import datetime
 from elasticsearch import Elasticsearch
+from monitoring.observability import es_index_with_retry
 import redis
 
 logger = logging.getLogger(__name__)
@@ -91,11 +92,7 @@ class ReviewFilterManager:
 
         try:
             # Index to Elasticsearch
-            self.es.index(
-                index=self.filters_index,
-                id=filter_id,
-                document=filter_doc
-            )
+            es_index_with_retry(self.es, self.filters_index, filter_doc, doc_id=filter_id)
 
             # Invalidate cache
             self._invalidate_cache(filter_data['agent'])

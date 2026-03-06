@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Optional
 import logging
 from monitoring.timestamp_utils import utc_now, utc_isoformat
+from monitoring.observability import es_index_with_retry
 
 logger = logging.getLogger(__name__)
 
@@ -242,19 +243,16 @@ class MetricsCollector:
         if self.es_enabled:
             try:
                 # Write to the alias, not the dated index - ILM will handle rollover
-                self.es.index(
-                    index="orchestrator-task-metrics",
-                    document={
-                        "@timestamp": timestamp_str,
-                        "agent": agent,
-                        "duration": duration,
-                        "success": success,
-                        "input_tokens": input_tokens,
-                        "output_tokens": output_tokens,
-                        "cache_read_tokens": cache_read_tokens,
-                        "cache_creation_tokens": cache_creation_tokens
-                    }
-                )
+                es_index_with_retry(self.es, "orchestrator-task-metrics", {
+                    "@timestamp": timestamp_str,
+                    "agent": agent,
+                    "duration": duration,
+                    "success": success,
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "cache_read_tokens": cache_read_tokens,
+                    "cache_creation_tokens": cache_creation_tokens
+                })
             except Exception as e:
                 logger.error(f"Failed to write task metrics to Elasticsearch: {e}")
 
@@ -282,15 +280,12 @@ class MetricsCollector:
         if self.es_enabled:
             try:
                 # Write to the alias, not the dated index - ILM will handle rollover
-                self.es.index(
-                    index="orchestrator-quality-metrics",
-                    document={
-                        "@timestamp": timestamp_str,
-                        "agent": agent,
-                        "metric_name": metric_name,
-                        "score": score
-                    }
-                )
+                es_index_with_retry(self.es, "orchestrator-quality-metrics", {
+                    "@timestamp": timestamp_str,
+                    "agent": agent,
+                    "metric_name": metric_name,
+                    "score": score
+                })
             except Exception as e:
                 logger.error(f"Failed to write quality metrics to Elasticsearch: {e}")
         

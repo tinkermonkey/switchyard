@@ -24,6 +24,7 @@ import os
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Any, Optional
 from elasticsearch import Elasticsearch, NotFoundError
+from monitoring.observability import es_index_with_retry
 
 logger = logging.getLogger(__name__)
 
@@ -302,7 +303,7 @@ class TokenMetricsService:
                     doc_id = f"{doc['agent_name']}_{int(hour_start.timestamp())}"
                     hourly_index = _index_name(AGENTS_HOURLY_INDEX_PREFIX, hour_start)
                     try:
-                        self.es.index(index=hourly_index, id=doc_id, body=doc)
+                        es_index_with_retry(self.es, hourly_index, doc, doc_id=doc_id)
                         total_agent_docs += 1
                     except Exception as e:
                         logger.error(f"Error writing hourly agent doc {doc_id}: {e}")
@@ -321,7 +322,7 @@ class TokenMetricsService:
                     doc_id = f"{doc['cycle_type']}_{int(hour_start.timestamp())}"
                     hourly_index = _index_name(CYCLES_HOURLY_INDEX_PREFIX, hour_start)
                     try:
-                        self.es.index(index=hourly_index, id=doc_id, body=doc)
+                        es_index_with_retry(self.es, hourly_index, doc, doc_id=doc_id)
                         total_cycle_docs += 1
                     except Exception as e:
                         logger.error(f"Error writing hourly cycle doc {doc_id}: {e}")
@@ -340,7 +341,7 @@ class TokenMetricsService:
                 for doc in exec_docs:
                     try:
                         doc_id = doc.get('agent_execution_id') or doc['task_id']
-                        self.es.index(index=exec_index, id=doc_id, body=doc)
+                        es_index_with_retry(self.es, exec_index, doc, doc_id=doc_id)
                     except Exception as e:
                         logger.error(f"Error writing execution summary doc {doc.get('task_id')}: {e}")
             except Exception as e:

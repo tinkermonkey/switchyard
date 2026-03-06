@@ -13,6 +13,7 @@ from datetime import datetime
 from dataclasses import dataclass
 import redis
 from elasticsearch import Elasticsearch
+from monitoring.observability import es_index_with_retry
 
 from services.review_parser import ReviewFinding
 from services.review_learning_schema import get_review_outcome_index_name
@@ -354,10 +355,7 @@ class ReviewOutcomeCorrelator:
             )
 
             # Index directly to Elasticsearch for pattern detection
-            self.es.index(
-                index=get_review_outcome_index_name(),
-                document=outcome_data
-            )
+            es_index_with_retry(self.es, get_review_outcome_index_name(), outcome_data)
 
             logger.debug(
                 f"Published outcome: {outcome.agent} - {outcome.finding.category} "

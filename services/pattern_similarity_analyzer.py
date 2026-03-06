@@ -11,6 +11,7 @@ import random
 from typing import Dict, Any, List, Tuple
 from datetime import datetime
 from elasticsearch import Elasticsearch
+from monitoring.observability import es_index_with_retry
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from difflib import SequenceMatcher
@@ -310,12 +311,7 @@ class PatternSimilarityAnalyzer:
             names_sorted = sorted([pattern_a['pattern_name'], pattern_b['pattern_name']])
             doc_id = f"{names_sorted[0]}___{names_sorted[1]}"
 
-            self.es.index(
-                index="pattern-similarity",
-                id=doc_id,
-                body=doc,
-                refresh=True
-            )
+            es_index_with_retry(self.es, "pattern-similarity", doc, doc_id=doc_id, refresh=True)
 
             logger.info(
                 f"Stored similarity: {pattern_a['pattern_name']} <-> {pattern_b['pattern_name']} "

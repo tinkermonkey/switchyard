@@ -12,6 +12,7 @@ import redis
 from typing import List, Dict, Optional, Tuple
 from datetime import datetime, timedelta
 from pathlib import Path
+from monitoring.observability import es_index_with_retry
 
 logger = logging.getLogger(__name__)
 
@@ -1347,7 +1348,7 @@ class AgentContainerRecovery:
                 'stale_rate': killed / len(running_containers) if running_containers else 0.0
             }
 
-            es.index(index=index_name, document=doc)
+            es_index_with_retry(es, index_name, doc)
             logger.debug(f"Indexed recovery metrics to {index_name}")
         except Exception as e:
             logger.warning(f"Failed to index recovery metrics to Elasticsearch: {e}")

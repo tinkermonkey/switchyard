@@ -1174,12 +1174,32 @@ class DockerAgentRunner:
             stdout_thread.start()
             stderr_thread.start()
 
-            # Wait for container to finish
-            # We use 'docker wait' instead of process.wait() because 'docker logs -f' might hang
-            # or we might want to stop following if the container dies.
-
-            wait_result = subprocess.run(['docker', 'wait', container_name], capture_output=True, text=True)
-            exit_code = int(wait_result.stdout.strip())
+            # Wait for container to finish, enforcing the agent's hard timeout.
+            # We use 'docker wait' instead of process.wait() because 'docker logs -f' might hang.
+            # The timeout comes from agents.yaml and is always finite — agents must complete
+            # within their allotted time even if they are still actively producing output.
+            hard_timeout = context.get('agent_hard_timeout', 10800)  # default 3 hours
+            try:
+                wait_result = subprocess.run(
+                    ['docker', 'wait', container_name],
+                    capture_output=True, text=True,
+                    timeout=hard_timeout,
+                )
+                exit_code = int(wait_result.stdout.strip())
+            except subprocess.TimeoutExpired:
+                logger.error(
+                    f"Container {container_name} exceeded hard timeout of {hard_timeout}s, killing..."
+                )
+                subprocess.run(['docker', 'kill', container_name], capture_output=True, timeout=30)
+                # Re-wait briefly to collect the exit code after kill
+                try:
+                    wait_result = subprocess.run(
+                        ['docker', 'wait', container_name],
+                        capture_output=True, text=True, timeout=30,
+                    )
+                    exit_code = int(wait_result.stdout.strip() or '-1')
+                except Exception:
+                    exit_code = -1
 
             # Allow log streamer to finish naturally
             # 'docker logs -f' should exit when the container stops, but we give it a timeout
