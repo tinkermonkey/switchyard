@@ -1,26 +1,28 @@
-import { Handle, Position } from '@xyflow/react'
+import { Handle, Position, NodeResizer } from '@xyflow/react'
 import { ChevronDown, ChevronRight } from 'lucide-react'
 
 /**
- * Base component for top-level expandable cycle containers.
- * Renders a dashed bounding box with a coloured header bar, collapse toggle,
- * corner decorations, and an optional collapsed summary view.
+ * Base component for expandable cycle containers at any nesting level.
+ * Renders a dashed (or solid) bounding box with a coloured header bar, optional
+ * collapse toggle, corner decorations, and an optional collapsed summary view.
  *
  * Not registered as a node type directly — used via themed wrappers.
  *
  * Props:
- *   data.cycleId          {string}
+ *   data.cycleId          {string}   - used as toggle callback arg; optional for sub-containers
  *   data.label            {string}   - header title
- *   data.iterationCount   {number}
- *   data.isCollapsed      {boolean}
- *   data.onToggleCollapse {function}
+ *   data.iterationCount   {number}   - shown in header when > 0
+ *   data.isCollapsed      {boolean}  - collapse state (sub-containers: always false)
+ *   data.onToggleCollapse {function} - if null/undefined, collapse toggle is hidden
+ *   data.isResizable      {boolean}  - optional: renders NodeResizer when true and not collapsed
  *
- *   theme.borderColor       {string}   - e.g. '#9333ea'
- *   theme.bgColor           {string}   - e.g. 'rgba(147,51,234,0.14)'
- *   theme.cornerColor       {string}   - semi-transparent version for corner decorations
- *   theme.icon              {Component}- lucide-react icon component
- *   theme.countSuffix       {string}   - e.g. 'iteration' or 'test cycle'
- *   theme.collapsedLabel    {string}   - label shown in collapsed card
+ *   theme.borderColor       {string}    - e.g. '#9333ea'
+ *   theme.borderStyle       {string}    - 'dashed' (default) or 'solid'
+ *   theme.bgColor           {string}    - e.g. 'rgba(147,51,234,0.14)'
+ *   theme.cornerColor       {string}    - semi-transparent version for corner decorations
+ *   theme.icon              {Component} - lucide-react icon component
+ *   theme.countSuffix       {string}    - e.g. 'iteration' or 'test cycle'
+ *   theme.collapsedLabel    {string}    - label shown in collapsed card
  *   theme.collapsedTextColor  {string}
  *   theme.collapsedCountColor {string}
  */
@@ -31,10 +33,12 @@ export function CycleContainerNode({ data, theme }) {
     iterationCount = 0,
     isCollapsed = false,
     onToggleCollapse,
+    isResizable = false,
   } = data
 
   const {
     borderColor,
+    borderStyle = 'dashed',
     bgColor,
     cornerColor,
     icon: Icon,
@@ -43,6 +47,8 @@ export function CycleContainerNode({ data, theme }) {
     collapsedTextColor,
     collapsedCountColor,
   } = theme
+
+  const isToggleable = !!onToggleCollapse
 
   const handleToggle = e => {
     e.stopPropagation()
@@ -54,7 +60,7 @@ export function CycleContainerNode({ data, theme }) {
       style={{
         width: isCollapsed ? 280 : '100%',
         height: isCollapsed ? 100 : '100%',
-        border: '2px dashed',
+        border: `2px ${borderStyle}`,
         borderColor,
         borderRadius: '12px',
         background: bgColor,
@@ -63,6 +69,14 @@ export function CycleContainerNode({ data, theme }) {
         pointerEvents: 'all',
       }}
     >
+      <NodeResizer
+        isVisible={isResizable && !isCollapsed}
+        minWidth={220}
+        minHeight={80}
+        handleStyle={{ background: '#6b7280', border: '1px solid white', borderRadius: '2px' }}
+        lineStyle={{ borderColor: '#6b728060' }}
+      />
+
       <Handle
         type="target"
         position={Position.Top}
@@ -76,9 +90,9 @@ export function CycleContainerNode({ data, theme }) {
 
       {/* Header bar */}
       <div
-        onClick={handleToggle}
-        onMouseEnter={e => (e.currentTarget.style.background = borderColor)}
-        onMouseLeave={e => (e.currentTarget.style.background = `${borderColor}e6`)}
+        onClick={isToggleable ? handleToggle : undefined}
+        onMouseEnter={isToggleable ? e => (e.currentTarget.style.background = borderColor) : undefined}
+        onMouseLeave={isToggleable ? e => (e.currentTarget.style.background = `${borderColor}e6`) : undefined}
         style={{
           position: 'absolute',
           top: 0, left: 0, right: 0,
@@ -87,16 +101,21 @@ export function CycleContainerNode({ data, theme }) {
           background: `${borderColor}e6`,
           color: 'white', borderRadius: '10px 10px 0 0',
           fontSize: 13, fontWeight: 600,
-          cursor: 'pointer', userSelect: 'none',
+          cursor: isToggleable ? 'pointer' : 'default',
+          userSelect: 'none',
           transition: 'background 0.2s ease',
         }}
       >
         <Icon className="w-4 h-4" />
         <span style={{ flex: 1 }}>{label}</span>
-        <span style={{ fontSize: 11, opacity: 0.9 }}>
-          {iterationCount} {countSuffix}{iterationCount !== 1 ? 's' : ''}
-        </span>
-        {isCollapsed ? <ChevronRight className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
+        {iterationCount > 0 && (
+          <span style={{ fontSize: 11, opacity: 0.9 }}>
+            {iterationCount} {countSuffix}{iterationCount !== 1 ? 's' : ''}
+          </span>
+        )}
+        {isToggleable && (
+          isCollapsed ? <ChevronRight className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />
+        )}
       </div>
 
       {/* Collapsed summary */}

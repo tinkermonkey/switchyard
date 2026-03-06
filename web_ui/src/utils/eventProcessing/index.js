@@ -644,28 +644,28 @@ export function processEvents(events, workflowConfig = null) {
 
   reviewCycleBoundaries.forEach(({ startEvent, endEvent }) => {
     const sMs = getMs(startEvent.timestamp)
-    const eMs = endEvent ? getMs(endEvent.timestamp) : sMs
+    const eMs = endEvent ? getMs(endEvent.timestamp) : Date.now()
     firstCycleStartMs = Math.min(firstCycleStartMs, sMs)
     lastCycleEndMs = Math.max(lastCycleEndMs, eMs)
   })
 
   repairCycleBoundaries.forEach(({ startEvent, endEvent }) => {
     const sMs = getMs(startEvent.timestamp)
-    const eMs = endEvent ? getMs(endEvent.timestamp) : sMs
+    const eMs = endEvent ? getMs(endEvent.timestamp) : Date.now()
     firstCycleStartMs = Math.min(firstCycleStartMs, sMs)
     lastCycleEndMs = Math.max(lastCycleEndMs, eMs)
   })
 
   prReviewCycleBoundaries.forEach(({ startEvent, endEvent }) => {
     const sMs = getMs(startEvent.timestamp)
-    const eMs = endEvent ? getMs(endEvent.timestamp) : sMs
+    const eMs = endEvent ? getMs(endEvent.timestamp) : Date.now()
     firstCycleStartMs = Math.min(firstCycleStartMs, sMs)
     lastCycleEndMs = Math.max(lastCycleEndMs, eMs)
   })
 
   conversationalLoopBoundaries.forEach(({ startEvent, endEvent }) => {
     const sMs = getMs(startEvent.timestamp)
-    const eMs = endEvent ? getMs(endEvent.timestamp) : sMs
+    const eMs = endEvent ? getMs(endEvent.timestamp) : Date.now()
     firstCycleStartMs = Math.min(firstCycleStartMs, sMs)
     lastCycleEndMs = Math.max(lastCycleEndMs, eMs)
   })
