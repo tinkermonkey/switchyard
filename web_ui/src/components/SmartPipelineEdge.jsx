@@ -1,4 +1,5 @@
-import { useNodes, BaseEdge, SmoothStepEdge } from '@xyflow/react'
+import { memo, useMemo, useCallback } from 'react'
+import { useStore, BaseEdge, SmoothStepEdge } from '@xyflow/react'
 import {
   getSmartEdge,
   pathfindingJumpPointNoDiagonal,
@@ -175,19 +176,72 @@ function drawSmartEdge(source, target, path) {
   return d
 }
 
+/**
+ * Selector that computes a compact geometry fingerprint for all nodes.
+ * Returns a string primitive — Zustand's equality check (===) then suppresses
+ * re-renders when node positions/sizes haven't actually changed, so A* only
+ * runs after a real layout update, not on every data/status update.
+ */
+function selectNodeGeometry(s) {
+  return s.nodes.map(n => {
+    const w = Math.round(n.measured?.width > 1 ? n.measured.width : (n.style?.width ?? 0))
+    const h = Math.round(n.measured?.height > 1 ? n.measured.height : (n.style?.height ?? 0))
+    return `${n.id}:${Math.round(n.position.x)},${Math.round(n.position.y)},${w},${h}`
+  }).join('|')
+}
+
+/**
+ * Equality guard for React.memo: only re-render when this edge's own endpoints
+ * or handle positions change. Node geometry changes are handled inside via
+ * the useStore fingerprint selector, independently of the prop comparison.
+ */
+function edgePropsEqual(prev, next) {
+  return (
+    prev.sourceX === next.sourceX &&
+    prev.sourceY === next.sourceY &&
+    prev.targetX === next.targetX &&
+    prev.targetY === next.targetY &&
+    prev.source === next.source &&
+    prev.target === next.target &&
+    prev.sourcePosition === next.sourcePosition &&
+    prev.targetPosition === next.targetPosition
+  )
+}
+
 let _edgeRenderCount = 0
 let _edgeTotalMs = 0
+let _edgeReusedCount = 0
 let _edgeLogTimer = null
 
-export default function SmartPipelineEdge(props) {
+function SmartPipelineEdgeInner(props) {
   const { sourcePosition, targetPosition, sourceX, sourceY, targetX, targetY, source, target } = props
-  const allNodes = useNodes()
 
+  // Single store subscription: selector returns a geometry fingerprint string.
+  // Zustand compares the returned string by value (===), so this component only
+  // re-renders when node positions or sizes actually change — not on data/status
+  // updates that account for the majority of store activity during live runs.
+  const { allNodes, geometryKey } = useStore(
+    useCallback(s => {
+      const key = s.nodes.map(n => {
+        const w = Math.round(n.measured?.width > 1 ? n.measured.width : (n.style?.width ?? 0))
+        const h = Math.round(n.measured?.height > 1 ? n.measured.height : (n.style?.height ?? 0))
+        return `${n.id}:${Math.round(n.position.x)},${Math.round(n.position.y)},${w},${h}`
+      }).join('|')
+      return { allNodes: s.nodes, geometryKey: key }
+    }, []),
+    (a, b) => a.geometryKey === b.geometryKey
+  )
+
+  // Recompute obstacle list only when node geometry or this edge's endpoints change.
+  const obstacleNodes = useMemo(
+    () => buildObstacleNodes(allNodes, source, target),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [geometryKey, source, target]
+  )
+
+  // Recompute A* path only when edge handle positions or obstacles change.
   const _t0 = performance.now()
-  const obstacleNodes = buildObstacleNodes(allNodes, source, target)
-  const _t1 = performance.now()
-
-  const result = getSmartEdge({
+  const result = useMemo(() => getSmartEdge({
     sourcePosition,
     targetPosition,
     sourceX,
@@ -201,23 +255,30 @@ export default function SmartPipelineEdge(props) {
       drawEdge: drawSmartEdge,
       generatePath: pathfindingJumpPointNoDiagonal,
     },
-  })
+  }), [sourceX, sourceY, targetX, targetY, sourcePosition, targetPosition, obstacleNodes])
+  const _t1 = performance.now()
 
-  const _t2 = performance.now()
-  _edgeRenderCount++
-  _edgeTotalMs += (_t2 - _t0)
+  const _elapsed = _t1 - _t0
+  if (_elapsed > 0.05) {
+    _edgeRenderCount++
+    _edgeTotalMs += _elapsed
+  } else {
+    _edgeReusedCount++
+  }
 
-  // Batch-log edge render stats once per animation frame to avoid console flood
+  // Batch-log edge timing once per frame to avoid console flood
   if (!_edgeLogTimer) {
     _edgeLogTimer = setTimeout(() => {
-      console.log(
-        `[PerfGraph] SmartPipelineEdge batch: ${_edgeRenderCount} edges rendered` +
-        ` | total:${_edgeTotalMs.toFixed(1)}ms avg:${(_edgeTotalMs / _edgeRenderCount).toFixed(1)}ms/edge` +
-        ` | obstacles per edge: ${allNodes.length}` +
-        ` | last edge obstacleNodes:${(_t1 - _t0).toFixed(1)}ms pathfind:${(_t2 - _t1).toFixed(1)}ms`
-      )
+      if (_edgeRenderCount > 0 || _edgeReusedCount > 0) {
+        console.log(
+          `[PerfGraph] SmartPipelineEdge: ${_edgeRenderCount} A* runs ${_edgeReusedCount} cache-hits` +
+          ` | A* total:${_edgeTotalMs.toFixed(1)}ms avg:${(_edgeRenderCount ? _edgeTotalMs / _edgeRenderCount : 0).toFixed(1)}ms/edge` +
+          ` | obstacles:${allNodes.length}`
+        )
+      }
       _edgeRenderCount = 0
       _edgeTotalMs = 0
+      _edgeReusedCount = 0
       _edgeLogTimer = null
     }, 0)
   }
@@ -228,3 +289,5 @@ export default function SmartPipelineEdge(props) {
 
   return <BaseEdge path={result.svgPathString} {...props} />
 }
+
+export default memo(SmartPipelineEdgeInner, edgePropsEqual)
