@@ -56,6 +56,29 @@ export default function AgentExecutionState({
   const { lastTodoWrite, lastTextMessage, lastToolCall, previousToolCall, previousToolResult, inputPrompt } = agentState
   const isExecuting = executionData?.status === 'running'
 
+  const metaCols = [
+    ...(pipelineRunId ? [{
+      label: 'Pipeline Run',
+      value: (
+        <Link
+          to="/pipeline-run"
+          search={{ runId: pipelineRunId }}
+          className="font-mono text-xs text-gh-accent-fg hover:underline"
+          title="View pipeline run"
+        >
+          {pipelineRunId}
+        </Link>
+      ),
+    }] : []),
+    { label: 'Execution ID', value: <span className="font-mono">{executionId}</span> },
+    { label: 'Task ID', value: <span className="font-mono">{executionData.task_id}</span> },
+    { label: 'Project', value: executionData.project },
+    { label: 'Agent', value: formatAgentName(executionData.agent) },
+    { label: 'Started', value: new Date(executionData.started_at).toLocaleString() },
+    ...(executionData.ended_at ? [{ label: 'Ended', value: new Date(executionData.ended_at).toLocaleString() }] : []),
+    ...(executionData.duration ? [{ label: 'Duration', value: `${Math.floor(executionData.duration / 60)}m ${Math.floor(executionData.duration % 60)}s` }] : []),
+  ]
+
   return (
     <div className="bg-gh-canvas-subtle rounded-md border border-gh-border mb-5">
       <div className="p-4 border-b border-gh-border flex items-center justify-between">
@@ -79,63 +102,23 @@ export default function AgentExecutionState({
       </div>
 
       <div className="p-4">
-        <div className="grid grid-cols-2 gap-4 mb-4">
-          <div className="space-y-2">
-            {pipelineRunId && (
-              <div className="text-sm">
-                <span className="text-gh-fg-muted">Pipeline Run ID:</span>
-                <Link
-                  to="/pipeline-run"
-                  search={{ runId: pipelineRunId }}
-                  className="ml-2 font-mono text-xs text-gh-accent-fg hover:underline"
-                  title="View pipeline run"
-                >
-                  {pipelineRunId}
-                </Link>
-              </div>
-            )}
-            <div className="text-sm">
-              <span className="text-gh-fg-muted">Execution ID:</span>
-              <span className="ml-2 font-mono text-xs">{executionId}</span>
-            </div>
-            <div className="text-sm">
-              <span className="text-gh-fg-muted">Task ID:</span>
-              <span className="ml-2 font-mono text-xs">{executionData.task_id}</span>
-            </div>
-            <div className="text-sm">
-              <span className="text-gh-fg-muted">Project:</span>
-              <span className="ml-2">{executionData.project}</span>
-            </div>
-            {executionData.agent ? (
-              <div className="text-sm mt-2">
-                <span className="text-gh-fg-muted">Selected agent:</span>
-                <span className="ml-2 font-mono text-xs">{formatAgentName(executionData.agent)}</span>
-              </div>
-            ) : (
-              <div className="text-sm mt-2">
-                <span className="text-gh-fg-muted">Selected agent:</span>
-                <span className="ml-2 font-mono text-xs">Unknown Agent</span>
-              </div>
-            )}
-          </div>
-          <div className="space-y-2">
-            <div className="text-sm">
-              <span className="text-gh-fg-muted">Started:</span>
-              <span className="ml-2">{new Date(executionData.started_at).toLocaleString()}</span>
-            </div>
-            {executionData.ended_at && (
-              <div className="text-sm">
-                <span className="text-gh-fg-muted">Ended:</span>
-                <span className="ml-2">{new Date(executionData.ended_at).toLocaleString()}</span>
-              </div>
-            )}
-            {executionData.duration && (
-              <div className="text-sm">
-                <span className="text-gh-fg-muted">Duration:</span>
-                <span className="ml-2">{Math.floor(executionData.duration / 60)}m {Math.floor(executionData.duration % 60)}s</span>
-              </div>
-            )}
-          </div>
+        <div className="overflow-x-auto mb-4">
+          <table className="text-xs border-collapse">
+            <thead>
+              <tr>
+                {metaCols.map(col => (
+                  <th key={col.label} className="text-left font-medium pr-5 pb-0.5 whitespace-nowrap text-gh-fg-muted opacity-70">{col.label}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                {metaCols.map(col => (
+                  <td key={col.label} className="pr-5 whitespace-nowrap text-gh-fg-muted">{col.value}</td>
+                ))}
+              </tr>
+            </tbody>
+          </table>
         </div>
 
         {/* When completed, use two-row layout */}
@@ -167,9 +150,8 @@ export default function AgentExecutionState({
                   </div>
                   <div className="relative">
                     <div
-                      className={`prose prose-sm prose-invert font-mono text-xs max-w-none transition-all break-words ${
-                        isPromptExpanded ? '' : 'max-h-[200px] overflow-y-auto'
-                      }`}
+                      className={`prose prose-sm prose-invert font-mono text-xs max-w-none transition-all break-words ${isPromptExpanded ? '' : 'max-h-[200px] overflow-y-auto'
+                        }`}
                       style={{ overflowWrap: 'break-word' }}
                     >
                       <ReactMarkdown remarkPlugins={[remarkGfm]}>
@@ -205,9 +187,8 @@ export default function AgentExecutionState({
                   </div>
                   <div className="relative">
                     <div
-                      className={`prose prose-sm prose-invert font-mono text-xs max-w-none transition-all break-words ${
-                        isMessageExpanded ? '' : 'max-h-[200px] overflow-y-auto'
-                      }`}
+                      className={`prose prose-sm prose-invert font-mono text-xs max-w-none transition-all break-words ${isMessageExpanded ? '' : 'max-h-[200px] overflow-y-auto'
+                        }`}
                       style={{ overflowWrap: 'break-word' }}
                     >
                       <ReactMarkdown remarkPlugins={[remarkGfm]}>
@@ -287,9 +268,8 @@ export default function AgentExecutionState({
                     </div>
                     <div className="relative">
                       <div
-                        className={`prose prose-sm prose-invert font-mono text-xs max-w-none transition-all break-words ${
-                          isPreviousResultExpanded ? '' : 'max-h-[200px] overflow-y-auto'
-                        }`}
+                        className={`prose prose-sm prose-invert font-mono text-xs max-w-none transition-all break-words ${isPreviousResultExpanded ? '' : 'max-h-[200px] overflow-y-auto'
+                          }`}
                         style={{ overflowWrap: 'break-word' }}
                       >
                         {typeof previousToolResult.content === 'string' ? (
@@ -345,9 +325,8 @@ export default function AgentExecutionState({
                   </div>
                   <div className="relative">
                     <div
-                      className={`prose prose-sm prose-invert font-mono text-xs max-w-none transition-all break-words ${
-                        isPromptExpanded ? '' : 'max-h-[200px] overflow-y-auto'
-                      }`}
+                      className={`prose prose-sm prose-invert font-mono text-xs max-w-none transition-all break-words ${isPromptExpanded ? '' : 'max-h-[200px] overflow-y-auto'
+                        }`}
                       style={{ overflowWrap: 'break-word' }}
                     >
                       <ReactMarkdown remarkPlugins={[remarkGfm]}>
@@ -384,9 +363,8 @@ export default function AgentExecutionState({
                   </div>
                   <div className="relative">
                     <div
-                      className={`prose prose-sm prose-invert font-mono text-xs max-w-none transition-all break-words ${
-                        isMessageExpanded ? '' : 'max-h-[200px] overflow-y-auto'
-                      }`}
+                      className={`prose prose-sm prose-invert font-mono text-xs max-w-none transition-all break-words ${isMessageExpanded ? '' : 'max-h-[200px] overflow-y-auto'
+                        }`}
                       style={{ overflowWrap: 'break-word' }}
                     >
                       <ReactMarkdown remarkPlugins={[remarkGfm]}>
@@ -461,9 +439,8 @@ export default function AgentExecutionState({
                   </div>
                   <div className="relative">
                     <div
-                      className={`prose prose-sm prose-invert font-mono text-xs max-w-none transition-all break-words ${
-                        isPreviousResultExpanded ? '' : 'max-h-[200px] overflow-y-auto'
-                      }`}
+                      className={`prose prose-sm prose-invert font-mono text-xs max-w-none transition-all break-words ${isPreviousResultExpanded ? '' : 'max-h-[200px] overflow-y-auto'
+                        }`}
                       style={{ overflowWrap: 'break-word' }}
                     >
                       {typeof previousToolResult.content === 'string' ? (
