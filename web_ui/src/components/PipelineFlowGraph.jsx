@@ -117,6 +117,9 @@ export default function PipelineFlowGraph({
   // Increments only on structural changes; LayoutController uses this (not rawBuild)
   // to decide when to reset and re-run layout.
   const [structuralVersion, setStructuralVersion] = useState(0)
+  // Increments on data-only changes (same node IDs, status/label updates); LayoutController
+  // uses this to re-run layout with fresh measurements without resetting the viewport.
+  const [dataVersion, setDataVersion] = useState(0)
   // Tracks the node IDs from the last layout pass to distinguish structural
   // changes (new/removed nodes) from data-only updates (status/label changes).
   const prevNodeIdsRef = useRef(new Set())
@@ -197,6 +200,9 @@ export default function PipelineFlowGraph({
         const newData = newDataById.get(node.id)
         return newData ? { ...node, data: newData } : node
       }))
+      // Signal LayoutController to re-run layout after React Flow re-measures the updated
+      // nodes — picks up any dimension changes caused by the data update.
+      setDataVersion(v => v + 1)
     }
   }, [rawBuild, setNodes, setEdges])
 
@@ -282,6 +288,7 @@ export default function PipelineFlowGraph({
             <LayoutController
               rawBuild={rawBuild}
               structuralVersion={structuralVersion}
+              dataVersion={dataVersion}
               layoutOptions={mergedLayoutOptions}
               finalizeNodes={finalizeNodes}
               setNodes={setNodes}

@@ -31,6 +31,7 @@ import { applyCycleLayout, updateEdgesForCycles } from '../utils/cycleLayout'
 export default function LayoutController({
   rawBuild,
   structuralVersion,
+  dataVersion,
   layoutOptions,
   finalizeNodes,
   setNodes,
@@ -130,8 +131,10 @@ export default function LayoutController({
     setViewport({ x, y, zoom }, { duration })
   }, [fitView, setViewport, storeApi])
 
-  // Core layout runner — stable identity, reads mutable state via refs
-  const runLayout = useCallback(() => {
+  // Core layout runner — stable identity, reads mutable state via refs.
+  // skipFitView: when true, skips the viewport pan/zoom after layout so the user's
+  // current viewport is preserved (used for data-only re-layouts).
+  const runLayout = useCallback((skipFitView = false) => {
     const rb = rawBuildRef.current
     if (!rb || rb.nodes.length === 0) return
     const rawMeasuredNodes = getNodes()
@@ -167,9 +170,11 @@ export default function LayoutController({
     layoutDone.current = true
     lastFinalNodesRef.current = finalNodes
     onLayoutDoneRef.current?.(finalNodes)
-    const duration = isFirstLayout.current ? 0 : 300
-    isFirstLayout.current = false
-    setTimeout(() => applyAlignedFitView(finalNodes, duration), 50)
+    if (!skipFitView) {
+      const duration = isFirstLayout.current ? 0 : 300
+      isFirstLayout.current = false
+      setTimeout(() => applyAlignedFitView(finalNodes, duration), 50)
+    }
   }, [getNodes, setNodes, setEdges, applyAlignedFitView])
 
   // Reset layout flag on structural changes (new/removed nodes) so Phase 2 re-runs.
@@ -191,6 +196,18 @@ export default function LayoutController({
     const finalEdges = updateEdgesForCycles(rawBuild.edges, rawBuild.updatedCycles, rawBuild.agentExecutions)
     setEdges(finalEdges)
   }, [rawBuild, setEdges])
+
+  // Data-only re-layout: when node data changes (same node IDs), React Flow re-renders
+  // and re-measures the affected nodes. We wait a frame for dimension events to propagate
+  // into nodeSizeCacheRef, then re-run layout with the updated measurements. skipFitView
+  // keeps the user's current viewport position — this is a silent correction pass.
+  // Skipped when a structural change is pending (layoutDone.current === false), since the
+  // upcoming Phase 2 layout will incorporate the latest measurements anyway.
+  useEffect(() => {
+    if (dataVersion === 0 || !layoutDone.current) return
+    const t = setTimeout(() => runLayout(true), 50)
+    return () => clearTimeout(t)
+  }, [dataVersion, runLayout])
 
   // Phase 2: all current nodes measured → apply layout.
   // structuralVersion is included so this re-evaluates when new nodes are added to an
