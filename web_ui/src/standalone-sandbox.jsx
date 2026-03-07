@@ -2,7 +2,7 @@ import { Upload, RotateCcw, Download } from 'lucide-react'
 import PipelineFlowGraph, { DEFAULT_LAYOUT_OPTIONS } from './components/PipelineFlowGraph'
 import { useState, useEffect, useCallback, useMemo } from 'react'
 import { toggleCycleCollapsed } from './utils/cycleLayout'
-import { buildFlowchart } from './utils/buildFlowchart'
+import { buildFlowchart, findActiveContainerPath } from './utils/buildFlowchart'
 
 // Human-readable labels for the layout parameter sliders.
 // Only keys present here will show as sliders; the rest of DEFAULT_LAYOUT_OPTIONS
@@ -77,17 +77,38 @@ export default function StandaloneSandbox() {
     // account for 80%+ of events in large runs and cause layout thread exhaustion.
     const graphEvents = events.filter(e => e.event_category !== 'claude_log')
 
+    // Compute active task_ids from events (same logic as pipeline-run.jsx)
+    const agentTaskInit = new Map()
+    const agentTaskDone = new Set()
+    graphEvents.forEach(e => {
+      if (e.event_type === 'agent_initialized') agentTaskInit.set(e.task_id, e.agent)
+      else if (e.event_type === 'agent_completed' || e.event_type === 'agent_failed') agentTaskDone.add(e.task_id)
+    })
+    const activeTaskIds = new Set()
+    agentTaskInit.forEach((agent, taskId) => {
+      if (!agentTaskDone.has(taskId)) activeTaskIds.add(taskId)
+    })
+
     const result = buildFlowchart({
       events: graphEvents,
       existingCycles: cycles,
       workflowConfig: workflowConfig || null,
       selectedPipelineRun: pipelineRun,
-      activeTaskIds: new Set(),
+      activeTaskIds,
     })
 
     const { updatedCycles } = result
+
+    // Auto-expand containers on the active agent path
+    if (result.model && activeTaskIds.size > 0) {
+      const activeContainerIds = findActiveContainerPath(result.model, activeTaskIds)
+      activeContainerIds.forEach(id => {
+        updatedCycles.set(id, { ...(updatedCycles.get(id) ?? {}), isCollapsed: false })
+      })
+    }
+
     const hasNewCycles = updatedCycles.size > 0 &&
-      [...updatedCycles.keys()].some(k => !cycles.has(k))
+      [...updatedCycles.keys()].some(k => !cycles.has(k) || cycles.get(k)?.isCollapsed !== updatedCycles.get(k)?.isCollapsed)
     if (hasNewCycles) {
       setCycles(updatedCycles)
       return
