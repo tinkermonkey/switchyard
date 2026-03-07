@@ -1,16 +1,17 @@
 """
 Pipeline Run Analysis Service
 
-Automatically investigates completed pipeline runs by invoking Claude CLI
-with bash tool access to query ES, run the timeline script, and check Docker logs.
+Automatically investigates completed pipeline runs by invoking Claude via the
+standard Docker execution path (run_claude_code / docker_runner). Claude gets
+bash tool access to query ES and investigate events dynamically.
 Results are stored back on the pipeline-run ES document.
 """
 
+import asyncio
 import json
 import logging
-import os
-import subprocess
 import threading
+import uuid
 from typing import Optional
 
 from elasticsearch import Elasticsearch
@@ -21,6 +22,10 @@ _ANALYSIS_JSON_START = "---ANALYSIS_JSON_START---"
 _ANALYSIS_JSON_END = "---ANALYSIS_JSON_END---"
 
 _SKILL_PATH = "/app/.claude/skills/pipeline-investigate/SKILL.md"
+_AGENT_NAME = "pipeline_analysis"
+# Mount the orchestrator codebase read-only — gives Claude access to scripts and skill files.
+# filesystem_write_allowed=false in agents.yaml ensures Docker runner mounts this as :ro.
+_PROJECT_NAME = "clauditoreum"
 
 
 class PipelineRunAnalysisService:
@@ -35,9 +40,9 @@ class PipelineRunAnalysisService:
     # ------------------------------------------------------------------
 
     def trigger_analysis_async(self, run_id: str, started_at: str) -> None:
-        """Fire-and-forget: spawn daemon thread to analyse the run."""
+        """Fire-and-forget: spawn daemon thread running a fresh event loop for the analysis."""
         t = threading.Thread(
-            target=self._run_analysis_safe,
+            target=self._run_in_new_loop,
             args=(run_id, started_at),
             daemon=True,
             name=f"pipeline-analysis-{run_id[:8]}",
@@ -46,35 +51,47 @@ class PipelineRunAnalysisService:
         logger.info(f"pipeline_run_analysis: triggered async for run {run_id}")
 
     def run_analysis_for_run(self, run_id: str, started_at: str) -> None:
-        """Synchronously analyse a single run (used by catch-up scan)."""
-        self._run_analysis_safe(run_id, started_at)
+        """Synchronously analyse a single run (used by catch-up scan via thread pool)."""
+        self._run_in_new_loop(run_id, started_at)
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _run_analysis_safe(self, run_id: str, started_at: str) -> None:
+    def _run_in_new_loop(self, run_id: str, started_at: str) -> None:
+        """Run the async analysis in a fresh event loop (called from daemon thread)."""
         try:
-            self._run_analysis(run_id, started_at)
+            asyncio.run(self._run_analysis(run_id, started_at))
         except Exception as e:
             logger.error(
                 f"pipeline_run_analysis: unhandled error for run {run_id}: {e}",
                 exc_info=True,
             )
 
-    def _run_analysis(self, run_id: str, started_at: str) -> None:
-        if self._already_analyzed(run_id, started_at):
+    async def _run_analysis(self, run_id: str, started_at: str) -> None:
+        if self._already_analyzed(run_id):
             logger.info(f"pipeline_run_analysis: run {run_id} already has summary — skipping")
             return
 
         logger.info(f"pipeline_run_analysis: starting analysis for run {run_id}")
 
         prompt = self._build_prompt(run_id)
-        raw_text = self._run_claude(prompt)
+        context = self._build_context(run_id)
+
+        try:
+            from claude.claude_integration import run_claude_code
+            raw_text = await run_claude_code(prompt, context)
+        except Exception as e:
+            logger.error(f"pipeline_run_analysis: claude execution failed for run {run_id}: {e}", exc_info=True)
+            return
 
         if not raw_text:
             logger.warning(f"pipeline_run_analysis: empty output from Claude for run {run_id}")
             return
+
+        # run_claude_code may return a dict (docker path) or a string (non-docker path)
+        if isinstance(raw_text, dict):
+            raw_text = raw_text.get('result', '')
 
         summary, success, orch_recs, proj_recs = self._parse_response(raw_text)
 
@@ -91,7 +108,21 @@ class PipelineRunAnalysisService:
             f"(success={success}, orch_recs={len(orch_recs)}, proj_recs={len(proj_recs)})"
         )
 
-    def _already_analyzed(self, run_id: str, started_at: str) -> bool:
+    def _build_context(self, run_id: str) -> dict:
+        """Build the context dict expected by run_claude_code / docker_runner."""
+        from config.manager import config_manager
+        agent_config = config_manager.get_agent(_AGENT_NAME)
+        task_id = f"analysis-{run_id[:12]}-{uuid.uuid4().hex[:6]}"
+        return {
+            'agent': _AGENT_NAME,
+            'task_id': task_id,
+            'project': _PROJECT_NAME,
+            'agent_config': agent_config,
+            'use_docker': True,
+            'mcp_servers': [],
+        }
+
+    def _already_analyzed(self, run_id: str) -> bool:
         """Return True if the ES document already has a non-empty summary."""
         try:
             result = self.es.search(
@@ -128,6 +159,10 @@ Pipeline Run ID to investigate: {run_id}
 
 Follow the investigation steps above (Steps 1–7) for pipeline run `{run_id}`.
 
+Note: This analysis runs after pipeline completion. Agent containers are already removed (--rm),
+so Step 2 (docker-compose exec timeline script) and Step 5 (docker logs) will not be available.
+Focus on the Elasticsearch queries in Steps 1, 3, 4, and 6, then synthesize in Step 7.
+
 After completing the investigation, output your findings in the following exact format:
 
 [Human-readable markdown summary — include a timeline table and root cause analysis]
@@ -158,85 +193,6 @@ Set "success" to false if the pipeline run failed or produced no useful output.
 Omit "filePath" from projectRecommendations entries (it is optional on orchestrator entries only).
 If there is nothing to recommend, use empty arrays.
 """
-
-    def _run_claude(self, prompt: str) -> str:
-        """Invoke Claude CLI and return concatenated assistant text."""
-        cmd = [
-            "claude",
-            "--print",
-            "--output-format", "stream-json",
-            "--permission-mode", "bypassPermissions",
-        ]
-
-        env = os.environ.copy()
-
-        try:
-            process = subprocess.Popen(
-                cmd,
-                cwd="/app",
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                stdin=subprocess.PIPE,
-                text=True,
-                env=env,
-            )
-
-            try:
-                process.stdin.write(prompt)
-                process.stdin.close()
-            except Exception as e:
-                process.kill()
-                raise RuntimeError(f"Failed to write prompt to stdin: {e}")
-
-            result_parts = []
-            stderr_lines = []
-
-            def read_stderr():
-                try:
-                    for line in iter(process.stderr.readline, ""):
-                        if line.strip():
-                            stderr_lines.append(line.strip())
-                            logger.debug(f"pipeline_run_analysis claude stderr: {line.strip()}")
-                except Exception:
-                    pass
-
-            stderr_thread = threading.Thread(target=read_stderr, daemon=True)
-            stderr_thread.start()
-
-            for line in iter(process.stdout.readline, ""):
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    event = json.loads(line)
-                    if event.get("type") == "assistant":
-                        message = event.get("message", {})
-                        for item in message.get("content", []):
-                            if isinstance(item, dict) and item.get("type") == "text":
-                                text = item.get("text", "")
-                                if text:
-                                    result_parts.append(text)
-                except json.JSONDecodeError:
-                    pass
-
-            process.wait(timeout=300)
-            stderr_thread.join(timeout=5)
-
-            if process.returncode != 0:
-                logger.warning(
-                    f"pipeline_run_analysis: claude exited with code {process.returncode}. "
-                    f"stderr: {' | '.join(stderr_lines[-5:])}"
-                )
-
-            return "".join(result_parts)
-
-        except subprocess.TimeoutExpired:
-            process.kill()
-            logger.error("pipeline_run_analysis: claude CLI timed out after 300s")
-            return ""
-        except Exception as e:
-            logger.error(f"pipeline_run_analysis: error running claude CLI: {e}", exc_info=True)
-            return ""
 
     def _parse_response(self, text: str):
         """

@@ -282,6 +282,23 @@ agents:
     mcp_servers:
       - context7
 
+  pipeline_analysis:
+    description: "Post-completion analysis of pipeline runs — investigates events, identifies root causes, stores structured results on the ES document"
+    model: "claude-sonnet-4-6"
+    timeout: 300
+    retries: 1
+    makes_code_changes: false
+    filesystem_write_allowed: false  # Mounts /workspace/clauditoreum read-only; only queries ES
+    requires_dev_container: false    # Uses orchestrator image — no project dependencies needed
+    requires_docker: true
+    capabilities:
+      - pipeline_analysis
+      - root_cause_analysis
+      - elasticsearch_querying
+    tools_enabled:
+      - file_operations
+    mcp_servers: []
+
 # Default agent configuration applied to all agents
 default_config:
   working_directory: "/workspace/{project_name}"

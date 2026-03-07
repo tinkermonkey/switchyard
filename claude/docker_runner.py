@@ -534,9 +534,15 @@ class DockerAgentRunner:
         logger.info(f"Mounting project: container={container_path_str}, host={host_project_path}")
 
         # Get agent config to check filesystem write permission
-        from config.manager import config_manager
-        agent_config = config_manager.get_project_agent_config(context.get('project', 'unknown'), agent)
-        filesystem_write_allowed = getattr(agent_config, 'filesystem_write_allowed', True)
+        # Fall back to context-provided agent_config for system-level agents (e.g. pipeline_analysis)
+        # that don't belong to a project config file.
+        try:
+            from config.manager import config_manager
+            agent_config = config_manager.get_project_agent_config(context.get('project', 'unknown'), agent)
+            filesystem_write_allowed = getattr(agent_config, 'filesystem_write_allowed', True)
+        except Exception:
+            ctx_agent_config = context.get('agent_config')
+            filesystem_write_allowed = getattr(ctx_agent_config, 'filesystem_write_allowed', False)
 
         # Determine mount mode for workspace
         workspace_mount_mode = 'rw' if filesystem_write_allowed else 'ro'
@@ -727,9 +733,12 @@ class DockerAgentRunner:
         from config.manager import config_manager
         from services.dev_container_state import dev_container_state
 
-        # Get agent configuration
-        agent_config = config_manager.get_project_agent_config(project, agent)
-        requires_dev_container = getattr(agent_config, 'requires_dev_container', False)
+        # Get agent configuration; fall back gracefully for system-level agents without a project config
+        try:
+            agent_config = config_manager.get_project_agent_config(project, agent)
+            requires_dev_container = getattr(agent_config, 'requires_dev_container', False)
+        except Exception:
+            requires_dev_container = False
 
         if requires_dev_container:
             # Check if project's dev container is verified
