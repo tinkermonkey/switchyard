@@ -124,6 +124,27 @@ class ScheduledTasksService:
             replace_existing=True
         )
 
+        # Pipeline analysis catch-up on startup (handles restarts missing the trigger)
+        analysis_startup_jitter = random.uniform(120, 300)  # 2–5 min, let ES warm up
+        self.scheduler.add_job(
+            self._run_pipeline_analysis_catchup,
+            trigger=DateTrigger(
+                run_date=datetime.now(timezone.utc) + timedelta(seconds=analysis_startup_jitter)
+            ),
+            id='pipeline_analysis_catchup_startup',
+            name='Pipeline analysis catchup (startup)',
+            replace_existing=True
+        )
+
+        # Pipeline analysis catch-up every 10 minutes
+        self.scheduler.add_job(
+            self._run_pipeline_analysis_catchup,
+            trigger=IntervalTrigger(minutes=10),
+            id='pipeline_analysis_catchup',
+            name='Pipeline analysis catchup (periodic)',
+            replace_existing=True
+        )
+
         self.scheduler.start()
         self.running = True
         logger.info("Scheduled tasks service started")
@@ -137,6 +158,7 @@ class ScheduledTasksService:
         logger.info(f"- Token metrics computation: Every {token_metrics_hours} hours")
         logger.info("- Project metrics rollup: Daily at 3:30 AM")
         logger.info(f"- Project metrics backfill: Once at startup in ~{jitter_seconds:.0f}s")
+        logger.info(f"- Pipeline analysis catchup: Once at startup in ~{analysis_startup_jitter:.0f}s, then every 10 min")
 
     def stop(self):
         """Stop the scheduler"""
@@ -714,6 +736,54 @@ class ScheduledTasksService:
             await service.run_metrics_job(lookback_days=7)
         except Exception as e:
             logger.error(f"Fatal error in project metrics backfill: {e}", exc_info=True)
+
+    async def _run_pipeline_analysis_catchup(self):
+        """
+        Catch-up scan: find completed pipeline runs missing a summary and analyse them.
+
+        Queries ES for completed runs in the last 24h with no summary field, then
+        runs analysis for each. This handles restarts where the inline trigger was missed.
+        """
+        logger.info("pipeline_run_analysis: starting catch-up scan")
+
+        try:
+            from services.pipeline_run_analysis import get_pipeline_run_analysis_service
+
+            service = get_pipeline_run_analysis_service()
+
+            result = service.es.search(
+                index="pipeline-runs-*",
+                body={
+                    "query": {
+                        "bool": {
+                            "must": [{"term": {"status": "completed"}}],
+                            "must_not": [{"exists": {"field": "summary"}}],
+                            "filter": [{"range": {"ended_at": {"gte": "now-24h"}}}],
+                        }
+                    },
+                    "size": 20,
+                    "_source": ["id", "started_at"],
+                },
+            )
+
+            hits = result.get("hits", {}).get("hits", [])
+            logger.info(f"pipeline_run_analysis: catch-up scan found {len(hits)} unanalysed runs")
+
+            loop = asyncio.get_event_loop()
+            for hit in hits:
+                source = hit.get("_source", {})
+                run_id = source.get("id")
+                started_at = source.get("started_at", "")
+                if run_id:
+                    # Run in thread pool — blocking subprocess call
+                    await loop.run_in_executor(
+                        None, service.run_analysis_for_run, run_id, started_at
+                    )
+
+            logger.info("pipeline_run_analysis: catch-up scan complete")
+
+        except Exception as e:
+            logger.error(f"pipeline_run_analysis: error in catch-up scan: {e}", exc_info=True)
 
     def run_cleanup_now(self):
         """Run cleanup task immediately (for testing/manual trigger)"""
