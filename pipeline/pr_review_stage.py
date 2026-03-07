@@ -8,6 +8,7 @@ Similar to RepairCycleStage architecture - orchestrates multiple agent
 invocations without running in Docker itself.
 """
 
+import asyncio
 import logging
 import subprocess
 import json
@@ -1215,13 +1216,29 @@ If all requirements are met, write "All requirements verified - no gaps found" a
 
                 issue_number = url_match.group(1)
 
-                # Get node ID
-                view_result = subprocess.run(
-                    ['gh', 'issue', 'view', issue_number, '-R', repo,
-                     '--json', 'id,number,url'],
-                    capture_output=True, text=True, check=True, timeout=30
-                )
-                issue_data = json.loads(view_result.stdout)
+                # Get node ID - retry with backoff since GitHub's API can lag
+                # immediately after a rapid series of issue creations.
+                issue_data = None
+                for _attempt in range(3):
+                    view_result = subprocess.run(
+                        ['gh', 'issue', 'view', issue_number, '-R', repo,
+                         '--json', 'id,number,url'],
+                        capture_output=True, text=True, timeout=30
+                    )
+                    if view_result.returncode == 0:
+                        issue_data = json.loads(view_result.stdout)
+                        break
+                    delay = 2 ** _attempt
+                    logger.warning(
+                        f"gh issue view {issue_number} failed (attempt {_attempt + 1}/3, "
+                        f"retrying in {delay}s): {view_result.stderr.strip()}"
+                    )
+                    await asyncio.sleep(delay)
+                if issue_data is None:
+                    raise RuntimeError(
+                        f"gh issue view {issue_number} failed after 3 attempts: "
+                        f"{view_result.stderr.strip()}"
+                    )
                 issue_id = issue_data['id']
 
                 # Add to SDLC board
