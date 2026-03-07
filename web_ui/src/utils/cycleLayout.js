@@ -32,6 +32,13 @@ const CONTAINER_TYPES = new Set([
 // Debug logging control - set to true to enable verbose console logging
 const DEBUG_CYCLE_LAYOUT = false
 
+// Fallback dimensions for collapsed cycle container nodes used on the first layout pass,
+// before React Flow has measured the rendered component. After Fix 1 (buildFlowchart.js),
+// collapsed containers have no pre-populated `measured`, so these values apply only until
+// RF fires its first ResizeObserver event with real dimensions.
+const COLLAPSED_CYCLE_HEIGHT = 120
+const COLLAPSED_CYCLE_WIDTH = 280
+
 /**
  * Groups sub-cycle and direct-child nodes into per-iteration columns.
  * Returns null if there are no subCycles (callers fall back to vertical layout).
@@ -238,12 +245,15 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
   const _clT1 = performance.now() // categorise + lookup maps done
 
   // ── Pass 0: Size subCycleContainers (bottom-up) ───────────────────────────
-  const COLLAPSED_WIDTH = 280
-  const COLLAPSED_HEIGHT = 100
+  const COLLAPSED_WIDTH = COLLAPSED_CYCLE_WIDTH
+  const COLLAPSED_HEIGHT = COLLAPSED_CYCLE_HEIGHT
   const subCycleSizes = new Map()
   subCycleContainers.forEach(sc => {
     if (sc.data?.isCollapsed) {
-      subCycleSizes.set(sc.id, { width: COLLAPSED_WIDTH, height: COLLAPSED_HEIGHT })
+      subCycleSizes.set(sc.id, {
+        width: sc.measured?.width > 1 ? sc.measured.width : COLLAPSED_WIDTH,
+        height: sc.measured?.height > 1 ? sc.measured.height : COLLAPSED_HEIGHT,
+      })
       return
     }
     const leaves = leavesBySubCycle.get(sc.id) || []
@@ -262,7 +272,10 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
   const iterSizes = new Map()
   iterContainers.forEach(iter => {
     if (iter.data?.isCollapsed) {
-      iterSizes.set(iter.id, { width: COLLAPSED_WIDTH, height: COLLAPSED_HEIGHT })
+      iterSizes.set(iter.id, {
+        width: iter.measured?.width > 1 ? iter.measured.width : COLLAPSED_WIDTH,
+        height: iter.measured?.height > 1 ? iter.measured.height : COLLAPSED_HEIGHT,
+      })
       return
     }
     const directChildren = childrenByIter.get(iter.id) || []
@@ -307,6 +320,14 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
   // ── Pass 2: Size cycle containers ────────────────────────────────────────
   const cycleSizes = new Map()
   cycleContainers.forEach(cc => {
+    if (cc.data?.isCollapsed) {
+      cycleSizes.set(cc.id, {
+        width: cc.measured?.width > 1 ? cc.measured.width : COLLAPSED_WIDTH,
+        height: cc.measured?.height > 1 ? cc.measured.height : COLLAPSED_HEIGHT,
+      })
+      return
+    }
+
     const iters = itersByParent.get(cc.id) || []
     const direct = directChildrenByCycle.get(cc.id) || []
     const maxIterHeight = iters.reduce(
@@ -385,10 +406,15 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
     const nextNode = rootLayoutNodes[index + 1]
     if (isRootCycleType(node.type)) {
       const size = cycleSizes.get(node.id) || { width: 500, height: 200 }
+      // Collapsed containers: set only width — RF measures height from rendered content.
+      // Expanded containers: set both width and height as computed by the layout engine.
+      const nodeStyle = node.data?.isCollapsed
+        ? { ...node.style, width: size.width }
+        : { ...node.style, width: size.width, height: size.height }
       positionedNodes.set(node.id, {
         ...node,
         position: { x: centerXPosition - size.width / 2, y: currentY },
-        style: { ...node.style, width: size.width, height: size.height },
+        style: nodeStyle,
       })
       currentY += size.height + cycleGap
     } else {
@@ -421,6 +447,7 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
 
     if (cc.type === 'reviewCycleContainer' || cc.type === 'prReviewCycleContainer') {
       let relX = cyclePadding
+      const maxIterH = iters.reduce((max, it) => Math.max(max, iterSizes.get(it.id)?.height ?? 0), 0)
 
       // Start event (leftmost direct child)
       if (direct[0]) {
@@ -431,13 +458,16 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
         relX += (direct[0].measured?.width ?? nodeWidth) + horizontalSpacing
       }
 
-      // Iteration containers
+      // Iteration containers — vertically centered within the tallest iteration's space
       iters.forEach(iter => {
         const iterSize = iterSizes.get(iter.id) || { width: nodeWidth + iterPadding * 2, height: 200 }
+        const iterY = contentY + Math.round((maxIterH - iterSize.height) / 2)
         positionedNodes.set(iter.id, {
           ...iter,
-          position: { x: relX, y: contentY },
-          style: { ...iter.style, width: iterSize.width, height: iterSize.height },
+          position: { x: relX, y: iterY },
+          style: iter.data?.isCollapsed
+            ? { ...iter.style, width: iterSize.width }
+            : { ...iter.style, width: iterSize.width, height: iterSize.height },
         })
         relX += iterSize.width + horizontalSpacing
       })
@@ -451,6 +481,7 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
       }
     } else if (cc.type === 'repairCycleContainer') {
       let relX = cyclePadding
+      const maxIterH = iters.reduce((max, it) => Math.max(max, iterSizes.get(it.id)?.height ?? 0), 0)
 
       // Residual event column (direct event children outside any test cycle)
       if (direct.length > 0) {
@@ -468,12 +499,16 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
         relX += maxW + horizontalSpacing
       }
 
+      // Iteration containers — vertically centered within the tallest iteration's space
       iters.forEach(iter => {
         const iterSize = iterSizes.get(iter.id) || { width: nodeWidth + iterPadding * 2, height: 200 }
+        const iterY = contentY + Math.round((maxIterH - iterSize.height) / 2)
         positionedNodes.set(iter.id, {
           ...iter,
-          position: { x: relX, y: contentY },
-          style: { ...iter.style, width: iterSize.width, height: iterSize.height },
+          position: { x: relX, y: iterY },
+          style: iter.data?.isCollapsed
+            ? { ...iter.style, width: iterSize.width }
+            : { ...iter.style, width: iterSize.width, height: iterSize.height },
         })
         relX += iterSize.width + horizontalSpacing
       })
@@ -517,7 +552,9 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
             positionedNodes.set(node.id, {
               ...node,
               position: { x: colX + (col.maxW - sz.width) / 2, y: childY },
-              style: { ...node.style, width: sz.width, height: sz.height },
+              style: node.data?.isCollapsed
+                ? { ...node.style, width: sz.width }
+                : { ...node.style, width: sz.width, height: sz.height },
             })
           } else {
             positionedNodes.set(node.id, {
@@ -550,7 +587,9 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
         positionedNodes.set(node.id, {
           ...node,
           position: { x: centeredX, y: childY },
-          style: { ...node.style, width: sz.width, height: sz.height },
+          style: node.data?.isCollapsed
+            ? { ...node.style, width: sz.width }
+            : { ...node.style, width: sz.width, height: sz.height },
         })
         childY += sz.height + innerVertSpacing
       } else {

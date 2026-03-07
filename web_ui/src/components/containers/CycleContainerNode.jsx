@@ -55,11 +55,82 @@ export function CycleContainerNode({ data, theme }) {
     if (onToggleCollapse) onToggleCollapse(cycleId)
   }
 
+  // ── Collapsed rendering ──────────────────────────────────────────────────
+  // No explicit height — React Flow measures the rendered content via ResizeObserver.
+  // The layout engine uses measured.height (not style.height) for handle positioning.
+  if (isCollapsed) {
+    const headerStyle = {
+      display: 'flex', alignItems: 'center', gap: 8,
+      padding: '6px 12px', height: 30,
+      background: `${borderColor}e6`,
+      color: 'white', borderRadius: '10px 10px 0 0',
+      fontSize: 13, fontWeight: 600,
+      cursor: isToggleable ? 'pointer' : 'default',
+      userSelect: 'none',
+    }
+    return (
+      <div
+        style={{
+          width: 280,
+          display: 'flex',
+          flexDirection: 'column',
+          border: `2px ${borderStyle}`,
+          borderColor,
+          borderRadius: '12px',
+          background: bgColor,
+          position: 'relative',
+          pointerEvents: 'all',
+        }}
+      >
+        <Handle
+          type="target"
+          position={Position.Top}
+          style={{ background: borderColor, width: 10, height: 10, border: '2px solid white', zIndex: 10 }}
+        />
+        <Handle
+          type="source"
+          position={Position.Bottom}
+          style={{ background: borderColor, width: 10, height: 10, border: '2px solid white', zIndex: 10 }}
+        />
+        <div
+          onClick={isToggleable ? handleToggle : undefined}
+          onMouseEnter={isToggleable ? e => (e.currentTarget.style.background = borderColor) : undefined}
+          onMouseLeave={isToggleable ? e => (e.currentTarget.style.background = `${borderColor}e6`) : undefined}
+          style={headerStyle}
+        >
+          <Icon className="w-4 h-4" />
+          <span style={{ flex: 1 }}>{label}</span>
+          {iterationCount > 0 && (
+            <span style={{ fontSize: 11, opacity: 0.9 }}>
+              {iterationCount} {countSuffix}{iterationCount !== 1 ? 's' : ''}
+            </span>
+          )}
+          {isToggleable && <ChevronRight className="w-4 h-4" />}
+        </div>
+        <div
+          style={{
+            display: 'flex', flexDirection: 'column',
+            alignItems: 'center', justifyContent: 'center',
+            padding: '12px 20px', gap: 8,
+          }}
+        >
+          <div style={{ fontSize: 24, fontWeight: 700, color: collapsedCountColor }}>
+            {iterationCount}×
+          </div>
+          <div style={{ fontSize: 11, color: '#9ca3af', textAlign: 'center' }}>
+            Click to expand
+          </div>
+        </div>
+      </div>
+    )
+  }
+
+  // ── Expanded rendering ────────────────────────────────────────────────────
   return (
     <div
       style={{
-        width: isCollapsed ? 280 : '100%',
-        height: isCollapsed ? 100 : '100%',
+        width: '100%',
+        height: '100%',
         border: `2px ${borderStyle}`,
         borderColor,
         borderRadius: '12px',
@@ -70,7 +141,7 @@ export function CycleContainerNode({ data, theme }) {
       }}
     >
       <NodeResizer
-        isVisible={isResizable && !isCollapsed}
+        isVisible={isResizable}
         minWidth={220}
         minHeight={80}
         handleStyle={{ background: '#6b7280', border: '1px solid white', borderRadius: '2px' }}
@@ -80,12 +151,12 @@ export function CycleContainerNode({ data, theme }) {
       <Handle
         type="target"
         position={Position.Top}
-        style={{ background: borderColor, width: 10, height: 10, border: '2px solid white', opacity: isCollapsed ? 1 : 0 }}
+        style={{ background: borderColor, width: 10, height: 10, border: '2px solid white', opacity: 0 }}
       />
       <Handle
         type="source"
         position={Position.Bottom}
-        style={{ background: borderColor, width: 10, height: 10, border: '2px solid white', opacity: isCollapsed ? 1 : 0 }}
+        style={{ background: borderColor, width: 10, height: 10, border: '2px solid white', opacity: 0 }}
       />
 
       {/* Header bar */}
@@ -113,55 +184,27 @@ export function CycleContainerNode({ data, theme }) {
             {iterationCount} {countSuffix}{iterationCount !== 1 ? 's' : ''}
           </span>
         )}
-        {isToggleable && (
-          isCollapsed ? <ChevronRight className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />
-        )}
+        {isToggleable && <ChevronDown className="w-4 h-4" />}
       </div>
 
-      {/* Collapsed summary */}
-      {isCollapsed && (
+      {/* Corner decorations */}
+      {[
+        { top: 8,    left: 8,  borderTop: true,    borderLeft: true,  borderRadius: '4px 0 0 0' },
+        { top: 8,    right: 8, borderTop: true,    borderRight: true, borderRadius: '0 4px 0 0' },
+        { bottom: 8, left: 8,  borderBottom: true, borderLeft: true,  borderRadius: '0 0 0 4px' },
+        { bottom: 8, right: 8, borderBottom: true, borderRight: true, borderRadius: '0 0 4px 0' },
+      ].map((corner, i) => (
         <div
+          key={i}
           style={{
-            padding: '20px',
-            display: 'flex', flexDirection: 'column',
-            alignItems: 'center', justifyContent: 'center',
-            height: '100%', gap: 8,
+            position: 'absolute', width: 16, height: 16, ...corner,
+            ...(corner.borderTop    ? { borderTop:    `2px solid ${cornerColor}` } : {}),
+            ...(corner.borderBottom ? { borderBottom: `2px solid ${cornerColor}` } : {}),
+            ...(corner.borderLeft   ? { borderLeft:   `2px solid ${cornerColor}` } : {}),
+            ...(corner.borderRight  ? { borderRight:  `2px solid ${cornerColor}` } : {}),
           }}
-        >
-          <div style={{ fontSize: 11, color: collapsedTextColor, fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.5px' }}>
-            {collapsedLabel}
-          </div>
-          <div style={{ fontSize: 24, fontWeight: 700, color: collapsedCountColor }}>
-            {iterationCount}×
-          </div>
-          <div style={{ fontSize: 11, color: '#9ca3af', textAlign: 'center' }}>
-            Click to expand
-          </div>
-        </div>
-      )}
-
-      {/* Corner decorations (expanded only) */}
-      {!isCollapsed && (
-        <>
-          {[
-            { top: 8,    left: 8,  borderTop: true,    borderLeft: true,  borderRadius: '4px 0 0 0' },
-            { top: 8,    right: 8, borderTop: true,    borderRight: true, borderRadius: '0 4px 0 0' },
-            { bottom: 8, left: 8,  borderBottom: true, borderLeft: true,  borderRadius: '0 0 0 4px' },
-            { bottom: 8, right: 8, borderBottom: true, borderRight: true, borderRadius: '0 0 4px 0' },
-          ].map((corner, i) => (
-            <div
-              key={i}
-              style={{
-                position: 'absolute', width: 16, height: 16, ...corner,
-                ...(corner.borderTop    ? { borderTop:    `2px solid ${cornerColor}` } : {}),
-                ...(corner.borderBottom ? { borderBottom: `2px solid ${cornerColor}` } : {}),
-                ...(corner.borderLeft   ? { borderLeft:   `2px solid ${cornerColor}` } : {}),
-                ...(corner.borderRight  ? { borderRight:  `2px solid ${cornerColor}` } : {}),
-              }}
-            />
-          ))}
-        </>
-      )}
+        />
+      ))}
     </div>
   )
 }

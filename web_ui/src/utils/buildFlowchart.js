@@ -220,10 +220,11 @@ export function buildFlowchart({
           startTime: cycle.startEvent?.timestamp,
           endTime: cycle.endEvent?.timestamp,
         },
-        style: { width: 0, height: 0 }, // sized by applyCycleLayout
-        // Non-zero measured prevents RF's updateNodeInternals (which requires width>0) from
-        // blocking nodesInitialized. Phase 2 overwrites with correct style dimensions.
-        measured: { width: 1, height: 1 },
+        // Collapsed: no style/measured — RF auto-sizes from content via ResizeObserver.
+        // Expanded: style:0x0 + measured:1x1 so nodesInitialized isn't blocked while
+        // children are still being measured.
+        style: isCollapsed ? {} : { width: 0, height: 0 },
+        ...(isCollapsed ? {} : { measured: { width: 1, height: 1 } }),
         draggable: false,
       }
       newNodes.push(rcNode)
@@ -264,8 +265,8 @@ export function buildFlowchart({
               isCollapsed: iterCollapsed,
               onToggleCollapse: null, // injected by caller
             },
-            style: { width: 0, height: 0 }, // sized by applyCycleLayout
-            measured: { width: 1, height: 1 },
+            style: iterCollapsed ? {} : { width: 0, height: 0 },
+            ...(iterCollapsed ? {} : { measured: { width: 1, height: 1 } }),
             draggable: false,
           }
           newNodes.push(iterNode)
@@ -308,8 +309,8 @@ export function buildFlowchart({
           startTime: cycle.startEvent?.timestamp,
           endTime: cycle.endEvent?.timestamp,
         },
-        style: { width: 0, height: 0 }, // sized by applyCycleLayout
-        measured: { width: 1, height: 1 },
+        style: isCollapsed ? {} : { width: 0, height: 0 },
+        ...(isCollapsed ? {} : { measured: { width: 1, height: 1 } }),
         draggable: false,
       }
       newNodes.push(rpcNode)
@@ -356,8 +357,8 @@ export function buildFlowchart({
               isCollapsed: tcCollapsed,
               onToggleCollapse: null, // injected by caller
             },
-            style: { width: 0, height: 0 }, // sized by applyCycleLayout
-            measured: { width: 1, height: 1 },
+            style: tcCollapsed ? {} : { width: 0, height: 0 },
+            ...(tcCollapsed ? {} : { measured: { width: 1, height: 1 } }),
             draggable: false,
           }
           newNodes.push(tcNode)
@@ -389,8 +390,8 @@ export function buildFlowchart({
                   isCollapsed: scCollapsed,
                   onToggleCollapse: null, // injected by caller
                 },
-                style: { width: 0, height: 0 },
-                measured: { width: 1, height: 1 },
+                style: scCollapsed ? {} : { width: 0, height: 0 },
+                ...(scCollapsed ? {} : { measured: { width: 1, height: 1 } }),
                 draggable: false,
               })
 
@@ -436,8 +437,8 @@ export function buildFlowchart({
           startTime: cycle.startEvent?.timestamp,
           endTime: cycle.endEvent?.timestamp,
         },
-        style: { width: 0, height: 0 }, // sized by applyCycleLayout
-        measured: { width: 1, height: 1 },
+        style: isCollapsed ? {} : { width: 0, height: 0 },
+        ...(isCollapsed ? {} : { measured: { width: 1, height: 1 } }),
         draggable: false,
       }
       newNodes.push(prNode)
@@ -475,8 +476,8 @@ export function buildFlowchart({
               isCollapsed: phaseCollapsed,
               onToggleCollapse: null, // injected by caller
             },
-            style: { width: 0, height: 0 }, // sized by applyCycleLayout
-            measured: { width: 1, height: 1 },
+            style: phaseCollapsed ? {} : { width: 0, height: 0 },
+            ...(phaseCollapsed ? {} : { measured: { width: 1, height: 1 } }),
             draggable: false,
           }
           newNodes.push(phaseNode)
@@ -517,8 +518,8 @@ export function buildFlowchart({
           startTime: cycle.startEvent?.timestamp,
           endTime: cycle.endEvent?.timestamp,
         },
-        style: { width: 0, height: 0 }, // sized by applyCycleLayout
-        measured: { width: 1, height: 1 },
+        style: isCollapsed ? {} : { width: 0, height: 0 },
+        ...(isCollapsed ? {} : { measured: { width: 1, height: 1 } }),
         draggable: false,
       }
       newNodes.push(clNode)

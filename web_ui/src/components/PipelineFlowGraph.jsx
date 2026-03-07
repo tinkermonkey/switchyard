@@ -178,7 +178,10 @@ export default function PipelineFlowGraph({
           return rawBuild.nodes.map(n => ({
             ...n,
             position: existingPositions.get(n.id) ?? { x: 0, y: 0 },
-            style: existingStyles.get(n.id) ?? n.style,
+            // Collapsed containers: use fresh style from buildFlowchart (now `{}`) so RF
+            // can auto-size from content. Expanded containers: carry forward the computed
+            // style.width/height so SmartPipelineEdge doesn't fall back to 200px obstacles.
+            style: n.data?.isCollapsed ? n.style : (existingStyles.get(n.id) ?? n.style),
           }))
         })
       } else {
