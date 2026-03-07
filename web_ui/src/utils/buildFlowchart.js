@@ -603,3 +603,70 @@ export function buildFlowchart({
 
   return { nodes: newNodes, edges: newEdges, agentExecutions, updatedCycles, model }
 }
+
+/**
+ * Finds all container IDs (cycle, iteration, sub-cycle) that contain events
+ * from currently-active agents, returning the full hierarchy path to expand.
+ *
+ * @param {Object} model            - Processed event model (from processEvents)
+ * @param {Set}    activeAgentNames - Set of agent name strings currently running
+ * @returns {Set<string>} Container IDs that should be auto-expanded
+ */
+export function findActiveContainerPath(model, activeAgentNames) {
+  if (!activeAgentNames.size) return new Set()
+  const result = new Set()
+
+  const hasActive = (events) =>
+    events.some(e => e.event_type === 'agent_initialized' && activeAgentNames.has(e.agent))
+
+  model.cycles.forEach(cycle => {
+    if (cycle.type === 'review_cycle') {
+      cycle.iterations?.forEach(iter => {
+        const iterId = `${cycle.id}-iter-${iter.number}`
+        const iterEvents = [iter.startEvent, ...iter.events].filter(Boolean)
+        if (hasActive(iterEvents)) {
+          result.add(cycle.id)
+          result.add(iterId)
+        }
+      })
+    } else if (cycle.type === 'repair_cycle') {
+      cycle.testCycles?.forEach(tc => {
+        const tcId = `${cycle.id}-tc-${tc.number}`
+        tc.subCycles?.forEach(sc => {
+          const scId = `${tcId}-${sc.cycleType}-${sc.number}`
+          const scEvents = [sc.startEvent, ...sc.events, sc.endEvent].filter(Boolean)
+          if (hasActive(scEvents)) {
+            result.add(cycle.id)
+            result.add(tcId)
+            result.add(scId)
+          }
+        })
+        const tcEvents = [tc.startEvent, ...(tc.events ?? []), tc.endEvent].filter(Boolean)
+        if (hasActive(tcEvents)) {
+          result.add(cycle.id)
+          result.add(tcId)
+        }
+      })
+      const cycleEvents = [cycle.startEvent, ...(cycle.events ?? []), cycle.endEvent].filter(Boolean)
+      if (hasActive(cycleEvents)) {
+        result.add(cycle.id)
+      }
+    } else if (cycle.type === 'pr_review_cycle') {
+      cycle.phases?.forEach(phase => {
+        const phaseId = `${cycle.id}-phase-${phase.number}`
+        const phaseEvents = [phase.startEvent, ...(phase.events ?? [])].filter(Boolean)
+        if (hasActive(phaseEvents)) {
+          result.add(cycle.id)
+          result.add(phaseId)
+        }
+      })
+    } else if (cycle.type === 'conversational_loop') {
+      const loopEvents = [cycle.startEvent, ...(cycle.events ?? []), cycle.endEvent].filter(Boolean)
+      if (hasActive(loopEvents)) {
+        result.add(cycle.id)
+      }
+    }
+  })
+
+  return result
+}

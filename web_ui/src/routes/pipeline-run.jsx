@@ -12,7 +12,7 @@ import { useNavigate } from '@tanstack/react-router'
 import { useSocket } from '../contexts/SocketContext'
 import { toggleCycleCollapsed } from '../utils/cycleLayout'
 import { mergePipelineRunEvents, mergeArrayByIdStable } from '../utils/eventMerging'
-import { buildFlowchart as buildFlowchartUtil } from '../utils/buildFlowchart'
+import { buildFlowchart as buildFlowchartUtil, findActiveContainerPath } from '../utils/buildFlowchart'
 import { processEvents } from '../utils/eventProcessing/index.js'
 
 function PipelineRunView() {
@@ -33,6 +33,7 @@ function PipelineRunView() {
   const [hasMoreCompleted, setHasMoreCompleted] = useState(true)
   const [rawBuild, setRawBuild] = useState(null)
   const [cycles, setCycles] = useState(new Map())
+  const [userOpenedCycles, setUserOpenedCycles] = useState(new Set())
   const [showKillModal, setShowKillModal] = useState(false)
   const [isFullscreen, setIsFullscreen] = useState(false)
   const [activeFilters, setActiveFilters] = useState({ project: '', board: '', outcome: '' })
@@ -52,12 +53,15 @@ function PipelineRunView() {
   const activeFiltersRef = useRef(activeFilters)
   const urlRunIdRef = useRef(urlRunId)
   const prevUrlRunIdRef = useRef(urlRunId)
+  const userOpenedCyclesRef = useRef(userOpenedCycles)
+  const prevAutoOpenedRef = useRef(new Set())
 
   useEffect(() => { selectedPipelineRunRef.current = selectedPipelineRun }, [selectedPipelineRun])
   useEffect(() => { completedLoadedCountRef.current = completedLoadedCount }, [completedLoadedCount])
   useEffect(() => { socketEventsRef.current = socketEvents }, [socketEvents])
   useEffect(() => { activeFiltersRef.current = activeFilters }, [activeFilters])
   useEffect(() => { urlRunIdRef.current = urlRunId }, [urlRunId])
+  useEffect(() => { userOpenedCyclesRef.current = userOpenedCycles }, [userOpenedCycles])
 
   // Re-fetch completed runs when filters change (also handles initial mount)
   useEffect(() => {
@@ -286,8 +290,15 @@ function PipelineRunView() {
   const toggleFullscreen = useCallback(() => setIsFullscreen(prev => !prev), [])
 
   const handleToggleCycle = useCallback((cycleId) => {
-    setCycles(prevCycles => toggleCycleCollapsed(prevCycles, cycleId))
-  }, [])
+    const currentIsCollapsed = cycles.get(cycleId)?.isCollapsed ?? true
+    setCycles(prev => toggleCycleCollapsed(prev, cycleId))
+    setUserOpenedCycles(prev => {
+      const next = new Set(prev)
+      if (currentIsCollapsed) next.add(cycleId)   // user expanding → remember
+      else next.delete(cycleId)                    // user collapsing → forget
+      return next
+    })
+  }, [cycles])
 
   // Merge API events with live WebSocket events (full, unfiltered)
   const mergedEvents = useMemo(() => {
@@ -419,6 +430,12 @@ function PipelineRunView() {
 
   const selectedRunId = selectedPipelineRun?.id
 
+  // Reset user-opened tracking when switching pipeline runs
+  useEffect(() => {
+    setUserOpenedCycles(new Set())
+    prevAutoOpenedRef.current = new Set()
+  }, [selectedRunId])
+
   // Prefetch events immediately from the URL param — don't wait for run metadata
   // to resolve from the run list. This eliminates the blank period on page reload.
   // Clear events when switching to a *different* run so stale graph/log data from
@@ -458,7 +475,7 @@ function PipelineRunView() {
     return () => clearInterval(intervalId)
   }, [selectedRunId, fetchPipelineRunEvents])
 
-  // Detect and update cycles when events change
+  // Detect and update cycles when events change; auto-expand hierarchy path to active agent
   useEffect(() => {
     if (!graphEvents.length) return
 
@@ -466,19 +483,61 @@ function PipelineRunView() {
     const _ceT0 = performance.now()
     const model = processEvents(graphEvents)
     console.log(`[PerfGraph] cycles-effect processEvents: ${(performance.now() - _ceT0).toFixed(1)}ms → ${model.cycles.length} cycles`)
+
+    // Determine active agents: initialized but not yet completed/failed
+    const agentTaskInit = new Map()
+    const agentTaskDone = new Set()
+    graphEvents.forEach(e => {
+      if (e.event_type === 'agent_initialized') agentTaskInit.set(e.task_id, e.agent)
+      else if (e.event_type === 'agent_completed' || e.event_type === 'agent_failed') agentTaskDone.add(e.task_id)
+    })
+    const activeAgents = new Set()
+    agentTaskInit.forEach((agent, taskId) => {
+      if (!agentTaskDone.has(taskId)) activeAgents.add(agent)
+    })
+
+    // Find containers that lead to the active agent
+    const activeContainerIds = findActiveContainerPath(model, activeAgents)
+    const prevAutoOpened = prevAutoOpenedRef.current
+
+    // Build new top-level cycle map (all expanded by default)
     const newCycleMap = new Map()
     model.cycles.forEach(cycle => {
       newCycleMap.set(cycle.id, { isCollapsed: false })
     })
 
     setCycles(prevCycles => {
+      // Merge top-level cycles preserving user state; retain nested container states
       const merged = new Map(newCycleMap)
       prevCycles.forEach((prev, id) => {
         if (merged.has(id)) merged.get(id).isCollapsed = prev.isCollapsed
+        else merged.set(id, prev)  // preserve nested container states
       })
+
+      // Auto-expand containers on the active agent path
+      activeContainerIds.forEach(id => {
+        const current = merged.get(id)
+        if (!current || current.isCollapsed) {
+          merged.set(id, { ...(current ?? {}), isCollapsed: false })
+        }
+      })
+
+      // Auto-collapse previously auto-opened containers no longer on the active path,
+      // unless the user explicitly opened them
+      prevAutoOpened.forEach(id => {
+        if (!activeContainerIds.has(id) && !userOpenedCyclesRef.current.has(id)) {
+          const current = merged.get(id)
+          if (current && !current.isCollapsed) {
+            merged.set(id, { ...current, isCollapsed: true })
+          }
+        }
+      })
+
       return merged
     })
-  }, [graphEvents])
+
+    prevAutoOpenedRef.current = activeContainerIds
+  }, [graphEvents, selectedPipelineRun])
 
   // Rebuild flowchart when events or config change — throttled to ≤ 2/sec
   useEffect(() => {

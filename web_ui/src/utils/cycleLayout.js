@@ -679,15 +679,8 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
  */
 export function toggleCycleCollapsed(cycles, cycleId) {
   const updatedCycles = new Map(cycles)
-  const cycleData = updatedCycles.get(cycleId)
-  
-  if (cycleData) {
-    updatedCycles.set(cycleId, {
-      ...cycleData,
-      isCollapsed: !cycleData.isCollapsed,
-    })
-  }
-  
+  const currentIsCollapsed = updatedCycles.get(cycleId)?.isCollapsed ?? true
+  updatedCycles.set(cycleId, { isCollapsed: !currentIsCollapsed })
   return updatedCycles
 }
 
