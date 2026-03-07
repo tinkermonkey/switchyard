@@ -1873,6 +1873,174 @@ def get_cycle_metrics():
         return jsonify({'success': False, 'error': str(e), 'metrics': []}), 500
 
 
+@app.route('/api/metrics/projects', methods=['GET'])
+def get_project_metrics():
+    """
+    Get per-project daily metrics aggregated over the requested time window.
+
+    Fetches daily docs from project-metrics-* and aggregates them so each
+    project has a single rolled-up summary for the requested window.
+    """
+    try:
+        try:
+            days = int(request.args.get('days', 7))
+        except (ValueError, TypeError):
+            return jsonify({'success': False, 'error': 'Invalid days parameter', 'projects': []}), 400
+        days = max(1, min(days, 30))  # project metrics retained for 30 days
+
+        try:
+            result = es_client.search(
+                index='project-metrics-*',
+                body={
+                    'size': days * 50,  # up to 50 projects per day
+                    'query': {'range': {'day_bucket': {'gte': f'now-{days}d/d'}}},
+                    'sort': [{'day_bucket': {'order': 'desc'}}],
+                }
+            )
+            docs = [hit['_source'] for hit in result['hits']['hits']]
+        except Exception as e:
+            if 'index_not_found' in str(e).lower() or 'no such index' in str(e).lower():
+                return jsonify({'success': True, 'projects': []})
+            raise
+
+        total_hits = (
+            result['hits']['total']['value']
+            if isinstance(result['hits']['total'], dict)
+            else result['hits']['total']
+        )
+        if total_hits > len(docs):
+            logger.warning(
+                f"project metrics query truncated: {total_hits} total but only {len(docs)} returned"
+            )
+
+        by_project: dict = {}
+        for doc in docs:
+            proj = doc.get('project')
+            if proj:
+                by_project.setdefault(proj, []).append(doc)
+
+        projects = [_aggregate_project_docs(proj, proj_docs) for proj, proj_docs in by_project.items()]
+        projects.sort(key=lambda p: p['pipeline_run_count'], reverse=True)
+
+        return jsonify({'success': True, 'projects': projects})
+
+    except Exception as e:
+        logger.error(f"Error fetching project metrics: {e}", exc_info=True)
+        return jsonify({'success': False, 'error': str(e), 'projects': []}), 500
+
+
+def _aggregate_project_docs(project: str, docs: list) -> dict:
+    """Aggregate a list of daily project-metrics docs into a single window summary."""
+    run_count = 0
+    sum_direct_input = sum_cache_read = sum_cache_creation = sum_output = 0
+    sum_max_context = peak_max_context = sum_initial_input = 0
+    total_invocations = 0
+    rv_count = rv_iterations = rv_max_iter = rv_escalations = 0
+    rp_count = rp_test_cycles_sum = rp_max_test = rp_fix_cycles_sum = rp_max_fix = 0
+    rp_test_dur_sum = rp_max_test_dur = rp_systemic = 0
+    pr_count = pr_iterations = pr_max_iter = 0
+    success_count = failed_count = 0
+
+    for doc in docs:
+        run_count += doc.get('pipeline_run_count', 0) or 0
+
+        t = doc.get('tokens') or {}
+        sum_direct_input += t.get('sum_direct_input', 0) or 0
+        sum_cache_read += t.get('sum_cache_read', 0) or 0
+        sum_cache_creation += t.get('sum_cache_creation', 0) or 0
+        sum_output += t.get('sum_output', 0) or 0
+
+        c = doc.get('context') or {}
+        sum_max_context += c.get('sum_max_context', 0) or 0
+        peak_max_context = max(peak_max_context, c.get('peak_max_context', 0) or 0)
+        sum_initial_input += c.get('sum_initial_input', 0) or 0
+
+        tc = doc.get('tool_calls') or {}
+        total_invocations += tc.get('total_invocations', 0) or 0
+
+        rv = doc.get('review_cycles') or {}
+        rv_count += rv.get('total_count', 0) or 0
+        rv_iterations += rv.get('total_iterations', 0) or 0
+        rv_max_iter = max(rv_max_iter, rv.get('max_iterations', 0) or 0)
+        rv_escalations += rv.get('escalation_count', 0) or 0
+
+        rp = doc.get('repair_cycles') or {}
+        rp_day_count = rp.get('total_count', 0) or 0
+        rp_count += rp_day_count
+        rp_test_cycles_sum += (rp.get('avg_test_cycles', 0) or 0) * rp_day_count
+        rp_max_test = max(rp_max_test, rp.get('max_test_cycles', 0) or 0)
+        rp_fix_cycles_sum += (rp.get('avg_fix_cycles', 0) or 0) * rp_day_count
+        rp_max_fix = max(rp_max_fix, rp.get('max_fix_cycles', 0) or 0)
+        rp_test_dur_sum += (rp.get('avg_test_duration_ms', 0) or 0) * rp_day_count
+        rp_max_test_dur = max(rp_max_test_dur, rp.get('max_test_duration_ms', 0) or 0)
+        rp_systemic += rp.get('systemic_analysis_count', 0) or 0
+
+        pr = doc.get('pr_review_cycles') or {}
+        pr_count += pr.get('total_count', 0) or 0
+        pr_iterations += pr.get('total_iterations', 0) or 0
+        pr_max_iter = max(pr_max_iter, pr.get('max_iterations', 0) or 0)
+
+        po = doc.get('pipeline_outcomes') or {}
+        success_count += po.get('success_count', 0) or 0
+        failed_count += po.get('failed_count', 0) or 0
+
+    total_outcomes = success_count + failed_count
+    return {
+        'project': project,
+        'pipeline_run_count': run_count,
+        'days_with_data': len(docs),
+        'tokens': {
+            'sum_direct_input': sum_direct_input,
+            'sum_cache_read': sum_cache_read,
+            'sum_cache_creation': sum_cache_creation,
+            'sum_output': sum_output,
+            'avg_direct_input_per_run': round(sum_direct_input / run_count, 1) if run_count else 0,
+            'avg_cache_read_per_run': round(sum_cache_read / run_count, 1) if run_count else 0,
+            'avg_cache_creation_per_run': round(sum_cache_creation / run_count, 1) if run_count else 0,
+            'avg_output_per_run': round(sum_output / run_count, 1) if run_count else 0,
+        },
+        'context': {
+            'sum_max_context': sum_max_context,
+            'peak_max_context': peak_max_context,
+            'avg_max_context_per_run': round(sum_max_context / run_count, 1) if run_count else 0,
+            'sum_initial_input': sum_initial_input,
+            'avg_initial_input_per_run': round(sum_initial_input / run_count, 1) if run_count else 0,
+        },
+        'tool_calls': {
+            'total_invocations': total_invocations,
+            'avg_invocations_per_run': round(total_invocations / run_count, 1) if run_count else 0,
+        },
+        'review_cycles': {
+            'total_count': rv_count,
+            'total_iterations': rv_iterations,
+            'avg_iterations': round(rv_iterations / rv_count, 2) if rv_count else 0,
+            'max_iterations': rv_max_iter,
+            'escalation_count': rv_escalations,
+        },
+        'repair_cycles': {
+            'total_count': rp_count,
+            'avg_test_cycles': round(rp_test_cycles_sum / rp_count, 2) if rp_count else 0,
+            'max_test_cycles': rp_max_test,
+            'avg_fix_cycles': round(rp_fix_cycles_sum / rp_count, 2) if rp_count else 0,
+            'max_fix_cycles': rp_max_fix,
+            'avg_test_duration_ms': round(rp_test_dur_sum / rp_count, 1) if rp_count else 0,
+            'max_test_duration_ms': rp_max_test_dur,
+            'systemic_analysis_count': rp_systemic,
+        },
+        'pr_review_cycles': {
+            'total_count': pr_count,
+            'total_iterations': pr_iterations,
+            'avg_iterations': round(pr_iterations / pr_count, 2) if pr_count else 0,
+            'max_iterations': pr_max_iter,
+        },
+        'pipeline_outcomes': {
+            'success_count': success_count,
+            'failed_count': failed_count,
+            'success_rate': round(success_count / total_outcomes * 100, 1) if total_outcomes else None,
+        },
+    }
+
+
 @app.route('/api/metrics/executions/top', methods=['GET'])
 def get_top_executions():
     """

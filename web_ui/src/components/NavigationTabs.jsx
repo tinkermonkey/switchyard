@@ -1,5 +1,5 @@
 import { Link } from '@tanstack/react-router'
-import { Activity, FolderGit2, Workflow, BarChart2 } from 'lucide-react'
+import { Activity, FolderGit2, Workflow, BarChart2, TrendingUp } from 'lucide-react'
 
 export default function NavigationTabs() {
   return (
@@ -66,6 +66,18 @@ export default function NavigationTabs() {
       >
         <BarChart2 className="inline w-4 h-4 mr-2" />
         Cycle Metrics
+      </Link>
+      <Link
+        to="/project-metrics"
+        activeProps={{
+          className: "px-4 py-2 bg-gh-accent-emphasis border border-gh-accent-primary rounded-md hover:bg-gh-accent-primary transition-colors text-sm text-white"
+        }}
+        inactiveProps={{
+          className: "px-4 py-2 bg-gh-canvas-subtle border border-gh-border rounded-md hover:bg-gh-border-muted transition-colors text-sm"
+        }}
+      >
+        <TrendingUp className="inline w-4 h-4 mr-2" />
+        Project Metrics
       </Link>
     </div>
   )

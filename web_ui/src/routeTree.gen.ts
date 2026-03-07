@@ -10,6 +10,7 @@
 
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as ProjectsRouteImport } from './routes/projects'
+import { Route as ProjectMetricsRouteImport } from './routes/project-metrics'
 import { Route as PipelineRunRouteImport } from './routes/pipeline-run'
 import { Route as CycleMetricsRouteImport } from './routes/cycle-metrics'
 import { Route as AgentMetricsRouteImport } from './routes/agent-metrics'
@@ -24,6 +25,11 @@ const ProjectsRoute = ProjectsRouteImport.update({
 const PipelineRunRoute = PipelineRunRouteImport.update({
   id: '/pipeline-run',
   path: '/pipeline-run',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const ProjectMetricsRoute = ProjectMetricsRouteImport.update({
+  id: '/project-metrics',
+  path: '/project-metrics',
   getParentRoute: () => rootRouteImport,
 } as any)
 const CycleMetricsRoute = CycleMetricsRouteImport.update({
@@ -52,6 +58,7 @@ export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/agent-metrics': typeof AgentMetricsRoute
   '/cycle-metrics': typeof CycleMetricsRoute
+  '/project-metrics': typeof ProjectMetricsRoute
   '/pipeline-run': typeof PipelineRunRoute
   '/projects': typeof ProjectsRoute
   '/agent-execution/$executionId': typeof AgentExecutionExecutionIdRoute
@@ -60,6 +67,7 @@ export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/agent-metrics': typeof AgentMetricsRoute
   '/cycle-metrics': typeof CycleMetricsRoute
+  '/project-metrics': typeof ProjectMetricsRoute
   '/pipeline-run': typeof PipelineRunRoute
   '/projects': typeof ProjectsRoute
   '/agent-execution/$executionId': typeof AgentExecutionExecutionIdRoute
@@ -69,6 +77,7 @@ export interface FileRoutesById {
   '/': typeof IndexRoute
   '/agent-metrics': typeof AgentMetricsRoute
   '/cycle-metrics': typeof CycleMetricsRoute
+  '/project-metrics': typeof ProjectMetricsRoute
   '/pipeline-run': typeof PipelineRunRoute
   '/projects': typeof ProjectsRoute
   '/agent-execution/$executionId': typeof AgentExecutionExecutionIdRoute
@@ -79,6 +88,7 @@ export interface FileRouteTypes {
     | '/'
     | '/agent-metrics'
     | '/cycle-metrics'
+    | '/project-metrics'
     | '/pipeline-run'
     | '/projects'
     | '/agent-execution/$executionId'
@@ -87,6 +97,7 @@ export interface FileRouteTypes {
     | '/'
     | '/agent-metrics'
     | '/cycle-metrics'
+    | '/project-metrics'
     | '/pipeline-run'
     | '/projects'
     | '/agent-execution/$executionId'
@@ -95,6 +106,7 @@ export interface FileRouteTypes {
     | '/'
     | '/agent-metrics'
     | '/cycle-metrics'
+    | '/project-metrics'
     | '/pipeline-run'
     | '/projects'
     | '/agent-execution/$executionId'
@@ -104,6 +116,7 @@ export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   AgentMetricsRoute: typeof AgentMetricsRoute
   CycleMetricsRoute: typeof CycleMetricsRoute
+  ProjectMetricsRoute: typeof ProjectMetricsRoute
   PipelineRunRoute: typeof PipelineRunRoute
   ProjectsRoute: typeof ProjectsRoute
   AgentExecutionExecutionIdRoute: typeof AgentExecutionExecutionIdRoute
@@ -130,6 +143,13 @@ declare module '@tanstack/react-router' {
       path: '/cycle-metrics'
       fullPath: '/cycle-metrics'
       preLoaderRoute: typeof CycleMetricsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/project-metrics': {
+      id: '/project-metrics'
+      path: '/project-metrics'
+      fullPath: '/project-metrics'
+      preLoaderRoute: typeof ProjectMetricsRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/agent-metrics': {
@@ -160,6 +180,7 @@ const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   AgentMetricsRoute: AgentMetricsRoute,
   CycleMetricsRoute: CycleMetricsRoute,
+  ProjectMetricsRoute: ProjectMetricsRoute,
   PipelineRunRoute: PipelineRunRoute,
   ProjectsRoute: ProjectsRoute,
   AgentExecutionExecutionIdRoute: AgentExecutionExecutionIdRoute,
