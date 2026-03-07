@@ -2195,6 +2195,23 @@ def trigger_token_metrics():
     return jsonify({'success': True, 'message': 'Token metrics job triggered'})
 
 
+@app.route('/api/metrics/projects/run-now', methods=['POST'])
+def trigger_project_metrics():
+    """Trigger an immediate project metrics backfill (7-day lookback)."""
+    import threading
+    import asyncio
+
+    def _run():
+        try:
+            from services.project_metrics_service import get_project_metrics_service
+            asyncio.run(get_project_metrics_service().run_metrics_job(lookback_days=7))
+        except Exception as e:
+            logger.error(f"Error in background project metrics job: {e}", exc_info=True)
+
+    threading.Thread(target=_run, daemon=True, name='project-metrics-now').start()
+    return jsonify({'success': True, 'message': 'Project metrics backfill triggered (7-day lookback)'})
+
+
 @app.route('/api/metrics/run-full-history', methods=['POST'])
 def trigger_token_metrics_full_history():
     """Backfill token metrics across all available event history.
