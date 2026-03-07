@@ -61,6 +61,7 @@ services:
       # Set to 1 for single-threaded (default), 2-8 for multi-threaded parallel execution
       # Recommended: 2-3 workers for multi-project deployments
       - ORCHESTRATOR_WORKERS=${ORCHESTRATOR_WORKERS:-1}
+      - PYTHONDONTWRITEBYTECODE=1
       # Host paths for Docker-in-Docker mounting
       # These are intentionally NOT set - the code has correct defaults:
       # - HOST_WORKSPACE_PATH defaults to '/workspace' (the mounted parent dir)
@@ -94,6 +95,7 @@ services:
       - GITHUB_APP_PRIVATE_KEY_PATH=${GITHUB_APP_PRIVATE_KEY_PATH}
       - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - PYTHONDONTWRITEBYTECODE=1
     depends_on:
       redis:
         condition: service_started
