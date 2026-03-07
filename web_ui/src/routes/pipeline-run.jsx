@@ -33,6 +33,7 @@ function PipelineRunView() {
   const [hasMoreCompleted, setHasMoreCompleted] = useState(true)
   const [rawBuild, setRawBuild] = useState(null)
   const [cycles, setCycles] = useState(new Map())
+  const cyclesRef = useRef(new Map())
   const [userOpenedCycles, setUserOpenedCycles] = useState(new Set())
   const [showKillModal, setShowKillModal] = useState(false)
   const [isFullscreen, setIsFullscreen] = useState(false)
@@ -62,6 +63,7 @@ function PipelineRunView() {
   useEffect(() => { activeFiltersRef.current = activeFilters }, [activeFilters])
   useEffect(() => { urlRunIdRef.current = urlRunId }, [urlRunId])
   useEffect(() => { userOpenedCyclesRef.current = userOpenedCycles }, [userOpenedCycles])
+  useEffect(() => { cyclesRef.current = cycles }, [cycles])
 
   // Re-fetch completed runs when filters change (also handles initial mount)
   useEffect(() => {
@@ -290,7 +292,7 @@ function PipelineRunView() {
   const toggleFullscreen = useCallback(() => setIsFullscreen(prev => !prev), [])
 
   const handleToggleCycle = useCallback((cycleId) => {
-    const currentIsCollapsed = cycles.get(cycleId)?.isCollapsed ?? true
+    const currentIsCollapsed = cyclesRef.current.get(cycleId)?.isCollapsed ?? true
     setCycles(prev => toggleCycleCollapsed(prev, cycleId))
     setUserOpenedCycles(prev => {
       const next = new Set(prev)
@@ -298,7 +300,7 @@ function PipelineRunView() {
       else next.delete(cycleId)                    // user collapsing → forget
       return next
     })
-  }, [cycles])
+  }, [])
 
   // Merge API events with live WebSocket events (full, unfiltered)
   const mergedEvents = useMemo(() => {
@@ -384,12 +386,12 @@ function PipelineRunView() {
 
     return buildFlowchartUtil({
       events: graphEvents,
-      existingCycles: cycles,
+      existingCycles: cyclesRef.current,
       workflowConfig,
       selectedPipelineRun,
       activeTaskIds,
     })
-  }, [graphEvents, selectedPipelineRun, cycles, workflowConfig])
+  }, [graphEvents, selectedPipelineRun, workflowConfig])
 
   const handleDownloadDebugData = useCallback(() => {
     if (!selectedPipelineRun) return
@@ -511,37 +513,41 @@ function PipelineRunView() {
       newCycleMap.set(cycle.id, { isCollapsed: false })
     })
 
-    setCycles(prevCycles => {
-      // Merge top-level cycles preserving user state; retain nested container states
-      const merged = new Map(newCycleMap)
-      prevCycles.forEach((prev, id) => {
-        if (merged.has(id)) merged.get(id).isCollapsed = prev.isCollapsed
-        else merged.set(id, prev)  // preserve nested container states
-      })
-
-      // Auto-expand containers on the active agent path
-      activeContainerIds.forEach(id => {
-        const current = merged.get(id)
-        if (!current || current.isCollapsed) {
-          merged.set(id, { ...(current ?? {}), isCollapsed: false })
-        }
-      })
-
-      // Auto-collapse previously auto-opened containers no longer on the active path,
-      // unless the user explicitly opened them
-      prevAutoOpened.forEach(id => {
-        if (!activeContainerIds.has(id) && !userOpenedCyclesRef.current.has(id)) {
-          const current = merged.get(id)
-          if (current && !current.isCollapsed) {
-            merged.set(id, { ...current, isCollapsed: true })
-          }
-        }
-      })
-
-      return merged
+    // Compute the merged cycle map directly (reading from ref avoids the functional
+    // update pattern so we can update cyclesRef.current before calling setCycles).
+    // Effects fire in definition order: this effect (line ~484) runs before the
+    // rebuild effect (line ~548), so cyclesRef.current will already hold the correct
+    // value by the time buildRawFlowchart reads it — eliminating the interstitial
+    // wrong-isCollapsed state that caused container label/chevron flicker.
+    const prevCycles = cyclesRef.current
+    const merged = new Map(newCycleMap)
+    prevCycles.forEach((prev, id) => {
+      if (merged.has(id)) merged.get(id).isCollapsed = prev.isCollapsed
+      else merged.set(id, prev)  // preserve nested container states
     })
 
+    // Auto-expand containers on the active agent path
+    activeContainerIds.forEach(id => {
+      const current = merged.get(id)
+      if (!current || current.isCollapsed) {
+        merged.set(id, { ...(current ?? {}), isCollapsed: false })
+      }
+    })
+
+    // Auto-collapse previously auto-opened containers no longer on the active path,
+    // unless the user explicitly opened them
+    prevAutoOpened.forEach(id => {
+      if (!activeContainerIds.has(id) && !userOpenedCyclesRef.current.has(id)) {
+        const current = merged.get(id)
+        if (current && !current.isCollapsed) {
+          merged.set(id, { ...current, isCollapsed: true })
+        }
+      }
+    })
+
+    cyclesRef.current = merged        // update ref before setCycles
     prevAutoOpenedRef.current = activeContainerIds
+    setCycles(merged)
   }, [graphEvents, selectedPipelineRun])
 
   // Rebuild flowchart when events or config change — throttled to ≤ 2/sec

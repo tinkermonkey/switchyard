@@ -1,8 +1,8 @@
 import { Upload, RotateCcw, Download } from 'lucide-react'
 import PipelineFlowGraph, { DEFAULT_LAYOUT_OPTIONS } from './components/PipelineFlowGraph'
-import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { toggleCycleCollapsed } from './utils/cycleLayout'
-import { buildFlowchart, findActiveContainerPath } from './utils/buildFlowchart'
+import { buildFlowchart } from './utils/buildFlowchart'
 
 // Human-readable labels for the layout parameter sliders.
 // Only keys present here will show as sliders; the rest of DEFAULT_LAYOUT_OPTIONS
@@ -109,14 +109,6 @@ export default function StandaloneSandbox() {
 
     const { updatedCycles } = result
 
-    // Auto-expand containers on the active agent path
-    if (result.model && activeTaskIds.size > 0) {
-      const activeContainerIds = findActiveContainerPath(result.model, activeTaskIds)
-      activeContainerIds.forEach(id => {
-        updatedCycles.set(id, { ...(updatedCycles.get(id) ?? {}), isCollapsed: false })
-      })
-    }
-
     const hasNewCycles = updatedCycles.size > 0 &&
       [...updatedCycles.keys()].some(k => !effectiveCycles.has(k) || effectiveCycles.get(k)?.isCollapsed !== updatedCycles.get(k)?.isCollapsed)
     if (hasNewCycles) {
@@ -149,49 +141,6 @@ export default function StandaloneSandbox() {
     a.click()
     URL.revokeObjectURL(url)
   }, [processedModel, debugData])
-
-  // Apply per-node visibility: hide defaultHidden nodes unless showAllNodes is on.
-  // Also reroutes edges so they skip hidden boundary nodes — React Flow hides any
-  // edge whose source or target is hidden, which would break the sequential chain.
-  const visibleRawBuild = useMemo(() => {
-    if (!rawBuild || showAllNodes) return rawBuild
-
-    const hiddenIds = new Set(
-      rawBuild.nodes.filter(n => n.data?.defaultHidden).map(n => n.id)
-    )
-    if (hiddenIds.size === 0) return rawBuild
-
-    // Build successor map (edges form a directed chain, one successor per node)
-    const successors = new Map()
-    rawBuild.edges.forEach(e => successors.set(e.source, e.target))
-
-    // Walk forward through hidden nodes to find the next visible target
-    function nextVisible(id) {
-      let cur = successors.get(id)
-      while (cur && hiddenIds.has(cur)) cur = successors.get(cur)
-      return cur
-    }
-
-    const newEdges = []
-    const seen = new Set()
-    rawBuild.edges.forEach(e => {
-      if (hiddenIds.has(e.source)) return // will be covered by a rerouted edge
-      const target = hiddenIds.has(e.target) ? nextVisible(e.target) : e.target
-      if (!target) return
-      const key = `${e.source}→${target}`
-      if (seen.has(key)) return
-      seen.add(key)
-      newEdges.push(e.target === target ? e : { ...e, id: `edge-${e.source}-${target}`, target })
-    })
-
-    return {
-      ...rawBuild,
-      nodes: rawBuild.nodes.map(node =>
-        node.data?.defaultHidden ? { ...node, hidden: true } : node
-      ),
-      edges: newEdges,
-    }
-  }, [rawBuild, showAllNodes])
 
   const handleParamChange = useCallback((key, value) => {
     const parsed = parseInt(value, 10)
@@ -325,11 +274,12 @@ export default function StandaloneSandbox() {
             </div>
           ) : (
             <PipelineFlowGraph
-              rawBuild={visibleRawBuild}
+              rawBuild={rawBuild}
               onToggleCycle={handleToggleCycle}
               layoutOptions={layoutParams}
               nodesDraggable={nodesDraggable}
               allowResizing={nodesDraggable}
+              showAllNodes={showAllNodes}
               height="100%"
               emptyMessage="No renderable events found in the debug data"
             />

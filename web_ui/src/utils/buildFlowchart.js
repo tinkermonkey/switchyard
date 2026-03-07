@@ -1,6 +1,16 @@
 import { MarkerType } from '@xyflow/react'
 import { processEvents } from './eventProcessing/index.js'
 import { getNodeType, HIDDEN_BY_DEFAULT_TYPES } from '../components/nodes/EVENT_TYPE_MAP.js'
+import {
+  extractRepairCycleSummary,
+  extractTestCycleSummary,
+  extractSubCycleSummary,
+  extractReviewCycleSummary,
+  extractReviewIterationSummary,
+  extractPRReviewCycleSummary,
+  extractPRReviewPhaseSummary,
+  extractConversationalLoopSummary,
+} from './cycleSummaries.js'
 
 /**
  * Builds React Flow nodes and edges from pipeline run events.
@@ -71,6 +81,13 @@ export function buildFlowchart({
       isCollapsed: existing?.isCollapsed ?? false,
     })
   })
+
+  // Which container IDs are on the path to currently-active agents.
+  // Used to annotate container nodes with containsActiveAgent so PipelineFlowGraph
+  // can auto-expand them without callers needing to implement the logic themselves.
+  const activeContainerIds = activeTaskIds.size > 0
+    ? findActiveContainerPath(model, activeTaskIds)
+    : new Set()
 
   // ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -216,9 +233,11 @@ export function buildFlowchart({
           label: 'Review Cycle',
           iterationCount: cycle.iterations.length,
           isCollapsed,
+          containsActiveAgent: activeContainerIds.has(cycle.id),
           onToggleCollapse: null, // injected by caller
           startTime: cycle.startEvent?.timestamp,
           endTime: cycle.endEvent?.timestamp,
+          summary: extractReviewCycleSummary(cycle),
         },
         // Collapsed: no style/measured — RF auto-sizes from content via ResizeObserver.
         // Expanded: style:0x0 + measured:1x1 so nodesInitialized isn't blocked while
@@ -263,7 +282,9 @@ export function buildFlowchart({
               label: `Iteration ${iteration.number}`,
               iterationCount: iteration.events.length + 1,
               isCollapsed: iterCollapsed,
+              containsActiveAgent: activeContainerIds.has(iterId),
               onToggleCollapse: null, // injected by caller
+              summary: extractReviewIterationSummary(iteration, cycle.startEvent),
             },
             style: iterCollapsed ? {} : { width: 0, height: 0 },
             ...(iterCollapsed ? {} : { measured: { width: 1, height: 1 } }),
@@ -305,9 +326,11 @@ export function buildFlowchart({
           label: 'Repair Cycle',
           iterationCount: cycle.testCycles?.length ?? 0,
           isCollapsed,
+          containsActiveAgent: activeContainerIds.has(cycle.id),
           onToggleCollapse: null, // injected by caller
           startTime: cycle.startEvent?.timestamp,
           endTime: cycle.endEvent?.timestamp,
+          summary: extractRepairCycleSummary(cycle),
         },
         style: isCollapsed ? {} : { width: 0, height: 0 },
         ...(isCollapsed ? {} : { measured: { width: 1, height: 1 } }),
@@ -355,7 +378,9 @@ export function buildFlowchart({
               label: tc.testType,
               iterationCount: tc.subCycles.length,
               isCollapsed: tcCollapsed,
+              containsActiveAgent: activeContainerIds.has(tcId),
               onToggleCollapse: null, // injected by caller
+              summary: extractTestCycleSummary(tc),
             },
             style: tcCollapsed ? {} : { width: 0, height: 0 },
             ...(tcCollapsed ? {} : { measured: { width: 1, height: 1 } }),
@@ -388,7 +413,9 @@ export function buildFlowchart({
                   startEvent: sc.startEvent,
                   endEvent: sc.endEvent,
                   isCollapsed: scCollapsed,
+                  containsActiveAgent: activeContainerIds.has(scId),
                   onToggleCollapse: null, // injected by caller
+                  summary: extractSubCycleSummary(sc),
                 },
                 style: scCollapsed ? {} : { width: 0, height: 0 },
                 ...(scCollapsed ? {} : { measured: { width: 1, height: 1 } }),
@@ -433,9 +460,11 @@ export function buildFlowchart({
           label: 'PR Review',
           iterationCount: cycle.phases?.length ?? 0,
           isCollapsed,
+          containsActiveAgent: activeContainerIds.has(cycle.id),
           onToggleCollapse: null, // injected by caller
           startTime: cycle.startEvent?.timestamp,
           endTime: cycle.endEvent?.timestamp,
+          summary: extractPRReviewCycleSummary(cycle),
         },
         style: isCollapsed ? {} : { width: 0, height: 0 },
         ...(isCollapsed ? {} : { measured: { width: 1, height: 1 } }),
@@ -474,7 +503,9 @@ export function buildFlowchart({
               label: `Phase ${phase.number}`,
               iterationCount: phase.events.length + 1,
               isCollapsed: phaseCollapsed,
+              containsActiveAgent: activeContainerIds.has(phaseId),
               onToggleCollapse: null, // injected by caller
+              summary: extractPRReviewPhaseSummary(phase),
             },
             style: phaseCollapsed ? {} : { width: 0, height: 0 },
             ...(phaseCollapsed ? {} : { measured: { width: 1, height: 1 } }),
@@ -514,9 +545,11 @@ export function buildFlowchart({
           label: 'Conversation',
           iterationCount: cycle.events?.length ?? 0,
           isCollapsed,
+          containsActiveAgent: activeContainerIds.has(cycle.id),
           onToggleCollapse: null, // injected by caller
           startTime: cycle.startEvent?.timestamp,
           endTime: cycle.endEvent?.timestamp,
+          summary: extractConversationalLoopSummary(cycle),
         },
         style: isCollapsed ? {} : { width: 0, height: 0 },
         ...(isCollapsed ? {} : { measured: { width: 1, height: 1 } }),

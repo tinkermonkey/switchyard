@@ -93,6 +93,7 @@ export default function PipelineFlowGraph({
   emptyMessage = 'No events found',
   onLayoutDone,
   fitViewAlign = 'center',
+  showAllNodes = true,
 }) {
   const [nodes, setNodes, onNodesChange] = useNodesState([])
   const [edges, setEdges, onEdgesChange] = useEdgesState([])
@@ -118,6 +119,16 @@ export default function PipelineFlowGraph({
   // Updated via onNodesChange dimension events so the layout function always has
   // accurate sizes even when node.measured hasn't been (re-)populated yet.
   const nodeSizeCacheRef = useRef(new Map())
+  // Stable ref for the latest onToggleCycle prop — lets handleToggleWithTracking
+  // always call the current callback without being recreated on every render.
+  const onToggleCycleRef = useRef(onToggleCycle)
+  useEffect(() => { onToggleCycleRef.current = onToggleCycle }, [onToggleCycle])
+  // Stable ref for rawBuild — used to read current isCollapsed state inside the
+  // toggle wrapper without creating a closure dependency on rawBuild.
+  const rawBuildRef = useRef(rawBuild)
+  useEffect(() => { rawBuildRef.current = rawBuild }, [rawBuild])
+  // Containers the user has explicitly closed — auto-expand will not override these.
+  const userClosedCyclesRef = useRef(new Set())
 
   // Merge caller overrides with canonical defaults so every param is always defined.
   // Memoized so the reference is stable — prevents LayoutController's param-change
@@ -126,6 +137,48 @@ export default function PipelineFlowGraph({
     () => ({ ...DEFAULT_LAYOUT_OPTIONS, ...layoutOptions }),
     [layoutOptions]
   )
+
+  // Hide nodes marked defaultHidden (boundary/housekeeping events) and reroute edges
+  // around them so the sequential chain stays intact. Skipped when showAllNodes is true.
+  const filteredRawBuild = useMemo(() => {
+    if (!rawBuild || showAllNodes) return rawBuild
+
+    const hiddenIds = new Set(
+      rawBuild.nodes.filter(n => n.data?.defaultHidden).map(n => n.id)
+    )
+    if (hiddenIds.size === 0) return rawBuild
+
+    // Build successor map (edges form a directed chain, one successor per node)
+    const successors = new Map()
+    rawBuild.edges.forEach(e => successors.set(e.source, e.target))
+
+    // Walk forward through hidden nodes to find the next visible target
+    function nextVisible(id) {
+      let cur = successors.get(id)
+      while (cur && hiddenIds.has(cur)) cur = successors.get(cur)
+      return cur
+    }
+
+    const newEdges = []
+    const seen = new Set()
+    rawBuild.edges.forEach(e => {
+      if (hiddenIds.has(e.source)) return
+      const target = hiddenIds.has(e.target) ? nextVisible(e.target) : e.target
+      if (!target) return
+      const key = `${e.source}→${target}`
+      if (seen.has(key)) return
+      seen.add(key)
+      newEdges.push(e.target === target ? e : { ...e, id: `edge-${e.source}-${target}`, target })
+    })
+
+    return {
+      ...rawBuild,
+      nodes: rawBuild.nodes.map(node =>
+        node.data?.defaultHidden ? { ...node, hidden: true } : node
+      ),
+      edges: newEdges,
+    }
+  }, [rawBuild, showAllNodes])
 
   // Phase 1: set raw unpositioned nodes for React Flow to render and measure.
   //
@@ -139,7 +192,7 @@ export default function PipelineFlowGraph({
   // Data-only updates (same node IDs, status/label changes): update node data
   // in-place preserving existing positions; graph stays visible, no layout needed.
   useEffect(() => {
-    if (!rawBuild || rawBuild.nodes.length === 0) {
+    if (!filteredRawBuild || filteredRawBuild.nodes.length === 0) {
       prevNodeIdsRef.current = new Set()
       hasLayoutedOnceRef.current = false
       setNodes([])
@@ -148,17 +201,21 @@ export default function PipelineFlowGraph({
       return
     }
 
-    const newNodeIds = new Set(rawBuild.nodes.map(n => n.id))
+    const newNodeIds = new Set(filteredRawBuild.nodes.map(n => n.id))
     const prevNodeIds = prevNodeIdsRef.current
     const structurallyChanged =
       prevNodeIds.size !== newNodeIds.size ||
-      rawBuild.nodes.some(n => !prevNodeIds.has(n.id))
+      filteredRawBuild.nodes.some(n => !prevNodeIds.has(n.id))
 
     prevNodeIdsRef.current = newNodeIds
 
     if (structurallyChanged) {
-      const anyOverlap = prevNodeIds.size > 0 && rawBuild.nodes.some(n => prevNodeIds.has(n.id))
+      const anyOverlap = prevNodeIds.size > 0 && filteredRawBuild.nodes.some(n => prevNodeIds.has(n.id))
       const isIncrementalUpdate = hasLayoutedOnceRef.current && anyOverlap
+      if (!anyOverlap) {
+        // Completely new graph (new pipeline run or file) — reset user-closed tracking.
+        userClosedCyclesRef.current = new Set()
+      }
 
       if (isIncrementalUpdate) {
         // Keep graph visible — carry existing positions and styles forward so container nodes
@@ -175,7 +232,7 @@ export default function PipelineFlowGraph({
         setNodes(prev => {
           const existingPositions = new Map(prev.map(n => [n.id, n.position]))
           const existingStyles = new Map(prev.map(n => [n.id, n.style]))
-          return rawBuild.nodes.map(n => ({
+          return filteredRawBuild.nodes.map(n => ({
             ...n,
             position: existingPositions.get(n.id) ?? { x: 0, y: 0 },
             // Collapsed containers: use fresh style from buildFlowchart (now `{}`) so RF
@@ -189,12 +246,12 @@ export default function PipelineFlowGraph({
         hasLayoutedOnceRef.current = false
         nodeSizeCacheRef.current = new Map()
         setLayoutReady(false)
-        setNodes(rawBuild.nodes)
+        setNodes(filteredRawBuild.nodes)
       }
       setStructuralVersion(v => v + 1)
     } else {
       // Same node IDs — update data and hidden in-place so positions are preserved.
-      const newNodeById = new Map(rawBuild.nodes.map(n => [n.id, n]))
+      const newNodeById = new Map(filteredRawBuild.nodes.map(n => [n.id, n]))
       setNodes(prev => prev.map(node => {
         const newNode = newNodeById.get(node.id)
         if (!newNode) return node
@@ -204,7 +261,21 @@ export default function PipelineFlowGraph({
       // nodes — picks up any dimension changes caused by the data update.
       setDataVersion(v => v + 1)
     }
-  }, [rawBuild, setNodes, setEdges])
+  }, [filteredRawBuild, setNodes, setEdges])
+
+  // Stable toggle wrapper: tracks whether the user explicitly closed a container
+  // so auto-expand will not override it. Uses refs so this callback never changes
+  // identity, keeping finalizeNodes (and therefore all container node onToggleCollapse
+  // props) stable across re-renders.
+  const handleToggleWithTracking = useCallback((cycleId) => {
+    const currentlyCollapsed = rawBuildRef.current?.updatedCycles?.get(cycleId)?.isCollapsed ?? true
+    if (currentlyCollapsed) {
+      userClosedCyclesRef.current.delete(cycleId)   // user expanding → allow future auto-expand
+    } else {
+      userClosedCyclesRef.current.add(cycleId)      // user collapsing → don't auto-expand
+    }
+    onToggleCycleRef.current?.(cycleId)
+  }, []) // stable — reads all mutable state via refs
 
   // Inject draggable/toggle callbacks after layout — passed to LayoutController
   const finalizeNodes = useCallback((layoutedNodes) => {
@@ -215,14 +286,32 @@ export default function PipelineFlowGraph({
           ...(nodesDraggable && { draggable: true }),
           data: {
             ...node.data,
-            onToggleCollapse: onToggleCycle,
+            onToggleCollapse: handleToggleWithTracking,
             isResizable: allowResizing && node.type === 'cycleBounding',
           },
         }
       }
       return nodesDraggable ? { ...node, draggable: true } : node
     })
-  }, [nodesDraggable, allowResizing, onToggleCycle])
+  }, [nodesDraggable, allowResizing, handleToggleWithTracking])
+
+  // Auto-expand containers that contain active agents (data.containsActiveAgent = true)
+  // when filteredRawBuild changes, unless the user has explicitly closed them.
+  // Calls onToggleCycle directly (not through handleToggleWithTracking) so these
+  // auto-opens are not recorded as user actions and remain auto-expandable.
+  useEffect(() => {
+    if (!filteredRawBuild || !onToggleCycleRef.current) return
+    filteredRawBuild.nodes.forEach(n => {
+      if (
+        CYCLE_CONTAINER_TYPES.includes(n.type) &&
+        n.data?.isCollapsed === true &&
+        n.data?.containsActiveAgent === true &&
+        !userClosedCyclesRef.current.has(n.id)
+      ) {
+        onToggleCycleRef.current(n.id)
+      }
+    })
+  }, [filteredRawBuild])
 
   const handleLayoutDone = useCallback((finalNodes) => {
     hasLayoutedOnceRef.current = true
@@ -292,7 +381,7 @@ export default function PipelineFlowGraph({
             panOnScroll={true}
           >
             <LayoutController
-              rawBuild={rawBuild}
+              rawBuild={filteredRawBuild}
               structuralVersion={structuralVersion}
               dataVersion={dataVersion}
               measurementVersion={measurementVersion}
