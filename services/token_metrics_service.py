@@ -909,6 +909,7 @@ class TokenMetricsService:
             'total_cache_read': int,
             'total_cache_creation': int,
             'tool_call_count': int,
+            'tool_breakdown': {tool_name: {'task_count': int, 'sum_output': int, 'sum_context_growth': int}},
         }}
         """
         if not task_ids:
@@ -966,7 +967,9 @@ class TokenMetricsService:
             sum_output = 0
             first_input: Optional[int] = None
             peak_input = 0
-            per_task_tool_invocations: Dict[str, int] = {}
+            task_tool_breakdown: Dict[str, Dict] = {}
+            prev_effective_input: Optional[int] = None
+            prev_tool_uses: List[str] = []
 
             # Dedup streaming re-emissions using message ID (same as _process_task_streams)
             _last_idx_for_msg: Dict[str, int] = {}
@@ -1028,15 +1031,43 @@ class TokenMetricsService:
                 contents = message.get('content') or []
                 if not isinstance(contents, list):
                     contents = []
+                current_tool_uses: List[str] = []
                 for c in contents:
                     if c.get('type') == 'tool_use':
                         name = _get_effective_tool_name(c)
                         if name:
-                            per_task_tool_invocations[name] = per_task_tool_invocations.get(name, 0) + 1
+                            current_tool_uses.append(name)
+
+                # Attribute this turn's token costs to tools invoked in this turn
+                if current_tool_uses:
+                    k = len(current_tool_uses)
+                    for tool_name in current_tool_uses:
+                        td = task_tool_breakdown.setdefault(tool_name, _empty_tool_entry())
+                        td['invocation_count'] += 1
+                        td['sum_output'] += output_tokens / k
+
+                # Context growth attribution: delta effective_input attributed to PREV turn's tools
+                if prev_effective_input is not None and prev_tool_uses:
+                    delta = max(0, effective_input - prev_effective_input)
+                    k = len(prev_tool_uses)
+                    per_tool_delta = delta / k if k > 0 else 0
+                    for tool_name in prev_tool_uses:
+                        td = task_tool_breakdown.setdefault(tool_name, _empty_tool_entry())
+                        td['sum_context_growth'] += per_tool_delta
+
+                prev_effective_input = effective_input
+                prev_tool_uses = current_tool_uses
 
             if first_input is not None:
                 context_growth = max(0, peak_input - first_input)
-                tool_call_count = sum(per_task_tool_invocations.values())
+                tool_breakdown = {
+                    tool_name: {
+                        'task_count': td['invocation_count'],
+                        'sum_output': int(td['sum_output']),
+                        'sum_context_growth': int(td['sum_context_growth']),
+                    }
+                    for tool_name, td in task_tool_breakdown.items()
+                }
                 results[task_id] = {
                     'initial_context': first_input,
                     'peak_context': peak_input,
@@ -1045,7 +1076,8 @@ class TokenMetricsService:
                     'total_direct_input': sum_direct,
                     'total_cache_read': sum_cache_read,
                     'total_cache_creation': sum_cache_creation,
-                    'tool_call_count': tool_call_count,
+                    'tool_call_count': sum(td['invocation_count'] for td in task_tool_breakdown.values()),
+                    'tool_breakdown': tool_breakdown,
                 }
 
         return results
@@ -1207,6 +1239,7 @@ class TokenMetricsService:
             doc['total_cache_read'] = tokens.get('total_cache_read')
             doc['total_cache_creation'] = tokens.get('total_cache_creation')
             doc['tool_call_count'] = tokens.get('tool_call_count')
+            doc['tool_breakdown'] = tokens.get('tool_breakdown', {})
 
             doc['prompt_length'] = prompt_length_map.get(tid)
 

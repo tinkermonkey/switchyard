@@ -221,8 +221,7 @@ class ProjectMetricsService:
         outcomes = self._compute_pipeline_outcomes(project, start, end)
 
         agent_breakdown = token_ctx.get('agent_breakdown', {})
-        agent_names = list(agent_breakdown.keys())
-        tool_breakdown = self._compute_tool_breakdown(project, start, end, agent_names)
+        tool_breakdown = self._compute_tool_breakdown(project, start, end)
 
         return {
             'project': project,
@@ -383,28 +382,23 @@ class ProjectMetricsService:
     # -------------------------------------------------------------------------
 
     def _compute_tool_breakdown(
-        self, project: str, start: datetime, end: datetime, agent_names: List[str]
+        self, project: str, start: datetime, end: datetime
     ) -> Dict[str, Any]:
         """
-        Approximate tool breakdown for a project by fetching hourly agent bucket docs
-        for agents active in this project during the day window.
-
-        Hourly bucket docs aggregate all projects using the same agent name in the same
-        hour, so these numbers may include a small amount of cross-project data when
-        multiple projects share agent names and run concurrently.
+        Compute per-tool breakdown for a project by aggregating tool_breakdown fields
+        from agent-execution-summaries-*, which are now written per execution and are
+        scoped exactly to the project.
         """
-        if not agent_names:
-            return {}
         try:
             result = self.es.search(
-                index='token-metrics-agents-hourly-*',
+                index='agent-execution-summaries-*',
                 body={
-                    'size': len(agent_names) * 48,  # up to 24 hourly docs per agent
+                    'size': 10000,
                     'query': {
                         'bool': {
                             'must': [
-                                {'terms': {'agent_name': agent_names}},
-                                {'range': {'hour_bucket': {
+                                {'term': {'project': project}},
+                                {'range': {'ended_at': {
                                     'gte': start.isoformat(),
                                     'lt': end.isoformat(),
                                 }}},
@@ -419,8 +413,18 @@ class ProjectMetricsService:
                 logger.warning(f"Error fetching tool breakdown for {project}: {e}")
             return {}
 
+        hits = result['hits']['hits']
+        total = result['hits'].get('total', {})
+        if isinstance(total, dict):
+            total = total.get('value', len(hits))
+        if total > len(hits):
+            logger.warning(
+                f"tool_breakdown query returned {len(hits)} of {total} docs "
+                f"for {project} in window {start.date()} — tool breakdown may be incomplete"
+            )
+
         tool_breakdown: Dict[str, Any] = {}
-        for hit in result['hits']['hits']:
+        for hit in hits:
             for tool_name, tb in (hit['_source'].get('tool_breakdown') or {}).items():
                 if not isinstance(tb, dict):
                     continue
