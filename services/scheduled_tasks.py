@@ -8,10 +8,12 @@ Uses APScheduler for Python-native scheduling.
 import logging
 import asyncio
 import os
+import random
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.date import DateTrigger
 from apscheduler.triggers.interval import IntervalTrigger
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +104,26 @@ class ScheduledTasksService:
             replace_existing=True
         )
 
+        # Schedule project metrics computation - daily at 3 AM
+        self.scheduler.add_job(
+            self._run_project_metrics,
+            trigger=CronTrigger(hour=3, minute=30),
+            id='project_metrics_daily',
+            name='Compute per-project daily rollup metrics',
+            replace_existing=True
+        )
+
+        # Backfill project metrics on startup (7-day lookback) with jitter
+        jitter_seconds = random.uniform(60, 600)
+        startup_time = datetime.now(timezone.utc) + timedelta(seconds=jitter_seconds)
+        self.scheduler.add_job(
+            self._run_project_metrics_backfill,
+            trigger=DateTrigger(run_date=startup_time),
+            id='project_metrics_startup_backfill',
+            name='Project metrics startup backfill (7-day)',
+            replace_existing=True
+        )
+
         self.scheduler.start()
         self.running = True
         logger.info("Scheduled tasks service started")
@@ -113,6 +135,8 @@ class ScheduledTasksService:
         logger.info("- Queue state reconciliation: Every 10 minutes")
         logger.info("- Empty output detection: Every 15 minutes")
         logger.info(f"- Token metrics computation: Every {token_metrics_hours} hours")
+        logger.info("- Project metrics rollup: Daily at 3:30 AM")
+        logger.info(f"- Project metrics backfill: Once at startup in ~{jitter_seconds:.0f}s")
 
     def stop(self):
         """Stop the scheduler"""
@@ -671,6 +695,26 @@ class ScheduledTasksService:
         except Exception as e:
             logger.error(f"Fatal error in token metrics job: {e}", exc_info=True)
 
+    async def _run_project_metrics(self):
+        """Run daily project metrics rollup job (1-day lookback)."""
+        logger.info("Starting project metrics rollup job")
+        try:
+            from services.project_metrics_service import get_project_metrics_service
+            service = get_project_metrics_service()
+            await service.run_metrics_job(lookback_days=1)
+        except Exception as e:
+            logger.error(f"Fatal error in project metrics job: {e}", exc_info=True)
+
+    async def _run_project_metrics_backfill(self):
+        """Backfill project metrics with a 7-day lookback on startup."""
+        logger.info("Starting project metrics startup backfill (7-day lookback)")
+        try:
+            from services.project_metrics_service import get_project_metrics_service
+            service = get_project_metrics_service()
+            await service.run_metrics_job(lookback_days=7)
+        except Exception as e:
+            logger.error(f"Fatal error in project metrics backfill: {e}", exc_info=True)
+
     def run_cleanup_now(self):
         """Run cleanup task immediately (for testing/manual trigger)"""
         logger.info("Manually triggering orphaned branch cleanup")
@@ -728,6 +772,16 @@ class ScheduledTasksService:
             await service.run_metrics_job(lookback_hours=lookback_hours)
         except Exception as e:
             logger.error(f"Fatal error in full-history token metrics backfill: {e}", exc_info=True)
+
+    def run_project_metrics_now(self):
+        """Run project metrics rollup immediately (for testing/manual trigger)."""
+        logger.info("Manually triggering project metrics rollup")
+        asyncio.create_task(self._run_project_metrics())
+
+    def run_project_metrics_backfill_now(self):
+        """Run project metrics 7-day backfill immediately (for testing/manual trigger)."""
+        logger.info("Manually triggering project metrics backfill")
+        asyncio.create_task(self._run_project_metrics_backfill())
 
 
 # Global instance

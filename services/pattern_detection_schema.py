@@ -530,3 +530,71 @@ def enrich_claude_log(log_data: dict) -> dict:
         enriched["event_type"] = "unknown"
 
     return enriched
+
+
+# Mapping for project-level daily rollup metrics
+PROJECT_METRICS_MAPPING = {
+    "mappings": {
+        "properties": {
+            "project":            {"type": "keyword"},
+            "day_bucket":         {"type": "date"},
+            "pipeline_run_count": {"type": "integer"},
+            "computed_at":        {"type": "date"},
+            # Nested metric groups — stored and queryable
+            "tokens":             {"type": "object", "enabled": True},
+            "context":            {"type": "object", "enabled": True},
+            "tool_calls":         {"type": "object", "enabled": True},
+            "review_cycles":      {"type": "object", "enabled": True},
+            "repair_cycles":      {"type": "object", "enabled": True},
+            "pr_review_cycles":   {"type": "object", "enabled": True},
+            "pipeline_outcomes":  {"type": "object", "enabled": True},
+        }
+    },
+    "settings": {
+        "index": {
+            "number_of_shards": 1,
+            "number_of_replicas": 0,
+            "refresh_interval": "30s",
+            "lifecycle": {
+                "name": "project-metrics-ilm-policy"
+            }
+        }
+    }
+}
+
+PROJECT_METRICS_TEMPLATE = {
+    "index_patterns": ["project-metrics-*"],
+    "template": PROJECT_METRICS_MAPPING,
+    "priority": 100
+}
+
+# ILM policy: 30-day retention (longer than 7-day task metrics;
+# project trends are valuable over time)
+PROJECT_METRICS_ILM_POLICY = {
+    "policy": {
+        "phases": {
+            "hot": {
+                "min_age": "0ms",
+                "actions": {
+                    "set_priority": {
+                        "priority": 100
+                    }
+                }
+            },
+            "warm": {
+                "min_age": "15d",
+                "actions": {
+                    "set_priority": {
+                        "priority": 50
+                    }
+                }
+            },
+            "delete": {
+                "min_age": "30d",
+                "actions": {
+                    "delete": {}
+                }
+            }
+        }
+    }
+}
