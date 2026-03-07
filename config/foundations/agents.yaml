@@ -155,7 +155,7 @@ agents:
   code_reviewer:
     description: "Code quality review and validation"
     model: "claude-opus-4-6"
-    timeout: 300
+    timeout: 3600
     retries: 2
     makes_code_changes: false  # Review only, no changes
     filesystem_write_allowed: false  # Posts reviews to GitHub, doesn't create files
