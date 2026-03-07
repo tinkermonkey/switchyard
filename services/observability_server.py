@@ -335,6 +335,13 @@ def health():
     """Health check endpoint - returns orchestrator health status"""
     import json
 
+    # Best-effort drain of ES backup buffer on each health check
+    try:
+        from monitoring.observability import get_observability_manager
+        get_observability_manager().drain_es_backup()
+    except Exception as e:
+        logger.debug(f"drain_es_backup skipped: {e}")
+
     # Get last health check result from Redis (cross-process shared state)
     try:
         health_json = redis_client_raw.get('orchestrator:health')

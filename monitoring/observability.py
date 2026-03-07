@@ -263,6 +263,9 @@ class EventType(Enum):
     SUB_ISSUE_CREATED = "sub_issue_created"
     SUB_ISSUE_CREATION_FAILED = "sub_issue_creation_failed"
 
+    # Prompt Health
+    PROMPT_SIZE_WARNING = "prompt_size_warning"
+
 @dataclass
 class ObservabilityEvent:
     """Structured event for agent observability"""
@@ -289,6 +292,14 @@ class ObservabilityEvent:
 
 class ObservabilityManager:
     """Manages event emission for agent observability"""
+
+    # Redis key / config for ES backup buffer
+    _ES_BACKUP_KEY = "es:failed_events"
+    _ES_BACKUP_MAX = 1000
+    _ES_DRAIN_BATCH = 50
+
+    # Prompt size threshold for emitting PROMPT_SIZE_WARNING decision events
+    _PROMPT_SIZE_WARNING_THRESHOLD = 50_000
 
     def __init__(self, redis_client: redis.Redis = None, elasticsearch_client: Elasticsearch = None, enabled: bool = True):
         """Initialize observability manager"""
@@ -373,6 +384,55 @@ class ObservabilityManager:
         except Exception as e:
             logger.error(f"Failed to setup Elasticsearch for decision events: {e}")
             return False
+
+    def _es_write(self, index: str, document: dict, doc_id=None, **kwargs) -> None:
+        """Write a document to ES, pushing to Redis backup list on failure."""
+        try:
+            es_index_with_retry(self.es, index, document, doc_id, **kwargs)
+        except Exception as exc:
+            logger.error(f"ES write failed for index {index}, pushing to backup buffer: {exc}")
+            if not self.redis:
+                return
+            try:
+                if self.redis.llen(self._ES_BACKUP_KEY) >= self._ES_BACKUP_MAX:
+                    logger.warning(
+                        f"ES backup buffer full ({self._ES_BACKUP_MAX} items); dropping event for index {index}"
+                    )
+                    return
+                payload = json.dumps({
+                    "index": index,
+                    "document": document,
+                    "doc_id": doc_id,
+                    "failed_at": utc_isoformat(),
+                })
+                self.redis.lpush(self._ES_BACKUP_KEY, payload)
+            except Exception as redis_exc:
+                logger.error(f"Failed to push event to ES backup buffer: {redis_exc}")
+
+    def drain_es_backup(self) -> None:
+        """Drain the Redis ES backup buffer, re-indexing documents into ES."""
+        if not self.es or not self.redis:
+            return
+        try:
+            for _ in range(self._ES_DRAIN_BATCH):
+                raw = self.redis.rpop(self._ES_BACKUP_KEY)
+                if raw is None:
+                    break
+                try:
+                    item = json.loads(raw)
+                    # max_retries=1: one attempt only so callers on hot paths
+                    # (e.g. /health) are not blocked for the full ~60s retry window.
+                    es_index_with_retry(self.es, item["index"], item["document"], item.get("doc_id"), max_retries=1)
+                    logger.info(f"Drained ES backup event to index {item['index']}")
+                except Exception as exc:
+                    logger.error(f"Drain re-index failed, pushing back to buffer: {exc}")
+                    try:
+                        self.redis.lpush(self._ES_BACKUP_KEY, raw)
+                    except Exception:
+                        pass
+                    break
+        except Exception as exc:
+            logger.error(f"drain_es_backup error: {exc}")
 
     def _is_decision_event(self, event_type: EventType) -> bool:
         """Check if an event type is a decision event that should be indexed in Elasticsearch"""
@@ -462,6 +522,8 @@ class ObservabilityManager:
             # Issue Management
             EventType.SUB_ISSUE_CREATED,
             EventType.SUB_ISSUE_CREATION_FAILED,
+            # Prompt Health
+            EventType.PROMPT_SIZE_WARNING,
         }
         return event_type in decision_events
 
@@ -538,7 +600,7 @@ class ObservabilityManager:
                         logger.info(f"[DIAGNOSTIC] Writing {event.event_type} to ES with pipeline_run_id: {pipeline_run_id} (is None: {pipeline_run_id is None}), project: {project}")
                     
                     # Index the document
-                    es_index_with_retry(self.es, index_name, doc)
+                    self._es_write(index_name, doc)
                     logger.info(f"Indexed decision event {event_type.value} to {index_name}")
                 except Exception as e:
                     logger.error(f"Failed to index decision event to Elasticsearch: {e}")
@@ -565,7 +627,7 @@ class ObservabilityManager:
                     }
                     
                     # Index the document
-                    es_index_with_retry(self.es, index_name, doc)
+                    self._es_write(index_name, doc)
                     logger.info(f"Indexed agent lifecycle event {event_type.value} to {index_name}")
                 except Exception as e:
                     logger.error(f"Failed to index agent lifecycle event to Elasticsearch: {e}")
@@ -626,19 +688,26 @@ class ObservabilityManager:
                                prompt: str, estimated_tokens: Optional[int] = None,
                                prompt_components: Optional[Dict[str, int]] = None):
         """Emit prompt constructed event"""
-        # Truncate very long prompts for the event
-        prompt_preview = prompt[:1000] + "..." if len(prompt) > 1000 else prompt
+        prompt_length = len(prompt)
+        prompt_preview = prompt[:1000] + "..." if prompt_length > 1000 else prompt
 
         data: Dict[str, Any] = {
             'prompt': prompt,
             'prompt_preview': prompt_preview,
-            'prompt_length': len(prompt),
+            'prompt_length': prompt_length,
             'estimated_tokens': estimated_tokens
         }
         if prompt_components:
             data['prompt_components'] = prompt_components
 
         self.emit(EventType.PROMPT_CONSTRUCTED, agent, task_id, project, data)
+
+        if prompt_length > self._PROMPT_SIZE_WARNING_THRESHOLD:
+            self.emit(EventType.PROMPT_SIZE_WARNING, agent, task_id, project, {
+                'prompt_length': prompt_length,
+                'threshold': self._PROMPT_SIZE_WARNING_THRESHOLD,
+                'prompt_components': prompt_components,
+            })
 
         if self.es:
             try:
@@ -649,17 +718,17 @@ class ObservabilityManager:
                     'agent': agent,
                     'task_id': task_id,
                     'project': project,
-                    'prompt_length': len(prompt),
+                    'prompt_length': prompt_length,
                     'raw_event': {
                         'data': {
                             'prompt': prompt,
-                            'prompt_length': len(prompt),
+                            'prompt_length': prompt_length,
                             'estimated_tokens': estimated_tokens,
                             'prompt_components': prompt_components,
                         }
                     },
                 }
-                es_index_with_retry(self.es, index_name, doc)
+                self._es_write(index_name, doc)
             except Exception as e:
                 logger.error(f"Failed to index prompt_constructed event to Elasticsearch: {e}")
 
@@ -793,7 +862,7 @@ class ObservabilityManager:
             }
 
             # Index the document
-            es_index_with_retry(self.es, index_name, doc)
+            self._es_write(index_name, doc)
             logger.debug(f"Indexed Claude stream event to {index_name} for {agent}/{task_id}")
         except Exception as e:
             logger.error(f"Failed to index Claude stream event to Elasticsearch: {e}")

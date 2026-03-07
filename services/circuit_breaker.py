@@ -29,7 +29,7 @@ class CircuitState(Enum):
 class CircuitBreakerConfig:
     """Circuit breaker configuration"""
     failure_threshold: int = 3        # Failures before opening circuit
-    recovery_timeout: int = 30        # Seconds to wait before testing recovery
+    recovery_timeout: int = 600       # Seconds to wait before testing recovery (10 minutes)
     success_threshold: int = 2        # Successes in half-open before closing
     expected_exception: type = Exception
 
@@ -59,7 +59,7 @@ class CircuitBreaker:
         self,
         name: str,
         failure_threshold: int = 3,
-        recovery_timeout: int = 30,
+        recovery_timeout: int = 600,
         success_threshold: int = 2,
         expected_exception: type = Exception
     ):
