@@ -58,7 +58,7 @@ function ProjectCard({ project: p }) {
         <div className="flex items-center gap-3">
           <h3 className="text-sm font-semibold font-mono">{p.project}</h3>
           <span className="text-xs text-gh-fg-muted">{p.pipeline_run_count} pipeline runs</span>
-          {p.days_with_data > 0 && (
+          {p.days_with_data > 1 && (
             <span className="text-xs text-gh-fg-muted">({p.days_with_data}d with data)</span>
           )}
         </div>
@@ -130,7 +130,9 @@ function ProjectCard({ project: p }) {
               />
             </div>
 
-            <SectionHeader title="Pipeline Outcomes" />
+            <div className="mt-4">
+              <SectionHeader title="Pipeline Outcomes" />
+            </div>
             <div className="bg-gh-canvas-subtle border border-gh-border rounded p-3 grid grid-cols-2 gap-3 mt-2">
               <StatCell label="Success" value={outcomes.success_count ?? '—'} />
               <StatCell label="Failed" value={outcomes.failed_count ?? '—'} />

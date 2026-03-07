@@ -1898,20 +1898,19 @@ def get_project_metrics():
                 }
             )
             docs = [hit['_source'] for hit in result['hits']['hits']]
+            total_hits = (
+                result['hits']['total']['value']
+                if isinstance(result['hits']['total'], dict)
+                else result['hits']['total']
+            )
+            if total_hits > len(docs):
+                logger.warning(
+                    f"project metrics query truncated: {total_hits} total but only {len(docs)} returned"
+                )
         except Exception as e:
             if 'index_not_found' in str(e).lower() or 'no such index' in str(e).lower():
                 return jsonify({'success': True, 'projects': []})
             raise
-
-        total_hits = (
-            result['hits']['total']['value']
-            if isinstance(result['hits']['total'], dict)
-            else result['hits']['total']
-        )
-        if total_hits > len(docs):
-            logger.warning(
-                f"project metrics query truncated: {total_hits} total but only {len(docs)} returned"
-            )
 
         by_project: dict = {}
         for doc in docs:
