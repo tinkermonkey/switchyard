@@ -588,9 +588,19 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
   // Order: root → cycleContainers → iterContainers → direct children → subCycleContainers → subCycleLeaves
   const parentNodes = nodes.filter(n => !n.parentId).map(n => positionedNodes.get(n.id) ?? n)
   const iterContainerNodes = iterContainers.map(n => positionedNodes.get(n.id) ?? n)
-  const directChildrenNodes = [...allDirectCycleChildren, ...allGrandchildren].map(n => positionedNodes.get(n.id) ?? n)
+  // Hidden nodes not in positionedNodes would fall back to position:{x:0,y:0}, placing them
+  // directly over their parent container's header (absolute, top:0, height:30). React Flow renders
+  // hidden nodes with visibility:hidden (DOM present), so those ghost elements intercept pointer
+  // events and block the collapse/expand button. Move them off-screen instead.
+  const offScreen = { x: -10000, y: -10000 }
+  const resolveNode = n => {
+    const positioned = positionedNodes.get(n.id)
+    if (positioned) return positioned
+    return n.hidden ? { ...n, position: offScreen } : n
+  }
+  const directChildrenNodes = [...allDirectCycleChildren, ...allGrandchildren].map(resolveNode)
   const subCycleContainerNodes = subCycleContainers.map(n => positionedNodes.get(n.id) ?? n)
-  const subCycleLeafNodes = allSubCycleLeaves.map(n => positionedNodes.get(n.id) ?? n)
+  const subCycleLeafNodes = allSubCycleLeaves.map(resolveNode)
 
   const cycleNodes = nodes.filter(
     n => n.type === 'reviewCycleContainer' ||
