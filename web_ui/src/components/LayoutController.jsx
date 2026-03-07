@@ -157,6 +157,7 @@ export default function LayoutController({
     // once the next measurementVersion increment arrives (dimension events have fired).
     const sizeCache = nodeSizeCache?.current
     if (sizeCache && rawMeasuredNodes.some(n =>
+      !n.hidden &&
       !sizeCache.has(n.id) && !(n.measured?.width && n.measured?.height)
     )) {
       return
