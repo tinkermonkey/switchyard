@@ -491,13 +491,13 @@ function PipelineRunView() {
       if (e.event_type === 'agent_initialized') agentTaskInit.set(e.task_id, e.agent)
       else if (e.event_type === 'agent_completed' || e.event_type === 'agent_failed') agentTaskDone.add(e.task_id)
     })
-    const activeAgents = new Set()
+    const activeTaskIds = new Set()
     agentTaskInit.forEach((agent, taskId) => {
-      if (!agentTaskDone.has(taskId)) activeAgents.add(agent)
+      if (!agentTaskDone.has(taskId)) activeTaskIds.add(taskId)
     })
 
     // Find containers that lead to the active agent
-    const activeContainerIds = findActiveContainerPath(model, activeAgents)
+    const activeContainerIds = findActiveContainerPath(model, activeTaskIds)
     const prevAutoOpened = prevAutoOpenedRef.current
 
     // Build new top-level cycle map (all expanded by default)

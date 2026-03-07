@@ -608,16 +608,16 @@ export function buildFlowchart({
  * Finds all container IDs (cycle, iteration, sub-cycle) that contain events
  * from currently-active agents, returning the full hierarchy path to expand.
  *
- * @param {Object} model            - Processed event model (from processEvents)
- * @param {Set}    activeAgentNames - Set of agent name strings currently running
+ * @param {Object} model          - Processed event model (from processEvents)
+ * @param {Set}    activeTaskIds  - Set of task_id strings for currently-running agent executions
  * @returns {Set<string>} Container IDs that should be auto-expanded
  */
-export function findActiveContainerPath(model, activeAgentNames) {
-  if (!activeAgentNames.size) return new Set()
+export function findActiveContainerPath(model, activeTaskIds) {
+  if (!activeTaskIds.size) return new Set()
   const result = new Set()
 
   const hasActive = (events) =>
-    events.some(e => e.event_type === 'agent_initialized' && activeAgentNames.has(e.agent))
+    events.some(e => e.event_type === 'agent_initialized' && activeTaskIds.has(e.task_id))
 
   model.cycles.forEach(cycle => {
     if (cycle.type === 'review_cycle') {
