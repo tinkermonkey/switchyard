@@ -18,13 +18,17 @@ from monitoring.timestamp_utils import utc_now, utc_isoformat
 logger = logging.getLogger(__name__)
 
 
-def es_index_with_retry(es, index: str, document: dict, doc_id=None, max_retries: int = 3, **kwargs) -> None:
+def es_index_with_retry(es, index: str, document: dict, doc_id=None, max_retries: int = 5, **kwargs) -> None:
     """Index a document in Elasticsearch, retrying on transient failures.
 
     Raises the last exception if all retries are exhausted so callers can
     decide whether to log-and-continue or propagate.
 
     Extra keyword arguments (e.g. refresh=True) are forwarded to es.index().
+
+    Retry schedule (default 5 retries): 2s, 4s, 8s, 16s, 30s = ~60s total window.
+    This is designed to outlast transient Docker DNS failures (~25s observed) and
+    the elastic-transport node-pool dead-node backoff (max 30s).
     """
     if max_retries < 1:
         raise ValueError(f"max_retries must be >= 1, got {max_retries}")
@@ -39,8 +43,9 @@ def es_index_with_retry(es, index: str, document: dict, doc_id=None, max_retries
         except Exception as exc:
             last_exc = exc
             if attempt < max_retries - 1:
-                logger.warning(f"ES index to {index} failed (attempt {attempt + 1}/{max_retries}), retrying: {exc}")
-                time.sleep(2 ** attempt)  # 1s, 2s backoff
+                sleep_seconds = min(2 ** (attempt + 1), 30)  # 2s, 4s, 8s, 16s, 30s
+                logger.warning(f"ES index to {index} failed (attempt {attempt + 1}/{max_retries}), retrying in {sleep_seconds}s: {exc}")
+                time.sleep(sleep_seconds)
     raise last_exc
 
 
