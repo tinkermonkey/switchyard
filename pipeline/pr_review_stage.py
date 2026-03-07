@@ -1229,11 +1229,12 @@ If all requirements are met, write "All requirements verified - no gaps found" a
                         issue_data = json.loads(view_result.stdout)
                         break
                     delay = 2 ** _attempt
-                    logger.warning(
-                        f"gh issue view {issue_number} failed (attempt {_attempt + 1}/3, "
-                        f"retrying in {delay}s): {view_result.stderr.strip()}"
-                    )
-                    await asyncio.sleep(delay)
+                    if _attempt < 2:
+                        logger.warning(
+                            f"gh issue view {issue_number} failed (attempt {_attempt + 1}/3, "
+                            f"retrying in {delay}s): {view_result.stderr.strip()}"
+                        )
+                        await asyncio.sleep(delay)
                 if issue_data is None:
                     raise RuntimeError(
                         f"gh issue view {issue_number} failed after 3 attempts: "
