@@ -46,6 +46,8 @@ export function CycleContainerNode({ data, theme }) {
     collapsedLabel,
     collapsedTextColor,
     collapsedCountColor,
+    collapsedWidth = 280,
+    renderCollapsedSummary,
   } = theme
 
   const isToggleable = !!onToggleCollapse
@@ -71,7 +73,7 @@ export function CycleContainerNode({ data, theme }) {
     return (
       <div
         style={{
-          width: 280,
+          width: collapsedWidth,
           display: 'flex',
           flexDirection: 'column',
           border: `2px ${borderStyle}`,
@@ -107,20 +109,26 @@ export function CycleContainerNode({ data, theme }) {
           )}
           {isToggleable && <ChevronRight className="w-4 h-4" />}
         </div>
-        <div
-          style={{
-            display: 'flex', flexDirection: 'column',
-            alignItems: 'center', justifyContent: 'center',
-            padding: '12px 20px', gap: 8,
-          }}
-        >
-          <div style={{ fontSize: 24, fontWeight: 700, color: collapsedCountColor }}>
-            {iterationCount}×
-          </div>
-          <div style={{ fontSize: 11, color: '#9ca3af', textAlign: 'center' }}>
-            Click to expand
-          </div>
-        </div>
+        {(() => {
+          const customBody = renderCollapsedSummary ? renderCollapsedSummary(data) : null
+          if (customBody != null) return customBody
+          return (
+            <div
+              style={{
+                display: 'flex', flexDirection: 'column',
+                alignItems: 'center', justifyContent: 'center',
+                padding: '12px 20px', gap: 8,
+              }}
+            >
+              <div style={{ fontSize: 24, fontWeight: 700, color: collapsedCountColor }}>
+                {iterationCount}×
+              </div>
+              <div style={{ fontSize: 11, color: '#9ca3af', textAlign: 'center' }}>
+                Click to expand
+              </div>
+            </div>
+          )
+        })()}
       </div>
     )
   }
