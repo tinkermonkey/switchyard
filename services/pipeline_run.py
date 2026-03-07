@@ -11,7 +11,7 @@ import json
 import uuid
 from typing import Optional, Dict, Any
 from datetime import datetime
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, fields
 from elasticsearch import Elasticsearch
 from monitoring.observability import es_index_with_retry
 
@@ -107,8 +107,9 @@ class PipelineRun:
     
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> 'PipelineRun':
-        """Create from dictionary"""
-        return cls(**data)
+        """Create from dictionary, ignoring unknown fields (e.g. analysis fields written back by pipeline_run_analysis)."""
+        known = {f.name for f in fields(cls)}
+        return cls(**{k: v for k, v in data.items() if k in known})
     
     def is_active(self) -> bool:
         """Check if pipeline run is still active"""
