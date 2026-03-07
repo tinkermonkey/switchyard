@@ -534,13 +534,13 @@ class DockerAgentRunner:
         logger.info(f"Mounting project: container={container_path_str}, host={host_project_path}")
 
         # Get agent config to check filesystem write permission
-        # Fall back to context-provided agent_config for system-level agents (e.g. pipeline_analysis)
-        # that don't belong to a project config file.
+        # Fall back to context-provided agent_config for system-level agents that don't
+        # belong to a project config file (raises ConfigurationError for unknown projects).
         try:
-            from config.manager import config_manager
+            from config.manager import config_manager, ConfigurationError
             agent_config = config_manager.get_project_agent_config(context.get('project', 'unknown'), agent)
             filesystem_write_allowed = getattr(agent_config, 'filesystem_write_allowed', True)
-        except Exception:
+        except ConfigurationError:
             ctx_agent_config = context.get('agent_config')
             filesystem_write_allowed = getattr(ctx_agent_config, 'filesystem_write_allowed', False)
 
@@ -730,14 +730,14 @@ class DockerAgentRunner:
         Returns:
             Docker image name to use
         """
-        from config.manager import config_manager
+        from config.manager import config_manager, ConfigurationError
         from services.dev_container_state import dev_container_state
 
         # Get agent configuration; fall back gracefully for system-level agents without a project config
         try:
             agent_config = config_manager.get_project_agent_config(project, agent)
             requires_dev_container = getattr(agent_config, 'requires_dev_container', False)
-        except Exception:
+        except ConfigurationError:
             requires_dev_container = False
 
         if requires_dev_container:
@@ -869,9 +869,13 @@ class DockerAgentRunner:
         # Get agent info for safety check
         agent = context.get('agent', 'unknown')
         task_id = context.get('task_id', 'unknown')
-        from config.manager import config_manager
-        agent_config = config_manager.get_project_agent_config(context.get('project', 'unknown'), agent)
-        filesystem_write_allowed = getattr(agent_config, 'filesystem_write_allowed', True)
+        from config.manager import config_manager, ConfigurationError
+        try:
+            agent_config = config_manager.get_project_agent_config(context.get('project', 'unknown'), agent)
+            filesystem_write_allowed = getattr(agent_config, 'filesystem_write_allowed', True)
+        except ConfigurationError:
+            ctx_agent_config = context.get('agent_config')
+            filesystem_write_allowed = getattr(ctx_agent_config, 'filesystem_write_allowed', False)
 
         # SAFETY CHECK: Verify container can actually write to workspace before launching expensive agent
         if filesystem_write_allowed:

@@ -288,9 +288,11 @@ agents:
     timeout: 300
     retries: 1
     makes_code_changes: false
-    filesystem_write_allowed: false  # Mounts /workspace/clauditoreum read-only; only queries ES
-    requires_dev_container: false    # Uses orchestrator image — no project dependencies needed
-    requires_docker: true
+    filesystem_write_allowed: false
+    requires_dev_container: false
+    requires_docker: false  # Runs in the orchestrator container (like dev_environment_setup);
+                            # avoids Docker runner's file-based prompt delivery which requires
+                            # a writeable workspace — analysis only queries ES via curl.
     capabilities:
       - pipeline_analysis
       - root_cause_analysis

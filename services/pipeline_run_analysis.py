@@ -109,7 +109,13 @@ class PipelineRunAnalysisService:
         )
 
     def _build_context(self, run_id: str) -> dict:
-        """Build the context dict expected by run_claude_code / docker_runner."""
+        """Build the context dict expected by run_claude_code.
+
+        Uses requires_docker=false so execution runs directly in the orchestrator
+        container (non-Docker path in claude_integration.py). This avoids the
+        Docker runner's file-based prompt delivery which requires a writeable
+        workspace — analysis only needs to run curl/ES queries.
+        """
         from config.manager import config_manager
         agent_config = config_manager.get_agent(_AGENT_NAME)
         task_id = f"analysis-{run_id[:12]}-{uuid.uuid4().hex[:6]}"
@@ -118,7 +124,7 @@ class PipelineRunAnalysisService:
             'task_id': task_id,
             'project': _PROJECT_NAME,
             'agent_config': agent_config,
-            'use_docker': True,
+            'work_dir': '/app',
             'mcp_servers': [],
         }
 
