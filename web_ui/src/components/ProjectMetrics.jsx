@@ -46,6 +46,13 @@ function ProjectCard({ project: p }) {
   const rp = p.repair_cycles || {}
   const pr = p.pr_review_cycles || {}
 
+  const agentBreakdown = Object.entries(p.agent_breakdown || {})
+    .sort((a, b) => (b[1].task_count || 0) - (a[1].task_count || 0))
+
+  const toolBreakdown = Object.entries(p.tool_breakdown || {})
+    .sort((a, b) => (b[1].sum_context_growth || 0) - (a[1].sum_context_growth || 0))
+    .slice(0, 10)
+
   const successRate = outcomes.success_rate
   const successBadge = successRate != null
     ? successRate >= 80
@@ -111,6 +118,78 @@ function ProjectCard({ project: p }) {
             avg={tools.avg_invocations_per_run}
             note={`${fmt(tools.total_invocations)} total`}
           />
+        </div>
+
+        {/* Agent + Tool breakdown */}
+        <div className="grid grid-cols-2 gap-4">
+          {/* Agent breakdown */}
+          <div>
+            <h4 className="text-xs font-semibold text-gh-fg-muted uppercase mb-2">Agent Breakdown</h4>
+            {agentBreakdown.length > 0 ? (
+              <table className="w-full text-xs">
+                <thead>
+                  <tr className="text-gh-fg-muted">
+                    <th className="text-left font-normal pb-1">Agent</th>
+                    <th className="text-right font-normal pb-1">Runs</th>
+                    <th className="text-right font-normal pb-1">Avg Direct</th>
+                    <th className="text-right font-normal pb-1">Avg Cache R</th>
+                    <th className="text-right font-normal pb-1">Avg Output</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-gh-border">
+                  {agentBreakdown.map(([agent, stats]) => {
+                    const atc = stats.task_count || 0
+                    const avgField = (f) => atc > 0 ? (stats[f] || 0) / atc : 0
+                    return (
+                      <tr key={agent}>
+                        <td className="font-mono py-0.5">{agent}</td>
+                        <td className="text-right py-0.5">{atc}</td>
+                        <td className="text-right py-0.5 font-mono">{fmt(avgField('sum_direct_input'))}</td>
+                        <td className="text-right py-0.5 font-mono">{fmt(avgField('sum_cache_read'))}</td>
+                        <td className="text-right py-0.5 font-mono">{fmt(avgField('sum_output'))}</td>
+                      </tr>
+                    )
+                  })}
+                </tbody>
+              </table>
+            ) : (
+              <p className="text-gh-fg-muted text-xs">No agent data</p>
+            )}
+          </div>
+
+          {/* Tool breakdown */}
+          <div>
+            <h4 className="text-xs font-semibold text-gh-fg-muted uppercase mb-2">Tool Breakdown (top by context growth)</h4>
+            {toolBreakdown.length > 0 ? (
+              <table className="w-full text-xs">
+                <thead>
+                  <tr className="text-gh-fg-muted">
+                    <th className="text-left font-normal pb-1">Tool</th>
+                    <th className="text-right font-normal pb-1">Invocations</th>
+                    <th className="text-right font-normal pb-1">Avg Output/Call</th>
+                    <th className="text-right font-normal pb-1">Context Growth</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-gh-border">
+                  {toolBreakdown.map(([tool, tb]) => {
+                    const inv = tb.task_count || 0
+                    return (
+                      <tr key={tool}>
+                        <td className="font-mono py-0.5">{tool}</td>
+                        <td className="text-right py-0.5">{inv}</td>
+                        <td className="text-right py-0.5 font-mono">
+                          {inv > 0 ? fmt((tb.sum_output || 0) / inv) : '—'}
+                        </td>
+                        <td className="text-right py-0.5 font-mono">{fmt(tb.sum_context_growth)}</td>
+                      </tr>
+                    )
+                  })}
+                </tbody>
+              </table>
+            ) : (
+              <p className="text-gh-fg-muted text-xs">No tool data</p>
+            )}
+          </div>
         </div>
 
         {/* Cycle summaries */}

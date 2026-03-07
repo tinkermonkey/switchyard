@@ -99,6 +99,8 @@ class ProjectMetricsService:
             "repair_cycles":      {"type": "object", "enabled": True},
             "pr_review_cycles":   {"type": "object", "enabled": True},
             "pipeline_outcomes":  {"type": "object", "enabled": True},
+            "agent_breakdown":    {"type": "object", "enabled": False},
+            "tool_breakdown":     {"type": "object", "enabled": False},
         }
         try:
             self.es.indices.get_index_template(name=PROJECT_METRICS_TEMPLATE)
@@ -218,6 +220,10 @@ class ProjectMetricsService:
         pr_review = self._compute_pr_review_metrics(project, start, end)
         outcomes = self._compute_pipeline_outcomes(project, start, end)
 
+        agent_breakdown = token_ctx.get('agent_breakdown', {})
+        agent_names = list(agent_breakdown.keys())
+        tool_breakdown = self._compute_tool_breakdown(project, start, end, agent_names)
+
         return {
             'project': project,
             'day_bucket': day_bucket,
@@ -230,6 +236,8 @@ class ProjectMetricsService:
             'repair_cycles': repair,
             'pr_review_cycles': pr_review,
             'pipeline_outcomes': outcomes,
+            'agent_breakdown': agent_breakdown,
+            'tool_breakdown': tool_breakdown,
         }
 
     # -------------------------------------------------------------------------
@@ -246,7 +254,7 @@ class ProjectMetricsService:
         Uses tool_call_count (indexed integer) for tool invocations — this field
         is the pre-summed count of all tool invocations per task.
         """
-        empty = {'pipeline_run_count': 0, 'tokens': {}, 'context': {}, 'tool_calls': {}}
+        empty = {'pipeline_run_count': 0, 'tokens': {}, 'context': {}, 'tool_calls': {}, 'agent_breakdown': {}}
         try:
             result = self.es.search(
                 index='agent-execution-summaries-*',
@@ -264,7 +272,7 @@ class ProjectMetricsService:
                         }
                     },
                     '_source': [
-                        'pipeline_run_id', 'total_direct_input', 'total_cache_read',
+                        'pipeline_run_id', 'agent_name', 'total_direct_input', 'total_cache_read',
                         'total_cache_creation', 'total_output', 'initial_context',
                         'peak_context', 'tool_call_count',
                     ],
@@ -288,6 +296,7 @@ class ProjectMetricsService:
 
         # Accumulate per pipeline_run_id so we can compute per-run averages
         runs: Dict[str, Dict[str, Any]] = {}
+        agent_breakdown: Dict[str, Dict[str, Any]] = {}
         for hit in hits:
             src = hit['_source']
             run_id = src.get('pipeline_run_id') or '__no_run__'
@@ -312,6 +321,22 @@ class ProjectMetricsService:
             if peak > r['peak_context']:
                 r['peak_context'] = peak
 
+            agent = src.get('agent_name') or 'unknown'
+            if agent not in agent_breakdown:
+                agent_breakdown[agent] = {
+                    'task_count': 0,
+                    'sum_direct_input': 0,
+                    'sum_cache_read': 0,
+                    'sum_cache_creation': 0,
+                    'sum_output': 0,
+                }
+            ab = agent_breakdown[agent]
+            ab['task_count'] += 1
+            ab['sum_direct_input'] += src.get('total_direct_input') or 0
+            ab['sum_cache_read'] += src.get('total_cache_read') or 0
+            ab['sum_cache_creation'] += src.get('total_cache_creation') or 0
+            ab['sum_output'] += src.get('total_output') or 0
+
         # Count distinct pipeline runs (exclude the sentinel no-run bucket)
         pipeline_run_count = len([rid for rid in runs if rid != '__no_run__'])
         if pipeline_run_count == 0:
@@ -329,6 +354,7 @@ class ProjectMetricsService:
 
         return {
             'pipeline_run_count': pipeline_run_count,
+            'agent_breakdown': agent_breakdown,
             'tokens': {
                 'sum_direct_input': total_direct_input,
                 'sum_cache_read': total_cache_read,
@@ -351,6 +377,61 @@ class ProjectMetricsService:
                 'avg_invocations_per_run': round(total_tool_calls / n, 2) if n else 0.0,
             },
         }
+
+    # -------------------------------------------------------------------------
+    # Tool breakdown
+    # -------------------------------------------------------------------------
+
+    def _compute_tool_breakdown(
+        self, project: str, start: datetime, end: datetime, agent_names: List[str]
+    ) -> Dict[str, Any]:
+        """
+        Approximate tool breakdown for a project by fetching hourly agent bucket docs
+        for agents active in this project during the day window.
+
+        Hourly bucket docs aggregate all projects using the same agent name in the same
+        hour, so these numbers may include a small amount of cross-project data when
+        multiple projects share agent names and run concurrently.
+        """
+        if not agent_names:
+            return {}
+        try:
+            result = self.es.search(
+                index='token-metrics-agents-hourly-*',
+                body={
+                    'size': len(agent_names) * 48,  # up to 24 hourly docs per agent
+                    'query': {
+                        'bool': {
+                            'must': [
+                                {'terms': {'agent_name': agent_names}},
+                                {'range': {'hour_bucket': {
+                                    'gte': start.isoformat(),
+                                    'lt': end.isoformat(),
+                                }}},
+                            ]
+                        }
+                    },
+                    '_source': ['tool_breakdown'],
+                },
+            )
+        except Exception as e:
+            if 'index_not_found' not in str(e).lower():
+                logger.warning(f"Error fetching tool breakdown for {project}: {e}")
+            return {}
+
+        tool_breakdown: Dict[str, Any] = {}
+        for hit in result['hits']['hits']:
+            for tool_name, tb in (hit['_source'].get('tool_breakdown') or {}).items():
+                if not isinstance(tb, dict):
+                    continue
+                if tool_name not in tool_breakdown:
+                    tool_breakdown[tool_name] = {'task_count': 0, 'sum_output': 0, 'sum_context_growth': 0}
+                entry = tool_breakdown[tool_name]
+                entry['task_count'] += tb.get('task_count', 0) or 0
+                entry['sum_output'] += tb.get('sum_output', 0) or 0
+                entry['sum_context_growth'] += tb.get('sum_context_growth', 0) or 0
+
+        return tool_breakdown
 
     # -------------------------------------------------------------------------
     # Review cycle metrics

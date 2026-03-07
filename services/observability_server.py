@@ -1983,6 +1983,40 @@ def _aggregate_project_docs(project: str, docs: list) -> dict:
         success_count += po.get('success_count', 0) or 0
         failed_count += po.get('failed_count', 0) or 0
 
+    # Merge agent_breakdown across daily docs
+    agent_breakdown: dict = {}
+    for doc in docs:
+        for agent, ab in (doc.get('agent_breakdown') or {}).items():
+            if not isinstance(ab, dict):
+                continue
+            if agent not in agent_breakdown:
+                agent_breakdown[agent] = {
+                    'task_count': 0,
+                    'sum_direct_input': 0,
+                    'sum_cache_read': 0,
+                    'sum_cache_creation': 0,
+                    'sum_output': 0,
+                }
+            entry = agent_breakdown[agent]
+            entry['task_count'] += ab.get('task_count', 0) or 0
+            entry['sum_direct_input'] += ab.get('sum_direct_input', 0) or 0
+            entry['sum_cache_read'] += ab.get('sum_cache_read', 0) or 0
+            entry['sum_cache_creation'] += ab.get('sum_cache_creation', 0) or 0
+            entry['sum_output'] += ab.get('sum_output', 0) or 0
+
+    # Merge tool_breakdown across daily docs
+    tool_breakdown: dict = {}
+    for doc in docs:
+        for tool, tb in (doc.get('tool_breakdown') or {}).items():
+            if not isinstance(tb, dict):
+                continue
+            if tool not in tool_breakdown:
+                tool_breakdown[tool] = {'task_count': 0, 'sum_output': 0, 'sum_context_growth': 0}
+            entry = tool_breakdown[tool]
+            entry['task_count'] += tb.get('task_count', 0) or 0
+            entry['sum_output'] += tb.get('sum_output', 0) or 0
+            entry['sum_context_growth'] += tb.get('sum_context_growth', 0) or 0
+
     total_outcomes = success_count + failed_count
     return {
         'project': project,
@@ -2037,6 +2071,8 @@ def _aggregate_project_docs(project: str, docs: list) -> dict:
             'failed_count': failed_count,
             'success_rate': round(success_count / total_outcomes * 100, 1) if total_outcomes else None,
         },
+        'agent_breakdown': agent_breakdown,
+        'tool_breakdown': tool_breakdown,
     }
 
 
