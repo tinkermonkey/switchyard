@@ -17,12 +17,16 @@ const fmtDur = (ms) => {
   return `${Math.round(ms)}ms`
 }
 
-function StatCell({ label, value, sub }) {
+function TokenRow({ label, avg, note }) {
   return (
-    <div className="flex flex-col">
+    <div className="flex items-center justify-between py-1 border-b border-gh-border last:border-0">
       <span className="text-xs text-gh-fg-muted">{label}</span>
-      <span className="font-mono text-sm font-semibold">{value}</span>
-      {sub && <span className="text-xs text-gh-fg-muted font-mono">{sub}</span>}
+      <div className="text-right">
+        <span className="font-mono text-sm font-semibold">{fmt(avg)}</span>
+        {note != null && (
+          <span className="text-xs text-gh-fg-muted font-mono ml-2">({note})</span>
+        )}
+      </div>
     </div>
   )
 }
@@ -69,75 +73,44 @@ function ProjectCard({ project: p }) {
         )}
       </div>
 
-      <div className="p-4 space-y-5">
-        {/* Tokens */}
-        <div>
-          <SectionHeader title="Tokens" />
-          <div className="bg-gh-canvas-subtle border border-gh-border rounded p-3 grid grid-cols-2 sm:grid-cols-4 gap-3">
-            <StatCell
-              label="Direct Input"
-              value={fmt(tokens.sum_direct_input)}
-              sub={`avg ${fmt(tokens.avg_direct_input_per_run)}/run`}
-            />
-            <StatCell
-              label="Cache Reads"
-              value={fmt(tokens.sum_cache_read)}
-              sub={`avg ${fmt(tokens.avg_cache_read_per_run)}/run`}
-            />
-            <StatCell
-              label="Cache Creation"
-              value={fmt(tokens.sum_cache_creation)}
-              sub={`avg ${fmt(tokens.avg_cache_creation_per_run)}/run`}
-            />
-            <StatCell
-              label="Output"
-              value={fmt(tokens.sum_output)}
-              sub={`avg ${fmt(tokens.avg_output_per_run)}/run`}
-            />
-          </div>
-        </div>
-
-        {/* Context + Tools */}
-        <div className="grid grid-cols-2 gap-4">
-          <div>
-            <SectionHeader title="Context" />
-            <div className="bg-gh-canvas-subtle border border-gh-border rounded p-3 grid grid-cols-2 gap-3">
-              <StatCell
-                label="Peak Context"
-                value={fmt(context.peak_max_context)}
-              />
-              <StatCell
-                label="Avg Max Context/Run"
-                value={fmt(context.avg_max_context_per_run)}
-              />
-              <StatCell
-                label="Total Initial"
-                value={fmt(context.sum_initial_input)}
-                sub={`avg ${fmt(context.avg_initial_input_per_run)}/run`}
-              />
-            </div>
-          </div>
-          <div>
-            <SectionHeader title="Tool Calls" />
-            <div className="bg-gh-canvas-subtle border border-gh-border rounded p-3 grid grid-cols-2 gap-3">
-              <StatCell
-                label="Total Invocations"
-                value={fmt(tools.total_invocations)}
-              />
-              <StatCell
-                label="Avg/Run"
-                value={fmt(tools.avg_invocations_per_run)}
-              />
-            </div>
-
-            <div className="mt-4">
-              <SectionHeader title="Pipeline Outcomes" />
-            </div>
-            <div className="bg-gh-canvas-subtle border border-gh-border rounded p-3 grid grid-cols-2 gap-3 mt-2">
-              <StatCell label="Success" value={outcomes.success_count ?? '—'} />
-              <StatCell label="Failed" value={outcomes.failed_count ?? '—'} />
-            </div>
-          </div>
+      <div className="p-4 space-y-4">
+        {/* Token / context / tool summary — same TokenRow style as CycleMetrics */}
+        <div className="bg-gh-canvas-subtle rounded p-3 border border-gh-border">
+          <TokenRow
+            label="Avg Direct Input"
+            avg={tokens.avg_direct_input_per_run}
+            note={`${fmt(tokens.sum_direct_input)} total`}
+          />
+          <TokenRow
+            label="Avg Cache Reads"
+            avg={tokens.avg_cache_read_per_run}
+            note={`${fmt(tokens.sum_cache_read)} total`}
+          />
+          <TokenRow
+            label="Avg Cache Creation"
+            avg={tokens.avg_cache_creation_per_run}
+            note={`${fmt(tokens.sum_cache_creation)} total`}
+          />
+          <TokenRow
+            label="Avg Output"
+            avg={tokens.avg_output_per_run}
+            note={`${fmt(tokens.sum_output)} total`}
+          />
+          <TokenRow
+            label="Avg Max Context"
+            avg={context.avg_max_context_per_run}
+            note={`${fmt(context.peak_max_context)} peak`}
+          />
+          <TokenRow
+            label="Avg Initial Context"
+            avg={context.avg_initial_input_per_run}
+            note={`${fmt(context.sum_initial_input)} total`}
+          />
+          <TokenRow
+            label="Avg Tool Calls"
+            avg={tools.avg_invocations_per_run}
+            note={`${fmt(tools.total_invocations)} total`}
+          />
         </div>
 
         {/* Cycle summaries */}
@@ -231,6 +204,21 @@ function ProjectCard({ project: p }) {
               ) : (
                 <p className="text-xs text-gh-fg-muted">No data</p>
               )}
+            </div>
+          </div>
+        </div>
+
+        {/* Pipeline outcomes */}
+        <div>
+          <SectionHeader title="Pipeline Outcomes" />
+          <div className="bg-gh-canvas-subtle border border-gh-border rounded p-3">
+            <div className="flex items-center justify-between py-1 border-b border-gh-border">
+              <span className="text-xs text-gh-fg-muted">Success</span>
+              <span className="font-mono text-sm font-semibold">{outcomes.success_count ?? '—'}</span>
+            </div>
+            <div className="flex items-center justify-between py-1">
+              <span className="text-xs text-gh-fg-muted">Failed</span>
+              <span className="font-mono text-sm font-semibold">{outcomes.failed_count ?? '—'}</span>
             </div>
           </div>
         </div>
