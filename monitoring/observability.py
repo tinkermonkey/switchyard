@@ -587,8 +587,11 @@ class ObservabilityManager:
                               config: Dict[str, Any], branch_name: Optional[str] = None,
                               container_name: Optional[str] = None,
                               pipeline_run_id: Optional[str] = None,
-                              execution_type: str = ""):
+                              execution_type: str = "",
+                              cycle_stack: Optional[list] = None):
         """Emit agent initialized event"""
+        from monitoring.cycle_stack import cycle_type_from_stack, cycle_iteration_from_stack
+
         # Generate unique agent execution ID for tracking this specific execution
         agent_execution_id = str(uuid.uuid4())
 
@@ -603,10 +606,14 @@ class ObservabilityManager:
             data['branch_name'] = branch_name
         if container_name:
             data['container_name'] = container_name
+        if cycle_stack is not None:
+            data['cycle_stack'] = cycle_stack
+            data['cycle_type'] = cycle_type_from_stack(cycle_stack)
+            data['cycle_iteration'] = cycle_iteration_from_stack(cycle_stack)
 
         self.emit(EventType.AGENT_INITIALIZED, agent, task_id, project, data, pipeline_run_id,
                   execution_type=execution_type)
-        
+
         # Return the execution ID so caller can use it for subsequent events
         return agent_execution_id
 

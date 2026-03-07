@@ -23,6 +23,7 @@ from agents.non_retryable import NonRetryableAgentError
 from monitoring.timestamp_utils import utc_now, utc_isoformat
 from monitoring.observability import EventType
 from monitoring.decision_events import DecisionEventEmitter
+from monitoring.cycle_stack import push_frame, CycleFrame
 from services.cancellation import get_cancellation_signal
 
 logger = logging.getLogger(__name__)
@@ -145,6 +146,18 @@ class PRReviewStage(PipelineStage):
             current_cycle = review_count + 1
             logger.info(f"Starting review cycle {current_cycle}/{MAX_REVIEW_CYCLES}")
 
+            # Build base pr_review_stage stack; phase frames are pushed per agent call
+            _pr_stage_stack = push_frame(
+                task_context.get('cycle_stack', []),
+                CycleFrame(
+                    cycle_type="pr_review_stage",
+                    cycle_id=pipeline_run_id or str(parent_issue_number),
+                    iteration=current_cycle,
+                    max_iterations=MAX_REVIEW_CYCLES,
+                    label=f"pr_review[cycle {current_cycle}]",
+                ),
+            )
+
             # Get project config
             project_config = self.config_manager.get_project_config(project_name)
             github_config = project_config.github
@@ -219,6 +232,13 @@ class PRReviewStage(PipelineStage):
                 pr_review_prompt = self._build_pr_review_prompt(pr_url, prior_cycle_context)
 
                 # Launch pr_code_reviewer in Docker (via AgentExecutor)
+                _phase1_stack = push_frame(_pr_stage_stack, CycleFrame(
+                    cycle_type="pr_review_phase",
+                    cycle_id=f"phase-1-cycle-{current_cycle}",
+                    iteration=1,
+                    max_iterations=4,
+                    label=f"pr_review[cycle {current_cycle}][phase 1]",
+                ))
                 pr_review_result = await agent_executor.execute_agent(
                     agent_name=self.pr_review_agent,
                     project_name=project_name,
@@ -229,6 +249,7 @@ class PRReviewStage(PipelineStage):
                         'direct_prompt': pr_review_prompt,
                         # IMPORTANT: Don't skip workspace prep - agent needs project code
                         'skip_workspace_prep': False,
+                        'cycle_stack': _phase1_stack,
                     },
                     execution_type="pr_review_phase1"
                 )
@@ -331,6 +352,13 @@ class PRReviewStage(PipelineStage):
                     )
 
                     # Launch requirements_verifier in Docker (via AgentExecutor)
+                    _phase2_stack = push_frame(_pr_stage_stack, CycleFrame(
+                        cycle_type="pr_review_phase",
+                        cycle_id=f"phase-2-{phase2_index}-cycle-{current_cycle}",
+                        iteration=2,
+                        max_iterations=4,
+                        label=f"pr_review[cycle {current_cycle}][phase 2.{phase2_index}]",
+                    ))
                     verification_result = await agent_executor.execute_agent(
                         agent_name=self.requirements_verifier_agent,
                         project_name=project_name,
@@ -343,6 +371,7 @@ class PRReviewStage(PipelineStage):
                             'direct_prompt': verification_prompt,
                             # IMPORTANT: Don't skip workspace prep - agent needs project code
                             'skip_workspace_prep': False,
+                            'cycle_stack': _phase2_stack,
                         },
                         execution_type="pr_review_phase2"
                     )
@@ -485,9 +514,16 @@ class PRReviewStage(PipelineStage):
                     }, pipeline_run_id)
 
                 try:
+                    _phase4_stack = push_frame(_pr_stage_stack, CycleFrame(
+                        cycle_type="pr_review_phase",
+                        cycle_id=f"phase-4-cycle-{current_cycle}",
+                        iteration=4,
+                        max_iterations=4,
+                        label=f"pr_review[cycle {current_cycle}][phase 4]",
+                    ))
                     consolidated_text = await self._run_consolidation_phase(
                         phase_outputs, pr_url, task_context, obs, pipeline_run_id, task_id,
-                        project_name, parent_issue_number, column
+                        project_name, parent_issue_number, column, _phase4_stack
                     )
                     phases_completed += 1
 
@@ -1511,6 +1547,7 @@ If all requirements are met, write "All requirements verified - no gaps found" a
         project_name: str,
         parent_issue_number: int,
         column: str,
+        cycle_stack: Optional[list] = None,
     ) -> str:
         """Run Phase 4 consolidation — feed all phase texts into a single agent call."""
         self._agent_call_count += 1
@@ -1528,16 +1565,20 @@ If all requirements are met, write "All requirements verified - no gaps found" a
             project_name=project_name
         )
 
+        phase4_ctx: Dict[str, Any] = {
+            **task_context,
+            'pr_url': pr_url,
+            'phase': 'consolidation',
+            'direct_prompt': prompt,
+            'skip_workspace_prep': True,
+        }
+        if cycle_stack is not None:
+            phase4_ctx['cycle_stack'] = cycle_stack
+
         result = await agent_executor.execute_agent(
             agent_name=self.pr_review_agent,
             project_name=project_name,
-            task_context={
-                **task_context,
-                'pr_url': pr_url,
-                'phase': 'consolidation',
-                'direct_prompt': prompt,
-                'skip_workspace_prep': True,
-            },
+            task_context=phase4_ctx,
             execution_type="pr_review_phase4"
         )
         return result.get('markdown_analysis', '')

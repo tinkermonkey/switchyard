@@ -45,6 +45,7 @@ from datetime import datetime
 from pipeline.base import PipelineStage
 from monitoring.timestamp_utils import utc_now, utc_isoformat, to_utc_isoformat
 from monitoring.observability import EventType
+from monitoring.cycle_stack import push_frame, CycleFrame
 from services.cancellation import CancellationError
 
 
@@ -292,6 +293,19 @@ class RepairCycleStage(PipelineStage):
         results = []
         error_message = None
 
+        # Push base repair_cycle frame; propagate to all sub-calls via repair_context
+        _repair_stack = push_frame(
+            context.get('cycle_stack', []),
+            CycleFrame(
+                cycle_type="repair_cycle",
+                cycle_id=pipeline_run_id or task_id,
+                iteration=1,
+                max_iterations=1,
+                label=f"repair_cycle[{self.name}]",
+            ),
+        )
+        repair_context = {**context, 'cycle_stack': _repair_stack}
+
         try:
             # Track which test type in sequence (1st, 2nd, 3rd)
             for test_type_index, test_config in enumerate(self.test_configs, start=1):
@@ -301,7 +315,7 @@ class RepairCycleStage(PipelineStage):
                 )
 
                 cycle_start = utc_now()
-                cycle_result = await self._run_test_cycle(test_config, context, test_type_index)
+                cycle_result = await self._run_test_cycle(test_config, repair_context, test_type_index)
                 cycle_end = utc_now()
 
                 cycle_result.duration_seconds = (cycle_end - cycle_start).total_seconds()
@@ -428,12 +442,25 @@ class RepairCycleStage(PipelineStage):
         Returns:
             CycleResult with success status and metrics
         """
+        # Push test_type frame; all sub-calls use test_type_context
+        _test_type_stack = push_frame(
+            context.get('cycle_stack', []),
+            CycleFrame(
+                cycle_type="repair_test_type",
+                cycle_id=config.test_type,
+                iteration=test_type_index,
+                max_iterations=len(self.test_configs),
+                label=f"repair_cycle[{config.test_type}]",
+            ),
+        )
+        context = {**context, 'cycle_stack': _test_type_stack}
+
         # Emit test cycle started event
         obs = context.get("observability")
         project = context.get("project", "unknown")
         task_id = context.get("task_id", f"repair_cycle_{self.name}")
         pipeline_run_id = context.get("pipeline_run_id")
-        
+
         if obs:
             obs.emit(
                 EventType.REPAIR_CYCLE_TEST_CYCLE_STARTED,
@@ -1078,6 +1105,16 @@ Also, make sure you are capturing the **full** output of the test runs, includin
 Be mindful of environment setup steps like installing dependencies and activating virtual environments.""" + _TEST_OUTPUT_FORMAT
 
         # Build task context for this agent execution
+        _iter_stack = push_frame(
+            context.get('cycle_stack', []),
+            CycleFrame(
+                cycle_type="repair_test_iteration",
+                cycle_id=f"{config.test_type}-iter-{test_cycle_iteration}",
+                iteration=test_cycle_iteration,
+                max_iterations=config.max_iterations,
+                label=f"repair_cycle[{config.test_type}][attempt {test_cycle_iteration}]",
+            ),
+        )
         task_context = {
             **context,
             "pipeline_run_id": pipeline_run_id,  # Ensure pipeline_run_id flows through
@@ -1088,6 +1125,7 @@ Be mindful of environment setup steps like installing dependencies and activatin
             "review_cycle": None,
             # Provide the custom instructions as a 'direct_prompt' so the agent can use it
             "direct_prompt": direct_prompt,
+            "cycle_stack": _iter_stack,
         }
 
         # Retry logic for infrastructure failures (e.g., JSON parsing)
@@ -1369,6 +1407,16 @@ Be mindful of environment setup steps like installing dependencies and activatin
             failure_text = "\n".join(failure_messages)
 
             # Build task context for this agent execution
+            _fix_stack = push_frame(
+                context.get('cycle_stack', []),
+                CycleFrame(
+                    cycle_type="repair_fix",
+                    cycle_id=f"{config.test_type}-fix-{self._sanitize_filename(test_file)}",
+                    iteration=1,
+                    max_iterations=config.max_file_iterations,
+                    label=f"repair_cycle[{config.test_type}][fix:{test_file}]",
+                ),
+            )
             task_context = {
                 **context,
                 "pipeline_run_id": pipeline_run_id,  # Ensure pipeline_run_id flows through
@@ -1377,6 +1425,7 @@ Be mindful of environment setup steps like installing dependencies and activatin
                 "skip_workspace_prep": True,
                 # Clear review_cycle context to avoid iteration count confusion from previous review cycles
                 "review_cycle": None,
+                "cycle_stack": _fix_stack,
                 # Provide the fix instructions as a 'direct_prompt' so the agent can use it
                 "direct_prompt": f"""Fix these test failures in {test_file}:
 
@@ -1516,6 +1565,16 @@ Be mindful of environment setup steps like installing dependencies and activatin
             warning_text = "\n".join(warning_messages)
 
             # Build task context for this agent execution
+            _warn_stack = push_frame(
+                context.get('cycle_stack', []),
+                CycleFrame(
+                    cycle_type="repair_warning_review",
+                    cycle_id=f"{config.test_type}-warn-{self._sanitize_filename(source_file)}",
+                    iteration=1,
+                    max_iterations=1,
+                    label=f"repair_cycle[{config.test_type}][warning_review:{source_file}]",
+                ),
+            )
             task_context = {
                 **context,
                 "pipeline_run_id": pipeline_run_id,  # Ensure pipeline_run_id flows through
@@ -1524,6 +1583,7 @@ Be mindful of environment setup steps like installing dependencies and activatin
                 "skip_workspace_prep": True,
                 # Clear review_cycle context to avoid iteration count confusion from previous review cycles
                 "review_cycle": None,
+                "cycle_stack": _warn_stack,
                 # Provide the review instructions as a 'direct_prompt' so the agent can use it
                 "direct_prompt": f"""Review these warnings from a run of {source_file}:
 
@@ -1848,12 +1908,23 @@ You MUST return ONLY valid JSON in this EXACT format (no markdown, no explanatio
 
 If the failures appear to be isolated per-file issues with different root causes, return has_env_issues: false and has_systemic_code_issues: false."""
 
+        _analysis_stack = push_frame(
+            context.get('cycle_stack', []),
+            CycleFrame(
+                cycle_type="repair_systemic_analysis",
+                cycle_id=f"{config.test_type}-systemic-analysis",
+                iteration=1,
+                max_iterations=1,
+                label=f"repair_cycle[{config.test_type}][systemic_analysis]",
+            ),
+        )
         task_context = {
             **context,
             "pipeline_run_id": pipeline_run_id,
             "task_description": f"Analyze systemic failures in {config.test_type} tests",
             "skip_workspace_prep": True,
             "review_cycle": None,
+            "cycle_stack": _analysis_stack,
             "direct_prompt": direct_prompt,
         }
 
@@ -2060,11 +2131,22 @@ If the failures appear to be isolated per-file issues with different root causes
                 # Queue dev environment setup with the change description, tagged with
                 # this pipeline_run_id so setup/verifier events are visible to the
                 # stall-detection query in _monitor_repair_cycle_container.
+                _env_rebuild_stack = push_frame(
+                    context.get('cycle_stack', []),
+                    CycleFrame(
+                        cycle_type="repair_env_rebuild",
+                        cycle_id=f"{config.test_type}-env-rebuild-{attempts_made}",
+                        iteration=attempts_made,
+                        max_iterations=MAX_SYSTEMIC_SUB_CYCLES,
+                        label=f"repair_cycle[{config.test_type}][env_rebuild {attempts_made}]",
+                    ),
+                )
                 from agents.orchestrator_integration import queue_dev_environment_setup
                 await queue_dev_environment_setup(
                     project, logger,
                     change_description=analysis.env_issue_description,
                     pipeline_run_id=pipeline_run_id,
+                    cycle_stack=_env_rebuild_stack,
                 )
 
             except CancellationError:
@@ -2366,12 +2448,23 @@ If the failures appear to be isolated per-file issues with different root causes
                 f"Fix {current_test_result.failed} {config.test_type} failures"
                 + (f": {analysis.systemic_issue_description[:80]}" if analysis.systemic_issue_description else "")
             )
+            _systemic_stack = push_frame(
+                context.get('cycle_stack', []),
+                CycleFrame(
+                    cycle_type="repair_systemic_fix",
+                    cycle_id=f"{config.test_type}-systemic-fix-{trigger}",
+                    iteration=attempts_made,
+                    max_iterations=MAX_SYSTEMIC_SUB_CYCLES,
+                    label=f"repair_cycle[{config.test_type}][systemic_fix/{trigger} attempt {attempts_made}]",
+                ),
+            )
             task_context = {
                 **context,
                 "pipeline_run_id": pipeline_run_id,
                 "task_description": task_description,
                 "skip_workspace_prep": True,
                 "review_cycle": None,
+                "cycle_stack": _systemic_stack,
                 "direct_prompt": direct_prompt,
             }
 

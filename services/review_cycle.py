@@ -13,6 +13,7 @@ from config.manager import WorkflowColumn
 from services.review_parser import ReviewParser, ReviewStatus
 from services.github_integration import GitHubIntegration
 from services.review_outcome_correlator import get_review_outcome_correlator
+from monitoring.cycle_stack import push_frame, CycleFrame
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +44,7 @@ class ReviewCycleState:
         self.workspace_type = workspace_type
         self.discussion_id = discussion_id
         self.pipeline_run_id = pipeline_run_id
+        self.cycle_stack: list = []  # parent cycle frames (JSON-serializable)
         self.current_iteration = 0
         self.maker_outputs = []
         self.review_outputs = []
@@ -70,6 +72,7 @@ class ReviewCycleState:
             'workspace_type': self.workspace_type,
             'discussion_id': self.discussion_id,
             'pipeline_run_id': self.pipeline_run_id,
+            'cycle_stack': self.cycle_stack,
             'current_iteration': self.current_iteration,
             'maker_outputs': self.maker_outputs,
             'review_outputs': self.review_outputs,
@@ -99,6 +102,7 @@ class ReviewCycleState:
             discussion_id=data.get('discussion_id'),
             pipeline_run_id=data.get('pipeline_run_id')
         )
+        state.cycle_stack = data.get('cycle_stack', [])
         state.current_iteration = data.get('current_iteration', 0)
         state.maker_outputs = data.get('maker_outputs', [])
         state.review_outputs = data.get('review_outputs', [])
@@ -2229,6 +2233,16 @@ class ReviewCycleExecutor:
                     f"Aborting review cycle."
                 )
 
+        _review_stack = push_frame(
+            cycle_state.cycle_stack,
+            CycleFrame(
+                cycle_type="review_cycle",
+                cycle_id=cycle_state.pipeline_run_id or str(cycle_state.issue_number),
+                iteration=iteration,
+                max_iterations=cycle_state.max_iterations,
+                label=f"review_cycle[#{cycle_state.issue_number} iter {iteration}]",
+            ),
+        )
         task_context = {
             'project': cycle_state.project_name,
             'board': cycle_state.board_name,
@@ -2240,6 +2254,7 @@ class ReviewCycleExecutor:
             'workspace_type': cycle_state.workspace_type,
             'discussion_id': cycle_state.discussion_id,
             'pipeline_run_id': cycle_state.pipeline_run_id,  # Include pipeline run ID for event tracking
+            'cycle_stack': _review_stack,
             'review_cycle': {
                 'iteration': iteration,
                 'max_iterations': cycle_state.max_iterations,
@@ -2271,6 +2286,16 @@ class ReviewCycleExecutor:
         # Get the original output for reference
         original_output = cycle_state.maker_outputs[0]['output'] if cycle_state.maker_outputs else ""
 
+        _maker_stack = push_frame(
+            cycle_state.cycle_stack,
+            CycleFrame(
+                cycle_type="review_cycle",
+                cycle_id=cycle_state.pipeline_run_id or str(cycle_state.issue_number),
+                iteration=iteration,
+                max_iterations=cycle_state.max_iterations,
+                label=f"review_cycle[#{cycle_state.issue_number} revision {iteration}]",
+            ),
+        )
         task_context = {
             'project': cycle_state.project_name,
             'board': cycle_state.board_name,
@@ -2282,6 +2307,7 @@ class ReviewCycleExecutor:
             'workspace_type': cycle_state.workspace_type,
             'discussion_id': cycle_state.discussion_id,
             'pipeline_run_id': cycle_state.pipeline_run_id,  # Include pipeline run ID for event tracking
+            'cycle_stack': _maker_stack,
             'review_cycle': {
                 'iteration': iteration,
                 'max_iterations': cycle_state.max_iterations,

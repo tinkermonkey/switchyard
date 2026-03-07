@@ -301,9 +301,11 @@ class AgentExecutor:
         # Emit agent initialized event (after workspace prep to include branch_name and container_name)
         # This returns the agent_execution_id for tracking this specific execution
         agent_config = agent_stage.agent_config or {}
+        cycle_stack = task_context.get('cycle_stack')
         agent_execution_id = self.obs.emit_agent_initialized(
             agent_name, task_id, project_name, agent_config, branch_name, container_name, pipeline_run_id,
-            execution_type=execution_type
+            execution_type=execution_type,
+            cycle_stack=cycle_stack
         )
         
         logger.info(f"Agent execution started with ID: {agent_execution_id}")

@@ -63,7 +63,7 @@ async def validate_task_can_run(task, logger) -> Dict[str, Any]:
         }
 
 
-async def queue_dev_environment_setup(project: str, logger, change_description: str = "", pipeline_run_id: str = None):
+async def queue_dev_environment_setup(project: str, logger, change_description: str = "", pipeline_run_id: str = None, cycle_stack: list = None):
     """
     Queue a dev_environment_setup task for a project.
 
@@ -78,6 +78,8 @@ async def queue_dev_environment_setup(project: str, logger, change_description: 
             instructions (e.g. from systemic failure analysis).
         pipeline_run_id: If provided, tags the setup (and subsequent verifier) task
             with this ID so their events appear in stall-detection queries.
+        cycle_stack: If provided, propagates the caller's cycle stack into the
+            queued task context so agent_initialized events carry full hierarchy.
     """
     from task_queue.task_manager import Task, TaskPriority, TaskQueue
     from services.dev_container_state import dev_container_state, DevContainerStatus
@@ -125,6 +127,8 @@ async def queue_dev_environment_setup(project: str, logger, change_description: 
         }
         if pipeline_run_id:
             context['pipeline_run_id'] = pipeline_run_id
+        if cycle_stack is not None:
+            context['cycle_stack'] = cycle_stack
 
         task = Task(
             id=str(uuid.uuid4()),

@@ -182,6 +182,9 @@ class TokenMetricsService:
                     "pipeline_run_id":      {"type": "keyword"},
                     "status":               {"type": "keyword"},
                     "execution_type":       {"type": "keyword"},
+                    "cycle_type":           {"type": "keyword"},
+                    "cycle_iteration":      {"type": "integer"},
+                    "cycle_stack":          {"type": "object", "enabled": False},
                     "started_at":           {"type": "date"},
                     "ended_at":             {"type": "date"},
                     "duration_ms":          {"type": "long"},
@@ -1113,7 +1116,9 @@ class TokenMetricsService:
                         }
                     },
                     '_source': [
-                        'task_id', 'agent_name', 'project', 'timestamp', 'raw_event'
+                        'task_id', 'agent_name', 'project', 'timestamp', 'raw_event',
+                        'cycle_type', 'cycle_iteration', 'cycle_stack',
+                        'agent_execution_id', 'pipeline_run_id', 'execution_type'
                     ]
                 }
             )
@@ -1141,9 +1146,12 @@ class TokenMetricsService:
                 'agent_name': src.get('agent_name') or raw.get('agent') or '',
                 'project': src.get('project') or raw.get('project') or '',
                 'timestamp': src.get('timestamp') or raw.get('timestamp'),
-                'agent_execution_id': raw_data.get('agent_execution_id'),
-                'pipeline_run_id': raw_data.get('pipeline_run_id'),
-                'execution_type': raw.get('execution_type') or '',
+                'agent_execution_id': src.get('agent_execution_id') or raw_data.get('agent_execution_id'),
+                'pipeline_run_id': src.get('pipeline_run_id') or raw_data.get('pipeline_run_id'),
+                'execution_type': src.get('execution_type') or raw.get('execution_type') or '',
+                'cycle_type': src.get('cycle_type', ''),
+                'cycle_iteration': src.get('cycle_iteration', 0),
+                'cycle_stack': src.get('cycle_stack', []),
             }
             existing = init_map.get(tid)
             if not existing or (not existing.get('agent_execution_id') and entry.get('agent_execution_id')):
@@ -1222,6 +1230,9 @@ class TokenMetricsService:
                 'project': init_src.get('project'),
                 'pipeline_run_id': init_src.get('pipeline_run_id'),
                 'execution_type': init_src.get('execution_type'),
+                'cycle_type': init_src.get('cycle_type', ''),
+                'cycle_iteration': init_src.get('cycle_iteration', 0),
+                'cycle_stack': init_src.get('cycle_stack', []),
                 'started_at': init_src.get('timestamp'),
             }
 
