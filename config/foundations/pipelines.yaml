@@ -105,8 +105,3 @@ pipeline_templates:
         retries: 1
         review_required: false
 
-# Pipeline execution settings
-execution_defaults:
-  max_concurrent_stages: 1
-  retry_backoff: 30
-  automatic_progression: true
