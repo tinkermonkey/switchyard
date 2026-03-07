@@ -119,14 +119,46 @@ export default function StandaloneSandbox() {
     URL.revokeObjectURL(url)
   }, [processedModel, debugData])
 
-  // Apply per-node visibility: hide defaultHidden nodes unless showAllNodes is on
+  // Apply per-node visibility: hide defaultHidden nodes unless showAllNodes is on.
+  // Also reroutes edges so they skip hidden boundary nodes — React Flow hides any
+  // edge whose source or target is hidden, which would break the sequential chain.
   const visibleRawBuild = useMemo(() => {
     if (!rawBuild || showAllNodes) return rawBuild
+
+    const hiddenIds = new Set(
+      rawBuild.nodes.filter(n => n.data?.defaultHidden).map(n => n.id)
+    )
+    if (hiddenIds.size === 0) return rawBuild
+
+    // Build successor map (edges form a directed chain, one successor per node)
+    const successors = new Map()
+    rawBuild.edges.forEach(e => successors.set(e.source, e.target))
+
+    // Walk forward through hidden nodes to find the next visible target
+    function nextVisible(id) {
+      let cur = successors.get(id)
+      while (cur && hiddenIds.has(cur)) cur = successors.get(cur)
+      return cur
+    }
+
+    const newEdges = []
+    const seen = new Set()
+    rawBuild.edges.forEach(e => {
+      if (hiddenIds.has(e.source)) return // will be covered by a rerouted edge
+      const target = hiddenIds.has(e.target) ? nextVisible(e.target) : e.target
+      if (!target) return
+      const key = `${e.source}→${target}`
+      if (seen.has(key)) return
+      seen.add(key)
+      newEdges.push(e.target === target ? e : { ...e, id: `edge-${e.source}-${target}`, target })
+    })
+
     return {
       ...rawBuild,
       nodes: rawBuild.nodes.map(node =>
         node.data?.defaultHidden ? { ...node, hidden: true } : node
       ),
+      edges: newEdges,
     }
   }, [rawBuild, showAllNodes])
 
