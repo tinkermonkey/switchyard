@@ -49,7 +49,7 @@ export function buildFlowchart({
   existingCycles = new Map(),
   workflowConfig = null,
   selectedPipelineRun,
-  activeAgentNames = new Set(),
+  activeTaskIds = new Set(),
 }) {
   if (!events.length || !selectedPipelineRun) {
     return { nodes: [], edges: [], agentExecutions: new Map(), updatedCycles: new Map() }
@@ -130,7 +130,7 @@ export function buildFlowchart({
     if (executionIndex < 0) return null
 
     const execution = executions[executionIndex]
-    const isActive = activeAgentNames.has(agent)
+    const isActive = activeTaskIds.has(event.task_id)
 
     const node = {
       id,

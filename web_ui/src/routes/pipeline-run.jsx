@@ -367,22 +367,27 @@ function PipelineRunView() {
   const buildRawFlowchart = useCallback(() => {
     if (!graphEvents.length || !selectedPipelineRun) return null
 
-    const activeAgents = new Set()
-    socketEventsRef.current
-      .filter(e => e.event_type === 'agent_initialized' &&
-        (e.pipeline_run_id || e.data?.pipeline_run_id) === selectedPipelineRun.id)
-      .forEach(e => activeAgents.add(e.agent))
-    socketEventsRef.current
-      .filter(e => ['agent_completed', 'agent_failed'].includes(e.event_type) &&
-        (e.pipeline_run_id || e.data?.pipeline_run_id) === selectedPipelineRun.id)
-      .forEach(e => activeAgents.delete(e.agent))
+    // Compute active task_ids from graphEvents (API + socket merged stream) so that
+    // historical agent_initialized events — which predate the WebSocket connection —
+    // are included. Task_id matching also avoids false positives when the same agent
+    // type has run multiple times.
+    const agentTaskInit = new Map()
+    const agentTaskDone = new Set()
+    graphEvents.forEach(e => {
+      if (e.event_type === 'agent_initialized') agentTaskInit.set(e.task_id, e.agent)
+      else if (e.event_type === 'agent_completed' || e.event_type === 'agent_failed') agentTaskDone.add(e.task_id)
+    })
+    const activeTaskIds = new Set()
+    agentTaskInit.forEach((agent, taskId) => {
+      if (!agentTaskDone.has(taskId)) activeTaskIds.add(taskId)
+    })
 
     return buildFlowchartUtil({
       events: graphEvents,
       existingCycles: cycles,
       workflowConfig,
       selectedPipelineRun,
-      activeAgentNames: activeAgents,
+      activeTaskIds,
     })
   }, [graphEvents, selectedPipelineRun, cycles, workflowConfig])
 

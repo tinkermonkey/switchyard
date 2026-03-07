@@ -82,7 +82,7 @@ export default function StandaloneSandbox() {
       existingCycles: cycles,
       workflowConfig: workflowConfig || null,
       selectedPipelineRun: pipelineRun,
-      activeAgentNames: new Set(),
+      activeTaskIds: new Set(),
     })
 
     const { updatedCycles } = result
