@@ -1886,7 +1886,7 @@ def get_project_metrics():
             days = int(request.args.get('days', 7))
         except (ValueError, TypeError):
             return jsonify({'success': False, 'error': 'Invalid days parameter', 'projects': []}), 400
-        days = max(1, min(days, 30))  # project metrics retained for 30 days
+        days = max(1, min(days, 7))
 
         try:
             result = es_client.search(
