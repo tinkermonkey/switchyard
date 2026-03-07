@@ -16,14 +16,14 @@ const LockStatusBadge = ({ lockStatus, lockHolderIssue }) => {
     )
   } else if (lockStatus === 'waiting_for_lock') {
     return (
-      <div className="flex items-center gap-1 text-xs text-yellow-400 bg-white/20 dark:text-yellow-400 dark:bg-yellow-900/20 border border-yellow-700/30 px-2 py-0.5 rounded">
+      <div className="flex items-center gap-1 text-xs text-yellow-600 bg-white/20 dark:text-yellow-400 dark:bg-yellow-900/20 border border-yellow-700/30 px-2 py-0.5 rounded">
         <Clock className="w-3 h-3" />
         <span>Waiting (#{lockHolderIssue})</span>
       </div>
     )
   } else if (lockStatus === 'no_lock') {
     return (
-      <div className="flex items-center gap-1 text-xs text-blue-400 bg-white/20 dark:text-blue-400 dark:bg-blue-900/20 border border-blue-700/30 px-2 py-0.5 rounded">
+      <div className="flex items-center gap-1 text-xs text-blue-600 bg-white/20 dark:text-blue-400 dark:bg-blue-900/20 border border-blue-700/30 px-2 py-0.5 rounded">
         <Unlock className="w-3 h-3" />
         <span>No Lock</span>
       </div>
@@ -33,9 +33,9 @@ const LockStatusBadge = ({ lockStatus, lockHolderIssue }) => {
 }
 
 const PRIORITY_COLORS = {
-  high: 'text-red-400 border-red-700/40 bg-white/20',
-  medium: 'text-yellow-400 border-yellow-700/40 bg-white/20',
-  low: 'text-blue-400 border-blue-700/40 bg-white/20',
+  high: 'text-red-600 border-red-700/40 bg-white/20',
+  medium: 'text-yellow-600 border-yellow-700/40 bg-white/20',
+  low: 'text-blue-600 border-blue-700/40 bg-white/20',
 }
 
 function AnalysisBadge({ analysis, onClick }) {
@@ -47,8 +47,8 @@ function AnalysisBadge({ analysis, onClick }) {
       onClick={onClick}
       className={`flex items-center gap-1 text-xs px-2 py-0.5 rounded border transition-colors hover:opacity-80 ${
         isSuccess
-          ? 'text-green-400 bg-white/20 border-green-700/30'
-          : 'text-red-400 bg-white/20 border-red-700/30'
+          ? 'text-green-600 bg-white/20 border-green-700/30'
+          : 'text-red-600 bg-white/20 border-red-700/30'
       }`}
       title="View pipeline analysis"
     >
@@ -88,13 +88,13 @@ function AnalysisModal({ analysis, onClose }) {
         <div className="flex items-center justify-between px-5 py-3 border-b border-gh-border flex-shrink-0">
           <div className="flex items-center gap-2">
             {analysis.outcome === 'success'
-              ? <CheckCircle2 className="w-4 h-4 text-green-400" />
-              : <AlertCircle className="w-4 h-4 text-red-400" />}
+              ? <CheckCircle2 className="w-4 h-4 text-green-600" />
+              : <AlertCircle className="w-4 h-4 text-red-600" />}
             <span className="font-semibold text-sm">Pipeline Analysis</span>
             <span className={`text-xs px-1.5 py-0.5 rounded border ${
               analysis.outcome === 'success'
-                ? 'text-green-400 bg-white/20 border-green-700/30'
-                : 'text-red-400 bg-white/20 border-red-700/30'
+                ? 'text-green-600 bg-white/20 border-green-700/30'
+                : 'text-red-600 bg-white/20 border-red-700/30'
             }`}>
               {analysis.outcome === 'success' ? 'Succeeded' : 'Failed'}
             </span>
@@ -258,7 +258,7 @@ export default function PipelineRunHeader({
       value: (
         <div className="flex items-center gap-1.5">
           <div className={`w-2 h-2 rounded-full flex-shrink-0 ${isActive ? 'bg-green-500 animate-pulse' : 'bg-gray-500'}`} />
-          <span className={isActive ? 'text-green-400' : ''}>{statusLabel}</span>
+          <span className={isActive ? 'text-green-600' : ''}>{statusLabel}</span>
         </div>
       ),
     },
@@ -326,7 +326,7 @@ export default function PipelineRunHeader({
               {pipelineRun.status === 'active' && (
                 <button
                   onClick={onKillRun}
-                  className="inline-flex items-center gap-2 px-3 py-1.5 text-sm bg-gh-canvas hover:bg-gh-border-muted transition-colors whitespace-nowrap text-red-400"
+                  className="inline-flex items-center gap-2 px-3 py-1.5 text-sm bg-gh-canvas hover:bg-gh-border-muted transition-colors whitespace-nowrap text-red-600"
                   title="Kill this pipeline run"
                 >
                   <XCircle className="w-4 h-4" />
@@ -370,13 +370,13 @@ export default function PipelineRunHeader({
       </div>
 
       {pipelineRun.lock_status === 'waiting_for_lock' && pipelineRun.blocked_by_issue && (
-        <div className="mt-2 text-xs text-yellow-400 bg-white/20 border border-yellow-700/20 px-3 py-2 rounded">
+        <div className="mt-2 text-xs text-yellow-600 bg-white/20 border border-yellow-700/20 px-3 py-2 rounded">
           ⚠️ This pipeline is waiting for lock currently held by issue #{pipelineRun.blocked_by_issue}
         </div>
       )}
 
       {isConversational && (
-        <div className="mt-2 bg-white/20 border border-blue-800 text-blue-400 px-4 py-3 rounded-md flex items-center gap-3">
+        <div className="mt-2 bg-white/20 border border-blue-800 text-blue-600 px-4 py-3 rounded-md flex items-center gap-3">
           <MessageSquare className="w-5 h-5 animate-pulse" />
           <div>
             <div className="font-semibold">Conversational Loop Active</div>
