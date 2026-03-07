@@ -1731,6 +1731,38 @@ def get_pipeline_run_token_usage(pipeline_run_id):
         logger.error(f"Error fetching pipeline run token usage: {e}")
         return jsonify({'success': False, 'error': str(e)}), 500
 
+@app.route('/api/pipeline-run/<pipeline_run_id>/analysis')
+def get_pipeline_run_analysis(pipeline_run_id):
+    try:
+        result = es_client.search(
+            index='pipeline-runs-*',
+            body={
+                'query': {'term': {'id': pipeline_run_id}},
+                '_source': ['summary', 'orchestratorRecommendations', 'projectRecommendations', 'outcome'],
+                'size': 1,
+            }
+        )
+        hits = result.get('hits', {}).get('hits', [])
+        if not hits:
+            return jsonify({'success': True, 'analysis': None})
+        source = hits[0]['_source']
+        summary = source.get('summary', '')
+        if not summary or not summary.strip():
+            return jsonify({'success': True, 'analysis': None})
+        return jsonify({
+            'success': True,
+            'analysis': {
+                'summary': summary,
+                'outcome': source.get('outcome'),
+                'orchestratorRecommendations': source.get('orchestratorRecommendations', []),
+                'projectRecommendations': source.get('projectRecommendations', []),
+            }
+        })
+    except Exception as e:
+        logger.error(f"Error fetching pipeline run analysis: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
 @app.route('/api/metrics/agents', methods=['GET'])
 def get_agent_metrics():
     """

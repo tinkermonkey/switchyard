@@ -18,6 +18,7 @@ from elasticsearch import Elasticsearch
 
 logger = logging.getLogger(__name__)
 
+_SUMMARY_START = "---SUMMARY_START---"
 _ANALYSIS_JSON_START = "---ANALYSIS_JSON_START---"
 _ANALYSIS_JSON_END = "---ANALYSIS_JSON_END---"
 
@@ -34,6 +35,11 @@ class PipelineRunAnalysisService:
     def __init__(self):
         self.es = Elasticsearch(["http://elasticsearch:9200"])
         self.es_index_pattern = "pipeline-runs"
+        # Track runs currently being analysed to prevent duplicate concurrent invocations.
+        # Both the inline trigger and the catch-up scan share this singleton, so a run
+        # added here by one caller is visible to the other.
+        self._in_flight: set[str] = set()
+        self._in_flight_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # Public API
@@ -69,6 +75,19 @@ class PipelineRunAnalysisService:
             )
 
     async def _run_analysis(self, run_id: str, started_at: str) -> None:
+        with self._in_flight_lock:
+            if run_id in self._in_flight:
+                logger.info(f"pipeline_run_analysis: run {run_id} already in-flight — skipping duplicate")
+                return
+            self._in_flight.add(run_id)
+
+        try:
+            await self._run_analysis_inner(run_id, started_at)
+        finally:
+            with self._in_flight_lock:
+                self._in_flight.discard(run_id)
+
+    async def _run_analysis_inner(self, run_id: str, started_at: str) -> None:
         if self._already_analyzed(run_id):
             logger.info(f"pipeline_run_analysis: run {run_id} already has summary — skipping")
             return
@@ -169,8 +188,10 @@ Note: This analysis runs after pipeline completion. Agent containers are already
 so Step 2 (docker-compose exec timeline script) and Step 5 (docker logs) will not be available.
 Focus on the Elasticsearch queries in Steps 1, 3, 4, and 6, then synthesize in Step 7.
 
-After completing the investigation, output your findings in the following exact format:
+After completing the investigation, output your findings in the following exact format.
+Do not include any text before {_SUMMARY_START} — that delimiter must be the very first thing you output in your final answer.
 
+{_SUMMARY_START}
 [Human-readable markdown summary — include a timeline table and root cause analysis]
 
 {_ANALYSIS_JSON_START}
@@ -204,18 +225,41 @@ If there is nothing to recommend, use empty arrays.
         """
         Parse the structured output from Claude.
 
+        The expected format is:
+            ---SUMMARY_START---
+            [markdown]
+            ---ANALYSIS_JSON_START---
+            {json}
+            ---ANALYSIS_JSON_END---
+
+        Everything before ---SUMMARY_START--- is agent preamble (tool call narration)
+        and is discarded. Falls back to the legacy behaviour (no SUMMARY_START) for
+        responses that predate this delimiter.
+
         Returns:
             (summary, success, orch_recs, proj_recs)
         """
-        start_idx = text.find(_ANALYSIS_JSON_START)
-        end_idx = text.find(_ANALYSIS_JSON_END)
+        json_start_idx = text.find(_ANALYSIS_JSON_START)
+        json_end_idx = text.find(_ANALYSIS_JSON_END)
 
-        if start_idx == -1 or end_idx == -1:
+        if json_start_idx == -1 or json_end_idx == -1:
             logger.warning("pipeline_run_analysis: no JSON delimiters found in response")
+            # Best-effort: strip preamble if SUMMARY_START is present, otherwise return raw text
+            summary_start_idx = text.find(_SUMMARY_START)
+            if summary_start_idx != -1:
+                return text[summary_start_idx + len(_SUMMARY_START):].strip(), None, [], []
             return text.strip(), None, [], []
 
-        summary = text[:start_idx].strip()
-        json_str = text[start_idx + len(_ANALYSIS_JSON_START):end_idx].strip()
+        # Extract summary — prefer the region after SUMMARY_START, fall back to everything
+        # before the JSON block (legacy behaviour for runs analysed before this change).
+        summary_start_idx = text.find(_SUMMARY_START)
+        if summary_start_idx != -1:
+            summary = text[summary_start_idx + len(_SUMMARY_START):json_start_idx].strip()
+        else:
+            logger.debug("pipeline_run_analysis: SUMMARY_START delimiter absent, using legacy extraction")
+            summary = text[:json_start_idx].strip()
+
+        json_str = text[json_start_idx + len(_ANALYSIS_JSON_START):json_end_idx].strip()
 
         try:
             data = json.loads(json_str)
