@@ -1879,12 +1879,18 @@ class DockerAgentRunner:
                 f"(project={project}, issue=#{issue_number}, agent={agent})"
             )
 
-            # Wait for container to exit (blocks until container stops)
+            # Wait for container to exit, using the agent's configured hard timeout
+            from config.manager import config_manager
+            try:
+                agent_config = config_manager.get_project_agent_config(project, agent)
+                hard_timeout = agent_config.timeout
+            except Exception:
+                hard_timeout = 10800  # default 3 hours
             result = subprocess.run(
                 ['docker', 'wait', container_name],
                 capture_output=True,
                 text=True,
-                timeout=7200  # 2 hours max
+                timeout=hard_timeout
             )
 
             exit_code = int(result.stdout.strip()) if result.stdout.strip() else -1

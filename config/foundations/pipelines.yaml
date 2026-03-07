@@ -13,7 +13,6 @@ pipeline_templates:
         name: "Market Research & Idea Validation"
         required_capabilities: ["research", "market_analysis"]
         default_agent: "idea_researcher"
-        timeout: 300
         retries: 2
         review_required: false
 
@@ -21,7 +20,6 @@ pipeline_templates:
         name: "Business Requirements Analysis"
         required_capabilities: ["requirements_analysis"]
         default_agent: "business_analyst"
-        timeout: 300
         retries: 3
         review_required: false
 
@@ -29,7 +27,6 @@ pipeline_templates:
         name: "System Architecture & Design"
         required_capabilities: ["system_architecture", "technical_design"]
         default_agent: "software_architect"
-        timeout: 600
         retries: 3
         review_required: false
 
@@ -38,7 +35,6 @@ pipeline_templates:
         required_capabilities: ["work_decomposition", "issue_creation"]
         default_agent: "work_breakdown_agent"
         inputs_from: ["business_analyst", "software_architect"]
-        timeout: 300
         retries: 2
         review_required: false
 
@@ -48,7 +44,6 @@ pipeline_templates:
         required_capabilities: ["code_review", "pr_analysis", "requirements_verification"]
         default_agent: "pr_code_reviewer"  # Primary agent for Phase 1
         inputs_from: ["work_breakdown"]
-        timeout: 3600  # 60 minutes for all phases
         retries: 1
         review_required: false
 
@@ -62,7 +57,6 @@ pipeline_templates:
         name: "Environment Configuration & Troubleshooting"
         required_capabilities: ["environment_analysis", "dockerfile_generation", "dependency_troubleshooting"]
         default_agent: "dev_environment_setup"
-        timeout: 1800
         retries: 3
         review_required: false
 
@@ -71,7 +65,6 @@ pipeline_templates:
         required_capabilities: ["environment_verification", "docker_image_validation"]
         default_agent: "dev_environment_verifier"
         inputs_from: ["dev_environment_setup"]
-        timeout: 300
         retries: 2
         review_required: false
 
@@ -86,11 +79,9 @@ pipeline_templates:
         required_capabilities: ["software_development", "code_implementation"]
         default_agent: "senior_software_engineer"
         inputs_from: ["software_architect"]  # Pull full design from planning workflow (requirements already in issue body)
-        timeout: 1800
         retries: 5
         review_required: true
         reviewer_agent: "code_reviewer"
-        reviewer_timeout: 300
         reviewer_retries: 5
         escalation:
           blocking_threshold: 1
@@ -101,7 +92,6 @@ pipeline_templates:
         stage_type: "repair_cycle"  # NEW: Signals this is a repair cycle stage
         required_capabilities: ["test_execution", "software_development"]
         default_agent: "senior_software_engineer"
-        timeout: 3600  # Longer timeout for iterative cycles
         retries: 1  # Retries handled internally by cycle
         review_required: false  # No review for deterministic testing
         # Test configurations will be loaded from project config
@@ -112,13 +102,11 @@ pipeline_templates:
         name: "Staging Review"
         required_capabilities: ["software_development", "code_implementation"]
         default_agent: "senior_software_engineer"
-        timeout: 7200
         retries: 1
         review_required: false
 
 # Pipeline execution settings
 execution_defaults:
   max_concurrent_stages: 1
-  stage_timeout: 1800
   retry_backoff: 30
   automatic_progression: true

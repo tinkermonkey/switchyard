@@ -5,7 +5,7 @@ agents:
   dev_environment_setup:
     description: "Development environment configuration, Dockerfile generation, and validation with automated troubleshooting"
     model: "claude-opus-4-6"
-    timeout: 1800  # 30 minutes for Docker builds and validation
+    timeout: 3600
     retries: 2
     makes_code_changes: true  # Modifies dependency files (requirements.txt, etc.)
     requires_dev_container: false  # Runs locally in orchestrator to build the dev container
@@ -28,7 +28,7 @@ agents:
   dev_environment_verifier:
     description: "Verifies dev environment setup succeeded and marks container as verified"
     model: "claude-sonnet-4-6"
-    timeout: 300
+    timeout: 3600
     retries: 2
     makes_code_changes: false  # Only verifies and updates state
     filesystem_write_allowed: false  # Only updates dev container state
@@ -49,7 +49,7 @@ agents:
   idea_researcher:
     description: "Market research and idea validation"
     model: "claude-opus-4-6"
-    timeout: 300
+    timeout: 3600
     retries: 2
     makes_code_changes: false  # Posts research to GitHub discussions, doesn't create files
     filesystem_write_allowed: false  # Must post to GitHub, not create local files
@@ -69,7 +69,7 @@ agents:
   business_analyst:
     description: "Requirements analysis and user story development"
     model: "claude-sonnet-4-6"
-    timeout: 300
+    timeout: 3600
     retries: 3
     makes_code_changes: false  # Posts to GitHub discussions, doesn't create files
     requires_dev_container: false  # Documentation work doesn't need project dependencies
@@ -90,7 +90,7 @@ agents:
   software_architect:
     description: "System architecture and technical design"
     model: "claude-opus-4-6"
-    timeout: 600
+    timeout: 3600
     retries: 3
     makes_code_changes: false  # Creates architecture documents and diagrams
     filesystem_write_allowed: false  # Posts reviews to GitHub, doesn't create files
@@ -111,7 +111,7 @@ agents:
   work_breakdown_agent:
     description: "Break approved designs into phase-based sub-issues for implementation"
     model: "claude-sonnet-4-6"
-    timeout: 300
+    timeout: 3600
     retries: 2
     makes_code_changes: false  # Creates GitHub issues, not files
     filesystem_write_allowed: false  # Creates GitHub issues via API only
@@ -175,7 +175,7 @@ agents:
   technical_writer:
     description: "Technical documentation creation"
     model: "claude-sonnet-4-6"
-    timeout: 300
+    timeout: 3600
     retries: 2
     makes_code_changes: true  # Creates documentation files
     requires_dev_container: false  # Documentation doesn't need dependencies
@@ -192,7 +192,7 @@ agents:
   documentation_editor:
     description: "Documentation review and editing"
     model: "claude-sonnet-4-6"
-    timeout: 300
+    timeout: 3600
     retries: 2
     makes_code_changes: false  # Review only, no changes
     filesystem_write_allowed: false  # Posts reviews to GitHub, doesn't create files
@@ -210,7 +210,7 @@ agents:
   pr_code_reviewer:
     description: "PR code quality review using pr-review-toolkit skill"
     model: "claude-opus-4-6"
-    timeout: 600  # 10 minutes for PR review
+    timeout: 3600
     retries: 2
     makes_code_changes: false
     filesystem_write_allowed: false
@@ -228,7 +228,7 @@ agents:
   requirements_verifier:
     description: "Verify PR against requirements and context"
     model: "claude-sonnet-4-6"
-    timeout: 300  # 5 minutes per verification
+    timeout: 3600
     retries: 2
     makes_code_changes: false
     filesystem_write_allowed: false
@@ -246,7 +246,7 @@ agents:
   test_agent:
     description: "Test agent for integration testing and CI/CD verification"
     model: "claude-haiku-4-5"
-    timeout: 300  # 5 minutes
+    timeout: 3600
     retries: 2
     makes_code_changes: true  # Can modify files for testing
     requires_dev_container: false  # Runs in basic orchestrator container
@@ -265,7 +265,7 @@ agents:
   claude_advisor:
     description: "Analyzes project failures and recommends improvements"
     model: "claude-sonnet-4-6"
-    timeout: 600
+    timeout: 3600
     retries: 1
     makes_code_changes: false
     filesystem_write_allowed: true  # Allow running tests/scripts that might write temp files

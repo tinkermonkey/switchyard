@@ -45,11 +45,9 @@ class PipelineStage:
     name: str
     required_capabilities: List[str]
     default_agent: str
-    timeout: int
     retries: int
     review_required: bool
     reviewer_agent: Optional[str] = None
-    reviewer_timeout: Optional[int] = None
     reviewer_retries: Optional[int] = None
     escalation: Optional[Dict[str, Any]] = None
     inputs_from: Optional[List[str]] = None  # List of agent names to gather outputs from
@@ -249,11 +247,9 @@ class ConfigManager:
                     name=stage_data['name'],
                     required_capabilities=stage_data['required_capabilities'],
                     default_agent=stage_data['default_agent'],
-                    timeout=stage_data['timeout'],
                     retries=stage_data['retries'],
                     review_required=stage_data.get('review_required', False),
                     reviewer_agent=stage_data.get('reviewer_agent'),
-                    reviewer_timeout=stage_data.get('reviewer_timeout'),
                     reviewer_retries=stage_data.get('reviewer_retries'),
                     escalation=stage_data.get('escalation'),
                     inputs_from=stage_data.get('inputs_from'),
