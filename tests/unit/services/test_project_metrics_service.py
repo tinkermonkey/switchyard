@@ -215,6 +215,8 @@ class TestComputeTokenAndContextMetrics:
 class TestComputeReviewCycleMetrics:
     def test_counts_iterations_per_run(self, service):
         service.es.search.return_value = _es_result([
+            _make_hit({'event_type': 'review_cycle_started',   'pipeline_run_id': 'run-1'}),
+            _make_hit({'event_type': 'review_cycle_started',   'pipeline_run_id': 'run-2'}),
             _make_hit({'event_type': 'review_cycle_iteration', 'pipeline_run_id': 'run-1'}),
             _make_hit({'event_type': 'review_cycle_iteration', 'pipeline_run_id': 'run-1'}),
             _make_hit({'event_type': 'review_cycle_iteration', 'pipeline_run_id': 'run-2'}),
@@ -226,7 +228,7 @@ class TestComputeReviewCycleMetrics:
             datetime(2026, 1, 2, tzinfo=timezone.utc),
         )
 
-        assert result['total_count'] == 2       # 2 distinct run IDs
+        assert result['total_count'] == 2       # 2 review_cycle_started events
         assert result['total_iterations'] == 3
         assert result['avg_iterations'] == 1.5  # (2+1)/2
         assert result['max_iterations'] == 2
@@ -257,9 +259,11 @@ class TestComputeReviewCycleMetrics:
 class TestComputeRepairCycleMetrics:
     def test_counts_test_and_fix_cycles(self, service):
         service.es.search.return_value = _es_result([
-            _make_hit({'event_type': 'repair_cycle_completed',          'pipeline_run_id': 'run-1', 'data': {'duration_seconds': 120}}),
+            _make_hit({'event_type': 'repair_cycle_completed',          'pipeline_run_id': 'run-1', 'data': {}}),
             _make_hit({'event_type': 'repair_cycle_test_cycle_started', 'pipeline_run_id': 'run-1', 'data': {}}),
             _make_hit({'event_type': 'repair_cycle_test_cycle_started', 'pipeline_run_id': 'run-1', 'data': {}}),
+            _make_hit({'event_type': 'repair_cycle_test_cycle_completed', 'pipeline_run_id': 'run-1', 'data': {'test_type': 'unit', 'duration_seconds': 60, 'test_cycle_iterations': 3}}),
+            _make_hit({'event_type': 'repair_cycle_test_cycle_completed', 'pipeline_run_id': 'run-1', 'data': {'test_type': 'pre-commit', 'duration_seconds': 30, 'test_cycle_iterations': 1}}),
             _make_hit({'event_type': 'repair_cycle_fix_cycle_started',  'pipeline_run_id': 'run-1', 'data': {}}),
             _make_hit({'event_type': 'repair_cycle_systemic_analysis_started', 'pipeline_run_id': 'run-1', 'data': {}}),
         ])
@@ -274,8 +278,14 @@ class TestComputeRepairCycleMetrics:
         assert result['max_test_cycles'] == 2
         assert result['avg_fix_cycles'] == 1.0
         assert result['max_fix_cycles'] == 1
-        assert result['avg_test_duration_ms'] == 120000.0
         assert result['systemic_analysis_count'] == 1
+        assert 'by_test_type' in result
+        assert 'unit' in result['by_test_type']
+        assert result['by_test_type']['unit']['count'] == 1
+        assert result['by_test_type']['unit']['avg_duration_ms'] == 60000.0
+        assert result['by_test_type']['unit']['avg_iterations'] == 3.0
+        assert 'pre-commit' in result['by_test_type']
+        assert result['by_test_type']['pre-commit']['avg_duration_ms'] == 30000.0
 
     def test_failed_cycles_counted(self, service):
         service.es.search.return_value = _es_result([
@@ -341,6 +351,22 @@ class TestComputePrReviewMetrics:
 
 class TestComputePipelineOutcomes:
     def test_counts_success_and_failed(self, service):
+        # 30 runs, 3 failed → 27 success
+        hits = [_make_hit({'outcome': 'failed'})] * 3 + [_make_hit({'outcome': None})] * 27
+        service.es.search.return_value = _es_result(hits)
+
+        result = service._compute_pipeline_outcomes(
+            'proj', datetime(2026, 1, 1, tzinfo=timezone.utc),
+            datetime(2026, 1, 2, tzinfo=timezone.utc),
+        )
+
+        assert result['total_count'] == 30
+        assert result['failed_count'] == 3
+        assert result['success_count'] == 27
+        assert result['success_rate'] == pytest.approx(0.9, abs=0.001)
+
+    def test_explicit_outcome_field_irrelevant_for_success(self, service):
+        # Only failures are counted; all other completed runs are successes
         service.es.search.return_value = _es_result([
             _make_hit({'outcome': 'success'}),
             _make_hit({'outcome': 'success'}),
@@ -352,11 +378,11 @@ class TestComputePipelineOutcomes:
             datetime(2026, 1, 2, tzinfo=timezone.utc),
         )
 
+        assert result['total_count'] == 3
         assert result['success_count'] == 2
         assert result['failed_count'] == 1
-        assert result['success_rate'] == pytest.approx(0.6667, abs=0.001)
 
-    def test_all_success(self, service):
+    def test_no_failures(self, service):
         service.es.search.return_value = _es_result([
             _make_hit({'outcome': 'success'}),
             _make_hit({'outcome': 'success'}),
@@ -369,6 +395,7 @@ class TestComputePipelineOutcomes:
 
         assert result['success_rate'] == 1.0
         assert result['failed_count'] == 0
+        assert result['success_count'] == 2
 
     def test_empty_result(self, service):
         service.es.search.return_value = _es_result([])

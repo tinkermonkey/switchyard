@@ -197,6 +197,7 @@ class TokenMetricsService:
                     "total_cache_creation": {"type": "long"},
                     "tool_call_count":      {"type": "integer"},
                     "prompt_length":        {"type": "long"},
+                    "tool_breakdown":       {"type": "object", "enabled": False},
                 }
             ),
         ]

@@ -1936,9 +1936,10 @@ def _aggregate_project_docs(project: str, docs: list) -> dict:
     total_invocations = 0
     rv_count = rv_iterations = rv_max_iter = rv_escalations = 0
     rp_count = rp_test_cycles_sum = rp_max_test = rp_fix_cycles_sum = rp_max_fix = 0
-    rp_test_dur_sum = rp_max_test_dur = rp_systemic = 0
+    rp_systemic = 0
+    rp_by_test_type: dict = {}
     pr_count = pr_iterations = pr_max_iter = 0
-    success_count = failed_count = 0
+    total_run_count = success_count = failed_count = 0
 
     for doc in docs:
         run_count += doc.get('pipeline_run_count', 0) or 0
@@ -1970,9 +1971,22 @@ def _aggregate_project_docs(project: str, docs: list) -> dict:
         rp_max_test = max(rp_max_test, rp.get('max_test_cycles', 0) or 0)
         rp_fix_cycles_sum += (rp.get('avg_fix_cycles', 0) or 0) * rp_day_count
         rp_max_fix = max(rp_max_fix, rp.get('max_fix_cycles', 0) or 0)
-        rp_test_dur_sum += (rp.get('avg_test_duration_ms', 0) or 0) * rp_day_count
-        rp_max_test_dur = max(rp_max_test_dur, rp.get('max_test_duration_ms', 0) or 0)
         rp_systemic += rp.get('systemic_analysis_count', 0) or 0
+        for ttype, tdata in (rp.get('by_test_type') or {}).items():
+            if not isinstance(tdata, dict):
+                continue
+            if ttype not in rp_by_test_type:
+                rp_by_test_type[ttype] = {
+                    'count': 0, 'total_iterations': 0, 'max_iterations': 0,
+                    'total_duration_ms': 0.0, 'max_duration_ms': 0,
+                }
+            entry = rp_by_test_type[ttype]
+            tcount = tdata.get('count', 0) or 0
+            entry['count'] += tcount
+            entry['total_iterations'] += tdata.get('total_iterations', 0) or 0
+            entry['max_iterations'] = max(entry['max_iterations'], tdata.get('max_iterations', 0) or 0)
+            entry['total_duration_ms'] += (tdata.get('avg_duration_ms', 0) or 0) * tcount
+            entry['max_duration_ms'] = max(entry['max_duration_ms'], tdata.get('max_duration_ms', 0) or 0)
 
         pr = doc.get('pr_review_cycles') or {}
         pr_count += pr.get('total_count', 0) or 0
@@ -1980,6 +1994,7 @@ def _aggregate_project_docs(project: str, docs: list) -> dict:
         pr_max_iter = max(pr_max_iter, pr.get('max_iterations', 0) or 0)
 
         po = doc.get('pipeline_outcomes') or {}
+        total_run_count += po.get('total_count', 0) or 0
         success_count += po.get('success_count', 0) or 0
         failed_count += po.get('failed_count', 0) or 0
 
@@ -2017,7 +2032,6 @@ def _aggregate_project_docs(project: str, docs: list) -> dict:
             entry['sum_output'] += tb.get('sum_output', 0) or 0
             entry['sum_context_growth'] += tb.get('sum_context_growth', 0) or 0
 
-    total_outcomes = success_count + failed_count
     return {
         'project': project,
         'pipeline_run_count': run_count,
@@ -2056,9 +2070,18 @@ def _aggregate_project_docs(project: str, docs: list) -> dict:
             'max_test_cycles': rp_max_test,
             'avg_fix_cycles': round(rp_fix_cycles_sum / rp_count, 2) if rp_count else 0,
             'max_fix_cycles': rp_max_fix,
-            'avg_test_duration_ms': round(rp_test_dur_sum / rp_count, 1) if rp_count else 0,
-            'max_test_duration_ms': rp_max_test_dur,
             'systemic_analysis_count': rp_systemic,
+            'by_test_type': {
+                ttype: {
+                    'count': entry['count'],
+                    'total_iterations': entry['total_iterations'],
+                    'avg_iterations': round(entry['total_iterations'] / entry['count'], 2) if entry['count'] else 0.0,
+                    'max_iterations': entry['max_iterations'],
+                    'avg_duration_ms': round(entry['total_duration_ms'] / entry['count'], 1) if entry['count'] else 0.0,
+                    'max_duration_ms': entry['max_duration_ms'],
+                }
+                for ttype, entry in rp_by_test_type.items()
+            },
         },
         'pr_review_cycles': {
             'total_count': pr_count,
@@ -2067,9 +2090,10 @@ def _aggregate_project_docs(project: str, docs: list) -> dict:
             'max_iterations': pr_max_iter,
         },
         'pipeline_outcomes': {
+            'total_count': total_run_count,
             'success_count': success_count,
             'failed_count': failed_count,
-            'success_rate': round(success_count / total_outcomes * 100, 1) if total_outcomes else None,
+            'success_rate': round(success_count / total_run_count * 100, 1) if total_run_count else None,
         },
         'agent_breakdown': agent_breakdown,
         'tool_breakdown': tool_breakdown,

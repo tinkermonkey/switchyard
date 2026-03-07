@@ -221,7 +221,8 @@ class ProjectMetricsService:
         outcomes = self._compute_pipeline_outcomes(project, start, end)
 
         agent_breakdown = token_ctx.get('agent_breakdown', {})
-        tool_breakdown = self._compute_tool_breakdown(project, start, end)
+        task_ids = token_ctx.get('task_ids', [])
+        tool_breakdown = self._compute_tool_breakdown(task_ids)
 
         return {
             'project': project,
@@ -253,7 +254,7 @@ class ProjectMetricsService:
         Uses tool_call_count (indexed integer) for tool invocations — this field
         is the pre-summed count of all tool invocations per task.
         """
-        empty = {'pipeline_run_count': 0, 'tokens': {}, 'context': {}, 'tool_calls': {}, 'agent_breakdown': {}}
+        empty = {'pipeline_run_count': 0, 'tokens': {}, 'context': {}, 'tool_calls': {}, 'agent_breakdown': {}, 'task_ids': []}
         try:
             result = self.es.search(
                 index='agent-execution-summaries-*',
@@ -271,7 +272,7 @@ class ProjectMetricsService:
                         }
                     },
                     '_source': [
-                        'pipeline_run_id', 'agent_name', 'total_direct_input', 'total_cache_read',
+                        'task_id', 'pipeline_run_id', 'agent_name', 'total_direct_input', 'total_cache_read',
                         'total_cache_creation', 'total_output', 'initial_context',
                         'peak_context', 'tool_call_count',
                     ],
@@ -296,8 +297,11 @@ class ProjectMetricsService:
         # Accumulate per pipeline_run_id so we can compute per-run averages
         runs: Dict[str, Dict[str, Any]] = {}
         agent_breakdown: Dict[str, Dict[str, Any]] = {}
+        task_ids: List[str] = []
         for hit in hits:
             src = hit['_source']
+            if src.get('task_id'):
+                task_ids.append(src['task_id'])
             run_id = src.get('pipeline_run_id') or '__no_run__'
             if run_id not in runs:
                 runs[run_id] = {
@@ -354,6 +358,7 @@ class ProjectMetricsService:
         return {
             'pipeline_run_count': pipeline_run_count,
             'agent_breakdown': agent_breakdown,
+            'task_ids': task_ids,
             'tokens': {
                 'sum_direct_input': total_direct_input,
                 'sum_cache_read': total_cache_read,
@@ -381,36 +386,39 @@ class ProjectMetricsService:
     # Tool breakdown
     # -------------------------------------------------------------------------
 
-    def _compute_tool_breakdown(
-        self, project: str, start: datetime, end: datetime
-    ) -> Dict[str, Any]:
+    def _compute_tool_breakdown(self, task_ids: List[str]) -> Dict[str, Any]:
         """
-        Compute per-tool breakdown for a project by aggregating tool_breakdown fields
-        from agent-execution-summaries-*, which are now written per execution and are
-        scoped exactly to the project.
+        Compute per-tool breakdown by parsing claude-streams-* events for the given task_ids.
+
+        Mirrors the approach used by TokenMetricsService for cycle/agent metrics: reads
+        raw assistant stream events and attributes token costs to tool_use content blocks.
+        This avoids reliance on the pre-computed tool_breakdown field in execution summaries,
+        which may be empty for older docs.
         """
+        import json
+        from services.token_metrics_service import _get_effective_tool_name, _empty_tool_entry
+
+        if not task_ids:
+            return {}
+
         try:
             result = self.es.search(
-                index='agent-execution-summaries-*',
+                index='claude-streams-*',
                 body={
                     'size': 10000,
                     'query': {
                         'bool': {
-                            'must': [
-                                {'term': {'project': project}},
-                                {'range': {'ended_at': {
-                                    'gte': start.isoformat(),
-                                    'lt': end.isoformat(),
-                                }}},
-                            ]
+                            'must': [{'terms': {'task_id': task_ids}}],
+                            'must_not': [{'term': {'event_type': 'prompt_constructed'}}],
                         }
                     },
-                    '_source': ['tool_breakdown'],
+                    '_source': ['task_id', 'raw_event', 'timestamp'],
+                    'sort': [{'task_id': {'order': 'asc'}}, {'timestamp': {'order': 'asc'}}],
                 },
             )
         except Exception as e:
             if 'index_not_found' not in str(e).lower():
-                logger.warning(f"Error fetching tool breakdown for {project}: {e}")
+                logger.warning(f"Error querying claude-streams for tool breakdown: {e}")
             return {}
 
         hits = result['hits']['hits']
@@ -419,23 +427,99 @@ class ProjectMetricsService:
             total = total.get('value', len(hits))
         if total > len(hits):
             logger.warning(
-                f"tool_breakdown query returned {len(hits)} of {total} docs "
-                f"for {project} in window {start.date()} — tool breakdown may be incomplete"
+                f"claude-streams tool breakdown query returned {len(hits)} of {total} hits — "
+                f"tool breakdown may be incomplete"
             )
+        if not hits:
+            return {}
 
-        tool_breakdown: Dict[str, Any] = {}
+        # Group by task_id, dedup re-emitted assistant messages by message ID
+        task_streams: Dict[str, List[Dict]] = {}
         for hit in hits:
-            for tool_name, tb in (hit['_source'].get('tool_breakdown') or {}).items():
-                if not isinstance(tb, dict):
-                    continue
-                if tool_name not in tool_breakdown:
-                    tool_breakdown[tool_name] = {'task_count': 0, 'sum_output': 0, 'sum_context_growth': 0}
-                entry = tool_breakdown[tool_name]
-                entry['task_count'] += tb.get('task_count', 0) or 0
-                entry['sum_output'] += tb.get('sum_output', 0) or 0
-                entry['sum_context_growth'] += tb.get('sum_context_growth', 0) or 0
+            src = hit['_source']
+            tid = src.get('task_id')
+            if tid:
+                task_streams.setdefault(tid, []).append(src)
 
-        return tool_breakdown
+        tool_breakdown_raw: Dict[str, Any] = {}
+
+        for tid, docs in task_streams.items():
+            # Dedup: for each message ID keep only the last emission
+            last_idx_for_msg: Dict[str, int] = {}
+            for i, doc in enumerate(docs):
+                raw = doc.get('raw_event')
+                if isinstance(raw, str):
+                    try:
+                        raw = json.loads(raw)
+                    except Exception:
+                        continue
+                if isinstance(raw, dict):
+                    event = raw.get('event') if isinstance(raw, dict) else None
+                    if event and event.get('type') == 'assistant':
+                        msg_id = event.get('message', {}).get('id')
+                        if msg_id:
+                            last_idx_for_msg[msg_id] = i
+            canonical = set(last_idx_for_msg.values())
+
+            prev_effective_input: Optional[int] = None
+            prev_tool_uses: List[str] = []
+
+            for i, doc in enumerate(docs):
+                raw = doc.get('raw_event')
+                if isinstance(raw, str):
+                    try:
+                        raw = json.loads(raw)
+                    except Exception:
+                        continue
+                event = raw.get('event') if isinstance(raw, dict) else None
+                if not event or event.get('type') != 'assistant':
+                    continue
+                message = event.get('message', {})
+                msg_id = message.get('id')
+                if msg_id and i not in canonical:
+                    continue
+
+                usage = message.get('usage', {})
+                output_tokens = usage.get('output_tokens') or 0
+                input_direct = usage.get('input_tokens') or 0
+                cache_read = usage.get('cache_read_input_tokens') or 0
+                cache_creation = usage.get('cache_creation_input_tokens') or 0
+                effective_input = input_direct + cache_read + cache_creation
+
+                contents = message.get('content') or []
+                current_tool_uses: List[str] = []
+                for c in (contents if isinstance(contents, list) else []):
+                    if c.get('type') == 'tool_use':
+                        name = _get_effective_tool_name(c)
+                        if name:
+                            current_tool_uses.append(name)
+
+                if current_tool_uses:
+                    k = len(current_tool_uses)
+                    for tool_name in current_tool_uses:
+                        td = tool_breakdown_raw.setdefault(tool_name, _empty_tool_entry())
+                        td['invocation_count'] += 1
+                        td['sum_output'] += output_tokens / k
+
+                if prev_effective_input is not None and prev_tool_uses:
+                    delta = max(0, effective_input - prev_effective_input)
+                    k = len(prev_tool_uses)
+                    per_tool_delta = delta / k if k > 0 else 0
+                    for tool_name in prev_tool_uses:
+                        td = tool_breakdown_raw.setdefault(tool_name, _empty_tool_entry())
+                        td['sum_context_growth'] += per_tool_delta
+
+                prev_effective_input = effective_input
+                prev_tool_uses = current_tool_uses
+
+        return {
+            tool_name: {
+                'task_count': int(td['invocation_count']),
+                'sum_output': int(td['sum_output']),
+                'sum_context_growth': int(td['sum_context_growth']),
+            }
+            for tool_name, td in tool_breakdown_raw.items()
+        }
 
     # -------------------------------------------------------------------------
     # Review cycle metrics
@@ -494,7 +578,7 @@ class ProjectMetricsService:
                 f"for {project} in window {start.date()} — metrics may be incomplete"
             )
 
-        all_run_ids: set = set()
+        started_count = 0
         run_iterations: Dict[str, int] = {}
         escalation_count = 0
 
@@ -502,15 +586,15 @@ class ProjectMetricsService:
             src = hit['_source']
             event_type = src.get('event_type', '')
             run_id = src.get('pipeline_run_id')
-            if run_id:
-                all_run_ids.add(run_id)
-            if event_type == 'review_cycle_iteration':
+            if event_type == 'review_cycle_started':
+                started_count += 1
+            elif event_type == 'review_cycle_iteration':
                 key = run_id or '__no_run__'
                 run_iterations[key] = run_iterations.get(key, 0) + 1
             elif event_type == 'review_cycle_escalated':
                 escalation_count += 1
 
-        total_count = len(all_run_ids)
+        total_count = started_count
         if not run_iterations:
             return {**empty, 'total_count': total_count, 'escalation_count': escalation_count}
 
@@ -545,9 +629,8 @@ class ProjectMetricsService:
             'max_test_cycles': 0,
             'avg_fix_cycles': 0.0,
             'max_fix_cycles': 0,
-            'avg_test_duration_ms': 0.0,
-            'max_test_duration_ms': 0,
             'systemic_analysis_count': 0,
+            'by_test_type': {},
         }
         try:
             result = self.es.search(
@@ -588,9 +671,10 @@ class ProjectMetricsService:
 
         test_cycle_counts: Dict[str, int] = {}
         fix_cycle_counts: Dict[str, int] = {}
-        durations_ms: List[float] = []
         systemic_analysis_count = 0
         total_count = 0
+        # per-test-type: {test_type: {durations_ms: [], iterations: []}}
+        by_test_type_raw: Dict[str, Dict[str, List]] = {}
 
         for hit in hits:
             src = hit['_source']
@@ -600,13 +684,20 @@ class ProjectMetricsService:
 
             if event_type == 'repair_cycle_completed':
                 total_count += 1
-                duration_s = data.get('duration_seconds')
-                if duration_s is not None:
-                    durations_ms.append(float(duration_s) * 1000)
             elif event_type == 'repair_cycle_failed':
                 total_count += 1
             elif event_type == 'repair_cycle_test_cycle_started':
                 test_cycle_counts[run_id] = test_cycle_counts.get(run_id, 0) + 1
+            elif event_type == 'repair_cycle_test_cycle_completed':
+                test_type = data.get('test_type') or 'unknown'
+                duration_s = data.get('duration_seconds')
+                iterations = data.get('test_cycle_iterations') or 1
+                if test_type not in by_test_type_raw:
+                    by_test_type_raw[test_type] = {'durations_ms': [], 'iterations': []}
+                entry = by_test_type_raw[test_type]
+                if duration_s is not None:
+                    entry['durations_ms'].append(float(duration_s) * 1000)
+                entry['iterations'].append(int(iterations))
             elif event_type == 'repair_cycle_fix_cycle_started':
                 fix_cycle_counts[run_id] = fix_cycle_counts.get(run_id, 0) + 1
             elif event_type == 'repair_cycle_systemic_analysis_started':
@@ -614,15 +705,28 @@ class ProjectMetricsService:
 
         test_vals = list(test_cycle_counts.values())
         fix_vals = list(fix_cycle_counts.values())
+
+        by_test_type: Dict[str, Any] = {}
+        for test_type, tdata in by_test_type_raw.items():
+            dms = tdata['durations_ms']
+            iters = tdata['iterations']
+            by_test_type[test_type] = {
+                'count': len(iters),
+                'total_iterations': sum(iters),
+                'avg_iterations': round(sum(iters) / len(iters), 2) if iters else 0.0,
+                'max_iterations': max(iters) if iters else 0,
+                'avg_duration_ms': round(sum(dms) / len(dms), 1) if dms else 0.0,
+                'max_duration_ms': round(max(dms)) if dms else 0,
+            }
+
         return {
             'total_count': total_count,
             'avg_test_cycles': round(sum(test_vals) / len(test_vals), 2) if test_vals else 0.0,
             'max_test_cycles': max(test_vals) if test_vals else 0,
             'avg_fix_cycles': round(sum(fix_vals) / len(fix_vals), 2) if fix_vals else 0.0,
             'max_fix_cycles': max(fix_vals) if fix_vals else 0,
-            'avg_test_duration_ms': round(sum(durations_ms) / len(durations_ms), 2) if durations_ms else 0.0,
-            'max_test_duration_ms': int(max(durations_ms)) if durations_ms else 0,
             'systemic_analysis_count': systemic_analysis_count,
+            'by_test_type': by_test_type,
         }
 
     # -------------------------------------------------------------------------
@@ -754,20 +858,19 @@ class ProjectMetricsService:
                 f"for {project} in window {start.date()} — outcome metrics may be incomplete"
             )
 
-        success_count = 0
+        total_runs = len(hits)
         failed_count = 0
         for hit in hits:
             outcome = hit['_source'].get('outcome')
-            if outcome == 'success':
-                success_count += 1
-            elif outcome in ('failed', 'failure'):
+            if outcome in ('failed', 'failure'):
                 failed_count += 1
 
-        total = success_count + failed_count
+        success_count = total_runs - failed_count
         return {
+            'total_count': total_runs,
             'success_count': success_count,
             'failed_count': failed_count,
-            'success_rate': round(success_count / total, 4) if total > 0 else 0.0,
+            'success_rate': round(success_count / total_runs, 4) if total_runs > 0 else 0.0,
         }
 
     # -------------------------------------------------------------------------

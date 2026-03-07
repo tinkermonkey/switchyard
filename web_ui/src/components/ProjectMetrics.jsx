@@ -231,29 +231,42 @@ function ProjectCard({ project: p }) {
               {rp.total_count > 0 ? (
                 <div className="space-y-1 text-xs">
                   <div className="flex justify-between">
-                    <span className="text-gh-fg-muted">Total</span>
+                    <span className="text-gh-fg-muted">Total runs</span>
                     <span className="font-mono font-semibold">{rp.total_count}</span>
-                  </div>
-                  <div className="flex justify-between">
-                    <span className="text-gh-fg-muted">Avg test cycles</span>
-                    <span className="font-mono">{rp.avg_test_cycles}</span>
-                  </div>
-                  <div className="flex justify-between">
-                    <span className="text-gh-fg-muted">Max test cycles</span>
-                    <span className="font-mono">{rp.max_test_cycles}</span>
                   </div>
                   <div className="flex justify-between">
                     <span className="text-gh-fg-muted">Avg fix cycles</span>
                     <span className="font-mono">{rp.avg_fix_cycles}</span>
                   </div>
-                  <div className="flex justify-between">
-                    <span className="text-gh-fg-muted">Avg test duration</span>
-                    <span className="font-mono">{fmtDur(rp.avg_test_duration_ms)}</span>
-                  </div>
                   {rp.systemic_analysis_count > 0 && (
                     <div className="flex justify-between">
                       <span className="text-gh-fg-muted">Systemic analyses</span>
                       <span className="font-mono text-gh-attention">{rp.systemic_analysis_count}</span>
+                    </div>
+                  )}
+                  {Object.keys(rp.by_test_type || {}).length > 0 && (
+                    <div className="mt-2 pt-2 border-t border-gh-border">
+                      <p className="text-gh-fg-muted mb-1 font-semibold">By test type</p>
+                      <table className="w-full">
+                        <thead>
+                          <tr className="text-gh-fg-muted">
+                            <th className="text-left font-normal pb-0.5">Type</th>
+                            <th className="text-right font-normal pb-0.5">Runs</th>
+                            <th className="text-right font-normal pb-0.5">Avg iter</th>
+                            <th className="text-right font-normal pb-0.5">Avg dur</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-gh-border">
+                          {Object.entries(rp.by_test_type).sort((a, b) => (b[1].count || 0) - (a[1].count || 0)).map(([ttype, tdata]) => (
+                            <tr key={ttype}>
+                              <td className="font-mono py-0.5">{ttype}</td>
+                              <td className="text-right py-0.5">{tdata.count || 0}</td>
+                              <td className="text-right py-0.5 font-mono">{tdata.avg_iterations ?? '—'}</td>
+                              <td className="text-right py-0.5 font-mono">{fmtDur(tdata.avg_duration_ms)}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
                     </div>
                   )}
                 </div>
@@ -291,13 +304,21 @@ function ProjectCard({ project: p }) {
         <div>
           <SectionHeader title="Pipeline Outcomes" />
           <div className="bg-gh-canvas-subtle border border-gh-border rounded p-3">
+            {outcomes.total_count != null && (
+              <div className="flex items-center justify-between py-1 border-b border-gh-border">
+                <span className="text-xs text-gh-fg-muted">Total completed</span>
+                <span className="font-mono text-sm font-semibold">{outcomes.total_count}</span>
+              </div>
+            )}
             <div className="flex items-center justify-between py-1 border-b border-gh-border">
               <span className="text-xs text-gh-fg-muted">Success</span>
-              <span className="font-mono text-sm font-semibold">{outcomes.success_count ?? '—'}</span>
+              <span className="font-mono text-sm font-semibold text-gh-success">{outcomes.success_count ?? '—'}</span>
             </div>
             <div className="flex items-center justify-between py-1">
               <span className="text-xs text-gh-fg-muted">Failed</span>
-              <span className="font-mono text-sm font-semibold">{outcomes.failed_count ?? '—'}</span>
+              <span className={`font-mono text-sm font-semibold ${(outcomes.failed_count ?? 0) > 0 ? 'text-gh-danger' : ''}`}>
+                {outcomes.failed_count ?? '—'}
+              </span>
             </div>
           </div>
         </div>
