@@ -1,6 +1,6 @@
 import { Upload, RotateCcw, Download } from 'lucide-react'
 import PipelineFlowGraph, { DEFAULT_LAYOUT_OPTIONS } from './components/PipelineFlowGraph'
-import { useState, useEffect, useCallback, useMemo } from 'react'
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import { toggleCycleCollapsed } from './utils/cycleLayout'
 import { buildFlowchart, findActiveContainerPath } from './utils/buildFlowchart'
 
@@ -25,6 +25,7 @@ export default function StandaloneSandbox() {
   const [nodesDraggable, setNodesDraggable] = useState(false)
   const [processedModel, setProcessedModel] = useState(null)
   const [showAllNodes, setShowAllNodes] = useState(false)
+  const prevDebugDataRef = useRef(null)
 
   const handleToggleCycle = useCallback((cycleId) => {
     setCycles(prev => toggleCycleCollapsed(prev, cycleId))
@@ -89,9 +90,18 @@ export default function StandaloneSandbox() {
       if (!agentTaskDone.has(taskId)) activeTaskIds.add(taskId)
     })
 
+    // When switching to a new file, ignore stale cycles from the previous file.
+    // Both the reset effect (setCycles(new Map())) and this effect fire on the
+    // same render — the reset wins in React's batching, but this effect still
+    // reads the OLD cycles closure value. Using an empty map for new files
+    // prevents stale expanded state from bleeding into the new file's build.
+    const isNewFile = prevDebugDataRef.current !== debugData
+    prevDebugDataRef.current = debugData
+    const effectiveCycles = isNewFile ? new Map() : cycles
+
     const result = buildFlowchart({
       events: graphEvents,
-      existingCycles: cycles,
+      existingCycles: effectiveCycles,
       workflowConfig: workflowConfig || null,
       selectedPipelineRun: pipelineRun,
       activeTaskIds,
@@ -108,7 +118,7 @@ export default function StandaloneSandbox() {
     }
 
     const hasNewCycles = updatedCycles.size > 0 &&
-      [...updatedCycles.keys()].some(k => !cycles.has(k) || cycles.get(k)?.isCollapsed !== updatedCycles.get(k)?.isCollapsed)
+      [...updatedCycles.keys()].some(k => !effectiveCycles.has(k) || effectiveCycles.get(k)?.isCollapsed !== updatedCycles.get(k)?.isCollapsed)
     if (hasNewCycles) {
       setCycles(updatedCycles)
       return
