@@ -1,8 +1,6 @@
 import { Upload, RotateCcw, Download } from 'lucide-react'
 import PipelineFlowGraph, { DEFAULT_LAYOUT_OPTIONS } from './components/PipelineFlowGraph'
-import { useState, useEffect, useCallback, useRef } from 'react'
-import { toggleCycleCollapsed } from './utils/cycleLayout'
-import { buildFlowchart } from './utils/buildFlowchart'
+import { useState, useCallback, useMemo } from 'react'
 
 // Human-readable labels for the layout parameter sliders.
 // Only keys present here will show as sliders; the rest of DEFAULT_LAYOUT_OPTIONS
@@ -18,18 +16,11 @@ const PARAM_LABELS = {
 export default function StandaloneSandbox() {
   const [debugData, setDebugData] = useState(null)
   const [layoutParams, setLayoutParams] = useState(DEFAULT_LAYOUT_OPTIONS)
-  const [cycles, setCycles] = useState(new Map())
   const [isDragOver, setIsDragOver] = useState(false)
   const [error, setError] = useState(null)
-  const [rawBuild, setRawBuild] = useState(null)
   const [nodesDraggable, setNodesDraggable] = useState(false)
   const [processedModel, setProcessedModel] = useState(null)
   const [showAllNodes, setShowAllNodes] = useState(false)
-  const prevDebugDataRef = useRef(null)
-
-  const handleToggleCycle = useCallback((cycleId) => {
-    setCycles(prev => toggleCycleCollapsed(prev, cycleId))
-  }, [])
 
   const loadFile = useCallback((file) => {
     if (!file) return
@@ -42,6 +33,7 @@ export default function StandaloneSandbox() {
           return
         }
         setDebugData(json)
+        setProcessedModel(null)
         setError(null)
       } catch {
         setError('Failed to parse JSON file')
@@ -61,64 +53,10 @@ export default function StandaloneSandbox() {
     e.target.value = ''
   }, [loadFile])
 
-  // Reset cycles when new data is loaded
-  useEffect(() => {
-    setCycles(new Map())
-    setRawBuild(null)
-    setProcessedModel(null)
+  const graphEvents = useMemo(() => {
+    if (!debugData?.events) return []
+    return debugData.events.filter(e => e.event_category !== 'claude_log')
   }, [debugData])
-
-  // Build raw (unpositioned) flowchart whenever data or cycles change
-  useEffect(() => {
-    if (!debugData) { setRawBuild(null); return }
-    const { pipelineRun, events, workflowConfig } = debugData
-    if (!pipelineRun || !events) return
-
-    // Exclude claude_log streaming events — irrelevant to graph building, but can
-    // account for 80%+ of events in large runs and cause layout thread exhaustion.
-    const graphEvents = events.filter(e => e.event_category !== 'claude_log')
-
-    // Compute active task_ids from events (same logic as pipeline-run.jsx)
-    const agentTaskInit = new Map()
-    const agentTaskDone = new Set()
-    graphEvents.forEach(e => {
-      if (e.event_type === 'agent_initialized') agentTaskInit.set(e.task_id, e.agent)
-      else if (e.event_type === 'agent_completed' || e.event_type === 'agent_failed') agentTaskDone.add(e.task_id)
-    })
-    const activeTaskIds = new Set()
-    agentTaskInit.forEach((agent, taskId) => {
-      if (!agentTaskDone.has(taskId)) activeTaskIds.add(taskId)
-    })
-
-    // When switching to a new file, ignore stale cycles from the previous file.
-    // Both the reset effect (setCycles(new Map())) and this effect fire on the
-    // same render — the reset wins in React's batching, but this effect still
-    // reads the OLD cycles closure value. Using an empty map for new files
-    // prevents stale expanded state from bleeding into the new file's build.
-    const isNewFile = prevDebugDataRef.current !== debugData
-    prevDebugDataRef.current = debugData
-    const effectiveCycles = isNewFile ? new Map() : cycles
-
-    const result = buildFlowchart({
-      events: graphEvents,
-      existingCycles: effectiveCycles,
-      workflowConfig: workflowConfig || null,
-      selectedPipelineRun: pipelineRun,
-      activeTaskIds,
-    })
-
-    const { updatedCycles } = result
-
-    const hasNewCycles = updatedCycles.size > 0 &&
-      [...updatedCycles.keys()].some(k => !effectiveCycles.has(k) || effectiveCycles.get(k)?.isCollapsed !== updatedCycles.get(k)?.isCollapsed)
-    if (hasNewCycles) {
-      setCycles(updatedCycles)
-      return
-    }
-
-    setRawBuild(result)
-    setProcessedModel(result.model ?? null)
-  }, [debugData, cycles])
 
   const handleDownloadProcessed = useCallback(() => {
     if (!processedModel || !debugData) return
@@ -274,8 +212,10 @@ export default function StandaloneSandbox() {
             </div>
           ) : (
             <PipelineFlowGraph
-              rawBuild={rawBuild}
-              onToggleCycle={handleToggleCycle}
+              graphEvents={graphEvents}
+              workflowConfig={debugData.workflowConfig ?? null}
+              selectedPipelineRun={debugData.pipelineRun ?? null}
+              onModelChange={setProcessedModel}
               layoutOptions={layoutParams}
               nodesDraggable={nodesDraggable}
               allowResizing={nodesDraggable}

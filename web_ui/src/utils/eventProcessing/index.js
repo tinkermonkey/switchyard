@@ -246,8 +246,14 @@ const REPAIR_SUB_CYCLE_REGISTRY = [
 
 /**
  * Group events within a time window into sub-cycles using a registry entry.
+ * Recursively detects nested sub-cycles one level deep (e.g. a test_execution
+ * that runs inside a systemic_fix is captured as a nested sub-cycle of that fix,
+ * accessible via sc.subCycles). Events that fall inside a nested sub-cycle's
+ * window are excluded from the outer sub-cycle's own events list so they are
+ * not double-counted.
  */
-function groupSubCycles(events, registryEntry, agentExecutions) {
+function groupSubCycles(events, registryEntry, agentExecutions, depth = 0) {
+  const MAX_NESTING_DEPTH = 1
   const { startEventType, endEventType, cycleType, label } = registryEntry
   const starts = events.filter(e => e.event_type === startEventType)
   const ends   = events.filter(e => e.event_type === endEventType)
@@ -256,10 +262,31 @@ function groupSubCycles(events, registryEntry, agentExecutions) {
     const endEvent  = ends[idx] || null
     const startMs   = new Date(startEvent.timestamp).getTime()
     const endMs     = endEvent ? new Date(endEvent.timestamp).getTime() : Infinity
-    const subEvents = events.filter(e => {
+    const windowEvents = events.filter(e => {
       const t = new Date(e.timestamp).getTime()
       return t > startMs && t < endMs
     })
+
+    // Detect nested sub-cycles one level deep, then exclude their events from
+    // this sub-cycle's own event list so events belong to exactly one container.
+    let subCycles = []
+    let residualEvents = windowEvents
+    if (depth < MAX_NESTING_DEPTH) {
+      subCycles = REPAIR_SUB_CYCLE_REGISTRY.flatMap(entry =>
+        groupSubCycles(windowEvents, entry, agentExecutions, depth + 1)
+      )
+      if (subCycles.length > 0) {
+        const nestedRanges = subCycles.map(nsc => ({
+          startMs: new Date(nsc.startEvent.timestamp).getTime(),
+          endMs:   nsc.endEvent ? new Date(nsc.endEvent.timestamp).getTime() : Infinity,
+        }))
+        residualEvents = windowEvents.filter(e => {
+          const t = new Date(e.timestamp).getTime()
+          return !nestedRanges.some(r => t >= r.startMs && t <= r.endMs)
+        })
+      }
+    }
+
     const subAgentExecs = []
     agentExecutions.forEach((executions, agent) => {
       executions.forEach((exec, executionIndex) => {
@@ -274,7 +301,8 @@ function groupSubCycles(events, registryEntry, agentExecutions) {
       label: `${label} ${idx + 1}`,
       startEvent,
       endEvent,
-      events: subEvents,
+      events: residualEvents,
+      subCycles,
       agentExecutions: subAgentExecs,
     }
   })

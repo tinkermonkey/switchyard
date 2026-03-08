@@ -53,8 +53,21 @@ function groupIterationColumns(subCycles, directChildren, subCycleSizes, opts) {
   const { nodeWidth, nodeHeight, innerVertSpacing } = opts
   if (!subCycles.length) return null
 
-  // Unique iteration numbers derived from sub-cycles, sorted ascending
-  const iterNums = [...new Set(subCycles.map(sc => sc.data.iterationNumber))].sort((a, b) => a - b)
+  // Unique iteration numbers derived from sub-cycles, sorted by the earliest chronological
+  // start time of any sub-cycle in each column. Sorting by iterationNumber (numeric) would
+  // place a lower-numbered sub-cycle type (e.g. systemic_fix 2) before a higher-numbered one
+  // (e.g. test_execution 3) that actually starts earlier — because sub-cycle numbers are
+  // independent per type and can have gaps from filtered-out entries.
+  const iterNumSet = new Set(subCycles.map(sc => sc.data.iterationNumber))
+  const iterNums = [...iterNumSet].sort((a, b) => {
+    const aStart = Math.min(...subCycles
+      .filter(sc => sc.data.iterationNumber === a)
+      .map(sc => new Date(sc.data.startEvent?.timestamp || 0).getTime()))
+    const bStart = Math.min(...subCycles
+      .filter(sc => sc.data.iterationNumber === b)
+      .map(sc => new Date(sc.data.startEvent?.timestamp || 0).getTime()))
+    return aStart - bStart
+  })
 
   // Earliest start and latest end timestamp per column (for direct-child assignment)
   const colStartMs = new Map()
@@ -212,11 +225,19 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
     childrenByIter.get(pid).push(child)
   })
 
-  const subCyclesByIter = new Map()  // iterId → [subCycleContainer]
+  const subCyclesByIter = new Map()  // iterId → [outer subCycleContainer]
+  const nestedSubCyclesByParentSc = new Map()  // outerScId → [inner subCycleContainer]
   subCycleContainers.forEach(sc => {
     const pid = sc.parentId
-    if (!subCyclesByIter.has(pid)) subCyclesByIter.set(pid, [])
-    subCyclesByIter.get(pid).push(sc)
+    if (iterContainerIds.has(pid)) {
+      // Outer SC: parent is an iterationContainer
+      if (!subCyclesByIter.has(pid)) subCyclesByIter.set(pid, [])
+      subCyclesByIter.get(pid).push(sc)
+    } else if (subCycleContainerIds.has(pid)) {
+      // Inner SC: parent is another subCycleContainer
+      if (!nestedSubCyclesByParentSc.has(pid)) nestedSubCyclesByParentSc.set(pid, [])
+      nestedSubCyclesByParentSc.get(pid).push(sc)
+    }
   })
 
   const leavesBySubCycle = new Map()  // subCycleId → [pipelineEvent]
@@ -244,11 +265,18 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
 
   const _clT1 = performance.now() // categorise + lookup maps done
 
-  // ── Pass 0: Size subCycleContainers (bottom-up) ───────────────────────────
+  // ── Pass 0: Size subCycleContainers (bottom-up: inner SCs before outer) ───
+  // Inner SCs (parentId is another SC) are sized first so outer SCs can include
+  // their dimensions when computing their own height/width.
   const COLLAPSED_WIDTH = COLLAPSED_CYCLE_WIDTH
   const COLLAPSED_HEIGHT = COLLAPSED_CYCLE_HEIGHT
   const subCycleSizes = new Map()
-  subCycleContainers.forEach(sc => {
+  const sortedSubCycleContainers = [...subCycleContainers].sort((a, b) => {
+    const aIsInner = subCycleContainerIds.has(a.parentId) ? 1 : 0
+    const bIsInner = subCycleContainerIds.has(b.parentId) ? 1 : 0
+    return bIsInner - aIsInner  // descending: inner (1) before outer (0)
+  })
+  sortedSubCycleContainers.forEach(sc => {
     if (sc.data?.isCollapsed) {
       subCycleSizes.set(sc.id, {
         width: sc.measured?.width > 1 ? sc.measured.width : COLLAPSED_WIDTH,
@@ -257,11 +285,19 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
       return
     }
     const leaves = leavesBySubCycle.get(sc.id) || []
-    const n = leaves.length
-    const totalLeafH = leaves.reduce((sum, c) => sum + (c.measured?.height ?? nodeHeight), 0)
-    const maxLeafW = n > 0 ? Math.max(...leaves.map(c => c.measured?.width ?? nodeWidth)) : nodeWidth
-    const height = iterHeaderHeight + cyclePadding * 2 + totalLeafH + Math.max(0, n - 1) * innerVertSpacing
-    const width = maxLeafW + cyclePadding * 2
+    const nestedSCs = nestedSubCyclesByParentSc.get(sc.id) || []
+    const allItems = [
+      ...leaves.map(l => ({ h: l.measured?.height ?? nodeHeight, w: l.measured?.width ?? nodeWidth })),
+      ...nestedSCs.map(nsc => {
+        const sz = subCycleSizes.get(nsc.id) || { width: nodeWidth, height: nodeHeight }
+        return { h: sz.height, w: sz.width }
+      }),
+    ]
+    const n = allItems.length
+    const totalH = allItems.reduce((sum, item) => sum + item.h, 0)
+    const maxW = n > 0 ? Math.max(...allItems.map(item => item.w)) : nodeWidth
+    const height = iterHeaderHeight + cyclePadding * 2 + totalH + Math.max(0, n - 1) * innerVertSpacing
+    const width = maxW + cyclePadding * 2
     subCycleSizes.set(sc.id, { width, height })
   })
 
@@ -606,18 +642,47 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
 
   const _clT7 = performance.now() // pass 5 done
 
-  // ── Pass 6: Position pipelineEvent leaves within subCycleContainers ───────
+  // ── Pass 6: Position leaves and nested SC containers within subCycleContainers ─
+  // Outer SCs may contain nested SC containers in addition to leaf event nodes;
+  // inner SCs contain only leaf events. All items are interleaved chronologically.
   subCycleContainers.forEach(sc => {
     const leaves = leavesBySubCycle.get(sc.id) || []
+    const nestedSCs = nestedSubCyclesByParentSc.get(sc.id) || []
     const scSize = subCycleSizes.get(sc.id) || { width: nodeWidth + cyclePadding * 2 }
-    let leafY = iterHeaderHeight + cyclePadding
-    leaves.forEach(leaf => {
-      const leafW = leaf.measured?.width ?? nodeWidth
-      positionedNodes.set(leaf.id, {
-        ...leaf,
-        position: { x: (scSize.width - leafW) / 2, y: leafY },
-      })
-      leafY += (leaf.measured?.height ?? nodeHeight) + innerVertSpacing
+
+    const allItems = [
+      ...leaves.map(l => ({
+        node: l,
+        ts: l.data?.timestamp || l.data?.startTime || '',
+        isContainer: false,
+      })),
+      ...nestedSCs.map(nsc => ({
+        node: nsc,
+        ts: nsc.data?.startEvent?.timestamp || '',
+        isContainer: true,
+      })),
+    ].sort((a, b) => new Date(a.ts) - new Date(b.ts))
+
+    let childY = iterHeaderHeight + cyclePadding
+    allItems.forEach(({ node, isContainer }) => {
+      if (isContainer) {
+        const sz = subCycleSizes.get(node.id) || { width: nodeWidth, height: nodeHeight }
+        positionedNodes.set(node.id, {
+          ...node,
+          position: { x: (scSize.width - sz.width) / 2, y: childY },
+          style: node.data?.isCollapsed
+            ? { ...node.style, width: sz.width }
+            : { ...node.style, width: sz.width, height: sz.height },
+        })
+        childY += sz.height + innerVertSpacing
+      } else {
+        const leafW = node.measured?.width ?? nodeWidth
+        positionedNodes.set(node.id, {
+          ...node,
+          position: { x: (scSize.width - leafW) / 2, y: childY },
+        })
+        childY += (node.measured?.height ?? nodeHeight) + innerVertSpacing
+      }
     })
   })
 

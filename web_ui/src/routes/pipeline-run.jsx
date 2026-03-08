@@ -10,10 +10,7 @@ import ConfirmationModal from '../components/ConfirmationModal'
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import { useNavigate } from '@tanstack/react-router'
 import { useSocket } from '../contexts/SocketContext'
-import { toggleCycleCollapsed } from '../utils/cycleLayout'
 import { mergePipelineRunEvents, mergeArrayByIdStable } from '../utils/eventMerging'
-import { buildFlowchart as buildFlowchartUtil, findActiveContainerPath } from '../utils/buildFlowchart'
-import { processEvents } from '../utils/eventProcessing/index.js'
 
 function PipelineRunView() {
   const navigate = useNavigate()
@@ -31,10 +28,6 @@ function PipelineRunView() {
   const [loadingEvents, setLoadingEvents] = useState(false)
   const [completedLoadedCount, setCompletedLoadedCount] = useState(0)
   const [hasMoreCompleted, setHasMoreCompleted] = useState(true)
-  const [rawBuild, setRawBuild] = useState(null)
-  const [cycles, setCycles] = useState(new Map())
-  const cyclesRef = useRef(new Map())
-  const [userOpenedCycles, setUserOpenedCycles] = useState(new Set())
   const [showKillModal, setShowKillModal] = useState(false)
   const [isFullscreen, setIsFullscreen] = useState(false)
   const [activeFilters, setActiveFilters] = useState({ project: '', board: '', outcome: '' })
@@ -47,23 +40,17 @@ function PipelineRunView() {
   const isFetchingActiveRef = useRef(false)
   const isFetchingCompletedRef = useRef(false)
   const completedLoadedCountRef = useRef(0)
-  const socketEventsRef = useRef(socketEvents)
   const previousActiveRunIdsRef = useRef(new Set())
   const processedEventIdsRef = useRef(new Set())
   const lastProcessedTimestampRef = useRef(0)
   const activeFiltersRef = useRef(activeFilters)
   const urlRunIdRef = useRef(urlRunId)
   const prevUrlRunIdRef = useRef(urlRunId)
-  const userOpenedCyclesRef = useRef(userOpenedCycles)
-  const prevAutoOpenedRef = useRef(new Set())
 
   useEffect(() => { selectedPipelineRunRef.current = selectedPipelineRun }, [selectedPipelineRun])
   useEffect(() => { completedLoadedCountRef.current = completedLoadedCount }, [completedLoadedCount])
-  useEffect(() => { socketEventsRef.current = socketEvents }, [socketEvents])
   useEffect(() => { activeFiltersRef.current = activeFilters }, [activeFilters])
   useEffect(() => { urlRunIdRef.current = urlRunId }, [urlRunId])
-  useEffect(() => { userOpenedCyclesRef.current = userOpenedCycles }, [userOpenedCycles])
-  useEffect(() => { cyclesRef.current = cycles }, [cycles])
 
   // Re-fetch completed runs when filters change (also handles initial mount)
   useEffect(() => {
@@ -291,17 +278,6 @@ function PipelineRunView() {
 
   const toggleFullscreen = useCallback(() => setIsFullscreen(prev => !prev), [])
 
-  const handleToggleCycle = useCallback((cycleId) => {
-    const currentIsCollapsed = cyclesRef.current.get(cycleId)?.isCollapsed ?? true
-    setCycles(prev => toggleCycleCollapsed(prev, cycleId))
-    setUserOpenedCycles(prev => {
-      const next = new Set(prev)
-      if (currentIsCollapsed) next.add(cycleId)   // user expanding → remember
-      else next.delete(cycleId)                    // user collapsing → forget
-      return next
-    })
-  }, [])
-
   // Merge API events with live WebSocket events (full, unfiltered)
   const mergedEvents = useMemo(() => {
     if (!selectedPipelineRun) return []
@@ -362,51 +338,12 @@ function PipelineRunView() {
     return false
   }, [graphEvents])
 
-  // Throttle ref for rawBuild updates (≤ 2/sec during heavy socket activity)
-  const rawBuildThrottleRef = useRef({ timer: null, lastRun: 0, pendingFn: null })
-
-  // Build raw (unpositioned) flowchart — pure, returns result
-  const buildRawFlowchart = useCallback(() => {
-    if (!graphEvents.length || !selectedPipelineRun) return null
-
-    // Compute active task_ids from graphEvents (API + socket merged stream) so that
-    // historical agent_initialized events — which predate the WebSocket connection —
-    // are included. Task_id matching also avoids false positives when the same agent
-    // type has run multiple times.
-    const agentTaskInit = new Map()
-    const agentTaskDone = new Set()
-    graphEvents.forEach(e => {
-      if (e.event_type === 'agent_initialized') agentTaskInit.set(e.task_id, e.agent)
-      else if (e.event_type === 'agent_completed' || e.event_type === 'agent_failed') agentTaskDone.add(e.task_id)
-    })
-    const activeTaskIds = new Set()
-    agentTaskInit.forEach((agent, taskId) => {
-      if (!agentTaskDone.has(taskId)) activeTaskIds.add(taskId)
-    })
-
-    return buildFlowchartUtil({
-      events: graphEvents,
-      existingCycles: cyclesRef.current,
-      workflowConfig,
-      selectedPipelineRun,
-      activeTaskIds,
-    })
-  }, [graphEvents, selectedPipelineRun, workflowConfig])
-
   const handleDownloadDebugData = useCallback(() => {
     if (!selectedPipelineRun) return
     const debugData = {
       pipelineRun: selectedPipelineRun,
       events: pipelineRunEvents,
       workflowConfig,
-      cycles: Array.from(cycles.entries()).map(([id, data]) => ({
-        id,
-        ...data,
-        agentExecutions: data.agentExecutions?.map(e => ({
-          agent: e.agent,
-          taskId: e.execution?.taskId || e.taskId,
-        })),
-      })),
       timestamp: new Date().toISOString(),
     }
     const blob = new Blob([JSON.stringify(debugData, null, 2)], { type: 'application/json' })
@@ -416,7 +353,7 @@ function PipelineRunView() {
     a.download = `pipeline-run-${selectedPipelineRun.id.substring(0, 8)}-debug.json`
     a.click()
     URL.revokeObjectURL(url)
-  }, [selectedPipelineRun, pipelineRunEvents, workflowConfig, cycles])
+  }, [selectedPipelineRun, pipelineRunEvents, workflowConfig])
 
   // Initial load (completed runs handled by the activeFilters effect above)
   useEffect(() => {
@@ -436,12 +373,6 @@ function PipelineRunView() {
   }, [fetchActivePipelineRuns, fetchCompletedPipelineRuns, completedLimit])
 
   const selectedRunId = selectedPipelineRun?.id
-
-  // Reset user-opened tracking when switching pipeline runs
-  useEffect(() => {
-    setUserOpenedCycles(new Set())
-    prevAutoOpenedRef.current = new Set()
-  }, [selectedRunId])
 
   // Prefetch events immediately from the URL param — don't wait for run metadata
   // to resolve from the run list. This eliminates the blank period on page reload.
@@ -481,111 +412,6 @@ function PipelineRunView() {
 
     return () => clearInterval(intervalId)
   }, [selectedRunId, fetchPipelineRunEvents])
-
-  // Detect and update cycles when events change; auto-expand hierarchy path to active agent
-  useEffect(() => {
-    if (!graphEvents.length) return
-
-    console.log(`[PerfGraph] cycles-effect START (${graphEvents.length} graphEvents)`)
-    const _ceT0 = performance.now()
-    const model = processEvents(graphEvents)
-    console.log(`[PerfGraph] cycles-effect processEvents: ${(performance.now() - _ceT0).toFixed(1)}ms → ${model.cycles.length} cycles`)
-
-    // Determine active agents: initialized but not yet completed/failed
-    const agentTaskInit = new Map()
-    const agentTaskDone = new Set()
-    graphEvents.forEach(e => {
-      if (e.event_type === 'agent_initialized') agentTaskInit.set(e.task_id, e.agent)
-      else if (e.event_type === 'agent_completed' || e.event_type === 'agent_failed') agentTaskDone.add(e.task_id)
-    })
-    const activeTaskIds = new Set()
-    agentTaskInit.forEach((agent, taskId) => {
-      if (!agentTaskDone.has(taskId)) activeTaskIds.add(taskId)
-    })
-
-    // Find containers that lead to the active agent
-    const activeContainerIds = findActiveContainerPath(model, activeTaskIds)
-    const prevAutoOpened = prevAutoOpenedRef.current
-
-    // Build new top-level cycle map (all expanded by default)
-    const newCycleMap = new Map()
-    model.cycles.forEach(cycle => {
-      newCycleMap.set(cycle.id, { isCollapsed: false })
-    })
-
-    // Compute the merged cycle map directly (reading from ref avoids the functional
-    // update pattern so we can update cyclesRef.current before calling setCycles).
-    // Effects fire in definition order: this effect (line ~484) runs before the
-    // rebuild effect (line ~548), so cyclesRef.current will already hold the correct
-    // value by the time buildRawFlowchart reads it — eliminating the interstitial
-    // wrong-isCollapsed state that caused container label/chevron flicker.
-    const prevCycles = cyclesRef.current
-    const merged = new Map(newCycleMap)
-    prevCycles.forEach((prev, id) => {
-      if (merged.has(id)) merged.get(id).isCollapsed = prev.isCollapsed
-      else merged.set(id, prev)  // preserve nested container states
-    })
-
-    // Auto-expand containers on the active agent path
-    activeContainerIds.forEach(id => {
-      const current = merged.get(id)
-      if (!current || current.isCollapsed) {
-        merged.set(id, { ...(current ?? {}), isCollapsed: false })
-      }
-    })
-
-    // Auto-collapse previously auto-opened containers no longer on the active path,
-    // unless the user explicitly opened them
-    prevAutoOpened.forEach(id => {
-      if (!activeContainerIds.has(id) && !userOpenedCyclesRef.current.has(id)) {
-        const current = merged.get(id)
-        if (current && !current.isCollapsed) {
-          merged.set(id, { ...current, isCollapsed: true })
-        }
-      }
-    })
-
-    cyclesRef.current = merged        // update ref before setCycles
-    prevAutoOpenedRef.current = activeContainerIds
-    setCycles(merged)
-  }, [graphEvents, selectedPipelineRun])
-
-  // Rebuild flowchart when events or config change — throttled to ≤ 2/sec
-  useEffect(() => {
-    const throttle = rawBuildThrottleRef.current
-    throttle.pendingFn = buildRawFlowchart  // always points to latest fn
-
-    const now = Date.now()
-    const elapsed = now - throttle.lastRun
-
-    if (elapsed >= 500) {
-      // Leading edge — apply immediately
-      throttle.lastRun = now
-      const _t0 = performance.now()
-      const result = buildRawFlowchart() ?? null
-      console.log(`[PerfGraph] buildRawFlowchart (leading): ${(performance.now() - _t0).toFixed(1)}ms → nodes:${result?.nodes?.length ?? 0} edges:${result?.edges?.length ?? 0}`)
-      setRawBuild(result)
-    } else if (!throttle.timer) {
-      // Within window — schedule trailing update
-      throttle.timer = setTimeout(() => {
-        throttle.timer = null
-        throttle.lastRun = Date.now()
-        const _t0 = performance.now()
-        const result = throttle.pendingFn?.() ?? null
-        console.log(`[PerfGraph] buildRawFlowchart (trailing): ${(performance.now() - _t0).toFixed(1)}ms → nodes:${result?.nodes?.length ?? 0} edges:${result?.edges?.length ?? 0}`)
-        setRawBuild(result)
-      }, 500 - elapsed)
-    }
-    // else: timer already scheduled; pendingFn updated above
-  }, [buildRawFlowchart])
-
-  // Cleanup timers on unmount
-  useEffect(() => {
-    return () => {
-      const { timer } = rawBuildThrottleRef.current
-      if (timer) clearTimeout(timer)
-    }
-  }, [])
 
   // Update on socket events
   useEffect(() => {
@@ -708,8 +534,9 @@ function PipelineRunView() {
                 {contentTab === 'graph' ? (
                   <div className="flex-1 min-h-0">
                     <PipelineFlowGraph
-                      rawBuild={rawBuild}
-                      onToggleCycle={handleToggleCycle}
+                      graphEvents={graphEvents}
+                      workflowConfig={workflowConfig}
+                      selectedPipelineRun={selectedPipelineRun}
                       nodesDraggable={selectedPipelineRun.status !== 'active'}
                       allowResizing={selectedPipelineRun.status !== 'active'}
                       minZoom={0.5}

@@ -391,9 +391,11 @@ export function buildFlowchart({
           if (tcCollapsed) {
             allRepairEntries.push({ containerId: tcId, timestamp: tc.startEvent?.timestamp ?? 0 })
           } else {
-            // Create sub-cycle containers and collect their events
-            tc.subCycles.forEach(sc => {
-              const scId = `${tcId}-${sc.cycleType}-${sc.number}`
+            // Recursively create sub-cycle containers and collect their events/nested containers.
+            // Called with the outer tc container as the initial parentId; nested sub-cycles
+            // use their parent SC's id as parentId so React Flow renders them correctly.
+            function addSubCycleEntries(sc, parentId) {
+              const scId = `${parentId}-${sc.cycleType}-${sc.number}`
               const scState = existingCycles.get(scId)
               const scCollapsed = scState?.isCollapsed ?? true  // default: collapsed
               updatedCycles.set(scId, { isCollapsed: scCollapsed })
@@ -401,7 +403,7 @@ export function buildFlowchart({
               newNodes.push({
                 id: scId,
                 type: 'subCycleContainer',
-                parentId: tcId,
+                parentId,
                 position: { x: 0, y: 0 },
                 zIndex: 1,
                 data: {
@@ -409,7 +411,7 @@ export function buildFlowchart({
                   label: sc.label,
                   cycleType: sc.cycleType,
                   iterationNumber: sc.number,
-                  iterationCount: sc.events.length,
+                  iterationCount: sc.events.length + (sc.subCycles?.length ?? 0),
                   startEvent: sc.startEvent,
                   endEvent: sc.endEvent,
                   isCollapsed: scCollapsed,
@@ -425,11 +427,16 @@ export function buildFlowchart({
               if (scCollapsed) {
                 allRepairEntries.push({ containerId: scId, timestamp: sc.startEvent?.timestamp ?? 0 })
               } else {
+                // Recurse into nested sub-cycles first (parent node already pushed above)
+                sc.subCycles?.forEach(nsc => addSubCycleEntries(nsc, scId))
+                // Then add residual events (outside any nested sub-cycle windows)
                 ;[sc.startEvent, ...sc.events, sc.endEvent].filter(Boolean).forEach(event => {
                   allRepairEntries.push({ event, parentId: scId, timestamp: event.timestamp })
                 })
               }
-            })
+            }
+
+            tc.subCycles.forEach(sc => addSubCycleEntries(sc, tcId))
 
             // Residual events within the test cycle go directly under the tc container
             ;[tc.startEvent, ...tc.events, tc.endEvent].filter(Boolean).forEach(event => {
@@ -665,15 +672,24 @@ export function findActiveContainerPath(model, activeTaskIds) {
     } else if (cycle.type === 'repair_cycle') {
       cycle.testCycles?.forEach(tc => {
         const tcId = `${cycle.id}-tc-${tc.number}`
-        tc.subCycles?.forEach(sc => {
-          const scId = `${tcId}-${sc.cycleType}-${sc.number}`
+
+        // Recursively check sub-cycles and their nested sub-cycles.
+        // ancestorIds: ordered list of container IDs that must be expanded if a
+        // descendant contains an active agent.
+        function checkSubCycle(sc, parentId, ancestorIds) {
+          const scId = `${parentId}-${sc.cycleType}-${sc.number}`
           const scEvents = [sc.startEvent, ...sc.events, sc.endEvent].filter(Boolean)
           if (hasActive(scEvents)) {
-            result.add(cycle.id)
-            result.add(tcId)
+            ancestorIds.forEach(id => result.add(id))
             result.add(scId)
           }
-        })
+          sc.subCycles?.forEach(nsc =>
+            checkSubCycle(nsc, scId, [...ancestorIds, scId])
+          )
+        }
+
+        tc.subCycles?.forEach(sc => checkSubCycle(sc, tcId, [cycle.id, tcId]))
+
         const tcEvents = [tc.startEvent, ...(tc.events ?? []), tc.endEvent].filter(Boolean)
         if (hasActive(tcEvents)) {
           result.add(cycle.id)
