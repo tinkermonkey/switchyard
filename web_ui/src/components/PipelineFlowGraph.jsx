@@ -30,14 +30,14 @@ import { processEvents } from '../utils/eventProcessing/index.js'
 export const DEFAULT_LAYOUT_OPTIONS = {
   nodeWidth: 250,
   nodeHeight: 80,
-  horizontalSpacing: 150,
-  verticalSpacing: 120,
-  cycleGap: 100,
+  horizontalSpacing: 100,
+  verticalSpacing: 60,
+  cycleGap: 60,
   cyclePadding: 40,
   viewportWidth: 1200,
   iterHeaderHeight: 30,
   iterPadding: 20,
-  innerVertSpacing: 20,
+  innerVertSpacing: 60,
   innerHorizSpacing: 60,
   containerHeaderHeight: 36,
 }
