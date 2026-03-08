@@ -272,9 +272,13 @@ function groupSubCycles(events, registryEntry, agentExecutions, depth = 0) {
     let subCycles = []
     let residualEvents = windowEvents
     if (depth < MAX_NESTING_DEPTH) {
-      subCycles = REPAIR_SUB_CYCLE_REGISTRY.flatMap(entry =>
-        groupSubCycles(windowEvents, entry, agentExecutions, depth + 1)
-      )
+      // Exclude the current entry from recursive detection to prevent a sub-cycle type
+      // from being nested inside another instance of itself (e.g. systemic_fix inside
+      // systemic_fix). Only cross-type nesting is meaningful (e.g. test_execution inside
+      // systemic_fix).
+      subCycles = REPAIR_SUB_CYCLE_REGISTRY
+        .filter(e => e !== registryEntry)
+        .flatMap(entry => groupSubCycles(windowEvents, entry, agentExecutions, depth + 1))
       if (subCycles.length > 0) {
         const nestedRanges = subCycles.map(nsc => ({
           startMs: new Date(nsc.startEvent.timestamp).getTime(),
@@ -662,6 +666,10 @@ function inferMissingCloseEvents(sortedEvents) {
             const outerEndMs = outerEnd ? new Date(outerEnd.timestamp).getTime() : tcEndMs
 
             REPAIR_SUB_CYCLE_REGISTRY.forEach(({ startEventType: innerStartType, endEventType: innerEndType }) => {
+              // Skip same-type pairings: a sub-cycle type cannot be nested inside itself.
+              // Allowing it would produce spurious closes when same-type boundaries overlap.
+              if (innerStartType === outerStartType) return
+
               const innerStarts = sortedEvents.filter(e => {
                 const t = new Date(e.timestamp).getTime()
                 return t > outerStartMs && t < outerEndMs && e.event_type === innerStartType

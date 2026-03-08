@@ -430,7 +430,7 @@ export function buildFlowchart({
             // Recursively create sub-cycle containers and collect their events/nested containers.
             // Called with the outer tc container as the initial parentId; nested sub-cycles
             // use their parent SC's id as parentId so React Flow renders them correctly.
-            function addSubCycleEntries(sc, parentId) {
+            const addSubCycleEntries = (sc, parentId) => {
               const scId = `${parentId}-${sc.cycleType}-${sc.number}`
               const scState = existingCycles.get(scId)
               const scCollapsed = scState?.isCollapsed ?? true  // default: collapsed
