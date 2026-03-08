@@ -1406,6 +1406,32 @@ def get_completed_pipeline_runs():
             'runs': []
         }), 500
 
+@app.route('/api/pipeline-run-filter-options')
+def get_pipeline_run_filter_options():
+    """Return distinct project, board, and outcome values across all completed pipeline runs."""
+    try:
+        result = es_client.search(
+            index="pipeline-runs-*",
+            body={
+                "query": {"term": {"status": "completed"}},
+                "size": 0,
+                "aggs": {
+                    "projects": {"terms": {"field": "project", "size": 200}},
+                    "boards":   {"terms": {"field": "board",   "size": 200}},
+                    "outcomes": {"terms": {"field": "outcome", "size": 50}},
+                }
+            }
+        )
+        aggs = result.get('aggregations', {})
+        projects = sorted(b['key'] for b in aggs.get('projects', {}).get('buckets', []))
+        boards   = sorted(b['key'] for b in aggs.get('boards',   {}).get('buckets', []))
+        outcomes = sorted(b['key'] for b in aggs.get('outcomes', {}).get('buckets', []))
+        return jsonify({'success': True, 'projects': projects, 'boards': boards, 'outcomes': outcomes})
+    except Exception as e:
+        logger.error(f"Error fetching pipeline run filter options: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
 @app.route('/api/feedback-loops/active')
 def get_active_feedback_loops():
     """

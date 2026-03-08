@@ -207,6 +207,22 @@ export default function PipelineReports({ search, onSearchChange }) {
   const [modalAnalysis, setModalAnalysis] = useState(null)
   const [modalLoading, setModalLoading] = useState(false)
 
+  // Fetch complete set of distinct filter values once on mount
+  useEffect(() => {
+    fetch('/api/pipeline-run-filter-options')
+      .then(r => r.json())
+      .then(data => {
+        if (data.success) {
+          setFilterOptions({
+            projects: data.projects || [],
+            boards: data.boards || [],
+            outcomes: data.outcomes || [],
+          })
+        }
+      })
+      .catch(err => console.error('[PipelineReports] filter options fetch error:', err))
+  }, [])
+
   const fetchRuns = useCallback(async () => {
     setLoading(true)
     setError(null)
@@ -222,14 +238,6 @@ export default function PipelineReports({ search, onSearchChange }) {
       if (data.success) {
         setRuns(data.runs || [])
         setTotal(data.total ?? data.count ?? data.runs?.length ?? 0)
-        setFilterOptions({
-          projects: [...new Set(data.runs.map(r => r.project).filter(Boolean))].sort(),
-          boards: [...new Set(data.runs.map(r => r.board).filter(Boolean))].sort(),
-          outcomes: [...new Set([
-            ...data.runs.map(r => r.outcome).filter(Boolean),
-            ...(data.runs.some(r => !r.outcome) ? ['unknown'] : []),
-          ])].sort(),
-        })
       } else {
         setError(data.error || 'Failed to load pipeline runs')
         setRuns([])
