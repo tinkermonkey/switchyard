@@ -122,15 +122,40 @@ export function extractReviewCycleSummary(cycle) {
       else status = 'approved'
     }
 
+    let durationSeconds = null
+    if (cycle.startEvent?.timestamp && endEvent?.timestamp && !endEvent._inferred) {
+      const startMs = new Date(cycle.startEvent.timestamp).getTime()
+      const endMs   = new Date(endEvent.timestamp).getTime()
+      if (!isNaN(startMs) && !isNaN(endMs) && endMs > startMs)
+        durationSeconds = Math.round((endMs - startMs) / 1000)
+    }
+
+    const iterations = (cycle.iterations ?? []).map((iter, idx) => {
+      const startMs = new Date(iter.startEvent?.timestamp).getTime()
+      const nextIter = cycle.iterations[idx + 1]
+      const endMs = nextIter
+        ? new Date(nextIter.startEvent?.timestamp).getTime()
+        : endEvent ? new Date(endEvent.timestamp).getTime() : NaN
+      const durSec = (!isNaN(startMs) && !isNaN(endMs) && endMs > startMs)
+        ? Math.round((endMs - startMs) / 1000)
+        : null
+      return { number: iter.number ?? idx + 1, durationSeconds: durSec }
+    })
+
+    const completionReason = (endEvent && !endEvent._inferred) ? (endEvent.reason ?? null) : null
+
     return {
       status,
       makerAgent: cycle.startEvent?.inputs?.maker_agent ?? cycle.startEvent?.maker_agent ?? null,
       reviewerAgent: cycle.startEvent?.inputs?.reviewer_agent ?? cycle.startEvent?.reviewer_agent ?? null,
       totalIterations: cycle.iterations?.length ?? 0,
       maxIterations: cycle.startEvent?.max_iterations ?? null,
+      durationSeconds,
+      iterations,
+      completionReason,
     }
   } catch {
-    return { status: 'running', makerAgent: null, reviewerAgent: null, totalIterations: 0, maxIterations: null }
+    return { status: 'running', makerAgent: null, reviewerAgent: null, totalIterations: 0, maxIterations: null, durationSeconds: null, iterations: [], completionReason: null }
   }
 }
 
