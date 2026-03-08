@@ -212,7 +212,7 @@ export function buildFlowchart({
 
     let node = null
 
-    if (event.event_category === 'decision') {
+    if (event.event_category === 'decision' && !SKIP_EVENT_TYPES.has(event.event_type)) {
       const id = `${idPrefix}-dec-${event.timestamp}`
       node = makeDecisionNode(event, id, parentId)
     } else if (
