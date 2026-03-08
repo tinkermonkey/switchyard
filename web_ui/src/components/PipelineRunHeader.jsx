@@ -1,8 +1,6 @@
-import { useState, useEffect, useRef } from 'react'
-import { Lock, Unlock, Clock, XCircle, ArrowRight, MessageSquare, Copy, Maximize2, Minimize2, CheckCircle2, AlertCircle, X } from 'lucide-react'
+import { useState, useEffect } from 'react'
+import { Lock, Unlock, Clock, XCircle, ArrowRight, MessageSquare, Copy, Maximize2, Minimize2, CheckCircle2, AlertCircle } from 'lucide-react'
 import { useNavigate } from '@tanstack/react-router'
-import ReactMarkdown from 'react-markdown'
-import remarkGfm from 'remark-gfm'
 import TokenUsagePanel from './TokenUsagePanel'
 import { formatDuration, formatRunDuration } from '../utils/stateHelpers'
 
@@ -32,142 +30,28 @@ const LockStatusBadge = ({ lockStatus, lockHolderIssue }) => {
   return null
 }
 
-const PRIORITY_COLORS = {
-  high: 'text-red-600 border-red-700/40 bg-white/20',
-  medium: 'text-yellow-600 border-yellow-700/40 bg-white/20',
-  low: 'text-blue-600 border-blue-700/40 bg-white/20',
-}
-
-function AnalysisBadge({ analysis, onClick }) {
+function AnalysisBadge({ analysis }) {
   if (!analysis) return null
   const isSuccess = analysis.outcome === 'success'
   const totalRecs = (analysis.orchestratorRecommendations?.length || 0) + (analysis.projectRecommendations?.length || 0)
   return (
-    <button
-      onClick={onClick}
-      className={`flex items-center gap-1 text-xs px-2 py-0.5 rounded border transition-colors hover:opacity-80 ${
-        isSuccess
-          ? 'text-green-600 bg-white/20 border-green-700/30'
-          : 'text-red-600 bg-white/20 border-red-700/30'
-      }`}
-      title="View pipeline analysis"
-    >
+    <div className={`flex items-center gap-1 text-xs px-2 py-0.5 rounded border ${
+      isSuccess
+        ? 'text-green-600 bg-white/20 border-green-700/30'
+        : 'text-red-600 bg-white/20 border-red-700/30'
+    }`}>
       {isSuccess
         ? <CheckCircle2 className="w-3 h-3" />
         : <AlertCircle className="w-3 h-3" />}
       <span>{isSuccess ? 'Succeeded' : 'Failed'}</span>
       {totalRecs > 0 && <span className="opacity-70">· {totalRecs} rec{totalRecs !== 1 ? 's' : ''}</span>}
-    </button>
-  )
-}
-
-function AnalysisModal({ analysis, onClose }) {
-  const backdropRef = useRef(null)
-
-  useEffect(() => {
-    const handleKey = (e) => { if (e.key === 'Escape') onClose() }
-    document.addEventListener('keydown', handleKey)
-    return () => document.removeEventListener('keydown', handleKey)
-  }, [onClose])
-
-  const handleBackdropClick = (e) => {
-    if (e.target === backdropRef.current) onClose()
-  }
-
-  const orchRecs = analysis.orchestratorRecommendations || []
-  const projRecs = analysis.projectRecommendations || []
-
-  return (
-    <div
-      ref={backdropRef}
-      onClick={handleBackdropClick}
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4"
-    >
-      <div className="relative bg-gh-canvas border border-gh-border rounded-lg shadow-2xl w-full max-w-3xl max-h-[85vh] flex flex-col">
-        {/* Header */}
-        <div className="flex items-center justify-between px-5 py-3 border-b border-gh-border flex-shrink-0">
-          <div className="flex items-center gap-2">
-            {analysis.outcome === 'success'
-              ? <CheckCircle2 className="w-4 h-4 text-green-600" />
-              : <AlertCircle className="w-4 h-4 text-red-600" />}
-            <span className="font-semibold text-sm">Pipeline Analysis</span>
-            <span className={`text-xs px-1.5 py-0.5 rounded border ${
-              analysis.outcome === 'success'
-                ? 'text-green-600 bg-white/20 border-green-700/30'
-                : 'text-red-600 bg-white/20 border-red-700/30'
-            }`}>
-              {analysis.outcome === 'success' ? 'Succeeded' : 'Failed'}
-            </span>
-          </div>
-          <button onClick={onClose} className="text-gh-fg-muted hover:text-gh-fg transition-colors">
-            <X className="w-4 h-4" />
-          </button>
-        </div>
-
-        {/* Body */}
-        <div className="overflow-y-auto flex-1 px-5 py-4 space-y-5">
-          {/* Summary */}
-          {analysis.summary && (
-            <div className="prose prose-invert prose-sm max-w-none text-gh-fg-muted text-xs leading-relaxed
-              [&_h1]:text-gh-fg [&_h1]:text-sm [&_h1]:font-semibold [&_h1]:mb-1
-              [&_h2]:text-gh-fg [&_h2]:text-xs [&_h2]:font-semibold [&_h2]:mt-3 [&_h2]:mb-1
-              [&_h3]:text-gh-fg [&_h3]:text-xs [&_h3]:font-semibold [&_h3]:mt-2 [&_h3]:mb-0.5
-              [&_table]:border-collapse [&_table]:w-full [&_table]:text-xs
-              [&_th]:text-left [&_th]:font-medium [&_th]:text-gh-fg-muted [&_th]:pb-1 [&_th]:border-b [&_th]:border-gh-border [&_th]:pr-4
-              [&_td]:py-1 [&_td]:pr-4 [&_td]:border-b [&_td]:border-gh-border/40
-              [&_code]:bg-gh-canvas-subtle [&_code]:px-1 [&_code]:rounded [&_code]:text-xs
-              [&_ul]:list-disc [&_ul]:pl-4 [&_li]:my-0.5
-              [&_strong]:text-gh-fg">
-              <ReactMarkdown remarkPlugins={[remarkGfm]}>{analysis.summary}</ReactMarkdown>
-            </div>
-          )}
-
-          {/* Recommendations */}
-          {(orchRecs.length > 0 || projRecs.length > 0) && (
-            <div className="space-y-3">
-              {orchRecs.length > 0 && (
-                <div>
-                  <div className="text-xs font-semibold text-gh-fg mb-1.5">Orchestrator Recommendations</div>
-                  <div className="space-y-1.5">
-                    {orchRecs.map((rec, i) => (
-                      <div key={i} className={`text-xs border rounded px-3 py-2 ${PRIORITY_COLORS[rec.priority] || 'text-gh-fg-muted border-gh-border bg-gh-canvas-subtle'}`}>
-                        <div className="flex items-start gap-2">
-                          <span className="uppercase font-semibold opacity-70 flex-shrink-0 text-[10px] mt-0.5">{rec.priority}</span>
-                          <div>
-                            <div>{rec.description}</div>
-                            {rec.filePath && <div className="opacity-60 font-mono text-[10px] mt-0.5">{rec.filePath}</div>}
-                          </div>
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              )}
-              {projRecs.length > 0 && (
-                <div>
-                  <div className="text-xs font-semibold text-gh-fg mb-1.5">Project Recommendations</div>
-                  <div className="space-y-1.5">
-                    {projRecs.map((rec, i) => (
-                      <div key={i} className={`text-xs border rounded px-3 py-2 ${PRIORITY_COLORS[rec.priority] || 'text-gh-fg-muted border-gh-border bg-gh-canvas-subtle'}`}>
-                        <div className="flex items-start gap-2">
-                          <span className="uppercase font-semibold opacity-70 flex-shrink-0 text-[10px] mt-0.5">{rec.priority}</span>
-                          <div>{rec.description}</div>
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              )}
-            </div>
-          )}
-        </div>
-      </div>
     </div>
   )
 }
 
 export default function PipelineRunHeader({
   pipelineRun,
+  analysis,
   latestAgentExecutionId,
   isConversational,
   onKillRun,
@@ -179,8 +63,6 @@ export default function PipelineRunHeader({
   const [pipelineRunLogs, setPipelineRunLogs] = useState([])
   const [copied, setCopied] = useState(false)
   const [, setTick] = useState(0)
-  const [analysis, setAnalysis] = useState(null)
-  const [showAnalysisModal, setShowAnalysisModal] = useState(false)
 
   useEffect(() => {
     if (pipelineRun?.duration || pipelineRun?.status !== 'active') return
@@ -195,16 +77,6 @@ export default function PipelineRunHeader({
       .then(r => r.json())
       .then(data => { if (!cancelled && data.success) setPipelineRunLogs(data.logs || []) })
       .catch(err => console.error('[PipelineRunHeader] token-usage fetch error:', err))
-    return () => { cancelled = true }
-  }, [pipelineRun?.id])
-
-  useEffect(() => {
-    if (!pipelineRun?.id) return
-    let cancelled = false
-    fetch(`/api/pipeline-run/${pipelineRun.id}/analysis`)
-      .then(r => r.json())
-      .then(data => { if (!cancelled && data.success && data.analysis) setAnalysis(data.analysis) })
-      .catch(err => console.error('[PipelineRunHeader] analysis fetch error:', err))
     return () => { cancelled = true }
   }, [pipelineRun?.id])
 
@@ -299,7 +171,7 @@ export default function PipelineRunHeader({
                 lockHolderIssue={pipelineRun.lock_holder_issue}
               />
             )}
-            <AnalysisBadge analysis={analysis} onClick={() => setShowAnalysisModal(true)} />
+            <AnalysisBadge analysis={analysis} />
             <div className="flex divide-x divide-gh-border border border-gh-border rounded overflow-hidden flex-shrink-0 ml-auto">
               {onToggleFullscreen && (
                 <button
@@ -385,9 +257,6 @@ export default function PipelineRunHeader({
         </div>
       )}
 
-      {showAnalysisModal && analysis && (
-        <AnalysisModal analysis={analysis} onClose={() => setShowAnalysisModal(false)} />
-      )}
     </div>
   )
 }

@@ -11,6 +11,76 @@ import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import { useNavigate } from '@tanstack/react-router'
 import { useSocket } from '../contexts/SocketContext'
 import { mergePipelineRunEvents, mergeArrayByIdStable } from '../utils/eventMerging'
+import ReactMarkdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
+
+const PRIORITY_COLORS = {
+  high: 'text-red-600 border-red-700/40 bg-white/20',
+  medium: 'text-yellow-600 border-yellow-700/40 bg-white/20',
+  low: 'text-blue-600 border-blue-700/40 bg-white/20',
+}
+
+function PipelineAnalysisReport({ analysis }) {
+  const orchRecs = analysis.orchestratorRecommendations || []
+  const projRecs = analysis.projectRecommendations || []
+  return (
+    <div className="flex-1 overflow-auto px-1">
+      <div className="space-y-5 py-1">
+        {analysis.summary && (
+          <div className="prose prose-invert prose-sm max-w-none text-gh-fg-muted text-xs leading-relaxed
+            [&_h1]:text-gh-fg [&_h1]:text-sm [&_h1]:font-semibold [&_h1]:mb-1
+            [&_h2]:text-gh-fg [&_h2]:text-xs [&_h2]:font-semibold [&_h2]:mt-3 [&_h2]:mb-1
+            [&_h3]:text-gh-fg [&_h3]:text-xs [&_h3]:font-semibold [&_h3]:mt-2 [&_h3]:mb-0.5
+            [&_table]:border-collapse [&_table]:w-full [&_table]:text-xs
+            [&_th]:text-left [&_th]:font-medium [&_th]:text-gh-fg-muted [&_th]:pb-1 [&_th]:border-b [&_th]:border-gh-border [&_th]:pr-4
+            [&_td]:py-1 [&_td]:pr-4 [&_td]:border-b [&_td]:border-gh-border/40
+            [&_code]:bg-gh-canvas-subtle [&_code]:px-1 [&_code]:rounded [&_code]:text-xs
+            [&_ul]:list-disc [&_ul]:pl-4 [&_li]:my-0.5
+            [&_strong]:text-gh-fg">
+            <ReactMarkdown remarkPlugins={[remarkGfm]}>{analysis.summary}</ReactMarkdown>
+          </div>
+        )}
+        {(orchRecs.length > 0 || projRecs.length > 0) && (
+          <div className="space-y-3">
+            {orchRecs.length > 0 && (
+              <div>
+                <div className="text-xs font-semibold text-gh-fg mb-1.5">Orchestrator Recommendations</div>
+                <div className="space-y-1.5">
+                  {orchRecs.map((rec, i) => (
+                    <div key={i} className={`text-xs border rounded px-3 py-2 ${PRIORITY_COLORS[rec.priority] || 'text-gh-fg-muted border-gh-border bg-gh-canvas-subtle'}`}>
+                      <div className="flex items-start gap-2">
+                        <span className="uppercase font-semibold opacity-70 flex-shrink-0 text-[10px] mt-0.5">{rec.priority}</span>
+                        <div>
+                          <div>{rec.description}</div>
+                          {rec.filePath && <div className="opacity-60 font-mono text-[10px] mt-0.5">{rec.filePath}</div>}
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+            {projRecs.length > 0 && (
+              <div>
+                <div className="text-xs font-semibold text-gh-fg mb-1.5">Project Recommendations</div>
+                <div className="space-y-1.5">
+                  {projRecs.map((rec, i) => (
+                    <div key={i} className={`text-xs border rounded px-3 py-2 ${PRIORITY_COLORS[rec.priority] || 'text-gh-fg-muted border-gh-border bg-gh-canvas-subtle'}`}>
+                      <div className="flex items-start gap-2">
+                        <span className="uppercase font-semibold opacity-70 flex-shrink-0 text-[10px] mt-0.5">{rec.priority}</span>
+                        <div>{rec.description}</div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
 
 function PipelineRunView() {
   const navigate = useNavigate()
@@ -28,6 +98,7 @@ function PipelineRunView() {
   const [loadingEvents, setLoadingEvents] = useState(false)
   const [completedLoadedCount, setCompletedLoadedCount] = useState(0)
   const [hasMoreCompleted, setHasMoreCompleted] = useState(true)
+  const [analysis, setAnalysis] = useState(null)
   const [showKillModal, setShowKillModal] = useState(false)
   const [isFullscreen, setIsFullscreen] = useState(false)
   const [activeFilters, setActiveFilters] = useState({ project: '', board: '', outcome: '' })
@@ -397,6 +468,20 @@ function PipelineRunView() {
     }
   }, [selectedRunId, fetchWorkflowConfig])
 
+  // Fetch pipeline analysis (summary + recommendations) when run changes.
+  // Clear immediately on every run switch so stale data from a previous run is
+  // never shown while the new fetch is in flight or if the new run has no analysis.
+  useEffect(() => {
+    setAnalysis(null)
+    if (!selectedRunId) return
+    let cancelled = false
+    fetch(`/api/pipeline-run/${selectedRunId}/analysis`)
+      .then(r => r.json())
+      .then(data => { if (!cancelled && data.success && data.analysis) setAnalysis(data.analysis) })
+      .catch(err => console.error('[pipeline-run] analysis fetch error:', err))
+    return () => { cancelled = true }
+  }, [selectedRunId])
+
   // Periodic polling for active run events — silent fallback every 30s if socket events are missed.
   // WebSocket is the primary update path; this only catches gaps in socket delivery.
   // Status is checked inside the callback via ref so this effect is not coupled to
@@ -497,6 +582,7 @@ function PipelineRunView() {
             <>
               <PipelineRunHeader
                 pipelineRun={selectedPipelineRun}
+                analysis={analysis}
                 latestAgentExecutionId={latestAgentExecutionId}
                 isConversational={isConversational}
                 onKillRun={handleKillRun}
@@ -510,7 +596,7 @@ function PipelineRunView() {
                 <button
                   onClick={() => updateUrlParams({ contentTab: 'graph' }, true)}
                   className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors ${
-                    contentTab === 'graph'
+                    contentTab === 'graph' || (contentTab === 'report' && !analysis)
                       ? 'border-gh-accent-emphasis text-gh-accent-fg'
                       : 'border-transparent text-gh-fg-muted hover:text-gh-fg hover:border-gh-border-muted'
                   }`}
@@ -527,11 +613,25 @@ function PipelineRunView() {
                 >
                   Event Log
                 </button>
+                {analysis && (
+                  <button
+                    onClick={() => updateUrlParams({ contentTab: 'report' }, true)}
+                    className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors ${
+                      contentTab === 'report'
+                        ? 'border-gh-accent-emphasis text-gh-accent-fg'
+                        : 'border-transparent text-gh-fg-muted hover:text-gh-fg hover:border-gh-border-muted'
+                    }`}
+                  >
+                    Report
+                  </button>
+                )}
               </div>
 
               {/* Content Area */}
               <div className="flex-1 min-h-0 flex">
-                {contentTab === 'graph' ? (
+                {contentTab === 'report' && analysis ? (
+                  <PipelineAnalysisReport analysis={analysis} />
+                ) : contentTab !== 'log' ? (
                   <div className="flex-1 min-h-0">
                     <PipelineFlowGraph
                       graphEvents={graphEvents}
@@ -592,7 +692,7 @@ export const Route = createFileRoute('/pipeline-run')({
   validateSearch: (search) => {
     return {
       runId: typeof search.runId === 'string' ? search.runId : undefined,
-      contentTab: search.contentTab === 'log' ? 'log' : 'graph',
+      contentTab: search.contentTab === 'log' ? 'log' : search.contentTab === 'report' ? 'report' : 'graph',
     }
   },
 })
