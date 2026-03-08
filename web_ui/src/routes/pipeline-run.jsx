@@ -546,6 +546,7 @@ function PipelineRunView() {
                       loading={loadingEvents}
                       emptyMessage="No events found for this pipeline run"
                       fitViewAlign={selectedPipelineRun.status === 'active' ? 'active-node' : 'top'}
+                      showAllNodes={false}
                     />
                   </div>
                 ) : (
