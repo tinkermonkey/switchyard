@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useMemo } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 import { ChevronUp, ChevronDown, Info } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
@@ -201,6 +201,7 @@ export default function PipelineReports({ search, onSearchChange }) {
   const [runs, setRuns] = useState([])
   const [total, setTotal] = useState(0)
   const [loading, setLoading] = useState(true)
+  const [error, setError] = useState(null)
   const [filterOptions, setFilterOptions] = useState({ projects: [], boards: [], outcomes: [] })
   const [modalRun, setModalRun] = useState(null)
   const [modalAnalysis, setModalAnalysis] = useState(null)
@@ -208,32 +209,39 @@ export default function PipelineReports({ search, onSearchChange }) {
 
   const fetchRuns = useCallback(async () => {
     setLoading(true)
+    setError(null)
     try {
       const params = new URLSearchParams({ limit: PAGE_SIZE, offset: page * PAGE_SIZE })
       if (project) params.set('project', project)
       if (board) params.set('board', board)
       if (outcome) params.set('outcome', outcome)
+      params.set('sort_col', sortCol)
+      params.set('sort_dir', sortDir)
       const res = await fetch(`/completed-pipeline-runs?${params}`)
       const data = await res.json()
       if (data.success) {
         setRuns(data.runs || [])
-        setTotal(data.count ?? data.runs?.length ?? 0)
-        setFilterOptions(prev => ({
-          projects: [...new Set([...prev.projects, ...data.runs.map(r => r.project).filter(Boolean)])].sort(),
-          boards: [...new Set([...prev.boards, ...data.runs.map(r => r.board).filter(Boolean)])].sort(),
+        setTotal(data.total ?? data.count ?? data.runs?.length ?? 0)
+        setFilterOptions({
+          projects: [...new Set(data.runs.map(r => r.project).filter(Boolean))].sort(),
+          boards: [...new Set(data.runs.map(r => r.board).filter(Boolean))].sort(),
           outcomes: [...new Set([
-            ...prev.outcomes,
             ...data.runs.map(r => r.outcome).filter(Boolean),
             ...(data.runs.some(r => !r.outcome) ? ['unknown'] : []),
           ])].sort(),
-        }))
+        })
+      } else {
+        setError(data.error || 'Failed to load pipeline runs')
+        setRuns([])
       }
     } catch (err) {
       console.error('[PipelineReports] fetch error:', err)
+      setError('Network error — could not load pipeline runs')
+      setRuns([])
     } finally {
       setLoading(false)
     }
-  }, [project, board, outcome, page])
+  }, [project, board, outcome, page, sortCol, sortDir])
 
   useEffect(() => { fetchRuns() }, [fetchRuns])
 
@@ -253,22 +261,6 @@ export default function PipelineReports({ search, onSearchChange }) {
   const handlePageChange = (newPage) => {
     onSearchChange({ page: newPage })
   }
-
-  // Client-side sort of current page
-  const sortedRuns = useMemo(() => {
-    const sorted = [...runs].sort((a, b) => {
-      let aVal = a[sortCol]
-      let bVal = b[sortCol]
-      if (aVal == null) aVal = ''
-      if (bVal == null) bVal = ''
-      if (typeof aVal === 'string') aVal = aVal.toLowerCase()
-      if (typeof bVal === 'string') bVal = bVal.toLowerCase()
-      if (aVal < bVal) return sortDir === 'asc' ? -1 : 1
-      if (aVal > bVal) return sortDir === 'asc' ? 1 : -1
-      return 0
-    })
-    return sorted
-  }, [runs, sortCol, sortDir])
 
   const openModal = async (run) => {
     setModalRun(run)
@@ -356,13 +348,19 @@ export default function PipelineReports({ search, onSearchChange }) {
                   Loading…
                 </td>
               </tr>
-            ) : sortedRuns.length === 0 ? (
+            ) : error ? (
+              <tr>
+                <td colSpan={7} className="px-3 py-8 text-center text-gh-danger text-sm">
+                  {error}
+                </td>
+              </tr>
+            ) : runs.length === 0 ? (
               <tr>
                 <td colSpan={7} className="px-3 py-8 text-center text-gh-fg-muted text-sm">
                   No pipeline runs found
                 </td>
               </tr>
-            ) : sortedRuns.map((run) => (
+            ) : runs.map((run) => (
               <tr key={run.id} className="border-t border-gh-border hover:bg-gh-canvas-subtle transition-colors">
                 <td className={bodyCell}>
                   <span className="text-xs font-mono">{run.project || '—'}</span>
@@ -423,7 +421,7 @@ export default function PipelineReports({ search, onSearchChange }) {
       {/* Report modal */}
       {modalRun && (
         <Modal
-          title={`#${modalRun.issue_number}${modalRun.issue_title ? ` — ${modalRun.issue_title}` : ''}`}
+          title={`${modalRun.issue_number ? `#${modalRun.issue_number}` : 'Pipeline Run'}${modalRun.issue_title ? ` — ${modalRun.issue_title}` : ''}`}
           onClose={closeModal}
         >
           {modalLoading ? (

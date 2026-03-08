@@ -1322,6 +1322,21 @@ def get_completed_pipeline_runs():
         project = request.args.get('project', None)
         board = request.args.get('board', None)
         outcome = request.args.get('outcome', None)
+        sort_col = request.args.get('sort_col', 'ended_at')
+        sort_dir = request.args.get('sort_dir', 'desc')
+        if sort_dir not in ('asc', 'desc'):
+            sort_dir = 'desc'
+
+        # Map frontend column names to ES field names
+        _sort_field_map = {
+            'started_at': 'started_at',
+            'ended_at': 'ended_at',
+            'issue_number': 'issue_number',
+            'project': 'project.keyword',
+            'board': 'board.keyword',
+            'outcome': 'outcome.keyword',
+        }
+        es_sort_field = _sort_field_map.get(sort_col, 'ended_at')
 
         filter_clauses = [{"term": {"status": "completed"}}]
         if project:
@@ -1336,7 +1351,7 @@ def get_completed_pipeline_runs():
         # Query Elasticsearch for completed pipeline runs
         query = {
             "query": {"bool": {"filter": filter_clauses}},
-            "sort": [{"ended_at": "desc"}],
+            "sort": [{es_sort_field: sort_dir}],
             "from": offset,
             "size": limit
         }
@@ -1371,9 +1386,11 @@ def get_completed_pipeline_runs():
                 run_data['issue_url'] = f"{repo_url}/issues/{run_data['issue_number']}"
             runs.append(run_data)
         
+        total = result['hits']['total']['value'] if isinstance(result['hits']['total'], dict) else result['hits']['total']
         return jsonify({
             'success': True,
             'runs': runs,
+            'total': total,
             'count': len(runs),
             'offset': offset,
             'limit': limit
