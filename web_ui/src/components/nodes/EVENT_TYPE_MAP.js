@@ -274,13 +274,22 @@ export const HIDDEN_BY_DEFAULT_TYPES = new Set([
   'reviewCycleStarted',
   'reviewCycleCompleted',
 
+  // Review cycle — iteration / selection events
+  'reviewCycleIteration',
+  'reviewCycleReviewerSelected',
+  'reviewCycleMakerSelected',
+
   // Repair cycle boundaries
+  'repairCycleStarted',
+  'repairCycleIteration',
   'repairCycleCompleted',
   'repairCycleFailed',
 
   // Repair cycle — test sub-family boundaries
   'repairCycleTestCycleStarted',
   'repairCycleTestCycleCompleted',
+  'repairCycleTestExecutionStarted',
+  'repairCycleTestExecutionCompleted',
 
   // Repair cycle — fix sub-family boundaries
   'repairCycleFixCycleStarted',
@@ -308,6 +317,9 @@ export const HIDDEN_BY_DEFAULT_TYPES = new Set([
   'prReviewPhaseStarted',
   'prReviewPhaseCompleted',
   'prReviewPhaseFailed',
+
+  // Branch management
+  'branchReused',
 
   // Conversational loop boundaries
   'conversationalLoopStarted',
