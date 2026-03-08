@@ -1432,6 +1432,64 @@ def get_pipeline_run_filter_options():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
+@app.route('/api/pipeline-recommendations')
+def get_pipeline_recommendations():
+    """Return all recommendations across completed pipeline runs, flattened and enriched with run context."""
+    try:
+        project_filter = request.args.get('project', None)
+        rec_type = request.args.get('rec_type', 'all')
+
+        filter_clauses = [
+            {"term": {"status": "completed"}},
+            {"bool": {"should": [
+                {"exists": {"field": "orchestratorRecommendations"}},
+                {"exists": {"field": "projectRecommendations"}},
+            ], "minimum_should_match": 1}}
+        ]
+        if project_filter:
+            filter_clauses.append({"term": {"project": project_filter}})
+
+        result = es_client.search(
+            index="pipeline-runs-*",
+            body={
+                "query": {"bool": {"filter": filter_clauses}},
+                "sort": [{"ended_at": "desc"}],
+                "size": 500,
+                "_source": ["project", "issue_number", "issue_title", "issue_url",
+                            "outcome", "orchestratorRecommendations", "projectRecommendations"]
+            }
+        )
+
+        recommendations = []
+        for hit in result['hits']['hits']:
+            src = hit['_source']
+            run_id = hit['_id']
+            run_meta = {
+                "id": run_id,
+                "issue_number": src.get("issue_number"),
+                "issue_title": src.get("issue_title"),
+                "issue_url": src.get("issue_url"),
+                "outcome": src.get("outcome"),
+            }
+            if rec_type in ('all', 'orchestrator'):
+                for rec in src.get('orchestratorRecommendations') or []:
+                    recommendations.append({**rec, "rec_type": "orchestrator",
+                                             "project": src.get("project"), "run": run_meta})
+            if rec_type in ('all', 'project'):
+                for rec in src.get('projectRecommendations') or []:
+                    recommendations.append({**rec, "rec_type": "project",
+                                             "project": src.get("project"), "run": run_meta})
+
+        return jsonify({'success': True, 'recommendations': recommendations,
+                        'total': len(recommendations)})
+    except Exception as e:
+        if 'index_not_found_exception' in str(e).lower() or 'no such index' in str(e).lower():
+            logger.debug(f"Pipeline runs index not found (expected on first run): {e}")
+            return jsonify({'success': True, 'recommendations': [], 'total': 0})
+        logger.error(f"Error fetching pipeline recommendations: {e}")
+        return jsonify({'success': False, 'error': str(e), 'recommendations': []}), 500
+
+
 @app.route('/api/feedback-loops/active')
 def get_active_feedback_loops():
     """
