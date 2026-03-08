@@ -1,6 +1,21 @@
 import { MarkerType } from '@xyflow/react'
 import { processEvents } from './eventProcessing/index.js'
 import { getNodeType, HIDDEN_BY_DEFAULT_TYPES } from '../components/nodes/EVENT_TYPE_MAP.js'
+
+// Infrastructure and telemetry event types that are intentionally not rendered as graph nodes.
+// See EVENT_TYPE_MAP.js for full documentation. Any event type NOT in this list and NOT
+// handled by processEventToNode will trigger a console.warn to surface new/unhandled types.
+const SKIP_EVENT_TYPES = new Set([
+  'task_received', 'agent_started', 'agent_completed', 'agent_failed',
+  'prompt_constructed',
+  'claude_api_call_started', 'claude_api_call_completed', 'claude_api_call_failed',
+  'container_launch_started', 'container_launch_succeeded', 'container_launch_failed',
+  'container_execution_started', 'container_execution_completed', 'container_execution_failed',
+  'response_chunk_received',
+  'response_processing_started', 'response_processing_completed',
+  'tool_execution_started', 'tool_execution_completed',
+  'performance_metric', 'token_usage',
+])
 import {
   extractRepairCycleSummary,
   extractTestCycleSummary,
@@ -187,8 +202,14 @@ export function buildFlowchart({
     ) {
       const id = `${idPrefix}-agent-${event.agent}-${event.task_id}`
       node = makeAgentNode(event, id, parentId)
+    } else if (!SKIP_EVENT_TYPES.has(event.event_type)) {
+      // Not a known infrastructure/telemetry type and not a handled category.
+      // This indicates a new backend event type with no frontend handler — add it to
+      // EVENT_TYPE_MAP.js (for rendering) or SKIP_EVENT_TYPES above (to silence).
+      console.warn('[buildFlowchart] unrendered event (missing from EVENT_TYPE_MAP or SKIP_EVENT_TYPES):',
+        event.event_category, event.event_type, event.timestamp)
     }
-    // agent_completed / agent_failed — skip (status captured on agent node)
+    // Known infrastructure/telemetry events in SKIP_EVENT_TYPES are intentionally not rendered.
 
     if (node) {
       newNodes.push(node)
@@ -252,24 +273,30 @@ export function buildFlowchart({
         // Collapsed: the container is the only leaf in the chain
         leafChain.push({ id: cycle.id, timestamp: cycle.startEvent?.timestamp })
       } else {
-        // Expanded: add direct children + iterations + grandchildren
+        // Expanded: collect all leaf-chain entries, then sort chronologically so residual
+        // events (in the cycle window but outside any iteration) are interleaved correctly.
+        const allReviewEntries = []
 
-        // review_cycle_started → direct child, leftmost
+        // review_cycle_started → direct child (pre-created node, goes straight to leafChain)
         if (cycle.startEvent) {
           const startId = `${cycle.id}-start`
-          const startNode = makeDecisionNode(cycle.startEvent, startId, cycle.id)
-          newNodes.push(startNode)
-          leafChain.push({ id: startId, timestamp: cycle.startEvent.timestamp })
+          newNodes.push(makeDecisionNode(cycle.startEvent, startId, cycle.id))
+          allReviewEntries.push({ leafId: startId, timestamp: cycle.startEvent.timestamp })
         }
 
-        // Iterations
+        // Residual events: in the cycle window but not claimed by any iteration
+        ;(cycle.events ?? []).forEach(event => {
+          allReviewEntries.push({ event, parentId: cycle.id, timestamp: event.timestamp })
+        })
+
+        // Iteration containers
         cycle.iterations.forEach(iteration => {
           const iterId = `${cycle.id}-iter-${iteration.number}`
           const iterState = existingCycles.get(iterId)
           const iterCollapsed = iterState?.isCollapsed ?? true  // default: collapsed
           updatedCycles.set(iterId, { isCollapsed: iterCollapsed })
 
-          const iterNode = {
+          newNodes.push({
             id: iterId,
             type: 'iterationContainer',
             parentId: cycle.id,
@@ -284,36 +311,45 @@ export function buildFlowchart({
               isCollapsed: iterCollapsed,
               containsActiveAgent: activeContainerIds.has(iterId),
               onToggleCollapse: null, // injected by caller
+              startTime: iteration.startEvent?.timestamp,  // used by cycleLayout for ordering
               summary: extractReviewIterationSummary(iteration, cycle.startEvent),
             },
             style: iterCollapsed ? {} : { width: 0, height: 0 },
             ...(iterCollapsed ? {} : { measured: { width: 1, height: 1 } }),
             draggable: false,
-          }
-          newNodes.push(iterNode)
+          })
 
           if (iterCollapsed) {
-            leafChain.push({ id: iterId, timestamp: iteration.startEvent?.timestamp })
+            allReviewEntries.push({ containerId: iterId, timestamp: iteration.startEvent?.timestamp })
           } else {
-            // Grandchildren: startEvent then the other events, chronologically
             const allIterEvents = [iteration.startEvent, ...iteration.events]
               .filter(Boolean)
               .sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp))
-
             allIterEvents.forEach(event => {
-              processEventToNode(event, iterId, iterId)
+              allReviewEntries.push({ event, parentId: iterId, timestamp: event.timestamp })
             })
           }
         })
 
-        // review_cycle_completed → direct child, rightmost (after iterations)
-        // Skip if inferred — synthetic bounds are not shown as nodes
+        // review_cycle_completed → direct child (skip if inferred)
         if (cycle.endEvent && !cycle.endEvent._inferred) {
           const endId = `${cycle.id}-end`
-          const endNode = makeDecisionNode(cycle.endEvent, endId, cycle.id)
-          newNodes.push(endNode)
-          leafChain.push({ id: endId, timestamp: cycle.endEvent.timestamp })
+          newNodes.push(makeDecisionNode(cycle.endEvent, endId, cycle.id))
+          allReviewEntries.push({ leafId: endId, timestamp: cycle.endEvent.timestamp })
         }
+
+        // Process all entries in chronological order for correct leafChain sequencing
+        allReviewEntries
+          .sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp))
+          .forEach(entry => {
+            if (entry.leafId) {
+              leafChain.push({ id: entry.leafId, timestamp: entry.timestamp })
+            } else if (entry.containerId) {
+              leafChain.push({ id: entry.containerId, timestamp: entry.timestamp })
+            } else {
+              processEventToNode(entry.event, entry.parentId, entry.parentId)
+            }
+          })
       }
     } else if (cycle.type === 'repair_cycle') {
       // ── Repair cycle container ──────────────────────────────────────────
@@ -482,13 +518,21 @@ export function buildFlowchart({
       if (isCollapsed) {
         leafChain.push({ id: cycle.id, timestamp: cycle.startEvent?.timestamp })
       } else {
-        // pr_review_stage_started → direct child, leftmost
+        // Expanded: collect all leaf-chain entries, then sort chronologically so residual
+        // events (between stage_started and first phase, or between phases) are interleaved.
+        const allPREntries = []
+
+        // pr_review_stage_started → direct child (pre-created node)
         if (cycle.startEvent) {
           const startId = `${cycle.id}-start`
-          const startNode = makeDecisionNode(cycle.startEvent, startId, cycle.id)
-          newNodes.push(startNode)
-          leafChain.push({ id: startId, timestamp: cycle.startEvent.timestamp })
+          newNodes.push(makeDecisionNode(cycle.startEvent, startId, cycle.id))
+          allPREntries.push({ leafId: startId, timestamp: cycle.startEvent.timestamp })
         }
+
+        // Residual events: in the cycle window but not claimed by any phase
+        ;(cycle.events ?? []).forEach(event => {
+          allPREntries.push({ event, parentId: cycle.id, timestamp: event.timestamp })
+        })
 
         // Phase containers
         ;(cycle.phases ?? []).forEach(phase => {
@@ -497,7 +541,7 @@ export function buildFlowchart({
           const phaseCollapsed = phaseState?.isCollapsed ?? true  // default: collapsed
           updatedCycles.set(phaseId, { isCollapsed: phaseCollapsed })
 
-          const phaseNode = {
+          newNodes.push({
             id: phaseId,
             type: 'iterationContainer',
             parentId: cycle.id,
@@ -512,34 +556,45 @@ export function buildFlowchart({
               isCollapsed: phaseCollapsed,
               containsActiveAgent: activeContainerIds.has(phaseId),
               onToggleCollapse: null, // injected by caller
+              startTime: phase.startEvent?.timestamp,  // used by cycleLayout for ordering
               summary: extractPRReviewPhaseSummary(phase),
             },
             style: phaseCollapsed ? {} : { width: 0, height: 0 },
             ...(phaseCollapsed ? {} : { measured: { width: 1, height: 1 } }),
             draggable: false,
-          }
-          newNodes.push(phaseNode)
+          })
 
           if (phaseCollapsed) {
-            leafChain.push({ id: phaseId, timestamp: phase.startEvent?.timestamp })
+            allPREntries.push({ containerId: phaseId, timestamp: phase.startEvent?.timestamp })
           } else {
             const allPhaseEvents = [phase.startEvent, ...phase.events]
               .filter(Boolean)
               .sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp))
-
             allPhaseEvents.forEach(event => {
-              processEventToNode(event, phaseId, phaseId)
+              allPREntries.push({ event, parentId: phaseId, timestamp: event.timestamp })
             })
           }
         })
 
-        // pr_review_stage_completed → direct child, rightmost
+        // pr_review_stage_completed → direct child (skip if inferred)
         if (cycle.endEvent && !cycle.endEvent._inferred) {
           const endId = `${cycle.id}-end`
-          const endNode = makeDecisionNode(cycle.endEvent, endId, cycle.id)
-          newNodes.push(endNode)
-          leafChain.push({ id: endId, timestamp: cycle.endEvent.timestamp })
+          newNodes.push(makeDecisionNode(cycle.endEvent, endId, cycle.id))
+          allPREntries.push({ leafId: endId, timestamp: cycle.endEvent.timestamp })
         }
+
+        // Process all entries in chronological order for correct leafChain sequencing
+        allPREntries
+          .sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp))
+          .forEach(entry => {
+            if (entry.leafId) {
+              leafChain.push({ id: entry.leafId, timestamp: entry.timestamp })
+            } else if (entry.containerId) {
+              leafChain.push({ id: entry.containerId, timestamp: entry.timestamp })
+            } else {
+              processEventToNode(entry.event, entry.parentId, entry.parentId)
+            }
+          })
       }
     } else if (cycle.type === 'conversational_loop') {
       // ── Conversational loop container ───────────────────────────────────
@@ -661,6 +716,9 @@ export function findActiveContainerPath(model, activeTaskIds) {
 
   model.cycles.forEach(cycle => {
     if (cycle.type === 'review_cycle') {
+      // Check residual cycle-level events (not inside any iteration)
+      const cycleResiduals = [cycle.startEvent, ...(cycle.events ?? []), cycle.endEvent].filter(Boolean)
+      if (hasActive(cycleResiduals)) result.add(cycle.id)
       cycle.iterations?.forEach(iter => {
         const iterId = `${cycle.id}-iter-${iter.number}`
         const iterEvents = [iter.startEvent, ...iter.events].filter(Boolean)
@@ -701,6 +759,9 @@ export function findActiveContainerPath(model, activeTaskIds) {
         result.add(cycle.id)
       }
     } else if (cycle.type === 'pr_review_cycle') {
+      // Check residual cycle-level events (not inside any phase)
+      const prResiduals = [cycle.startEvent, ...(cycle.events ?? []), cycle.endEvent].filter(Boolean)
+      if (hasActive(prResiduals)) result.add(cycle.id)
       cycle.phases?.forEach(phase => {
         const phaseId = `${cycle.id}-phase-${phase.number}`
         const phaseEvents = [phase.startEvent, ...(phase.events ?? [])].filter(Boolean)

@@ -371,19 +371,14 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
     )
 
     if (cc.type === 'reviewCycleContainer' || cc.type === 'prReviewCycleContainer') {
-      // Layout: [start] [iter1] [iter2] … [end]  — all horizontal
-      const numDirect = direct.length   // typically 2 (start + end events)
-      const numIters = iters.length
-      const iterTotalWidth = iters.reduce(
-        (sum, it) => sum + (iterSizes.get(it.id)?.width ?? 0), 0
-      )
-      // Use measured widths for direct children (start/end events) when available
-      const startWidth = direct[0]?.measured?.width ?? nodeWidth
-      const endWidth = direct[1]?.measured?.width ?? nodeWidth
-      const leftWidth = numDirect > 0 ? startWidth + horizontalSpacing : 0
-      const rightWidth = numDirect > 1 ? horizontalSpacing + endWidth : 0
-      const iterSpacingTotal = numIters > 1 ? horizontalSpacing * (numIters - 1) : 0
-      const width = cyclePadding * 2 + leftWidth + iterTotalWidth + iterSpacingTotal + rightWidth
+      // All items lay out horizontally: direct event children (boundary + residuals) + iterations.
+      // Sum all widths regardless of order (total width doesn't depend on arrangement).
+      const directWidths = direct.map(d => d.measured?.width ?? nodeWidth)
+      const iterWidths = iters.map(it => iterSizes.get(it.id)?.width ?? nodeWidth)
+      const allWidths = [...directWidths, ...iterWidths]
+      const totalWidth = allWidths.reduce((sum, w) => sum + w, 0)
+      const spacingTotal = allWidths.length > 1 ? horizontalSpacing * (allWidths.length - 1) : 0
+      const width = cyclePadding * 2 + totalWidth + spacingTotal
       const height = containerHeaderHeight + cyclePadding * 2 + maxIterHeight
       cycleSizes.set(cc.id, { width: Math.max(width, 500), height: Math.max(height, 180) })
     } else if (cc.type === 'repairCycleContainer') {
@@ -482,39 +477,45 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
     const contentY = containerHeaderHeight + cyclePadding  // y offset inside container
 
     if (cc.type === 'reviewCycleContainer' || cc.type === 'prReviewCycleContainer') {
-      let relX = cyclePadding
       const maxIterH = iters.reduce((max, it) => Math.max(max, iterSizes.get(it.id)?.height ?? 0), 0)
 
-      // Start event (leftmost direct child)
-      if (direct[0]) {
-        positionedNodes.set(direct[0].id, {
-          ...direct[0],
-          position: { x: relX, y: contentY },
-        })
-        relX += (direct[0].measured?.width ?? nodeWidth) + horizontalSpacing
-      }
+      // Sort all horizontal items (direct event children + iteration containers) chronologically.
+      // This handles residual events (which may appear between the start event and the first
+      // iteration, or between iterations) without hardcoding start/end positions.
+      const allItems = [
+        ...direct.map(d => ({
+          node: d,
+          ts: d.data?.timestamp || d.data?.startTime || '',
+          isIter: false,
+        })),
+        ...iters.map(it => ({
+          node: it,
+          ts: it.data?.startTime || '',
+          isIter: true,
+        })),
+      ].sort((a, b) => new Date(a.ts) - new Date(b.ts))
 
-      // Iteration containers — vertically centered within the tallest iteration's space
-      iters.forEach(iter => {
-        const iterSize = iterSizes.get(iter.id) || { width: nodeWidth + iterPadding * 2, height: 200 }
-        const iterY = contentY + Math.round((maxIterH - iterSize.height) / 2)
-        positionedNodes.set(iter.id, {
-          ...iter,
-          position: { x: relX, y: iterY },
-          style: iter.data?.isCollapsed
-            ? { ...iter.style, width: iterSize.width }
-            : { ...iter.style, width: iterSize.width, height: iterSize.height },
-        })
-        relX += iterSize.width + horizontalSpacing
+      let relX = cyclePadding
+      allItems.forEach(({ node, isIter }) => {
+        if (isIter) {
+          const iterSize = iterSizes.get(node.id) || { width: nodeWidth + iterPadding * 2, height: 200 }
+          const iterY = contentY + Math.round((maxIterH - iterSize.height) / 2)
+          positionedNodes.set(node.id, {
+            ...node,
+            position: { x: relX, y: iterY },
+            style: node.data?.isCollapsed
+              ? { ...node.style, width: iterSize.width }
+              : { ...node.style, width: iterSize.width, height: iterSize.height },
+          })
+          relX += iterSize.width + horizontalSpacing
+        } else {
+          positionedNodes.set(node.id, {
+            ...node,
+            position: { x: relX, y: contentY },
+          })
+          relX += (node.measured?.width ?? nodeWidth) + horizontalSpacing
+        }
       })
-
-      // End event (rightmost direct child)
-      if (direct[1]) {
-        positionedNodes.set(direct[1].id, {
-          ...direct[1],
-          position: { x: relX, y: contentY },
-        })
-      }
     } else if (cc.type === 'repairCycleContainer') {
       let relX = cyclePadding
       const maxIterH = iters.reduce((max, it) => Math.max(max, iterSizes.get(it.id)?.height ?? 0), 0)

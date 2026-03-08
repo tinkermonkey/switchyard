@@ -616,6 +616,82 @@ function inferMissingCloseEvents(sortedEvents) {
     })
   }
 
+  // ── Phase 4b: Nested sub-cycles within outer sub-cycles ─────────────────
+  // Phase 4 inferred close events for outer sub-cycles. Now use those (via snapshot)
+  // to determine outer-SC windows and infer closes for any unclosed nested sub-cycles
+  // (e.g. a test_execution running inside a systemic_fix with no completed event).
+  {
+    const stream4b = snapshot()
+    repairStarts.forEach(repairStart => {
+      const repairStartMs = new Date(repairStart.timestamp).getTime()
+      const repairEnd = stream4b.find(
+        e => e.event_category === 'agent_lifecycle' &&
+             (e.event_type === 'agent_completed' || e.event_type === 'agent_failed') &&
+             e.agent === 'repair_cycle' &&
+             new Date(e.timestamp).getTime() > repairStartMs
+      )
+      const repairEndMs = repairEnd ? new Date(repairEnd.timestamp).getTime() : lastMs + 1
+
+      const allTcStarts = sortedEvents.filter(e => {
+        const t = new Date(e.timestamp).getTime()
+        return t >= repairStartMs && t <= repairEndMs && e.event_type === 'repair_cycle_test_cycle_started'
+      })
+      const allTcEnds = stream4b.filter(e => {
+        const t = new Date(e.timestamp).getTime()
+        return t >= repairStartMs && t <= repairEndMs && e.event_type === 'repair_cycle_test_cycle_completed'
+      })
+
+      allTcStarts.forEach((tcStart, idx) => {
+        const tcStartMs = new Date(tcStart.timestamp).getTime()
+        const tcEnd = allTcEnds[idx] || null
+        const tcEndMs = tcEnd ? new Date(tcEnd.timestamp).getTime() : repairEndMs
+
+        REPAIR_SUB_CYCLE_REGISTRY.forEach(({ startEventType: outerStartType, endEventType: outerEndType }) => {
+          const outerStarts = sortedEvents.filter(e => {
+            const t = new Date(e.timestamp).getTime()
+            return t > tcStartMs && t < tcEndMs && e.event_type === outerStartType
+          })
+          const outerEnds = stream4b.filter(e => {
+            const t = new Date(e.timestamp).getTime()
+            return t > tcStartMs && t < tcEndMs && e.event_type === outerEndType
+          })
+
+          outerStarts.forEach((outerStart, outerIdx) => {
+            const outerStartMs = new Date(outerStart.timestamp).getTime()
+            const outerEnd = outerEnds[outerIdx] || null
+            const outerEndMs = outerEnd ? new Date(outerEnd.timestamp).getTime() : tcEndMs
+
+            REPAIR_SUB_CYCLE_REGISTRY.forEach(({ startEventType: innerStartType, endEventType: innerEndType }) => {
+              const innerStarts = sortedEvents.filter(e => {
+                const t = new Date(e.timestamp).getTime()
+                return t > outerStartMs && t < outerEndMs && e.event_type === innerStartType
+              })
+              const innerEnds = sortedEvents.filter(e => {
+                const t = new Date(e.timestamp).getTime()
+                return t > outerStartMs && t < outerEndMs && e.event_type === innerEndType
+              })
+
+              innerStarts.forEach((innerStart, innerIdx) => {
+                if (innerEnds[innerIdx]) return
+                const innerStartMs = new Date(innerStart.timestamp).getTime()
+                const nextInnerStart = innerStarts[innerIdx + 1]
+                synthetic.push(makeSyntheticClose(
+                  innerStart,
+                  innerEndType,
+                  closestUpperBound(
+                    innerStartMs,
+                    nextInnerStart ? new Date(nextInnerStart.timestamp).getTime() : null,
+                    outerEndMs
+                  )
+                ))
+              })
+            })
+          })
+        })
+      })
+    })
+  }
+
   if (!synthetic.length) return sortedEvents
 
   return [...sortedEvents, ...synthetic].sort(
@@ -725,12 +801,26 @@ export function processEvents(events, workflowConfig = null) {
 
     const iterations = groupReviewCycleIterations(cycleEvents, boundary, agentExecutions)
 
+    // Residual events: in cycle window but not claimed by any iteration, and not the boundary events.
+    // Without this, events that occur between cycle_started and the first iteration marker
+    // (or after the last iteration) are silently lost — they appear in neither prelude, nor
+    // any iteration, nor postlude (they fall inside the cycle's time window).
+    const iterationClaimed = new Set()
+    iterations.forEach(iter => {
+      if (iter.startEvent) iterationClaimed.add(iter.startEvent)
+      iter.events.forEach(e => iterationClaimed.add(e))
+    })
+    const reviewResiduals = cycleEvents.filter(e =>
+      !iterationClaimed.has(e) && e !== startEvent && e !== endEvent
+    )
+
     cycles.push({
       id: `review_cycle_${idx + 1}`,
       type: 'review_cycle',
       startEvent,
       endEvent,
       iterations,
+      events: reviewResiduals,
       isCollapsed: false,
     })
   })
@@ -780,12 +870,23 @@ export function processEvents(events, workflowConfig = null) {
 
     const phases = groupPRReviewPhases(cycleEvents, boundary)
 
+    // Residual events: in cycle window but not claimed by any phase, and not the boundary events.
+    const phasesClaimed = new Set()
+    phases.forEach(phase => {
+      if (phase.startEvent) phasesClaimed.add(phase.startEvent)
+      phase.events.forEach(e => phasesClaimed.add(e))
+    })
+    const prResiduals = cycleEvents.filter(e =>
+      !phasesClaimed.has(e) && e !== startEvent && e !== endEvent
+    )
+
     cycles.push({
       id: `pr_review_cycle_${idx + 1}`,
       type: 'pr_review_cycle',
       startEvent,
       endEvent,
       phases,
+      events: prResiduals,
       isCollapsed: false,
     })
   })
