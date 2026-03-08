@@ -16,7 +16,7 @@ Runs periodically as a background task to ensure automatic recovery.
 import logging
 import subprocess
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Any, Optional
 from elasticsearch import Elasticsearch
 
@@ -100,7 +100,7 @@ class PipelineWatchdog:
                 "sort": [{"started_at": {"order": "asc"}}]  # Oldest first
             }
 
-            response = self.es.search(index="pipeline-runs-*", body=query)
+            response = self.es.search(index="pipeline-runs-*", **query)
 
             if response['hits']['total']['value'] == 0:
                 logger.info("No active pipeline runs found")
@@ -109,8 +109,8 @@ class PipelineWatchdog:
             total_active = response['hits']['total']['value']
             logger.info(f"Found {total_active} active pipeline runs, checking for zombies")
 
-            # Calculate threshold timestamp
-            threshold = datetime.utcnow() - timedelta(minutes=self.zombie_threshold_minutes)
+            # Calculate threshold timestamp (timezone-aware UTC)
+            threshold = datetime.now(timezone.utc) - timedelta(minutes=self.zombie_threshold_minutes)
 
             for hit in response['hits']['hits']:
                 results['checked'] += 1
@@ -148,7 +148,7 @@ class PipelineWatchdog:
                 # No container and old enough = ZOMBIE
                 results['zombies_found'] += 1
 
-                age_minutes = (datetime.utcnow() - started_at).total_seconds() / 60
+                age_minutes = (datetime.now(timezone.utc) - started_at).total_seconds() / 60
                 logger.warning(
                     f"Found zombie pipeline run {pipeline_run_id[:8]}... for {project} "
                     f"issue #{issue_number} (age: {age_minutes:.1f} minutes, no container)"

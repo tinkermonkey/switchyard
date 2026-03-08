@@ -799,8 +799,20 @@ class ScheduledTasksService:
         """Clean up zombie pipeline runs using PipelineWatchdog."""
         try:
             from services.pipeline_watchdog import get_pipeline_watchdog
+            from services.pipeline_run import get_pipeline_run_manager
+            from services.pipeline_lock_manager import get_pipeline_lock_manager
+            from elasticsearch import Elasticsearch
             loop = asyncio.get_event_loop()
-            watchdog = get_pipeline_watchdog()
+            try:
+                es_client = Elasticsearch(["http://elasticsearch:9200"])
+            except Exception as e:
+                logger.warning(f"Zombie cleanup: could not connect to Elasticsearch: {e}")
+                es_client = None
+            watchdog = get_pipeline_watchdog(
+                es_client=es_client,
+                pipeline_run_manager=get_pipeline_run_manager(),
+                lock_manager=get_pipeline_lock_manager()
+            )
             results = await loop.run_in_executor(None, watchdog.check_for_zombie_runs)
             if results.get('zombies_cleaned', 0) > 0:
                 logger.info(
