@@ -2,11 +2,11 @@ import { Handle, Position } from '@xyflow/react'
 import { Activity, CircleCheck, CircleX, OctagonX, Timer, Zap } from 'lucide-react'
 
 const STATUS_THEME = {
-  running:     { bg: '#111d2e', border: '#58a6ff', headerBg: '#0d1f35', color: '#cae8ff', badgeBg: '#58a6ff20', badgeColor: '#58a6ff' },
-  completed:   { bg: '#0f1f0f', border: '#2ea043', headerBg: '#0b1e0b', color: '#b0f0b0', badgeBg: '#3fb95020', badgeColor: '#3fb950' },
-  failed:      { bg: '#1e0a0a', border: '#f85149', headerBg: '#1a0808', color: '#ffd2d2', badgeBg: '#f8514920', badgeColor: '#f85149' },
-  interrupted: { bg: '#1c1208', border: '#8b5e3c', headerBg: '#180f05', color: '#f0d5b8', badgeBg: '#d2905520', badgeColor: '#d29055' },
-  default:     { bg: '#161b22', border: '#30363d', headerBg: '#0d1117', color: '#c9d1d9', badgeBg: '#30363d',   badgeColor: '#6e7681' },
+  running:     { bg: '#111d2e', border: '#58a6ff', headerBg: '#0d1f35', color: '#cae8ff', badgeBg: '#58a6ff20', badgeColor: '#58a6ff', statColor: '#adc8e8', pillBg: '#1a3050', pillColor: '#8bb8e8' },
+  completed:   { bg: '#0f1f0f', border: '#2ea043', headerBg: '#0b1e0b', color: '#b0f0b0', badgeBg: '#3fb95020', badgeColor: '#3fb950', statColor: '#9bc49b', pillBg: '#132813', pillColor: '#7ac97a' },
+  failed:      { bg: '#1e0a0a', border: '#f85149', headerBg: '#1a0808', color: '#ffd2d2', badgeBg: '#f8514920', badgeColor: '#f85149', statColor: '#d9908e', pillBg: '#2a1010', pillColor: '#e8a0a0' },
+  interrupted: { bg: '#1c1208', border: '#8b5e3c', headerBg: '#180f05', color: '#f0d5b8', badgeBg: '#d2905520', badgeColor: '#d29055', statColor: '#7a6050', pillBg: '#221508', pillColor: '#c49070' },
+  default:     { bg: '#161b22', border: '#30363d', headerBg: '#0d1117', color: '#c9d1d9', badgeBg: '#30363d',   badgeColor: '#6e7681', statColor: '#6e7681', pillBg: '#21262d', pillColor: '#8b949e' },
 }
 
 const STATUS_ICON = {
@@ -146,15 +146,17 @@ export default function AgentExecutionNode({ data }) {
         }}>
           {/* Duration — always shown for running (as —), shown when available otherwise */}
           {(durationStr || effectiveStatus === 'running') && (
-            <span style={{ display: 'flex', alignItems: 'center', gap: 4, color: durationStr ? theme.color : '#484f58' }}>
-              <Timer size={12} style={{ opacity: 0.6, flexShrink: 0 }} />
-              {durationStr ?? '—'}
+            <span style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+              <Timer size={12} color="#8b949e" style={{ flexShrink: 0 }} />
+              <span style={{ color: durationStr ? theme.statColor : '#484f58' }}>
+                {durationStr ?? '—'}
+              </span>
             </span>
           )}
           {tokensStr && (
             <span style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-              <Zap size={12} style={{ opacity: 0.6, flexShrink: 0 }} />
-              {tokensStr}
+              <Zap size={12} color="#8b949e" style={{ flexShrink: 0 }} />
+              <span style={{ color: theme.statColor }}>{tokensStr}</span>
             </span>
           )}
         </div>
@@ -170,9 +172,8 @@ export default function AgentExecutionNode({ data }) {
                 fontSize: 10,
                 padding: '2px 6px',
                 borderRadius: 4,
-                background: `${theme.border}22`,
-                border: `1px solid ${theme.border}44`,
-                color: theme.color,
+                background: theme.pillBg,
+                color: theme.pillColor,
                 fontFamily: 'monospace',
               }}
             >
