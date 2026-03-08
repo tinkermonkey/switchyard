@@ -250,12 +250,16 @@ function SmartPipelineEdgeInner(props) {
   // updates that account for the majority of store activity during live runs.
   const { allNodes, geometryKey } = useStore(
     useCallback(s => {
-      const key = s.nodes.map(n => {
+      // Exclude hidden nodes from both the obstacle set and the geometry fingerprint.
+      // Hidden nodes are placed off-screen at {x:-10000, y:-10000} (relative to parent)
+      // and must not act as obstacles or trigger re-renders when moved off-screen.
+      const visibleNodes = s.nodes.filter(n => !n.hidden)
+      const key = visibleNodes.map(n => {
         const w = Math.round(n.measured?.width > 1 ? n.measured.width : (n.style?.width ?? 0))
         const h = Math.round(n.measured?.height > 1 ? n.measured.height : (n.style?.height ?? 0))
         return `${n.id}:${Math.round(n.position.x)},${Math.round(n.position.y)},${w},${h}`
       }).join('|')
-      return { allNodes: s.nodes, geometryKey: key }
+      return { allNodes: visibleNodes, geometryKey: key }
     }, []),
     (a, b) => a.geometryKey === b.geometryKey
   )

@@ -382,7 +382,7 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
       const spacingTotal = allWidths.length > 1 ? horizontalSpacing * (allWidths.length - 1) : 0
       const width = cyclePadding * 2 + totalWidth + spacingTotal
       const height = containerHeaderHeight + cyclePadding * 2 + maxIterHeight
-      cycleSizes.set(cc.id, { width: Math.max(width, 500), height: Math.max(height, 180) })
+      cycleSizes.set(cc.id, { width: Math.max(width, 300), height: Math.max(height, 180) })
     } else if (cc.type === 'repairCycleContainer') {
       // Layout: [residual-col?] [tc1] [tc2] [tc3]  — horizontal
       const numIters = iters.length
