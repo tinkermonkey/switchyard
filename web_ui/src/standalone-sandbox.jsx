@@ -15,6 +15,7 @@ const PARAM_LABELS = {
 
 export default function StandaloneSandbox() {
   const [debugData, setDebugData] = useState(null)
+  const [fileName, setFileName] = useState(null)
   const [layoutParams, setLayoutParams] = useState(DEFAULT_LAYOUT_OPTIONS)
   const [isDragOver, setIsDragOver] = useState(false)
   const [error, setError] = useState(null)
@@ -33,6 +34,7 @@ export default function StandaloneSandbox() {
           return
         }
         setDebugData(json)
+        setFileName(file.name)
         setProcessedModel(null)
         setError(null)
       } catch {
@@ -124,6 +126,11 @@ export default function StandaloneSandbox() {
 
           {debugData && (
             <div className="text-xs text-gh-fg-muted bg-gh-canvas border border-gh-border rounded px-2 py-1">
+              {fileName && (
+                <div className="font-mono text-gh-fg-muted truncate mb-1" title={fileName}>
+                  {fileName}
+                </div>
+              )}
               <div className="font-medium text-gh-fg truncate">
                 {debugData.pipelineRun?.issue_title || 'Unknown pipeline'}
               </div>
@@ -213,6 +220,7 @@ export default function StandaloneSandbox() {
           ) : (
             <PipelineFlowGraph
               graphEvents={graphEvents}
+              allEvents={debugData.events}
               workflowConfig={debugData.workflowConfig ?? null}
               selectedPipelineRun={debugData.pipelineRun ?? null}
               onModelChange={setProcessedModel}

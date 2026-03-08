@@ -432,6 +432,9 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
     type === 'repairCycleContainer' ||
     type === 'prReviewCycleContainer' ||
     type === 'conversationalLoopContainer'
+  const isRootContainerType = (type) =>
+    isRootCycleType(type) || type === 'iterationContainer'
+
   let currentY = 100
   rootLayoutNodes.forEach((node, index) => {
     const nextNode = rootLayoutNodes[index + 1]
@@ -439,6 +442,19 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
       const size = cycleSizes.get(node.id) || { width: 500, height: 200 }
       // Collapsed containers: set only width — RF measures height from rendered content.
       // Expanded containers: set both width and height as computed by the layout engine.
+      const nodeStyle = node.data?.isCollapsed
+        ? { ...node.style, width: size.width }
+        : { ...node.style, width: size.width, height: size.height }
+      positionedNodes.set(node.id, {
+        ...node,
+        position: { x: centerXPosition - size.width / 2, y: currentY },
+        style: nodeStyle,
+      })
+      currentY += size.height + cycleGap
+    } else if (node.type === 'iterationContainer') {
+      // Standalone top-level iteration container (orphaned — no parent cycle container).
+      // Use iterSizes (computed in Pass 1) and apply explicit dimensions so the border renders.
+      const size = iterSizes.get(node.id) || { width: nodeWidth + iterPadding * 2, height: 200 }
       const nodeStyle = node.data?.isCollapsed
         ? { ...node.style, width: size.width }
         : { ...node.style, width: size.width, height: size.height }
@@ -456,7 +472,7 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
         position: { x: centerXPosition - w / 2, y: currentY },
       })
       // Use cycleGap when next item is a cycle container, otherwise innerVertSpacing
-      currentY += h + (nextNode && isRootCycleType(nextNode.type) ? cycleGap : innerVertSpacing)
+      currentY += h + (nextNode && isRootContainerType(nextNode.type) ? cycleGap : innerVertSpacing)
     }
   })
 
@@ -692,7 +708,8 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
   // ── Collect and order final nodes (parents before children) ──────────────
   // Order: root → cycleContainers → iterContainers → direct children → subCycleContainers → subCycleLeaves
   const parentNodes = nodes.filter(n => !n.parentId).map(n => positionedNodes.get(n.id) ?? n)
-  const iterContainerNodes = iterContainers.map(n => positionedNodes.get(n.id) ?? n)
+  // Exclude top-level iterationContainers (no parentId) — they're already in parentNodes.
+  const iterContainerNodes = iterContainers.filter(n => n.parentId).map(n => positionedNodes.get(n.id) ?? n)
   // Hidden nodes not in positionedNodes would fall back to position:{x:0,y:0}, placing them
   // directly over their parent container's header (absolute, top:0, height:30). React Flow renders
   // hidden nodes with visibility:hidden (DOM present), so those ghost elements intercept pointer

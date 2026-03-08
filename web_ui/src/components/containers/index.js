@@ -1,24 +1,19 @@
 import CycleBoundingNode from './CycleBoundingNode'
-import ReviewCycleContainerNode from './ReviewCycleContainerNode'
-import RepairCycleContainerNode from './RepairCycleContainerNode'
-import PRReviewCycleContainerNode from './PRReviewCycleContainerNode'
-import ConversationalLoopContainerNode from './ConversationalLoopContainerNode'
-import IterationContainerNode from './IterationContainerNode'
-import SubCycleContainerNode from './SubCycleContainerNode'
+import CycleContainerNode from './CycleContainerNode'
 
 export const containerNodeTypes = {
-  // Level 1 — top-level cycle bounding containers
+  // Legacy bounding node (separate theme map, kept for compatibility)
   cycleBounding:               CycleBoundingNode,
-  reviewCycleContainer:        ReviewCycleContainerNode,
-  repairCycleContainer:        RepairCycleContainerNode,
-  prReviewCycleContainer:      PRReviewCycleContainerNode,
-  conversationalLoopContainer: ConversationalLoopContainerNode,
 
-  // Level 2 — iteration/phase containers (child of cycle container)
-  // Theme is driven by data.cycleType: 'review' | 'repair' | 'pr_review'
-  iterationContainer:          IterationContainerNode,
+  // Level 1 — top-level cycle containers (theme driven by data.cycleType)
+  reviewCycleContainer:        CycleContainerNode,
+  repairCycleContainer:        CycleContainerNode,
+  prReviewCycleContainer:      CycleContainerNode,
+  conversationalLoopContainer: CycleContainerNode,
 
-  // Level 3 — sub-cycle containers (child of iterationContainer, repair cycles only)
-  // Theme is driven by data.cycleType: 'test_execution' | 'fix_cycle' | 'warning_review' | 'systemic_analysis' | 'systemic_fix'
-  subCycleContainer:           SubCycleContainerNode,
+  // Level 2 — iteration/phase containers (theme driven by data.cycleType)
+  iterationContainer:          CycleContainerNode,
+
+  // Level 3 — sub-cycle containers (theme driven by data.cycleType)
+  subCycleContainer:           CycleContainerNode,
 }

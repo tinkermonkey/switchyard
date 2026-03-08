@@ -1,6 +1,6 @@
 import { memo } from 'react'
 import { RotateCcw, AlertTriangle, MessageSquare, Box } from 'lucide-react'
-import { CycleContainerNode } from './CycleContainerNode'
+import { CycleContainer } from './CycleContainer'
 
 const CYCLE_BOUNDING_THEME_MAP = {
   review_cycle: {
@@ -47,7 +47,7 @@ const CYCLE_BOUNDING_THEME_MAP = {
 
 const CycleBoundingNode = ({ data, ...props }) => {
   const theme = CYCLE_BOUNDING_THEME_MAP[data.cycleType] || CYCLE_BOUNDING_THEME_MAP.unknown
-  return <CycleContainerNode data={data} {...props} theme={theme} />
+  return <CycleContainer data={data} {...props} theme={theme} />
 }
 
 export default memo(CycleBoundingNode)

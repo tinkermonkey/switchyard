@@ -68,6 +68,7 @@ const CYCLE_CONTAINER_TYPES = Object.keys(containerNodeTypes)
  *
  * Props:
  *   graphEvents         - Filtered events array (no claude_log events)
+ *   allEvents           - Full unfiltered event array (incl. claude_log) for token/tool enrichment (optional)
  *   workflowConfig      - Workflow config object
  *   selectedPipelineRun - Pipeline run object
  *   onModelChange       - Optional callback(model) fired after each buildFlowchart call
@@ -88,6 +89,7 @@ const CYCLE_CONTAINER_TYPES = Object.keys(containerNodeTypes)
  */
 export default function PipelineFlowGraph({
   graphEvents,
+  allEvents = null,
   workflowConfig,
   selectedPipelineRun,
   onModelChange,
@@ -173,19 +175,20 @@ export default function PipelineFlowGraph({
   const buildRawFlowchart = useCallback(() => {
     if (!graphEvents || !graphEvents.length || !selectedPipelineRun) return null
 
-    const agentTaskInit = new Map()
-    const agentTaskDone = new Set()
-    graphEvents.forEach(e => {
-      if (e.event_type === 'agent_initialized') agentTaskInit.set(e.task_id, e.agent)
-      else if (e.event_type === 'agent_completed' || e.event_type === 'agent_failed') agentTaskDone.add(e.task_id)
-    })
+    // Derive activeTaskIds from the zombie-aware agentExecutions map so that
+    // interrupted (zombie) agents are excluded. The raw scan of agent_initialized
+    // without agent_completed would incorrectly include zombies from orchestrator restarts.
+    const { agentExecutions: execMap } = processEvents(graphEvents)
     const activeTaskIds = new Set()
-    agentTaskInit.forEach((agent, taskId) => {
-      if (!agentTaskDone.has(taskId)) activeTaskIds.add(taskId)
+    execMap.forEach(executions => {
+      executions.forEach(exec => {
+        if (exec.status === 'running') activeTaskIds.add(exec.taskId)
+      })
     })
 
     return buildFlowchartUtil({
       events: graphEvents,
+      allEvents,
       existingCycles: cyclesRef.current,  // ref is pre-updated before this fires (see below)
       workflowConfig,
       selectedPipelineRun,
@@ -195,7 +198,7 @@ export default function PipelineFlowGraph({
   // The function reads cyclesRef.current (not the closure value) because both the cycles
   // detection effect and handleToggleWithTracking pre-update the ref synchronously before
   // calling setCycles — guaranteeing the ref is current when this callback executes.
-  }, [graphEvents, selectedPipelineRun, workflowConfig, cycles])
+  }, [graphEvents, allEvents, selectedPipelineRun, workflowConfig, cycles])
 
   // Detect and update cycles when events change; auto-expand hierarchy path to active agent
   useEffect(() => {
@@ -203,15 +206,13 @@ export default function PipelineFlowGraph({
 
     const model = processEvents(graphEvents)
 
-    const agentTaskInit = new Map()
-    const agentTaskDone = new Set()
-    graphEvents.forEach(e => {
-      if (e.event_type === 'agent_initialized') agentTaskInit.set(e.task_id, e.agent)
-      else if (e.event_type === 'agent_completed' || e.event_type === 'agent_failed') agentTaskDone.add(e.task_id)
-    })
+    // Derive activeTaskIds from model.agentExecutions (already zombie-aware) so that
+    // interrupted agents from orchestrator restarts don't trigger false auto-expansion.
     const activeTaskIds = new Set()
-    agentTaskInit.forEach((agent, taskId) => {
-      if (!agentTaskDone.has(taskId)) activeTaskIds.add(taskId)
+    model.agentExecutions.forEach(executions => {
+      executions.forEach(exec => {
+        if (exec.status === 'running') activeTaskIds.add(exec.taskId)
+      })
     })
 
     const activeContainerIds = findActiveContainerPath(model, activeTaskIds)
@@ -364,15 +365,23 @@ export default function PipelineFlowGraph({
         // Keep graph visible — carry existing positions and styles forward so container nodes
         // don't lose their computed dimensions (style.width/height) while LayoutController
         // re-runs. Without this, SmartPipelineEdge falls back to 200px obstacle widths.
+        // Also preserve injected callbacks (onToggleCollapse) — raw build nodes have null
+        // because finalizeNodes hasn't run yet; overwriting causes toggle controls to flicker.
         nodeSizeCacheRef.current = new Map()
         setNodes(prev => {
-          const existingPositions = new Map(prev.map(n => [n.id, n.position]))
-          const existingStyles = new Map(prev.map(n => [n.id, n.style]))
-          return filteredRawBuild.nodes.map(n => ({
-            ...n,
-            position: existingPositions.get(n.id) ?? { x: 0, y: 0 },
-            style: n.data?.isCollapsed ? n.style : (existingStyles.get(n.id) ?? n.style),
-          }))
+          const existingByNode = new Map(prev.map(n => [n.id, n]))
+          return filteredRawBuild.nodes.map(n => {
+            const existing = existingByNode.get(n.id)
+            const data = existing?.data?.onToggleCollapse
+              ? { ...n.data, onToggleCollapse: existing.data.onToggleCollapse }
+              : n.data
+            return {
+              ...n,
+              data,
+              position: existing?.position ?? { x: 0, y: 0 },
+              style: n.data?.isCollapsed ? n.style : (existing?.style ?? n.style),
+            }
+          })
         })
       } else {
         hasLayoutedOnceRef.current = false
@@ -386,7 +395,12 @@ export default function PipelineFlowGraph({
       setNodes(prev => prev.map(node => {
         const newNode = newNodeById.get(node.id)
         if (!newNode) return node
-        return { ...node, data: newNode.data, hidden: newNode.hidden ?? false }
+        // Preserve injected callbacks — raw build nodes always have onToggleCollapse: null
+        // (finalizeNodes hasn't re-run); overwriting causes toggle controls to flicker.
+        const data = node.data?.onToggleCollapse
+          ? { ...newNode.data, onToggleCollapse: node.data.onToggleCollapse }
+          : newNode.data
+        return { ...node, data, hidden: newNode.hidden ?? false }
       }))
       setDataVersion(v => v + 1)
     }

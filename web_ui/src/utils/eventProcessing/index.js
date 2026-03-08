@@ -44,7 +44,46 @@ function buildAgentExecutionMap(sortedEvents) {
     }
   })
 
+  // Mark zombie executions as 'interrupted'.
+  // A zombie is a 'running' execution where a later execution for the same agent has
+  // already completed or failed. This happens when an orchestrator restart kills an agent
+  // container without emitting an end event.
+  map.forEach(executions => {
+    executions.forEach(exec => {
+      if (exec.status !== 'running') return
+      const hasLaterSettled = executions.some(
+        other => other.startTime > exec.startTime && other.status !== 'running'
+      )
+      if (hasLaterSettled) exec.status = 'interrupted'
+    })
+  })
+
   return map
+}
+
+/**
+ * Match start events to end events using sequential-window pairing.
+ * For each start S_i, the end must come after S_i AND before the next start S_{i+1}.
+ * An end that only arrives after S_{i+1} has begun belongs to a later cycle, not this one.
+ *
+ * This correctly handles abandoned cycles: if a cycle is restarted without a close event,
+ * the existing end event is left for the later start that actually owns it.
+ * Returns [{startEvent, endEvent}] — endEvent is null for abandoned/open starts.
+ */
+function pairCycleEvents(starts, ends) {
+  const usedEnds = new Set()
+  return starts.map((start, idx) => {
+    const startMs = new Date(start.timestamp).getTime()
+    const nextStart = starts[idx + 1]
+    const nextStartMs = nextStart ? new Date(nextStart.timestamp).getTime() : Infinity
+    const matchedEnd = ends.find(
+      e => !usedEnds.has(e) &&
+           new Date(e.timestamp).getTime() > startMs &&
+           new Date(e.timestamp).getTime() <= nextStartMs
+    )
+    if (matchedEnd) usedEnds.add(matchedEnd)
+    return { startEvent: start, endEvent: matchedEnd ?? null }
+  })
 }
 
 /**
@@ -59,11 +98,7 @@ function findReviewCycles(sortedEvents) {
   const ends = sortedEvents.filter(
     e => e.event_category === 'decision' && e.event_type === 'review_cycle_completed'
   )
-
-  return starts.map((start, idx) => ({
-    startEvent: start,
-    endEvent: ends[idx] || null,
-  }))
+  return pairCycleEvents(starts, ends)
 }
 
 /**
@@ -77,10 +112,7 @@ function findPRReviewCycles(sortedEvents) {
   const ends = sortedEvents.filter(
     e => e.event_category === 'decision' && e.event_type === 'pr_review_stage_completed'
   )
-  return starts.map((start, idx) => ({
-    startEvent: start,
-    endEvent: ends[idx] || null,
-  }))
+  return pairCycleEvents(starts, ends)
 }
 
 /**
@@ -128,10 +160,7 @@ function findConversationalLoops(sortedEvents) {
   const closes = sortedEvents.filter(
     e => e.event_category === 'decision' && e.event_type === 'conversational_loop_paused'
   )
-  return opens.map((openEvent, idx) => ({
-    startEvent: openEvent,
-    endEvent: closes[idx] || null,
-  }))
+  return pairCycleEvents(opens, closes)
 }
 
 /**
@@ -452,14 +481,21 @@ function inferMissingCloseEvents(sortedEvents) {
     const reviewEnds = sortedEvents.filter(
       e => e.event_category === 'decision' && e.event_type === 'review_cycle_completed'
     )
+    const usedReviewEnds = new Set()
     reviewStarts.forEach((start, idx) => {
-      if (reviewEnds[idx]) return
       const startMs = new Date(start.timestamp).getTime()
       const nextStart = reviewStarts[idx + 1]
+      const nextStartMs = nextStart ? new Date(nextStart.timestamp).getTime() : Infinity
+      const matchedEnd = reviewEnds.find(
+        e => !usedReviewEnds.has(e) &&
+             new Date(e.timestamp).getTime() > startMs &&
+             new Date(e.timestamp).getTime() <= nextStartMs
+      )
+      if (matchedEnd) { usedReviewEnds.add(matchedEnd); return }
       synthetic.push(makeSyntheticClose(
         start,
         'review_cycle_completed',
-        closestUpperBound(startMs, nextStart ? new Date(nextStart.timestamp).getTime() : null)
+        closestUpperBound(startMs, nextStart ? nextStartMs : null)
       ))
     })
   }
@@ -472,14 +508,21 @@ function inferMissingCloseEvents(sortedEvents) {
     const prEnds = sortedEvents.filter(
       e => e.event_category === 'decision' && e.event_type === 'pr_review_stage_completed'
     )
+    const usedPrEnds = new Set()
     prStarts.forEach((start, idx) => {
-      if (prEnds[idx]) return
       const startMs = new Date(start.timestamp).getTime()
       const nextStart = prStarts[idx + 1]
+      const nextStartMs = nextStart ? new Date(nextStart.timestamp).getTime() : Infinity
+      const matchedEnd = prEnds.find(
+        e => !usedPrEnds.has(e) &&
+             new Date(e.timestamp).getTime() > startMs &&
+             new Date(e.timestamp).getTime() <= nextStartMs
+      )
+      if (matchedEnd) { usedPrEnds.add(matchedEnd); return }
       synthetic.push(makeSyntheticClose(
         start,
         'pr_review_stage_completed',
-        closestUpperBound(startMs, nextStart ? new Date(nextStart.timestamp).getTime() : null)
+        closestUpperBound(startMs, nextStart ? nextStartMs : null)
       ))
     })
   }
@@ -493,14 +536,21 @@ function inferMissingCloseEvents(sortedEvents) {
     const loopCloses = sortedEvents.filter(
       e => e.event_category === 'decision' && e.event_type === 'conversational_loop_paused'
     )
+    const usedLoopCloses = new Set()
     loopOpens.forEach((open, idx) => {
-      if (loopCloses[idx]) return
       const openMs = new Date(open.timestamp).getTime()
       const nextOpen = loopOpens[idx + 1]
+      const nextOpenMs = nextOpen ? new Date(nextOpen.timestamp).getTime() : Infinity
+      const matchedClose = loopCloses.find(
+        e => !usedLoopCloses.has(e) &&
+             new Date(e.timestamp).getTime() > openMs &&
+             new Date(e.timestamp).getTime() <= nextOpenMs
+      )
+      if (matchedClose) { usedLoopCloses.add(matchedClose); return }
       synthetic.push(makeSyntheticClose(
         open,
         'conversational_loop_paused',
-        closestUpperBound(openMs, nextOpen ? new Date(nextOpen.timestamp).getTime() : null)
+        closestUpperBound(openMs, nextOpen ? nextOpenMs : null)
       ))
     })
   }
@@ -782,6 +832,23 @@ export function processEvents(events, workflowConfig = null) {
     lastCycleEndMs = Math.max(lastCycleEndMs, eMs)
   })
 
+  // Pre-scan for orphaned review_cycle_iteration events to include their time bounds
+  // in firstCycleStartMs / lastCycleEndMs before prelude/postlude are computed.
+  // (Full orphaned-iteration processing happens after cycles are built below.)
+  const reviewCycleWindowsForOrphans = reviewCycleBoundaries.map(({ startEvent, endEvent }) => ({
+    startMs: getMs(startEvent.timestamp),
+    endMs: endEvent ? getMs(endEvent.timestamp) : Date.now(),
+  }))
+  sorted.forEach(e => {
+    if (e.event_type !== 'review_cycle_iteration') return
+    const t = getMs(e.timestamp)
+    if (reviewCycleWindowsForOrphans.some(w => t >= w.startMs && t <= w.endMs)) return
+    firstCycleStartMs = Math.min(firstCycleStartMs, t)
+    // Open-ended: orphaned iterations extend to now, so all subsequent events
+    // are claimed by the iteration and excluded from the postlude.
+    lastCycleEndMs = Date.now()
+  })
+
   const noCycles = firstCycleStartMs === Infinity
 
   // Prelude: events strictly before the first cycle's startTime
@@ -926,9 +993,57 @@ export function processEvents(events, workflowConfig = null) {
     })
   })
 
+  // ── Orphaned review iterations ────────────────────────────────────────────
+  // review_cycle_iteration events that fall outside every known review cycle window are
+  // "orphaned" — they still need containers. This happens when an orchestrator restart
+  // causes an iteration to fire without a preceding review_cycle_started event.
+  // Each orphaned iteration becomes a standalone top-level cycle entry so it gets its
+  // own iteration container in the graph without requiring a parent review cycle.
+  {
+    const isInsideReviewCycle = (t) =>
+      reviewCycleWindowsForOrphans.some(w => t >= w.startMs && t <= w.endMs)
+
+    const orphanedIterMarkers = sorted.filter(e => {
+      if (e.event_type !== 'review_cycle_iteration') return false
+      return !isInsideReviewCycle(getMs(e.timestamp))
+    })
+
+    orphanedIterMarkers.forEach((iterEvent, idx) => {
+      const iterStartMs = getMs(iterEvent.timestamp)
+      const nextMarker = orphanedIterMarkers[idx + 1]
+      const iterEndMs = nextMarker ? getMs(nextMarker.timestamp) : Infinity
+
+      const events = sorted.filter(e => {
+        const t = getMs(e.timestamp)
+        return t > iterStartMs && t < iterEndMs && !isInsideReviewCycle(t)
+      })
+
+      const iterAgentExecs = []
+      agentExecutions.forEach((executions, agent) => {
+        executions.forEach((exec, executionIndex) => {
+          const execMs = getMs(exec.startTime)
+          if (execMs >= iterStartMs && execMs < iterEndMs) {
+            iterAgentExecs.push({ agent, execution: exec, executionIndex })
+          }
+        })
+      })
+
+      cycles.push({
+        id: `review_iteration_orphan_${idx + 1}`,
+        type: 'review_iteration',
+        startEvent: iterEvent,
+        endEvent: null,
+        events,
+        agentExecutions: iterAgentExecs,
+        iterationNumber: idx + 1,
+        isCollapsed: false,
+      })
+    })
+  }
+
   // Sort all cycles chronologically (review and repair cycles may interleave)
   cycles.sort((a, b) =>
-    new Date(a.startEvent.timestamp).getTime() - new Date(b.startEvent.timestamp).getTime()
+    getMs(a.startEvent.timestamp) - getMs(b.startEvent.timestamp)
   )
 
   const _tEnd = performance.now()

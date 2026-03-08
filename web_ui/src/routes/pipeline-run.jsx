@@ -535,6 +535,7 @@ function PipelineRunView() {
                   <div className="flex-1 min-h-0">
                     <PipelineFlowGraph
                       graphEvents={graphEvents}
+                      allEvents={mergedEvents}
                       workflowConfig={workflowConfig}
                       selectedPipelineRun={selectedPipelineRun}
                       nodesDraggable={selectedPipelineRun.status !== 'active'}

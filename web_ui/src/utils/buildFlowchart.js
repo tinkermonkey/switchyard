@@ -1,6 +1,7 @@
 import { MarkerType } from '@xyflow/react'
 import { processEvents } from './eventProcessing/index.js'
 import { getNodeType, HIDDEN_BY_DEFAULT_TYPES } from '../components/nodes/EVENT_TYPE_MAP.js'
+import { extractClaudeLogSummaries } from './extractClaudeLogSummaries.js'
 
 // Infrastructure and telemetry event types that are intentionally not rendered as graph nodes.
 // See EVENT_TYPE_MAP.js for full documentation. Any event type NOT in this list and NOT
@@ -62,15 +63,17 @@ import {
  * (React Flow requirement for correct rendering).
  *
  * @param {Object} params
- * @param {Array}  params.events              - Pipeline run events
+ * @param {Array}  params.events              - Pipeline run events (filtered, no claude_log)
+ * @param {Array}  params.allEvents           - Full unfiltered event array (incl. claude_log) for token/tool enrichment
  * @param {Map}    params.existingCycles       - Existing cycles map (preserves collapse state)
  * @param {Object} params.workflowConfig       - Workflow configuration (passed to processEvents)
  * @param {Object} params.selectedPipelineRun  - Pipeline run metadata
- * @param {Set}    params.activeAgentNames     - Currently-active agent names
+ * @param {Set}    params.activeTaskIds        - Currently-active task IDs
  * @returns {{ nodes, edges, agentExecutions, updatedCycles }}
  */
 export function buildFlowchart({
   events,
+  allEvents = null,
   existingCycles = new Map(),
   workflowConfig = null,
   selectedPipelineRun,
@@ -81,6 +84,9 @@ export function buildFlowchart({
   }
 
   const _bfT0 = performance.now()
+
+  // ── 0. Extract claude_log summaries for agent enrichment ─────────────────
+  const claudeSummaries = extractClaudeLogSummaries(allEvents)
 
   // ── 1. Process events into structured model ──────────────────────────────
   const model = processEvents(events, workflowConfig)
@@ -164,6 +170,12 @@ export function buildFlowchart({
     const execution = executions[executionIndex]
     const isActive = activeTaskIds.has(event.task_id)
 
+    const durationMs = (execution.startTime && execution.endTime)
+      ? new Date(execution.endTime) - new Date(execution.startTime)
+      : null
+
+    const claudeData = claudeSummaries.get(taskId) ?? null
+
     const node = {
       id,
       type: 'agentExecution',
@@ -175,6 +187,10 @@ export function buildFlowchart({
         metadata: isActive ? 'Running' : execution.status,
         isActive,
         startTime: event.timestamp,
+        durationMs,
+        inputTokens: claudeData?.inputTokens ?? null,
+        outputTokens: claudeData?.outputTokens ?? null,
+        tools: claudeData?.tools ?? null,
       },
       draggable: false,
     }
@@ -251,6 +267,7 @@ export function buildFlowchart({
         position: { x: 0, y: 0 },
         data: {
           cycleId: cycle.id,
+          cycleType: 'review_cycle',
           label: 'Review Cycle',
           iterationCount: cycle.iterations.length,
           isCollapsed,
@@ -304,7 +321,7 @@ export function buildFlowchart({
             zIndex: 1,
             data: {
               cycleId: iterId,
-              cycleType: 'review',
+              cycleType: 'review_iteration',
               iterationNumber: iteration.number,
               label: `Iteration ${iteration.number}`,
               iterationCount: iteration.events.length + 1,
@@ -359,6 +376,7 @@ export function buildFlowchart({
         position: { x: 0, y: 0 },
         data: {
           cycleId: cycle.id,
+          cycleType: 'repair_cycle',
           label: 'Repair Cycle',
           iterationCount: cycle.testCycles?.length ?? 0,
           isCollapsed,
@@ -409,7 +427,7 @@ export function buildFlowchart({
             zIndex: 1,
             data: {
               cycleId: tcId,
-              cycleType: 'repair',
+              cycleType: 'repair_test_cycle',
               iterationNumber: tc.number,
               label: tc.testType,
               iterationCount: tc.subCycles.length,
@@ -500,6 +518,7 @@ export function buildFlowchart({
         position: { x: 0, y: 0 },
         data: {
           cycleId: cycle.id,
+          cycleType: 'pr_review_cycle',
           label: 'PR Review',
           iterationCount: cycle.phases?.length ?? 0,
           isCollapsed,
@@ -549,7 +568,7 @@ export function buildFlowchart({
             zIndex: 1,
             data: {
               cycleId: phaseId,
-              cycleType: 'pr_review',
+              cycleType: 'pr_review_phase',
               iterationNumber: phase.number,
               label: `Phase ${phase.number}`,
               iterationCount: phase.events.length + 1,
@@ -604,6 +623,7 @@ export function buildFlowchart({
         position: { x: 0, y: 0 },
         data: {
           cycleId: cycle.id,
+          cycleType: 'conversational_loop',
           label: 'Conversation',
           iterationCount: cycle.events?.length ?? 0,
           isCollapsed,
@@ -642,6 +662,45 @@ export function buildFlowchart({
           newNodes.push(endNode)
           leafChain.push({ id: endId, timestamp: cycle.endEvent.timestamp })
         }
+      }
+    } else if (cycle.type === 'review_iteration') {
+      // ── Standalone review iteration (orphaned — no parent review cycle) ──
+      // Rendered as a top-level iterationContainer so it gets expand/collapse
+      // and active-agent highlighting without requiring a parent cycle container.
+      const iterState = updatedCycles.get(cycle.id)
+      const iterCollapsed = iterState?.isCollapsed ?? false  // default: expanded at top level
+      updatedCycles.set(cycle.id, { isCollapsed: iterCollapsed })
+
+      newNodes.push({
+        id: cycle.id,
+        type: 'iterationContainer',
+        position: { x: 0, y: 0 },
+        data: {
+          cycleId: cycle.id,
+          cycleType: 'review_iteration',
+          iterationNumber: cycle.iterationNumber,
+          label: `Iteration ${cycle.iterationNumber}`,
+          iterationCount: cycle.events.length + 1,
+          isCollapsed: iterCollapsed,
+          containsActiveAgent: activeContainerIds.has(cycle.id),
+          onToggleCollapse: null, // injected by caller
+          startTime: cycle.startEvent?.timestamp,
+          summary: extractReviewIterationSummary(cycle, null),
+        },
+        style: iterCollapsed ? {} : { width: 0, height: 0 },
+        ...(iterCollapsed ? {} : { measured: { width: 1, height: 1 } }),
+        draggable: false,
+      })
+
+      if (iterCollapsed) {
+        leafChain.push({ id: cycle.id, timestamp: cycle.startEvent?.timestamp })
+      } else {
+        const allIterEvents = [cycle.startEvent, ...cycle.events]
+          .filter(Boolean)
+          .sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp))
+        allIterEvents.forEach(event => {
+          processEventToNode(event, cycle.id, cycle.id)
+        })
       }
     }
   })
@@ -773,6 +832,12 @@ export function findActiveContainerPath(model, activeTaskIds) {
     } else if (cycle.type === 'conversational_loop') {
       const loopEvents = [cycle.startEvent, ...(cycle.events ?? []), cycle.endEvent].filter(Boolean)
       if (hasActive(loopEvents)) {
+        result.add(cycle.id)
+      }
+    } else if (cycle.type === 'review_iteration') {
+      // Standalone orphaned iteration — no parent container, just check the iteration itself
+      const iterEvents = [cycle.startEvent, ...(cycle.events ?? [])].filter(Boolean)
+      if (hasActive(iterEvents)) {
         result.add(cycle.id)
       }
     }
