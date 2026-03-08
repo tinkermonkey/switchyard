@@ -200,6 +200,37 @@ export function extractPRReviewPhaseSummary(phase) {
   }
 }
 
+export function extractStatusProgressionSummary(cycle) {
+  try {
+    const startEvent = cycle.startEvent
+    const endEvent = cycle.endEvent
+    const fromStatus = startEvent?.inputs?.from_status ?? startEvent?.from_status ?? null
+    const toStatus = startEvent?.decision?.to_status ?? startEvent?.to_status ?? null
+    const trigger = startEvent?.inputs?.trigger ?? startEvent?.trigger ?? null
+
+    let status = 'progressing'
+    if (endEvent && !endEvent._inferred) {
+      if (endEvent.event_type === 'status_progression_failed') {
+        status = 'failed'
+      } else {
+        status = endEvent.success === false ? 'failed' : 'completed'
+      }
+    }
+
+    let durationSeconds = null
+    if (startEvent?.timestamp && endEvent?.timestamp && !endEvent._inferred) {
+      const startMs = new Date(startEvent.timestamp).getTime()
+      const endMs = new Date(endEvent.timestamp).getTime()
+      if (!isNaN(startMs) && !isNaN(endMs) && endMs > startMs)
+        durationSeconds = Math.round((endMs - startMs) / 1000)
+    }
+
+    return { fromStatus, toStatus, trigger, status, durationSeconds }
+  } catch {
+    return { fromStatus: null, toStatus: null, trigger: null, status: 'progressing', durationSeconds: null }
+  }
+}
+
 export function extractConversationalLoopSummary(cycle) {
   try {
     const endEvent = cycle.endEvent

@@ -311,4 +311,9 @@ export const HIDDEN_BY_DEFAULT_TYPES = new Set([
 
   // Conversational loop boundaries
   'conversationalLoopStarted',
+
+  // Status progression boundaries
+  'statusProgressionStarted',
+  'statusProgressionCompleted',
+  'statusProgressionFailed',
 ])

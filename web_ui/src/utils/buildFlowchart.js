@@ -26,6 +26,7 @@ import {
   extractPRReviewCycleSummary,
   extractPRReviewPhaseSummary,
   extractConversationalLoopSummary,
+  extractStatusProgressionSummary,
 } from './cycleSummaries.js'
 
 /**
@@ -99,7 +100,9 @@ export function buildFlowchart({
     const existing = existingCycles.get(cycle.id)
     updatedCycles.set(cycle.id, {
       ...cycle,
-      isCollapsed: existing?.isCollapsed ?? false,
+      // Use processEvents default (cycle.isCollapsed) when no user-persisted state exists.
+      // This lets individual cycle types set their own defaults (e.g. status_progression: true).
+      isCollapsed: existing?.isCollapsed ?? cycle.isCollapsed,
     })
   })
 
@@ -663,6 +666,52 @@ export function buildFlowchart({
           leafChain.push({ id: endId, timestamp: cycle.endEvent.timestamp })
         }
       }
+    } else if (cycle.type === 'status_progression') {
+      // ── Status progression container ─────────────────────────────────────
+      const spNode = {
+        id: cycle.id,
+        type: 'statusProgressionContainer',
+        position: { x: 0, y: 0 },
+        data: {
+          cycleId: cycle.id,
+          cycleType: 'status_progression',
+          label: 'Status Move',
+          iterationCount: cycle.events?.length ?? 0,
+          isCollapsed,
+          containsActiveAgent: activeContainerIds.has(cycle.id),
+          onToggleCollapse: null, // injected by caller
+          startTime: cycle.startEvent?.timestamp,
+          endTime: cycle.endEvent?.timestamp,
+          summary: extractStatusProgressionSummary(cycle),
+        },
+        style: isCollapsed ? {} : { width: 0, height: 0 },
+        ...(isCollapsed ? {} : { measured: { width: 1, height: 1 } }),
+        draggable: false,
+      }
+      newNodes.push(spNode)
+
+      if (isCollapsed) {
+        leafChain.push({ id: cycle.id, timestamp: cycle.startEvent?.timestamp })
+      } else {
+        // Start event → direct child, leftmost
+        if (cycle.startEvent) {
+          const startId = `${cycle.id}-start`
+          newNodes.push(makeDecisionNode(cycle.startEvent, startId, cycle.id))
+          leafChain.push({ id: startId, timestamp: cycle.startEvent.timestamp })
+        }
+
+        // Child events (flat)
+        ;(cycle.events ?? [])
+          .sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp))
+          .forEach(event => processEventToNode(event, cycle.id, cycle.id))
+
+        // End event → direct child, rightmost (skip if inferred)
+        if (cycle.endEvent && !cycle.endEvent._inferred) {
+          const endId = `${cycle.id}-end`
+          newNodes.push(makeDecisionNode(cycle.endEvent, endId, cycle.id))
+          leafChain.push({ id: endId, timestamp: cycle.endEvent.timestamp })
+        }
+      }
     } else if (cycle.type === 'review_iteration') {
       // ── Standalone review iteration (orphaned — no parent review cycle) ──
       // Rendered as a top-level iterationContainer so it gets expand/collapse
@@ -832,6 +881,11 @@ export function findActiveContainerPath(model, activeTaskIds) {
     } else if (cycle.type === 'conversational_loop') {
       const loopEvents = [cycle.startEvent, ...(cycle.events ?? []), cycle.endEvent].filter(Boolean)
       if (hasActive(loopEvents)) {
+        result.add(cycle.id)
+      }
+    } else if (cycle.type === 'status_progression') {
+      const spEvents = [cycle.startEvent, ...(cycle.events ?? []), cycle.endEvent].filter(Boolean)
+      if (hasActive(spEvents)) {
         result.add(cycle.id)
       }
     } else if (cycle.type === 'review_iteration') {

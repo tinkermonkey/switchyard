@@ -205,6 +205,79 @@ export function renderConversationalLoopSummary(data) {
   )
 }
 
+// ── Status progression renderer ───────────────────────────────────────────────
+
+const STATUS_COLORS = {
+  'In Progress':  { bg: 'rgba(59,130,246,0.15)', border: 'rgba(59,130,246,0.4)', text: '#93c5fd' },
+  'In Review':    { bg: 'rgba(147,51,234,0.15)', border: 'rgba(147,51,234,0.4)', text: '#c4b5fd' },
+  'Done':         { bg: 'rgba(16,185,129,0.15)', border: 'rgba(16,185,129,0.4)', text: '#6ee7b7' },
+  'Completed':    { bg: 'rgba(16,185,129,0.15)', border: 'rgba(16,185,129,0.4)', text: '#6ee7b7' },
+  'To Do':        { bg: 'rgba(107,114,128,0.15)', border: 'rgba(107,114,128,0.4)', text: '#9ca3af' },
+  'Backlog':      { bg: 'rgba(107,114,128,0.15)', border: 'rgba(107,114,128,0.4)', text: '#9ca3af' },
+  'Blocked':      { bg: 'rgba(239,68,68,0.15)',  border: 'rgba(239,68,68,0.4)',  text: '#fca5a5' },
+}
+
+function StatusPill({ label }) {
+  const fmt = str => str ? str.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase()) : '—'
+  const formatted = fmt(label)
+  const theme = STATUS_COLORS[formatted] ?? { bg: 'rgba(34,197,94,0.12)', border: 'rgba(34,197,94,0.35)', text: '#86efac' }
+  return (
+    <div style={{
+      background: theme.bg,
+      border: `1px solid ${theme.border}`,
+      borderRadius: 6,
+      padding: '4px 10px',
+      fontSize: 11,
+      color: theme.text,
+      fontWeight: 600,
+      whiteSpace: 'nowrap',
+      letterSpacing: '0.01em',
+    }}>
+      {formatted}
+    </div>
+  )
+}
+
+export function renderStatusProgressionSummary(data) {
+  const s = data.summary
+  if (!s) return null
+
+  const statusColor =
+    s.status === 'completed'  ? '#22c55e' :
+    s.status === 'failed'     ? '#ef4444' : '#86efac'
+
+  const statusLabel =
+    s.status === 'completed'  ? 'MOVED' :
+    s.status === 'failed'     ? 'FAILED' : 'MOVING…'
+
+  return (
+    <div style={{ padding: '10px 14px', display: 'flex', flexDirection: 'column', gap: 7 }}>
+      {/* From → To graphic */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+        <StatusPill label={s.fromStatus ?? '?'} />
+        <div style={{ fontSize: 16, color: '#22c55e', fontWeight: 700, lineHeight: 1, flexShrink: 0 }}>→</div>
+        <StatusPill label={s.toStatus ?? '?'} />
+        {s.durationSeconds != null && (
+          <span style={{ fontSize: 10, color: '#6b7280', marginLeft: 'auto' }}>
+            {fmtDur(s.durationSeconds)}
+          </span>
+        )}
+      </div>
+
+      {/* Status + trigger */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
+        <StatusDot color={statusColor} />
+        <span style={{ fontSize: 10, fontWeight: 700, color: statusColor }}>{statusLabel}</span>
+        {s.trigger && (
+          <span style={{ fontSize: 9, color: '#4b5563', marginLeft: 3 }}>
+            via {s.trigger.replace(/_/g, ' ')}
+          </span>
+        )}
+      </div>
+    </div>
+  )
+}
+
 // ── Level-2 renderers ─────────────────────────────────────────────────────────
 
 export function renderReviewIterationSummary(data) {

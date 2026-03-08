@@ -147,6 +147,23 @@ function groupPRReviewPhases(cycleEvents, boundary) {
 }
 
 /**
+ * Find status progression cycle boundaries.
+ * Each progression cycle is opened by status_progression_started and closed by
+ * status_progression_completed or status_progression_failed.
+ * Returns [{startEvent, endEvent}] — endEvent is null if in-progress.
+ */
+function findStatusProgressionCycles(sortedEvents) {
+  const starts = sortedEvents.filter(
+    e => e.event_category === 'decision' && e.event_type === 'status_progression_started'
+  )
+  const ends = sortedEvents.filter(
+    e => e.event_category === 'decision' &&
+         (e.event_type === 'status_progression_completed' || e.event_type === 'status_progression_failed')
+  )
+  return pairCycleEvents(starts, ends)
+}
+
+/**
  * Find conversational loop boundaries.
  * Each loop is opened by conversational_loop_started or conversational_loop_resumed
  * and closed by the next conversational_loop_paused.
@@ -527,7 +544,35 @@ function inferMissingCloseEvents(sortedEvents) {
     })
   }
 
-  // ── Phase 1c: Conversational loops ───────────────────────────────────────
+  // ── Phase 1c: Status progression cycles ──────────────────────────────────
+  {
+    const spStarts = sortedEvents.filter(
+      e => e.event_category === 'decision' && e.event_type === 'status_progression_started'
+    )
+    const spEnds = sortedEvents.filter(
+      e => e.event_category === 'decision' &&
+           (e.event_type === 'status_progression_completed' || e.event_type === 'status_progression_failed')
+    )
+    const usedSpEnds = new Set()
+    spStarts.forEach((start, idx) => {
+      const startMs = new Date(start.timestamp).getTime()
+      const nextStart = spStarts[idx + 1]
+      const nextStartMs = nextStart ? new Date(nextStart.timestamp).getTime() : Infinity
+      const matchedEnd = spEnds.find(
+        e => !usedSpEnds.has(e) &&
+             new Date(e.timestamp).getTime() > startMs &&
+             new Date(e.timestamp).getTime() <= nextStartMs
+      )
+      if (matchedEnd) { usedSpEnds.add(matchedEnd); return }
+      synthetic.push(makeSyntheticClose(
+        start,
+        'status_progression_completed',
+        closestUpperBound(startMs, nextStart ? nextStartMs : null)
+      ))
+    })
+  }
+
+  // ── Phase 1d: Conversational loops ───────────────────────────────────────
   {
     const loopOpens = sortedEvents.filter(
       e => e.event_category === 'decision' &&
@@ -798,6 +843,7 @@ export function processEvents(events, workflowConfig = null) {
   const repairCycleBoundaries = findRepairCycles(sorted)
   const prReviewCycleBoundaries = findPRReviewCycles(sorted)
   const conversationalLoopBoundaries = findConversationalLoops(sorted)
+  const statusProgressionBoundaries = findStatusProgressionCycles(sorted)
   const _t3 = performance.now()
 
   // Compute the earliest/latest cycle timestamps for prelude/postlude splitting
@@ -826,6 +872,13 @@ export function processEvents(events, workflowConfig = null) {
   })
 
   conversationalLoopBoundaries.forEach(({ startEvent, endEvent }) => {
+    const sMs = getMs(startEvent.timestamp)
+    const eMs = endEvent ? getMs(endEvent.timestamp) : Date.now()
+    firstCycleStartMs = Math.min(firstCycleStartMs, sMs)
+    lastCycleEndMs = Math.max(lastCycleEndMs, eMs)
+  })
+
+  statusProgressionBoundaries.forEach(({ startEvent, endEvent }) => {
     const sMs = getMs(startEvent.timestamp)
     const eMs = endEvent ? getMs(endEvent.timestamp) : Date.now()
     firstCycleStartMs = Math.min(firstCycleStartMs, sMs)
@@ -990,6 +1043,31 @@ export function processEvents(events, workflowConfig = null) {
       endEvent,
       events: childEvents,
       isCollapsed: false,
+    })
+  })
+
+  statusProgressionBoundaries.forEach((boundary, idx) => {
+    const { startEvent, endEvent } = boundary
+    const cycleStartMs = getMs(startEvent.timestamp)
+    const cycleEndMs = endEvent ? getMs(endEvent.timestamp) : Date.now()
+
+    const cycleEvents = sorted.filter(e => {
+      const t = getMs(e.timestamp)
+      return t >= cycleStartMs && t <= cycleEndMs
+    })
+
+    // Child events: everything inside the cycle window except the open/close markers
+    const childEvents = cycleEvents.filter(
+      e => e !== startEvent && e !== endEvent
+    )
+
+    cycles.push({
+      id: `status_progression_${idx + 1}`,
+      type: 'status_progression',
+      startEvent,
+      endEvent,
+      events: childEvents,
+      isCollapsed: true,  // default collapsed — quick operation, primary info is the summary
     })
   })
 

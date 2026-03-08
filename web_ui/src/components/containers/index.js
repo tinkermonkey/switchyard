@@ -10,6 +10,7 @@ export const containerNodeTypes = {
   repairCycleContainer:        CycleContainerNode,
   prReviewCycleContainer:      CycleContainerNode,
   conversationalLoopContainer: CycleContainerNode,
+  statusProgressionContainer:  CycleContainerNode,
 
   // Level 2 — iteration/phase containers (theme driven by data.cycleType)
   iterationContainer:          CycleContainerNode,

@@ -24,6 +24,7 @@ const CONTAINER_TYPES = new Set([
   'repairCycleContainer',
   'prReviewCycleContainer',
   'conversationalLoopContainer',
+  'statusProgressionContainer',
   'iterationContainer',
   'subCycleContainer',
   'cycleBounding',
@@ -183,7 +184,8 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
       n.type === 'reviewCycleContainer' ||
       n.type === 'repairCycleContainer' ||
       n.type === 'prReviewCycleContainer' ||
-      n.type === 'conversationalLoopContainer'
+      n.type === 'conversationalLoopContainer' ||
+      n.type === 'statusProgressionContainer'
     ) && !n.parentId
   )
   const iterContainers = nodes.filter(n => n.type === 'iterationContainer')
@@ -402,7 +404,7 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
       const width = cyclePadding * 2 + directColW + iterTotalWidth + iterSpacingTotal
       const height = containerHeaderHeight + cyclePadding * 2 + Math.max(maxIterHeight, directTotalH)
       cycleSizes.set(cc.id, { width: Math.max(width, 400), height: Math.max(height, 180) })
-    } else if (cc.type === 'conversationalLoopContainer') {
+    } else if (cc.type === 'conversationalLoopContainer' || cc.type === 'statusProgressionContainer') {
       // Layout: vertical stack of direct event children (start + child events + end)
       const numDirect = direct.length
       const directTotalH = numDirect > 0
@@ -431,7 +433,8 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
     type === 'reviewCycleContainer' ||
     type === 'repairCycleContainer' ||
     type === 'prReviewCycleContainer' ||
-    type === 'conversationalLoopContainer'
+    type === 'conversationalLoopContainer' ||
+    type === 'statusProgressionContainer'
   const isRootContainerType = (type) =>
     isRootCycleType(type) || type === 'iterationContainer'
 
@@ -565,7 +568,7 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
         })
         relX += iterSize.width + horizontalSpacing
       })
-    } else if (cc.type === 'conversationalLoopContainer') {
+    } else if (cc.type === 'conversationalLoopContainer' || cc.type === 'statusProgressionContainer') {
       // Vertical stack of all direct event children (start + child events + end)
       const ccSize = cycleSizes.get(cc.id) || { width: 300 }
       let childY = contentY
@@ -728,7 +731,8 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
     n => n.type === 'reviewCycleContainer' ||
          n.type === 'repairCycleContainer' ||
          n.type === 'prReviewCycleContainer' ||
-         n.type === 'conversationalLoopContainer'
+         n.type === 'conversationalLoopContainer' ||
+         n.type === 'statusProgressionContainer'
   ).map(n => positionedNodes.get(n.id) ?? n)
 
   const _clTEnd = performance.now()
