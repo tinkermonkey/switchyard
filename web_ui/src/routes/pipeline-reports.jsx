@@ -23,13 +23,18 @@ function PipelineReportsPage() {
 }
 
 export const Route = createFileRoute('/pipeline-reports')({
-  validateSearch: (search) => ({
-    project: typeof search.project === 'string' ? search.project : '',
-    board: typeof search.board === 'string' ? search.board : '',
-    outcome: typeof search.outcome === 'string' ? search.outcome : '',
-    page: Number(search.page) || 0,
-    sortCol: typeof search.sortCol === 'string' ? search.sortCol : 'started_at',
-    sortDir: search.sortDir === 'asc' ? 'asc' : 'desc',
-  }),
+  validateSearch: (search) => {
+    const pageSizeOptions = [20, 50, 100]
+    const parsedPageSize = Number(search.pageSize)
+    return {
+      project: typeof search.project === 'string' ? search.project : '',
+      board: typeof search.board === 'string' ? search.board : '',
+      outcome: typeof search.outcome === 'string' ? search.outcome : '',
+      page: Number(search.page) || 0,
+      pageSize: pageSizeOptions.includes(parsedPageSize) ? parsedPageSize : 20,
+      sortCol: typeof search.sortCol === 'string' ? search.sortCol : 'started_at',
+      sortDir: search.sortDir === 'asc' ? 'asc' : 'desc',
+    }
+  },
   component: PipelineReportsPage,
 })

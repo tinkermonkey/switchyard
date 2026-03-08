@@ -4,7 +4,7 @@ import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import Modal from './Modal'
 
-const PAGE_SIZE = 20
+const PAGE_SIZE_OPTIONS = [20, 50, 100]
 
 const PRIORITY_COLORS = {
   high: 'text-red-600 border-red-700/40 bg-white/20',
@@ -196,7 +196,7 @@ function Pagination({ page, total, pageSize, onPageChange }) {
 }
 
 export default function PipelineReports({ search, onSearchChange }) {
-  const { project, board, outcome, page, sortCol, sortDir } = search
+  const { project, board, outcome, page, pageSize, sortCol, sortDir } = search
 
   const [runs, setRuns] = useState([])
   const [total, setTotal] = useState(0)
@@ -227,7 +227,7 @@ export default function PipelineReports({ search, onSearchChange }) {
     setLoading(true)
     setError(null)
     try {
-      const params = new URLSearchParams({ limit: PAGE_SIZE, offset: page * PAGE_SIZE })
+      const params = new URLSearchParams({ limit: pageSize, offset: page * pageSize })
       if (project) params.set('project', project)
       if (board) params.set('board', board)
       if (outcome) params.set('outcome', outcome)
@@ -251,7 +251,7 @@ export default function PipelineReports({ search, onSearchChange }) {
     } finally {
       setLoading(false)
     }
-  }, [project, board, outcome, page, sortCol, sortDir])
+  }, [project, board, outcome, page, pageSize, sortCol, sortDir])
 
   useEffect(() => { fetchRuns() }, [fetchRuns])
 
@@ -327,6 +327,16 @@ export default function PipelineReports({ search, onSearchChange }) {
           <option value="">All Outcomes</option>
           {filterOptions.outcomes.map(o => <option key={o} value={o}>{o}</option>)}
         </select>
+        <div className="ml-auto flex items-center gap-2 text-sm text-gh-fg-muted">
+          <span>Per page</span>
+          <select
+            value={pageSize}
+            onChange={(e) => onSearchChange({ pageSize: Number(e.target.value), page: 0 })}
+            className="px-2 py-1.5 bg-gh-canvas-subtle border border-gh-border rounded text-sm text-gh-fg focus:outline-none focus:border-gh-accent-primary"
+          >
+            {PAGE_SIZE_OPTIONS.map(n => <option key={n} value={n}>{n}</option>)}
+          </select>
+        </div>
       </div>
 
       {/* Table */}
@@ -424,7 +434,7 @@ export default function PipelineReports({ search, onSearchChange }) {
       <Pagination
         page={page}
         total={total}
-        pageSize={PAGE_SIZE}
+        pageSize={pageSize}
         onPageChange={handlePageChange}
       />
 
