@@ -285,8 +285,10 @@ export default function PipelineFlowGraph({
     }
   }, [])
 
-  // Hide nodes marked defaultHidden (boundary/housekeeping events) and reroute edges
-  // around them so the sequential chain stays intact. Skipped when showAllNodes is true.
+  // Remove nodes marked defaultHidden (boundary/housekeeping events) and reroute edges
+  // around them so the sequential chain stays intact. Nodes are fully removed (not just
+  // marked hidden) so the layout engine never allocates space for them. Skipped when
+  // showAllNodes is true.
   const filteredRawBuild = useMemo(() => {
     if (!rawBuild || showAllNodes) return rawBuild
 
@@ -318,9 +320,7 @@ export default function PipelineFlowGraph({
 
     return {
       ...rawBuild,
-      nodes: rawBuild.nodes.map(node =>
-        node.data?.defaultHidden ? { ...node, hidden: true } : node
-      ),
+      nodes: rawBuild.nodes.filter(node => !node.data?.defaultHidden),
       edges: newEdges,
     }
   }, [rawBuild, showAllNodes])

@@ -206,8 +206,6 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
 
   // Visible-only subsets — hidden nodes are excluded from sizing and positioning
   // so containers are correctly sized around what is actually rendered.
-  // Hidden nodes are still passed through in the collect phase at their default
-  // position {x:0, y:0} so React Flow can handle edge routing.
   const grandchildren = allGrandchildren.filter(n => !n.hidden)
   const directCycleChildren = allDirectCycleChildren.filter(n => !n.hidden)
   const subCycleLeaves = allSubCycleLeaves.filter(n => !n.hidden)
