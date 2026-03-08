@@ -5416,6 +5416,25 @@ _Repair cycle initiated by Claude Code Orchestrator_
 
             if not container_name:
                 logger.error(f"Failed to launch repair cycle container for issue #{issue_number}")
+                try:
+                    self.pipeline_run_manager.end_pipeline_run(
+                        project=project_name,
+                        issue_number=issue_number,
+                        reason="Repair cycle container launch failed"
+                    )
+                except Exception as cleanup_e:
+                    logger.error(f"Failed to end pipeline run after container launch failure: {cleanup_e}")
+                try:
+                    work_execution_tracker.record_execution_outcome(
+                        issue_number=issue_number,
+                        column=status,
+                        agent=stage_config.default_agent,
+                        outcome='failure',
+                        project_name=project_name,
+                        error="Repair cycle container launch failed"
+                    )
+                except Exception as cleanup_e:
+                    logger.error(f"Failed to record execution failure after container launch: {cleanup_e}")
                 return None
 
             # Register container in Redis
@@ -5462,6 +5481,28 @@ _Repair cycle initiated by Claude Code Orchestrator_
             logger.error(f"Error starting repair cycle: {e}")
             import traceback
             logger.error(traceback.format_exc())
+            # Best-effort cleanup: end the pipeline run and record failure if we got far enough
+            try:
+                if 'pipeline_run' in dir():
+                    self.pipeline_run_manager.end_pipeline_run(
+                        project=project_name,
+                        issue_number=issue_number,
+                        reason=f"Repair cycle startup error: {e}"
+                    )
+            except Exception as cleanup_e:
+                logger.error(f"Failed to end pipeline run after repair cycle error: {cleanup_e}")
+            try:
+                if 'stage_config' in dir() and 'work_execution_tracker' in dir():
+                    work_execution_tracker.record_execution_outcome(
+                        issue_number=issue_number,
+                        column=status,
+                        agent=stage_config.default_agent,
+                        outcome='failure',
+                        project_name=project_name,
+                        error=f"Repair cycle startup error: {e}"
+                    )
+            except Exception as cleanup_e:
+                logger.error(f"Failed to record execution failure after repair cycle error: {cleanup_e}")
             return None
 
     def _reconcile_active_runs(self):
@@ -6074,6 +6115,13 @@ _Repair cycle initiated by Claude Code Orchestrator_
             # Get workflow template to identify exit columns
             workflow_template = config_manager.get_workflow_template(pipeline_config.workflow)
             exit_columns = set(getattr(workflow_template, 'pipeline_exit_columns', None) or [])
+            # Columns with no agent configured (e.g. Backlog) — issues here are idle, not stalled.
+            # We only flag them if they still have an orphaned active pipeline run.
+            no_agent_columns = set()
+            if hasattr(workflow_template, 'columns') and workflow_template.columns:
+                for col in workflow_template.columns:
+                    if not getattr(col, 'agent', None) or col.agent == 'null':
+                        no_agent_columns.add(col.name)
 
             # Use cached items if provided, otherwise fetch from GitHub
             if cached_items is not None:
@@ -6171,8 +6219,12 @@ _Repair cycle initiated by Claude Code Orchestrator_
                             # else: ES returned an event older than grace_period — the run
                             # has genuinely stalled (started_at fallback intentionally skipped).
 
-                        # If we get here: no active run OR run with no recent activity
-                        # This is a stalled issue
+                        # If we get here: no active run OR run with no recent activity.
+                        # Issues in no-agent columns (e.g. Backlog) with NO active run are simply
+                        # idle — not stalled. Only flag them when there's an orphaned active run
+                        # that genuinely needs cleanup.
+                        if not pipeline_run and column in no_agent_columns:
+                            continue
                         stalled_issues.append({
                             'issue_number': issue_number,
                             'column': column,

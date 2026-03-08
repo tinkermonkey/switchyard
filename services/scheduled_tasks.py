@@ -145,6 +145,15 @@ class ScheduledTasksService:
             replace_existing=True
         )
 
+        # Schedule zombie pipeline run cleanup - every 30 minutes
+        self.scheduler.add_job(
+            self._cleanup_zombie_pipeline_runs,
+            trigger=IntervalTrigger(minutes=30),
+            id='zombie_pipeline_run_cleanup',
+            name='Cleanup zombie pipeline runs (active in ES, no container)',
+            replace_existing=True
+        )
+
         self.scheduler.start()
         self.running = True
         logger.info("Scheduled tasks service started")
@@ -159,6 +168,7 @@ class ScheduledTasksService:
         logger.info("- Project metrics rollup: Daily at 3:30 AM")
         logger.info(f"- Project metrics backfill: Once at startup in ~{jitter_seconds:.0f}s")
         logger.info(f"- Pipeline analysis catchup: Once at startup in ~{analysis_startup_jitter:.0f}s, then every 10 min")
+        logger.info("- Zombie pipeline run cleanup: Every 30 minutes")
 
     def stop(self):
         """Stop the scheduler"""
@@ -784,6 +794,26 @@ class ScheduledTasksService:
 
         except Exception as e:
             logger.error(f"pipeline_run_analysis: error in catch-up scan: {e}", exc_info=True)
+
+    async def _cleanup_zombie_pipeline_runs(self):
+        """Clean up zombie pipeline runs using PipelineWatchdog."""
+        try:
+            from services.pipeline_watchdog import get_pipeline_watchdog
+            loop = asyncio.get_event_loop()
+            watchdog = get_pipeline_watchdog()
+            results = await loop.run_in_executor(None, watchdog.check_for_zombie_runs)
+            if results.get('zombies_cleaned', 0) > 0:
+                logger.info(
+                    f"Zombie pipeline run cleanup: {results['zombies_cleaned']} "
+                    f"cleaned of {results['zombies_found']} found"
+                )
+            else:
+                logger.info(
+                    f"Zombie pipeline run cleanup: none found "
+                    f"(checked {results.get('checked', 0)} active runs)"
+                )
+        except Exception as e:
+            logger.error(f"Zombie pipeline run cleanup failed: {e}", exc_info=True)
 
     def run_cleanup_now(self):
         """Run cleanup task immediately (for testing/manual trigger)"""
