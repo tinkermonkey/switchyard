@@ -1327,14 +1327,16 @@ def get_completed_pipeline_runs():
         if sort_dir not in ('asc', 'desc'):
             sort_dir = 'desc'
 
-        # Map frontend column names to ES field names
+        # Map frontend column names to ES field names.
+        # project/board/outcome are already mapped as "keyword" type in the index
+        # template (pipeline_run.py), so no .keyword sub-field exists.
         _sort_field_map = {
             'started_at': 'started_at',
             'ended_at': 'ended_at',
             'issue_number': 'issue_number',
-            'project': 'project.keyword',
-            'board': 'board.keyword',
-            'outcome': 'outcome.keyword',
+            'project': 'project',
+            'board': 'board',
+            'outcome': 'outcome',
         }
         es_sort_field = _sort_field_map.get(sort_col, 'ended_at')
 

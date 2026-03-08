@@ -233,11 +233,13 @@ export default function PipelineReports({ search, onSearchChange }) {
       } else {
         setError(data.error || 'Failed to load pipeline runs')
         setRuns([])
+        setTotal(0)
       }
     } catch (err) {
       console.error('[PipelineReports] fetch error:', err)
       setError('Network error — could not load pipeline runs')
       setRuns([])
+      setTotal(0)
     } finally {
       setLoading(false)
     }
