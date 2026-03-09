@@ -79,11 +79,11 @@ REPAIR_CYCLE_RECOVERY_TEMPLATE = {
 
 class AgentContainerRecovery:
     """Manages recovery of agent containers after orchestrator restart"""
-    
+
     def __init__(self, redis_client: Optional[redis.Redis] = None):
         """
         Initialize container recovery service
-        
+
         Args:
             redis_client: Redis client for tracking
         """
@@ -95,6 +95,19 @@ class AgentContainerRecovery:
                 port=6379,
                 decode_responses=True
             )
+
+        # Record the time this orchestrator process started.  Any container
+        # created AFTER this timestamp was launched by the current process and
+        # is therefore NOT an orphan from a previous crashed run — skip it.
+        import psutil
+        try:
+            self._process_start_time = datetime.utcfromtimestamp(
+                psutil.Process().create_time()
+            )
+        except Exception:
+            # Fallback: treat "now" as start time — adds a small grace window
+            # but is still safer than monitoring freshly-launched containers.
+            self._process_start_time = datetime.utcnow()
     
     def get_running_agent_containers(self) -> List[Dict[str, str]]:
         """
@@ -511,9 +524,25 @@ class AgentContainerRecovery:
                             self.cleanup_execution_state(project, issue_number, agent, "container_timeout")
                         killed += 1
                         continue
+
+                    # Skip containers created AFTER this orchestrator process started.
+                    # Those were launched by the current process and are already being
+                    # monitored by their own execution path — attaching a second monitoring
+                    # thread causes a race condition (double GitHub post, double review
+                    # cycle processing).
+                    if created_dt > self._process_start_time:
+                        logger.info(
+                            f"Skipping {container_name}: created after orchestrator startup "
+                            f"({created_dt.isoformat()} > {self._process_start_time.isoformat()}), "
+                            f"already monitored by active execution path"
+                        )
+                        recovered_task_ids.add(task_id)  # Still count as active
+                        recovered += 1
+                        continue
+
                 except Exception as e:
                     logger.warning(f"Could not parse container age: {e}")
-                
+
                 # Container looks valid - reconnect monitoring
                 logger.info(
                     f"Container {container_name} appears valid, reconnecting monitoring"

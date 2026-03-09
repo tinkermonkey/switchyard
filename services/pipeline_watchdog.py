@@ -291,7 +291,8 @@ class PipelineWatchdog:
             ended = self.pipeline_run_manager.end_pipeline_run(
                 project=project,
                 issue_number=issue_number,
-                reason=f"Zombie pipeline run cleanup (started: {started_at}, no container found)"
+                reason=f"Zombie pipeline run cleanup (started: {started_at}, no container found)",
+                outcome="failed"
             )
 
             if ended:
@@ -313,6 +314,23 @@ class PipelineWatchdog:
                     f"Lock was not held for {project} issue #{issue_number} "
                     f"during zombie cleanup (may have already been released)"
                 )
+
+        # Remove any stale review cycle state so it doesn't block future runs
+        try:
+            from services.review_cycle import get_review_cycle_executor
+            review_cycle_executor = get_review_cycle_executor()
+            cycle_state = review_cycle_executor.active_cycles.get(issue_number)
+            if cycle_state is None:
+                # Also check disk (cycle may not be in-memory after a restart)
+                all_cycles = review_cycle_executor._load_active_cycles(project)
+                cycle_state = next((c for c in all_cycles if c.issue_number == issue_number), None)
+            if cycle_state:
+                review_cycle_executor._remove_cycle_state(cycle_state)
+                if issue_number in review_cycle_executor.active_cycles:
+                    del review_cycle_executor.active_cycles[issue_number]
+                logger.info(f"Removed stale review cycle state for {project} issue #{issue_number} during zombie cleanup")
+        except Exception as e:
+            logger.warning(f"Failed to clean up review cycle state during zombie cleanup for {project} issue #{issue_number}: {e}")
 
         # Log cleanup event to observability
         try:

@@ -754,8 +754,9 @@ class ReviewCycleExecutor:
                             recovery_action="Review cycle terminated, GitHub comment posted"
                         )
 
-                    # Clean up on error
+                    # Clean up on error (both in-memory and on-disk)
                     if issue_number in self.active_cycles:
+                        self._remove_cycle_state(self.active_cycles[issue_number])
                         del self.active_cycles[issue_number]
 
                     # End the pipeline run if it exists
@@ -767,7 +768,8 @@ class ReviewCycleExecutor:
                                 project_name,
                                 issue_number,
                                 reason=f"review_cycle_failed: {str(e)[:100]}",
-                                retain_lock=True
+                                retain_lock=True,
+                                outcome="failed"
                             )
                             logger.info(f"Ended pipeline run {existing_cycle.pipeline_run_id} due to review cycle failure")
                         except Exception as prm_error:
@@ -893,6 +895,7 @@ class ReviewCycleExecutor:
             if isinstance(e, CancellationError):
                 logger.info(f"Review cycle cancelled for issue #{issue_number}: {e}")
                 if issue_number in self.active_cycles:
+                    self._remove_cycle_state(self.active_cycles[issue_number])
                     del self.active_cycles[issue_number]
                 raise
 
@@ -908,8 +911,9 @@ class ReviewCycleExecutor:
                     recovery_action="Review cycle terminated, GitHub error comment posted"
                 )
 
-            # Clean up on error
+            # Clean up on error (both in-memory and on-disk)
             if issue_number in self.active_cycles:
+                self._remove_cycle_state(self.active_cycles[issue_number])
                 del self.active_cycles[issue_number]
 
             # Post error comment (workspace-aware)
@@ -1098,12 +1102,33 @@ class ReviewCycleExecutor:
                     'output': maker_output,
                     'timestamp': datetime.now().isoformat()
                 })
-                # Do not increment iteration here - let the review loop handle it
-                # cycle_state.current_iteration += 1
+                # Do not increment iteration here - _execute_review_loop increments at the top
+                # of each iteration, so current_iteration stays at N and the loop will run N+1.
                 cycle_state.status = 'initialized'
                 self._save_cycle_state(cycle_state)
 
-                logger.info(f"Maker completed revision, ready for iteration {cycle_state.current_iteration + 1}")
+                logger.info(
+                    f"Maker completed revision (recovery path), continuing directly to "
+                    f"iteration {cycle_state.current_iteration + 1}"
+                )
+
+                # Continue directly rather than waiting for resume_active_cycles.
+                # The lock is already held by the caller (process_recovered_reviewer_output)
+                # and _execute_review_loop does not acquire it, so this is safe.
+                if cycle_state.current_iteration < cycle_state.max_iterations:
+                    result = await self._execute_review_loop(cycle_state, column, issue_data, org)
+                    if result:
+                        _, next_col_name = result
+                        if next_col_name and next_col_name != column.name:
+                            await self._advance_issue_after_review_approval(
+                                cycle_state, column.name, next_col_name
+                            )
+                else:
+                    logger.warning(
+                        f"Max iterations ({cycle_state.max_iterations}) reached after recovery-path "
+                        f"maker run for issue #{cycle_state.issue_number}. Escalating."
+                    )
+                    await self._escalate_max_iterations(cycle_state, self.review_parser.parse_review(review_output))
 
             elif review_result.status == ReviewStatus.BLOCKED:
                 logger.info(f"Review blocked, escalating")
@@ -1843,8 +1868,11 @@ class ReviewCycleExecutor:
                 cycle_state.project_name
             )
 
-            # Get reviewer's output from context (avoids GitHub API timing issues)
-            review_comment = reviewer_context.get('markdown_review', '')
+            # Get reviewer's output from context (avoids GitHub API timing issues).
+            # Guard against a non-dict return (e.g. "" from a validation failure in the
+            # docker runner) — treat it as no inline output and fall through to the GitHub
+            # fetch below rather than crashing with AttributeError.
+            review_comment = reviewer_context.get('markdown_review', '') if isinstance(reviewer_context, dict) else ''
 
             # Fallback: if no markdown_review in context, fetch from GitHub
             if not review_comment:
