@@ -317,8 +317,7 @@ class PipelineWatchdog:
 
         # Remove any stale review cycle state so it doesn't block future runs
         try:
-            from services.review_cycle import get_review_cycle_executor
-            review_cycle_executor = get_review_cycle_executor()
+            from services.review_cycle import review_cycle_executor
             cycle_state = review_cycle_executor.active_cycles.get(issue_number)
             if cycle_state is None:
                 # Also check disk (cycle may not be in-memory after a restart)
