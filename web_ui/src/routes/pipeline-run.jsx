@@ -128,7 +128,6 @@ function PipelineRunView() {
     setCompletedPipelineRuns([])
     setCompletedLoadedCount(0)
     setHasMoreCompleted(true)
-    setFilterOptions({ projects: [], boards: [], outcomes: [] })
     fetchCompletedPipelineRuns(0, false, null, activeFilters)
   }, [activeFilters]) // eslint-disable-line react-hooks/exhaustive-deps
 
