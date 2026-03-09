@@ -949,7 +949,7 @@ export function processEvents(events, workflowConfig = null) {
       endEvent,
       iterations,
       events: reviewResiduals,
-      isCollapsed: false,
+      isCollapsed: true,
     })
   })
 
@@ -982,7 +982,7 @@ export function processEvents(events, workflowConfig = null) {
       endEvent,
       testCycles,
       events: residualEvents,
-      isCollapsed: false,
+      isCollapsed: true,
     })
   })
 
@@ -1015,7 +1015,7 @@ export function processEvents(events, workflowConfig = null) {
       endEvent,
       phases,
       events: prResiduals,
-      isCollapsed: false,
+      isCollapsed: true,
     })
   })
 
@@ -1042,7 +1042,7 @@ export function processEvents(events, workflowConfig = null) {
       startEvent,
       endEvent,
       events: childEvents,
-      isCollapsed: false,
+      isCollapsed: true,
     })
   })
 
@@ -1114,7 +1114,7 @@ export function processEvents(events, workflowConfig = null) {
         events,
         agentExecutions: iterAgentExecs,
         iterationNumber: idx + 1,
-        isCollapsed: false,
+        isCollapsed: true,
       })
     })
   }

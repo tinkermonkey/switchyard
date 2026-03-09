@@ -198,9 +198,8 @@ export default function PipelineFlowGraph({
 
     const newCycleMap = new Map()
     model.cycles.forEach(cycle => {
-      // Use each cycle's own default (from processEvents) so types like
-      // status_progression (isCollapsed: true) start collapsed out of the box.
-      newCycleMap.set(cycle.id, { isCollapsed: cycle.isCollapsed ?? false })
+      // All cycles start collapsed; processEvents sets isCollapsed: true for all types.
+      newCycleMap.set(cycle.id, { isCollapsed: cycle.isCollapsed ?? true })
     })
 
     const prevCycles = cyclesRef.current

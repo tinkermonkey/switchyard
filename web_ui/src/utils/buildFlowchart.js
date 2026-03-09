@@ -260,7 +260,7 @@ export function buildFlowchart({
   // ── 4. Cycles ─────────────────────────────────────────────────────────────
   cycles.forEach(cycle => {
     const cycleState = updatedCycles.get(cycle.id)
-    const isCollapsed = cycleState?.isCollapsed ?? false
+    const isCollapsed = cycleState?.isCollapsed ?? true
 
     if (cycle.type === 'review_cycle') {
       // ── Review cycle container ──────────────────────────────────────────
