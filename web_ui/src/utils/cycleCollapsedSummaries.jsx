@@ -374,6 +374,10 @@ export function renderRepairTestCycleSummary(data, isDark) {
   const testTypeColor = isDark ? '#fcd34d' : '#92400e'
   const systemicColor = isDark ? '#a78bfa' : '#7c3aed'
 
+  const tr = s.testResultRow
+  const hasTestResult = tr && (tr.passedCount != null || tr.failedCount != null)
+  const hasFooter = (s.filesFixed != null && s.filesFixed > 0) || s.iterationsUsed != null
+
   return (
     <div style={{ padding: '8px 12px', display: 'flex', flexDirection: 'column', gap: 3 }}>
       {/* Header row: pass/fail + type + duration */}
@@ -389,32 +393,36 @@ export function renderRepairTestCycleSummary(data, isDark) {
         )}
       </div>
 
-      <Sep isDark={isDark} />
-
-      {/* Test counts */}
-      {s.testResultRow && (s.testResultRow.passedCount != null || s.testResultRow.failedCount != null) && (
-        <div style={{ fontSize: 10, color: secondary }}>
-          {'Tests: '}
-          {s.testResultRow.passedCount != null && (
-            <span style={{ color: isDark ? '#10b981' : '#047857' }}>{s.testResultRow.passedCount} pass</span>
+      {/* BigNum test counts: N pass | N fail | N warn */}
+      {hasTestResult && (
+        <div style={{ display: 'flex', gap: 10 }}>
+          {tr.passedCount != null && (
+            <BigNum value={tr.passedCount} label="pass" color={isDark ? '#34d399' : '#047857'} isDark={isDark} />
           )}
-          {s.testResultRow.passedCount != null && s.testResultRow.failedCount != null && ' / '}
-          {s.testResultRow.failedCount != null && (
-            <span style={{ color: isDark ? '#ef4444' : '#dc2626' }}>{s.testResultRow.failedCount} fail</span>
+          {tr.failedCount != null && (
+            <BigNum
+              value={tr.failedCount}
+              label="fail"
+              color={(tr.failedCount ?? 0) > 0 ? (isDark ? '#f87171' : '#dc2626') : (isDark ? '#6ee7b7' : '#047857')}
+              isDark={isDark}
+            />
           )}
-          {s.testResultRow.warningsCount != null && (
-            <>{' / '}<span style={{ color: isDark ? '#f59e0b' : '#d97706' }}>{s.testResultRow.warningsCount} warn</span></>
+          {tr.warningsCount != null && (
+            <BigNum value={tr.warningsCount} label="warn" color={isDark ? '#fcd34d' : '#92400e'} isDark={isDark} />
           )}
         </div>
       )}
 
-      {/* Files fixed + iterations */}
-      {((s.filesFixed != null && s.filesFixed > 0) || s.iterationsUsed != null) && (
-        <div style={{ fontSize: 10, color: secondary }}>
-          {s.filesFixed != null && s.filesFixed > 0 && `${s.filesFixed} files fixed`}
-          {s.filesFixed != null && s.filesFixed > 0 && s.iterationsUsed != null && ' · '}
-          {s.iterationsUsed != null && `${s.iterationsUsed} iter${s.iterationsUsed !== 1 ? 's' : ''}`}
-        </div>
+      {/* Footer: files fixed + iterations */}
+      {hasFooter && (
+        <>
+          <Sep isDark={isDark} />
+          <div style={{ fontSize: 10, color: secondary }}>
+            {s.filesFixed != null && s.filesFixed > 0 && `${s.filesFixed} files fixed`}
+            {s.filesFixed != null && s.filesFixed > 0 && s.iterationsUsed != null && ' · '}
+            {s.iterationsUsed != null && `${s.iterationsUsed} iter${s.iterationsUsed !== 1 ? 's' : ''}`}
+          </div>
+        </>
       )}
 
       {s.hadSystemicFix && (
@@ -487,18 +495,19 @@ export function renderTestExecutionSummary(data, isDark) {
 
   const failures = s.failuresList ?? []
 
-  const passColor = isDark ? '#6ee7b7' : '#047857'
-  const failColor = isDark ? '#f87171' : '#dc2626'
-  const muted     = isDark ? '#7d8590' : '#6e7781'
+  const passColor    = isDark ? '#6ee7b7' : '#047857'
+  const failNumColor = failed > 0 ? (isDark ? '#f87171' : '#dc2626') : (isDark ? '#6ee7b7' : '#047857')
+  const failColor    = isDark ? '#f87171' : '#dc2626'
+  const muted        = isDark ? '#7d8590' : '#6e7781'
 
   return (
     <div style={{ padding: '8px 12px', display: 'flex', flexDirection: 'column', gap: 4 }}>
-      {/* Pass / fail counts + pct */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 11 }}>
-        <span style={{ color: passColor, fontWeight: 700 }}>✓ {passed}</span>
-        <span style={{ color: failColor, fontWeight: 700 }}>✗ {failed}</span>
+      {/* Pass / fail BigNums + pct */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+        <BigNum value={passed} label="pass" color={passColor} isDark={isDark} />
+        <BigNum value={failed} label="fail" color={failNumColor} isDark={isDark} />
         {total > 0 && (
-          <span style={{ color: muted, marginLeft: 'auto' }}>
+          <span style={{ fontSize: 14, fontWeight: 700, color: muted, marginLeft: 'auto', alignSelf: 'center' }}>
             {Math.round(pct)}%
           </span>
         )}
@@ -507,16 +516,26 @@ export function renderTestExecutionSummary(data, isDark) {
       {/* Progress bar */}
       <Bar pct={pct} color="#10b981" isDark={isDark} />
 
-      {/* Failure list */}
+      {/* Failure list: test name (red) + file basename (gray) */}
       {failures.length > 0 && (
         <>
           <Sep isDark={isDark} />
           {failures.slice(0, 3).map((f, i) => {
-            const label = typeof f === 'string' ? f : (f.name ?? f.test ?? String(f))
-            const basename = label.includes('/') ? label.split('/').pop() : label
+            const rawName = typeof f === 'string' ? f : (f.name ?? f.test ?? String(f))
+            // Extract method name after '::' (Python test pattern), fallback to full name
+            const testLabel = rawName.includes('::') ? rawName.split('::').pop() : rawName
+            const filePath = typeof f === 'object' ? (f.file ?? f.path ?? null) : null
+            const fileBase = filePath ? filePath.split('/').pop() : null
             return (
-              <div key={i} style={{ fontSize: 10, color: failColor }}>
-                · <span style={{ color: muted }}>{basename}</span>
+              <div key={i} style={{ display: 'flex', flexDirection: 'column', gap: 1, minWidth: 0 }}>
+                <div style={{ fontSize: 10, color: failColor, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  {testLabel}
+                </div>
+                {fileBase && (
+                  <div style={{ fontSize: 10, color: muted, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    · {fileBase}
+                  </div>
+                )}
               </div>
             )
           })}
