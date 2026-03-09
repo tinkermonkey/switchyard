@@ -13,7 +13,7 @@ import SmartPipelineEdge from './SmartPipelineEdge'
 import { containerNodeTypes } from './containers/index.js'
 import { eventNodeTypes } from './nodes/index.js'
 import { toggleCycleCollapsed } from '../utils/cycleLayout'
-import { buildFlowchart as buildFlowchartUtil } from '../utils/buildFlowchart'
+import { buildFlowchart as buildFlowchartUtil, findActiveContainerPath } from '../utils/buildFlowchart'
 import { processEvents } from '../utils/eventProcessing/index.js'
 
 /**
@@ -136,6 +136,12 @@ export default function PipelineFlowGraph({
   const cyclesRef = useRef(new Map())
   useEffect(() => { cyclesRef.current = cycles }, [cycles])
 
+  // Track containers the user explicitly opened so auto-collapse won't override them.
+  const userOpenedCyclesRef = useRef(new Set())
+  // Track which containers were last auto-expanded so we can auto-collapse them when
+  // the active agent moves away or finishes.
+  const prevAutoOpenedRef = useRef(new Set())
+
   // Internally computed rawBuild (unpositioned nodes + edges from buildFlowchart).
   const [rawBuild, setRawBuild] = useState(null)
   // Throttle ref for rawBuild updates (≤ 2/sec during heavy socket activity)
@@ -159,6 +165,8 @@ export default function PipelineFlowGraph({
   useEffect(() => {
     setCycles(new Map())
     cyclesRef.current = new Map()
+    userOpenedCyclesRef.current = new Set()
+    prevAutoOpenedRef.current = new Set()
   }, [selectedRunId])
 
   // Build raw (unpositioned) flowchart — pure, returns result
@@ -191,6 +199,8 @@ export default function PipelineFlowGraph({
   }, [graphEvents, allEvents, selectedPipelineRun, workflowConfig, cycles])
 
   // Detect and update cycles when events change, preserving any user toggle state.
+  // Auto-expands the hierarchy path leading to any in-progress agent, and auto-collapses
+  // containers that were previously auto-expanded but are no longer on the active path.
   useEffect(() => {
     if (!graphEvents || !graphEvents.length) return
 
@@ -208,6 +218,37 @@ export default function PipelineFlowGraph({
       if (merged.has(id)) merged.get(id).isCollapsed = prev.isCollapsed
       else merged.set(id, prev)
     })
+
+    // Determine which containers are on the active-agent path.
+    const activeTaskIds = new Set()
+    model.agentExecutions.forEach(executions => {
+      executions.forEach(exec => {
+        if (exec.status === 'running') activeTaskIds.add(exec.taskId)
+      })
+    })
+    const activeContainerIds = findActiveContainerPath(model, activeTaskIds)
+    const prevAutoOpened = prevAutoOpenedRef.current
+
+    // Auto-expand containers on the active path (unless already expanded).
+    activeContainerIds.forEach(id => {
+      const current = merged.get(id)
+      if (!current || current.isCollapsed) {
+        merged.set(id, { ...(current ?? {}), isCollapsed: false })
+      }
+    })
+
+    // Auto-collapse containers that were previously auto-opened but are no longer on
+    // the active path — skip any that the user explicitly opened.
+    prevAutoOpened.forEach(id => {
+      if (!activeContainerIds.has(id) && !userOpenedCyclesRef.current.has(id)) {
+        const current = merged.get(id)
+        if (current && !current.isCollapsed) {
+          merged.set(id, { ...current, isCollapsed: true })
+        }
+      }
+    })
+
+    prevAutoOpenedRef.current = activeContainerIds
 
     cyclesRef.current = merged
     setCycles(merged)
@@ -370,9 +411,17 @@ export default function PipelineFlowGraph({
   const handleToggleWithTracking = useCallback((cycleId) => {
     // Pre-update the ref synchronously so buildRawFlowchart reads the correct value
     // when the rebuild effect fires (same pattern as the cycles detection effect).
+    const currentlyCollapsed = cyclesRef.current.get(cycleId)?.isCollapsed ?? true
     const newCycles = toggleCycleCollapsed(cyclesRef.current, cycleId)
     cyclesRef.current = newCycles
     setCycles(newCycles)
+
+    // Record user intent: remember explicitly opened containers; forget explicitly closed ones.
+    if (currentlyCollapsed) {
+      userOpenedCyclesRef.current.add(cycleId)      // user expanding → protect from auto-collapse
+    } else {
+      userOpenedCyclesRef.current.delete(cycleId)   // user collapsing → allow auto-expand again
+    }
   }, []) // stable — reads all mutable state via refs
 
   // Inject draggable/toggle callbacks after layout — passed to LayoutController
