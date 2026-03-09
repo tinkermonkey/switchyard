@@ -38,7 +38,7 @@ export function CycleContainer({ data, theme }) {
 
   const {
     borderColor,
-    borderStyle = 'dashed',
+    borderStyle = 'solid',
     bgColor,
     cornerColor,
     icon: Icon,
@@ -62,11 +62,11 @@ export function CycleContainer({ data, theme }) {
   // The layout engine uses measured.height (not style.height) for handle positioning.
   if (isCollapsed) {
     const headerStyle = {
-      display: 'flex', alignItems: 'center', gap: 8,
-      padding: '6px 12px', height: 30,
+      display: 'flex', alignItems: 'center', gap: 6,
+      padding: '0 10px', height: 28,
       background: `${borderColor}e6`,
       color: 'white', borderRadius: '10px 10px 0 0',
-      fontSize: 13, fontWeight: 600,
+      fontSize: 11, fontWeight: 600,
       cursor: isToggleable ? 'pointer' : 'default',
       userSelect: 'none',
     }
@@ -76,8 +76,7 @@ export function CycleContainer({ data, theme }) {
           width: collapsedWidth,
           display: 'flex',
           flexDirection: 'column',
-          border: `2px ${borderStyle}`,
-          borderColor,
+          border: `2px ${borderStyle} ${borderColor}`,
           borderRadius: '12px',
           background: bgColor,
           position: 'relative',
@@ -100,14 +99,9 @@ export function CycleContainer({ data, theme }) {
           onMouseLeave={isToggleable ? e => (e.currentTarget.style.background = `${borderColor}e6`) : undefined}
           style={headerStyle}
         >
-          <Icon className="w-4 h-4" />
-          <span style={{ flex: 1 }}>{label}</span>
-          {iterationCount > 0 && (
-            <span style={{ fontSize: 11, opacity: 0.9 }}>
-              {iterationCount} {countSuffix}{iterationCount !== 1 ? 's' : ''}
-            </span>
-          )}
-          {isToggleable && <ChevronRight className="w-4 h-4" />}
+          <Icon style={{ width: 13, height: 13 }} />
+          <span>{label}</span>
+          {isToggleable && <ChevronRight style={{ width: 13, height: 13 }} />}
         </div>
         {(() => {
           const customBody = renderCollapsedSummary ? renderCollapsedSummary(data) : null
@@ -139,8 +133,7 @@ export function CycleContainer({ data, theme }) {
       style={{
         width: '100%',
         height: '100%',
-        border: `2px ${borderStyle}`,
-        borderColor,
+        border: `2px ${borderStyle} ${borderColor}`,
         borderRadius: '12px',
         background: bgColor,
         position: 'relative',
@@ -175,24 +168,19 @@ export function CycleContainer({ data, theme }) {
         style={{
           position: 'absolute',
           top: 0, left: 0, right: 0,
-          display: 'flex', alignItems: 'center', gap: 8,
-          padding: '6px 12px', height: 30,
+          display: 'flex', alignItems: 'center', gap: 6,
+          padding: '0 10px', height: 28,
           background: `${borderColor}e6`,
           color: 'white', borderRadius: '10px 10px 0 0',
-          fontSize: 13, fontWeight: 600,
+          fontSize: 11, fontWeight: 600,
           cursor: isToggleable ? 'pointer' : 'default',
           userSelect: 'none',
           transition: 'background 0.2s ease',
         }}
       >
-        <Icon className="w-4 h-4" />
-        <span style={{ flex: 1 }}>{label}</span>
-        {iterationCount > 0 && (
-          <span style={{ fontSize: 11, opacity: 0.9 }}>
-            {iterationCount} {countSuffix}{iterationCount !== 1 ? 's' : ''}
-          </span>
-        )}
-        {isToggleable && <ChevronDown className="w-4 h-4" />}
+        <Icon style={{ width: 13, height: 13 }} />
+        <span>{label}</span>
+        {isToggleable && <ChevronDown style={{ width: 13, height: 13 }} />}
       </div>
 
       {/* Corner decorations */}

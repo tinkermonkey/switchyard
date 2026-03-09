@@ -13,7 +13,7 @@ import SmartPipelineEdge from './SmartPipelineEdge'
 import { containerNodeTypes } from './containers/index.js'
 import { eventNodeTypes } from './nodes/index.js'
 import { toggleCycleCollapsed } from '../utils/cycleLayout'
-import { buildFlowchart as buildFlowchartUtil, findActiveContainerPath } from '../utils/buildFlowchart'
+import { buildFlowchart as buildFlowchartUtil } from '../utils/buildFlowchart'
 import { processEvents } from '../utils/eventProcessing/index.js'
 
 /**
@@ -129,13 +129,6 @@ export default function PipelineFlowGraph({
   // Updated via onNodesChange dimension events so the layout function always has
   // accurate sizes even when node.measured hasn't been (re-)populated yet.
   const nodeSizeCacheRef = useRef(new Map())
-  // Containers the user has explicitly opened — auto-collapse will not override these.
-  const [userOpenedCycles, setUserOpenedCycles] = useState(new Set())
-  const userOpenedCyclesRef = useRef(new Set())
-  useEffect(() => { userOpenedCyclesRef.current = userOpenedCycles }, [userOpenedCycles])
-  // Tracks which containers were auto-opened on the previous render so they can be
-  // auto-collapsed when the active agent path changes.
-  const prevAutoOpenedRef = useRef(new Set())
 
   // Internal cycle collapse state — managed here so toggle callbacks work without
   // forwarding to a parent component.
@@ -166,9 +159,6 @@ export default function PipelineFlowGraph({
   useEffect(() => {
     setCycles(new Map())
     cyclesRef.current = new Map()
-    setUserOpenedCycles(new Set())
-    userOpenedCyclesRef.current = new Set()
-    prevAutoOpenedRef.current = new Set()
   }, [selectedRunId])
 
   // Build raw (unpositioned) flowchart — pure, returns result
@@ -200,23 +190,11 @@ export default function PipelineFlowGraph({
   // calling setCycles — guaranteeing the ref is current when this callback executes.
   }, [graphEvents, allEvents, selectedPipelineRun, workflowConfig, cycles])
 
-  // Detect and update cycles when events change; auto-expand hierarchy path to active agent
+  // Detect and update cycles when events change, preserving any user toggle state.
   useEffect(() => {
     if (!graphEvents || !graphEvents.length) return
 
     const model = processEvents(graphEvents)
-
-    // Derive activeTaskIds from model.agentExecutions (already zombie-aware) so that
-    // interrupted agents from orchestrator restarts don't trigger false auto-expansion.
-    const activeTaskIds = new Set()
-    model.agentExecutions.forEach(executions => {
-      executions.forEach(exec => {
-        if (exec.status === 'running') activeTaskIds.add(exec.taskId)
-      })
-    })
-
-    const activeContainerIds = findActiveContainerPath(model, activeTaskIds)
-    const prevAutoOpened = prevAutoOpenedRef.current
 
     const newCycleMap = new Map()
     model.cycles.forEach(cycle => {
@@ -232,24 +210,7 @@ export default function PipelineFlowGraph({
       else merged.set(id, prev)
     })
 
-    activeContainerIds.forEach(id => {
-      const current = merged.get(id)
-      if (!current || current.isCollapsed) {
-        merged.set(id, { ...(current ?? {}), isCollapsed: false })
-      }
-    })
-
-    prevAutoOpened.forEach(id => {
-      if (!activeContainerIds.has(id) && !userOpenedCyclesRef.current.has(id)) {
-        const current = merged.get(id)
-        if (current && !current.isCollapsed) {
-          merged.set(id, { ...current, isCollapsed: true })
-        }
-      }
-    })
-
     cyclesRef.current = merged
-    prevAutoOpenedRef.current = activeContainerIds
     setCycles(merged)
   }, [graphEvents, selectedPipelineRun])
 
@@ -357,11 +318,7 @@ export default function PipelineFlowGraph({
     if (structurallyChanged) {
       const anyOverlap = prevNodeIds.size > 0 && filteredRawBuild.nodes.some(n => prevNodeIds.has(n.id))
       const isIncrementalUpdate = hasLayoutedOnceRef.current && anyOverlap
-      if (!anyOverlap) {
-        // Completely new graph (new pipeline run or file) — reset user-opened tracking.
-        setUserOpenedCycles(new Set())
-        userOpenedCyclesRef.current = new Set()
-      }
+
 
       if (isIncrementalUpdate) {
         // Keep graph visible — carry existing positions and styles forward so container nodes
@@ -413,18 +370,11 @@ export default function PipelineFlowGraph({
   // identity, keeping finalizeNodes (and therefore all container node onToggleCollapse
   // props) stable across re-renders.
   const handleToggleWithTracking = useCallback((cycleId) => {
-    const currentlyCollapsed = cyclesRef.current.get(cycleId)?.isCollapsed ?? true
     // Pre-update the ref synchronously so buildRawFlowchart reads the correct value
     // when the rebuild effect fires (same pattern as the cycles detection effect).
     const newCycles = toggleCycleCollapsed(cyclesRef.current, cycleId)
     cyclesRef.current = newCycles
     setCycles(newCycles)
-    setUserOpenedCycles(prev => {
-      const next = new Set(prev)
-      if (currentlyCollapsed) next.add(cycleId)   // user expanding → remember
-      else next.delete(cycleId)                    // user collapsing → forget
-      return next
-    })
   }, []) // stable — reads all mutable state via refs
 
   // Inject draggable/toggle callbacks after layout — passed to LayoutController

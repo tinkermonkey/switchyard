@@ -24,7 +24,7 @@ export const CYCLE_THEME_MAP = {
   // ── Level 1 ───────────────────────────────────────────────────────────────
   review_cycle: {
     borderColor:              '#9333ea',
-    borderStyle:              'dashed',
+    borderStyle:              'solid',
     bgColor:                  'rgba(147, 51, 234, 0.14)',
     cornerColor:              'rgba(147,51,234,0.6)',
     icon:                     RotateCcw,
@@ -37,7 +37,7 @@ export const CYCLE_THEME_MAP = {
   },
   repair_cycle: {
     borderColor:              '#d97706',
-    borderStyle:              'dashed',
+    borderStyle:              'solid',
     bgColor:                  'rgba(217, 119, 6, 0.14)',
     cornerColor:              'rgba(217,119,6,0.6)',
     icon:                     Wrench,
@@ -50,7 +50,7 @@ export const CYCLE_THEME_MAP = {
   },
   pr_review_cycle: {
     borderColor:              '#0ea5e9',
-    borderStyle:              'dashed',
+    borderStyle:              'solid',
     bgColor:                  'rgba(14,165,233,0.12)',
     cornerColor:              'rgba(14,165,233,0.5)',
     icon:                     GitPullRequest,
@@ -63,7 +63,7 @@ export const CYCLE_THEME_MAP = {
   },
   conversational_loop: {
     borderColor:              '#ec4899',
-    borderStyle:              'dashed',
+    borderStyle:              'solid',
     bgColor:                  'rgba(236,72,153,0.12)',
     cornerColor:              'rgba(236,72,153,0.5)',
     icon:                     MessageSquare,
@@ -77,7 +77,7 @@ export const CYCLE_THEME_MAP = {
 
   status_progression: {
     borderColor:              '#22c55e',
-    borderStyle:              'dashed',
+    borderStyle:              'solid',
     bgColor:                  'rgba(34,197,94,0.10)',
     cornerColor:              'rgba(34,197,94,0.4)',
     icon:                     ArrowRight,
