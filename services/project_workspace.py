@@ -103,23 +103,43 @@ class ProjectWorkspaceManager:
                 logger.info("If running in Docker, ensure project is checked out on host and mounted correctly")
                 raise
 
+        # Ensure the remote uses SSH — agent containers have SSH keys but no HTTPS
+        # credentials, so an HTTPS remote (e.g. from a prior HTTPS clone) will break
+        # every git fetch/pull/push.
+        self._ensure_ssh_remote(project_dir)
+
         return was_cloned
+
+    def _ensure_ssh_remote(self, project_dir: Path):
+        """
+        Ensure the git remote uses SSH rather than HTTPS.
+
+        Agent containers have SSH keys mounted but no HTTPS credential helper, so
+        any workspace cloned via HTTPS will fail on fetch/pull/push. This detects
+        an HTTPS origin and rewrites it to the equivalent SSH URL in-place.
+        """
+        import re
+        result = subprocess.run(
+            ['git', 'remote', 'get-url', 'origin'],
+            cwd=project_dir, capture_output=True, text=True
+        )
+        current_url = result.stdout.strip()
+        if not current_url or current_url.startswith('git@'):
+            return  # already SSH or no remote — nothing to do
+
+        match = re.search(r'github\.com[/:](.+?)(?:\.git)?$', current_url)
+        if match:
+            ssh_url = f"git@github.com:{match.group(1)}.git"
+            subprocess.run(
+                ['git', 'remote', 'set-url', 'origin', ssh_url],
+                cwd=project_dir, capture_output=True
+            )
+            logger.info(f"Converted remote URL to SSH: {current_url} → {ssh_url}")
 
     def _clone_repository(self, repo_url: str, target_dir: Path, branch: str):
         """Clone a repository to the target directory"""
         try:
-            # Convert SSH URLs to HTTPS if GITHUB_TOKEN is available
-            import os
-            github_token = os.environ.get('GITHUB_TOKEN')
-            clone_url = repo_url
-
-            if github_token and repo_url.startswith('git@github.com:'):
-                # Convert git@github.com:user/repo.git to https://TOKEN@github.com/user/repo.git
-                repo_path = repo_url.replace('git@github.com:', '').replace('.git', '')
-                clone_url = f"https://{github_token}@github.com/{repo_path}.git"
-                logger.info(f"Using HTTPS with token for cloning (converted from SSH)")
-
-            cmd = ['git', 'clone', '--branch', branch, clone_url, str(target_dir)]
+            cmd = ['git', 'clone', '--branch', branch, repo_url, str(target_dir)]
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
 
             if result.returncode != 0:

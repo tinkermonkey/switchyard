@@ -14,6 +14,7 @@ from services.review_parser import ReviewParser, ReviewStatus
 from services.github_integration import GitHubIntegration
 from services.review_outcome_correlator import get_review_outcome_correlator
 from monitoring.cycle_stack import push_frame, CycleFrame
+from services.cancellation import CancellationError
 
 logger = logging.getLogger(__name__)
 
@@ -493,6 +494,8 @@ class ReviewCycleExecutor:
                                         )
                             else:
                                 logger.error(f"Could not find column config for reviewer {cycle_state.reviewer_agent}")
+                        except CancellationError as e:
+                            logger.info(f"Review cycle resume skipped (cancelled): {e}")
                         except Exception as e:
                             logger.error(f"Failed to resume review loop: {e}", exc_info=True)
                         finally:

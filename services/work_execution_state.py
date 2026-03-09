@@ -466,7 +466,7 @@ class WorkExecutionStateTracker:
                 if cycle.project_name == project_name:
                     logger.debug(
                         f"Active review cycle found for {project_name}/#{issue_number}: "
-                        f"iteration {cycle.current_iteration}, phase={cycle.phase}"
+                        f"iteration {cycle.current_iteration}, status={cycle.status}"
                     )
                     return True
         except (ImportError, AttributeError) as e:
