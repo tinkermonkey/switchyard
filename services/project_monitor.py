@@ -199,10 +199,10 @@ def _launch_repair_cycle_container(
         # Get Docker runner for path detection
         docker_runner = DockerAgentRunner()
         host_workspace_path = docker_runner._detect_host_workspace_path()
-        # Detect host home from the orchestrator's mountinfo (where SSH key IS mounted).
-        # This must be done here (orchestrator context), not inside the repair cycle
-        # container, which has no SSH mount and would fall back to /home/orchestrator —
-        # an empty directory on the host with no SSH keys.
+        # Read HOST_HOME from environment (set in .env, injected via docker-compose.yml).
+        # Must be forwarded explicitly to the repair cycle container — it won't inherit
+        # the orchestrator's environment, and without it _detect_host_home_path() falls
+        # back to the container's $HOME which is wrong for SSH/git mounts.
         host_home_path = DockerAgentRunner._detect_host_home_path()
 
         # Get environment variables
