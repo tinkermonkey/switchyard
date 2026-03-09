@@ -997,6 +997,7 @@ class ReviewCycleExecutor:
                 await self._analyze_review_cycle_outcomes(cycle_state)
 
                 self._remove_cycle_state(cycle_state)
+                del self.active_cycles[cycle_state.issue_number]
 
                 # NOTE: Do NOT update PR status here!
                 # PR status is managed by feature_branch_manager.finalize_workspace()
@@ -1117,9 +1118,11 @@ class ReviewCycleExecutor:
                 # and _execute_review_loop does not acquire it, so this is safe.
                 if cycle_state.current_iteration < cycle_state.max_iterations:
                     result = await self._execute_review_loop(cycle_state, column, issue_data, org)
+                    if cycle_state.issue_number in self.active_cycles:
+                        del self.active_cycles[cycle_state.issue_number]
                     if result:
-                        _, next_col_name = result
-                        if next_col_name and next_col_name != column.name:
+                        final_status, next_col_name = result
+                        if final_status == ReviewStatus.APPROVED and next_col_name and next_col_name != column.name:
                             await self._advance_issue_after_review_approval(
                                 cycle_state, column.name, next_col_name
                             )
@@ -1135,6 +1138,8 @@ class ReviewCycleExecutor:
                 await self._escalate_blocked(cycle_state, review_result)
 
         except Exception as e:
+            if isinstance(e, CancellationError):
+                raise
             logger.error(f"Failed to continue cycle from review: {e}", exc_info=True)
 
     async def _continue_cycle_from_maker(self, cycle_state: ReviewCycleState, org: str):
