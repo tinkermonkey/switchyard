@@ -145,7 +145,19 @@ class PipelineWatchdog:
                     )
                     continue
 
-                # No container and old enough = ZOMBIE
+                # Never clean up a run that still holds the pipeline lock.
+                # The lock gates all important flows (review cycles, repair cycles, escalations
+                # awaiting human feedback, etc.) — if it's held, work is in progress or pending.
+                if self.lock_manager:
+                    current_lock = self.lock_manager.get_lock(project, board)
+                    if current_lock and current_lock.lock_status == 'locked' and current_lock.locked_by_issue == issue_number:
+                        logger.info(
+                            f"Pipeline run {pipeline_run_id[:8]}... for {project} issue #{issue_number} "
+                            f"holds the pipeline lock - skipping zombie cleanup"
+                        )
+                        continue
+
+                # No container, old enough, and no lock held = ZOMBIE
                 results['zombies_found'] += 1
 
                 age_minutes = (datetime.now(timezone.utc) - started_at).total_seconds() / 60

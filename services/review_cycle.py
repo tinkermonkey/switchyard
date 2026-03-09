@@ -733,8 +733,11 @@ class ReviewCycleExecutor:
                         org
                     )
 
-                    # Clean up
-                    del self.active_cycles[issue_number]
+                    # Clean up only if not awaiting human feedback.
+                    # Escalated cycles must remain in active_cycles so that
+                    # check_escalated_review_cycles() can detect human feedback.
+                    if cycle_state.status != 'awaiting_human_feedback':
+                        del self.active_cycles[issue_number]
 
                     return next_column, True
 
@@ -876,8 +879,11 @@ class ReviewCycleExecutor:
                 org
             )
 
-            # Clean up
-            del self.active_cycles[issue_number]
+            # Clean up only if not awaiting human feedback.
+            # Escalated cycles must remain in active_cycles so that
+            # check_escalated_review_cycles() can detect human feedback.
+            if cycle_state.status != 'awaiting_human_feedback':
+                del self.active_cycles[issue_number]
 
             return next_column, True
 
@@ -1136,6 +1142,15 @@ class ReviewCycleExecutor:
 
         logger.info(f"Resuming escalated review cycle for issue #{cycle_state.issue_number} with human feedback")
 
+        # Guard against concurrent calls from successive polling iterations
+        lock = self._get_cycle_lock(cycle_state.issue_number)
+        if not lock.acquire(blocking=False):
+            logger.info(
+                f"Resume already in progress for issue #{cycle_state.issue_number}, "
+                f"skipping concurrent call"
+            )
+            return
+
         try:
             # Get column configuration
             workflow = config_manager.get_project_workflow(cycle_state.project_name, cycle_state.board_name)
@@ -1218,6 +1233,9 @@ class ReviewCycleExecutor:
                 logger.error("Review still blocked after human feedback and reviewer update")
                 cycle_state.status = 'completed'  # Mark as done, needs manual intervention
                 self._save_cycle_state(cycle_state)
+                self._remove_cycle_state(cycle_state)
+                if cycle_state.issue_number in self.active_cycles:
+                    del self.active_cycles[cycle_state.issue_number]
                 return
 
             # If approved, we're done!
@@ -1229,6 +1247,9 @@ class ReviewCycleExecutor:
                 )
                 cycle_state.status = 'completed'
                 self._save_cycle_state(cycle_state)
+                self._remove_cycle_state(cycle_state)
+                if cycle_state.issue_number in self.active_cycles:
+                    del self.active_cycles[cycle_state.issue_number]
 
                 # Analyze review cycle outcomes for learning (async, non-blocking)
                 await self._analyze_review_cycle_outcomes(cycle_state)
@@ -1313,7 +1334,14 @@ class ReviewCycleExecutor:
             logger.error(f"Failed to resume review cycle with feedback: {e}")
             import traceback
             logger.error(traceback.format_exc())
+            # Restore awaiting_human_feedback so the next poll can retry
+            if cycle_state.issue_number in self.active_cycles:
+                cycle_state.status = 'awaiting_human_feedback'
+                self._save_cycle_state(cycle_state)
             raise
+
+        finally:
+            lock.release()
 
     async def resume_review_cycle(
         self,
