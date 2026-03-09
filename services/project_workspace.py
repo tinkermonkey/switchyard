@@ -134,7 +134,9 @@ class ProjectWorkspaceManager:
                 ['git', 'remote', 'set-url', 'origin', ssh_url],
                 cwd=project_dir, capture_output=True
             )
-            logger.info(f"Converted remote URL to SSH: {current_url} → {ssh_url}")
+            # Redact any embedded token before logging (https://token@github.com/...)
+            sanitized = re.sub(r'://[^@]+@', '://<redacted>@', current_url)
+            logger.info(f"Converted remote URL to SSH: {sanitized} → {ssh_url}")
 
     def _clone_repository(self, repo_url: str, target_dir: Path, branch: str):
         """Clone a repository to the target directory"""
