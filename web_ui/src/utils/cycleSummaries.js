@@ -4,6 +4,8 @@
  * No JSX — pure JavaScript only.
  */
 
+import { CYCLE_TERMINAL_EVENTS } from './cycleDefinitions.js'
+
 export function extractRepairCycleSummary(cycle) {
   try {
     const events = cycle.events ?? []
@@ -122,12 +124,18 @@ export function extractReviewCycleSummary(cycle) {
   try {
     const endEvent = cycle.endEvent
     let status = 'running'
+    let isFailure = false
     if (endEvent && !endEvent._inferred) {
-      const outcome = endEvent.outcome ?? endEvent.decision?.outcome
-      if (outcome === 'approved') status = 'approved'
-      else if (outcome === 'rejected') status = 'rejected'
-      else if (outcome === 'escalated') status = 'escalated'
-      else status = 'approved'
+      const termDef = CYCLE_TERMINAL_EVENTS.review_cycle.terminalEvents[endEvent.event_type]
+      if (termDef?.status) {
+        status = termDef.status
+        isFailure = termDef.isFailure ?? false
+      } else {
+        const outcome = endEvent.outcome ?? endEvent.decision?.outcome
+        if (outcome === 'approved') status = 'approved'
+        else if (outcome === 'rejected') { status = 'rejected'; isFailure = true }
+        else status = 'approved'
+      }
     }
 
     let durationSeconds = null
@@ -150,10 +158,13 @@ export function extractReviewCycleSummary(cycle) {
       return { number: iter.number ?? idx + 1, durationSeconds: durSec }
     })
 
-    const completionReason = (endEvent && !endEvent._inferred) ? (endEvent.reason ?? null) : null
+    const completionReason = (endEvent && !endEvent._inferred)
+      ? (endEvent.reason ?? endEvent.escalation_reason ?? null)
+      : null
 
     return {
       status,
+      isFailure,
       makerAgent: cycle.startEvent?.inputs?.maker_agent ?? cycle.startEvent?.maker_agent ?? null,
       reviewerAgent: cycle.startEvent?.inputs?.reviewer_agent ?? cycle.startEvent?.reviewer_agent ?? null,
       totalIterations: cycle.iterations?.length ?? 0,
@@ -163,19 +174,20 @@ export function extractReviewCycleSummary(cycle) {
       completionReason,
     }
   } catch {
-    return { status: 'running', makerAgent: null, reviewerAgent: null, totalIterations: 0, maxIterations: null, durationSeconds: null, iterations: [], completionReason: null }
+    return { status: 'running', isFailure: false, makerAgent: null, reviewerAgent: null, totalIterations: 0, maxIterations: null, durationSeconds: null, iterations: [], completionReason: null }
   }
 }
 
-export function extractReviewIterationSummary(iteration, cycleStartEvent) {
+export function extractReviewIterationSummary(iteration, cycleStartEvent, isFailed = false) {
   try {
     return {
       makerAgent: cycleStartEvent?.inputs?.maker_agent ?? cycleStartEvent?.maker_agent ?? null,
       reviewerAgent: cycleStartEvent?.inputs?.reviewer_agent ?? cycleStartEvent?.reviewer_agent ?? null,
       eventCount: iteration.events?.length ?? 0,
+      isFailed,
     }
   } catch {
-    return { makerAgent: null, reviewerAgent: null, eventCount: 0 }
+    return { makerAgent: null, reviewerAgent: null, eventCount: 0, isFailed: false }
   }
 }
 

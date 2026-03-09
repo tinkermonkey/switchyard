@@ -47,8 +47,8 @@ export function renderReviewCycleSummary(data, isDark) {
 
   const statusColor =
     s.status === 'approved'  ? '#10b981' :
-    s.status === 'rejected'  ? '#ef4444' :
-    s.status === 'escalated' ? '#f59e0b' : '#9333ea'
+    s.isFailure              ? '#ef4444' :
+    '#9333ea'
 
   const iterations = s.iterations ?? []
   const maxIterDur = iterations.reduce((mx, it) => Math.max(mx, it.durationSeconds ?? 0), 0)
@@ -104,25 +104,34 @@ export function renderReviewCycleSummary(data, isDark) {
 
           {/* Proportional bars per iteration */}
           {iterations.map((iter, idx) => {
-            const isRunning = iter.durationSeconds == null && s.status === 'running' && idx === iterations.length - 1
+            const isLast = idx === iterations.length - 1
+            const isLastFailed = s.isFailure && isLast
+            const isRunning = iter.durationSeconds == null && s.status === 'running' && isLast
             const pct = iter.durationSeconds != null && maxIterDur > 0
               ? (iter.durationSeconds / maxIterDur) * 100
               : isRunning ? 25 : 2
+            const barColor = isLastFailed ? '#ef4444' : '#9333ea'
 
             return (
               <div key={iter.number} style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                <span style={{ fontSize: 9, color: muted, minWidth: 28 }}>
+                <span style={{ fontSize: 9, color: isLastFailed ? '#ef4444' : muted, minWidth: 28, fontWeight: isLastFailed ? 600 : 400 }}>
                   Iter {iter.number}
                 </span>
                 <div style={{ flex: 1 }}>
-                  <Bar pct={pct} color="#9333ea" isDark={isDark} />
+                  <Bar pct={pct} color={barColor} isDark={isDark} />
                 </div>
-                <span style={{ fontSize: 9, color: muted, minWidth: 28, textAlign: 'right' }}>
-                  {fmtDur(iter.durationSeconds)}
-                </span>
+                {isLastFailed
+                  ? <span style={{ fontSize: 9, color: '#ef4444', fontWeight: 700, minWidth: 28, textAlign: 'right' }}>✗</span>
+                  : <span style={{ fontSize: 9, color: muted, minWidth: 28, textAlign: 'right' }}>{fmtDur(iter.durationSeconds)}</span>
+                }
               </div>
             )
           })}
+          {s.isFailure && s.completionReason && (
+            <div style={{ fontSize: 10, color: isDark ? '#f87171' : '#dc2626', marginTop: 1 }}>
+              ✗ {s.completionReason}
+            </div>
+          )}
         </>
       )}
     </div>
@@ -320,9 +329,13 @@ export function renderReviewIterationSummary(data, isDark) {
 
   const muted      = isDark ? '#7d8590' : '#57606a'
   const agentColor = isDark ? '#c4b5fd' : '#6d28d9'
+  const failColor  = isDark ? '#f87171' : '#dc2626'
 
   return (
     <div style={{ padding: '8px 12px', display: 'flex', flexDirection: 'column', gap: 3 }}>
+      {s.isFailed && (
+        <div style={{ fontSize: 10, fontWeight: 700, color: failColor }}>✗ Escalated</div>
+      )}
       {s.makerAgent && (
         <div style={{ fontSize: 10, display: 'flex', gap: 4 }}>
           <span style={{ color: muted, minWidth: 52 }}>Maker</span>

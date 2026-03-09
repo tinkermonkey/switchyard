@@ -12,6 +12,8 @@
  * }
  */
 
+import { CYCLE_TERMINAL_EVENTS } from '../cycleDefinitions.js'
+
 /**
  * Build map of agent → [execution instances] from lifecycle events.
  * Executions are stored in the order they started.
@@ -87,30 +89,18 @@ function pairCycleEvents(starts, ends) {
 }
 
 /**
- * Find review cycle boundaries from decision events.
- * Returns [{startEvent, endEvent}] — one entry per review_cycle_started/completed pair.
- * An in-progress cycle (no matching completed event) will have endEvent = null.
+ * Find cycle boundaries for any event-driven cycle defined in CYCLE_TERMINAL_EVENTS.
+ * Supports both single startEvent (string) and multiple startEvents (array).
+ * Returns [{startEvent, endEvent}] — endEvent is null for abandoned/open starts.
  */
-function findReviewCycles(sortedEvents) {
+function findCycleBoundaries(def, sortedEvents) {
+  const startTypes = def.startEvents ?? [def.startEvent]
+  const terminalTypes = Object.keys(def.terminalEvents)
   const starts = sortedEvents.filter(
-    e => e.event_category === 'decision' && e.event_type === 'review_cycle_started'
+    e => e.event_category === 'decision' && startTypes.includes(e.event_type)
   )
   const ends = sortedEvents.filter(
-    e => e.event_category === 'decision' && e.event_type === 'review_cycle_completed'
-  )
-  return pairCycleEvents(starts, ends)
-}
-
-/**
- * Find PR review cycle boundaries from decision events.
- * Returns [{startEvent, endEvent}] — one entry per pr_review_stage_started/completed pair.
- */
-function findPRReviewCycles(sortedEvents) {
-  const starts = sortedEvents.filter(
-    e => e.event_category === 'decision' && e.event_type === 'pr_review_stage_started'
-  )
-  const ends = sortedEvents.filter(
-    e => e.event_category === 'decision' && e.event_type === 'pr_review_stage_completed'
+    e => e.event_category === 'decision' && terminalTypes.includes(e.event_type)
   )
   return pairCycleEvents(starts, ends)
 }
@@ -146,39 +136,6 @@ function groupPRReviewPhases(cycleEvents, boundary) {
   })
 }
 
-/**
- * Find status progression cycle boundaries.
- * Each progression cycle is opened by status_progression_started and closed by
- * status_progression_completed or status_progression_failed.
- * Returns [{startEvent, endEvent}] — endEvent is null if in-progress.
- */
-function findStatusProgressionCycles(sortedEvents) {
-  const starts = sortedEvents.filter(
-    e => e.event_category === 'decision' && e.event_type === 'status_progression_started'
-  )
-  const ends = sortedEvents.filter(
-    e => e.event_category === 'decision' &&
-         (e.event_type === 'status_progression_completed' || e.event_type === 'status_progression_failed')
-  )
-  return pairCycleEvents(starts, ends)
-}
-
-/**
- * Find conversational loop boundaries.
- * Each loop is opened by conversational_loop_started or conversational_loop_resumed
- * and closed by the next conversational_loop_paused.
- * Returns [{startEvent, endEvent}] — endEvent is null if in-progress.
- */
-function findConversationalLoops(sortedEvents) {
-  const opens = sortedEvents.filter(
-    e => e.event_category === 'decision' &&
-         (e.event_type === 'conversational_loop_started' || e.event_type === 'conversational_loop_resumed')
-  )
-  const closes = sortedEvents.filter(
-    e => e.event_category === 'decision' && e.event_type === 'conversational_loop_paused'
-  )
-  return pairCycleEvents(opens, closes)
-}
 
 /**
  * Find all repair cycle boundaries.
@@ -490,111 +447,32 @@ function inferMissingCloseEvents(sortedEvents) {
     )
   }
 
-  // ── Phase 1: Review cycles ────────────────────────────────────────────────
-  {
-    const reviewStarts = sortedEvents.filter(
-      e => e.event_category === 'decision' && e.event_type === 'review_cycle_started'
+  // ── Phase 1: All event-driven cycles (decision events) ───────────────────
+  // Generic: each definition in CYCLE_TERMINAL_EVENTS drives its own open/close pairing.
+  // Supports both single startEvent (string) and multiple startEvents (array).
+  for (const def of Object.values(CYCLE_TERMINAL_EVENTS)) {
+    const startTypes   = def.startEvents ?? [def.startEvent]
+    const terminalTypes = Object.keys(def.terminalEvents)
+    const opens = sortedEvents.filter(
+      e => e.event_category === 'decision' && startTypes.includes(e.event_type)
     )
-    const reviewEnds = sortedEvents.filter(
-      e => e.event_category === 'decision' && e.event_type === 'review_cycle_completed'
+    const closes = sortedEvents.filter(
+      e => e.event_category === 'decision' && terminalTypes.includes(e.event_type)
     )
-    const usedReviewEnds = new Set()
-    reviewStarts.forEach((start, idx) => {
-      const startMs = new Date(start.timestamp).getTime()
-      const nextStart = reviewStarts[idx + 1]
-      const nextStartMs = nextStart ? new Date(nextStart.timestamp).getTime() : Infinity
-      const matchedEnd = reviewEnds.find(
-        e => !usedReviewEnds.has(e) &&
-             new Date(e.timestamp).getTime() > startMs &&
-             new Date(e.timestamp).getTime() <= nextStartMs
-      )
-      if (matchedEnd) { usedReviewEnds.add(matchedEnd); return }
-      synthetic.push(makeSyntheticClose(
-        start,
-        'review_cycle_completed',
-        closestUpperBound(startMs, nextStart ? nextStartMs : null)
-      ))
-    })
-  }
-
-  // ── Phase 1b: PR review stages ───────────────────────────────────────────
-  {
-    const prStarts = sortedEvents.filter(
-      e => e.event_category === 'decision' && e.event_type === 'pr_review_stage_started'
-    )
-    const prEnds = sortedEvents.filter(
-      e => e.event_category === 'decision' && e.event_type === 'pr_review_stage_completed'
-    )
-    const usedPrEnds = new Set()
-    prStarts.forEach((start, idx) => {
-      const startMs = new Date(start.timestamp).getTime()
-      const nextStart = prStarts[idx + 1]
-      const nextStartMs = nextStart ? new Date(nextStart.timestamp).getTime() : Infinity
-      const matchedEnd = prEnds.find(
-        e => !usedPrEnds.has(e) &&
-             new Date(e.timestamp).getTime() > startMs &&
-             new Date(e.timestamp).getTime() <= nextStartMs
-      )
-      if (matchedEnd) { usedPrEnds.add(matchedEnd); return }
-      synthetic.push(makeSyntheticClose(
-        start,
-        'pr_review_stage_completed',
-        closestUpperBound(startMs, nextStart ? nextStartMs : null)
-      ))
-    })
-  }
-
-  // ── Phase 1c: Status progression cycles ──────────────────────────────────
-  {
-    const spStarts = sortedEvents.filter(
-      e => e.event_category === 'decision' && e.event_type === 'status_progression_started'
-    )
-    const spEnds = sortedEvents.filter(
-      e => e.event_category === 'decision' &&
-           (e.event_type === 'status_progression_completed' || e.event_type === 'status_progression_failed')
-    )
-    const usedSpEnds = new Set()
-    spStarts.forEach((start, idx) => {
-      const startMs = new Date(start.timestamp).getTime()
-      const nextStart = spStarts[idx + 1]
-      const nextStartMs = nextStart ? new Date(nextStart.timestamp).getTime() : Infinity
-      const matchedEnd = spEnds.find(
-        e => !usedSpEnds.has(e) &&
-             new Date(e.timestamp).getTime() > startMs &&
-             new Date(e.timestamp).getTime() <= nextStartMs
-      )
-      if (matchedEnd) { usedSpEnds.add(matchedEnd); return }
-      synthetic.push(makeSyntheticClose(
-        start,
-        'status_progression_completed',
-        closestUpperBound(startMs, nextStart ? nextStartMs : null)
-      ))
-    })
-  }
-
-  // ── Phase 1d: Conversational loops ───────────────────────────────────────
-  {
-    const loopOpens = sortedEvents.filter(
-      e => e.event_category === 'decision' &&
-           (e.event_type === 'conversational_loop_started' || e.event_type === 'conversational_loop_resumed')
-    )
-    const loopCloses = sortedEvents.filter(
-      e => e.event_category === 'decision' && e.event_type === 'conversational_loop_paused'
-    )
-    const usedLoopCloses = new Set()
-    loopOpens.forEach((open, idx) => {
-      const openMs = new Date(open.timestamp).getTime()
-      const nextOpen = loopOpens[idx + 1]
+    const usedCloses = new Set()
+    opens.forEach((open, idx) => {
+      const openMs   = new Date(open.timestamp).getTime()
+      const nextOpen = opens[idx + 1]
       const nextOpenMs = nextOpen ? new Date(nextOpen.timestamp).getTime() : Infinity
-      const matchedClose = loopCloses.find(
-        e => !usedLoopCloses.has(e) &&
+      const matched = closes.find(
+        e => !usedCloses.has(e) &&
              new Date(e.timestamp).getTime() > openMs &&
              new Date(e.timestamp).getTime() <= nextOpenMs
       )
-      if (matchedClose) { usedLoopCloses.add(matchedClose); return }
+      if (matched) { usedCloses.add(matched); return }
       synthetic.push(makeSyntheticClose(
         open,
-        'conversational_loop_paused',
+        def.syntheticCloseType,
         closestUpperBound(openMs, nextOpen ? nextOpenMs : null)
       ))
     })
@@ -839,11 +717,11 @@ export function processEvents(events, workflowConfig = null) {
   const _t2 = performance.now()
 
   // Detect cycle boundaries
-  const reviewCycleBoundaries = findReviewCycles(sorted)
-  const repairCycleBoundaries = findRepairCycles(sorted)
-  const prReviewCycleBoundaries = findPRReviewCycles(sorted)
-  const conversationalLoopBoundaries = findConversationalLoops(sorted)
-  const statusProgressionBoundaries = findStatusProgressionCycles(sorted)
+  const reviewCycleBoundaries       = findCycleBoundaries(CYCLE_TERMINAL_EVENTS.review_cycle, sorted)
+  const repairCycleBoundaries       = findRepairCycles(sorted)
+  const prReviewCycleBoundaries     = findCycleBoundaries(CYCLE_TERMINAL_EVENTS.pr_review_cycle, sorted)
+  const conversationalLoopBoundaries = findCycleBoundaries(CYCLE_TERMINAL_EVENTS.conversational_loop, sorted)
+  const statusProgressionBoundaries  = findCycleBoundaries(CYCLE_TERMINAL_EVENTS.status_progression, sorted)
   const _t3 = performance.now()
 
   // Compute the earliest/latest cycle timestamps for prelude/postlude splitting

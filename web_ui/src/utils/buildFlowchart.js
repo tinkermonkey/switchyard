@@ -264,6 +264,7 @@ export function buildFlowchart({
 
     if (cycle.type === 'review_cycle') {
       // ── Review cycle container ──────────────────────────────────────────
+      const rcSummary = extractReviewCycleSummary(cycle)
       const rcNode = {
         id: cycle.id,
         type: 'reviewCycleContainer',
@@ -278,7 +279,7 @@ export function buildFlowchart({
           onToggleCollapse: null, // injected by caller
           startTime: cycle.startEvent?.timestamp,
           endTime: cycle.endEvent?.timestamp,
-          summary: extractReviewCycleSummary(cycle),
+          summary: rcSummary,
         },
         // Collapsed: no style/measured — RF auto-sizes from content via ResizeObserver.
         // Expanded: style:0x0 + measured:1x1 so nodesInitialized isn't blocked while
@@ -310,11 +311,14 @@ export function buildFlowchart({
         })
 
         // Iteration containers
-        cycle.iterations.forEach(iteration => {
+        const lastIterIdx = cycle.iterations.length - 1
+        cycle.iterations.forEach((iteration, iterIdx) => {
           const iterId = `${cycle.id}-iter-${iteration.number}`
           const iterState = existingCycles.get(iterId)
           const iterCollapsed = iterState?.isCollapsed ?? true  // default: collapsed
           updatedCycles.set(iterId, { isCollapsed: iterCollapsed })
+
+          const isLastFailed = rcSummary.isFailure && iterIdx === lastIterIdx
 
           newNodes.push({
             id: iterId,
@@ -332,7 +336,8 @@ export function buildFlowchart({
               containsActiveAgent: activeContainerIds.has(iterId),
               onToggleCollapse: null, // injected by caller
               startTime: iteration.startEvent?.timestamp,  // used by cycleLayout for ordering
-              summary: extractReviewIterationSummary(iteration, cycle.startEvent),
+              summary: extractReviewIterationSummary(iteration, cycle.startEvent, isLastFailed),
+              isFailure: isLastFailed,
             },
             style: iterCollapsed ? {} : { width: 0, height: 0 },
             ...(iterCollapsed ? {} : { measured: { width: 1, height: 1 } }),

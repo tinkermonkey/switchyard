@@ -27,10 +27,22 @@ const DEFAULT_THEME = {
   collapsedCountColorLight: '#374151',
 }
 
+const FAILURE_THEME_OVERRIDE = {
+  borderColor:              '#ef4444',
+  bgColor:                  'rgba(239,68,68,0.10)',
+  cornerColor:              'rgba(239,68,68,0.5)',
+  collapsedTextColor:       '#fca5a5',
+  collapsedCountColor:      '#fca5a5',
+  collapsedCountColorLight: '#dc2626',
+}
+
 const CycleContainerNode = ({ data, ...props }) => {
   const { theme: appTheme } = useTheme()
   const isDark = appTheme === 'dark'
-  const theme = CYCLE_THEME_MAP[data.cycleType] ?? DEFAULT_THEME
+  const baseTheme = CYCLE_THEME_MAP[data.cycleType] ?? DEFAULT_THEME
+  const theme = data.isFailure || data.summary?.isFailure
+    ? { ...baseTheme, ...FAILURE_THEME_OVERRIDE }
+    : baseTheme
   return <CycleContainer data={data} {...props} theme={theme} isDark={isDark} />
 }
 
