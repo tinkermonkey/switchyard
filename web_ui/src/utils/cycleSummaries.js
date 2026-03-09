@@ -95,6 +95,10 @@ export function extractSubCycleSummary(sc) {
       affectedFiles: endEvent?.affected_files_count ?? null,
       testPassedCount: endEvent?.passed ?? endEvent?.passed_count ?? null,
       testFailedCount: endEvent?.failed ?? endEvent?.failed_count ?? null,
+      failuresList:     endEvent?.failures ?? endEvent?.failed_tests ?? [],
+      fixedFilesList:   endEvent?.fixed_files ?? endEvent?.files ?? [],
+      issueDescription: endEvent?.systemic_issue_description ?? null,
+      attemptCount:     endEvent?.attempt_count ?? endEvent?.attempts ?? null,
     }
   } catch {
     return {
@@ -106,6 +110,10 @@ export function extractSubCycleSummary(sc) {
       affectedFiles: null,
       testPassedCount: null,
       testFailedCount: null,
+      failuresList: [],
+      fixedFilesList: [],
+      issueDescription: null,
+      attemptCount: null,
     }
   }
 }
@@ -179,13 +187,25 @@ export function extractPRReviewCycleSummary(cycle) {
       status = endEvent.status === 'failed' ? 'failed' : 'completed'
     }
 
+    const issueCount = (cycle.phases ?? []).reduce((n, p) => n + (p.endEvent?.issues_found ?? 0), 0)
+    const ciFailCount = (cycle.phases ?? []).reduce((n, p) => n + (p.endEvent?.failures_found ?? 0), 0)
+    const durationSeconds = (() => {
+      const startMs = new Date(cycle.startEvent?.timestamp).getTime()
+      const endMs   = new Date(endEvent?.timestamp).getTime()
+      return (!endEvent?._inferred && !isNaN(startMs) && !isNaN(endMs) && endMs > startMs)
+        ? Math.round((endMs - startMs) / 1000) : null
+    })()
+
     return {
       status,
       phaseCount: cycle.phases?.length ?? 0,
       finalStatus: endEvent?.status ?? null,
+      issueCount,
+      ciFailCount,
+      durationSeconds,
     }
   } catch {
-    return { status: 'running', phaseCount: 0, finalStatus: null }
+    return { status: 'running', phaseCount: 0, finalStatus: null, issueCount: 0, ciFailCount: 0, durationSeconds: null }
   }
 }
 
@@ -193,10 +213,20 @@ export function extractPRReviewPhaseSummary(phase) {
   try {
     return {
       phaseNumber: phase.number,
+      phaseName: phase.startEvent?.phase_name ?? phase.startEvent?.inputs?.phase_name ?? null,
       eventCount: phase.events?.length ?? 0,
+      durationSeconds: (() => {
+        const s = new Date(phase.startEvent?.timestamp).getTime()
+        const e = new Date(phase.endEvent?.timestamp).getTime()
+        return (phase.endEvent && !phase.endEvent._inferred && !isNaN(s) && !isNaN(e) && e > s)
+          ? Math.round((e - s) / 1000) : null
+      })(),
+      textCollected: phase.endEvent?.text_collected ?? null,
+      failuresFound: phase.endEvent?.failures_found ?? null,
+      issuesFound:   phase.endEvent?.issues_found   ?? null,
     }
   } catch {
-    return { phaseNumber: 0, eventCount: 0 }
+    return { phaseNumber: 0, phaseName: null, eventCount: 0, durationSeconds: null, textCollected: null, failuresFound: null, issuesFound: null }
   }
 }
 
@@ -246,8 +276,11 @@ export function extractConversationalLoopSummary(cycle) {
       }
     }
 
-    return { status, exchangeCount, durationSeconds }
+    const agentName    = cycle.startEvent?.inputs?.agent_name ?? cycle.startEvent?.agent_name ?? null
+    const pausedReason = cycle.endEvent?.reason ?? cycle.endEvent?.message ?? null
+
+    return { status, exchangeCount, durationSeconds, agentName, pausedReason }
   } catch {
-    return { status: 'running', exchangeCount: 0, durationSeconds: null }
+    return { status: 'running', exchangeCount: 0, durationSeconds: null, agentName: null, pausedReason: null }
   }
 }

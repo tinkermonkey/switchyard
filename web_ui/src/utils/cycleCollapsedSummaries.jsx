@@ -9,6 +9,7 @@
 
 export const fmtDur = s => {
   if (s == null) return '—'
+  s = Math.round(s)
   if (s < 60) return `${s}s`
   const m = Math.floor(s / 60), sec = s % 60
   return sec > 0 ? `${m}m ${sec}s` : `${m}m`
@@ -22,7 +23,20 @@ export const StatusDot = ({ color }) => (
 )
 
 const Sep = () => (
-  <div style={{ height: 1, background: '#d97706', opacity: 0.25, margin: '2px 0' }} />
+  <div style={{ height: 1, background: '#21262d', margin: '3px 0' }} />
+)
+
+const Bar = ({ pct, color }) => (
+  <div style={{ height: 4, background: '#21262d', borderRadius: 2, overflow: 'hidden' }}>
+    <div style={{ height: '100%', width: `${Math.min(100, Math.max(0, pct))}%`, background: color, borderRadius: 2 }} />
+  </div>
+)
+
+const BigNum = ({ value, label, color }) => (
+  <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 1 }}>
+    <span style={{ fontSize: 18, fontWeight: 700, color, lineHeight: 1 }}>{value ?? '—'}</span>
+    <span style={{ fontSize: 8, color: '#7d8590', textTransform: 'uppercase', letterSpacing: '0.06em' }}>{label}</span>
+  </div>
 )
 
 // ── Level-1 renderers ─────────────────────────────────────────────────────────
@@ -36,73 +50,76 @@ export function renderReviewCycleSummary(data) {
     s.status === 'rejected'  ? '#ef4444' :
     s.status === 'escalated' ? '#f59e0b' : '#9333ea'
 
-  const BAR_MAX_W = 180
-  const totalDur = s.durationSeconds
   const iterations = s.iterations ?? []
   const maxIterDur = iterations.reduce((mx, it) => Math.max(mx, it.durationSeconds ?? 0), 0)
 
   return (
     <div style={{ padding: '8px 12px', display: 'flex', flexDirection: 'column', gap: 4 }}>
+      {/* Status row */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
         <StatusDot color={statusColor} />
         <span style={{ fontSize: 11, fontWeight: 700, color: statusColor }}>
           {s.status.toUpperCase()}
         </span>
-        {totalDur != null && (
+        {s.durationSeconds != null && (
           <span style={{ fontSize: 11, color: '#9ca3af', marginLeft: 'auto' }}>
-            {fmtDur(totalDur)}
+            {fmtDur(s.durationSeconds)}
           </span>
         )}
       </div>
 
+      {/* Agent rows */}
       {s.makerAgent && (
         <div style={{ fontSize: 10, display: 'flex', gap: 4 }}>
-          <span style={{ color: '#6b7280', minWidth: 52 }}>Maker</span>
+          <span style={{ color: '#7d8590', minWidth: 52 }}>Maker</span>
           <span style={{ color: '#c4b5fd' }}>{formatAgent(s.makerAgent)}</span>
         </div>
       )}
       {s.reviewerAgent && (
         <div style={{ fontSize: 10, display: 'flex', gap: 4 }}>
-          <span style={{ color: '#6b7280', minWidth: 52 }}>Reviewer</span>
+          <span style={{ color: '#7d8590', minWidth: 52 }}>Reviewer</span>
           <span style={{ color: '#c4b5fd' }}>{formatAgent(s.reviewerAgent)}</span>
         </div>
       )}
 
       {iterations.length > 0 && (
-        <div style={{ marginTop: 4, display: 'flex', flexDirection: 'column', gap: 3 }}>
-          <span style={{ fontSize: 9, color: '#6b7280', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
-            Iteration timeline
-          </span>
+        <>
+          <Sep />
+          {/* Iteration count callout — inline: "2 / 5 ITERATIONS" */}
+          <div style={{ display: 'flex', alignItems: 'baseline', gap: 4 }}>
+            <span style={{ fontSize: 18, fontWeight: 700, color: '#9333ea', lineHeight: 1 }}>
+              {s.totalIterations ?? '—'}
+            </span>
+            {s.maxIterations != null && (
+              <span style={{ fontSize: 11, color: '#7d8590' }}>/{s.maxIterations}</span>
+            )}
+            <span style={{ fontSize: 8, color: '#7d8590', textTransform: 'uppercase', letterSpacing: '0.06em', marginLeft: 2 }}>
+              ITERATIONS
+            </span>
+          </div>
+
+          {/* Proportional bars per iteration */}
           {iterations.map((iter, idx) => {
-            const isFirst = idx === 0
-            const barColor = isFirst ? '#9333ea' : '#f59e0b'
             const isRunning = iter.durationSeconds == null && s.status === 'running' && idx === iterations.length - 1
-            const barW = iter.durationSeconds != null && maxIterDur > 0
-              ? Math.max(4, Math.round((iter.durationSeconds / maxIterDur) * BAR_MAX_W))
-              : isRunning ? 40 : 4
+            const pct = iter.durationSeconds != null && maxIterDur > 0
+              ? (iter.durationSeconds / maxIterDur) * 100
+              : isRunning ? 25 : 2
 
             return (
               <div key={iter.number} style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                <span style={{ fontSize: 9, color: '#6b7280', minWidth: 10, textAlign: 'right' }}>
-                  {iter.number}
+                <span style={{ fontSize: 9, color: '#7d8590', minWidth: 28 }}>
+                  Iter {iter.number}
                 </span>
-                <div
-                  style={{
-                    height: 6,
-                    width: barW,
-                    borderRadius: 3,
-                    background: barColor,
-                    opacity: isRunning ? undefined : 0.9,
-                    animation: isRunning ? 'pulse 1.5s ease-in-out infinite' : undefined,
-                  }}
-                />
-                <span style={{ fontSize: 9, color: '#9ca3af' }}>
+                <div style={{ flex: 1 }}>
+                  <Bar pct={pct} color="#9333ea" />
+                </div>
+                <span style={{ fontSize: 9, color: '#7d8590', minWidth: 28, textAlign: 'right' }}>
                   {fmtDur(iter.durationSeconds)}
                 </span>
               </div>
             )
           })}
-        </div>
+        </>
       )}
     </div>
   )
@@ -115,8 +132,13 @@ export function renderRepairCycleSummary(data) {
   const statusColor = s.status === 'success' ? '#10b981' : s.status === 'failed' ? '#ef4444' : '#f59e0b'
   const statusText = s.status === 'running' ? 'RUNNING' : s.status === 'success' ? 'SUCCESS' : 'FAILED'
 
+  const totalPass   = s.testCycleRows.filter(tc => tc.passed).length
+  const totalFixed  = s.testCycleRows.reduce((n, tc) => n + (tc.filesFixed ?? 0), 0)
+  const cycleCount  = s.testCycleRows.length
+
   return (
-    <div style={{ padding: '8px 12px', display: 'flex', flexDirection: 'column', gap: 3 }}>
+    <div style={{ padding: '8px 12px', display: 'flex', flexDirection: 'column', gap: 4 }}>
+      {/* Status row */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
         <StatusDot color={statusColor} />
         <span style={{ fontSize: 11, fontWeight: 700, color: statusColor }}>{statusText}</span>
@@ -125,26 +147,36 @@ export function renderRepairCycleSummary(data) {
         )}
       </div>
 
-      {s.testCycleRows.length > 0 && <Sep />}
-
-      {s.testCycleRows.map((tc, i) => (
-        <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 11 }}>
-          <span style={{ color: '#d1d5db', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', minWidth: 0 }}>
-            {tc.testType}
-          </span>
-          {tc.passed != null && (
-            <span style={{ color: tc.passed ? '#10b981' : '#ef4444', flexShrink: 0 }}>
-              {tc.passed ? '✓' : '✗'}
-            </span>
-          )}
-          {tc.filesFixed != null && tc.filesFixed > 0 && (
-            <span style={{ color: '#9ca3af', flexShrink: 0 }}>{tc.filesFixed} fixed</span>
-          )}
-          {tc.iterations != null && (
-            <span style={{ color: '#9ca3af', flexShrink: 0 }}>{tc.iterations} iters</span>
-          )}
-        </div>
-      ))}
+      {cycleCount > 0 && (
+        <>
+          <Sep />
+          {/* Stat row */}
+          <div style={{ display: 'flex', justifyContent: 'space-around' }}>
+            <BigNum value={totalPass}  label="PASS"   color="#10b981" />
+            <BigNum value={totalFixed} label="FIXED"  color="#fcd34d" />
+            <BigNum value={cycleCount} label="CYCLES" color="#d97706" />
+          </div>
+          {/* Per-type rows */}
+          {s.testCycleRows.map((tc, i) => (
+            <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 10 }}>
+              <span style={{ color: '#fcd34d', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', minWidth: 0 }}>
+                {tc.testType}
+              </span>
+              {tc.passed != null && (
+                <span style={{ color: tc.passed ? '#10b981' : '#ef4444', flexShrink: 0 }}>
+                  {tc.passed ? '✓' : '✗'}
+                </span>
+              )}
+              {tc.filesFixed != null && tc.filesFixed > 0 && (
+                <span style={{ color: '#9ca3af', flexShrink: 0 }}>{tc.filesFixed} fixed</span>
+              )}
+              {tc.iterations != null && (
+                <span style={{ color: '#9ca3af', flexShrink: 0 }}>{tc.iterations} iter{tc.iterations !== 1 ? 's' : ''}</span>
+              )}
+            </div>
+          ))}
+        </>
+      )}
 
       {s.envRebuildTriggered && (
         <>
@@ -167,13 +199,23 @@ export function renderPRReviewCycleSummary(data) {
   const statusText = (s.finalStatus ?? s.status).toUpperCase()
 
   return (
-    <div style={{ padding: '8px 12px', display: 'flex', flexDirection: 'column', gap: 3 }}>
+    <div style={{ padding: '8px 12px', display: 'flex', flexDirection: 'column', gap: 4 }}>
+      {/* Status row */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
         <StatusDot color={statusColor} />
         <span style={{ fontSize: 11, fontWeight: 700, color: statusColor }}>{statusText}</span>
+        {s.durationSeconds != null && (
+          <span style={{ fontSize: 11, color: '#9ca3af', marginLeft: 'auto' }}>{fmtDur(s.durationSeconds)}</span>
+        )}
       </div>
-      <div style={{ fontSize: 11, color: '#7dd3fc' }}>
-        {s.phaseCount} review phase{s.phaseCount !== 1 ? 's' : ''}
+
+      <Sep />
+
+      {/* Stat row: phases / issues / ci fail */}
+      <div style={{ display: 'flex', justifyContent: 'space-around' }}>
+        <BigNum value={s.phaseCount}  label="PHASES"  color="#0ea5e9" />
+        <BigNum value={s.issueCount}  label="ISSUES"  color="#7dd3fc" />
+        <BigNum value={s.ciFailCount} label="CI FAIL" color="#f87171" />
       </div>
     </div>
   )
@@ -183,10 +225,11 @@ export function renderConversationalLoopSummary(data) {
   const s = data.summary
   if (!s) return null
 
-  const statusColor = s.status === 'paused' ? '#9ca3af' : '#ec4899'
+  const statusColor = '#ec4899'
 
   return (
-    <div style={{ padding: '8px 12px', display: 'flex', flexDirection: 'column', gap: 3 }}>
+    <div style={{ padding: '8px 12px', display: 'flex', flexDirection: 'column', gap: 4 }}>
+      {/* Status row */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
         <StatusDot color={statusColor} />
         <span style={{ fontSize: 11, fontWeight: 700, color: statusColor }}>
@@ -198,9 +241,22 @@ export function renderConversationalLoopSummary(data) {
           </span>
         )}
       </div>
-      <div style={{ fontSize: 11, color: '#f9a8d4' }}>
-        {s.exchangeCount} exchange{s.exchangeCount !== 1 ? 's' : ''}
-      </div>
+
+      <Sep />
+
+      {/* Exchange count callout */}
+      <BigNum value={s.exchangeCount} label="EXCHANGES" color="#ec4899" />
+
+      {(s.agentName || s.pausedReason) && <Sep />}
+
+      {s.agentName && (
+        <div style={{ fontSize: 10, color: '#9ca3af' }}>
+          Agent: {formatAgent(s.agentName)}
+        </div>
+      )}
+      {s.pausedReason && (
+        <div style={{ fontSize: 10, color: '#f59e0b' }}>{s.pausedReason}</div>
+      )}
     </div>
   )
 }
@@ -287,16 +343,22 @@ export function renderReviewIterationSummary(data) {
   return (
     <div style={{ padding: '8px 12px', display: 'flex', flexDirection: 'column', gap: 3 }}>
       {s.makerAgent && (
-        <div style={{ fontSize: 10 }}>
-          <span style={{ color: '#6b7280' }}>Maker: </span>
+        <div style={{ fontSize: 10, display: 'flex', gap: 4 }}>
+          <span style={{ color: '#7d8590', minWidth: 52 }}>Maker</span>
           <span style={{ color: '#c4b5fd' }}>{formatAgent(s.makerAgent)}</span>
         </div>
       )}
       {s.reviewerAgent && (
-        <div style={{ fontSize: 10 }}>
-          <span style={{ color: '#6b7280' }}>Reviewer: </span>
+        <div style={{ fontSize: 10, display: 'flex', gap: 4 }}>
+          <span style={{ color: '#7d8590', minWidth: 52 }}>Reviewer</span>
           <span style={{ color: '#c4b5fd' }}>{formatAgent(s.reviewerAgent)}</span>
         </div>
+      )}
+      {s.eventCount > 0 && (
+        <>
+          <Sep />
+          <div style={{ fontSize: 10, color: '#7d8590' }}>{s.eventCount} events</div>
+        </>
       )}
     </div>
   )
@@ -311,18 +373,24 @@ export function renderRepairTestCycleSummary(data) {
 
   return (
     <div style={{ padding: '8px 12px', display: 'flex', flexDirection: 'column', gap: 3 }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 11 }}>
-        <span style={{ fontWeight: 700, color: passColor }}>{passText}</span>
-        {s.filesFixed != null && s.filesFixed > 0 && (
-          <span style={{ color: '#9ca3af' }}>{s.filesFixed} files fixed</span>
-        )}
+      {/* Header row: pass/fail + type + duration */}
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', fontSize: 11 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+          <span style={{ fontWeight: 700, color: passColor }}>{passText}</span>
+          {s.testType && (
+            <span style={{ color: '#fcd34d' }}>{s.testType}</span>
+          )}
+        </div>
         {s.durationSeconds != null && (
-          <span style={{ color: '#9ca3af', marginLeft: 'auto' }}>{fmtDur(s.durationSeconds)}</span>
+          <span style={{ color: '#7d8590' }}>{fmtDur(s.durationSeconds)}</span>
         )}
       </div>
 
+      <Sep />
+
+      {/* Test counts */}
       {s.testResultRow && (s.testResultRow.passedCount != null || s.testResultRow.failedCount != null) && (
-        <div style={{ fontSize: 10, color: '#6b7280' }}>
+        <div style={{ fontSize: 10, color: '#9ca3af' }}>
           {'Tests: '}
           {s.testResultRow.passedCount != null && (
             <span style={{ color: '#10b981' }}>{s.testResultRow.passedCount} pass</span>
@@ -337,8 +405,13 @@ export function renderRepairTestCycleSummary(data) {
         </div>
       )}
 
-      {s.warningsReviewed != null && s.warningsReviewed > 0 && (
-        <div style={{ fontSize: 10, color: '#f59e0b' }}>{s.warningsReviewed} warnings reviewed</div>
+      {/* Files fixed + iterations */}
+      {((s.filesFixed != null && s.filesFixed > 0) || s.iterationsUsed != null) && (
+        <div style={{ fontSize: 10, color: '#9ca3af' }}>
+          {s.filesFixed != null && s.filesFixed > 0 && `${s.filesFixed} files fixed`}
+          {s.filesFixed != null && s.filesFixed > 0 && s.iterationsUsed != null && ' · '}
+          {s.iterationsUsed != null && `${s.iterationsUsed} iter${s.iterationsUsed !== 1 ? 's' : ''}`}
+        </div>
       )}
 
       {s.hadSystemicFix && (
@@ -352,11 +425,44 @@ export function renderPRReviewPhaseSummary(data) {
   const s = data.summary
   if (!s) return null
 
+  const phaseName = s.phaseName
+  const nameLC = (phaseName ?? '').toLowerCase()
+
+  let detailLine = null
+  if (nameLC.includes('ci') || nameLC.includes('check')) {
+    detailLine = `${s.failuresFound ?? 0} failures · ${s.eventCount} pending`
+  } else if (nameLC.includes('consolidat')) {
+    detailLine = `${s.issuesFound ?? 0} issues found`
+  } else if (phaseName) {
+    // Generic code review phase — show text collected indicator
+    const icon = s.textCollected ? '✓' : '✗'
+    const iconColor = s.textCollected ? '#10b981' : '#ef4444'
+    detailLine = (
+      <span>
+        <span style={{ color: iconColor }}>{icon}</span>
+        <span style={{ color: '#9ca3af' }}> text collected · {s.eventCount} events</span>
+      </span>
+    )
+  } else {
+    detailLine = `${s.eventCount} event${s.eventCount !== 1 ? 's' : ''}`
+  }
+
   return (
-    <div style={{ padding: '8px 12px' }}>
-      <div style={{ fontSize: 11, color: '#7dd3fc' }}>
-        {s.eventCount} event{s.eventCount !== 1 ? 's' : ''}
+    <div style={{ padding: '8px 12px', display: 'flex', flexDirection: 'column', gap: 3 }}>
+      {/* Phase name + duration */}
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+        <span style={{ fontSize: 11, fontWeight: 600, color: '#7dd3fc' }}>
+          {phaseName ?? `Phase ${s.phaseNumber}`}
+        </span>
+        {s.durationSeconds != null && (
+          <span style={{ fontSize: 10, color: '#7d8590' }}>{fmtDur(s.durationSeconds)}</span>
+        )}
       </div>
+
+      {/* Detail line */}
+      {detailLine != null && (
+        <div style={{ fontSize: 10, color: '#9ca3af' }}>{detailLine}</div>
+      )}
     </div>
   )
 }
@@ -368,16 +474,44 @@ export function renderTestExecutionSummary(data) {
   if (!s) return null
   if (s.testPassedCount == null && s.testFailedCount == null) return null
 
+  const passed = s.testPassedCount ?? 0
+  const failed = s.testFailedCount ?? 0
+  const total  = passed + failed
+  const pct    = total > 0 ? (passed / total) * 100 : 0
+
+  const failures = s.failuresList ?? []
+
   return (
-    <div style={{ padding: '8px 12px' }}>
-      <div style={{ display: 'flex', gap: 8, fontSize: 11 }}>
-        {s.testPassedCount != null && (
-          <span style={{ color: '#10b981' }}>✓ {s.testPassedCount} pass</span>
-        )}
-        {s.testFailedCount != null && (
-          <span style={{ color: '#ef4444' }}>✗ {s.testFailedCount} fail</span>
+    <div style={{ padding: '8px 12px', display: 'flex', flexDirection: 'column', gap: 4 }}>
+      {/* Pass / fail counts + pct */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 11 }}>
+        <span style={{ color: '#6ee7b7', fontWeight: 700 }}>✓ {passed}</span>
+        <span style={{ color: '#f87171', fontWeight: 700 }}>✗ {failed}</span>
+        {total > 0 && (
+          <span style={{ color: '#7d8590', marginLeft: 'auto' }}>
+            {Math.round(pct)}%
+          </span>
         )}
       </div>
+
+      {/* Progress bar */}
+      <Bar pct={pct} color="#10b981" />
+
+      {/* Failure list */}
+      {failures.length > 0 && (
+        <>
+          <Sep />
+          {failures.slice(0, 3).map((f, i) => {
+            const label = typeof f === 'string' ? f : (f.name ?? f.test ?? String(f))
+            const basename = label.includes('/') ? label.split('/').pop() : label
+            return (
+              <div key={i} style={{ fontSize: 10, color: '#f87171' }}>
+                · <span style={{ color: '#7d8590' }}>{basename}</span>
+              </div>
+            )
+          })}
+        </>
+      )}
     </div>
   )
 }
@@ -386,9 +520,26 @@ export function renderFixCycleSummary(data) {
   const s = data.summary
   if (!s || s.filesFixed == null) return null
 
+  const files = s.fixedFilesList ?? []
+
   return (
-    <div style={{ padding: '8px 12px' }}>
-      <div style={{ fontSize: 11, color: '#fcd34d' }}>{s.filesFixed} files fixed</div>
+    <div style={{ padding: '8px 12px', display: 'flex', flexDirection: 'column', gap: 4 }}>
+      {/* Big number callout */}
+      <BigNum value={s.filesFixed} label="FILES FIXED" color="#fcd34d" />
+
+      {/* File list */}
+      {files.length > 0 && (
+        <>
+          <Sep />
+          {files.slice(0, 3).map((f, i) => {
+            const path = typeof f === 'string' ? f : (f.path ?? f.file ?? String(f))
+            const basename = path.includes('/') ? path.split('/').pop() : path
+            return (
+              <div key={i} style={{ fontSize: 10, color: '#9ca3af' }}>· {basename}</div>
+            )
+          })}
+        </>
+      )}
     </div>
   )
 }
@@ -398,8 +549,9 @@ export function renderWarningReviewSummary(data) {
   if (!s || s.warningCount == null) return null
 
   return (
-    <div style={{ padding: '8px 12px' }}>
-      <div style={{ fontSize: 11, color: '#fde68a' }}>{s.warningCount} warnings reviewed</div>
+    <div style={{ padding: '8px 12px', display: 'flex', alignItems: 'center', gap: 8 }}>
+      <span style={{ fontSize: 14, color: '#f59e0b' }}>⚠</span>
+      <BigNum value={s.warningCount} label="WARNINGS" color="#fde68a" />
     </div>
   )
 }
@@ -408,15 +560,17 @@ export function renderSystemicAnalysisSummary(data) {
   const s = data.summary
   if (!s || (!s.patternCategory && s.affectedFiles == null)) return null
 
+  const title = s.issueDescription ?? 'Systemic Code Issue'
+
   return (
     <div style={{ padding: '8px 12px', display: 'flex', flexDirection: 'column', gap: 2 }}>
-      {s.patternCategory && (
-        <div style={{ fontSize: 10, color: '#c4b5fd' }}>
-          Pattern: <span style={{ color: '#ddd6fe' }}>{s.patternCategory}</span>
+      <div style={{ fontSize: 11, fontWeight: 600, color: '#c4b5fd' }}>⚙ {title}</div>
+      {(s.patternCategory || s.affectedFiles != null) && (
+        <div style={{ fontSize: 10, color: '#9ca3af' }}>
+          {s.patternCategory ?? ''}
+          {s.patternCategory && s.affectedFiles != null && ' · '}
+          {s.affectedFiles != null && `${s.affectedFiles} files affected`}
         </div>
-      )}
-      {s.affectedFiles != null && (
-        <div style={{ fontSize: 10, color: '#a78bfa' }}>{s.affectedFiles} files affected</div>
       )}
     </div>
   )
@@ -424,11 +578,23 @@ export function renderSystemicAnalysisSummary(data) {
 
 export function renderSystemicFixSummary(data) {
   const s = data.summary
-  if (!s || s.filesFixed == null) return null
+  if (!s) return null
+
+  const isComplete = s.outcome === 'complete' || (s.filesFixed != null && s.filesFixed > 0)
 
   return (
-    <div style={{ padding: '8px 12px' }}>
-      <div style={{ fontSize: 11, color: '#ddd6fe' }}>{s.filesFixed} files fixed (systemic)</div>
+    <div style={{ padding: '8px 12px', display: 'flex', flexDirection: 'column', gap: 2 }}>
+      <div style={{ fontSize: 11, fontWeight: 600, color: isComplete ? '#10b981' : '#7d8590' }}>
+        {isComplete ? '✓ Tests passing' : '… Running'}{' '}
+        <span style={{ color: '#7d8590', fontWeight: 400 }}>(systemic)</span>
+      </div>
+      {(s.patternCategory || s.attemptCount != null) && (
+        <div style={{ fontSize: 10, color: '#9ca3af' }}>
+          {s.patternCategory ?? ''}
+          {s.patternCategory && s.attemptCount != null && ' · '}
+          {s.attemptCount != null && `${s.attemptCount} attempt${s.attemptCount !== 1 ? 's' : ''}`}
+        </div>
+      )}
     </div>
   )
 }
