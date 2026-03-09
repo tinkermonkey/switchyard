@@ -319,7 +319,6 @@ export default function PipelineFlowGraph({
       const anyOverlap = prevNodeIds.size > 0 && filteredRawBuild.nodes.some(n => prevNodeIds.has(n.id))
       const isIncrementalUpdate = hasLayoutedOnceRef.current && anyOverlap
 
-
       if (isIncrementalUpdate) {
         // Keep graph visible — carry existing positions and styles forward so container nodes
         // don't lose their computed dimensions (style.width/height) while LayoutController

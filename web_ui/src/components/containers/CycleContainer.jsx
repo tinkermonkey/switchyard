@@ -16,15 +16,12 @@ import { ChevronDown, ChevronRight } from 'lucide-react'
  *   data.onToggleCollapse {function} - if null/undefined, collapse toggle is hidden
  *   data.isResizable      {boolean}  - optional: renders NodeResizer when true and not collapsed
  *
- *   theme.borderColor       {string}    - e.g. '#9333ea'
- *   theme.borderStyle       {string}    - 'dashed' (default) or 'solid'
- *   theme.bgColor           {string}    - e.g. 'rgba(147,51,234,0.14)'
- *   theme.cornerColor       {string}    - semi-transparent version for corner decorations
- *   theme.icon              {Component} - lucide-react icon component
- *   theme.countSuffix       {string}    - e.g. 'iteration' or 'test cycle'
- *   theme.collapsedLabel    {string}    - label shown in collapsed card
- *   theme.collapsedTextColor  {string}
- *   theme.collapsedCountColor {string}
+ *   theme.borderColor         {string}    - e.g. '#9333ea'
+ *   theme.borderStyle         {string}    - 'solid' (default) or other CSS border-style
+ *   theme.bgColor             {string}    - e.g. 'rgba(147,51,234,0.14)'
+ *   theme.cornerColor         {string}    - semi-transparent version for corner decorations
+ *   theme.icon                {Component} - lucide-react icon component
+ *   theme.collapsedCountColor {string}    - color for the iteration count in the fallback collapsed body
  */
 export function CycleContainer({ data, theme }) {
   const {
@@ -42,9 +39,6 @@ export function CycleContainer({ data, theme }) {
     bgColor,
     cornerColor,
     icon: Icon,
-    countSuffix = 'cycle',
-    collapsedLabel,
-    collapsedTextColor,
     collapsedCountColor,
     collapsedWidth = 280,
     renderCollapsedSummary,
