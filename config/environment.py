@@ -66,6 +66,7 @@ class Environment(BaseSettings):
     host_uid: Optional[int] = 1000
     host_gid: Optional[int] = 1000
     docker_gid: Optional[int] = 0
+    host_home: Optional[str] = None  # Host user home dir for Docker-in-Docker SSH mounts (set in .env)
 
     class Config:
         env_file = ".env"

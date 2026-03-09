@@ -62,12 +62,10 @@ services:
       # Recommended: 2-3 workers for multi-project deployments
       - ORCHESTRATOR_WORKERS=${ORCHESTRATOR_WORKERS:-1}
       - PYTHONDONTWRITEBYTECODE=1
-      # Host paths for Docker-in-Docker mounting
-      # These are intentionally NOT set - the code has correct defaults:
-      # - HOST_WORKSPACE_PATH defaults to '/workspace' (the mounted parent dir)
-      # - HOST_HOME defaults to $HOME inside the container
-      # Setting them from the host's $HOME can cause issues with Snap Docker
-      # where $HOME points to /home/user/snap/docker/XXX instead of /home/user
+      # Host home directory for Docker-in-Docker SSH/git mounts.
+      # Must be set explicitly in .env — path inference via /proc/self/mountinfo
+      # is unreliable under Snap Docker (see .env.example for details).
+      - HOST_HOME=${HOST_HOME}
 
     depends_on:
       redis:

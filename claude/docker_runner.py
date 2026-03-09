@@ -75,34 +75,30 @@ class DockerAgentRunner:
     @staticmethod
     def _detect_host_home_path() -> str:
         """
-        Auto-detect the actual host home directory path.
-        
-        This reads /proc/self/mountinfo to find the host's home directory from SSH key mounts,
-        avoiding issues with Snap Docker where $HOME points to snap-specific paths.
-        
+        Return the host user's home directory for Docker-in-Docker volume mounts.
+
+        HOST_HOME must be set explicitly in .env (e.g. HOST_HOME=/home/youruser).
+        This is required because path inference via /proc/self/mountinfo is unreliable
+        under Snap Docker, which resolves bind-mounts through a snap-versioned user
+        data directory (e.g. /home/user/snap/docker/<rev>/.ssh) that is missing
+        known_hosts and SSH config, causing git push to fail in agent containers.
+
         Returns:
-            The host home directory path, or $HOME as fallback
+            The value of HOST_HOME, falling back to the container's $HOME.
         """
-        try:
-            with open('/proc/self/mountinfo', 'r') as f:
-                for line in f:
-                    parts = line.split()
-                    if len(parts) >= 5:
-                        mount_point = parts[4]
-                        # Look for .ssh mount which should be from host home
-                        if '.ssh' in mount_point:
-                            host_path = parts[3]  # e.g., /home/username/.ssh/id_ed25519
-                            # Extract home directory (remove /.ssh/... part)
-                            if '/.ssh/' in host_path:
-                                host_home = host_path.split('/.ssh/')[0]
-                                logger.info(f"Auto-detected host home path: {host_home}")
-                                return host_home
-        except Exception as e:
-            logger.warning(f"Failed to auto-detect host home path: {e}")
-        
-        # Fallback to environment variable or container's HOME
-        fallback = os.environ.get("HOST_HOME", os.environ.get("HOME", "/root"))
-        logger.info(f"Using fallback host home path: {fallback}")
+        host_home = os.environ.get("HOST_HOME")
+        if host_home:
+            logger.info(f"Using HOST_HOME={host_home}")
+            return host_home
+
+        # No explicit override — fall back to container $HOME and warn, since this
+        # is almost certainly wrong in a Docker-in-Docker deployment.
+        fallback = os.environ.get("HOME", "/root")
+        logger.warning(
+            f"HOST_HOME is not set; falling back to container $HOME={fallback}. "
+            "SSH/git operations in agent containers will likely fail. "
+            "Set HOST_HOME=/home/<your-user> in .env to fix this."
+        )
         return fallback
 
     @staticmethod
