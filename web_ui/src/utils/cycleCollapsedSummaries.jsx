@@ -1,7 +1,7 @@
 /**
  * All collapsed summary renderers for cycle container nodes.
  * One named function per cycle type. Shared helpers defined once here.
- * Each renderer receives `data` and returns JSX (or null).
+ * Each renderer receives `data` and `isDark` and returns JSX (or null).
  * No theme logic — just content.
  */
 
@@ -22,26 +22,26 @@ export const StatusDot = ({ color }) => (
   <div style={{ width: 6, height: 6, borderRadius: '50%', background: color, flexShrink: 0 }} />
 )
 
-const Sep = () => (
-  <div style={{ height: 1, background: '#21262d', margin: '3px 0' }} />
+const Sep = ({ isDark }) => (
+  <div style={{ height: 1, background: isDark ? '#21262d' : '#d0d7de', margin: '3px 0' }} />
 )
 
-const Bar = ({ pct, color }) => (
-  <div style={{ height: 4, background: '#21262d', borderRadius: 2, overflow: 'hidden' }}>
+const Bar = ({ pct, color, isDark }) => (
+  <div style={{ height: 4, background: isDark ? '#21262d' : '#e5e7eb', borderRadius: 2, overflow: 'hidden' }}>
     <div style={{ height: '100%', width: `${Math.min(100, Math.max(0, pct))}%`, background: color, borderRadius: 2 }} />
   </div>
 )
 
-const BigNum = ({ value, label, color }) => (
+const BigNum = ({ value, label, color, isDark }) => (
   <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 1 }}>
     <span style={{ fontSize: 18, fontWeight: 700, color, lineHeight: 1 }}>{value ?? '—'}</span>
-    <span style={{ fontSize: 8, color: '#7d8590', textTransform: 'uppercase', letterSpacing: '0.06em' }}>{label}</span>
+    <span style={{ fontSize: 8, color: isDark ? '#7d8590' : '#57606a', textTransform: 'uppercase', letterSpacing: '0.06em' }}>{label}</span>
   </div>
 )
 
 // ── Level-1 renderers ─────────────────────────────────────────────────────────
 
-export function renderReviewCycleSummary(data) {
+export function renderReviewCycleSummary(data, isDark) {
   const s = data.summary
   if (!s) return null
 
@@ -53,6 +53,10 @@ export function renderReviewCycleSummary(data) {
   const iterations = s.iterations ?? []
   const maxIterDur = iterations.reduce((mx, it) => Math.max(mx, it.durationSeconds ?? 0), 0)
 
+  const secondary = isDark ? '#9ca3af' : '#6e7781'
+  const muted     = isDark ? '#7d8590' : '#57606a'
+  const agentColor = isDark ? '#c4b5fd' : '#6d28d9'
+
   return (
     <div style={{ padding: '8px 12px', display: 'flex', flexDirection: 'column', gap: 4 }}>
       {/* Status row */}
@@ -62,7 +66,7 @@ export function renderReviewCycleSummary(data) {
           {s.status.toUpperCase()}
         </span>
         {s.durationSeconds != null && (
-          <span style={{ fontSize: 11, color: '#9ca3af', marginLeft: 'auto' }}>
+          <span style={{ fontSize: 11, color: secondary, marginLeft: 'auto' }}>
             {fmtDur(s.durationSeconds)}
           </span>
         )}
@@ -71,29 +75,29 @@ export function renderReviewCycleSummary(data) {
       {/* Agent rows */}
       {s.makerAgent && (
         <div style={{ fontSize: 10, display: 'flex', gap: 4 }}>
-          <span style={{ color: '#7d8590', minWidth: 52 }}>Maker</span>
-          <span style={{ color: '#c4b5fd' }}>{formatAgent(s.makerAgent)}</span>
+          <span style={{ color: muted, minWidth: 52 }}>Maker</span>
+          <span style={{ color: agentColor }}>{formatAgent(s.makerAgent)}</span>
         </div>
       )}
       {s.reviewerAgent && (
         <div style={{ fontSize: 10, display: 'flex', gap: 4 }}>
-          <span style={{ color: '#7d8590', minWidth: 52 }}>Reviewer</span>
-          <span style={{ color: '#c4b5fd' }}>{formatAgent(s.reviewerAgent)}</span>
+          <span style={{ color: muted, minWidth: 52 }}>Reviewer</span>
+          <span style={{ color: agentColor }}>{formatAgent(s.reviewerAgent)}</span>
         </div>
       )}
 
       {iterations.length > 0 && (
         <>
-          <Sep />
+          <Sep isDark={isDark} />
           {/* Iteration count callout — inline: "2 / 5 ITERATIONS" */}
           <div style={{ display: 'flex', alignItems: 'baseline', gap: 4 }}>
             <span style={{ fontSize: 18, fontWeight: 700, color: '#9333ea', lineHeight: 1 }}>
               {s.totalIterations ?? '—'}
             </span>
             {s.maxIterations != null && (
-              <span style={{ fontSize: 11, color: '#7d8590' }}>/{s.maxIterations}</span>
+              <span style={{ fontSize: 11, color: muted }}>/{s.maxIterations}</span>
             )}
-            <span style={{ fontSize: 8, color: '#7d8590', textTransform: 'uppercase', letterSpacing: '0.06em', marginLeft: 2 }}>
+            <span style={{ fontSize: 8, color: muted, textTransform: 'uppercase', letterSpacing: '0.06em', marginLeft: 2 }}>
               ITERATIONS
             </span>
           </div>
@@ -107,13 +111,13 @@ export function renderReviewCycleSummary(data) {
 
             return (
               <div key={iter.number} style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                <span style={{ fontSize: 9, color: '#7d8590', minWidth: 28 }}>
+                <span style={{ fontSize: 9, color: muted, minWidth: 28 }}>
                   Iter {iter.number}
                 </span>
                 <div style={{ flex: 1 }}>
-                  <Bar pct={pct} color="#9333ea" />
+                  <Bar pct={pct} color="#9333ea" isDark={isDark} />
                 </div>
-                <span style={{ fontSize: 9, color: '#7d8590', minWidth: 28, textAlign: 'right' }}>
+                <span style={{ fontSize: 9, color: muted, minWidth: 28, textAlign: 'right' }}>
                   {fmtDur(iter.durationSeconds)}
                 </span>
               </div>
@@ -125,7 +129,7 @@ export function renderReviewCycleSummary(data) {
   )
 }
 
-export function renderRepairCycleSummary(data) {
+export function renderRepairCycleSummary(data, isDark) {
   const s = data.summary
   if (!s) return null
 
@@ -136,6 +140,11 @@ export function renderRepairCycleSummary(data) {
   const totalFixed  = s.testCycleRows.reduce((n, tc) => n + (tc.filesFixed ?? 0), 0)
   const cycleCount  = s.testCycleRows.length
 
+  const secondary   = isDark ? '#9ca3af' : '#57606a'
+  const fixedColor  = isDark ? '#fcd34d' : '#92400e'
+  const testTypeColor = isDark ? '#fcd34d' : '#92400e'
+  const envWarnColor  = isDark ? '#f59e0b' : '#d97706'
+
   return (
     <div style={{ padding: '8px 12px', display: 'flex', flexDirection: 'column', gap: 4 }}>
       {/* Status row */}
@@ -143,23 +152,23 @@ export function renderRepairCycleSummary(data) {
         <StatusDot color={statusColor} />
         <span style={{ fontSize: 11, fontWeight: 700, color: statusColor }}>{statusText}</span>
         {s.durationSeconds != null && (
-          <span style={{ fontSize: 11, color: '#9ca3af', marginLeft: 'auto' }}>{fmtDur(s.durationSeconds)}</span>
+          <span style={{ fontSize: 11, color: secondary, marginLeft: 'auto' }}>{fmtDur(s.durationSeconds)}</span>
         )}
       </div>
 
       {cycleCount > 0 && (
         <>
-          <Sep />
+          <Sep isDark={isDark} />
           {/* Stat row */}
           <div style={{ display: 'flex', justifyContent: 'space-around' }}>
-            <BigNum value={totalPass}  label="PASS"   color="#10b981" />
-            <BigNum value={totalFixed} label="FIXED"  color="#fcd34d" />
-            <BigNum value={cycleCount} label="CYCLES" color="#d97706" />
+            <BigNum value={totalPass}  label="PASS"   color="#10b981" isDark={isDark} />
+            <BigNum value={totalFixed} label="FIXED"  color={fixedColor} isDark={isDark} />
+            <BigNum value={cycleCount} label="CYCLES" color="#d97706" isDark={isDark} />
           </div>
           {/* Per-type rows */}
           {s.testCycleRows.map((tc, i) => (
             <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 10 }}>
-              <span style={{ color: '#fcd34d', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', minWidth: 0 }}>
+              <span style={{ color: testTypeColor, flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', minWidth: 0 }}>
                 {tc.testType}
               </span>
               {tc.passed != null && (
@@ -168,10 +177,10 @@ export function renderRepairCycleSummary(data) {
                 </span>
               )}
               {tc.filesFixed != null && tc.filesFixed > 0 && (
-                <span style={{ color: '#9ca3af', flexShrink: 0 }}>{tc.filesFixed} fixed</span>
+                <span style={{ color: secondary, flexShrink: 0 }}>{tc.filesFixed} fixed</span>
               )}
               {tc.iterations != null && (
-                <span style={{ color: '#9ca3af', flexShrink: 0 }}>{tc.iterations} iter{tc.iterations !== 1 ? 's' : ''}</span>
+                <span style={{ color: secondary, flexShrink: 0 }}>{tc.iterations} iter{tc.iterations !== 1 ? 's' : ''}</span>
               )}
             </div>
           ))}
@@ -180,15 +189,15 @@ export function renderRepairCycleSummary(data) {
 
       {s.envRebuildTriggered && (
         <>
-          <Sep />
-          <div style={{ fontSize: 10, color: '#f59e0b' }}>⚠ Env rebuild triggered</div>
+          <Sep isDark={isDark} />
+          <div style={{ fontSize: 10, color: envWarnColor }}>⚠ Env rebuild triggered</div>
         </>
       )}
     </div>
   )
 }
 
-export function renderPRReviewCycleSummary(data) {
+export function renderPRReviewCycleSummary(data, isDark) {
   const s = data.summary
   if (!s) return null
 
@@ -198,6 +207,11 @@ export function renderPRReviewCycleSummary(data) {
 
   const statusText = (s.finalStatus ?? s.status).toUpperCase()
 
+  const secondary   = isDark ? '#9ca3af' : '#6e7781'
+  const phaseColor  = isDark ? '#0ea5e9' : '#0369a1'
+  const issueColor  = isDark ? '#7dd3fc' : '#0284c7'
+  const ciFailColor = isDark ? '#f87171' : '#dc2626'
+
   return (
     <div style={{ padding: '8px 12px', display: 'flex', flexDirection: 'column', gap: 4 }}>
       {/* Status row */}
@@ -205,27 +219,30 @@ export function renderPRReviewCycleSummary(data) {
         <StatusDot color={statusColor} />
         <span style={{ fontSize: 11, fontWeight: 700, color: statusColor }}>{statusText}</span>
         {s.durationSeconds != null && (
-          <span style={{ fontSize: 11, color: '#9ca3af', marginLeft: 'auto' }}>{fmtDur(s.durationSeconds)}</span>
+          <span style={{ fontSize: 11, color: secondary, marginLeft: 'auto' }}>{fmtDur(s.durationSeconds)}</span>
         )}
       </div>
 
-      <Sep />
+      <Sep isDark={isDark} />
 
       {/* Stat row: phases / issues / ci fail */}
       <div style={{ display: 'flex', justifyContent: 'space-around' }}>
-        <BigNum value={s.phaseCount}  label="PHASES"  color="#0ea5e9" />
-        <BigNum value={s.issueCount}  label="ISSUES"  color="#7dd3fc" />
-        <BigNum value={s.ciFailCount} label="CI FAIL" color="#f87171" />
+        <BigNum value={s.phaseCount}  label="PHASES"  color={phaseColor}  isDark={isDark} />
+        <BigNum value={s.issueCount}  label="ISSUES"  color={issueColor}  isDark={isDark} />
+        <BigNum value={s.ciFailCount} label="CI FAIL" color={ciFailColor} isDark={isDark} />
       </div>
     </div>
   )
 }
 
-export function renderConversationalLoopSummary(data) {
+export function renderConversationalLoopSummary(data, isDark) {
   const s = data.summary
   if (!s) return null
 
-  const statusColor = '#ec4899'
+  const statusColor  = '#ec4899'
+  const secondary    = isDark ? '#9ca3af' : '#57606a'
+  const exchangeColor = isDark ? '#ec4899' : '#be185d'
+  const pausedColor  = isDark ? '#f59e0b' : '#d97706'
 
   return (
     <div style={{ padding: '8px 12px', display: 'flex', flexDirection: 'column', gap: 4 }}>
@@ -236,26 +253,26 @@ export function renderConversationalLoopSummary(data) {
           {s.status.toUpperCase()}
         </span>
         {s.durationSeconds != null && (
-          <span style={{ fontSize: 11, color: '#9ca3af', marginLeft: 'auto' }}>
+          <span style={{ fontSize: 11, color: isDark ? '#9ca3af' : '#6e7781', marginLeft: 'auto' }}>
             {fmtDur(s.durationSeconds)}
           </span>
         )}
       </div>
 
-      <Sep />
+      <Sep isDark={isDark} />
 
       {/* Exchange count callout */}
-      <BigNum value={s.exchangeCount} label="EXCHANGES" color="#ec4899" />
+      <BigNum value={s.exchangeCount} label="EXCHANGES" color={exchangeColor} isDark={isDark} />
 
-      {(s.agentName || s.pausedReason) && <Sep />}
+      {(s.agentName || s.pausedReason) && <Sep isDark={isDark} />}
 
       {s.agentName && (
-        <div style={{ fontSize: 10, color: '#9ca3af' }}>
+        <div style={{ fontSize: 10, color: secondary }}>
           Agent: {formatAgent(s.agentName)}
         </div>
       )}
       {s.pausedReason && (
-        <div style={{ fontSize: 10, color: '#f59e0b' }}>{s.pausedReason}</div>
+        <div style={{ fontSize: 10, color: pausedColor }}>{s.pausedReason}</div>
       )}
     </div>
   )
@@ -263,15 +280,19 @@ export function renderConversationalLoopSummary(data) {
 
 // ── Status progression renderer ───────────────────────────────────────────────
 
-export function renderStatusProgressionSummary(data) {
+export function renderStatusProgressionSummary(data, isDark) {
   const s = data.summary
   if (!s) return null
 
   const fmt = str => str ? str.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase()) : '?'
 
-  const statusColor =
-    s.status === 'completed' ? '#22c55e' :
-    s.status === 'failed'    ? '#ef4444' : '#86efac'
+  const statusColor = isDark
+    ? (s.status === 'completed' ? '#22c55e' : s.status === 'failed' ? '#ef4444' : '#86efac')
+    : (s.status === 'completed' ? '#15803d' : s.status === 'failed' ? '#dc2626' : '#166534')
+
+  const titleColor = isDark
+    ? (s.status === 'completed' ? '#86efac' : s.status === 'failed' ? '#fca5a5' : '#86efac')
+    : (s.status === 'completed' ? '#166534' : s.status === 'failed' ? '#dc2626' : '#166534')
 
   const statusLabel =
     s.status === 'completed' ? 'MOVED' :
@@ -281,7 +302,7 @@ export function renderStatusProgressionSummary(data) {
 
   return (
     <div style={{ padding: '8px 12px', display: 'flex', flexDirection: 'column', gap: 4 }}>
-      <div style={{ fontSize: 11, fontWeight: 600, color: statusColor }}>
+      <div style={{ fontSize: 11, fontWeight: 600, color: titleColor }}>
         {fmt(s.fromStatus ?? '?')} → {fmt(s.toStatus ?? '?')}
       </div>
       <div style={{ fontSize: 10, fontWeight: 700, color: statusColor }}>
@@ -293,40 +314,52 @@ export function renderStatusProgressionSummary(data) {
 
 // ── Level-2 renderers ─────────────────────────────────────────────────────────
 
-export function renderReviewIterationSummary(data) {
+export function renderReviewIterationSummary(data, isDark) {
   const s = data.summary
   if (!s || (!s.makerAgent && !s.reviewerAgent)) return null
+
+  const muted      = isDark ? '#7d8590' : '#57606a'
+  const agentColor = isDark ? '#c4b5fd' : '#6d28d9'
 
   return (
     <div style={{ padding: '8px 12px', display: 'flex', flexDirection: 'column', gap: 3 }}>
       {s.makerAgent && (
         <div style={{ fontSize: 10, display: 'flex', gap: 4 }}>
-          <span style={{ color: '#7d8590', minWidth: 52 }}>Maker</span>
-          <span style={{ color: '#c4b5fd' }}>{formatAgent(s.makerAgent)}</span>
+          <span style={{ color: muted, minWidth: 52 }}>Maker</span>
+          <span style={{ color: agentColor }}>{formatAgent(s.makerAgent)}</span>
         </div>
       )}
       {s.reviewerAgent && (
         <div style={{ fontSize: 10, display: 'flex', gap: 4 }}>
-          <span style={{ color: '#7d8590', minWidth: 52 }}>Reviewer</span>
-          <span style={{ color: '#c4b5fd' }}>{formatAgent(s.reviewerAgent)}</span>
+          <span style={{ color: muted, minWidth: 52 }}>Reviewer</span>
+          <span style={{ color: agentColor }}>{formatAgent(s.reviewerAgent)}</span>
         </div>
       )}
       {s.eventCount > 0 && (
         <>
-          <Sep />
-          <div style={{ fontSize: 10, color: '#7d8590' }}>{s.eventCount} events</div>
+          <Sep isDark={isDark} />
+          <div style={{ fontSize: 10, color: muted }}>{s.eventCount} events</div>
         </>
       )}
     </div>
   )
 }
 
-export function renderRepairTestCycleSummary(data) {
+export function renderRepairTestCycleSummary(data, isDark) {
   const s = data.summary
   if (!s) return null
 
-  const passColor = s.passed ? '#10b981' : s.passed != null ? '#ef4444' : '#9ca3af'
+  const passColor = s.passed
+    ? (isDark ? '#10b981' : '#047857')
+    : s.passed != null
+      ? (isDark ? '#ef4444' : '#dc2626')
+      : (isDark ? '#9ca3af' : '#57606a')
   const passText = s.passed ? '✓ Passed' : s.passed != null ? '✗ Failed' : '…'
+
+  const muted        = isDark ? '#7d8590' : '#6e7781'
+  const secondary    = isDark ? '#9ca3af' : '#57606a'
+  const testTypeColor = isDark ? '#fcd34d' : '#92400e'
+  const systemicColor = isDark ? '#a78bfa' : '#7c3aed'
 
   return (
     <div style={{ padding: '8px 12px', display: 'flex', flexDirection: 'column', gap: 3 }}>
@@ -335,36 +368,36 @@ export function renderRepairTestCycleSummary(data) {
         <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
           <span style={{ fontWeight: 700, color: passColor }}>{passText}</span>
           {s.testType && (
-            <span style={{ color: '#fcd34d' }}>{s.testType}</span>
+            <span style={{ color: testTypeColor }}>{s.testType}</span>
           )}
         </div>
         {s.durationSeconds != null && (
-          <span style={{ color: '#7d8590' }}>{fmtDur(s.durationSeconds)}</span>
+          <span style={{ color: muted }}>{fmtDur(s.durationSeconds)}</span>
         )}
       </div>
 
-      <Sep />
+      <Sep isDark={isDark} />
 
       {/* Test counts */}
       {s.testResultRow && (s.testResultRow.passedCount != null || s.testResultRow.failedCount != null) && (
-        <div style={{ fontSize: 10, color: '#9ca3af' }}>
+        <div style={{ fontSize: 10, color: secondary }}>
           {'Tests: '}
           {s.testResultRow.passedCount != null && (
-            <span style={{ color: '#10b981' }}>{s.testResultRow.passedCount} pass</span>
+            <span style={{ color: isDark ? '#10b981' : '#047857' }}>{s.testResultRow.passedCount} pass</span>
           )}
           {s.testResultRow.passedCount != null && s.testResultRow.failedCount != null && ' / '}
           {s.testResultRow.failedCount != null && (
-            <span style={{ color: '#ef4444' }}>{s.testResultRow.failedCount} fail</span>
+            <span style={{ color: isDark ? '#ef4444' : '#dc2626' }}>{s.testResultRow.failedCount} fail</span>
           )}
           {s.testResultRow.warningsCount != null && (
-            <>{' / '}<span style={{ color: '#f59e0b' }}>{s.testResultRow.warningsCount} warn</span></>
+            <>{' / '}<span style={{ color: isDark ? '#f59e0b' : '#d97706' }}>{s.testResultRow.warningsCount} warn</span></>
           )}
         </div>
       )}
 
       {/* Files fixed + iterations */}
       {((s.filesFixed != null && s.filesFixed > 0) || s.iterationsUsed != null) && (
-        <div style={{ fontSize: 10, color: '#9ca3af' }}>
+        <div style={{ fontSize: 10, color: secondary }}>
           {s.filesFixed != null && s.filesFixed > 0 && `${s.filesFixed} files fixed`}
           {s.filesFixed != null && s.filesFixed > 0 && s.iterationsUsed != null && ' · '}
           {s.iterationsUsed != null && `${s.iterationsUsed} iter${s.iterationsUsed !== 1 ? 's' : ''}`}
@@ -372,18 +405,22 @@ export function renderRepairTestCycleSummary(data) {
       )}
 
       {s.hadSystemicFix && (
-        <div style={{ fontSize: 10, color: '#a78bfa' }}>🔍 Systemic fix applied</div>
+        <div style={{ fontSize: 10, color: systemicColor }}>🔍 Systemic fix applied</div>
       )}
     </div>
   )
 }
 
-export function renderPRReviewPhaseSummary(data) {
+export function renderPRReviewPhaseSummary(data, isDark) {
   const s = data.summary
   if (!s) return null
 
   const phaseName = s.phaseName
   const nameLC = (phaseName ?? '').toLowerCase()
+
+  const muted     = isDark ? '#7d8590' : '#6e7781'
+  const secondary = isDark ? '#9ca3af' : '#57606a'
+  const phaseNameColor = isDark ? '#7dd3fc' : '#0369a1'
 
   let detailLine = null
   if (nameLC.includes('ci') || nameLC.includes('check')) {
@@ -391,13 +428,12 @@ export function renderPRReviewPhaseSummary(data) {
   } else if (nameLC.includes('consolidat')) {
     detailLine = `${s.issuesFound ?? 0} issues found`
   } else if (phaseName) {
-    // Generic code review phase — show text collected indicator
     const icon = s.textCollected ? '✓' : '✗'
-    const iconColor = s.textCollected ? '#10b981' : '#ef4444'
+    const iconColor = s.textCollected ? (isDark ? '#10b981' : '#047857') : (isDark ? '#ef4444' : '#dc2626')
     detailLine = (
       <span>
         <span style={{ color: iconColor }}>{icon}</span>
-        <span style={{ color: '#9ca3af' }}> text collected · {s.eventCount} events</span>
+        <span style={{ color: secondary }}> text collected · {s.eventCount} events</span>
       </span>
     )
   } else {
@@ -408,17 +444,17 @@ export function renderPRReviewPhaseSummary(data) {
     <div style={{ padding: '8px 12px', display: 'flex', flexDirection: 'column', gap: 3 }}>
       {/* Phase name + duration */}
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-        <span style={{ fontSize: 11, fontWeight: 600, color: '#7dd3fc' }}>
+        <span style={{ fontSize: 11, fontWeight: 600, color: phaseNameColor }}>
           {phaseName ?? `Phase ${s.phaseNumber}`}
         </span>
         {s.durationSeconds != null && (
-          <span style={{ fontSize: 10, color: '#7d8590' }}>{fmtDur(s.durationSeconds)}</span>
+          <span style={{ fontSize: 10, color: muted }}>{fmtDur(s.durationSeconds)}</span>
         )}
       </div>
 
       {/* Detail line */}
       {detailLine != null && (
-        <div style={{ fontSize: 10, color: '#9ca3af' }}>{detailLine}</div>
+        <div style={{ fontSize: 10, color: secondary }}>{detailLine}</div>
       )}
     </div>
   )
@@ -426,7 +462,7 @@ export function renderPRReviewPhaseSummary(data) {
 
 // ── Level-3 renderers ─────────────────────────────────────────────────────────
 
-export function renderTestExecutionSummary(data) {
+export function renderTestExecutionSummary(data, isDark) {
   const s = data.summary
   if (!s) return null
   if (s.testPassedCount == null && s.testFailedCount == null) return null
@@ -438,32 +474,36 @@ export function renderTestExecutionSummary(data) {
 
   const failures = s.failuresList ?? []
 
+  const passColor = isDark ? '#6ee7b7' : '#047857'
+  const failColor = isDark ? '#f87171' : '#dc2626'
+  const muted     = isDark ? '#7d8590' : '#6e7781'
+
   return (
     <div style={{ padding: '8px 12px', display: 'flex', flexDirection: 'column', gap: 4 }}>
       {/* Pass / fail counts + pct */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 11 }}>
-        <span style={{ color: '#6ee7b7', fontWeight: 700 }}>✓ {passed}</span>
-        <span style={{ color: '#f87171', fontWeight: 700 }}>✗ {failed}</span>
+        <span style={{ color: passColor, fontWeight: 700 }}>✓ {passed}</span>
+        <span style={{ color: failColor, fontWeight: 700 }}>✗ {failed}</span>
         {total > 0 && (
-          <span style={{ color: '#7d8590', marginLeft: 'auto' }}>
+          <span style={{ color: muted, marginLeft: 'auto' }}>
             {Math.round(pct)}%
           </span>
         )}
       </div>
 
       {/* Progress bar */}
-      <Bar pct={pct} color="#10b981" />
+      <Bar pct={pct} color="#10b981" isDark={isDark} />
 
       {/* Failure list */}
       {failures.length > 0 && (
         <>
-          <Sep />
+          <Sep isDark={isDark} />
           {failures.slice(0, 3).map((f, i) => {
             const label = typeof f === 'string' ? f : (f.name ?? f.test ?? String(f))
             const basename = label.includes('/') ? label.split('/').pop() : label
             return (
-              <div key={i} style={{ fontSize: 10, color: '#f87171' }}>
-                · <span style={{ color: '#7d8590' }}>{basename}</span>
+              <div key={i} style={{ fontSize: 10, color: failColor }}>
+                · <span style={{ color: muted }}>{basename}</span>
               </div>
             )
           })}
@@ -473,26 +513,28 @@ export function renderTestExecutionSummary(data) {
   )
 }
 
-export function renderFixCycleSummary(data) {
+export function renderFixCycleSummary(data, isDark) {
   const s = data.summary
   if (!s || s.filesFixed == null) return null
 
   const files = s.fixedFilesList ?? []
+  const fixedColor = isDark ? '#fcd34d' : '#92400e'
+  const secondary  = isDark ? '#9ca3af' : '#57606a'
 
   return (
     <div style={{ padding: '8px 12px', display: 'flex', flexDirection: 'column', gap: 4 }}>
       {/* Big number callout */}
-      <BigNum value={s.filesFixed} label="FILES FIXED" color="#fcd34d" />
+      <BigNum value={s.filesFixed} label="FILES FIXED" color={fixedColor} isDark={isDark} />
 
       {/* File list */}
       {files.length > 0 && (
         <>
-          <Sep />
+          <Sep isDark={isDark} />
           {files.slice(0, 3).map((f, i) => {
             const path = typeof f === 'string' ? f : (f.path ?? f.file ?? String(f))
             const basename = path.includes('/') ? path.split('/').pop() : path
             return (
-              <div key={i} style={{ fontSize: 10, color: '#9ca3af' }}>· {basename}</div>
+              <div key={i} style={{ fontSize: 10, color: secondary }}>· {basename}</div>
             )
           })}
         </>
@@ -501,29 +543,33 @@ export function renderFixCycleSummary(data) {
   )
 }
 
-export function renderWarningReviewSummary(data) {
+export function renderWarningReviewSummary(data, isDark) {
   const s = data.summary
   if (!s || s.warningCount == null) return null
 
+  const warnColor = isDark ? '#fde68a' : '#92400e'
+
   return (
     <div style={{ padding: '8px 12px', display: 'flex', alignItems: 'center', gap: 8 }}>
-      <span style={{ fontSize: 14, color: '#f59e0b' }}>⚠</span>
-      <BigNum value={s.warningCount} label="WARNINGS" color="#fde68a" />
+      <span style={{ fontSize: 14, color: isDark ? '#f59e0b' : '#d97706' }}>⚠</span>
+      <BigNum value={s.warningCount} label="WARNINGS" color={warnColor} isDark={isDark} />
     </div>
   )
 }
 
-export function renderSystemicAnalysisSummary(data) {
+export function renderSystemicAnalysisSummary(data, isDark) {
   const s = data.summary
   if (!s || (!s.patternCategory && s.affectedFiles == null)) return null
 
   const title = s.issueDescription ?? 'Systemic Code Issue'
+  const titleColor = isDark ? '#c4b5fd' : '#6d28d9'
+  const secondary  = isDark ? '#9ca3af' : '#57606a'
 
   return (
     <div style={{ padding: '8px 12px', display: 'flex', flexDirection: 'column', gap: 2 }}>
-      <div style={{ fontSize: 11, fontWeight: 600, color: '#c4b5fd' }}>⚙ {title}</div>
+      <div style={{ fontSize: 11, fontWeight: 600, color: titleColor }}>⚙ {title}</div>
       {(s.patternCategory || s.affectedFiles != null) && (
-        <div style={{ fontSize: 10, color: '#9ca3af' }}>
+        <div style={{ fontSize: 10, color: secondary }}>
           {s.patternCategory ?? ''}
           {s.patternCategory && s.affectedFiles != null && ' · '}
           {s.affectedFiles != null && `${s.affectedFiles} files affected`}
@@ -533,20 +579,25 @@ export function renderSystemicAnalysisSummary(data) {
   )
 }
 
-export function renderSystemicFixSummary(data) {
+export function renderSystemicFixSummary(data, isDark) {
   const s = data.summary
   if (!s) return null
 
   const isComplete = s.outcome === 'complete' || (s.filesFixed != null && s.filesFixed > 0)
 
+  const successColor = isDark ? '#10b981' : '#047857'
+  const runningColor = isDark ? '#7d8590' : '#57606a'
+  const mutedColor   = isDark ? '#7d8590' : '#57606a'
+  const secondary    = isDark ? '#9ca3af' : '#57606a'
+
   return (
     <div style={{ padding: '8px 12px', display: 'flex', flexDirection: 'column', gap: 2 }}>
-      <div style={{ fontSize: 11, fontWeight: 600, color: isComplete ? '#10b981' : '#7d8590' }}>
+      <div style={{ fontSize: 11, fontWeight: 600, color: isComplete ? successColor : runningColor }}>
         {isComplete ? '✓ Tests passing' : '… Running'}{' '}
-        <span style={{ color: '#7d8590', fontWeight: 400 }}>(systemic)</span>
+        <span style={{ color: mutedColor, fontWeight: 400 }}>(systemic)</span>
       </div>
       {(s.patternCategory || s.attemptCount != null) && (
-        <div style={{ fontSize: 10, color: '#9ca3af' }}>
+        <div style={{ fontSize: 10, color: secondary }}>
           {s.patternCategory ?? ''}
           {s.patternCategory && s.attemptCount != null && ' · '}
           {s.attemptCount != null && `${s.attemptCount} attempt${s.attemptCount !== 1 ? 's' : ''}`}

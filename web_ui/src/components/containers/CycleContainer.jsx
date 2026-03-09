@@ -23,7 +23,7 @@ import { ChevronDown, ChevronRight } from 'lucide-react'
  *   theme.icon                {Component} - lucide-react icon component
  *   theme.collapsedCountColor {string}    - color for the iteration count in the fallback collapsed body
  */
-export function CycleContainer({ data, theme }) {
+export function CycleContainer({ data, theme, isDark = true }) {
   const {
     cycleId,
     label,
@@ -40,9 +40,12 @@ export function CycleContainer({ data, theme }) {
     cornerColor,
     icon: Icon,
     collapsedCountColor,
+    collapsedCountColorLight,
     collapsedWidth = 280,
     renderCollapsedSummary,
   } = theme
+
+  const actualCountColor = isDark ? collapsedCountColor : (collapsedCountColorLight ?? collapsedCountColor)
 
   const isToggleable = !!onToggleCollapse
 
@@ -98,7 +101,7 @@ export function CycleContainer({ data, theme }) {
           {isToggleable && <ChevronRight style={{ width: 13, height: 13 }} />}
         </div>
         {(() => {
-          const customBody = renderCollapsedSummary ? renderCollapsedSummary(data) : null
+          const customBody = renderCollapsedSummary ? renderCollapsedSummary(data, isDark) : null
           if (customBody != null) return customBody
           return (
             <div
@@ -108,10 +111,10 @@ export function CycleContainer({ data, theme }) {
                 padding: '12px 20px', gap: 8,
               }}
             >
-              <div style={{ fontSize: 24, fontWeight: 700, color: collapsedCountColor }}>
+              <div style={{ fontSize: 24, fontWeight: 700, color: actualCountColor }}>
                 {iterationCount}×
               </div>
-              <div style={{ fontSize: 11, color: '#9ca3af', textAlign: 'center' }}>
+              <div style={{ fontSize: 11, color: isDark ? '#9ca3af' : '#57606a', textAlign: 'center' }}>
                 Click to expand
               </div>
             </div>
