@@ -637,8 +637,6 @@ function PipelineRunView() {
                       allEvents={mergedEvents}
                       workflowConfig={workflowConfig}
                       selectedPipelineRun={selectedPipelineRun}
-                      nodesDraggable={selectedPipelineRun.status !== 'active'}
-                      allowResizing={selectedPipelineRun.status !== 'active'}
                       minZoom={0.5}
                       maxZoom={1.5}
                       height="100%"
