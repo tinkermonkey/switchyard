@@ -94,7 +94,7 @@ class ProjectWorkspaceManager:
             # Try to clone if directory doesn't exist
             # Note: In container environments with mounted host directories, projects should already exist
             logger.warning(f"Project {project_name} not found at {project_dir}")
-            logger.info(f"Attempting to clone from {repo_url}")
+            logger.info(f"Attempting to clone from {self._redact_url(repo_url)}")
             try:
                 self._clone_repository(repo_url, project_dir, default_branch)
                 was_cloned = True
@@ -109,6 +109,12 @@ class ProjectWorkspaceManager:
         self._ensure_ssh_remote(project_dir)
 
         return was_cloned
+
+    @staticmethod
+    def _redact_url(url: str) -> str:
+        """Redact credentials from a URL before logging (https://token@host → https://<redacted>@host)."""
+        import re
+        return re.sub(r'://[^@]+@', '://<redacted>@', url)
 
     def _ensure_ssh_remote(self, project_dir: Path):
         """
@@ -134,9 +140,7 @@ class ProjectWorkspaceManager:
                 ['git', 'remote', 'set-url', 'origin', ssh_url],
                 cwd=project_dir, capture_output=True
             )
-            # Redact any embedded token before logging (https://token@github.com/...)
-            sanitized = re.sub(r'://[^@]+@', '://<redacted>@', current_url)
-            logger.info(f"Converted remote URL to SSH: {sanitized} → {ssh_url}")
+            logger.info(f"Converted remote URL to SSH: {self._redact_url(current_url)} → {ssh_url}")
 
     def _clone_repository(self, repo_url: str, target_dir: Path, branch: str):
         """Clone a repository to the target directory"""
@@ -145,7 +149,7 @@ class ProjectWorkspaceManager:
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
 
             if result.returncode != 0:
-                raise Exception(f"Git clone failed: {result.stderr}")
+                raise Exception(f"Git clone failed: {self._redact_url(result.stderr)}")
 
             logger.info(f"Successfully cloned repository to {target_dir}")
         except subprocess.TimeoutExpired:
