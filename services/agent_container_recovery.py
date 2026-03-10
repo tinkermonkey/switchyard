@@ -54,7 +54,7 @@ REPAIR_CYCLE_RECOVERY_TEMPLATE = {
     "template": {
         "settings": {
             "number_of_shards": 1,
-            "number_of_replicas": 1,
+            "number_of_replicas": 0,
             "index": {
                 "lifecycle": {
                     "name": "repair-cycle-recovery-ilm-policy"

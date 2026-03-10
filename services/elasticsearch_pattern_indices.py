@@ -39,7 +39,7 @@ PATTERN_OCCURRENCES_MAPPING = {
     },
     "settings": {
         "number_of_shards": 1,
-        "number_of_replicas": 1,
+        "number_of_replicas": 0,
         "refresh_interval": "5s"
     }
 }
@@ -77,7 +77,7 @@ PATTERN_GITHUB_TRACKING_MAPPING = {
     },
     "settings": {
         "number_of_shards": 1,
-        "number_of_replicas": 1
+        "number_of_replicas": 0
     }
 }
 
@@ -127,7 +127,7 @@ PATTERN_LLM_ANALYSIS_MAPPING = {
     },
     "settings": {
         "number_of_shards": 1,
-        "number_of_replicas": 1
+        "number_of_replicas": 0
     }
 }
 
@@ -155,7 +155,7 @@ PATTERN_INSIGHTS_MAPPING = {
     },
     "settings": {
         "number_of_shards": 1,
-        "number_of_replicas": 1
+        "number_of_replicas": 0
     }
 }
 
@@ -205,7 +205,7 @@ CLAUDE_MD_CHANGES_MAPPING = {
     },
     "settings": {
         "number_of_shards": 1,
-        "number_of_replicas": 1
+        "number_of_replicas": 0
     }
 }
 
@@ -232,7 +232,7 @@ PATTERN_SIMILARITY_MAPPING = {
     },
     "settings": {
         "number_of_shards": 1,
-        "number_of_replicas": 1
+        "number_of_replicas": 0
     }
 }
 
@@ -257,7 +257,7 @@ PIPELINE_RUNS_MAPPING = {
     },
     "settings": {
         "number_of_shards": 1,
-        "number_of_replicas": 1,
+        "number_of_replicas": 0,
         "refresh_interval": "5s"
     }
 }
