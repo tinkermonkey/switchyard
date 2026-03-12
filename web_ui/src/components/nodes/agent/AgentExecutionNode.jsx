@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { Handle, Position } from '@xyflow/react'
-import { Activity, CircleCheck, CircleX, Info, OctagonX, Timer, Zap } from 'lucide-react'
+import { Activity, CircleCheck, CircleX, OctagonX, Timer, Zap } from 'lucide-react'
 import { useTheme } from '../../../contexts'
 import AgentExecutionDetailModal from '../../AgentExecutionDetailModal'
 
@@ -95,7 +95,9 @@ export default function AgentExecutionNode({ data }) {
           : '0 2px 6px rgba(0,0,0,0.15)',
         overflow: 'hidden',
         fontSize: 12,
+        ...(executionId && { cursor: 'pointer' }),
       }}
+      onClick={executionId ? (e) => { e.stopPropagation(); setModalOpen(true) } : undefined}
     >
       <Handle type="target" position={Position.Top} style={{ opacity: 0 }} />
 
@@ -150,25 +152,6 @@ export default function AgentExecutionNode({ data }) {
         }}>
           {STATUS_LABEL[effectiveStatus] ?? effectiveStatus}
         </span>
-        {executionId && (
-          <button
-            onClick={(e) => { e.stopPropagation(); setModalOpen(true) }}
-            style={{
-              background: 'none',
-              border: 'none',
-              cursor: 'pointer',
-              color: theme.iconColor,
-              display: 'flex',
-              alignItems: 'center',
-              padding: 2,
-              flexShrink: 0,
-              borderRadius: 3,
-            }}
-            title="View execution details"
-          >
-            <Info size={13} />
-          </button>
-        )}
       </div>
 
       {/* Stats row */}
