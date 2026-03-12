@@ -1,6 +1,8 @@
+import { useState } from 'react'
 import { Handle, Position } from '@xyflow/react'
-import { Activity, CircleCheck, CircleX, OctagonX, Timer, Zap } from 'lucide-react'
+import { Activity, CircleCheck, CircleX, Info, OctagonX, Timer, Zap } from 'lucide-react'
 import { useTheme } from '../../../contexts'
+import AgentExecutionDetailModal from '../../AgentExecutionDetailModal'
 
 const STATUS_THEME_DARK = {
   running:     { bg: '#111d2e', border: '#58a6ff', headerBg: '#0d1f35', color: '#cae8ff', badgeBg: '#58a6ff20', badgeColor: '#58a6ff', statColor: '#adc8e8', iconColor: '#8b949e', pillBg: '#1a3050', pillColor: '#8bb8e8', stripeBg: '#1a3060', runShadow: '0 0 10px rgba(88,166,255,0.4)' },
@@ -55,6 +57,8 @@ export default function AgentExecutionNode({ data }) {
   if (!data) return null
   const { status, isActive, label, durationMs, inputTokens, outputTokens, tools } = data
   const { theme: colorMode } = useTheme()
+  const [modalOpen, setModalOpen] = useState(false)
+  const executionId = data.event?.agent_execution_id || data.event?.data?.agent_execution_id
 
   if (process.env.NODE_ENV !== 'production' && status !== undefined && !KNOWN_STATUSES.has(status)) {
     console.warn(`AgentExecutionNode: unrecognised status "${status}" — add a style mapping or update KNOWN_STATUSES`)
@@ -77,6 +81,7 @@ export default function AgentExecutionNode({ data }) {
   const hasTools = tools?.length > 0
 
   return (
+    <>
     <div
       style={{
         minWidth: 220,
@@ -145,6 +150,25 @@ export default function AgentExecutionNode({ data }) {
         }}>
           {STATUS_LABEL[effectiveStatus] ?? effectiveStatus}
         </span>
+        {executionId && (
+          <button
+            onClick={(e) => { e.stopPropagation(); setModalOpen(true) }}
+            style={{
+              background: 'none',
+              border: 'none',
+              cursor: 'pointer',
+              color: theme.iconColor,
+              display: 'flex',
+              alignItems: 'center',
+              padding: 2,
+              flexShrink: 0,
+              borderRadius: 3,
+            }}
+            title="View execution details"
+          >
+            <Info size={13} />
+          </button>
+        )}
       </div>
 
       {/* Stats row */}
@@ -197,5 +221,9 @@ export default function AgentExecutionNode({ data }) {
 
       <Handle type="source" position={Position.Bottom} style={{ opacity: 0 }} />
     </div>
+    {modalOpen && (
+      <AgentExecutionDetailModal executionId={executionId} onClose={() => setModalOpen(false)} />
+    )}
+    </>
   )
 }
