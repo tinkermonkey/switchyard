@@ -107,7 +107,6 @@ export default function PipelineFlowGraph({
 }) {
   const [nodes, setNodes, onNodesChange] = useNodesState([])
   const [edges, setEdges, onEdgesChange] = useEdgesState([])
-  const [hoveredNode, setHoveredNode] = useState(null)
   const [layoutReady, setLayoutReady] = useState(false)
   // Increments only on structural changes; LayoutController uses this (not rawBuild)
   // to decide when to reset and re-run layout.
@@ -448,9 +447,6 @@ export default function PipelineFlowGraph({
     onLayoutDone?.(finalNodes)
   }, [onLayoutDone])
 
-  const onNodeMouseEnter = useCallback((event, node) => setHoveredNode(node), [])
-  const onNodeMouseLeave = useCallback(() => setHoveredNode(null), [])
-
   // Intercept React Flow's dimension-change events to populate the persistent size cache.
   const handleNodesChange = useCallback((changes) => {
     let gotDimensions = false
@@ -493,8 +489,6 @@ export default function PipelineFlowGraph({
             edges={edges}
             onNodesChange={handleNodesChange}
             onEdgesChange={onEdgesChange}
-            onNodeMouseEnter={onNodeMouseEnter}
-            onNodeMouseLeave={onNodeMouseLeave}
             nodeTypes={nodeTypes}
             edgeTypes={edgeTypes}
             nodesDraggable={nodesDraggable}
@@ -522,12 +516,6 @@ export default function PipelineFlowGraph({
             <Controls />
           </ReactFlow>
 
-          {hoveredNode && hoveredNode.data.metadata && (
-            <div className="absolute top-4 right-4 bg-gh-canvas-inset border border-gh-border rounded-md p-3 shadow-lg max-w-sm z-10">
-              <div className="font-semibold text-sm mb-1">{hoveredNode.data.label}</div>
-              <div className="text-xs text-gh-fg-muted">{hoveredNode.data.metadata}</div>
-            </div>
-          )}
         </div>
       )}
 

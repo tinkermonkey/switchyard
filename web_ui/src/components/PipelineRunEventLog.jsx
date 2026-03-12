@@ -1,4 +1,5 @@
 import { useState, useEffect, useMemo, memo } from 'react'
+import EventJsonModal from './EventJsonModal'
 import { Link } from '@tanstack/react-router'
 import { useSocket } from '../contexts/SocketContext'
 import {
@@ -475,70 +476,6 @@ const getEventComponent = (event, onIconClick) => {
 
   const Component = eventTypeMap[event.event_type] || GenericEvent
   return <Component key={event.event_id} event={event} onIconClick={onIconClick} />
-}
-
-// Event JSON Modal Component
-const EventJsonModal = ({ event, onClose }) => {
-  if (!event) return null
-
-  // Close modal on Escape key
-  useEffect(() => {
-    const handleEscape = (e) => {
-      if (e.key === 'Escape') {
-        onClose()
-      }
-    }
-    window.addEventListener('keydown', handleEscape)
-    return () => window.removeEventListener('keydown', handleEscape)
-  }, [onClose])
-
-  return (
-    <div
-      className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4"
-      onClick={onClose}
-    >
-      <div
-        className="bg-gh-canvas border border-gh-border rounded-lg max-w-4xl w-full max-h-[90vh] overflow-hidden flex flex-col"
-        onClick={(e) => e.stopPropagation()}
-      >
-        {/* Modal Header */}
-        <div className="p-4 border-b border-gh-border flex items-center justify-between">
-          <h3 className="text-lg font-semibold text-gh-fg">Event JSON</h3>
-          <button
-            onClick={onClose}
-            className="text-gh-fg-muted hover:text-gh-fg transition-colors"
-          >
-            <XCircle className="w-5 h-5" />
-          </button>
-        </div>
-
-        {/* Modal Body */}
-        <div className="flex-1 overflow-auto p-4">
-          <pre className="text-xs font-mono bg-gh-canvas-subtle p-4 rounded border border-gh-border overflow-x-auto">
-            {JSON.stringify(event, null, 2)}
-          </pre>
-        </div>
-
-        {/* Modal Footer */}
-        <div className="p-4 border-t border-gh-border flex justify-end gap-2">
-          <button
-            onClick={() => {
-              navigator.clipboard.writeText(JSON.stringify(event, null, 2))
-            }}
-            className="px-4 py-2 bg-gh-accent-emphasis text-white rounded hover:bg-opacity-90 transition-colors"
-          >
-            Copy to Clipboard
-          </button>
-          <button
-            onClick={onClose}
-            className="px-4 py-2 bg-gh-canvas-subtle border border-gh-border rounded hover:bg-gh-border-muted transition-colors"
-          >
-            Close
-          </button>
-        </div>
-      </div>
-    </div>
-  )
 }
 
 // Main PipelineRunEventLog component

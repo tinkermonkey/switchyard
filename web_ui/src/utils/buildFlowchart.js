@@ -152,6 +152,7 @@ export function buildFlowchart({
         metadata: metadataParts.join(' • '),
         decision_category: event.decision_category,
         timestamp: event.timestamp,
+        event,
         ...(HIDDEN_BY_DEFAULT_TYPES.has(nodeType) && { defaultHidden: true }),
       },
       draggable: false,
@@ -194,6 +195,7 @@ export function buildFlowchart({
         inputTokens: claudeData?.inputTokens ?? null,
         outputTokens: claudeData?.outputTokens ?? null,
         tools: claudeData?.tools ?? null,
+        event,
       },
       draggable: false,
     }
