@@ -41,6 +41,7 @@ export default function LayoutController({
   containerHeight,
   fitViewAlign = 'center',
   nodeSizeCache,
+  userExpandedContainersRef = null,
 }) {
   const storeApi = useStoreApi()
   const { getNodes, setViewport, fitView } = useReactFlow()
@@ -73,6 +74,8 @@ export default function LayoutController({
    * 'center': delegates to React Flow's built-in fitView.
    */
   const applyAlignedFitView = useCallback((nodes, duration = 300) => {
+    if (userExpandedContainersRef?.current?.size > 0) return
+
     const align = fitViewAlignRef.current
 
     if (!align || align === 'center') {
@@ -130,7 +133,7 @@ export default function LayoutController({
       : padding - minY * zoom
 
     setViewport({ x, y, zoom }, { duration })
-  }, [fitView, setViewport, storeApi])
+  }, [fitView, setViewport, storeApi, userExpandedContainersRef])
 
   // Core layout runner — stable identity, reads mutable state via refs.
   // skipFitView: when true, skips the viewport pan/zoom after layout so the user's

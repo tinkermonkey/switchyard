@@ -511,6 +511,7 @@ export default function PipelineFlowGraph({
               containerHeight={height}
               fitViewAlign={fitViewAlign}
               nodeSizeCache={nodeSizeCacheRef}
+              userExpandedContainersRef={userOpenedCyclesRef}
             />
             <Background />
             <Controls />
