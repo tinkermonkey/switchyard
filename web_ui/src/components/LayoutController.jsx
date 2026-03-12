@@ -74,22 +74,27 @@ export default function LayoutController({
    * 'center': delegates to React Flow's built-in fitView.
    */
   const applyAlignedFitView = useCallback((nodes, duration = 300) => {
-    if (userExpandedContainersRef?.current?.size > 0) return
-
     const align = fitViewAlignRef.current
 
-    if (!align || align === 'center') {
-      fitView({ padding: 0.1, duration })
-      return
-    }
-
     // Centre on the in-progress node if one exists; fall through to 'bottom' if not.
+    // Active-node tracking is never suppressed — we always want to follow the running
+    // agent even when the user has manually opened other containers.
     if (align === 'active-node') {
       const activeNode = nodes.find(n => n.data?.isActive)
       if (activeNode) {
         fitView({ nodes: [{ id: activeNode.id }], padding: 0.5, maxZoom: 1, duration })
         return
       }
+    }
+
+    // For all other alignments (and active-node fallthrough when no active node is
+    // found), skip re-centering if the user has manually opened containers — this
+    // preserves their viewport position after container toggles trigger re-layouts.
+    if (userExpandedContainersRef?.current?.size > 0) return
+
+    if (!align || align === 'center') {
+      fitView({ padding: 0.1, duration })
+      return
     }
 
     // Only root-level nodes have absolute positions in the canvas

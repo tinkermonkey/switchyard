@@ -249,6 +249,12 @@ export default function PipelineFlowGraph({
 
     prevAutoOpenedRef.current = activeContainerIds
 
+    // Prune stale entries from userOpenedCyclesRef — containers that no longer exist
+    // in the graph (e.g., completed stages) should not continue blocking applyAlignedFitView.
+    userOpenedCyclesRef.current.forEach(id => {
+      if (!newCycleMap.has(id)) userOpenedCyclesRef.current.delete(id)
+    })
+
     cyclesRef.current = merged
     setCycles(merged)
   }, [graphEvents, selectedPipelineRun])
