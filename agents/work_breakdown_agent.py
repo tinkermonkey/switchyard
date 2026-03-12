@@ -1070,6 +1070,8 @@ Do not add any other text before or after the JSON.
                                 board="SDLC Execution",
                                 reason=f"Work breakdown phase: {sub_issue['phase']}",
                                 source="work_breakdown",
+                                issue_url=issue_url,
+                                body=sub_issue.get('body', ''),
                                 context_data={
                                     'phase': sub_issue['phase'],
                                     'order_in_phase': idx,

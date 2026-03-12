@@ -1274,6 +1274,8 @@ If all requirements are met, write "All requirements verified - no gaps found" a
                             board="SDLC Execution",
                             reason=f"PR review finding: {spec.get('severity', 'medium')} severity issue",
                             source="pr_review",
+                            issue_url=issue_url,
+                            body=spec.get('body', ''),
                             context_data={
                                 'severity': spec.get('severity', 'medium'),
                                 'source_phase': spec.get('source', 'unknown'),

@@ -1327,6 +1327,8 @@ class DecisionEventEmitter:
         board: str,
         reason: str,
         source: str,  # "pr_review" or "work_breakdown"
+        issue_url: str = "",
+        body: str = "",
         context_data: Optional[Dict[str, Any]] = None,
         pipeline_run_id: Optional[str] = None
     ):
@@ -1341,6 +1343,8 @@ class DecisionEventEmitter:
             board: Board name
             reason: Human-readable reason for creation
             source: Creation source ("pr_review" or "work_breakdown")
+            issue_url: GitHub URL of the created issue
+            body: Markdown body of the created issue
             context_data: Optional context (review_cycle, severity, phase, etc.)
             pipeline_run_id: Pipeline run ID for traceability
         """
@@ -1350,11 +1354,13 @@ class DecisionEventEmitter:
             'decision_category': 'issue_creation',
             'parent_issue': parent_issue,
             'issue_number': issue_number,
+            'issue_url': issue_url,
             'board': board,
             'inputs': {
                 'parent_issue': parent_issue,
                 'title': title,
                 'source': source,
+                'body': body,
             },
             'decision': {
                 'action': 'create_sub_issue',
