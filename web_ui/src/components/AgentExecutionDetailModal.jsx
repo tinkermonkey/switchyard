@@ -1,7 +1,8 @@
 import { useState, useEffect, useMemo } from 'react'
 import { createPortal } from 'react-dom'
 import { RefreshCw, X, ExternalLink } from 'lucide-react'
-import { normalizeTimestamp } from '../utils/eventMerging'
+import { normalizeTimestamp, mergeAgentExecutionEvents, mergeObjectStable, mergeArrayByIdStable } from '../utils/eventMerging'
+import { useSocket } from '../contexts/SocketContext'
 import TokenUsagePanel from './TokenUsagePanel'
 import AgentExecutionState from './AgentExecutionState'
 
@@ -9,8 +10,11 @@ export default function AgentExecutionDetailModal({ executionId, onClose }) {
   const [executionData, setExecutionData] = useState(null)
   const [executionLogs, setExecutionLogs] = useState([])
   const [promptEvent, setPromptEvent] = useState(null)
+  const [pipelineEvents, setPipelineEvents] = useState([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
+
+  const { logs: allLogs } = useSocket()
 
   useEffect(() => {
     async function fetchData() {
@@ -18,9 +22,9 @@ export default function AgentExecutionDetailModal({ executionId, onClose }) {
         const response = await fetch(`/api/agent-execution/${executionId}`)
         const data = await response.json()
         if (data.success) {
-          setExecutionData(data.execution)
-          setExecutionLogs(data.logs || [])
-          setPromptEvent(data.prompt_event || null)
+          setExecutionData(current => mergeObjectStable(current, data.execution))
+          setExecutionLogs(current => mergeArrayByIdStable(current, data.logs || [], 'id'))
+          setPromptEvent(current => mergeObjectStable(current, data.prompt_event || null))
         } else {
           setError(data.error || 'Failed to load execution data')
         }
@@ -33,6 +37,25 @@ export default function AgentExecutionDetailModal({ executionId, onClose }) {
     fetchData()
   }, [executionId])
 
+  // Fetch pipeline events once pipeline_run_id is available
+  useEffect(() => {
+    const pipelineRunId = executionData?.pipeline_run_id
+    if (!pipelineRunId) return
+
+    async function fetchPipelineEvents() {
+      try {
+        const response = await fetch(`/pipeline-run-events?pipeline_run_id=${pipelineRunId}`)
+        const data = await response.json()
+        if (data.success) {
+          setPipelineEvents(current => mergeArrayByIdStable(current, data.events || [], 'event_id'))
+        }
+      } catch (err) {
+        console.error('Error fetching pipeline events:', err)
+      }
+    }
+    fetchPipelineEvents()
+  }, [executionData?.pipeline_run_id])
+
   // Close on Escape key
   useEffect(() => {
     const handleKey = (e) => { if (e.key === 'Escape') onClose() }
@@ -40,17 +63,42 @@ export default function AgentExecutionDetailModal({ executionId, onClose }) {
     return () => document.removeEventListener('keydown', handleKey)
   }, [onClose])
 
-  const agentState = useMemo(() => {
-    if (!executionLogs.length) return {}
+  const pipelineRunId = executionData?.pipeline_run_id ?? null
 
+  const { agentState, mergedLogs, mergedPipelineEvents } = useMemo(() => {
+    if (!executionData) return { agentState: {}, mergedLogs: [], mergedPipelineEvents: [] }
+
+    // Merge API logs with live WebSocket events
+    const logs = mergeAgentExecutionEvents(executionLogs, allLogs, executionData)
+
+    // Merge historical pipeline events with any newer live events
+    let pipelineEventsList = [...pipelineEvents]
+    if (pipelineRunId) {
+      let lastHistTimestamp = 0
+      if (pipelineEvents.length > 0) {
+        const lastEvent = pipelineEvents[pipelineEvents.length - 1]
+        lastHistTimestamp = normalizeTimestamp(lastEvent.timestamp || lastEvent.created_at) || 0
+      }
+      const livePipelineEvents = allLogs.filter(event => {
+        const eventRunId = event.pipeline_run_id || event.data?.pipeline_run_id
+        if (eventRunId !== pipelineRunId) return false
+        const eventTimestamp = normalizeTimestamp(event.timestamp)
+        return eventTimestamp > lastHistTimestamp
+      })
+      if (livePipelineEvents.length > 0) {
+        pipelineEventsList = [...pipelineEventsList, ...livePipelineEvents]
+      }
+    }
+
+    // Build agent state from merged logs (most recent first)
     let lastTodoWrite = null
     let lastTextMessage = null
     let lastToolCall = null
     let previousToolCall = null
     let previousToolResult = null
 
-    for (let i = executionLogs.length - 1; i >= 0; i--) {
-      const log = executionLogs[i]
+    for (let i = logs.length - 1; i >= 0; i--) {
+      const log = logs[i]
       const event = log.raw_event?.event
       const ts = normalizeTimestamp(log.timestamp)
 
@@ -80,8 +128,8 @@ export default function AgentExecutionDetailModal({ executionId, onClose }) {
     }
 
     if (previousToolCall) {
-      for (let i = executionLogs.length - 1; i >= 0; i--) {
-        const log = executionLogs[i]
+      for (let i = logs.length - 1; i >= 0; i--) {
+        const log = logs[i]
         const event = log.raw_event?.event
         const ts = normalizeTimestamp(log.timestamp)
 
@@ -119,8 +167,12 @@ export default function AgentExecutionDetailModal({ executionId, onClose }) {
       }
     }
 
-    return { lastTodoWrite, lastTextMessage, lastToolCall, previousToolCall, previousToolResult, inputPrompt }
-  }, [executionLogs, promptEvent])
+    return {
+      agentState: { lastTodoWrite, lastTextMessage, lastToolCall, previousToolCall, previousToolResult, inputPrompt },
+      mergedLogs: logs,
+      mergedPipelineEvents: pipelineEventsList,
+    }
+  }, [executionData, executionLogs, allLogs, promptEvent, pipelineEvents, pipelineRunId])
 
   const agentLabel = executionData?.agent
     ? executionData.agent.split('_').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ')
@@ -213,13 +265,13 @@ export default function AgentExecutionDetailModal({ executionId, onClose }) {
           )}
           {!loading && !error && executionData && (
             <>
-              <TokenUsagePanel logs={executionLogs} promptText={agentState.inputPrompt?.text} />
+              <TokenUsagePanel logs={mergedLogs} promptText={agentState.inputPrompt?.text} />
               <AgentExecutionState
                 executionId={executionId}
                 executionData={executionData}
                 pipelineRunId={executionData.pipeline_run_id}
                 agentState={agentState}
-                mergedPipelineEvents={[]}
+                mergedPipelineEvents={mergedPipelineEvents}
               />
             </>
           )}
