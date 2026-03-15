@@ -18,7 +18,7 @@ The orchestrator uses a **three-tier containerization model**:
 │                                                                  │
 │  ┌────────────────────────────────────────────────────────┐    │
 │  │ ORCHESTRATOR CONTAINER                                  │    │
-│  │ (clauditoreum)                                          │    │
+│  │ (switchyard)                                          │    │
 │  │                                                          │    │
 │  │  ┌──────────────────────────────────────────────────┐  │    │
 │  │  │ AGENT CONTAINER                                   │  │    │
@@ -51,7 +51,7 @@ The orchestrator uses a **three-tier containerization model**:
 
 ### Dockerfile Configuration
 
-**Location**: `/clauditoreum/Dockerfile`
+**Location**: `/switchyard/Dockerfile`
 
 ```dockerfile
 FROM python:3.12-slim
@@ -101,7 +101,7 @@ CMD ["python", "main.py"]
 
 ### docker-compose.yml Configuration
 
-**Location**: `/clauditoreum/docker-compose.yml`
+**Location**: `/switchyard/docker-compose.yml`
 
 **Critical Volume Mounts**:
 
@@ -208,15 +208,15 @@ volumes:
 **On Host**:
 ```
 /home/user/workspace/orchestrator/
-├── clauditoreum/          # Orchestrator code
+├── switchyard/          # Orchestrator code
 └── project-name/          # Managed project checkouts
 ```
 
 **In Orchestrator Container**:
 ```
-/app/                      # Orchestrator code (./clauditoreum mapped here)
+/app/                      # Orchestrator code (./switchyard mapped here)
 /workspace/                # Parent directory from host
-├── clauditoreum/          # Same as /app
+├── switchyard/          # Same as /app
 └── project-name/          # Project checkouts
 ```
 

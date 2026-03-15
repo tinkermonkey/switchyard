@@ -26,7 +26,7 @@ _SKILL_PATH = "/app/.claude/skills/pipeline-investigate/SKILL.md"
 _AGENT_NAME = "pipeline_analysis"
 # Mount the orchestrator codebase read-only — gives Claude access to scripts and skill files.
 # filesystem_write_allowed=false in agents.yaml ensures Docker runner mounts this as :ro.
-_PROJECT_NAME = "clauditoreum"
+_PROJECT_NAME = "switchyard"
 
 
 class PipelineRunAnalysisService:

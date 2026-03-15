@@ -47,7 +47,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 # Set ORCHESTRATOR_ROOT for running outside Docker container
 # Inside container: /app (set by container environment)
-# Outside container: Current directory (clauditoreum/)
+# Outside container: Current directory (switchyard/)
 if 'ORCHESTRATOR_ROOT' not in os.environ:
     os.environ['ORCHESTRATOR_ROOT'] = str(Path(__file__).parent.parent.resolve())
 

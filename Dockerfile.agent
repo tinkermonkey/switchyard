@@ -1,18 +1,18 @@
 # ============================================================================
-# Dockerfile.agent for clauditoreum project
+# Dockerfile.agent for switchyard project
 # ============================================================================
 # This Dockerfile builds an AGENT IMAGE for Claude agents to operate within.
 # It extends the orchestrator base image and pre-installs project dependencies.
 #
 # DESIGN PRINCIPLE: Build the ENVIRONMENT, not the source code.
 # Source code is mounted at runtime by the orchestrator via:
-#   docker run -v /host/project:/workspace/clauditoreum ...
+#   docker run -v /host/project:/workspace/switchyard ...
 # ============================================================================
 
 # ============================================================================
 # Stage 1: Base Environment from Orchestrator
 # ============================================================================
-FROM clauditoreum-orchestrator:latest
+FROM switchyard-orchestrator:latest
 
 # The base image already includes:
 # - Claude CLI (installed via npm)
@@ -26,7 +26,7 @@ FROM clauditoreum-orchestrator:latest
 # ============================================================================
 # Stage 2: No Additional Runtimes Needed
 # ============================================================================
-# The orchestrator base image already has everything clauditoreum needs:
+# The orchestrator base image already has everything switchyard needs:
 # - Python 3.11 with pip
 # - Node.js (for Claude CLI and other tools)
 # - All system dependencies
@@ -36,7 +36,7 @@ FROM clauditoreum-orchestrator:latest
 # ============================================================================
 USER root
 
-WORKDIR /workspace/clauditoreum
+WORKDIR /workspace/switchyard
 
 # Copy only the requirements file for dependency installation
 # Source code comes from the runtime mount
@@ -50,7 +50,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Stage 4: Set Working Directory
 # ============================================================================
 # The orchestrator mounts the project here at runtime
-WORKDIR /workspace/clauditoreum
+WORKDIR /workspace/switchyard
 
 # ============================================================================
 # Stage 5: Switch to Runtime User

@@ -101,7 +101,7 @@ This is analogous to `dev_environment_setup` (maintains project Docker images) b
 ```python
 def discover_projects_for_generation(project_filter: str = None) -> List[str]
     # Discover projects needing agent generation
-    # Exclude clauditoreum (orchestrator itself)
+    # Exclude switchyard (orchestrator itself)
 
 def detect_codebase_changes(project: str) -> Dict[str, Any]
     # Calculate hash of critical files

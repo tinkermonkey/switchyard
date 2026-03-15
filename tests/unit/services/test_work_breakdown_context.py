@@ -30,7 +30,7 @@ def sample_discussion_data_with_threads():
                     {
                         'id': 'comment1',
                         'body': '_Processed by the business_analyst agent_\n\nInitial requirements draft',
-                        'author': {'login': 'clauditoreum-bot'},
+                        'author': {'login': 'switchyard-bot'},
                         'createdAt': '2025-10-14T10:00:00Z',
                         'replies': {
                             'nodes': [
@@ -43,7 +43,7 @@ def sample_discussion_data_with_threads():
                                 {
                                     'id': 'reply2',
                                     'body': '_Processed by the business_analyst agent_\n\nUpdated requirements with authentication',
-                                    'author': {'login': 'clauditoreum-bot'},
+                                    'author': {'login': 'switchyard-bot'},
                                     'createdAt': '2025-10-14T11:00:00Z'
                                 },
                                 {
@@ -55,7 +55,7 @@ def sample_discussion_data_with_threads():
                                 {
                                     'id': 'reply4',
                                     'body': '_Processed by the business_analyst agent_\n\nFinal requirements with auth and authz',
-                                    'author': {'login': 'clauditoreum-bot'},
+                                    'author': {'login': 'switchyard-bot'},
                                     'createdAt': '2025-10-14T12:00:00Z'
                                 }
                             ]
@@ -64,7 +64,7 @@ def sample_discussion_data_with_threads():
                     {
                         'id': 'comment2',
                         'body': '_Processed by the software_architect agent_\n\nArchitecture design',
-                        'author': {'login': 'clauditoreum-bot'},
+                        'author': {'login': 'switchyard-bot'},
                         'createdAt': '2025-10-14T13:00:00Z',
                         'replies': {
                             'nodes': [
@@ -77,7 +77,7 @@ def sample_discussion_data_with_threads():
                                 {
                                     'id': 'reply6',
                                     'body': '_Processed by the software_architect agent_\n\nRevised design with microservices',
-                                    'author': {'login': 'clauditoreum-bot'},
+                                    'author': {'login': 'switchyard-bot'},
                                     'createdAt': '2025-10-14T14:00:00Z'
                                 }
                             ]
@@ -99,14 +99,14 @@ def sample_discussion_data_no_threads():
                     {
                         'id': 'comment1',
                         'body': '_Processed by the business_analyst agent_\n\nRequirements without feedback',
-                        'author': {'login': 'clauditoreum-bot'},
+                        'author': {'login': 'switchyard-bot'},
                         'createdAt': '2025-10-14T10:00:00Z',
                         'replies': {'nodes': []}
                     },
                     {
                         'id': 'comment2',
                         'body': '_Processed by the software_architect agent_\n\nArchitecture without feedback',
-                        'author': {'login': 'clauditoreum-bot'},
+                        'author': {'login': 'switchyard-bot'},
                         'createdAt': '2025-10-14T11:00:00Z',
                         'replies': {'nodes': []}
                     }
@@ -183,7 +183,7 @@ def test_get_agent_outputs_finds_most_recent(mock_github_app):
                     {
                         'id': 'comment1',
                         'body': '_Processed by the business_analyst agent_\n\nOld version',
-                        'author': {'login': 'clauditoreum-bot'},
+                        'author': {'login': 'switchyard-bot'},
                         'createdAt': '2025-10-14T10:00:00Z',
                         'replies': {
                             'nodes': [
@@ -196,7 +196,7 @@ def test_get_agent_outputs_finds_most_recent(mock_github_app):
                                 {
                                     'id': 'reply2',
                                     'body': '_Processed by the business_analyst agent_\n\nNew version',
-                                    'author': {'login': 'clauditoreum-bot'},
+                                    'author': {'login': 'switchyard-bot'},
                                     'createdAt': '2025-10-14T12:00:00Z'
                                 }
                             ]
@@ -235,7 +235,7 @@ def test_get_agent_outputs_handles_missing_agent(mock_github_app):
                     {
                         'id': 'comment1',
                         'body': '_Processed by the business_analyst agent_\n\nOutput',
-                        'author': {'login': 'clauditoreum-bot'},
+                        'author': {'login': 'switchyard-bot'},
                         'createdAt': '2025-10-14T10:00:00Z',
                         'replies': {'nodes': []}
                     }
@@ -315,7 +315,7 @@ def test_context_size_improvement():
                     {
                         'id': 'comment1',
                         'body': '_Processed by the business_analyst agent_\n\n' + ('Requirements content. ' * 100),
-                        'author': {'login': 'clauditoreum-bot'},
+                        'author': {'login': 'switchyard-bot'},
                         'createdAt': '2025-10-14T10:00:00Z',
                         'replies': {
                             'nodes': [
@@ -327,7 +327,7 @@ def test_context_size_improvement():
                                 } if i % 2 == 1 else {
                                     'id': f'reply{i}',
                                     'body': f'_Processed by the business_analyst agent_\n\nAgent response {i}. ' * 50,
-                                    'author': {'login': 'clauditoreum-bot'},
+                                    'author': {'login': 'switchyard-bot'},
                                     'createdAt': f'2025-10-14T{10+i}:00:00Z'
                                 }
                                 for i in range(1, 6)

@@ -94,7 +94,7 @@ USER orchestrator
 
 # Install Claude Code plugins (must be after USER orchestrator so they install to the right home dir)
 RUN claude plugin marketplace add anthropics/claude-plugins-official && \
-    claude plugin install pr-review-toolkit
+    claude plugin install pr-review-toolkit || true
 
 # Set entrypoint to handle SSH setup at runtime
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]

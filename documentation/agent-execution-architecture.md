@@ -659,7 +659,7 @@ Agent Execution
 
 Orchestrator Python Logs
      │
-     ├─► stdout/stderr → Docker logs (docker logs clauditoreum-orchestrator-1)
+     ├─► stdout/stderr → Docker logs (docker logs switchyard-orchestrator-1)
      │
      └─► File: orchestrator_data/logs/orchestrator.log
 

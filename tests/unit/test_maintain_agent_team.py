@@ -36,7 +36,7 @@ def temp_workspace(tmp_path):
     workspace.mkdir()
 
     # Create mock projects
-    projects = ['context-studio', 'documentation_robotics', 'clauditoreum']
+    projects = ['context-studio', 'documentation_robotics', 'switchyard']
     for project in projects:
         project_dir = workspace / project
         project_dir.mkdir()
@@ -74,16 +74,16 @@ class TestProjectDiscovery:
         mock_config.list_visible_projects.return_value = [
             'context-studio',
             'documentation_robotics',
-            'clauditoreum'
+            'switchyard'
         ]
 
         projects = discover_projects_for_generation()
 
-        # Should exclude clauditoreum (orchestrator itself)
+        # Should exclude switchyard (orchestrator itself)
         assert len(projects) == 2
         assert 'context-studio' in projects
         assert 'documentation_robotics' in projects
-        assert 'clauditoreum' not in projects
+        assert 'switchyard' not in projects
 
     @patch('scripts.maintain_agent_team.config_manager')
     @patch('scripts.maintain_agent_team.get_workspace_root')

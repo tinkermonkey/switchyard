@@ -21,10 +21,10 @@ echo "Resetting state for project: $PROJECT_NAME"
 echo "=============================================="
 
 # Check if orchestrator container is running
-if docker ps | grep -q clauditoreum-orchestrator-1; then
+if docker ps | grep -q switchyard-orchestrator-1; then
     echo ""
     echo "Step 1: Stopping orchestrator..."
-    docker stop clauditoreum-orchestrator-1
+    docker stop switchyard-orchestrator-1
     echo "✓ Orchestrator stopped"
 else
     echo ""
@@ -71,7 +71,7 @@ fi
 # Restart orchestrator
 echo ""
 echo "Step 5: Restarting orchestrator..."
-docker start clauditoreum-orchestrator-1
+docker start switchyard-orchestrator-1
 echo "✓ Orchestrator started"
 
 echo ""
@@ -85,7 +85,7 @@ echo "   gh project list --owner <org>"
 echo "   gh project delete <number> --owner <org>"
 echo ""
 echo "2. Monitor orchestrator logs:"
-echo "   docker logs -f clauditoreum-orchestrator-1"
+echo "   docker logs -f switchyard-orchestrator-1"
 echo ""
 echo "3. The orchestrator will:"
 echo "   - Discover existing boards by name (no duplicates)"

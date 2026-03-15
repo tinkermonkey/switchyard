@@ -95,23 +95,23 @@ This is the Claude Code Agent Orchestrator - an autonomous AI development system
 **Host File System**:
 ```
 ./                                # Orchestrator isolated workspace
-│   ├── clauditoreum/             # This codebase
+│   ├── switchyard/             # This codebase
 │   └── <project-name>/           # Managed project checkouts (e.g., context-studio/)
 ```
 
 **Inside Orchestrator Container**:
 The orchestrator always runs in Docker. The container can only see the orchestrator workspace:
 ```
-/app/                             # Orchestrator code (clauditoreum/)
+/app/                             # Orchestrator code (switchyard/)
 /workspace/                       # Orchestrator workspace root
-├── clauditoreum/                 # Same as /app (this codebase)
+├── switchyard/                 # Same as /app (this codebase)
 └── <project-name>/               # Managed checkouts ONLY
 ```
 
 **Container Volume Mounts** (from docker-compose.yml):
 ```yaml
 volumes:
-  - ./:/app                        # Host: clauditoreum/ → Container: /app
+  - ./:/app                        # Host: switchyard/ → Container: /app
   - ..:/workspace                  # Host: orchestrator/ → Container: /workspace
   - ~/.ssh/id_ed25519:/home/orchestrator/.ssh/id_ed25519:ro
   - ~/.gitconfig:/home/orchestrator/.gitconfig:ro
@@ -581,7 +581,7 @@ See `scripts/DIAGNOSTIC_SCRIPTS.md` for complete documentation, examples, and co
 ## File Structure Reference
 
 ```
-clauditoreum/
+switchyard/
 ├── agents/                      # 11 registered AI agents
 │   ├── base_maker_agent.py     # MakerAgent base class
 │   ├── base_analysis_agent.py  # AnalysisAgent base class

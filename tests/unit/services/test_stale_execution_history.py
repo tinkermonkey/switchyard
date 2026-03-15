@@ -477,10 +477,10 @@ class TestRecoverOrCleanupContainersTracksTaskIds:
             'created_at': f'{recent_ts} +0000 UTC',
             'image': 'myproject-agent',
             'labels': (
-                'org.clauditoreum.project=myproject,'
-                'org.clauditoreum.agent=software_engineer,'
-                'org.clauditoreum.task_id=abc123,'
-                'org.clauditoreum.issue_number=42'
+                'org.switchyard.project=myproject,'
+                'org.switchyard.agent=software_engineer,'
+                'org.switchyard.task_id=abc123,'
+                'org.switchyard.issue_number=42'
             ),
         }])
 

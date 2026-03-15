@@ -116,7 +116,7 @@ async def generate_agent(
     # Get project-specific .claude directory
     workspace_root = get_workspace_root()
     claude_dir = get_project_claude_dir(project)
-    agents_dir = claude_dir / 'agents' / 'clauditoreum'
+    agents_dir = claude_dir / 'agents' / 'switchyard'
     agent_file = agents_dir / f"{agent_spec['name']}.md"
 
     if dry_run:
@@ -167,7 +167,7 @@ You are creating an agent definition for the **{project}** project.
 
 Create a complete agent definition markdown file with YAML frontmatter.
 
-**Output Path:** `.claude/agents/clauditoreum/{agent_spec['name']}.md`
+**Output Path:** `.claude/agents/switchyard/{agent_spec['name']}.md`
 
 Use this structure:
 
@@ -589,7 +589,7 @@ You are reviewing the generated agent and skill definitions for **{project}**.
 ## Artifacts to Review
 
 **Agents ({len(agent_files)}):**
-{chr(10).join(f'- .claude/agents/clauditoreum/{name}' for name in agent_files)}
+{chr(10).join(f'- .claude/agents/switchyard/{name}' for name in agent_files)}
 
 **Skills ({len(skill_files)}):**
 {chr(10).join(f'- .claude/skills/{name}' for name in skill_files)}

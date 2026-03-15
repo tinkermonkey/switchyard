@@ -268,7 +268,7 @@ jobs:
 
 Ensure you're running from the project root:
 ```bash
-cd /home/austinsand/workspace/orchestrator/clauditoreum
+cd /home/austinsand/workspace/orchestrator/switchyard
 PYTHONPATH=. pytest tests/integration/test_github_resilience_integration.py -v
 ```
 

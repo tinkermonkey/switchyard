@@ -243,15 +243,15 @@ def _sanitize_container_name(raw_name: str) -> str:
 ### Host
 ```
 /home/user/workspace/orchestrator/
-├── clauditoreum/          # Orchestrator code
+├── switchyard/          # Orchestrator code
 └── project-name/          # Project checkout
 ```
 
 ### Orchestrator Container
 ```
-/app/                      # Orchestrator code (./clauditoreum)
+/app/                      # Orchestrator code (./switchyard)
 /workspace/                # Parent directory (..)
-├── clauditoreum/
+├── switchyard/
 └── project-name/
 ```
 

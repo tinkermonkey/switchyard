@@ -367,7 +367,7 @@ class AgentContainerRecovery:
 
                 # Skip agent containers that are part of repair cycles
                 # Check execution_type label first, fall back to container name for old-format containers
-                label_execution_type = labels.get('org.clauditoreum.execution_type', '')
+                label_execution_type = labels.get('org.switchyard.execution_type', '')
                 is_repair = label_execution_type.startswith('repair_') or (
                     not label_execution_type and ('repair_' in container_name or 'repair-' in container_name)
                 )
@@ -379,10 +379,10 @@ class AgentContainerRecovery:
                     continue
 
                 # Try to get metadata from labels first
-                project = labels.get('org.clauditoreum.project')
-                agent = labels.get('org.clauditoreum.agent')
-                task_id = labels.get('org.clauditoreum.task_id')
-                issue_number_label = labels.get('org.clauditoreum.issue_number')
+                project = labels.get('org.switchyard.project')
+                agent = labels.get('org.switchyard.agent')
+                task_id = labels.get('org.switchyard.task_id')
+                issue_number_label = labels.get('org.switchyard.issue_number')
                 
                 metadata = None
                 if project and agent and task_id:
@@ -407,7 +407,7 @@ class AgentContainerRecovery:
                 project = metadata['project']
                 task_id = metadata['task_id']
                 # Agent comes from labels (most reliable), metadata, or Redis
-                agent = labels.get('org.clauditoreum.agent', '') or metadata.get('agent', '')
+                agent = labels.get('org.switchyard.agent', '') or metadata.get('agent', '')
 
                 # Try to get additional metadata from Redis (if still available after restart)
                 redis_key = f'agent:container:{container_name}'
@@ -798,7 +798,7 @@ class AgentContainerRecovery:
         try:
             # Try new location first (in orchestrator_data)
             if issue_number is not None:
-                orchestrator_data_dir = Path("/workspace/clauditoreum/orchestrator_data/repair_cycles")
+                orchestrator_data_dir = Path("/workspace/switchyard/orchestrator_data/repair_cycles")
                 checkpoint_file = orchestrator_data_dir / project / str(issue_number) / "checkpoint.json"
                 
                 if checkpoint_file.exists():
@@ -1031,7 +1031,7 @@ class AgentContainerRecovery:
 
             # --- PRIMARY PATH: load everything from the persistent context file ---
             context_file = Path(
-                f"/workspace/clauditoreum/orchestrator_data/repair_cycles"
+                f"/workspace/switchyard/orchestrator_data/repair_cycles"
                 f"/{project}/{issue_number}/context.json"
             )
 
@@ -1409,7 +1409,7 @@ class AgentContainerRecovery:
         logger.info(f"Processing completed repair cycle for {project}/#{issue_number}")
 
         # Load context file
-        context_file = Path(f"/workspace/clauditoreum/orchestrator_data/repair_cycles/{project}/{issue_number}/context.json")
+        context_file = Path(f"/workspace/switchyard/orchestrator_data/repair_cycles/{project}/{issue_number}/context.json")
         if not context_file.exists():
             logger.error(f"Context file not found: {context_file}")
             raise FileNotFoundError(f"Context file not found: {context_file}")

@@ -85,8 +85,8 @@ def _save_repair_cycle_context(
     project_name = context.get('project')
     issue_number = context.get('issue_number')
     
-    # Create directory structure: clauditoreum/orchestrator_data/repair_cycles/{project}/{issue}/
-    orchestrator_data_dir = Path("/workspace/clauditoreum/orchestrator_data/repair_cycles")
+    # Create directory structure: switchyard/orchestrator_data/repair_cycles/{project}/{issue}/
+    orchestrator_data_dir = Path("/workspace/switchyard/orchestrator_data/repair_cycles")
     repair_cycle_dir = orchestrator_data_dir / project_name / str(issue_number)
     repair_cycle_dir.mkdir(parents=True, exist_ok=True)
     
@@ -213,7 +213,7 @@ def _launch_repair_cycle_container(
         # (which contains the repair cycle runner code)
         # The project workspace is mounted to provide project files
         # Agents are launched as sub-containers with the project's agent image
-        repair_cycle_image = "clauditoreum-orchestrator"
+        repair_cycle_image = "switchyard-orchestrator"
         
         # Build Docker run command
         docker_cmd = [
@@ -226,9 +226,9 @@ def _launch_repair_cycle_container(
             
             # Volume mounts
             # Mount orchestrator code (live code for development)
-            '-v', f'{host_workspace_path}/clauditoreum:/app',
-            # ALSO mount orchestrator at /workspace/clauditoreum for checkpoint paths
-            '-v', f'{host_workspace_path}/clauditoreum:/workspace/clauditoreum',
+            '-v', f'{host_workspace_path}/switchyard:/app',
+            # ALSO mount orchestrator at /workspace/switchyard for checkpoint paths
+            '-v', f'{host_workspace_path}/switchyard:/workspace/switchyard',
             # Mount project workspace at standard path (same as agent containers)
             '-v', f'{host_workspace_path}/{project_name}:/workspace/{project_name}',
             # Mount Docker socket (for launching agent containers)
@@ -255,7 +255,7 @@ def _launch_repair_cycle_container(
             '--issue', str(issue_number),
             '--pipeline-run-id', pipeline_run_id,
             '--stage', stage_name,
-            '--context', f'/workspace/clauditoreum/orchestrator_data/repair_cycles/{project_name}/{issue_number}/context.json'
+            '--context', f'/workspace/switchyard/orchestrator_data/repair_cycles/{project_name}/{issue_number}/context.json'
         ]
         
         # Launch container
@@ -407,7 +407,7 @@ def _cleanup_repair_cycle_state(project_name: str, issue_number: int, run_id: st
         import redis
 
         # Clean up file-based state (context and checkpoint)
-        orchestrator_data_dir = Path("/workspace/clauditoreum/orchestrator_data/repair_cycles")
+        orchestrator_data_dir = Path("/workspace/switchyard/orchestrator_data/repair_cycles")
         repair_cycle_dir = orchestrator_data_dir / project_name / str(issue_number)
 
         if repair_cycle_dir.exists():

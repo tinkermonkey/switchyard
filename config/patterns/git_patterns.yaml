@@ -19,7 +19,7 @@ patterns:
         ### Git Operations Safety
         Before running git commands, verify you are in the correct directory:
         - Project repos are in `/workspace/<project-name>/`
-        - The orchestrator itself is in `/workspace/clauditoreum/`
+        - The orchestrator itself is in `/workspace/switchyard/`
         - Always use `pwd` to confirm location before git operations
 
         Example workflow:

@@ -277,7 +277,7 @@ def find_generated_artifacts(project: Optional[str] = None) -> Dict[str, List[Pa
 
     # Get project-specific directories
     claude_dir = get_project_claude_dir(project)
-    agents_dir = claude_dir / 'agents' / 'clauditoreum'
+    agents_dir = claude_dir / 'agents' / 'switchyard'
     skills_dir = claude_dir / 'skills'
 
     # Find agent files

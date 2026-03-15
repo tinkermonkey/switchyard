@@ -9,7 +9,7 @@ The orchestrator is a **multi-layered autonomous AI development system** that ma
 ## Layer 1: Core Orchestration Layer
 
 ### 1.1 Main Orchestrator (`main.py`)
-**Location**: `/clauditoreum/main.py`
+**Location**: `/switchyard/main.py`
 
 **Responsibilities**:
 - System initialization and startup
@@ -29,7 +29,7 @@ The orchestrator is a **multi-layered autonomous AI development system** that ma
 - Periodic health checks with exponential backoff
 
 ### 1.2 Agent Orchestrator Integration (`agents/orchestrator_integration.py`)
-**Location**: `/clauditoreum/agents/orchestrator_integration.py`
+**Location**: `/switchyard/agents/orchestrator_integration.py`
 
 **Responsibilities**:
 - Bridge between task queue and agent execution
@@ -574,7 +574,7 @@ AGENT_REGISTRY = {
 **Workspace Structure**:
 ```
 /workspace/
-├── clauditoreum/       # Orchestrator code
+├── switchyard/       # Orchestrator code
 └── {project}/          # Managed project checkouts
 ```
 
@@ -1116,7 +1116,7 @@ AGENT_REGISTRY = {
 - Dependency management
 
 **Images**:
-- Orchestrator: `clauditoreum`
+- Orchestrator: `switchyard`
 - Agent: `{project}-agent:latest` (per project)
 
 ### 15.4 GitHub

@@ -1,7 +1,7 @@
 #!/bin/bash
 # Test the Docker workspace fixture fix
 
-cd /home/austinsand/workspace/orchestrator/clauditoreum
+cd /home/austinsand/workspace/orchestrator/switchyard
 
 echo "=================================="
 echo "Testing Docker Workspace Fixture"

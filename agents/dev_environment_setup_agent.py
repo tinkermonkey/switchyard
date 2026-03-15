@@ -146,7 +146,7 @@ bash command="docker run --rm -v /workspace/{PROJECT_NAME}:/workspace/{PROJECT_N
 # ============================================================================
 # Stage 1: Base Environment Setup
 # ============================================================================
-FROM clauditoreum-orchestrator:latest
+FROM switchyard-orchestrator:latest
 
 # The base image already includes:
 # - Claude CLI (REQUIRED - must be present)

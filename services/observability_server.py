@@ -3129,14 +3129,14 @@ def git_branch_collector_thread():
 
     while True:
         try:
-            # Also check /app (clauditoreum itself) for git data
+            # Also check /app (switchyard itself) for git data
             app_path = Path("/app")
             if (app_path / '.git').exists():
-                branch_data = collect_git_branch_data('clauditoreum', app_path)
+                branch_data = collect_git_branch_data('switchyard', app_path)
                 if branch_data:
                     with git_branch_cache_lock:
-                        git_branch_cache['clauditoreum'] = branch_data
-                    logger.debug("Updated git branch cache for clauditoreum")
+                        git_branch_cache['switchyard'] = branch_data
+                    logger.debug("Updated git branch cache for switchyard")
 
             # Check configured visible (non-hidden) projects in workspace
             project_configs = config_manager.list_visible_projects()
@@ -3170,19 +3170,19 @@ def get_projects():
 
         projects = []
 
-        # Add clauditoreum itself as a special project for git monitoring
+        # Add switchyard itself as a special project for git monitoring
         app_path = Path("/app")
         if (app_path / '.git').exists():
             git_branches = None
             with git_branch_cache_lock:
-                git_branches = git_branch_cache.get('clauditoreum')
+                git_branches = git_branch_cache.get('switchyard')
 
             projects.append({
-                'name': 'clauditoreum',
+                'name': 'switchyard',
                 'github': {
                     'org': 'tinkermonkey',
-                    'repo': 'clauditoreum',
-                    'url': 'https://github.com/tinkermonkey/clauditoreum'
+                    'repo': 'switchyard',
+                    'url': 'https://github.com/tinkermonkey/switchyard'
                 },
                 'pipelines': [],
                 'workspace': {

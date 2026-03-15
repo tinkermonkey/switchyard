@@ -646,7 +646,7 @@ class TestGraphQLResilienceAcrossModules:
             'services/github_api_client.py'
         ]
 
-        base_path = '/home/austinsand/workspace/orchestrator/clauditoreum'
+        base_path = '/home/austinsand/workspace/orchestrator/switchyard'
         incorrect_usage = []
 
         for file in files_to_check:
@@ -682,7 +682,7 @@ class TestGraphQLResilienceAcrossModules:
             'services/pipeline_progression.py'
         ]
 
-        base_path = '/home/austinsand/workspace/orchestrator/clauditoreum'
+        base_path = '/home/austinsand/workspace/orchestrator/switchyard'
         missing_timeouts = []
 
         for file in files_to_check:

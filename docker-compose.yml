@@ -19,12 +19,12 @@ services:
     # This allows file access and Claude Code to run with bypass permissions
     restart: unless-stopped
     volumes:
-      # Mount the orchestrator code (this is clauditoreum/)
+      # Mount the orchestrator code (this is switchyard/)
       - ./:/app
 
       # Mount ONLY the orchestrator parent directory (~/workspace/orchestrator)
       # This directory contains:
-      #   - clauditoreum/ (this codebase, mounted above as /app)
+      #   - switchyard/ (this codebase, mounted above as /app)
       #   - <project-name>/ (managed project checkouts)
       # This ensures orchestrator cannot access sibling directories like ~/workspace/context-studio
       - ..:/workspace

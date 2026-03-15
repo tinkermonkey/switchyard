@@ -22,7 +22,7 @@ except ImportError:
 class DockerAgentRunner:
     """Runs Claude Code agents in isolated Docker containers"""
 
-    def __init__(self, network_name: str = "clauditoreum_orchestrator-net"):
+    def __init__(self, network_name: str = "switchyard_orchestrator-net"):
         # Docker Compose prefixes network names with project directory name
         self.network_name = network_name
         self._host_workspace_path = None  # Cache for host workspace path detection
@@ -244,7 +244,7 @@ class DockerAgentRunner:
             # Test writes to /workspace (the project directory), NOT to /home/orchestrator/.ssh (which is read-only)
             # Use unique filename to prevent race conditions between concurrent agents
             test_cmd.extend([
-                'clauditoreum-orchestrator:latest',  # Use simple base image for quick test
+                'switchyard-orchestrator:latest',  # Use simple base image for quick test
                 'sh', '-c',
                 f'echo "test" > /workspace/{test_filename} && cat /workspace/{test_filename} && rm /workspace/{test_filename} && echo "SUCCESS"'
             ])
@@ -573,11 +573,11 @@ class DockerAgentRunner:
         execution_type_label = task_context_for_labels.get('execution_type') or context.get('execution_type', '')
 
         cmd.extend([
-            '--label', f'org.clauditoreum.project={context.get("project", "unknown")}',
-            '--label', f'org.clauditoreum.agent={agent}',
-            '--label', f'org.clauditoreum.task_id={context.get("task_id", "unknown")}',
-            '--label', f'org.clauditoreum.execution_type={execution_type_label}',
-            '--label', 'org.clauditoreum.managed=true'
+            '--label', f'org.switchyard.project={context.get("project", "unknown")}',
+            '--label', f'org.switchyard.agent={agent}',
+            '--label', f'org.switchyard.task_id={context.get("task_id", "unknown")}',
+            '--label', f'org.switchyard.execution_type={execution_type_label}',
+            '--label', 'org.switchyard.managed=true'
         ])
 
         # Add optional labels if available
@@ -586,11 +586,11 @@ class DockerAgentRunner:
         task_context = context.get('context', {})
         issue_number = task_context.get('issue_number') or context.get('issue_number')
         if issue_number:
-            cmd.extend(['--label', f'org.clauditoreum.issue_number={issue_number}'])
+            cmd.extend(['--label', f'org.switchyard.issue_number={issue_number}'])
 
         pipeline_run_id = task_context.get('pipeline_run_id') or context.get('pipeline_run_id')
         if pipeline_run_id:
-            cmd.extend(['--label', f'org.clauditoreum.pipeline_run_id={pipeline_run_id}'])
+            cmd.extend(['--label', f'org.switchyard.pipeline_run_id={pipeline_run_id}'])
 
         # Add -i (interactive) flag if we need stdin for large prompts
         if use_stdin:
@@ -613,7 +613,7 @@ class DockerAgentRunner:
         ])
 
         # Mount Claude Code wrapper script for container-side Redis writes
-        wrapper_host_path = f'{host_workspace}/clauditoreum/scripts/docker-claude-wrapper.py'
+        wrapper_host_path = f'{host_workspace}/switchyard/scripts/docker-claude-wrapper.py'
         cmd.extend([
             '-v', f'{wrapper_host_path}:/app/scripts/docker-claude-wrapper.py:ro'
         ])
@@ -631,9 +631,9 @@ class DockerAgentRunner:
 
             if mcp_config_path.startswith('/app/'):
                 # Running in orchestrator - /app is mounted from host
-                # Convert /app/tmp/file.json -> host_workspace/clauditoreum/tmp/file.json
+                # Convert /app/tmp/file.json -> host_workspace/switchyard/tmp/file.json
                 relative_from_app = mcp_config_path.replace('/app/', '')
-                host_mcp_path = f'{host_workspace}/clauditoreum/{relative_from_app}'
+                host_mcp_path = f'{host_workspace}/switchyard/{relative_from_app}'
             
             elif mcp_config_path.startswith('/workspace/'):
                 # Running in orchestrator - /workspace is mounted from host
@@ -751,7 +751,7 @@ class DockerAgentRunner:
                 logger.warning(f"Agent {agent} requires dev container but project status is {status.value}, using orchestrator image")
 
         # Default: use orchestrator image
-        return 'clauditoreum-orchestrator:latest'
+        return 'switchyard-orchestrator:latest'
 
     def _detect_rate_limit_reset_time(self, project_dir: Path) -> Optional[datetime]:
         """

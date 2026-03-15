@@ -315,12 +315,12 @@ async def main():
                         import subprocess
                         try:
                             # Check for running agent containers for this issue using Docker labels
-                            # All containers are labeled with org.clauditoreum.issue_number={issue}
+                            # All containers are labeled with org.switchyard.issue_number={issue}
                             result = subprocess.run(
                                 [
                                     'docker', 'ps',
-                                    '--filter', f'label=org.clauditoreum.issue_number={lock.locked_by_issue}',
-                                    '--filter', f'label=org.clauditoreum.project={project_name}',
+                                    '--filter', f'label=org.switchyard.issue_number={lock.locked_by_issue}',
+                                    '--filter', f'label=org.switchyard.project={project_name}',
                                     '--format', '{{.Names}}'
                                 ],
                                 capture_output=True,

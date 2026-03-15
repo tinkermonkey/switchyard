@@ -680,7 +680,7 @@ class WorkExecutionStateTracker:
         if task_id:
             try:
                 result = subprocess.run(
-                    ['docker', 'ps', '--filter', f'label=org.clauditoreum.task_id={task_id}',
+                    ['docker', 'ps', '--filter', f'label=org.switchyard.task_id={task_id}',
                      '--format', '{{.Names}}'],
                     capture_output=True,
                     text=True,
@@ -702,8 +702,8 @@ class WorkExecutionStateTracker:
             try:
                 result = subprocess.run(
                     ['docker', 'ps',
-                     '--filter', f'label=org.clauditoreum.project={project}',
-                     '--filter', f'label=org.clauditoreum.issue_number={issue_number}',
+                     '--filter', f'label=org.switchyard.project={project}',
+                     '--filter', f'label=org.switchyard.issue_number={issue_number}',
                      '--format', '{{.Names}}'],
                     capture_output=True,
                     text=True,
@@ -805,11 +805,11 @@ class WorkExecutionStateTracker:
                 # Extract container ID and labels via docker inspect
                 inspect_result = subprocess.run(
                     ['docker', 'inspect', '--format',
-                     '{{.Id}}|{{index .Config.Labels "org.clauditoreum.agent"}}|'
-                     '{{index .Config.Labels "org.clauditoreum.project"}}|'
-                     '{{index .Config.Labels "org.clauditoreum.task_id"}}|'
-                     '{{index .Config.Labels "org.clauditoreum.issue_number"}}|'
-                     '{{index .Config.Labels "org.clauditoreum.pipeline_run_id"}}',
+                     '{{.Id}}|{{index .Config.Labels "org.switchyard.agent"}}|'
+                     '{{index .Config.Labels "org.switchyard.project"}}|'
+                     '{{index .Config.Labels "org.switchyard.task_id"}}|'
+                     '{{index .Config.Labels "org.switchyard.issue_number"}}|'
+                     '{{index .Config.Labels "org.switchyard.pipeline_run_id"}}',
                      container_name],
                     capture_output=True,
                     text=True,

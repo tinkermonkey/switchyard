@@ -22,7 +22,7 @@ The orchestrator now uses a modern configuration management system that eliminat
 
 ```bash
 git clone <your-repo-url>
-cd clauditoreum
+cd switchyard
 python -m venv venv
 source venv/bin/activate  # On Windows: venv\\Scripts\\activate
 pip install -r requirements.txt

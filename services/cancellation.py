@@ -194,8 +194,8 @@ def kill_containers_for_issue(project: str, issue_number: int) -> int:
     try:
         result = subprocess.run(
             ['docker', 'ps', '-q',
-             '--filter', f'label=org.clauditoreum.project={project}',
-             '--filter', f'label=org.clauditoreum.issue_number={issue_number}'],
+             '--filter', f'label=org.switchyard.project={project}',
+             '--filter', f'label=org.switchyard.issue_number={issue_number}'],
             capture_output=True, text=True, timeout=10
         )
 

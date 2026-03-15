@@ -49,7 +49,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 # Set ORCHESTRATOR_ROOT for running outside Docker container
 # Inside container: /app (set by container environment)
-# Outside container: Current directory (clauditoreum/)
+# Outside container: Current directory (switchyard/)
 if 'ORCHESTRATOR_ROOT' not in os.environ:
     os.environ['ORCHESTRATOR_ROOT'] = str(Path(__file__).parent.parent.resolve())
 
@@ -291,10 +291,10 @@ def discover_projects_for_generation(project_filter: str = None) -> List[str]:
     else:
         projects = config_manager.list_visible_projects()
 
-    # Filter to projects that exist and aren't clauditoreum itself
+    # Filter to projects that exist and aren't switchyard itself
     valid_projects = []
     for project in projects:
-        if project == 'clauditoreum':
+        if project == 'switchyard':
             logger.debug(f"Skipping {project}: This is the orchestrator itself")
             continue
 

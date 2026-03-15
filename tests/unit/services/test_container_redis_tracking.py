@@ -265,7 +265,7 @@ class TestRepairMissingRedisTracking:
         """When Docker labels are empty, use the function arguments as fallback."""
         tracker = self._make_tracker(tmp_path)
 
-        # Labels are empty (container has no org.clauditoreum.* labels)
+        # Labels are empty (container has no org.switchyard.* labels)
         inspect_output = 'sha256abc||||||\n'
         mock_subprocess_result = MagicMock()
         mock_subprocess_result.returncode = 0
@@ -433,7 +433,7 @@ class TestDiscoverContainersForExecution:
         call_args = mock_run.call_args[0][0]
         assert 'docker' in call_args
         assert 'ps' in call_args
-        assert any('label=org.clauditoreum.task_id=task-123' in str(arg) for arg in call_args)
+        assert any('label=org.switchyard.task_id=task-123' in str(arg) for arg in call_args)
 
     def test_discover_by_project_issue_labels(self, tmp_path):
         """When task_id unavailable, fall back to project+issue labels."""
@@ -466,7 +466,7 @@ class TestDiscoverContainersForExecution:
         assert 'docker' in call_args
         assert 'ps' in call_args
         # Should have both project and issue_number filters
-        assert any('label=org.clauditoreum.project=myproject' in str(arg) for arg in call_args)
+        assert any('label=org.switchyard.project=myproject' in str(arg) for arg in call_args)
 
     def test_discover_by_name_pattern_fallback(self, tmp_path):
         """When labels unavailable, fall back to name pattern matching."""

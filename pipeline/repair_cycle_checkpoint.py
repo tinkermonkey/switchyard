@@ -62,7 +62,7 @@ class RepairCycleCheckpoint:
         
         # Store checkpoint in state directory (keeps project workspace clean)
         if issue_number is not None:
-            state_dir = Path("/workspace/clauditoreum/state/projects")
+            state_dir = Path("/workspace/switchyard/state/projects")
             repair_cycle_dir = state_dir / project_name / "repair_cycles" / str(issue_number)
             repair_cycle_dir.mkdir(parents=True, exist_ok=True)
 
