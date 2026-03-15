@@ -807,16 +807,18 @@ Do not add any other text before or after the JSON.
 
         logger.info(f"Creating sub-issues in project {sdlc_board.project_number}, column {backlog_column.name}")
 
-        # Extract parent issue number (should be same for all sub-issues)
-        parent_issue_number = None
-        if sub_issues and 'parent_issue' in sub_issues[0]:
-            parent_issue_str = sub_issues[0]['parent_issue']
-            # Extract number from "#123" format
+        # Use task_context issue_number as the authoritative parent — never trust the
+        # agent's JSON output for this, as Claude may confuse issues mentioned in the
+        # discussion context with the actual parent.
+        parent_issue_number = str(task_context.get('issue_number')) if task_context.get('issue_number') else None
+        if parent_issue_number:
+            logger.info(f"Parent issue: #{parent_issue_number} (from task_context)")
+        elif sub_issues and 'parent_issue' in sub_issues[0]:
             import re as regex
-            match = regex.search(r'#(\d+)', parent_issue_str)
+            match = regex.search(r'#(\d+)', sub_issues[0]['parent_issue'])
             if match:
                 parent_issue_number = match.group(1)
-                logger.info(f"Parent issue: #{parent_issue_number}")
+                logger.warning(f"Parent issue: #{parent_issue_number} (from agent JSON — task_context had no issue_number)")
 
         # Get parent issue ID (node ID, not number) for GraphQL
         parent_issue_id = None
