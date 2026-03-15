@@ -1764,33 +1764,50 @@ class ProjectMonitor:
                     already_has_lock = True
 
                 if not lock_already_acquired and not already_has_lock:
-                    # CRITICAL: Check if this issue is next in line based on GitHub board order
-                    # This ensures we respect the user's ordering on the GitHub board
-                    next_issue = pipeline_queue.get_next_waiting_issue()
-                    if next_issue and next_issue['issue_number'] != issue_number:
-                        logger.info(
-                            f"Issue #{issue_number} waiting in queue: "
-                            f"issue #{next_issue['issue_number']} is ahead in GitHub board order "
-                            f"(position {next_issue.get('position_in_column', '?')})"
-                        )
-                        return None  # Wait for higher-priority issues to execute first
-
-                    # Try to acquire pipeline lock
-                    can_execute, reason = lock_manager.try_acquire_lock(
-                        project=project_name,
-                        board=board_name,
-                        issue_number=issue_number
+                    # Conversational columns run without an exclusive lock — multiple
+                    # feedback loops can be active concurrently on the same board.
+                    is_conversational_col = (
+                        column and hasattr(column, 'type') and column.type == 'conversational'
                     )
 
-                    if not can_execute:
+                    if is_conversational_col:
+                        # Conversational loops don't hold the pipeline lock — they run
+                        # concurrently and leave the board free for PR reviews at any time.
+                        # Queue ordering is also skipped: there's no reason to serialize
+                        # independent human conversations on the same board.
+                        pipeline_queue.mark_issue_active(issue_number)
                         logger.info(
-                            f"Issue #{issue_number} waiting for pipeline access: {reason}"
+                            f"Issue #{issue_number} starting conversational loop "
+                            f"(no pipeline lock required)"
                         )
-                        return None  # Don't create task yet - waiting in queue
+                    else:
+                        # CRITICAL: Check if this issue is next in line based on GitHub board order
+                        # This ensures we respect the user's ordering on the GitHub board
+                        next_issue = pipeline_queue.get_next_waiting_issue()
+                        if next_issue and next_issue['issue_number'] != issue_number:
+                            logger.info(
+                                f"Issue #{issue_number} waiting in queue: "
+                                f"issue #{next_issue['issue_number']} is ahead in GitHub board order "
+                                f"(position {next_issue.get('position_in_column', '?')})"
+                            )
+                            return None  # Wait for higher-priority issues to execute first
 
-                    # Lock acquired - mark issue as active in queue
-                    pipeline_queue.mark_issue_active(issue_number)
-                    logger.info(f"Issue #{issue_number} acquired pipeline lock, proceeding with execution")
+                        # Try to acquire pipeline lock
+                        can_execute, reason = lock_manager.try_acquire_lock(
+                            project=project_name,
+                            board=board_name,
+                            issue_number=issue_number
+                        )
+
+                        if not can_execute:
+                            logger.info(
+                                f"Issue #{issue_number} waiting for pipeline access: {reason}"
+                            )
+                            return None  # Don't create task yet - waiting in queue
+
+                        # Lock acquired - mark issue as active in queue
+                        pipeline_queue.mark_issue_active(issue_number)
+                        logger.info(f"Issue #{issue_number} acquired pipeline lock, proceeding with execution")
                 elif lock_already_acquired:
                     # Caller (e.g., failsafe) already acquired lock - proceed with execution
                     pipeline_queue.mark_issue_active(issue_number)
@@ -1850,18 +1867,23 @@ class ProjectMonitor:
 
             if agent and agent != 'null':
                 # DEFENSE-IN-DEPTH: Verify lock is still held before execution
-                # This catches race conditions that slipped through earlier checks
-                from services.pipeline_lock_manager import get_pipeline_lock_manager
-                lock_manager_verify = get_pipeline_lock_manager()
-                current_lock_verify = lock_manager_verify.get_lock(project_name, pipeline_config.board_name)
+                # Conversational loops intentionally run without a lock (concurrent by design),
+                # so this check is skipped for them.
+                is_conversational_col = (
+                    column and hasattr(column, 'type') and column.type == 'conversational'
+                )
+                if not is_conversational_col:
+                    from services.pipeline_lock_manager import get_pipeline_lock_manager
+                    lock_manager_verify = get_pipeline_lock_manager()
+                    current_lock_verify = lock_manager_verify.get_lock(project_name, pipeline_config.board_name)
 
-                if current_lock_verify and current_lock_verify.locked_by_issue != issue_number:
-                    logger.error(
-                        f"CRITICAL: Issue #{issue_number} lost pipeline lock before execution! "
-                        f"Now held by issue #{current_lock_verify.locked_by_issue}. "
-                        f"Aborting to prevent race condition."
-                    )
-                    return None
+                    if current_lock_verify and current_lock_verify.locked_by_issue != issue_number:
+                        logger.error(
+                            f"CRITICAL: Issue #{issue_number} lost pipeline lock before execution! "
+                            f"Now held by issue #{current_lock_verify.locked_by_issue}. "
+                            f"Aborting to prevent race condition."
+                        )
+                        return None
 
                 # Determine workspace type and get discussion ID FIRST, before using them
                 from config.state_manager import state_manager
@@ -2663,17 +2685,19 @@ class ProjectMonitor:
 
             # Get current lock
             lock = lock_manager.get_lock(project_name, board_name)
+            lock_held_by_us = lock and lock.locked_by_issue == issue_number
 
-            # Safety check: Verify this issue actually holds the lock
-            if lock and lock.locked_by_issue != issue_number:
-                logger.warning(
-                    f"Issue #{issue_number} reached exit column '{exit_column}' but doesn't hold lock "
-                    f"(lock held by #{lock.locked_by_issue})"
+            # If another issue holds the lock, skip release but continue with cleanup.
+            # Conversational issues never acquire the lock, so this is the normal path
+            # for Planning & Design board exits.
+            if lock and not lock_held_by_us:
+                logger.info(
+                    f"Issue #{issue_number} reached exit column '{exit_column}' without holding lock "
+                    f"(lock held by #{lock.locked_by_issue}) — skipping lock release"
                 )
-                return
 
-            # Release the lock
-            if lock:
+            # Release the lock only if held by this issue
+            if lock_held_by_us:
                 released = lock_manager.release_lock(project_name, board_name, issue_number)
                 if released:
                     logger.info(
@@ -2732,29 +2756,35 @@ class ProjectMonitor:
                     f"for {project_name}/{board_name}"
                 )
 
-                # Acquire lock for next issue
-                acquired, reason = lock_manager.try_acquire_lock(
-                    project=project_name,
-                    board=board_name,
-                    issue_number=next_issue['issue_number']
+                # Get current column first so we can decide whether the next issue
+                # needs an exclusive lock (non-conversational) or not (conversational).
+                current_column = self.get_issue_column_sync(
+                    project_name, board_name, next_issue['issue_number']
                 )
 
-                if acquired:
-                    # Mark as active in queue
-                    pipeline_queue.mark_issue_active(next_issue['issue_number'])
-
-                    # Get current column for the next issue from GitHub
-                    # (May have moved since it was queued)
-                    current_column = self.get_issue_column_sync(
-                        project_name, board_name, next_issue['issue_number']
+                if not current_column:
+                    logger.warning(
+                        f"Could not determine current column for issue #{next_issue['issue_number']}, "
+                        f"removing from queue"
+                    )
+                    pipeline_queue.remove_issue_from_queue(next_issue['issue_number'])
+                else:
+                    next_column_obj = next(
+                        (c for c in workflow_template.columns if c.name == current_column), None
+                    )
+                    is_conversational_next = (
+                        next_column_obj and
+                        hasattr(next_column_obj, 'type') and
+                        next_column_obj.type == 'conversational'
                     )
 
-                    if current_column:
+                    if is_conversational_next:
+                        # Conversational loops don't need the exclusive lock — start directly.
+                        pipeline_queue.mark_issue_active(next_issue['issue_number'])
                         logger.info(
-                            f"Triggering agent for next queued issue #{next_issue['issue_number']} "
-                            f"in column '{current_column}'"
+                            f"Triggering conversational loop for next queued issue "
+                            f"#{next_issue['issue_number']} in '{current_column}' (no lock)"
                         )
-                        # Trigger agent for the waiting issue
                         self.trigger_agent_for_status(
                             project_name, board_name,
                             next_issue['issue_number'],
@@ -2762,16 +2792,29 @@ class ProjectMonitor:
                             repository
                         )
                     else:
-                        logger.warning(
-                            f"Could not determine current column for issue #{next_issue['issue_number']}, "
-                            f"removing from queue"
+                        # Non-conversational stage: acquire exclusive lock before starting.
+                        acquired, reason = lock_manager.try_acquire_lock(
+                            project=project_name,
+                            board=board_name,
+                            issue_number=next_issue['issue_number']
                         )
-                        pipeline_queue.remove_issue_from_queue(next_issue['issue_number'])
-                        lock_manager.release_lock(project_name, board_name, next_issue['issue_number'])
-                else:
-                    logger.error(
-                        f"Failed to acquire lock for next issue #{next_issue['issue_number']}: {reason}"
-                    )
+
+                        if acquired:
+                            pipeline_queue.mark_issue_active(next_issue['issue_number'])
+                            logger.info(
+                                f"Triggering agent for next queued issue #{next_issue['issue_number']} "
+                                f"in column '{current_column}'"
+                            )
+                            self.trigger_agent_for_status(
+                                project_name, board_name,
+                                next_issue['issue_number'],
+                                current_column,
+                                repository
+                            )
+                        else:
+                            logger.error(
+                                f"Failed to acquire lock for next issue #{next_issue['issue_number']}: {reason}"
+                            )
             else:
                 logger.info(
                     f"No waiting issues in pipeline queue for {project_name}/{board_name}"
@@ -6392,21 +6435,44 @@ _Repair cycle initiated by Claude Code Orchestrator_
                                 )
                                 continue
 
-                            logger.info(
-                                f"⚡ FAILSAFE: Triggering agent for issue "
-                                f"#{issue_number} in column '{current_column}'"
+                            # Check if the column is conversational — if so, release the
+                            # just-acquired lock before triggering (conversational loops
+                            # run without an exclusive lock).
+                            workflow_tmpl = self.config_manager.get_workflow_template(pipeline.workflow)
+                            col_obj = next(
+                                (c for c in workflow_tmpl.columns if c.name == current_column), None
+                            ) if workflow_tmpl else None
+                            is_conversational_col = (
+                                col_obj and hasattr(col_obj, 'type') and col_obj.type == 'conversational'
                             )
 
-                            # Trigger agent using normal flow
-                            # Pass lock_already_acquired=True since we just acquired it above
-                            self.trigger_agent_for_status(
-                                project_name,
-                                pipeline.board_name,
-                                issue_number,
-                                current_column,
-                                project_config.github['repo'],
-                                lock_already_acquired=True
-                            )
+                            if is_conversational_col:
+                                lock_manager.release_lock(project_name, pipeline.board_name, issue_number)
+                                logger.info(
+                                    f"⚡ FAILSAFE: Triggering conversational loop for issue "
+                                    f"#{issue_number} in column '{current_column}' (no lock)"
+                                )
+                                self.trigger_agent_for_status(
+                                    project_name,
+                                    pipeline.board_name,
+                                    issue_number,
+                                    current_column,
+                                    project_config.github['repo']
+                                )
+                            else:
+                                logger.info(
+                                    f"⚡ FAILSAFE: Triggering agent for issue "
+                                    f"#{issue_number} in column '{current_column}'"
+                                )
+                                # Pass lock_already_acquired=True since we just acquired it above
+                                self.trigger_agent_for_status(
+                                    project_name,
+                                    pipeline.board_name,
+                                    issue_number,
+                                    current_column,
+                                    project_config.github['repo'],
+                                    lock_already_acquired=True
+                                )
 
                             # Record metrics for stalled issue recovery
                             if is_stalled:
