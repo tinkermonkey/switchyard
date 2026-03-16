@@ -29,6 +29,20 @@ class MergeConflictError(Exception):
         self.files = files
 
 
+class StaleBranchError(Exception):
+    """Raised when a feature branch is too many commits behind main to proceed safely."""
+    def __init__(self, message: str, branch_name: str, commits_behind: int, parent_issue: int = None):
+        super().__init__(message)
+        self.branch_name = branch_name
+        self.commits_behind = commits_behind
+        self.parent_issue = parent_issue
+
+
+class BranchPullFailedError(Exception):
+    """Raised when git pull of main fails during branch creation, leaving local main potentially stale."""
+    pass
+
+
 @dataclass
 class SubIssueState:
     """Tracks a sub-issue's progress in a feature branch"""
@@ -728,7 +742,12 @@ class FeatureBranchManager:
 
         # Ensure we're on main and up to date
         await git_workflow_manager.checkout_branch(project_dir, "main")
-        await git_workflow_manager.pull_branch(project_dir)
+        pull_success = await git_workflow_manager.pull_branch(project_dir)
+        if not pull_success:
+            raise BranchPullFailedError(
+                f"Failed to pull latest main before creating branch '{branch_name}'. "
+                f"Local main may be stale. Verify network/auth access to the repository and retry."
+            )
 
         # Create and checkout new branch
         success = await git_workflow_manager.create_branch(project_dir, branch_name)
@@ -1205,37 +1224,24 @@ git push --force-with-lease
                 if parent_issue and feature_branch:
                     commits_behind = await self.get_commits_behind_main(project_dir, branch_name)
                     feature_branch.commits_behind_main = commits_behind
-                    if commits_behind > 50:
-                        # EMIT DECISION EVENT: Critical staleness
+                    if commits_behind > 5:
+                        # EMIT DECISION EVENT: Branch too stale to proceed
                         self.decision_events.emit_branch_stale_detected(
                             project=project,
                             issue_number=issue_number,
                             branch_name=branch_name,
                             commits_behind=commits_behind,
-                            action_taken="escalate_stale_branch",
+                            action_taken="block_stale_branch",
                             parent_issue=parent_issue,
                             pipeline_run_id=pipeline_run_id
                         )
-                        
-                        await self.escalate_stale_branch(
-                            github_integration,
-                            parent_issue,
-                            branch_name,
-                            commits_behind
-                        )
-                    elif commits_behind > 20:
-                        # EMIT DECISION EVENT: Warning staleness
-                        self.decision_events.emit_branch_stale_detected(
-                            project=project,
-                            issue_number=issue_number,
+                        raise StaleBranchError(
+                            f"Branch '{branch_name}' is {commits_behind} commits behind main. "
+                            f"Rebase required before work can continue.",
                             branch_name=branch_name,
                             commits_behind=commits_behind,
-                            action_taken="warn_stale_branch",
-                            parent_issue=parent_issue,
-                            pipeline_run_id=pipeline_run_id
+                            parent_issue=parent_issue
                         )
-                        
-                        logger.warning(f"Branch {branch_name} is {commits_behind} commits behind main")
 
                     # Mark sub-issue as in progress
                     self.mark_sub_issue_in_progress(project, feature_branch, issue_number)
@@ -1507,38 +1513,23 @@ Waiting for human decision...
         commits_behind = await self.get_commits_behind_main(project_dir, feature_branch.branch_name)
         feature_branch.commits_behind_main = commits_behind
 
-        if commits_behind > 50:
-            # EMIT DECISION EVENT: Critical staleness detected
+        if commits_behind > 5:
+            # EMIT DECISION EVENT: Branch too stale to proceed
             self.decision_events.emit_branch_stale_detected(
                 project=project,
                 issue_number=issue_number,
                 branch_name=feature_branch.branch_name,
                 commits_behind=commits_behind,
-                action_taken="escalate_stale_branch",
+                action_taken="block_stale_branch",
                 parent_issue=parent_issue,
                 pipeline_run_id=pipeline_run_id
             )
-            
-            await self.escalate_stale_branch(
-                github_integration,
-                parent_issue,
-                feature_branch.branch_name,
-                commits_behind
-            )
-        elif commits_behind > 20:
-            # EMIT DECISION EVENT: Warning staleness detected
-            self.decision_events.emit_branch_stale_detected(
-                project=project,
-                issue_number=issue_number,
+            raise StaleBranchError(
+                f"Branch '{feature_branch.branch_name}' is {commits_behind} commits behind main. "
+                f"Rebase required before work can continue.",
                 branch_name=feature_branch.branch_name,
                 commits_behind=commits_behind,
-                action_taken="warn_stale_branch",
-                parent_issue=parent_issue,
-                pipeline_run_id=pipeline_run_id
-            )
-            
-            logger.warning(
-                f"Branch {feature_branch.branch_name} is {commits_behind} commits behind main"
+                parent_issue=parent_issue
             )
 
         # Mark sub-issue as in progress

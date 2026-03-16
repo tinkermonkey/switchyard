@@ -25,13 +25,23 @@ gh auth refresh -s project
 
 **The orchestrator has organization access.** If using a GitHub App, the app must be installed on the target organization. If using a PAT, the token owner must be a member of the org.
 
-**SSH key is configured** for the repository host. The orchestrator and all agent containers authenticate via SSH — HTTPS remotes are rewritten to SSH automatically on startup, but the underlying key must be present at `~/.ssh/id_ed25519` (the path mounted into the container per `docker-compose.yml`).
+**SSH key is configured** for the repository host. The orchestrator and all agent containers authenticate via SSH — HTTPS remotes are rewritten to SSH automatically on startup, but the underlying key must be present at `~/.ssh/id_ed25519` (the path mounted into the container per `docker-compose.yml`). Agent containers have SSH keys mounted but no HTTPS credential helper, so any workspace with an HTTPS remote would fail on every git operation. The rewrite is a safety net for cases where the repo_url in the project config was accidentally specified as HTTPS, or where the repo was cloned via HTTPS by some other means.
 
 **The orchestrator is not running** when you add a project config for the first time. The project list is loaded at startup. If the orchestrator is already running when you add the config file, restart it to pick up the new project.
 
 ---
 
 ## 2. Create the project config file
+
+### What I do
+
+I ask claude (running in this codebase):
+
+```
+Add a new project to switchyard for this repo using the default workflow config: git@github.com:tinkermonkey/documentation_robotics.git
+```
+
+### Manual setup
 
 Create a new file at:
 ```

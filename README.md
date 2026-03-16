@@ -39,6 +39,12 @@ flowchart TD
     OB -->|"serve data"| UI
 ```
 
+## Architecture overview
+
+This project was not architected so much as it evolved organically from a simple proof of concept into a more robust system. The baseline was a simple Claude Code agent orchestrator with containerization and defined workflow support driven by GitHub Projects v2. The idea is to be able to (fairly well) investigate / spec / design / build software without being in an editor, to allow the human in the loop to stay at the context level. It is really intended to be a reference implementation and playground for experimentation, not a production-grade system. That said, it works reasonably well.
+
+The obvious limitaions are that it's hard-wired into github and claude code. The "fix" for that I've been working on is to use this foothold and fold the learnings from this into a more modular and extensible framework: [codetoreum](https://github.com/tinkermonkey/codetoreum/). Because this system is inherently complicated, I'm focussing that project on a simulation-first hexagonal architecture approach, which will allow for much more rigorous testing and iteration on the core abstractions without needing to run the full stack, while also making it easier to swap out components (e.g., add support for other LLM providers, or other VCS / project management platforms).
+
 ### Key components
 
 | Component | Location | Responsibility |

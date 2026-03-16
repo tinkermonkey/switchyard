@@ -25,6 +25,40 @@ from services.github_integration import GitHubIntegration, AgentCommentFormatter
 logger = logging.getLogger(__name__)
 
 
+def _build_branch_error_comment(e) -> str:
+    """Build a GitHub comment body for StaleBranchError or BranchPullFailedError."""
+    from services.feature_branch_manager import StaleBranchError
+    if isinstance(e, StaleBranchError):
+        return (
+            f"## Branch Rebase Required\n\n"
+            f"The feature branch `{e.branch_name}` is **{e.commits_behind} commits behind main** "
+            f"and cannot proceed without a rebase.\n\n"
+            f"**Rebase command:**\n"
+            f"```bash\n"
+            f"git checkout {e.branch_name}\n"
+            f"git fetch origin\n"
+            f"git rebase origin/main\n"
+            f"# Resolve any conflicts\n"
+            f"git push --force-with-lease\n"
+            f"```\n\n"
+            f"After rebasing, move this issue back to **Development** to resume work.\n\n"
+            f"_Pipeline lock retained — no new work will start on this issue until "
+            f"the rebase is complete._"
+        )
+    else:
+        return (
+            f"## Branch Creation Blocked\n\n"
+            f"Failed to pull the latest `main` before creating the feature branch. "
+            f"The local checkout may be out of date or there may be a network/auth issue.\n\n"
+            f"**To diagnose:**\n"
+            f"1. Check `docker-compose logs orchestrator` for git errors\n"
+            f"2. Verify network/SSH access to the repository\n"
+            f"3. Move this issue back to **Development** to retry once the issue is resolved.\n\n"
+            f"_Pipeline lock retained — no new work will start on this issue until "
+            f"this is resolved._"
+        )
+
+
 class AgentExecutor:
     """
     Centralized service for executing agents with guaranteed observability.
@@ -234,6 +268,55 @@ class AgentExecutor:
 
             except Exception as e:
                 from agents.non_retryable import NonRetryableAgentError
+                from services.feature_branch_manager import StaleBranchError, BranchPullFailedError
+
+                # Stale branch and pull failures require human intervention:
+                # end the pipeline run with retain_lock=True and post a GitHub comment,
+                # then re-raise as NonRetryableAgentError so the caller does not retry.
+                if isinstance(e, (StaleBranchError, BranchPullFailedError)):
+                    issue_number = task_context.get('issue_number')
+                    logger.error(
+                        f"Branch error during workspace preparation for {project_name} "
+                        f"issue #{issue_number}: {e}"
+                    )
+
+                    # Post GitHub comment so the issue has visible context
+                    if issue_number:
+                        try:
+                            from config.manager import config_manager
+                            from services.github_integration import GitHubIntegration
+                            project_config = config_manager.get_project_config(project_name)
+                            github = GitHubIntegration(
+                                repo_owner=project_config.github['org'],
+                                repo_name=project_config.github['repo']
+                            )
+                            comment = _build_branch_error_comment(e)
+                            await github.post_comment(issue_number, comment)
+                        except Exception as comment_err:
+                            logger.error(
+                                f"Failed to post branch error comment to issue #{issue_number}: {comment_err}"
+                            )
+
+                    # End the pipeline run, retaining the lock so the issue stays blocked
+                    # until a human rebases the branch and moves it back to Development.
+                    if issue_number:
+                        try:
+                            from services.pipeline_run import get_pipeline_run_manager
+                            get_pipeline_run_manager().end_pipeline_run(
+                                project=project_name,
+                                issue_number=issue_number,
+                                reason=str(e),
+                                retain_lock=True,
+                                outcome="failed"
+                            )
+                        except Exception as end_err:
+                            logger.error(
+                                f"Failed to end pipeline run after branch error for "
+                                f"{project_name} issue #{issue_number}: {end_err}"
+                            )
+
+                    raise NonRetryableAgentError(str(e)) from e
+
                 if isinstance(e, NonRetryableAgentError):
                     raise
 
