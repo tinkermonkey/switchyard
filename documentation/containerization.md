@@ -230,13 +230,13 @@ else:  # UNVERIFIED
 
 ```mermaid
 stateDiagram-v2
-    [*] --> UNVERIFIED : project first seen\nor image missing
-    UNVERIFIED --> IN_PROGRESS : queue_dev_environment_setup()\nsets status before enqueue
-    IN_PROGRESS --> VERIFIED : dev_environment_verifier\ncalls set_status(VERIFIED)
-    IN_PROGRESS --> BLOCKED : dev_environment_verifier\ncalls set_status(BLOCKED)
-    BLOCKED --> UNVERIFIED : _run_env_rebuild_sub_cycle()\ncalls set_status(UNVERIFIED)
-    VERIFIED --> UNVERIFIED : verify_and_update_status()\ndetects missing image
-    VERIFIED --> [*] : gates open —\nrequires_dev_container agents\nrun in project image
+    [*] --> UNVERIFIED : project first seen<br>or image missing
+    UNVERIFIED --> IN_PROGRESS : queue_dev_environment_setup()<br>sets status before enqueue
+    IN_PROGRESS --> VERIFIED : dev_environment_verifier<br>calls set_status(VERIFIED)
+    IN_PROGRESS --> BLOCKED : dev_environment_verifier<br>calls set_status(BLOCKED)
+    BLOCKED --> UNVERIFIED : _run_env_rebuild_sub_cycle()<br>calls set_status(UNVERIFIED)
+    VERIFIED --> UNVERIFIED : verify_and_update_status()<br>detects missing image
+    VERIFIED --> [*] : gates open —<br>requires_dev_container agents<br>run in project image
 ```
 
 ---

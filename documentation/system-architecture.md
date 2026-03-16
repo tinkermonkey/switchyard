@@ -10,28 +10,28 @@ The system targets teams that want to hand off entire development workflows — 
 
 ```mermaid
 graph TD
-    PM[ProjectMonitor\nservices/project_monitor.py] -->|enqueue Task| TQ[TaskQueue\ntask_queue/task_manager.py]
+    PM[ProjectMonitor<br>services/project_monitor.py] -->|enqueue Task| TQ[TaskQueue<br>task_queue/task_manager.py]
     TQ -->|dequeue| W[Worker / main loop]
-    W -->|create stage| OI[orchestrator_integration\nagents/orchestrator_integration.py]
-    OI -->|resolve agent| AR[AGENT_REGISTRY\nagents/__init__.py]
-    AR -->|instantiate| AG[Agent instance\nagents/*_agent.py]
-    AG -->|build prompt| CI[ClaudeIntegration\nclaude/claude_integration.py]
-    CI -->|docker run| DR[DockerAgentRunner\nclaude/docker_runner.py]
-    DR -->|launch| DC[Agent container\nclaude-agent-<project>-<task_id>]
+    W -->|create stage| OI[orchestrator_integration<br>agents/orchestrator_integration.py]
+    OI -->|resolve agent| AR[AGENT_REGISTRY<br>agents/__init__.py]
+    AR -->|instantiate| AG[Agent instance<br>agents/*_agent.py]
+    AG -->|build prompt| CI[ClaudeIntegration<br>claude/claude_integration.py]
+    CI -->|docker run| DR[DockerAgentRunner<br>claude/docker_runner.py]
+    DR -->|launch| DC[Agent container<br>claude-agent-<project>-<task_id>]
     DC -->|post output| GH[GitHub Issue / Discussion]
-    GH -->|next column| PP[PipelineProgression\npipeline/progression.py]
+    GH -->|next column| PP[PipelineProgression<br>pipeline/progression.py]
     PP -->|poll board| PM
 
-    SP[SequentialPipeline\npipeline/orchestrator.py] -->|wraps| AG
-    SP -->|checkpoint| FS[State files\norchestrator_data/state/]
-    SP -->|circuit breaker| CB[CircuitBreaker\npipeline/base.py]
+    SP[SequentialPipeline<br>pipeline/orchestrator.py] -->|wraps| AG
+    SP -->|checkpoint| FS[State files<br>orchestrator_data/state/]
+    SP -->|circuit breaker| CB[CircuitBreaker<br>pipeline/base.py]
 
-    GHM[GitHubProjectManager\nservices/github_project_manager.py] -->|reconcile boards| GH
-    OBS[ObservabilityServer\nservices/observability_server.py] -->|reads| ES[Elasticsearch]
-    LC[LogCollector\nservices/log_collector.py] -->|batch write| ES
+    GHM[GitHubProjectManager<br>services/github_project_manager.py] -->|reconcile boards| GH
+    OBS[ObservabilityServer<br>services/observability_server.py] -->|reads| ES[Elasticsearch]
+    LC[LogCollector<br>services/log_collector.py] -->|batch write| ES
     DR -->|stream events| RS[Redis streams]
     RS --> LC
-    TQ -->|backed by| RD[Redis\ntask queue]
+    TQ -->|backed by| RD[Redis<br>task queue]
 ```
 
 ### Entry point: `main.py`
@@ -141,14 +141,14 @@ A separate Docker Compose service that reads structured log events from a Redis 
 ```mermaid
 graph LR
     subgraph docker-compose services
-        ORC[orchestrator\nport: internal] -->|depends on| RD[redis:6379]
+        ORC[orchestrator<br>port: internal] -->|depends on| RD[redis:6379]
         ORC -->|depends on| ES[elasticsearch:9200]
-        OBS[observability-server\nport: 5001] -->|depends on| RD
+        OBS[observability-server<br>port: 5001] -->|depends on| RD
         OBS -->|depends on| ES
-        WUI[web-ui\nport: 3000] -->|depends on| OBS
+        WUI[web-ui<br>port: 3000] -->|depends on| OBS
         LC[log-collector] -->|depends on| RD
         LC -->|writes| ES
-        BL[browserless\nport: 3080]
+        BL[browserless<br>port: 3080]
         ORC -->|launches agent containers via| DSK[/var/run/docker.sock]
     end
     ORC -.->|read events| RD
@@ -187,18 +187,18 @@ The orchestrator and observability server are built from the same image. The ima
 graph TD
     subgraph host filesystem
         HH["~/workspace/orchestrator/"]
-        HH --> SW["switchyard/\n(this codebase)"]
-        HH --> P1["context-studio/\n(managed project checkout)"]
+        HH --> SW["switchyard/<br>(this codebase)"]
+        HH --> P1["context-studio/<br>(managed project checkout)"]
         HH --> PN["<project-n>/"]
         HH2["~/.ssh/id_ed25519"]
         HH3["~/.gitconfig"]
-        HH4["~/.orchestrator/\n(GitHub App keys)"]
+        HH4["~/.orchestrator/<br>(GitHub App keys)"]
         DSK["/var/run/docker.sock"]
     end
 
     subgraph orchestrator container
-        APP["/app/\n← switchyard/"]
-        WS["/workspace/\n← orchestrator/"]
+        APP["/app/<br>← switchyard/"]
+        WS["/workspace/<br>← orchestrator/"]
         WS --> WSW["/workspace/switchyard/"]
         WS --> WP1["/workspace/context-studio/"]
         SSH["/home/orchestrator/.ssh/id_ed25519 (ro)"]
@@ -208,7 +208,7 @@ graph TD
     end
 
     subgraph agent container launched by orchestrator
-        AWK["/workspace/\n← host orchestrator/context-studio/"]
+        AWK["/workspace/<br>← host orchestrator/context-studio/"]
         ASSH["/home/orchestrator/.ssh/ (ro)"]
         AGCF["/home/orchestrator/.gitconfig"]
         WRP["/app/scripts/docker-claude-wrapper.py (ro)"]
@@ -293,11 +293,11 @@ sequenceDiagram
     W->>TQ: dequeue Task (step 5)
     W->>OI: process_task_integrated() (step 5)
     OI->>OI: resolve agent from AGENT_REGISTRY (step 6)
-    OI->>CI: build full prompt (step 7)\n(agent .md + issue body + prior stage outputs)
+    OI->>CI: build full prompt (step 7)<br>(agent .md + issue body + prior stage outputs)
     CI->>DR: run_agent_in_container() (step 8)
-    DR->>DR: construct docker run command\n(image, mounts, labels, env) (step 9)
+    DR->>DR: construct docker run command<br>(image, mounts, labels, env) (step 9)
     DR->>AC: docker run claude-agent-<project>-<task_id> (step 9)
-    AC->>AC: claude --project /workspace <prompt> (step 10)\n(wrapper streams events to Redis)
+    AC->>AC: claude --project /workspace <prompt> (step 10)<br>(wrapper streams events to Redis)
     AC->>GH: gh issue comment (post output) (step 11)
     AC-->>DR: stdout + exit code (step 12)
     DR->>DR: unregister container from Redis (step 12)

@@ -60,7 +60,7 @@ GITHUB_APP_PRIVATE_KEY_PATH=/path/to/orchestrator-bot.pem  # Path to the RSA pri
 The private key can alternatively be provided inline:
 
 ```
-GITHUB_APP_PRIVATE_KEY="-----BEGIN RSA PRIVATE KEY-----\n...\n-----END RSA PRIVATE KEY-----"
+GITHUB_APP_PRIVATE_KEY="-----BEGIN RSA PRIVATE KEY-----<br>...<br>-----END RSA PRIVATE KEY-----"
 ```
 
 In production, `GITHUB_APP_PRIVATE_KEY_PATH` pointing to a file at `~/.orchestrator/<app-name>.pem` is preferred. The Docker Compose configuration mounts `~/.orchestrator` into the container at `/home/orchestrator/.orchestrator`.

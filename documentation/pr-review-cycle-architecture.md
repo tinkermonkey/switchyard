@@ -83,7 +83,7 @@ All outputs collected in `phase_outputs` (phases 1 and 2) are passed to `_run_co
     {
       "name": "Functional Area Name",
       "severity": "critical|high|medium|low",
-      "findings": "- **Finding Title**: description with file:line ref\n..."
+      "findings": "- **Finding Title**: description with file:line ref<br>..."
     }
   ],
   "filtered_out": ["one-line note about each removed finding"]

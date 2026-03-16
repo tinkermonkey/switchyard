@@ -13,17 +13,17 @@ Switchyard is a Claude Code agent orchestrator that automates software developme
 
 ```mermaid
 flowchart TD
-    GH["GitHub\n(issues & project boards)"]
-    PM["ProjectMonitor\n(polls boards every 15-30s)"]
-    TQ["TaskQueue\n(Redis priority queue)"]
-    PO["Pipeline Orchestrator\n(SequentialPipeline stages)"]
-    AR["Agent Registry\n(12 specialized agents)"]
-    DR["DockerAgentRunner\n(container lifecycle)"]
-    AC["Agent Container\n(Claude Code + project workspace)"]
-    PP["PipelineProgression\n(column advancement)"]
-    ES["Elasticsearch\n(events, logs, metrics)"]
-    OB["Observability Server\n(REST API, port 5001)"]
-    UI["Web UI\n(dashboard, port 3000)"]
+    GH["GitHub<br>(issues & project boards)"]
+    PM["ProjectMonitor<br>(polls boards every 15-30s)"]
+    TQ["TaskQueue<br>(Redis priority queue)"]
+    PO["Pipeline Orchestrator<br>(SequentialPipeline stages)"]
+    AR["Agent Registry<br>(12 specialized agents)"]
+    DR["DockerAgentRunner<br>(container lifecycle)"]
+    AC["Agent Container<br>(Claude Code + project workspace)"]
+    PP["PipelineProgression<br>(column advancement)"]
+    ES["Elasticsearch<br>(events, logs, metrics)"]
+    OB["Observability Server<br>(REST API, port 5001)"]
+    UI["Web UI<br>(dashboard, port 3000)"]
 
     GH -->|"card movement detected"| PM
     PM -->|"enqueue task"| TQ

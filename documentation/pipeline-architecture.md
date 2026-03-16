@@ -19,31 +19,37 @@ The three templates and the workflows that instantiate them:
 ```mermaid
 graph TD
     subgraph planning_design
-        PD1[research\nidea_researcher]
-        PD2[requirements\nbusiness_analyst]
-        PD3[design\nsoftware_architect]
-        PD4[work_breakdown\nwork_breakdown_agent]
-        PD5[pr_review\nPRReviewStage]
-        PD1 --> PD2 --> PD3 --> PD4 --> PD5
+        PD1[research<br>idea_researcher]
+        PD2[requirements<br>business_analyst]
+        PD3[design<br>software_architect]
+        PD4[work_breakdown<br>work_breakdown_agent]
+        PD_DEV["In Development<br>epic tracks sub-issue progress"]
+        PD5[pr_review<br>PRReviewStage]
+        PD1 --> PD2 --> PD3 --> PD4 --> PD_DEV
+        PD_DEV -->|all_subtasks_completed| PD5
     end
 
     subgraph sdlc_execution
-        SE1[implementation\nsenior_software_engineer]
-        SE2[testing\nRepairCycleStage]
-        SE3[staging\nsenior_software_engineer]
+        SE1[implementation<br>senior_software_engineer]
+        SE2[testing<br>RepairCycleStage]
+        SE3[staging<br>senior_software_engineer]
+        SE_CHECK{all sub-issues<br>complete?}
         SE1 -->|code_reviewer checks| SE1R{approved?}
         SE1R -->|yes| SE2
         SE1R -->|revision| SE1
         SE2 --> SE3
+        SE3 --> SE_CHECK
+        SE_CHECK -->|no| SE_WAIT[sub-issue done<br>others still pending]
     end
 
     subgraph environment_support
-        ES1[environment_setup\ndev_environment_setup]
-        ES2[environment_verification\ndev_environment_verifier]
+        ES1[environment_setup<br>dev_environment_setup]
+        ES2[environment_verification<br>dev_environment_verifier]
         ES1 --> ES2
     end
 
     PD4 -.->|creates sub-issues| SE1
+    SE_CHECK -->|yes| PD5
 ```
 
 Projects reference templates and workflows in `config/projects/<project>.yaml`. The `PipelineFactory` in `pipeline/factory.py` instantiates a `SequentialPipeline` from a template by creating one `AgentStage` per stage (plus a reviewer stage where `review_required: true`).
@@ -89,16 +95,16 @@ Stages in order:
 
 ```mermaid
 flowchart TD
-    A[ProjectMonitor polls board\nGraphQL every 15–60s] --> B{status_changed?}
+    A[ProjectMonitor polls board<br>GraphQL every 15–60s] --> B{status_changed?}
     B -->|no| A
-    B -->|yes, column has agent| C{pipeline lock\navailable?}
-    C -->|locked by another issue| D[add to PipelineQueueManager\ndefer processing]
-    C -->|available| E[fetch full issue details\ngh issue view]
-    E --> F[assemble previous-stage context\nget_previous_stage_context]
-    F --> G[enqueue Task in Redis\nwith priority]
-    G --> H[worker dequeues Task\ncalls process_task_integrated]
+    B -->|yes, column has agent| C{pipeline lock<br>available?}
+    C -->|locked by another issue| D[add to PipelineQueueManager<br>defer processing]
+    C -->|available| E[fetch full issue details<br>gh issue view]
+    E --> F[assemble previous-stage context<br>get_previous_stage_context]
+    F --> G[enqueue Task in Redis<br>with priority]
+    G --> H[worker dequeues Task<br>calls process_task_integrated]
     H --> I{validate_task_can_run}
-    I -->|dev container not verified| J[queue dev_environment_setup\ndefer task]
+    I -->|dev container not verified| J[queue dev_environment_setup<br>defer task]
     I -->|dev container in progress| K[defer task]
     I -->|dev container verified| L{stage_type?}
     L -->|none| M[AgentStage]
@@ -107,7 +113,7 @@ flowchart TD
     M --> P[SequentialPipeline.execute]
     N --> P
     O --> P
-    P --> Q[checkpoint stage_index\nto disk]
+    P --> Q[checkpoint stage_index<br>to disk]
     Q --> R[stage.run_with_circuit_breaker]
 ```
 
@@ -227,16 +233,16 @@ Full mapping across all three workflows:
 
 ```mermaid
 flowchart TD
-    A[Issue moves to Development column] --> B[senior_software_engineer\ninitial mode]
-    B --> C[PR created\ncode pushed to branch]
+    A[Issue moves to Development column] --> B[senior_software_engineer<br>initial mode]
+    B --> C[PR created<br>code pushed to branch]
     C --> D[Issue moves to Code Review column]
-    D --> E[code_reviewer\ninspects PR]
+    D --> E[code_reviewer<br>inspects PR]
     E --> F{verdict}
-    F -->|approved| G[advance to Testing column\nauto_advance_on_approval]
-    F -->|changes_requested\ncycle < max_iterations 5| H[increment review cycle count\nset trigger: review_cycle_revision]
-    H --> I[senior_software_engineer\nrevision mode\nwith reviewer feedback in context]
+    F -->|approved| G[advance to Testing column<br>auto_advance_on_approval]
+    F -->|changes_requested<br>cycle < max_iterations 5| H[increment review cycle count<br>set trigger: review_cycle_revision]
+    H --> I[senior_software_engineer<br>revision mode<br>with reviewer feedback in context]
     I --> E
-    F -->|blocked OR\ncycle >= blocking_threshold 1| J[escalate\npipeline halts\nhuman review required]
+    F -->|blocked OR<br>cycle >= blocking_threshold 1| J[escalate<br>pipeline halts<br>human review required]
 ```
 
 When an issue moves to the `Code Review` column, the orchestrator starts a maker-checker loop between `senior_software_engineer` (maker) and `code_reviewer` (checker).
@@ -370,30 +376,30 @@ Pipeline lock released
 ```mermaid
 flowchart TD
     S0([Issue in Backlog]) --> S1
-    S1[ProjectMonitor detects\nstatus_changed] --> S2
-    S2[Task enqueued\nin Redis TaskQueue] --> S3
-    S3{validate_task_can_run} -->|dev container missing| S3A[queue env setup\ndefer]
+    S1[ProjectMonitor detects<br>status_changed] --> S2
+    S2[Task enqueued<br>in Redis TaskQueue] --> S3
+    S3{validate_task_can_run} -->|dev container missing| S3A[queue env setup<br>defer]
     S3 -->|ready| S4
-    S4[create_stage_from_config\nAgentStage / RepairCycleStage / PRReviewStage] --> S5
-    S5[SequentialPipeline.execute\nrestore from checkpoint if present] --> S6
-    S6[write checkpoint\nstage_index + context] --> S7
-    S7[stage.run_with_circuit_breaker] --> S8{circuit\nbreaker}
+    S4[create_stage_from_config<br>AgentStage / RepairCycleStage / PRReviewStage] --> S5
+    S5[SequentialPipeline.execute<br>restore from checkpoint if present] --> S6
+    S6[write checkpoint<br>stage_index + context] --> S7
+    S7[stage.run_with_circuit_breaker] --> S8{circuit<br>breaker}
     S8 -->|open| S9([pipeline halts])
     S8 -->|closed| S10
-    S10[MakerAgent.execute\n_determine_execution_mode\ninitial / revision / question] --> S11
-    S11[build prompt\nrun_claude_code\nDocker container] --> S12
-    S12[agent posts output\nto GitHub] --> S13
-    S13[log_stage_completion\ncurrent_stage_index += 1] --> S14{review\nrequired?}
+    S10[MakerAgent.execute<br>_determine_execution_mode<br>initial / revision / question] --> S11
+    S11[build prompt<br>run_claude_code<br>Docker container] --> S12
+    S12[agent posts output<br>to GitHub] --> S13
+    S13[log_stage_completion<br>current_stage_index += 1] --> S14{review<br>required?}
     S14 -->|yes| S15[reviewer agent runs]
     S15 --> S16{verdict}
     S16 -->|approved| S17
-    S16 -->|changes_requested\nunder max_iterations| S18[re-queue maker\nrevision mode]
+    S16 -->|changes_requested<br>under max_iterations| S18[re-queue maker<br>revision mode]
     S18 --> S10
-    S16 -->|blocked / over threshold| S19([escalate\npipeline halts])
+    S16 -->|blocked / over threshold| S19([escalate<br>pipeline halts])
     S14 -->|no| S17
     S17{more stages?} -->|yes| S6
     S17 -->|no| S20
-    S20[advance to exit column\nStaged or Done] --> S21([pipeline lock released])
+    S20[advance to exit column<br>Staged or Done] --> S21([pipeline lock released])
 ```
 
 ### Circuit breaker states
@@ -406,9 +412,9 @@ stateDiagram-v2
     half_open --> closed: probe call succeeds
     half_open --> open: probe call fails
 
-    closed: closed\ncalls pass through
-    open: open\ncalls rejected immediately\npipeline raises halt error
-    half_open: half-open\nlimited probe calls allowed
+    closed: closed<br>calls pass through
+    open: open<br>calls rejected immediately<br>pipeline raises halt error
+    half_open: half-open<br>limited probe calls allowed
 ```
 
 Each `PipelineStage` holds a `CircuitBreaker` instance. States:
