@@ -54,7 +54,7 @@
               "id": "em4Zk",
               "name": "dl1ht",
               "fill": "#7d8590",
-              "content": "LEVEL 1 — DASHED BORDER (top-level containers)",
+              "content": "LEVEL 1 — SOLID BORDER (top-level containers)",
               "fontFamily": "Inter",
               "fontSize": 11,
               "fontWeight": "700"
@@ -3661,7 +3661,7 @@
               "id": "x7nhM",
               "name": "ll1ht",
               "fill": "#57606a",
-              "content": "LEVEL 1 — DASHED BORDER (top-level containers)",
+              "content": "LEVEL 1 — SOLID BORDER (top-level containers)",
               "fontFamily": "Inter",
               "fontSize": 11,
               "fontWeight": "700"
