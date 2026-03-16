@@ -8,6 +8,7 @@ import HeaderSystemHealth from './HeaderSystemHealth'
 import HeaderCircuitBreakers from './HeaderCircuitBreakers'
 import HeaderClaudeUsage from './HeaderClaudeUsage'
 import HeaderStatsCard from './HeaderStatsCard'
+import switchyardLogo from '../assets/switchyard_logo.svg'
 
 export default function Header() {
   const { connected, stats } = useSocket()
@@ -239,32 +240,30 @@ export default function Header() {
 
       {/* Main Header */}
       <div className="bg-gh-canvas-subtle p-5 rounded-md border border-gh-border relative">
-        {/* Theme toggle - upper right corner */}
-        <button
-          onClick={toggleTheme}
-          className="absolute top-5 right-5 p-2 bg-gh-canvas border border-gh-border rounded-md hover:bg-gh-border-muted transition-colors"
-          title={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}
-        >
-          {theme === 'dark' ? <Sun className="w-4 h-4" /> : <Moon className="w-4 h-4" />}
-        </button>
+        {/* Theme toggle + WebSocket indicator - upper right corner */}
+        <div className="absolute top-5 right-5 flex flex-col items-center gap-1.5">
+          <button
+            onClick={toggleTheme}
+            className="p-2 bg-gh-canvas border border-gh-border rounded-md hover:bg-gh-border-muted transition-colors"
+            title={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}
+          >
+            {theme === 'dark' ? <Sun className="w-4 h-4" /> : <Moon className="w-4 h-4" />}
+          </button>
+          <div
+            className={`w-3 h-3 rounded-sm ${connected ? 'bg-gh-success' : 'bg-gh-danger'}`}
+            title={connected ? 'WebSocket connected' : 'WebSocket disconnected'}
+          />
+        </div>
 
         {/* Main content */}
         <div className="flex items-start justify-between gap-6">
-          {/* Left side: Title and badges */}
+          {/* Left side: Logo */}
           <div className="flex-shrink-0">
-            <h1 className="text-gh-accent-primary text-2xl font-semibold mb-3">
-              <div>Agent</div>
-              <div>Observability</div>
-              <div>Dashboard</div>
-            </h1>
-            <div className="flex gap-2 flex-wrap">
-              <span className={`inline-block px-3 py-1 rounded-full text-xs font-semibold ${connected
-                ? 'bg-gh-success text-white'
-                : 'bg-gh-danger text-white'
-                }`}>
-                {connected ? 'WebSocket Connected' : 'WebSocket Disconnected'}
-              </span>
-            </div>
+            <img
+              src={switchyardLogo}
+              alt="Switchyard"
+              className="h-16 w-auto"
+            />
           </div>
 
           {/* Right side: Stats cards */}

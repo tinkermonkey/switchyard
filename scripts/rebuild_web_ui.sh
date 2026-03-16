@@ -24,7 +24,7 @@ echo "✓ Container stopped"
 
 echo ""
 echo "Step 3: Starting web-ui container..."
-docker compose up -d web-ui
+docker compose up -d --no-deps web-ui
 echo "✓ Container started"
 
 echo ""

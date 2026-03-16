@@ -1,3 +1,5 @@
+![Switchyard](assets/repo_header_medium.png)
+
 # Switchyard
 
 Switchyard is a Claude Code agent orchestrator that automates software development workflows through GitHub Projects v2 Kanban boards. It monitors boards for issue movement, routes work to specialized AI agents, executes agents in isolated Docker containers, and progresses issues through configurable SDLC pipelines — from requirements analysis through implementation, code review, and testing.
