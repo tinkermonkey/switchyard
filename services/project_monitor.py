@@ -6305,12 +6305,13 @@ _Repair cycle initiated by Claude Code Orchestrator_
 
         Sequence (designed for 'eventual correctness'):
         1. Clean stale state FIRST (start with consistent state)
-        2. Process waiting issues (existing logic)
-        3. Process stalled operations (NEW - issues in action columns with no active work)
+        2. Resume in-flight issues stranded in mid-pipeline columns (Code Review, Testing)
+        3. Pull next waiting issue from Development queue (only if no in-flight issue found)
 
         The failsafe checks each pipeline for:
-        - Scenario 1 (existing): Pipeline unlocked + waiting issues → process next waiting
-        - Scenario 2 (NEW): Pipeline unlocked + stalled issues → retry stalled issue
+        - Scenario 1: Pipeline unlocked + in-flight issue in mid-pipeline column → resume it
+          (takes priority: an issue already running should not be skipped for new Development work)
+        - Scenario 2: Pipeline unlocked + no in-flight issues + waiting Development issues → process next
 
         Args:
             poll_cycle_items: Pre-fetched items from the main poll loop, keyed by
@@ -6347,36 +6348,37 @@ _Repair cycle initiated by Claude Code Orchestrator_
                         if lock and lock.lock_status == 'locked':
                             continue  # Pipeline busy, skip
 
-                        # SCENARIO 1: Check if there are waiting issues (existing logic)
-                        # This also syncs queue with GitHub (ensures up-to-date state)
-                        next_issue = pipeline_queue.get_next_waiting_issue()
-                        if next_issue:
-                            # We have: waiting issue + unlocked pipeline = should be processing!
+                        # SCENARIO 1: Check for in-flight issues stranded in mid-pipeline
+                        # columns (Code Review, Testing, etc.). These take priority over new
+                        # Development work — an issue already running should resume before the
+                        # next queued issue starts. Uses cached board items to avoid extra API calls.
+                        cached = poll_cycle_items.get((project_name, pipeline.board_name)) if poll_cycle_items else None
+                        stalled_issues = self._find_stalled_issues_for_pipeline(
+                            project_name, pipeline.board_name,
+                            cached_items=cached
+                        )
+
+                        if stalled_issues:
+                            # Found in-flight issue stranded in a mid-pipeline column
+                            next_issue = stalled_issues[0]  # Limited to 1 per pipeline for safety
                             logger.info(
-                                f"⚡ FAILSAFE (WAITING): Found waiting issue #{next_issue['issue_number']} "
-                                f"for unlocked pipeline {project_name}/{pipeline.board_name} - attempting to process"
+                                f"⚡ FAILSAFE (STALLED): Found in-flight issue #{next_issue['issue_number']} "
+                                f"in column '{next_issue['column']}' for {project_name}/{pipeline.board_name} "
+                                f"- resuming before pulling from Development queue"
                             )
                         else:
-                            # SCENARIO 2: No waiting issues - check for stalled operations (NEW)
-                            logger.debug(f"⚡ FAILSAFE: No waiting issues for {project_name}/{pipeline.board_name}, checking for stalled operations...")
-
-                            # Pass cached items from main poll loop to avoid duplicate API call
-                            cached = poll_cycle_items.get((project_name, pipeline.board_name)) if poll_cycle_items else None
-                            stalled_issues = self._find_stalled_issues_for_pipeline(
-                                project_name, pipeline.board_name,
-                                cached_items=cached
-                            )
-
-                            if not stalled_issues:
-                                continue  # No waiting or stalled issues, skip this pipeline
-
-                            # Found stalled issue - use it as next_issue
-                            next_issue = stalled_issues[0]  # Limited to 1 per pipeline for safety
-
-                            logger.info(
-                                f"⚡ FAILSAFE (STALLED): Found stalled issue #{next_issue['issue_number']} "
-                                f"in column '{next_issue['column']}' for {project_name}/{pipeline.board_name} - attempting recovery"
-                            )
+                            # SCENARIO 2: No in-flight issues - check for waiting Development issues
+                            # This also syncs queue with GitHub (ensures up-to-date state)
+                            logger.debug(f"⚡ FAILSAFE: No in-flight issues for {project_name}/{pipeline.board_name}, checking Development queue...")
+                            next_issue = pipeline_queue.get_next_waiting_issue()
+                            if next_issue:
+                                # We have: waiting issue + unlocked pipeline = should be processing!
+                                logger.info(
+                                    f"⚡ FAILSAFE (WAITING): Found waiting issue #{next_issue['issue_number']} "
+                                    f"for unlocked pipeline {project_name}/{pipeline.board_name} - attempting to process"
+                                )
+                            else:
+                                continue  # No in-flight or waiting issues, skip this pipeline
 
                         # At this point, next_issue is either a waiting issue or a stalled issue
                         # Process it using the same logic
