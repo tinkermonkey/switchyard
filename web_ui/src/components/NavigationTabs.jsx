@@ -1,11 +1,11 @@
 import { Link } from '@tanstack/react-router'
-import { Activity, FolderGit2, Workflow, BarChart2, TrendingUp, FileBarChart2, ClipboardList } from 'lucide-react'
+import { FolderGit2, Workflow, BarChart2, TrendingUp, FileBarChart2, ClipboardList } from 'lucide-react'
 
 export default function NavigationTabs() {
   return (
     <div className="flex gap-3 my-3">
       <Link
-        to="/"
+        to="/pipeline-run"
         activeProps={{
           className: "px-4 py-2 bg-gh-accent-emphasis border border-gh-accent-primary rounded-md hover:bg-gh-accent-primary transition-colors text-sm text-white"
         }}
@@ -13,8 +13,8 @@ export default function NavigationTabs() {
           className: "px-4 py-2 bg-gh-canvas-subtle border border-gh-border rounded-md hover:bg-gh-border-muted transition-colors text-sm"
         }}
       >
-        <Activity className="inline w-4 h-4 mr-2" />
-        Dashboard
+        <Workflow className="inline w-4 h-4 mr-2" />
+        Pipeline Runs
       </Link>
       <Link
         to="/projects"
@@ -27,18 +27,6 @@ export default function NavigationTabs() {
       >
         <FolderGit2 className="inline w-4 h-4 mr-2" />
         Projects
-      </Link>
-      <Link
-        to="/pipeline-run"
-        activeProps={{
-          className: "px-4 py-2 bg-gh-accent-emphasis border border-gh-accent-primary rounded-md hover:bg-gh-accent-primary transition-colors text-sm text-white"
-        }}
-        inactiveProps={{
-          className: "px-4 py-2 bg-gh-canvas-subtle border border-gh-border rounded-md hover:bg-gh-border-muted transition-colors text-sm"
-        }}
-      >
-        <Workflow className="inline w-4 h-4 mr-2" />
-        Pipeline Runs
       </Link>
 
         <div> | </div>
