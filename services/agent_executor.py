@@ -291,7 +291,6 @@ class AgentExecutor:
                     # Post GitHub comment so the issue has visible context
                     if issue_number:
                         try:
-                            from config.manager import config_manager
                             from services.github_integration import GitHubIntegration
                             project_config = config_manager.get_project_config(project_name)
                             github = GitHubIntegration(
