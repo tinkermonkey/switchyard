@@ -18,6 +18,11 @@ from typing import Optional, Tuple
 logger = logging.getLogger(__name__)
 
 
+class ClaudeCodeRateLimitError(Exception):
+    """Raised when Claude Code has hit its usage limit. Systemic - do not retry."""
+    pass
+
+
 class ClaudeCodeBreaker:
     """
     Circuit breaker for Claude Code token limits.

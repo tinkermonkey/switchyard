@@ -12,11 +12,13 @@ logger = logging.getLogger(__name__)
 
 # Import Claude Code breaker for token limit detection
 try:
-    from monitoring.claude_code_breaker import get_breaker
+    from monitoring.claude_code_breaker import get_breaker, ClaudeCodeRateLimitError
 except ImportError:
     # Fallback if module not available
     def get_breaker():
         return None
+    class ClaudeCodeRateLimitError(Exception):
+        pass
 
 
 class DockerAgentRunner:
@@ -795,13 +797,21 @@ class DockerAgentRunner:
                                         "lte": now_utc.isoformat()
                                     }
                                 }
-                            },
+                            }
+                        ],
+                        "should": [
                             {
                                 "term": {
                                     "raw_event.event.error.keyword": "rate_limit"
                                 }
+                            },
+                            {
+                                "match": {
+                                    "raw_event.event.message.content.text": "hit your limit"
+                                }
                             }
-                        ]
+                        ],
+                        "minimum_should_match": 1
                     }
                 }
             }
@@ -1090,10 +1100,24 @@ class DockerAgentRunner:
                     # Check for token limits in both stdout and stderr
                     breaker = get_breaker()
                     if breaker:
-                        is_limit, reset_time = breaker.detect_session_limit(line)
+                        check_text = line
+                        # Claude Code stdout is structured JSON; extract the inner text content
+                        # before calling detect_session_limit(), which has a MAX_MESSAGE_LENGTH
+                        # guard that would silently skip the full JSON envelope (~500+ chars).
+                        if not is_stderr:
+                            try:
+                                parsed = json.loads(line)
+                                content = parsed.get('message', {}).get('content', [])
+                                for item in (content if isinstance(content, list) else []):
+                                    if isinstance(item, dict) and item.get('type') == 'text':
+                                        check_text = item.get('text', line)
+                                        break
+                            except (json.JSONDecodeError, AttributeError, TypeError):
+                                pass  # Fall back to raw line for non-JSON stdout or stderr
+                        is_limit, reset_time = breaker.detect_session_limit(check_text)
                         if is_limit:
                             breaker.trip(reset_time)
-                            logger.error(f"🔴 TRIPPED BREAKER: Token limit detected in output: {line}")
+                            logger.error(f"🔴 TRIPPED BREAKER: Token limit detected in output: {check_text}")
 
                     if is_stderr:
                         stderr_parts.append(line + '\n')
@@ -1432,7 +1456,7 @@ class DockerAgentRunner:
                         # If breaker is already open, we know it's a rate limit
                         if breaker.state == breaker.OPEN:
                             logger.error("🔴 Claude Code breaker is OPEN - rate limit confirmed")
-                            raise Exception("Claude Code rate limit reached. Please wait for reset.")
+                            raise ClaudeCodeRateLimitError("Claude Code rate limit reached. Please wait for reset.")
                         # Otherwise, try to verify if this is actually a rate limit
                         else:
                             logger.warning("🟡 Suspicious exit 1 with no error output - verifying if rate limit...")
@@ -1453,7 +1477,7 @@ class DockerAgentRunner:
                                 # Confirmed rate limit - trip the breaker
                                 logger.error(f"🔴 CONFIRMED rate limit. Tripping breaker. Resets at: {reset_time.strftime('%Y-%m-%d %H:%M:%S %Z')}")
                                 breaker.trip(reset_time)
-                                raise Exception(f"Claude Code rate limit confirmed. Breaker tripped. Resets at {reset_time.strftime('%I:%M %p')}.")
+                                raise ClaudeCodeRateLimitError(f"Claude Code rate limit confirmed. Breaker tripped. Resets at {reset_time.strftime('%I:%M %p')}.")
                 
                 if not stderr_text:
                     stderr_text = f"Container exited with code {exit_code} but no error output captured."

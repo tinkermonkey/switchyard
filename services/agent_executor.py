@@ -24,6 +24,14 @@ from services.github_integration import GitHubIntegration, AgentCommentFormatter
 
 logger = logging.getLogger(__name__)
 
+try:
+    from monitoring.claude_code_breaker import ClaudeCodeRateLimitError, get_breaker as get_claude_code_breaker
+except ImportError:
+    class ClaudeCodeRateLimitError(Exception):  # type: ignore[assignment]
+        pass
+    def get_claude_code_breaker():  # type: ignore[misc]
+        return None
+
 
 def _build_branch_error_comment(e) -> str:
     """Build a GitHub comment body for StaleBranchError or BranchPullFailedError."""
@@ -452,9 +460,8 @@ class AgentExecutor:
 
                     # Check Claude Code circuit breaker before attempting execution
                     # If it's open, we should not attempt execution or count failures against the agent
-                    from monitoring.claude_code_breaker import get_breaker
-                    claude_breaker = get_breaker()
-                    if claude_breaker.is_open():
+                    claude_breaker = get_claude_code_breaker()
+                    if claude_breaker and claude_breaker.is_open():
                         reset_time = claude_breaker.reset_time
                         if reset_time:
                             from datetime import datetime, timezone
@@ -463,14 +470,13 @@ class AgentExecutor:
                                 f"⏸️  Claude Code circuit breaker is OPEN. Agent {agent_name} execution paused. "
                                 f"Tokens reset in {time_until:.0f}s at {reset_time.strftime('%I:%M %p')}"
                             )
-                            # Raise a specific exception that indicates this is a systemic issue, not an agent failure
-                            raise Exception(
+                            raise ClaudeCodeRateLimitError(
                                 f"Claude Code circuit breaker is OPEN. Resets at {reset_time.strftime('%I:%M %p')}. "
                                 f"This is a systemic token limit issue, not an agent failure."
                             )
                         else:
                             logger.warning(f"⏸️  Claude Code circuit breaker is OPEN. Agent {agent_name} execution paused.")
-                            raise Exception(
+                            raise ClaudeCodeRateLimitError(
                                 "Claude Code circuit breaker is OPEN. Awaiting token reset. "
                                 "This is a systemic token limit issue, not an agent failure."
                             )
@@ -494,9 +500,18 @@ class AgentExecutor:
                         logger.warning(f"Agent {agent_name} hit non-retryable error: {e}")
                         raise
 
+                    # ClaudeCodeRateLimitError: systemic token limit — trip breaker if not open, never retry
+                    if isinstance(e, ClaudeCodeRateLimitError):
+                        claude_breaker = get_claude_code_breaker()
+                        if claude_breaker and not claude_breaker.is_open():
+                            claude_breaker.trip()
+                        raise
+
                     # Check if this is a Claude Code breaker failure (systemic issue)
                     error_message = str(e)
-                    is_claude_breaker_failure = "Claude Code circuit breaker is OPEN" in error_message
+                    is_claude_breaker_failure = (
+                        "Claude Code circuit breaker is OPEN" in error_message
+                    )
 
                     if is_claude_breaker_failure:
                         # This is a systemic issue (token limits), not an agent failure
@@ -705,7 +720,10 @@ class AgentExecutor:
                 raise
 
             error_message = str(e)
-            is_claude_breaker_failure = "Claude Code circuit breaker is OPEN" in error_message
+            is_claude_breaker_failure = (
+                isinstance(e, ClaudeCodeRateLimitError) or
+                "Claude Code circuit breaker is OPEN" in error_message
+            )
 
             if is_claude_breaker_failure:
                 # This is a systemic issue (token limits), not an agent failure
