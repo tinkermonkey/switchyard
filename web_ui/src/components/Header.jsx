@@ -2,7 +2,7 @@ import { useSocket } from '../contexts/SocketContext'
 import { useTheme } from '../contexts/ThemeContext'
 import { useSystemHealth } from '../hooks/useSystemHealth'
 import { useCircuitBreakers } from '../hooks/useCircuitBreakers'
-import { Sun, Moon, AlertTriangle, AlertCircle } from 'lucide-react'
+import { Sun, Moon, AlertTriangle, AlertCircle, Plug, Unplug, CircleHelp } from 'lucide-react'
 import HeaderActiveAgents from './HeaderActiveAgents'
 import HeaderSystemHealth from './HeaderSystemHealth'
 import HeaderCircuitBreakers from './HeaderCircuitBreakers'
@@ -250,25 +250,30 @@ export default function Header() {
             {theme === 'dark' ? <Sun className="w-4 h-4" /> : <Moon className="w-4 h-4" />}
           </button>
           <div
-            className={`w-3 h-3 rounded-sm ${connected ? 'bg-gh-success' : 'bg-gh-danger'}`}
-            title={connected ? 'WebSocket connected' : 'WebSocket disconnected'}
-          />
+            className={`p-2 border rounded-md ${
+              connected === true  ? 'bg-gh-canvas border-gh-border text-gh-success'
+            : connected === false ? 'bg-gh-canvas border-gh-border text-gh-danger'
+            :                       'bg-gh-canvas border-gh-border text-gh-fg-muted'
+            }`}
+            title={connected === true ? 'WebSocket connected' : connected === false ? 'WebSocket disconnected' : 'WebSocket status unknown'}
+          >
+            {connected === true  ? <Plug className="w-4 h-4" />
+           : connected === false ? <Unplug className="w-4 h-4" />
+           :                       <CircleHelp className="w-4 h-4" />}
+          </div>
         </div>
 
-        {/* Main content */}
-        <div className="flex items-start justify-between gap-6">
-          {/* Left side: Logo */}
+        {/* Main content — logo and cards are siblings in the same flex row so the
+            logo can stretch to match card height via align-items:stretch (default) */}
+        <div className="flex justify-between items-center gap-4 mr-12">
           <div className="flex-shrink-0">
             <img
               src={switchyardLogo}
               alt="Switchyard"
-              className="h-16 w-auto"
+              className="h-32 w-auto"
             />
           </div>
-
-          {/* Right side: Stats cards */}
-          <div className="flex gap-4 flex-wrap justify-end flex-1 mr-12">
-            {/* Only show these blocks if connected */}
+          <div className="flex gap-4 flex-wrap justify-end">
             {connected && (
               <>
                 <HeaderActiveAgents />
