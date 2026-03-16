@@ -149,7 +149,7 @@ graph LR
         LC[log-collector] -->|depends on| RD
         LC -->|writes| ES
         BL[browserless<br>port: 3080]
-        ORC -->|launches agent containers via| DSK[/var/run/docker.sock]
+        ORC -->|launches agent containers via| DSK[Docker Socket]
     end
     ORC -.->|read events| RD
     OBS -.->|query history| ES

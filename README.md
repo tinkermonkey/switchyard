@@ -45,6 +45,23 @@ This project was not architected so much as it evolved organically from a simple
 
 The obvious limitaions are that it's hard-wired into github and claude code. The "fix" for that I've been working on is to use this foothold and fold the learnings from this into a more modular and extensible framework: [codetoreum](https://github.com/tinkermonkey/codetoreum/). Because this system is inherently complicated, I'm focussing that project on a simulation-first hexagonal architecture approach, which will allow for much more rigorous testing and iteration on the core abstractions without needing to run the full stack, while also making it easier to swap out components (e.g., add support for other LLM providers, or other VCS / project management platforms).
 
+## Key capabilities
+
+- **Claude Code agent orchestration** with a registry of specialized agents for different SDLC stages and tasks
+- **GitHub Projects v2 integration** for workflow management and issue tracking
+- **Docker-in-Docker containerization** for isolated agent execution with project-specific environments
+- **Configurable pipelines and workflows** defined in YAML for flexible process automation
+- **Task queue with Redis** for reliable asynchronous processing and retry logic
+- **Observability stack** with Elasticsearch for logs and metrics, and a REST API for monitoring and control
+- **Web UI dashboard** for real-time visibility into pipeline runs, agent activity, and project status
+- **Automated code review and PR management** through agent-driven interactions with GitHub
+- **Automated dev environment setup** with dynamic Docker image building based on project tech stack
+- **Self-reflection for each pipeline run** claude code generates a report at the end of each run analyzing what went well, what went poorly, and how to improve in the future, broken down for the project being worked on and the orchestrator itself
+
+## Roadmap and future enhancements
+
+Well, the roadmap is really to fold the learnings from this project into the more modular and extensible framework in [codetoreum](https://github.com/tinkermonkey/codetoreum/). It's a balance of continuing to iterate and improve this codebase vs. building the next one, but the changes going into this codebase are very tactical to make it good enough for the moment.
+
 ### Key components
 
 | Component | Location | Responsibility |
@@ -81,7 +98,7 @@ The obvious limitaions are that it's hard-wired into github and claude code. The
 - The orchestrator expects to run from a directory whose parent contains both `switchyard/` and the managed project checkouts. The parent directory is mounted as `/workspace` in the container.
 
 ```
-~/workspace/orchestrator/      # Parent directory (mounted as /workspace)
+~/workspace/orchestrator/      # Parent directory
 ├── switchyard/                # This repository
 └── <your-project>/            # Managed project checkouts (cloned automatically)
 ```

@@ -35,7 +35,7 @@ gh auth refresh -s project
 
 ### What I do
 
-I ask claude (running in this codebase):
+I ask claude (launched in my local clone of codebase):
 
 ```
 Add a new project to switchyard for this repo using the default workflow config: git@github.com:tinkermonkey/documentation_robotics.git
