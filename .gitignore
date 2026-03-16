@@ -2,6 +2,8 @@
 medic/*
 .claude/settings.local.json
 
+web_ui/example_graph_data
+
 # Environment variables
 .env
 .env.local
