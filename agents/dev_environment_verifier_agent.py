@@ -43,6 +43,14 @@ class DevEnvironmentVerifierAgent(PipelineStage):
             is_rereviewing = review_cycle.get('is_rereviewing', False)
 
             if is_rereviewing:
+                previous_review_feedback = review_cycle.get('previous_review_feedback') or ''
+                prior_feedback_section = f"""
+**Your Previous Review Feedback**:
+<previous_feedback>
+{previous_review_feedback}
+</previous_feedback>
+
+""" if previous_review_feedback else ""
                 iteration_context = f"""
 
 ## Review Cycle Context - Re-Verification Mode
@@ -51,10 +59,10 @@ This is **Re-Verification Iteration {iteration} of {max_iterations}**.
 
 **Setup Agent** has revised their work based on your previous feedback.
 
-**Your Task**: Verify previous issues are resolved. Be concise.
+{prior_feedback_section}**Your Task**: Verify previous issues are resolved. Be concise.
 
 **Verification Approach**:
-1. Check if your PREVIOUS feedback items were addressed
+1. Check if your PREVIOUS feedback items (listed above) were addressed
 2. Re-run Docker build and tests to verify fixes
 3. Note any NEW issues discovered
 4. Make your decision

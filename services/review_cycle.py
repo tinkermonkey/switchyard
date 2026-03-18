@@ -2324,7 +2324,11 @@ class ReviewCycleExecutor:
                 'max_iterations': cycle_state.max_iterations,
                 'maker_agent': cycle_state.maker_agent,
                 'previous_maker_output': latest_maker_output,
-                'is_rereviewing': iteration > 1
+                'is_rereviewing': iteration > 1,
+                'previous_review_feedback': (
+                    cycle_state.review_outputs[-1]['output']
+                    if cycle_state.review_outputs else None
+                ),
             },
             'previous_stage_output': context_for_review,  # Discussions context only; empty for issues
             'change_manifest': change_manifest,  # Compact manifest; reviewer fetches diffs via bash

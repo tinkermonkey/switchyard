@@ -161,6 +161,14 @@ You previously escalated this review due to **blocking issues** that required hu
 
 """
             elif is_rereviewing:
+                previous_review_feedback = review_cycle.get('previous_review_feedback') or ''
+                prior_feedback_section = f"""
+**Your Previous Review Feedback**:
+<previous_feedback>
+{previous_review_feedback}
+</previous_feedback>
+
+""" if previous_review_feedback else ""
                 iteration_context = f"""
 
 ## Review Cycle Context - Re-Review Mode
@@ -169,7 +177,7 @@ This is **Re-Review Iteration {iteration} of {max_iterations}**.
 
 **Maker Agent**: {maker_agent.replace('_', ' ').title()} has revised their documentation based on your previous feedback.
 
-**IMPORTANT - Review Scope**:
+{prior_feedback_section}**IMPORTANT - Review Scope**:
 - You are reviewing ONLY the changes made by {maker_agent.replace('_', ' ').title()} in response to feedback
 - DO NOT re-review documentation that was previously approved by other review cycles
 - Focus on the sections revised by {maker_agent.replace('_', ' ').title()} since the last review
@@ -177,7 +185,7 @@ This is **Re-Review Iteration {iteration} of {max_iterations}**.
 **Your Task**: Verify previous issues are resolved. Be concise.
 
 **Review Approach**:
-1. Check if your PREVIOUS feedback items were addressed (don't re-raise if fixed)
+1. Check if your PREVIOUS feedback items (listed above) were addressed (don't re-raise if fixed)
 2. Note any NEW issues discovered in the maker's changes
 3. Make your decision
 
