@@ -739,74 +739,87 @@ class GitWorkflowManager:
 
     async def pull_rebase(self, project_dir: str):
         """
-        Pull latest changes with rebase
+        Sync the workspace to the remote branch state via fetch + hard reset.
 
-        Raises exception if conflicts detected
+        Replaces the previous `git pull --rebase` approach, which could produce
+        "both added" merge conflicts when the shared workspace held local commits
+        that diverged from remote (e.g. a previous agent committed but did not
+        push before the next agent's workspace was prepared).
+
+        `git reset --hard origin/<branch>` is conflict-free and idempotent: it
+        always leaves the workspace at exactly the pushed remote state. Any
+        local-only commits are discarded with a warning — in the normal pipeline
+        flow agents always push before completing, so local-only commits indicate
+        stale state from a failed or incomplete run.
+
+        Raises exception if fetch or reset fails.
         """
         try:
-            # Guard: ensure workspace is clean before attempting rebase.
-            # Previous agent runs may have left staged/unstaged/untracked files
-            # that would cause "cannot pull with rebase: uncommitted changes".
-            status_result = subprocess.run(
-                ['git', 'status', '--porcelain'],
+            # Determine current branch to build the remote ref
+            branch_result = subprocess.run(
+                ['git', 'rev-parse', '--abbrev-ref', 'HEAD'],
                 cwd=project_dir, capture_output=True, text=True, timeout=10
             )
-            if status_result.returncode == 0 and status_result.stdout.strip():
-                dirty_files = status_result.stdout.strip().split('\n')
-                logger.warning(
-                    f"Dirty workspace detected before pull rebase ({len(dirty_files)} files). "
-                    f"Cleaning up to allow rebase."
-                )
-                for df in dirty_files:
-                    logger.warning(f"  dirty: {df.strip()}")
-                # Reset staged changes, restore modified files, remove untracked files
-                for cmd, desc in [
-                    (['git', 'reset', 'HEAD', '.'], 'git reset HEAD'),
-                    (['git', 'checkout', '--', '.'], 'git checkout'),
-                    (['git', 'clean', '-fd'], 'git clean'),
-                ]:
-                    r = subprocess.run(
-                        cmd, cwd=project_dir, capture_output=True, text=True, timeout=10
-                    )
-                    if r.returncode != 0:
-                        logger.error(
-                            f"{desc} failed during pre-rebase cleanup (rc={r.returncode}): "
-                            f"{r.stderr.strip()}"
-                        )
+            if branch_result.returncode != 0:
+                raise Exception(f"Failed to determine current branch: {branch_result.stderr.strip()}")
+            branch_name = branch_result.stdout.strip()
 
-                # Verify cleanup succeeded
-                recheck = subprocess.run(
-                    ['git', 'status', '--porcelain'],
-                    cwd=project_dir, capture_output=True, text=True, timeout=10
-                )
-                if recheck.returncode == 0 and recheck.stdout.strip():
-                    remaining = recheck.stdout.strip().split('\n')
-                    logger.error(
-                        f"Workspace still dirty after cleanup ({len(remaining)} files remain). "
-                        f"Rebase will likely fail."
-                    )
-                    for r in remaining:
-                        logger.error(f"  still dirty: {r.strip()}")
-
-            result = subprocess.run(
-                ['git', 'pull', '--rebase'],
-                cwd=project_dir,
-                capture_output=True,
-                text=True,
-                timeout=60
+            # Fetch to ensure local origin refs are up to date
+            fetch_result = subprocess.run(
+                ['git', 'fetch', 'origin'],
+                cwd=project_dir, capture_output=True, text=True, timeout=60
             )
+            if fetch_result.returncode != 0:
+                raise Exception(f"git fetch origin failed: {fetch_result.stderr.strip()}")
 
-            if result.returncode == 0:
-                logger.info(f"Pulled with rebase successfully")
-            else:
-                error_msg = result.stderr
-                if 'conflict' in error_msg.lower() or 'rebase' in error_msg.lower():
-                    raise Exception(f"Merge conflict detected: {error_msg}")
-                else:
-                    raise Exception(f"Pull rebase failed: {error_msg}")
+            # If the remote branch doesn't exist yet (new branch before first push),
+            # there is nothing to sync against — workspace is already at the right state.
+            remote_ref = f'origin/{branch_name}'
+            check_remote = subprocess.run(
+                ['git', 'rev-parse', '--verify', remote_ref],
+                cwd=project_dir, capture_output=True, timeout=10
+            )
+            if check_remote.returncode != 0:
+                logger.info(f"Remote branch {remote_ref} does not exist yet; skipping reset")
+                return
+
+            # Warn if there are local commits that will be discarded
+            ahead_result = subprocess.run(
+                ['git', 'rev-list', '--count', f'{remote_ref}..HEAD'],
+                cwd=project_dir, capture_output=True, text=True, timeout=10
+            )
+            if ahead_result.returncode == 0:
+                ahead_count = int(ahead_result.stdout.strip() or '0')
+                if ahead_count > 0:
+                    logger.error(
+                        f"Discarding {ahead_count} local commit(s) not on {remote_ref} — "
+                        f"previous agent should have pushed before completing. "
+                        f"Work in these commits is lost."
+                    )
+
+            # Hard reset to remote state — cannot produce merge conflicts
+            reset_result = subprocess.run(
+                ['git', 'reset', '--hard', remote_ref],
+                cwd=project_dir, capture_output=True, text=True, timeout=30
+            )
+            if reset_result.returncode != 0:
+                raise Exception(f"git reset --hard {remote_ref} failed: {reset_result.stderr.strip()}")
+
+            # Remove untracked files left by previous agent runs (prompt artifacts, temp files)
+            clean_result = subprocess.run(
+                ['git', 'clean', '-fd'],
+                cwd=project_dir, capture_output=True, text=True, timeout=30
+            )
+            if clean_result.returncode != 0:
+                logger.error(
+                    f"git clean -fd failed (rc={clean_result.returncode}): {clean_result.stderr.strip()}. "
+                    f"Workspace may retain untracked artifacts."
+                )
+
+            logger.info(f"Workspace synced to {remote_ref}")
 
         except subprocess.TimeoutExpired:
-            raise Exception("Pull rebase timed out")
+            raise Exception("Workspace sync timed out")
 
     async def get_current_branch(self, project_dir: str) -> str:
         """Get the current branch name"""

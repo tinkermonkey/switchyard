@@ -1178,8 +1178,10 @@ git push --force-with-lease
                 # Checkout and continue with existing flow
                 await self.git_checkout(project_dir, branch_name)
 
-                # Clean up any prompt file artifacts before pull rebase
-                # These files can cause "uncommitted changes" errors during git pull --rebase
+                # Clean up any prompt file artifacts before workspace sync.
+                # git reset --hard only restores tracked files; untracked prompt artifacts
+                # (.claude_prompt_*.txt) are removed here so git clean -fd inside
+                # pull_rebase doesn't have to rely on them being absent.
                 try:
                     import glob
                     prompt_files = glob.glob(os.path.join(project_dir, '.claude_prompt_*.txt'))
@@ -1465,8 +1467,10 @@ Waiting for human decision...
         # Step 3: Checkout branch
         await self.git_checkout(project_dir, feature_branch.branch_name)
 
-        # Clean up any prompt file artifacts before pull rebase
-        # These files can cause "uncommitted changes" errors during git pull --rebase
+        # Clean up any prompt file artifacts before workspace sync.
+        # git reset --hard only restores tracked files; untracked prompt artifacts
+        # (.claude_prompt_*.txt) are removed here so git clean -fd inside
+        # pull_rebase doesn't have to rely on them being absent.
         try:
             import glob
             prompt_files = glob.glob(os.path.join(project_dir, '.claude_prompt_*.txt'))
