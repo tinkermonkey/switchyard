@@ -15,6 +15,7 @@ from services.github_integration import GitHubIntegration
 from services.review_outcome_correlator import get_review_outcome_correlator
 from monitoring.cycle_stack import push_frame, CycleFrame
 from services.cancellation import CancellationError
+from services.review_cycle_context import ReviewCycleContextWriter
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +61,8 @@ class ReviewCycleState:
         self.last_escalation_comment_id = None  # Escalation comment ID for feedback tracking
         self.last_approved_commit = None  # Git commit hash of last approved review (for scoped diffs)
         self.pre_maker_commit = None  # HEAD snapshot taken just before the maker agent runs each iteration
+        self.context_dir: Optional[str] = None  # Container path to review cycle context directory
+        self.context_writer: Optional[ReviewCycleContextWriter] = None  # In-memory handle (not persisted)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -86,6 +89,7 @@ class ReviewCycleState:
             'last_escalation_comment_id': self.last_escalation_comment_id,
             'last_approved_commit': self.last_approved_commit,
             'pre_maker_commit': self.pre_maker_commit,
+            'context_dir': self.context_dir,
         }
 
     @classmethod
@@ -116,6 +120,7 @@ class ReviewCycleState:
         state.last_escalation_comment_id = data.get('last_escalation_comment_id')
         state.last_approved_commit = data.get('last_approved_commit')
         state.pre_maker_commit = data.get('pre_maker_commit')
+        state.context_dir = data.get('context_dir')
         return state
 
 
@@ -161,14 +166,57 @@ class ReviewCycleExecutor:
     def _get_github_for_project(self, project_name: str, repository: str) -> GitHubIntegration:
         """Get properly initialized GitHubIntegration for a project/repository"""
         from config.manager import config_manager
-        
+
         project_config = config_manager.get_project_config(project_name)
         repo_owner = project_config.github.get('org') if project_config and hasattr(project_config, 'github') else None
-        
+
         if not repo_owner:
             raise ValueError(f"Cannot determine repo owner for project {project_name}")
-            
+
         return GitHubIntegration(repo_owner=repo_owner, repo_name=repository)
+
+    def _ensure_context_writer(
+        self,
+        cycle_state: ReviewCycleState,
+        issue_data: Optional[Dict[str, Any]] = None,
+    ) -> Optional[ReviewCycleContextWriter]:
+        """
+        Return the context writer for this cycle, restoring it after a restart if needed.
+
+        Recovery cases (in order of likelihood):
+          1. writer already in memory          → return as-is
+          2. context_dir persisted + dir exists → re-attach with from_existing()
+          3. context_dir persisted + dir missing → re-create and repopulate from state
+          4. context_dir absent (legacy state)  → return None (fall back to embedded prompts)
+        """
+        if cycle_state.context_writer is not None:
+            return cycle_state.context_writer
+
+        if not cycle_state.context_dir:
+            # Legacy state predating this feature — embedded-prompt fallback
+            return None
+
+        writer = ReviewCycleContextWriter.from_existing(cycle_state.context_dir)
+        if not writer.exists():
+            logger.warning(
+                f"Review cycle context dir missing for issue #{cycle_state.issue_number} "
+                f"({cycle_state.context_dir}) — repopulating from state"
+            )
+            if issue_data:
+                writer.repopulate_from_state(
+                    issue=issue_data,
+                    maker_outputs=cycle_state.maker_outputs,
+                    review_outputs=cycle_state.review_outputs,
+                )
+            else:
+                logger.warning(
+                    f"Cannot repopulate context dir without issue_data for "
+                    f"issue #{cycle_state.issue_number}; falling back to embedded prompts"
+                )
+                return None
+
+        cycle_state.context_writer = writer
+        return writer
 
     async def _analyze_review_cycle_outcomes(self, cycle_state: ReviewCycleState):
         """
@@ -255,7 +303,7 @@ class ReviewCycleExecutor:
         return cycles
 
     def _remove_cycle_state(self, cycle_state: ReviewCycleState):
-        """Remove a completed cycle from active state"""
+        """Remove a completed cycle from active state and clean up its context directory."""
         import yaml
         import os
 
@@ -276,6 +324,14 @@ class ReviewCycleExecutor:
         # Write back
         with open(state_file, 'w') as f:
             yaml.dump(data, f, default_flow_style=False)
+
+        # Clean up the file-based context directory (best-effort).
+        # issue_data is not available here; if the dir was already lost (volume remount),
+        # _ensure_context_writer returns None and cleanup is a silent no-op — which is fine,
+        # since there is nothing to clean up in that case.
+        writer = self._ensure_context_writer(cycle_state)
+        if writer:
+            writer.cleanup()
 
         logger.info(f"Removed completed cycle state for issue {cycle_state.issue_number}")
 
@@ -830,12 +886,32 @@ class ReviewCycleExecutor:
                 pipeline_run_id=pipeline_run_id
             )
 
+        # Set up file-based context directory for this new cycle
+        try:
+            writer = ReviewCycleContextWriter.setup(issue_number, pipeline_run_id or '')
+            cycle_state.context_writer = writer
+            cycle_state.context_dir = writer.context_dir
+            writer.write_initial_request(
+                issue_data.get('title', ''),
+                issue_data.get('body', ''),
+            )
+        except Exception as ctx_err:
+            logger.warning(
+                f"Failed to set up review cycle context dir for issue #{issue_number}: {ctx_err}. "
+                f"Falling back to embedded-prompt context."
+            )
+
         # Store initial maker output (only for NEW cycles)
         cycle_state.maker_outputs.append({
             'iteration': 0,
             'output': previous_stage_output,
             'timestamp': datetime.now().isoformat()
         })
+        if cycle_state.context_writer:
+            try:
+                cycle_state.context_writer.write_maker_output(previous_stage_output, 1)
+            except Exception as e:
+                logger.warning(f"Failed to write initial maker output to context dir: {e}")
 
         # Track active cycle
         self.active_cycles[issue_number] = cycle_state
@@ -964,6 +1040,9 @@ class ReviewCycleExecutor:
 
             github = self._get_github_integration(cycle_state)
             issue_data = await github.get_issue_details(cycle_state.issue_number, cycle_state.repository)
+
+            # Restore context writer from persisted context_dir (handles restarts)
+            self._ensure_context_writer(cycle_state, issue_data)
 
             # Safety net: APPROVED with high-severity findings is a reviewer protocol violation.
             # The reviewer prompt explicitly forbids this combination; if it occurs anyway,
@@ -1103,6 +1182,12 @@ class ReviewCycleExecutor:
                     'output': maker_output,
                     'timestamp': datetime.now().isoformat()
                 })
+                _writer = self._ensure_context_writer(cycle_state, issue_data)
+                if _writer:
+                    try:
+                        _writer.write_maker_output(maker_output, cycle_state.current_iteration + 1)
+                    except Exception as e:
+                        logger.warning(f"Failed to write recovered maker output to context dir: {e}")
                 # Do not increment iteration here - _execute_review_loop increments at the top
                 # of each iteration, so current_iteration stays at N and the loop will run N+1.
                 cycle_state.status = 'initialized'
@@ -1798,6 +1883,8 @@ class ReviewCycleExecutor:
         Returns:
             Tuple of (final_status, next_column_name)
         """
+        # Ensure context writer is available (handles restart recovery automatically)
+        self._ensure_context_writer(cycle_state, issue_data)
 
         while cycle_state.current_iteration < cycle_state.max_iterations:
             # Check cancellation before each iteration
@@ -1852,7 +1939,16 @@ class ReviewCycleExecutor:
                 iteration,
                 full_discussion_context=fresh_context
             )
-            
+
+            # Update current_diff.md so the reviewer can read the latest changes
+            if cycle_state.context_writer:
+                try:
+                    cycle_state.context_writer.write_current_diff(
+                        review_task_context.get('change_manifest', '')
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to write current_diff to context dir: {e}")
+
             # EMIT DECISION EVENT: Reviewer selected
             self.decision_events.emit_review_cycle_decision(
                 issue_number=cycle_state.issue_number,
@@ -1897,6 +1993,11 @@ class ReviewCycleExecutor:
                 'output': review_comment,
                 'timestamp': datetime.now().isoformat()
             })
+            if cycle_state.context_writer:
+                try:
+                    cycle_state.context_writer.write_review_feedback(review_comment, iteration)
+                except Exception as e:
+                    logger.warning(f"Failed to write review_feedback_{iteration} to context dir: {e}")
             cycle_state.status = 'reviewer_working'
             cycle_state.last_review_comment_id = 'latest'  # TODO: capture actual comment ID
             self._save_cycle_state(cycle_state)
@@ -2191,6 +2292,12 @@ class ReviewCycleExecutor:
                 'output': maker_comment,
                 'timestamp': datetime.now().isoformat()
             })
+            if cycle_state.context_writer:
+                try:
+                    # maker_output index = iteration + 1 (iteration 1 review → maker_output_2, etc.)
+                    cycle_state.context_writer.write_maker_output(maker_comment, iteration + 1)
+                except Exception as e:
+                    logger.warning(f"Failed to write maker_output_{iteration + 1} to context dir: {e}")
             self._save_cycle_state(cycle_state)
 
             # Continue to next iteration - the loop will go back to the reviewer
@@ -2332,6 +2439,7 @@ class ReviewCycleExecutor:
             },
             'previous_stage_output': context_for_review,  # Discussions context only; empty for issues
             'change_manifest': change_manifest,  # Compact manifest; reviewer fetches diffs via bash
+            'review_cycle_context_dir': cycle_state.context_dir,  # File-based context (mounted in container)
             'timestamp': datetime.now().isoformat()
         }
         logger.info(f"[DIAGNOSTIC] Created review task_context with pipeline_run_id: {cycle_state.pipeline_run_id} for issue #{cycle_state.issue_number}")
@@ -2391,6 +2499,7 @@ class ReviewCycleExecutor:
                 'feedback': review_feedback,  # Concise feedback to address
                 'formatted_feedback': f"**Review Feedback (Iteration {iteration}):**\n\n{review_feedback}"
             },
+            'review_cycle_context_dir': cycle_state.context_dir,  # File-based context (mounted in container)
             'timestamp': datetime.now().isoformat()
         }
         logger.info(f"[DIAGNOSTIC] Created maker revision task_context with pipeline_run_id: {cycle_state.pipeline_run_id} for issue #{cycle_state.issue_number}")
@@ -3025,6 +3134,15 @@ _Escalated by Claude Code Orchestrator_
                 'output': reviewer_output,
                 'timestamp': datetime.now().isoformat(),
             })
+            # issue_data is not available here (fetched later in _continue_cycle_from_review).
+            # If the context dir was lost, _ensure_context_writer returns None and the
+            # feedback is not written to a file — the fallback to embedded prompts handles it.
+            _writer = self._ensure_context_writer(cycle_state)
+            if _writer:
+                try:
+                    _writer.write_review_feedback(reviewer_output, target_iteration)
+                except Exception as e:
+                    logger.warning(f"Failed to write recovered review_feedback_{target_iteration}: {e}")
             cycle_state.current_iteration = target_iteration
             cycle_state.status = 'reviewer_working'
             self._save_cycle_state(cycle_state)

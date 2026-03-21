@@ -339,6 +339,66 @@ After {max_iterations} iterations, unresolved work escalates for human review.
 User feedback has been provided on your previous work. Incorporate their suggestions.
 """
 
+        # Use file-based context when available (reduces prompt size, full history accessible)
+        context_dir = task_context.get('review_cycle_context_dir')
+        if context_dir and is_review_cycle:
+            feedback_file = f'review_feedback_{iteration}.md'
+            maker_file = f'maker_output_{iteration}.md'
+            prompt = f"""
+You are the {self.agent_display_name} revising your work based on feedback.
+
+{self.agent_role_description}
+{cycle_context}
+**Title**: {issue.get('title', 'No title')}
+
+## Review Cycle Context Files
+
+All context for this review cycle is at `/workspace/review_cycle_context/`:
+- **`{feedback_file}`** — the feedback you MUST address ← read this first
+- `{maker_file}` — the implementation that was reviewed (your previous version)
+- `initial_request.md` — original requirements
+- Earlier numbered files show the full iteration history if needed
+
+## Revision Guidelines
+
+**CRITICAL - How to Revise**:
+1. **Read `{feedback_file}` thoroughly** — list each distinct issue raised
+2. **Address EVERY feedback point** — don't leave any issues unresolved
+3. **Make TARGETED changes** — modify only what was criticized
+4. **Keep working content** — don't rewrite sections that weren't criticized
+5. **Stay focused** — don't add new content unless specifically requested
+
+**Required Output Structure**:
+
+**MUST START WITH**:
+```
+## Revision Notes
+- ✅ [Issue 1 Title]: [Brief description of what you changed]
+- ✅ [Issue 2 Title]: [Brief description of what you changed]
+- ✅ [Issue 3 Title]: [Brief description of what you changed]
+...
+```
+
+This checklist is **CRITICAL** - it helps the reviewer see you addressed each point.
+
+**Then provide your COMPLETE, REVISED document**:
+- All sections: {', '.join(self.output_sections)}
+- Full content (not just changes)
+- DO NOT include project name, feature name, or date headers (already in discussion)
+
+**Important Don'ts**:
+- ❌ Start from scratch (this is a REVISION, not complete rewrite)
+- ❌ Skip any feedback point without addressing it
+- ❌ Remove content that wasn't criticized
+- ❌ Add new sections unless specifically requested
+- ❌ Make changes to sections that weren't mentioned in feedback
+- ❌ Ignore subtle feedback ("clarify X" means "add more detail about X")
+
+**Format**: Markdown text for GitHub posting.
+"""
+            return prompt
+
+        # Fallback: embed context directly (legacy state or non-review-cycle revisions)
         prompt = f"""
 You are the {self.agent_display_name} revising your work based on feedback.
 

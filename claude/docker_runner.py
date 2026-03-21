@@ -649,6 +649,24 @@ class DockerAgentRunner:
             cmd.extend(['-v', f'{host_mcp_path}:/home/orchestrator/.mcp_config.json:ro'])
             logger.info(f"Mounting MCP config: {host_mcp_path} -> /home/orchestrator/.mcp_config.json")
 
+        # Mount review cycle context directory if provided (file-based context for review cycles)
+        review_cycle_context_dir = (
+            task_context.get('review_cycle_context_dir')
+            or context.get('review_cycle_context_dir')
+        )
+        if review_cycle_context_dir:
+            host_ctx_path = review_cycle_context_dir
+            if review_cycle_context_dir.startswith('/workspace/'):
+                relative = review_cycle_context_dir.replace('/workspace/', '')
+                host_ctx_path = f'{host_workspace}/{relative}'
+            elif review_cycle_context_dir.startswith('/app/'):
+                relative = review_cycle_context_dir.replace('/app/', '')
+                host_ctx_path = f'{host_workspace}/switchyard/{relative}'
+            cmd.extend(['-v', f'{host_ctx_path}:/workspace/review_cycle_context:ro'])
+            logger.info(
+                f"Mounting review cycle context: {host_ctx_path} -> /workspace/review_cycle_context"
+            )
+
         cmd.extend([
             # Working directory inside container
             '-w', '/workspace',

@@ -126,6 +126,9 @@ REQUIRED: Include "### Status" followed by the bold status on the next line for 
         # Get change manifest if available (for issues workspace)
         change_manifest = task_context.get('change_manifest', '')
 
+        # File-based context dir (mounted into container at /workspace/review_cycle_context)
+        context_dir = task_context.get('review_cycle_context_dir')
+
         # Build iteration context for re-reviews
         iteration_context = ""
         is_rereviewing = False
@@ -161,8 +164,17 @@ You previously escalated this review due to **blocking issues** that required hu
 
 """
             elif is_rereviewing:
-                previous_review_feedback = review_cycle.get('previous_review_feedback') or ''
-                prior_feedback_section = f"""
+                # When file-based context is available, point to the previous feedback file
+                # instead of embedding the full text in the prompt
+                if context_dir and iteration and iteration > 1:
+                    prev_feedback_file = f'review_feedback_{iteration - 1}.md'
+                    prior_feedback_section = f"""
+**Your Previous Review Feedback**: read `/workspace/review_cycle_context/{prev_feedback_file}`
+
+"""
+                else:
+                    previous_review_feedback = review_cycle.get('previous_review_feedback') or ''
+                    prior_feedback_section = f"""
 **Your Previous Review Feedback**:
 <previous_feedback>
 {previous_review_feedback}
@@ -224,10 +236,43 @@ This is **Review Iteration {iteration} of {max_iterations}**.
         # Inject learned review filters
         filter_instructions = await self._get_filter_instructions()
 
-        # Build change manifest section if available
-        git_diff_section = ""
-        if change_manifest:
-            git_diff_section = f"""
+        # Build change manifest / context section
+        if context_dir and review_cycle:
+            # File-based context: point reviewer to the mounted directory
+            maker_file = f'maker_output_{iteration}.md' if iteration else 'maker_output_1.md'
+            prev_feedback_note = ''
+            if is_rereviewing and iteration and iteration > 1:
+                prev_feedback_file = f'review_feedback_{iteration - 1}.md'
+                prev_feedback_note = (
+                    f'- **`{prev_feedback_file}`** — your previous feedback; '
+                    f'verify those issues are now resolved\n'
+                )
+            context_files_section = f"""
+
+## Review Cycle Context Files
+
+All context files are at `/workspace/review_cycle_context/`:
+- **`current_diff.md`** — git changes to review (stat + commits) ← run `git diff` from those commits
+- **`{maker_file}`** — current implementation to review
+- `initial_request.md` — original requirements to verify against
+{prev_feedback_note}- Earlier numbered files show the full iteration history
+
+**Review focus**: Read `current_diff.md` for the list of changed files, then use
+`git diff <base_commit> HEAD -- <file>` to examine the actual changes. Review ONLY
+additions (`+`) and deletions (`-`). Do not review unchanged code.
+"""
+            git_diff_section = context_files_section
+            requirements_section = f"""
+## Original Requirements
+
+**Title**: {issue.get('title', 'No title')}
+(Full requirements in `/workspace/review_cycle_context/initial_request.md`)
+"""
+        else:
+            # Legacy fallback: embed context directly in prompt
+            git_diff_section = ""
+            if change_manifest:
+                git_diff_section = f"""
 
 ## Code Changes
 
@@ -237,6 +282,12 @@ This is **Review Iteration {iteration} of {max_iterations}**.
 changes before reviewing. Review ONLY additions (`+`) and deletions (`-`) in the diff output.
 Do not review unchanged code.
 """
+            requirements_section = f"""
+## Original Requirements
+
+**Title**: {issue.get('title', 'No title')}
+**Description**: {issue.get('body', 'No description')}
+"""
 
         prompt = f"""
 You are a **Senior Software Engineer** conducting comprehensive code review.
@@ -244,11 +295,7 @@ You are a **Senior Software Engineer** conducting comprehensive code review.
 {iteration_context}
 
 {filter_instructions}
-
-## Original Requirements
-
-**Title**: {issue.get('title', 'No title')}
-**Description**: {issue.get('body', 'No description')}
+{requirements_section}
 {git_diff_section}
 ## Project-Specific Expert Agents
 
