@@ -662,10 +662,21 @@ class DockerAgentRunner:
             elif review_cycle_context_dir.startswith('/app/'):
                 relative = review_cycle_context_dir.replace('/app/', '')
                 host_ctx_path = f'{host_workspace}/switchyard/{relative}'
-            cmd.extend(['-v', f'{host_ctx_path}:/workspace/review_cycle_context:ro'])
-            logger.info(
-                f"Mounting review cycle context: {host_ctx_path} -> /workspace/review_cycle_context"
-            )
+            # Mount to /review_cycle_context (NOT inside /workspace) to avoid Docker
+            # overlay2 nested-mount failure: runc cannot mkdirat inside an
+            # already-mounted /workspace overlay merged layer.
+            # Verify existence using the container-side path (host_ctx_path is a host
+            # path and is not accessible from inside the orchestrator container).
+            if os.path.isdir(review_cycle_context_dir):
+                cmd.extend(['-v', f'{host_ctx_path}:/review_cycle_context:ro'])
+                logger.info(
+                    f"Mounting review cycle context: {host_ctx_path} -> /review_cycle_context"
+                )
+            else:
+                logger.warning(
+                    f"Review cycle context dir not found ({review_cycle_context_dir}); "
+                    f"skipping mount — agents will use embedded context fallback"
+                )
 
         cmd.extend([
             # Working directory inside container

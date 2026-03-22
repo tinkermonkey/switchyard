@@ -118,7 +118,7 @@ class TestReviewCycleContextWriter:
         w.write_review_feedback('feedback', 1)
         section = w.maker_prompt_section(1)
         assert 'review_feedback_1.md' in section
-        assert '/workspace/review_cycle_context/' in section
+        assert '/review_cycle_context/' in section
         assert 'initial_request.md' in section
 
     def test_reviewer_prompt_section_contains_file_refs(self, tmp_base):
@@ -129,7 +129,7 @@ class TestReviewCycleContextWriter:
         section = w.reviewer_prompt_section(1)
         assert 'current_diff.md' in section
         assert 'initial_request.md' in section
-        assert '/workspace/review_cycle_context/' in section
+        assert '/review_cycle_context/' in section
 
     def test_reviewer_prompt_section_rerereview_includes_prev_feedback(self, tmp_base):
         w = ReviewCycleContextWriter.setup(1, 'abc12345')

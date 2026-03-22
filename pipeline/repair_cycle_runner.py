@@ -220,6 +220,27 @@ class RepairCycleRunner:
                     )
                     self.checkpoint_manager.clear_checkpoint()
 
+            # Write startup checkpoint so recovery can confirm container is alive
+            # before the first test run completes (which can take several minutes).
+            self.checkpoint_manager.save_checkpoint({
+                'project': self.context.get('project'),
+                'issue_number': self.context.get('issue_number'),
+                'pipeline_run_id': self.context.get('pipeline_run_id'),
+                'stage_name': self.context.get('stage_name', 'Testing'),
+                'status': 'starting',
+                'test_type': (
+                    self.stage.test_configs[0].test_type
+                    if self.stage.test_configs else 'unknown'
+                ),
+                'test_type_index': 0,
+                'iteration': 0,
+                'agent_call_count': self.stage._agent_call_count,
+                'files_fixed': [],
+                'test_results': None,
+                'cycle_results': [],
+            })
+            logger.info("Startup checkpoint written")
+
             # Execute stage
             logger.info("Starting repair cycle execution...")
             result = await self.stage.execute(self.context)

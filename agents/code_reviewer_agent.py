@@ -126,7 +126,7 @@ REQUIRED: Include "### Status" followed by the bold status on the next line for 
         # Get change manifest if available (for issues workspace)
         change_manifest = task_context.get('change_manifest', '')
 
-        # File-based context dir (mounted into container at /workspace/review_cycle_context)
+        # File-based context dir (mounted into container at /review_cycle_context)
         context_dir = task_context.get('review_cycle_context_dir')
 
         # Build iteration context for re-reviews
@@ -169,7 +169,7 @@ You previously escalated this review due to **blocking issues** that required hu
                 if context_dir and iteration and iteration > 1:
                     prev_feedback_file = f'review_feedback_{iteration - 1}.md'
                     prior_feedback_section = f"""
-**Your Previous Review Feedback**: read `/workspace/review_cycle_context/{prev_feedback_file}`
+**Your Previous Review Feedback**: read `/review_cycle_context/{prev_feedback_file}`
 
 """
                 else:
@@ -251,7 +251,7 @@ This is **Review Iteration {iteration} of {max_iterations}**.
 
 ## Review Cycle Context Files
 
-All context files are at `/workspace/review_cycle_context/`:
+All context files are at `/review_cycle_context/`:
 - **`current_diff.md`** — git changes to review (stat + commits) ← run `git diff` from those commits
 - **`{maker_file}`** — current implementation to review
 - `initial_request.md` — original requirements to verify against
@@ -266,7 +266,7 @@ additions (`+`) and deletions (`-`). Do not review unchanged code.
 ## Original Requirements
 
 **Title**: {issue.get('title', 'No title')}
-(Full requirements in `/workspace/review_cycle_context/initial_request.md`)
+(Full requirements in `/review_cycle_context/initial_request.md`)
 """
         else:
             # Legacy fallback: embed context directly in prompt

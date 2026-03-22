@@ -353,7 +353,7 @@ You are the {self.agent_display_name} revising your work based on feedback.
 
 ## Review Cycle Context Files
 
-All context for this review cycle is at `/workspace/review_cycle_context/`:
+All context for this review cycle is at `/review_cycle_context/`:
 - **`{feedback_file}`** — the feedback you MUST address ← read this first
 - `{maker_file}` — the implementation that was reviewed (your previous version)
 - `initial_request.md` — original requirements

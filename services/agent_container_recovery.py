@@ -796,11 +796,11 @@ class AgentContainerRecovery:
             Checkpoint data if exists, None otherwise
         """
         try:
-            # Try new location first (in orchestrator_data)
+            # Try state directory (where RepairCycleCheckpoint actually writes checkpoints)
             if issue_number is not None:
-                orchestrator_data_dir = Path("/workspace/switchyard/orchestrator_data/repair_cycles")
-                checkpoint_file = orchestrator_data_dir / project / str(issue_number) / "checkpoint.json"
-                
+                state_dir = Path("/workspace/switchyard/state/projects")
+                checkpoint_file = state_dir / project / "repair_cycles" / str(issue_number) / "checkpoint.json"
+
                 if checkpoint_file.exists():
                     with open(checkpoint_file, 'r') as f:
                         checkpoint = json.load(f)

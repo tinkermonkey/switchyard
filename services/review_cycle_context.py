@@ -2,7 +2,7 @@
 Review Cycle Context Writer
 
 Writes review cycle context pieces as numbered files into a temp directory
-that gets mounted into agent containers at /workspace/review_cycle_context/.
+that gets mounted into agent containers at /review_cycle_context/.
 
 This replaces embedding large text blobs in agent prompts with file references,
 reducing maker agent context overload and giving the reviewer access to the
@@ -191,7 +191,7 @@ class ReviewCycleContextWriter:
         return f"""
 ## Review Cycle Context Files
 
-All context for this review cycle is available at `/workspace/review_cycle_context/`:
+All context for this review cycle is available at `/review_cycle_context/`:
 
 {file_lines}
 
@@ -224,7 +224,7 @@ All context for this review cycle is available at `/workspace/review_cycle_conte
         return f"""
 ## Review Cycle Context Files
 
-All context for this review cycle is available at `/workspace/review_cycle_context/`:
+All context for this review cycle is available at `/review_cycle_context/`:
 
 {file_lines}
 
