@@ -17,6 +17,13 @@ from dataclasses import dataclass, asdict
 
 logger = logging.getLogger(__name__)
 
+# pipeline_progression writes a pre-enqueue probe (in_progress, no task_id) before
+# enqueuing the task to Redis so project_monitor can't start a review cycle race.
+# In normal operation the task_manager stamps a task_id within seconds of pickup.
+# If this threshold elapses with no task_id stamp, the Redis task was swept or lost
+# before being consumed and the probe is now a permanent blocker — clear it.
+_STALE_ENQUEUE_PROBE_SECS = 300  # 5 minutes
+
 
 @dataclass
 class ExecutionRecord:
@@ -449,6 +456,54 @@ class WorkExecutionStateTracker:
         state = self.load_state(project_name, issue_number)
         for execution in state['execution_history']:
             if execution.get('outcome') == 'in_progress':
+                # Detect stale pre-enqueue probes written by pipeline_progression.
+                #
+                # pipeline_progression writes in_progress BEFORE enqueuing the Redis
+                # task so that concurrent project_monitor polls can't start a review
+                # cycle while the task is queued.  When the task_manager actually picks
+                # up the task, agent_executor calls stamp_execution_task_id(), which
+                # adds 'task_id' to this entry.  If the task was swept from Redis
+                # before pickup (e.g. by the 10-minute queue-sync during a restart),
+                # no task_id is ever stamped and the probe becomes a permanent blocker.
+                #
+                # Guard: only applies to pipeline_progression probes with no task_id.
+                # Entries written by other sources, or probes that were stamped, are
+                # left alone — they represent legitimately running containers.
+                if (execution.get('trigger_source') == 'pipeline_progression'
+                        and 'task_id' not in execution):
+                    try:
+                        probe_time = datetime.fromisoformat(execution['timestamp'])
+                        if probe_time.tzinfo is None:
+                            probe_time = probe_time.replace(tzinfo=timezone.utc)
+                        age_secs = (datetime.now(timezone.utc) - probe_time).total_seconds()
+                        if age_secs > _STALE_ENQUEUE_PROBE_SECS:
+                            logger.warning(
+                                f"Clearing stale pipeline_progression probe for "
+                                f"{project_name}/#{issue_number}: "
+                                f"{execution.get('agent')} in {execution.get('column')} "
+                                f"(age={age_secs:.0f}s, no task_id stamp — "
+                                f"Redis task was swept before consumption)"
+                            )
+                            self.record_execution_outcome(
+                                issue_number=issue_number,
+                                column=execution['column'],
+                                agent=execution['agent'],
+                                outcome='abandoned',
+                                project_name=project_name,
+                                error=(
+                                    f'Pre-enqueue probe stale after {age_secs:.0f}s '
+                                    f'with no task_id stamp; Redis task was swept '
+                                    f'from queue before being consumed'
+                                )
+                            )
+                            continue  # not blocking
+                    except Exception as e:
+                        logger.warning(
+                            f"Failed to check probe staleness for "
+                            f"{project_name}/#{issue_number}: {e}"
+                        )
+                        # Fall through: treat as active (safe default)
+
                 logger.debug(
                     f"Active execution found in history for {project_name}/#{issue_number}: "
                     f"{execution.get('agent')} in {execution.get('column')}"
