@@ -772,6 +772,7 @@ Do not add any other text before or after the JSON.
         """
         import subprocess
         import json as json_lib
+        import time
 
         pipeline_run_id = task_context.get('pipeline_run_id')
 
@@ -894,16 +895,32 @@ Do not add any other text before or after the JSON.
                     issue_number = url_match.group(1)
                     
                     # Get full issue details including node ID using gh issue view
-                    view_result = subprocess.run(
-                        ['gh', 'issue', 'view', issue_number,
-                         '-R', repo,
-                         '--json', 'id,number,url'],
-                        capture_output=True,
-                        text=True,
-                        check=True
-                    )
-                    
-                    issue_data = json_lib.loads(view_result.stdout)
+                    # Retry with backoff since GitHub's API can lag immediately after
+                    # a rapid series of issue creations.
+                    issue_data = None
+                    for _attempt in range(3):
+                        view_result = subprocess.run(
+                            ['gh', 'issue', 'view', issue_number,
+                             '-R', repo,
+                             '--json', 'id,number,url'],
+                            capture_output=True,
+                            text=True
+                        )
+                        if view_result.returncode == 0:
+                            issue_data = json_lib.loads(view_result.stdout)
+                            break
+                        delay = 2 ** _attempt
+                        if _attempt < 2:
+                            logger.warning(
+                                f"gh issue view {issue_number} failed (attempt {_attempt + 1}/3, "
+                                f"retrying in {delay}s): {view_result.stderr.strip()}"
+                            )
+                            time.sleep(delay)
+                    if issue_data is None:
+                        raise RuntimeError(
+                            f"gh issue view {issue_number} failed after 3 attempts: "
+                            f"{view_result.stderr.strip()}"
+                        )
                     issue_id = issue_data['id']
                     issue_number = str(issue_data['number'])
 
@@ -1059,27 +1076,26 @@ Do not add any other text before or after the JSON.
                     )
                     logger.info(f"Linked issue #{issue_number} as sub-issue of #{parent_issue_number}")
 
-                    # Emit SUCCESS event (only for newly created issues, not existing)
-                    if not existing_issue:
-                        obs = task_context.get('observability')
-                        if obs:
-                            decision_emitter = DecisionEventEmitter(obs)
-                            decision_emitter.emit_sub_issue_created(
-                                project=project_name,
-                                parent_issue=int(parent_issue_number),
-                                issue_number=int(issue_number),
-                                title=sub_issue['title'],
-                                board="SDLC Execution",
-                                reason=f"Work breakdown phase: {sub_issue['phase']}",
-                                source="work_breakdown",
-                                issue_url=issue_url,
-                                body=sub_issue.get('body', ''),
-                                context_data={
-                                    'phase': sub_issue['phase'],
-                                    'order_in_phase': idx,
-                                },
-                                pipeline_run_id=pipeline_run_id
-                            )
+                    # Emit SUCCESS event
+                    obs = task_context.get('observability')
+                    if obs:
+                        decision_emitter = DecisionEventEmitter(obs)
+                        decision_emitter.emit_sub_issue_created(
+                            project=project_name,
+                            parent_issue=int(parent_issue_number),
+                            issue_number=int(issue_number),
+                            title=sub_issue['title'],
+                            board="SDLC Execution",
+                            reason=f"Work breakdown phase: {sub_issue['phase']}",
+                            source="work_breakdown",
+                            issue_url=issue_url,
+                            body=sub_issue.get('body', ''),
+                            context_data={
+                                'phase': sub_issue['phase'],
+                                'order_in_phase': idx,
+                            },
+                            pipeline_run_id=pipeline_run_id
+                        )
 
                 created_issues.append({
                     'number': issue_number,
