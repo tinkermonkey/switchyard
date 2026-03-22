@@ -829,7 +829,8 @@ Do not add any other text before or after the JSON.
                     ['gh', 'issue', 'view', parent_issue_number, '-R', repo, '--json', 'id'],
                     capture_output=True,
                     text=True,
-                    check=True
+                    check=True,
+                    timeout=30
                 )
                 parent_data = json_lib.loads(result.stdout)
                 parent_issue_id = parent_data['id']
@@ -852,7 +853,8 @@ Do not add any other text before or after the JSON.
                         search_cmd,
                         capture_output=True,
                         text=True,
-                        check=True
+                        check=True,
+                        timeout=30
                     )
                     search_data = json_lib.loads(search_result.stdout)
                     
@@ -880,7 +882,8 @@ Do not add any other text before or after the JSON.
                          '--body', sub_issue['body']],
                         capture_output=True,
                         text=True,
-                        check=True
+                        check=True,
+                        timeout=30
                     )
 
                     # gh issue create returns the issue URL
@@ -932,7 +935,8 @@ Do not add any other text before or after the JSON.
                      '--url', issue_url],
                     capture_output=True,
                     text=True,
-                    check=True
+                    check=True,
+                    timeout=30
                 )
 
                 # Get the project item ID and set status to "Backlog"
@@ -959,7 +963,8 @@ Do not add any other text before or after the JSON.
                         ['gh', 'api', 'graphql', '-f', f'query={query}'],
                         capture_output=True,
                         text=True,
-                        check=True
+                        check=True,
+                        timeout=30
                     )
 
                     query_data = json_lib.loads(result.stdout)
@@ -999,7 +1004,8 @@ Do not add any other text before or after the JSON.
                                     ['gh', 'api', 'graphql', '-f', f'query={delete_mutation}'],
                                     capture_output=True,
                                     text=True,
-                                    check=True
+                                    check=True,
+                                    timeout=30
                                 )
                                 logger.info(f"✓ Removed issue #{issue_number} from project '{item['project']['title']}' (#{item['project']['number']})")
                             except Exception as e:
@@ -1039,7 +1045,8 @@ Do not add any other text before or after the JSON.
                                 ['gh', 'api', 'graphql', '-f', f'query={status_mutation}'],
                                 capture_output=True,
                                 text=True,
-                                check=True
+                                check=True,
+                                timeout=30
                             )
                             logger.info(f"Set issue #{issue_number} status to Backlog in SDLC board")
                     else:
@@ -1073,7 +1080,8 @@ Do not add any other text before or after the JSON.
                          '-f', f'query={graphql_query}'],
                         capture_output=True,
                         text=True,
-                        check=True
+                        check=True,
+                        timeout=30
                     )
                     logger.info(f"Linked issue #{issue_number} as sub-issue of #{parent_issue_number}")
 

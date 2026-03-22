@@ -484,18 +484,18 @@ class WorkExecutionStateTracker:
                                 f"(age={age_secs:.0f}s, no task_id stamp — "
                                 f"Redis task was swept before consumption)"
                             )
-                            self.record_execution_outcome(
-                                issue_number=issue_number,
-                                column=execution['column'],
-                                agent=execution['agent'],
-                                outcome='abandoned',
-                                project_name=project_name,
-                                error=(
-                                    f'Pre-enqueue probe stale after {age_secs:.0f}s '
-                                    f'with no task_id stamp; Redis task was swept '
-                                    f'from queue before being consumed'
-                                )
+                            # Mutate this specific entry directly in the already-loaded
+                            # state dict, then persist once.  Using record_execution_outcome()
+                            # here would be unsafe: that method matches by agent+column and
+                            # would also mark any legitimately-running entry for the same
+                            # agent/column as abandoned.
+                            execution['outcome'] = 'abandoned'
+                            execution['error'] = (
+                                f'Pre-enqueue probe stale after {age_secs:.0f}s '
+                                f'with no task_id stamp; Redis task was swept '
+                                f'from queue before being consumed'
                             )
+                            self.save_state(project_name, issue_number, state)
                             continue  # not blocking
                     except Exception as e:
                         logger.warning(
