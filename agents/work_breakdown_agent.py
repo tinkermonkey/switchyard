@@ -772,7 +772,7 @@ Do not add any other text before or after the JSON.
         """
         import subprocess
         import json as json_lib
-        import time
+        import asyncio
 
         pipeline_run_id = task_context.get('pipeline_run_id')
 
@@ -904,7 +904,8 @@ Do not add any other text before or after the JSON.
                              '-R', repo,
                              '--json', 'id,number,url'],
                             capture_output=True,
-                            text=True
+                            text=True,
+                            timeout=30
                         )
                         if view_result.returncode == 0:
                             issue_data = json_lib.loads(view_result.stdout)
@@ -915,7 +916,7 @@ Do not add any other text before or after the JSON.
                                 f"gh issue view {issue_number} failed (attempt {_attempt + 1}/3, "
                                 f"retrying in {delay}s): {view_result.stderr.strip()}"
                             )
-                            time.sleep(delay)
+                            await asyncio.sleep(delay)
                     if issue_data is None:
                         raise RuntimeError(
                             f"gh issue view {issue_number} failed after 3 attempts: "
