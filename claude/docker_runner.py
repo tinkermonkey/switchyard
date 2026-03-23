@@ -678,6 +678,32 @@ class DockerAgentRunner:
                     f"skipping mount — agents will use embedded context fallback"
                 )
 
+        # Mount pipeline context directory if provided (file-based context for planning agents)
+        pipeline_context_dir = (
+            task_context.get('pipeline_context_dir')
+            or context.get('pipeline_context_dir')
+        )
+        if pipeline_context_dir:
+            host_ctx_path = pipeline_context_dir
+            if pipeline_context_dir.startswith('/workspace/'):
+                relative = pipeline_context_dir.replace('/workspace/', '')
+                host_ctx_path = f'{host_workspace}/{relative}'
+            elif pipeline_context_dir.startswith('/app/'):
+                relative = pipeline_context_dir.replace('/app/', '')
+                host_ctx_path = f'{host_workspace}/switchyard/{relative}'
+            # Mount to /pipeline_context (NOT inside /workspace) to avoid Docker
+            # overlay2 nested-mount failure (same reason as review_cycle_context).
+            if os.path.isdir(pipeline_context_dir):
+                cmd.extend(['-v', f'{host_ctx_path}:/pipeline_context:ro'])
+                logger.info(
+                    f"Mounting pipeline context: {host_ctx_path} -> /pipeline_context"
+                )
+            else:
+                logger.warning(
+                    f"Pipeline context dir not found ({pipeline_context_dir}); "
+                    f"skipping mount — agents will use embedded context fallback"
+                )
+
         cmd.extend([
             # Working directory inside container
             '-w', '/workspace',

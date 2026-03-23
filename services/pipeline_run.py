@@ -100,6 +100,7 @@ class PipelineRun:
     status: str = "active"  # active, completed
     discussion_id: Optional[str] = None  # GitHub discussion node ID for context continuity
     outcome: Optional[str] = None  # success, failed, or None for unknown
+    context_dir: Optional[str] = None  # Path to pipeline context directory on host volume
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for storage"""
@@ -272,9 +273,27 @@ class PipelineRunManager:
             f"Created pipeline run {pipeline_run_id} for "
             f"{project} issue #{issue_number}"
         )
-        
+
         return pipeline_run
-    
+
+    def update_context_dir(self, pipeline_run: 'PipelineRun') -> None:
+        """
+        Persist an updated context_dir field back to Redis and Elasticsearch.
+
+        Called after the pipeline context directory is created so that subsequent
+        task lookups (including feedback tasks) can find the directory path.
+        """
+        redis_key = self._get_redis_key(pipeline_run.id)
+        self.redis.setex(
+            redis_key,
+            7200,  # 2 hour TTL
+            json.dumps(pipeline_run.to_dict())
+        )
+        self._persist_to_elasticsearch(pipeline_run)
+        logger.debug(
+            f"Updated context_dir for pipeline run {pipeline_run.id}: {pipeline_run.context_dir}"
+        )
+
     def get_active_pipeline_run(
         self,
         project: str,

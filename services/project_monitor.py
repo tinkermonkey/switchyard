@@ -894,7 +894,8 @@ class ProjectMonitor:
                                    discussion_id: Optional[str] = None,
                                    pipeline_config=None,
                                    current_stage_config=None,
-                                   project_name: Optional[str] = None) -> str:
+                                   project_name: Optional[str] = None,
+                                   pipeline_run_id: Optional[str] = None) -> str:
         """
         Fetch comments from the previous workflow stage agent and user comments since then.
         Works with both issues and discussions workspaces.
@@ -904,6 +905,18 @@ class ProjectMonitor:
 
         Returns formatted context string.
         """
+        # Build a pipeline context writer if we have a run id with a context_dir —
+        # used to persist stage outputs as files for downstream agents to read from disk
+        _context_writer = None
+        if pipeline_run_id:
+            try:
+                run = self.pipeline_run_manager.get_pipeline_run(pipeline_run_id)
+                if run and run.context_dir:
+                    from services.pipeline_context_writer import PipelineContextWriter
+                    _context_writer = PipelineContextWriter.from_existing(run.context_dir)
+            except Exception:
+                pass
+
         # Check if this stage has specific input requirements
         if current_stage_config and hasattr(current_stage_config, 'inputs_from') and current_stage_config.inputs_from:
             # Determine expected workspace for the current pipeline
@@ -988,17 +1001,23 @@ class ProjectMonitor:
             # Use discussion-based approach for gathering specific agent outputs
             if actual_discussion_id:
                 logger.info(f"Gathering inputs from specific agents via discussion: {current_stage_config.inputs_from}")
-                return self._get_agent_outputs_from_discussion(actual_discussion_id, current_stage_config.inputs_from)
+                return self._get_agent_outputs_from_discussion(
+                    actual_discussion_id, current_stage_config.inputs_from,
+                    context_writer=_context_writer
+                )
             else:
                 # For issues workspace, this is expected behavior - use issue-based gathering
                 if pipeline_workspace == 'issues':
                     logger.debug(f"inputs_from specified for issues-workspace pipeline, using issue-based gathering for #{issue_number}")
                 else:
                     logger.warning(f"inputs_from specified but no discussion found for discussion-workspace pipeline (issue #{issue_number})")
-                
+
                 # Fallback 1: Check the current issue for agent outputs
                 logger.info(f"Checking current issue #{issue_number} for outputs from: {current_stage_config.inputs_from}")
-                issue_outputs = self._get_agent_outputs_from_issue(repository, issue_number, org, current_stage_config.inputs_from)
+                issue_outputs = self._get_agent_outputs_from_issue(
+                    repository, issue_number, org, current_stage_config.inputs_from,
+                    context_writer=_context_writer
+                )
                 
                 if issue_outputs:
                     logger.info(f"Found agent outputs in current issue #{issue_number}")
@@ -1058,14 +1077,16 @@ class ProjectMonitor:
                         if parent_discussion_id:
                             logger.info(f"Found discussion {parent_discussion_id} for parent issue #{parent_issue_number}, checking for agent outputs")
                             parent_outputs = self._get_agent_outputs_from_discussion(
-                                parent_discussion_id, current_stage_config.inputs_from
+                                parent_discussion_id, current_stage_config.inputs_from,
+                                context_writer=_context_writer
                             )
-                        
+
                         # If no outputs found in discussion (or no discussion), check issue comments
                         if not parent_outputs:
                             logger.info(f"Checking parent issue #{parent_issue_number} comments for agent outputs")
                             parent_outputs = self._get_agent_outputs_from_issue(
-                                repository, parent_issue_number, org, current_stage_config.inputs_from
+                                repository, parent_issue_number, org, current_stage_config.inputs_from,
+                                context_writer=_context_writer
                             )
                         
                         if parent_outputs:
@@ -1354,11 +1375,12 @@ class ProjectMonitor:
             logger.error(traceback.format_exc())
             return ""
 
-    def _get_agent_outputs_from_discussion(self, discussion_id: str, agent_names: List[str]) -> str:
+    def _get_agent_outputs_from_discussion(self, discussion_id: str, agent_names: List[str],
+                                            context_writer=None) -> str:
         """
         Get outputs from specific agents with full threaded context.
         Used when a stage has inputs_from specified.
-        
+
         For each agent:
         1. Find their final output (could be top-level OR a threaded reply)
         2. Collect all threaded conversation (human feedback + agent replies)
@@ -1367,6 +1389,7 @@ class ProjectMonitor:
         Args:
             discussion_id: The discussion ID
             agent_names: List of agent names to get outputs from
+            context_writer: Optional PipelineContextWriter to persist outputs as files
 
         Returns:
             Formatted context string with all specified agent outputs and their threaded conversations
@@ -1478,6 +1501,14 @@ class ProjectMonitor:
                     # Just the final output (no thread)
                     agent_context.append(final_output.get('body', ''))
 
+                # Write the raw output to the pipeline context dir so downstream
+                # agents can read it from disk instead of having it embedded in prompts
+                if context_writer and final_output:
+                    try:
+                        context_writer.write_stage_output(agent_name, final_output.get('body', ''))
+                    except Exception:
+                        pass
+
                 context_parts.append('\n'.join(agent_context))
 
             return "\n\n---\n\n".join(context_parts) if context_parts else ""
@@ -1488,11 +1519,12 @@ class ProjectMonitor:
             logger.error(traceback.format_exc())
             return ""
 
-    def _get_agent_outputs_from_issue(self, repository: str, issue_number: int, org: str, agent_names: List[str]) -> str:
+    def _get_agent_outputs_from_issue(self, repository: str, issue_number: int, org: str,
+                                       agent_names: List[str], context_writer=None) -> str:
         """
         Get outputs from specific agents from an issue.
         Similar to _get_agent_outputs_from_discussion but for issues.
-        
+
         For each agent:
         1. Find their most recent output in the issue comments
         2. Return the complete comment body
@@ -1502,6 +1534,7 @@ class ProjectMonitor:
             issue_number: Issue number
             org: Organization name
             agent_names: List of agent names to get outputs from
+            context_writer: Optional PipelineContextWriter to persist outputs as files
 
         Returns:
             Formatted context string with all specified agent outputs
@@ -1565,6 +1598,14 @@ class ProjectMonitor:
                 agent_context = []
                 agent_context.append(f"## Output from {agent_name.replace('_', ' ').title()}")
                 agent_context.append(final_output.get('body', ''))
+
+                # Write the raw output to the pipeline context dir so downstream
+                # agents can read it from disk instead of having it embedded in prompts
+                if context_writer:
+                    try:
+                        context_writer.write_stage_output(agent_name, final_output.get('body', ''))
+                    except Exception:
+                        pass
 
                 context_parts.append('\n'.join(agent_context))
 
@@ -1916,6 +1957,29 @@ class ProjectMonitor:
                     discussion_id=discussion_id
                 )
                 logger.debug(f"Using pipeline run {pipeline_run.id} for issue #{issue_number}")
+
+                # Create or re-attach pipeline context directory for file-based context passing
+                if pipeline_run_was_created:
+                    try:
+                        from services.pipeline_context_writer import PipelineContextWriter
+                        _pipeline_ctx_writer = PipelineContextWriter.setup(issue_number, pipeline_run.id)
+                        _pipeline_ctx_writer.write_initial_request(
+                            issue_data_early.get('title', ''),
+                            issue_data_early.get('body', ''),
+                        )
+                        pipeline_run.context_dir = _pipeline_ctx_writer.context_dir
+                        self.pipeline_run_manager.update_context_dir(pipeline_run)
+                        logger.info(f"Created pipeline context dir: {pipeline_run.context_dir}")
+                    except Exception as _e:
+                        logger.error(f"Could not create pipeline context dir for #{issue_number}: {_e}")
+                elif pipeline_run.context_dir:
+                    try:
+                        from services.pipeline_context_writer import PipelineContextWriter
+                        _pipeline_ctx_writer = PipelineContextWriter.from_existing(pipeline_run.context_dir)
+                        if not _pipeline_ctx_writer.exists():
+                            _pipeline_ctx_writer.repopulate_from_state(issue_data_early, {}, [])
+                    except Exception as _e:
+                        logger.warning(f"Could not re-attach pipeline context dir: {_e}")
 
                 # EMIT DECISION EVENT: Agent routing decision
                 # Collect alternative agents from workflow
@@ -2539,7 +2603,8 @@ class ProjectMonitor:
                     discussion_id=discussion_id,
                     pipeline_config=pipeline_config,
                     current_stage_config=current_stage_config,
-                    project_name=project_name
+                    project_name=project_name,
+                    pipeline_run_id=pipeline_run.id
                 )
 
                 # Pipeline run already created above, just use it
@@ -2559,6 +2624,8 @@ class ProjectMonitor:
                     'trigger_source': trigger_source,
                     'workspace_type': workspace_type,
                     'pipeline_run_id': pipeline_run.id,  # Include pipeline run ID
+                    'pipeline_context_dir': pipeline_run.context_dir,  # File-based context dir
+                    'inputs_from': list(getattr(current_stage_config, 'inputs_from', None) or []),
                     'timestamp': utc_isoformat()
                 }
 
@@ -6965,12 +7032,28 @@ _Repair cycle initiated by Claude Code Orchestrator_
                 for comment in feedback_comments
             ])
 
-            # Get pipeline_run_id for traceability
+            # Get pipeline_run_id and context_dir for traceability and file-based context
             pipeline_run_id = None
+            pipeline_context_dir = None
             try:
                 active_run = self.pipeline_run_manager.get_active_pipeline_run(project_name, issue_number)
                 if active_run:
                     pipeline_run_id = active_run.id
+                    pipeline_context_dir = active_run.context_dir
+                    # Write the user's question to the context dir before creating the task
+                    if pipeline_context_dir:
+                        try:
+                            from services.pipeline_context_writer import PipelineContextWriter
+                            _writer = PipelineContextWriter.from_existing(pipeline_context_dir)
+                            if _writer.exists():
+                                _turn_n = _writer._next_turn_number()
+                                _first = feedback_comments[0] if feedback_comments else {}
+                                _writer.write_conversation_turn(
+                                    _turn_n, _first.get('author', 'user'), feedback_text
+                                )
+                                _writer.write_latest_question(_first.get('author', 'user'), feedback_text)
+                        except Exception as _e:
+                            logger.debug(f"Could not write conversation turn to context dir: {_e}")
             except Exception as e:
                 logger.debug(f"Could not get pipeline_run_id for feedback task: {e}")
 
@@ -6990,6 +7073,7 @@ _Repair cycle initiated by Claude Code Orchestrator_
                 },
                 'previous_output': previous_output,  # Include agent's previous work
                 'pipeline_run_id': pipeline_run_id,  # For event tracking
+                'pipeline_context_dir': pipeline_context_dir,  # File-based context dir
                 'timestamp': utc_isoformat()
             }
 
@@ -8175,12 +8259,28 @@ Moving to implementation phase.
                 for comment in feedback_comments
             ])
 
-            # Get pipeline_run_id for traceability
+            # Get pipeline_run_id and context_dir for traceability and file-based context
             pipeline_run_id = None
+            pipeline_context_dir = None
             try:
                 active_run = self.pipeline_run_manager.get_active_pipeline_run(project_name, issue_number)
                 if active_run:
                     pipeline_run_id = active_run.id
+                    pipeline_context_dir = active_run.context_dir
+                    # Write the user's question to the context dir before creating the task
+                    if pipeline_context_dir:
+                        try:
+                            from services.pipeline_context_writer import PipelineContextWriter
+                            _writer = PipelineContextWriter.from_existing(pipeline_context_dir)
+                            if _writer.exists():
+                                _turn_n = _writer._next_turn_number()
+                                _first = feedback_comments[0] if feedback_comments else {}
+                                _writer.write_conversation_turn(
+                                    _turn_n, _first.get('author', 'user'), feedback_text
+                                )
+                                _writer.write_latest_question(_first.get('author', 'user'), feedback_text)
+                        except Exception as _e:
+                            logger.debug(f"Could not write conversation turn to context dir: {_e}")
             except Exception as e:
                 logger.debug(f"Could not get pipeline_run_id for feedback task: {e}")
 
@@ -8205,6 +8305,7 @@ Moving to implementation phase.
                 },
                 'previous_output': previous_output,
                 'pipeline_run_id': pipeline_run_id,  # For event tracking
+                'pipeline_context_dir': pipeline_context_dir,  # File-based context dir
                 'timestamp': utc_isoformat()
             }
 
