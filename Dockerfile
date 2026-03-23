@@ -8,7 +8,7 @@ WORKDIR /app
 
 # Install Node.js and Claude CLI
 ENV NODE_VERSION=v22.20.0
-RUN apt update -y && apt install curl git redis-tools gnupg2 procps -y \
+RUN apt update -y && apt install curl git redis-tools gnupg2 procps jq -y \
     && ARCH=$(dpkg --print-architecture) \
     && if [ "$ARCH" = "amd64" ]; then NODE_ARCH="x64"; elif [ "$ARCH" = "arm64" ]; then NODE_ARCH="arm64"; else NODE_ARCH="x64"; fi \
     && curl -fsSL https://nodejs.org/dist/$NODE_VERSION/node-$NODE_VERSION-linux-$NODE_ARCH.tar.gz -o node.tar.gz \

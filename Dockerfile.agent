@@ -65,7 +65,8 @@ RUN claude --version && \
     git --version && \
     gh --version && \
     python3 --version && \
-    docker --version
+    docker --version && \
+    jq --version
 
 # ============================================================================
 # Default command

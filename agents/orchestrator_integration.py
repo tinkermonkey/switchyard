@@ -240,11 +240,15 @@ def create_stage_from_config(stage_config, project_name: str) -> PipelineStage:
 
         elif stage_config.stage_type == 'pr_review':
             # Create PRReviewStage
-            logger.info(f"Creating PRReviewStage for {stage_config.name}")
+            project_config = config_manager.get_project_config(project_name)
+            ci_config = project_config.ci or {}
+            skip_ci_check = not ci_config.get('enabled', True)
+            logger.info(f"Creating PRReviewStage for {stage_config.name} (skip_ci_check={skip_ci_check})")
             return PRReviewStage(
                 name=stage_config.name,
                 pr_review_agent=stage_config.default_agent,  # pr_code_reviewer
-                requirements_verifier_agent="requirements_verifier"
+                requirements_verifier_agent="requirements_verifier",
+                skip_ci_check=skip_ci_check,
             )
 
         else:

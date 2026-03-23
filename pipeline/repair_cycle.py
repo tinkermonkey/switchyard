@@ -1016,6 +1016,17 @@ Follow these steps exactly:
    **IMPORTANT**: Only check the CI run that was triggered by the push in step 2 (or the most recent one if already up-to-date).
    Do NOT report a stale CI run that predates the current commit as the result.
    Verify the run's head SHA matches the current commit: `gh run view <run_id> --json headSha`
+
+   **JSON parsing**: Do NOT use `jq` — it may not be installed. Use python3 instead:
+   ```
+   gh run list --limit 1 --branch BRANCH --json databaseId,status,conclusion,workflowName \
+     | python3 -c "import sys,json; runs=json.load(sys.stdin); r=runs[0] if runs else {{}}; print(r.get('databaseId',''), r.get('status',''), r.get('conclusion',''))"
+   ```
+   Or to get a single field from `gh run view`:
+   ```
+   gh run view RUN_ID --json headSha | python3 -c "import sys,json; print(json.load(sys.stdin).get('headSha',''))"
+   ```
+
    If no CI run appears within 3 minutes of pushing, return:
    {{"passed": 0, "failed": 1, "warnings": 0, "failures": [{{"file": "ci", "test": "trigger", "message": "No CI run triggered within 3 minutes of push — CI may not be configured for this branch"}}], "warning_list": []}}
    If CI has still not completed when you are within 2 minutes of your deadline, stop polling and return:

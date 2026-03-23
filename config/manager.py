@@ -123,7 +123,8 @@ class ProjectConfig:
     tech_stacks: Dict[str, str]
     pipelines: List[ProjectPipeline]
     pipeline_routing: Dict[str, Any]
-    testing: Optional[Dict[str, Any]] = None  # NEW: Testing configuration
+    testing: Optional[Dict[str, Any]] = None  # Testing configuration
+    ci: Optional[Dict[str, Any]] = None  # CI configuration (e.g. enabled: false)
     agent_customizations: Dict[str, Dict[str, Any]] = None
     orchestrator: Dict[str, Any] = None
     hidden: bool = False  # Hide from UI and monitoring
@@ -358,10 +359,11 @@ class ConfigManager:
             tech_stacks=project_data['tech_stacks'],
             pipelines=pipelines,
             pipeline_routing=project_data['pipeline_routing'],
-            testing=project_data.get('testing'),  # NEW
+            testing=project_data.get('testing'),
+            ci=project_data.get('ci'),
             agent_customizations=project_data.get('agent_customizations', {}),
             orchestrator=data.get('orchestrator', {}),
-            hidden=project_data.get('hidden', False)  # Hide from UI and monitoring
+            hidden=project_data.get('hidden', False)
         )
 
     def get_agents(self) -> Dict[str, AgentConfig]:

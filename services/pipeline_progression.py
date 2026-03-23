@@ -229,6 +229,17 @@ class PipelineProgression:
             if not column_option_id:
                 logger.error(f"Column '{target_column}' not found in board {board_name}")
                 logger.error(f"Available columns: {[c.name for c in board_state.columns]}")
+                self.decision_events.emit_status_progression(
+                    issue_number=issue_number,
+                    project=project_name,
+                    board=board_name,
+                    from_status=current_status or 'unknown',
+                    to_status=target_column,
+                    trigger=trigger,
+                    success=False,
+                    error=f"Column '{target_column}' not found in board {board_name}",
+                    pipeline_run_id=pipeline_run_id
+                )
                 return False
 
             # First, get the project item ID for this issue

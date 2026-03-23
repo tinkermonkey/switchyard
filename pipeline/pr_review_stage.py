@@ -76,6 +76,7 @@ class PRReviewStage(PipelineStage):
         pr_review_agent: str = "pr_code_reviewer",
         requirements_verifier_agent: str = "requirements_verifier",
         max_agent_calls: int = 20,
+        skip_ci_check: bool = False,
         **kwargs
     ):
         super().__init__(name, **kwargs)
@@ -92,6 +93,9 @@ class PRReviewStage(PipelineStage):
         # Circuit breaker for cost control
         self.max_agent_calls = max_agent_calls
         self._agent_call_count = 0
+
+        # CI check control
+        self.skip_ci_check = skip_ci_check
 
     async def execute(self, context: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -420,74 +424,78 @@ class PRReviewStage(PipelineStage):
                 context['markdown_analysis'] = "## PR Review Cancelled\n\nPipeline run ended externally."
                 return context
 
-            # This runs locally (no Docker) using gh CLI
-            logger.info(f"Phase 3: Checking CI status for {pr_url}")
-            phase3_start = utc_now()
-            phases_attempted += 1
+            if self.skip_ci_check:
+                logger.info("Phase 3: CI status check skipped (ci.enabled=false for this project)")
+                review_summary_parts.append("### CI Status\n\nCI checks disabled for this project.")
+            else:
+                # This runs locally (no Docker) using gh CLI
+                logger.info(f"Phase 3: Checking CI status for {pr_url}")
+                phase3_start = utc_now()
+                phases_attempted += 1
 
-            # Emit phase started event
-            if obs:
-                obs.emit(EventType.PR_REVIEW_PHASE_STARTED, "pr_review_stage", task_id, project_name, {
-                    "phase": 3,
-                    "phase_name": "CI Status Check",
-                    "agent": "local_gh_cli",
-                }, pipeline_run_id)
-
-            try:
-                failures, pending = self._check_ci_status(pr_url, repo)
-                phases_completed += 1
-
-                phase3_duration = (utc_now() - phase3_start).total_seconds()
-                logger.info(f"Phase 3 completed in {phase3_duration:.1f}s")
-
-                if failures:
-                    review_found_issues = True
-                    ci_issue_spec = self._build_ci_failure_issue(failures, pr_url)
-                    created = await self._create_review_issues(
-                        [ci_issue_spec], repo, github_config, parent_issue_number, project_name,
-                        obs, pipeline_run_id, pr_url
-                    )
-                    all_created_issues.extend(created)
-                    logger.info(f"Phase 3: {len(failures)} CI checks failing, created {len(created)} issues")
-                    review_summary_parts.append(
-                        f"### CI Status\n\n{len(failures)} failing check(s):\n\n"
-                        + self._format_ci_table(failures)
-                    )
-                elif pending:
-                    logger.warning(f"Phase 3: {len(pending)} CI checks still pending")
-                    review_summary_parts.append(
-                        f"### CI Status\n\n{len(pending)} check(s) still pending:\n\n"
-                        + self._format_ci_table(pending)
-                    )
-                else:
-                    logger.info("Phase 3: All CI checks passed")
-                    review_summary_parts.append("### CI Status\n\nAll CI checks passed.")
-
-                # Emit phase completed event
+                # Emit phase started event
                 if obs:
-                    obs.emit(EventType.PR_REVIEW_PHASE_COMPLETED, "pr_review_stage", task_id, project_name, {
+                    obs.emit(EventType.PR_REVIEW_PHASE_STARTED, "pr_review_stage", task_id, project_name, {
                         "phase": 3,
                         "phase_name": "CI Status Check",
-                        "success": True,
-                        "failures_found": len(failures),
-                        "pending_count": len(pending),
-                        "duration_seconds": phase3_duration,
+                        "agent": "local_gh_cli",
                     }, pipeline_run_id)
 
-            except Exception as e:
-                logger.error(f"Phase 3 CI status check failed: {e}", exc_info=True)
-                review_summary_parts.append(f"### CI Status\n\nFailed: {e}")
+                try:
+                    failures, pending = self._check_ci_status(pr_url, repo)
+                    phases_completed += 1
 
-                # Emit phase failed event
-                if obs:
                     phase3_duration = (utc_now() - phase3_start).total_seconds()
-                    obs.emit(EventType.PR_REVIEW_PHASE_FAILED, "pr_review_stage", task_id, project_name, {
-                        "phase": 3,
-                        "phase_name": "CI Status Check",
-                        "success": False,
-                        "error": str(e),
-                        "duration_seconds": phase3_duration,
-                    }, pipeline_run_id)
+                    logger.info(f"Phase 3 completed in {phase3_duration:.1f}s")
+
+                    if failures:
+                        review_found_issues = True
+                        ci_issue_spec = self._build_ci_failure_issue(failures, pr_url)
+                        created = await self._create_review_issues(
+                            [ci_issue_spec], repo, github_config, parent_issue_number, project_name,
+                            obs, pipeline_run_id, pr_url
+                        )
+                        all_created_issues.extend(created)
+                        logger.info(f"Phase 3: {len(failures)} CI checks failing, created {len(created)} issues")
+                        review_summary_parts.append(
+                            f"### CI Status\n\n{len(failures)} failing check(s):\n\n"
+                            + self._format_ci_table(failures)
+                        )
+                    elif pending:
+                        logger.warning(f"Phase 3: {len(pending)} CI checks still pending")
+                        review_summary_parts.append(
+                            f"### CI Status\n\n{len(pending)} check(s) still pending:\n\n"
+                            + self._format_ci_table(pending)
+                        )
+                    else:
+                        logger.info("Phase 3: All CI checks passed")
+                        review_summary_parts.append("### CI Status\n\nAll CI checks passed.")
+
+                    # Emit phase completed event
+                    if obs:
+                        obs.emit(EventType.PR_REVIEW_PHASE_COMPLETED, "pr_review_stage", task_id, project_name, {
+                            "phase": 3,
+                            "phase_name": "CI Status Check",
+                            "success": True,
+                            "failures_found": len(failures),
+                            "pending_count": len(pending),
+                            "duration_seconds": phase3_duration,
+                        }, pipeline_run_id)
+
+                except Exception as e:
+                    logger.error(f"Phase 3 CI status check failed: {e}", exc_info=True)
+                    review_summary_parts.append(f"### CI Status\n\nFailed: {e}")
+
+                    # Emit phase failed event
+                    if obs:
+                        phase3_duration = (utc_now() - phase3_start).total_seconds()
+                        obs.emit(EventType.PR_REVIEW_PHASE_FAILED, "pr_review_stage", task_id, project_name, {
+                            "phase": 3,
+                            "phase_name": "CI Status Check",
+                            "success": False,
+                            "error": str(e),
+                            "duration_seconds": phase3_duration,
+                        }, pipeline_run_id)
 
             # ---- Phase 4: Consolidation ----
             if phase_outputs:
@@ -606,8 +614,8 @@ class PRReviewStage(PipelineStage):
                     self._post_comment_on_issue(repo, parent_issue_number, summary_comment)
 
             else:
-                # Clean pass - advance to documentation
-                logger.info(f"Clean pass for #{parent_issue_number}, advancing to Documentation")
+                # Clean pass - advance to Done
+                logger.info(f"Clean pass for #{parent_issue_number}, advancing to Done")
                 pr_review_state_manager.increment_review_count(project_name, parent_issue_number, [])
                 self._advance_parent_to_documentation(project_name, parent_issue_number)
                 manual_progression_made = True
@@ -1477,7 +1485,7 @@ If all requirements are met, write "All requirements verified - no gaps found" a
             )
 
     def _advance_parent_to_documentation(self, project_name: str, parent_issue_number: int):
-        """Advance the parent issue from 'In Review' to 'Documentation' on the Planning board."""
+        """Advance the parent issue from 'In Review' to 'Done' on the Planning board."""
         try:
             from services.pipeline_progression import PipelineProgression
             from task_queue.task_manager import TaskQueue
@@ -1487,7 +1495,7 @@ If all requirements are met, write "All requirements verified - no gaps found" a
 
             github_state = self.state_manager.load_project_state(project_name)
             if not github_state:
-                logger.warning(f"No GitHub state for {project_name}, cannot advance to Documentation")
+                logger.warning(f"No GitHub state for {project_name}, cannot advance to Done")
                 return
 
             planning_board = None
@@ -1499,16 +1507,16 @@ If all requirements are met, write "All requirements verified - no gaps found" a
             if planning_board:
                 success = progression.move_issue_to_column(
                     project_name, planning_board, parent_issue_number,
-                    "Documentation", trigger='pr_review_clean_pass'
+                    "Done", trigger='pr_review_clean_pass'
                 )
                 if success:
-                    logger.info(f"Advanced #{parent_issue_number} to Documentation (clean pass)")
+                    logger.info(f"Advanced #{parent_issue_number} to Done (clean pass)")
                 else:
-                    logger.error(f"Failed to advance #{parent_issue_number} to Documentation")
+                    logger.error(f"Failed to advance #{parent_issue_number} to Done")
             else:
-                logger.warning(f"Planning board not found for {project_name}, cannot advance to Documentation")
+                logger.warning(f"Planning board not found for {project_name}, cannot advance to Done")
         except Exception as e:
-            logger.error(f"Failed to advance parent to Documentation: {e}", exc_info=True)
+            logger.error(f"Failed to advance parent to Done: {e}", exc_info=True)
 
     def _return_parent_to_development(self, project_name: str, parent_issue_number: int):
         """Move the parent issue from 'In Review' back to 'In Development' on the Planning board."""
