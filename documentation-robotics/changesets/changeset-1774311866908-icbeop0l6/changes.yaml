@@ -1,0 +1,985 @@
+- type: add
+  elementId: security.securitymodel.orchestrator-security-model
+  layerName: security
+  after:
+    id: 9d471ce3-0d9a-4570-bed6-94d97310e8c6
+    path: security.securitymodel.orchestrator-security-model
+    spec_node_id: security.securitymodel
+    type: securitymodel
+    layer_id: security
+    name: Orchestrator Security Model
+    attributes:
+      version: "1.0"
+      application: Claude Code Agent Orchestrator
+      accessControlModel: rbac
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: documentation/github-authentication.md
+          symbol: GitHubApp
+    metadata:
+      created_at: 2026-03-24T00:24:38.081Z
+      updated_at: 2026-03-24T00:24:38.081Z
+      version: 1
+  timestamp: 2026-03-24T00:24:38.109Z
+  sequenceNumber: 0
+- type: add
+  elementId: security.actor.human-operator
+  layerName: security
+  after:
+    id: c0843a1b-c96d-475b-92ce-1b5f7726a10a
+    path: security.actor.human-operator
+    spec_node_id: security.actor
+    type: actor
+    layer_id: security
+    name: Human Operator
+    description: DevOps engineer who configures and operates the orchestrator
+    attributes:
+      type: human
+      trustLevel: high
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: documentation/github-authentication.md
+          symbol: PersonalAccessToken
+    metadata:
+      created_at: 2026-03-24T00:24:38.601Z
+      updated_at: 2026-03-24T00:24:38.601Z
+      version: 1
+  timestamp: 2026-03-24T00:24:38.626Z
+  sequenceNumber: 1
+- type: add
+  elementId: security.actor.orchestrator-bot
+  layerName: security
+  after:
+    id: 23513e4d-3ccf-4abe-bc5d-1d01665747e7
+    path: security.actor.orchestrator-bot
+    spec_node_id: security.actor
+    type: actor
+    layer_id: security
+    name: Orchestrator Bot
+    description: GitHub App bot identity that posts comments as orchestrator-bot[bot]
+    attributes:
+      type: service
+      trustLevel: high
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/github_app.py
+          symbol: GitHubApp
+    metadata:
+      created_at: 2026-03-24T00:24:39.121Z
+      updated_at: 2026-03-24T00:24:39.121Z
+      version: 1
+  timestamp: 2026-03-24T00:24:39.146Z
+  sequenceNumber: 2
+- type: add
+  elementId: security.actor.claude-agent-container
+  layerName: security
+  after:
+    id: 6d764b3b-2103-49c2-9551-67036b3ad12b
+    path: security.actor.claude-agent-container
+    spec_node_id: security.actor
+    type: actor
+    layer_id: security
+    name: Claude Agent Container
+    description: Isolated Docker container executing Claude agents for a single task
+    attributes:
+      type: system
+      trustLevel: medium
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: claude/docker_runner.py
+          symbol: DockerAgentRunner
+    metadata:
+      created_at: 2026-03-24T00:24:39.632Z
+      updated_at: 2026-03-24T00:24:39.632Z
+      version: 1
+  timestamp: 2026-03-24T00:24:39.659Z
+  sequenceNumber: 3
+- type: add
+  elementId: security.actor.git-hub-api
+  layerName: security
+  after:
+    id: 00d1ecbd-ae07-4db7-a8e0-7bef87c37b53
+    path: security.actor.git-hub-api
+    spec_node_id: security.actor
+    type: actor
+    layer_id: security
+    name: GitHub API
+    description: External GitHub REST and GraphQL API endpoints
+    attributes:
+      type: external-entity
+      trustLevel: high
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/github_app.py
+          symbol: GitHubApp.graphql_request
+    metadata:
+      created_at: 2026-03-24T00:24:40.153Z
+      updated_at: 2026-03-24T00:24:40.153Z
+      version: 1
+  timestamp: 2026-03-24T00:24:40.178Z
+  sequenceNumber: 4
+- type: add
+  elementId: security.role.orchestrator-operator
+  layerName: security
+  after:
+    id: 3018059f-a6a7-4998-b201-6c54a7bc18bb
+    path: security.role.orchestrator-operator
+    spec_node_id: security.role
+    type: role
+    layer_id: security
+    name: Orchestrator Operator
+    description: Human operator with full access to configure and operate the orchestrator
+    attributes:
+      displayName: Orchestrator Operator
+      level: 100
+      inheritsFrom: ""
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: documentation/github-authentication.md
+          symbol: PersonalAccessToken
+    metadata:
+      created_at: 2026-03-24T00:24:52.006Z
+      updated_at: 2026-03-24T00:24:52.006Z
+      version: 1
+  timestamp: 2026-03-24T00:24:52.034Z
+  sequenceNumber: 5
+- type: add
+  elementId: security.role.pipeline-executor
+  layerName: security
+  after:
+    id: a58faf3b-0391-46b8-9bfc-502231af4e0d
+    path: security.role.pipeline-executor
+    spec_node_id: security.role
+    type: role
+    layer_id: security
+    name: Pipeline Executor
+    description: GitHub App bot identity executing pipeline stages and posting to GitHub
+    attributes:
+      displayName: Pipeline Executor
+      level: 50
+      inheritsFrom: ""
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/github_app.py
+          symbol: GitHubApp
+    metadata:
+      created_at: 2026-03-24T00:24:52.516Z
+      updated_at: 2026-03-24T00:24:52.516Z
+      version: 1
+  timestamp: 2026-03-24T00:24:52.542Z
+  sequenceNumber: 6
+- type: add
+  elementId: security.role.agent-sandbox
+  layerName: security
+  after:
+    id: a22b5781-6761-4ef8-bc85-c3f0f099b06e
+    path: security.role.agent-sandbox
+    spec_node_id: security.role
+    type: role
+    layer_id: security
+    name: Agent Sandbox
+    description: Isolated container role with write access only to project workspace
+    attributes:
+      displayName: Agent Sandbox
+      level: 10
+      inheritsFrom: ""
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: claude/docker_runner.py
+          symbol: DockerAgentRunner
+    metadata:
+      created_at: 2026-03-24T00:24:53.032Z
+      updated_at: 2026-03-24T00:24:53.032Z
+      version: 1
+  timestamp: 2026-03-24T00:24:53.059Z
+  sequenceNumber: 7
+- type: add
+  elementId: security.authenticationconfig.git-hub-app-jwt-authentication
+  layerName: security
+  after:
+    id: 833bc981-b8bb-41d8-b345-6bf8c5d4b607
+    path: security.authenticationconfig.git-hub-app-jwt-authentication
+    spec_node_id: security.authenticationconfig
+    type: authenticationconfig
+    layer_id: security
+    name: GitHub App JWT Authentication
+    description: RS256 JWT signed with RSA private key exchanged for 1-hour
+      installation token
+    attributes:
+      provider: oauth2
+      sessionTimeout: 3600
+      mfaRequired: false
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/github_app_auth.py
+          symbol: GitHubAppAuth.generate_jwt
+    metadata:
+      created_at: 2026-03-24T00:25:01.241Z
+      updated_at: 2026-03-24T00:25:01.241Z
+      version: 1
+  timestamp: 2026-03-24T00:25:01.267Z
+  sequenceNumber: 8
+- type: add
+  elementId: security.authenticationconfig.personal-access-token-authentication
+  layerName: security
+  after:
+    id: 997f444b-aebf-4ae8-8ffe-ad28beff4aa7
+    path: security.authenticationconfig.personal-access-token-authentication
+    spec_node_id: security.authenticationconfig
+    type: authenticationconfig
+    layer_id: security
+    name: Personal Access Token Authentication
+    description: GITHUB_TOKEN PAT fallback used when GitHub App is not configured
+    attributes:
+      provider: local
+      sessionTimeout: 0
+      mfaRequired: false
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/github_app.py
+          symbol: GitHubApp._get_token
+    metadata:
+      created_at: 2026-03-24T00:25:01.755Z
+      updated_at: 2026-03-24T00:25:01.755Z
+      version: 1
+  timestamp: 2026-03-24T00:25:01.783Z
+  sequenceNumber: 9
+- type: add
+  elementId: security.authenticationconfig.ssh-key-authentication
+  layerName: security
+  after:
+    id: 56f7a95c-f776-48ba-a71d-d01c943e6d19
+    path: security.authenticationconfig.ssh-key-authentication
+    spec_node_id: security.authenticationconfig
+    type: authenticationconfig
+    layer_id: security
+    name: SSH Key Authentication
+    description: SSH private key mounted read-only into orchestrator container for
+      git operations
+    attributes:
+      provider: local
+      sessionTimeout: 0
+      mfaRequired: false
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: Dockerfile
+          symbol: SSH_KEY_MOUNT
+    metadata:
+      created_at: 2026-03-24T00:25:02.276Z
+      updated_at: 2026-03-24T00:25:02.276Z
+      version: 1
+  timestamp: 2026-03-24T00:25:02.303Z
+  sequenceNumber: 10
+- type: add
+  elementId: security.securitypolicy.git-hub-api-access-control-policy
+  layerName: security
+  after:
+    id: 8b081e1b-a9f4-4da0-a6ee-1d0e4e593a8b
+    path: security.securitypolicy.git-hub-api-access-control-policy
+    spec_node_id: security.securitypolicy
+    type: securitypolicy
+    layer_id: security
+    name: GitHub API Access Control Policy
+    description: All GitHub API requests must use App installation token; PAT only
+      as fallback
+    attributes:
+      priority: 1
+      target: service
+      enabled: true
+      requirementLevel: mandatory
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/github_app.py
+          symbol: GitHubApp._get_token
+    metadata:
+      created_at: 2026-03-24T00:25:11.680Z
+      updated_at: 2026-03-24T00:25:11.680Z
+      version: 1
+  timestamp: 2026-03-24T00:25:11.706Z
+  sequenceNumber: 11
+- type: add
+  elementId: security.securitypolicy.docker-container-isolation-policy
+  layerName: security
+  after:
+    id: d3a21405-839e-48ee-b1f9-79a11eb7d3c4
+    path: security.securitypolicy.docker-container-isolation-policy
+    spec_node_id: security.securitypolicy
+    type: securitypolicy
+    layer_id: security
+    name: Docker Container Isolation Policy
+    description: Each agent runs in an isolated Docker container with filesystem
+      scope limited to /workspace/<project>
+    attributes:
+      priority: 1
+      target: service
+      enabled: true
+      requirementLevel: mandatory
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: claude/docker_runner.py
+          symbol: DockerAgentRunner
+    metadata:
+      created_at: 2026-03-24T00:25:12.182Z
+      updated_at: 2026-03-24T00:25:12.182Z
+      version: 1
+  timestamp: 2026-03-24T00:25:12.209Z
+  sequenceNumber: 12
+- type: add
+  elementId: security.securitypolicy.non-root-container-execution-policy
+  layerName: security
+  after:
+    id: b611f3d3-733a-4b4a-9c8a-3a2e7a7df2cc
+    path: security.securitypolicy.non-root-container-execution-policy
+    spec_node_id: security.securitypolicy
+    type: securitypolicy
+    layer_id: security
+    name: Non-Root Container Execution Policy
+    description: All containers run as non-root user (UID 1000) to limit privilege
+      escalation
+    attributes:
+      priority: 2
+      target: service
+      enabled: true
+      requirementLevel: mandatory
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: Dockerfile
+          symbol: USER orchestrator
+    metadata:
+      created_at: 2026-03-24T00:25:12.729Z
+      updated_at: 2026-03-24T00:25:12.729Z
+      version: 1
+  timestamp: 2026-03-24T00:25:12.756Z
+  sequenceNumber: 13
+- type: add
+  elementId: security.securitypolicy.secret-environment-variable-policy
+  layerName: security
+  after:
+    id: d7c8b2a0-18cd-4243-b600-9df4e464926a
+    path: security.securitypolicy.secret-environment-variable-policy
+    spec_node_id: security.securitypolicy
+    type: securitypolicy
+    layer_id: security
+    name: Secret Environment Variable Policy
+    description: API keys and tokens injected via environment variables from .env
+      file; never committed to source
+    attributes:
+      priority: 2
+      target: data
+      enabled: true
+      requirementLevel: mandatory
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: docker-compose.yml
+          symbol: environment
+    metadata:
+      created_at: 2026-03-24T00:25:13.247Z
+      updated_at: 2026-03-24T00:25:13.247Z
+      version: 1
+  timestamp: 2026-03-24T00:25:13.273Z
+  sequenceNumber: 14
+- type: add
+  elementId: security.countermeasure.circuit-breaker-rate-limit-protection
+  layerName: security
+  after:
+    id: 881a82b5-f916-4f0c-b8e7-0997e1b6bf50
+    path: security.countermeasure.circuit-breaker-rate-limit-protection
+    spec_node_id: security.countermeasure
+    type: countermeasure
+    layer_id: security
+    name: Circuit Breaker Rate Limit Protection
+    description: Three-state circuit breaker prevents cascading failures when GitHub
+      API rate limit is exhausted
+    attributes:
+      type: technical
+      effectiveness: high
+      implemented: true
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/github_api_client.py
+          symbol: GitHubBreaker
+    metadata:
+      created_at: 2026-03-24T00:25:27.482Z
+      updated_at: 2026-03-24T00:25:27.482Z
+      version: 1
+  timestamp: 2026-03-24T00:25:27.510Z
+  sequenceNumber: 15
+- type: add
+  elementId: security.countermeasure.docker-workspace-scope-isolation
+  layerName: security
+  after:
+    id: a03aa76c-9b8a-4f89-91f0-2097d5a15f7f
+    path: security.countermeasure.docker-workspace-scope-isolation
+    spec_node_id: security.countermeasure
+    type: countermeasure
+    layer_id: security
+    name: Docker Workspace Scope Isolation
+    description: Volume mounts restrict agent container filesystem access to
+      /workspace/<project> and read-only SSH
+    attributes:
+      type: technical
+      effectiveness: high
+      implemented: true
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: claude/docker_runner.py
+          symbol: DockerAgentRunner
+    metadata:
+      created_at: 2026-03-24T00:25:27.996Z
+      updated_at: 2026-03-24T00:25:27.996Z
+      version: 1
+  timestamp: 2026-03-24T00:25:28.024Z
+  sequenceNumber: 16
+- type: add
+  elementId: security.countermeasure.git-hub-app-installation-token-rotation
+  layerName: security
+  after:
+    id: 8b4f01d3-caff-496f-9f7a-09f31dc883e8
+    path: security.countermeasure.git-hub-app-installation-token-rotation
+    spec_node_id: security.countermeasure
+    type: countermeasure
+    layer_id: security
+    name: GitHub App Installation Token Rotation
+    description: Tokens cached for max 55 minutes; auto-refreshed on expiry or 401 response
+    attributes:
+      type: technical
+      effectiveness: high
+      implemented: true
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/github_app_auth.py
+          symbol: GitHubAppAuth.get_installation_token
+    metadata:
+      created_at: 2026-03-24T00:25:28.523Z
+      updated_at: 2026-03-24T00:25:28.523Z
+      version: 1
+  timestamp: 2026-03-24T00:25:28.550Z
+  sequenceNumber: 17
+- type: add
+  elementId: security.countermeasure.read-only-ssh-key-mount
+  layerName: security
+  after:
+    id: 148742cc-b923-491f-bb0c-ed51762d9b2a
+    path: security.countermeasure.read-only-ssh-key-mount
+    spec_node_id: security.countermeasure
+    type: countermeasure
+    layer_id: security
+    name: Read-Only SSH Key Mount
+    description: SSH private key mounted as read-only (:ro) so containers cannot
+      modify host credentials
+    attributes:
+      type: technical
+      effectiveness: medium
+      implemented: true
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: docker-compose.yml
+          symbol: volumes
+    metadata:
+      created_at: 2026-03-24T00:25:29.033Z
+      updated_at: 2026-03-24T00:25:29.033Z
+      version: 1
+  timestamp: 2026-03-24T00:25:29.060Z
+  sequenceNumber: 18
+- type: add
+  elementId: security.countermeasure.docker-gid-group-membership-control
+  layerName: security
+  after:
+    id: a38e03c2-d342-4da0-9483-65f8419ba6c1
+    path: security.countermeasure.docker-gid-group-membership-control
+    spec_node_id: security.countermeasure
+    type: countermeasure
+    layer_id: security
+    name: Docker GID Group Membership Control
+    description: Orchestrator user added to Docker group using host GID to control
+      Docker socket access
+    attributes:
+      type: operational
+      effectiveness: medium
+      implemented: true
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: Dockerfile
+          symbol: DOCKER_GID
+    metadata:
+      created_at: 2026-03-24T00:25:29.569Z
+      updated_at: 2026-03-24T00:25:29.569Z
+      version: 1
+  timestamp: 2026-03-24T00:25:29.597Z
+  sequenceNumber: 19
+- type: add
+  elementId: security.threat.git-hub-token-credential-exposure
+  layerName: security
+  after:
+    id: 0066b263-2840-4051-b3d2-802d386adf64
+    path: security.threat.git-hub-token-credential-exposure
+    spec_node_id: security.threat
+    type: threat
+    layer_id: security
+    name: GitHub Token Credential Exposure
+    description: GITHUB_TOKEN or GitHub App private key could leak via environment
+      variable exposure or committed .env files
+    attributes:
+      threatens: service
+      likelihood: moderate
+      impact: high
+      criticality: high
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: docker-compose.yml
+          symbol: environment
+    metadata:
+      created_at: 2026-03-24T00:25:38.564Z
+      updated_at: 2026-03-24T00:25:38.564Z
+      version: 1
+  timestamp: 2026-03-24T00:25:38.595Z
+  sequenceNumber: 20
+- type: add
+  elementId: security.threat.agent-container-privilege-escalation
+  layerName: security
+  after:
+    id: c0ceb70f-c862-4b34-af6a-7b5f6ad771f0
+    path: security.threat.agent-container-privilege-escalation
+    spec_node_id: security.threat
+    type: threat
+    layer_id: security
+    name: Agent Container Privilege Escalation
+    description: Agent running as UID 1000 with docker socket access could spawn
+      privileged containers
+    attributes:
+      threatens: service
+      likelihood: low
+      impact: high
+      criticality: high
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: Dockerfile
+          symbol: USER orchestrator
+    metadata:
+      created_at: 2026-03-24T00:25:39.088Z
+      updated_at: 2026-03-24T00:25:39.088Z
+      version: 1
+  timestamp: 2026-03-24T00:25:39.116Z
+  sequenceNumber: 21
+- type: add
+  elementId: security.threat.workspace-path-traversal
+  layerName: security
+  after:
+    id: 32f33abb-5ea1-4f9d-b467-9b9a86bb4a13
+    path: security.threat.workspace-path-traversal
+    spec_node_id: security.threat
+    type: threat
+    layer_id: security
+    name: Workspace Path Traversal
+    description: Agent task prompt injection could cause filesystem writes outside
+      /workspace/<project>
+    attributes:
+      threatens: data
+      likelihood: low
+      impact: moderate
+      criticality: medium
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: claude/docker_runner.py
+          symbol: DockerAgentRunner
+    metadata:
+      created_at: 2026-03-24T00:25:39.633Z
+      updated_at: 2026-03-24T00:25:39.633Z
+      version: 1
+  timestamp: 2026-03-24T00:25:39.666Z
+  sequenceNumber: 22
+- type: add
+  elementId: security.threat.git-hub-api-rate-limit-exhaustion
+  layerName: security
+  after:
+    id: 6ade4dd3-6a39-4c38-be3d-0b9571e89889
+    path: security.threat.git-hub-api-rate-limit-exhaustion
+    spec_node_id: security.threat
+    type: threat
+    layer_id: security
+    name: GitHub API Rate Limit Exhaustion
+    description: Burst of pipeline triggers could exhaust 5000 req/hour GitHub API
+      rate limit
+    attributes:
+      threatens: service
+      likelihood: moderate
+      impact: moderate
+      criticality: medium
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/github_api_client.py
+          symbol: GitHubRateLimitStatus
+    metadata:
+      created_at: 2026-03-24T00:25:40.211Z
+      updated_at: 2026-03-24T00:25:40.211Z
+      version: 1
+  timestamp: 2026-03-24T00:25:40.242Z
+  sequenceNumber: 23
+- type: add
+  elementId: security.permission.git-hub-repository-read-write
+  layerName: security
+  after:
+    id: 9ddcd0e6-f50a-45d0-a4aa-c5e83dbd2f50
+    path: security.permission.git-hub-repository-read-write
+    spec_node_id: security.permission
+    type: permission
+    layer_id: security
+    name: GitHub Repository Read-Write
+    description: Contents, issues, pull requests read and write access to managed
+      repositories
+    attributes:
+      scope: write
+      resource: github-repository
+      action: update
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: documentation/github-authentication.md
+          symbol: RepositoryPermissions
+    metadata:
+      created_at: 2026-03-24T00:25:51.132Z
+      updated_at: 2026-03-24T00:25:51.132Z
+      version: 1
+  timestamp: 2026-03-24T00:25:51.163Z
+  sequenceNumber: 24
+- type: add
+  elementId: security.permission.git-hub-projects-board-admin
+  layerName: security
+  after:
+    id: 7b0cc75c-817c-4811-b214-3b7732854ba3
+    path: security.permission.git-hub-projects-board-admin
+    spec_node_id: security.permission
+    type: permission
+    layer_id: security
+    name: GitHub Projects Board Admin
+    description: Read and write access to GitHub Projects v2 Kanban boards
+    attributes:
+      scope: admin
+      resource: github-project
+      action: update
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: documentation/github-authentication.md
+          symbol: ProjectPermissions
+    metadata:
+      created_at: 2026-03-24T00:25:51.671Z
+      updated_at: 2026-03-24T00:25:51.671Z
+      version: 1
+  timestamp: 2026-03-24T00:25:51.702Z
+  sequenceNumber: 25
+- type: add
+  elementId: security.permission.git-hub-discussions-write
+  layerName: security
+  after:
+    id: 01670f3a-c063-4e5f-948e-dd7cbc8510f0
+    path: security.permission.git-hub-discussions-write
+    spec_node_id: security.permission
+    type: permission
+    layer_id: security
+    name: GitHub Discussions Write
+    description: createDiscussion and addDiscussionComment mutations require GitHub
+      App installation token
+    attributes:
+      scope: write
+      resource: github-discussions
+      action: create
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: documentation/github-authentication.md
+          symbol: GitHubApp
+    metadata:
+      created_at: 2026-03-24T00:25:52.224Z
+      updated_at: 2026-03-24T00:25:52.224Z
+      version: 1
+  timestamp: 2026-03-24T00:25:52.271Z
+  sequenceNumber: 26
+- type: add
+  elementId: security.permission.docker-socket-access
+  layerName: security
+  after:
+    id: d3e4f7b9-7f30-4533-aa6c-4ca042225b4e
+    path: security.permission.docker-socket-access
+    spec_node_id: security.permission
+    type: permission
+    layer_id: security
+    name: Docker Socket Access
+    description: Orchestrator and observability containers have access to Docker
+      socket for container management
+    attributes:
+      scope: admin
+      resource: docker-socket
+      action: execute
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: docker-compose.yml
+          symbol: docker.sock
+    metadata:
+      created_at: 2026-03-24T00:25:52.783Z
+      updated_at: 2026-03-24T00:25:52.783Z
+      version: 1
+  timestamp: 2026-03-24T00:25:52.814Z
+  sequenceNumber: 27
+- type: add
+  elementId: security.secureresource.git-hub-api-endpoint
+  layerName: security
+  after:
+    id: 5bfe61a3-00f2-4ced-aea5-f5bff66e4c6b
+    path: security.secureresource.git-hub-api-endpoint
+    spec_node_id: security.secureresource
+    type: secureresource
+    layer_id: security
+    name: GitHub API Endpoint
+    description: GitHub REST and GraphQL API endpoints protected by token authentication
+    attributes:
+      resource: https://api.github.com
+      type: api
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/github_app.py
+          symbol: GitHubApp.rest_request
+    metadata:
+      created_at: 2026-03-24T00:26:07.876Z
+      updated_at: 2026-03-24T00:26:07.876Z
+      version: 1
+  timestamp: 2026-03-24T00:26:07.912Z
+  sequenceNumber: 28
+- type: add
+  elementId: security.secureresource.docker-socket
+  layerName: security
+  after:
+    id: 278dfc17-7bab-46a1-942e-3a3408ad105c
+    path: security.secureresource.docker-socket
+    spec_node_id: security.secureresource
+    type: secureresource
+    layer_id: security
+    name: Docker Socket
+    description: Unix socket granting full Docker daemon control, mounted into
+      orchestrator container
+    attributes:
+      resource: /var/run/docker.sock
+      type: file
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: docker-compose.yml
+          symbol: docker.sock
+    metadata:
+      created_at: 2026-03-24T00:26:08.440Z
+      updated_at: 2026-03-24T00:26:08.440Z
+      version: 1
+  timestamp: 2026-03-24T00:26:08.474Z
+  sequenceNumber: 29
+- type: add
+  elementId: security.secureresource.project-workspace-directory
+  layerName: security
+  after:
+    id: 17a2ae72-7427-49bf-9ef2-08e1823a76dd
+    path: security.secureresource.project-workspace-directory
+    spec_node_id: security.secureresource
+    type: secureresource
+    layer_id: security
+    name: Project Workspace Directory
+    description: Filesystem path /workspace/<project> mounted into agent containers
+      with write access
+    attributes:
+      resource: /workspace/<project>
+      type: file
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: claude/docker_runner.py
+          symbol: DockerAgentRunner
+    metadata:
+      created_at: 2026-03-24T00:26:08.994Z
+      updated_at: 2026-03-24T00:26:08.994Z
+      version: 1
+  timestamp: 2026-03-24T00:26:09.028Z
+  sequenceNumber: 30
+- type: add
+  elementId: security.secureresource.orchestrator-redis-state
+  layerName: security
+  after:
+    id: b96d2662-8f43-41cf-b15e-6cc9b3a79577
+    path: security.secureresource.orchestrator-redis-state
+    spec_node_id: security.secureresource
+    type: secureresource
+    layer_id: security
+    name: Orchestrator Redis State
+    description: Redis instance storing task queue, pipeline locks, circuit breaker
+      state, and rate limit data
+    attributes:
+      resource: redis://redis:6379
+      type: database
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: task_queue/task_manager.py
+          symbol: TaskQueue
+    metadata:
+      created_at: 2026-03-24T00:26:09.565Z
+      updated_at: 2026-03-24T00:26:09.565Z
+      version: 1
+  timestamp: 2026-03-24T00:26:09.600Z
+  sequenceNumber: 31
+- type: add
+  elementId: security.dataclassification.api-credentials
+  layerName: security
+  after:
+    id: 85641fd4-2e9c-4243-94dd-8370f85f9e49
+    path: security.dataclassification.api-credentials
+    spec_node_id: security.dataclassification
+    type: dataclassification
+    layer_id: security
+    name: API Credentials
+    description: GitHub tokens, Anthropic API keys, and GitHub App private keys
+    attributes:
+      version: "1.0"
+      encryptionRequirement: in-transit
+      classificationLevel: restricted
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: docker-compose.yml
+          symbol: environment
+    metadata:
+      created_at: 2026-03-24T00:26:17.859Z
+      updated_at: 2026-03-24T00:26:17.859Z
+      version: 1
+  timestamp: 2026-03-24T00:26:17.892Z
+  sequenceNumber: 32
+- type: add
+  elementId: security.dataclassification.source-code-and-pipeline-state
+  layerName: security
+  after:
+    id: 750ad7dc-320d-4279-9bc0-5f5ab3cf18c5
+    path: security.dataclassification.source-code-and-pipeline-state
+    spec_node_id: security.dataclassification
+    type: dataclassification
+    layer_id: security
+    name: Source Code and Pipeline State
+    description: Project source code, checkpoint files, and pipeline execution state
+    attributes:
+      version: "1.0"
+      encryptionRequirement: none
+      classificationLevel: confidential
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: state_management/manager.py
+          symbol: StateManager.checkpoint
+    metadata:
+      created_at: 2026-03-24T00:26:18.454Z
+      updated_at: 2026-03-24T00:26:18.454Z
+      version: 1
+  timestamp: 2026-03-24T00:26:18.488Z
+  sequenceNumber: 33
+- type: add
+  elementId: security.dataclassification.observability-telemetry
+  layerName: security
+  after:
+    id: 798afc97-c693-4612-817b-510a5e9c2bd1
+    path: security.dataclassification.observability-telemetry
+    spec_node_id: security.dataclassification
+    type: dataclassification
+    layer_id: security
+    name: Observability Telemetry
+    description: Agent execution logs, task metrics, and pipeline events stored in
+      Elasticsearch
+    attributes:
+      version: "1.0"
+      encryptionRequirement: none
+      classificationLevel: internal
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: monitoring/observability.py
+          symbol: ObservabilityService
+    metadata:
+      created_at: 2026-03-24T00:26:19.013Z
+      updated_at: 2026-03-24T00:26:19.013Z
+      version: 1
+  timestamp: 2026-03-24T00:26:19.046Z
+  sequenceNumber: 34
+- type: add
+  elementId: security.auditconfig.git-hub-action-audit-logging
+  layerName: security
+  after:
+    id: ff61253c-80d7-446c-950c-3092a1c567e6
+    path: security.auditconfig.git-hub-action-audit-logging
+    spec_node_id: security.auditconfig
+    type: auditconfig
+    layer_id: security
+    name: GitHub Action Audit Logging
+    description: All GitHub API calls logged with caller identifier, rate limit
+      usage, and response status
+    attributes:
+      level: standard
+      sanitizeFields: authorization
+      enabled: true
+      includeHeaders: false
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/github_api_client.py
+          symbol: GitHubAPIClient
+    metadata:
+      created_at: 2026-03-24T00:26:38.169Z
+      updated_at: 2026-03-24T00:26:38.169Z
+      version: 1
+  timestamp: 2026-03-24T00:26:38.205Z
+  sequenceNumber: 35
+- type: add
+  elementId: security.auditconfig.agent-execution-audit-logging
+  layerName: security
+  after:
+    id: 860b0187-ac4a-4266-8cdd-d4f383683620
+    path: security.auditconfig.agent-execution-audit-logging
+    spec_node_id: security.auditconfig
+    type: auditconfig
+    layer_id: security
+    name: Agent Execution Audit Logging
+    description: Agent container start, completion, exit code, and task details
+      logged to structured output
+    attributes:
+      level: standard
+      sanitizeFields: ANTHROPIC_API_KEY,GITHUB_TOKEN
+      enabled: true
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: claude/docker_runner.py
+          symbol: DockerAgentRunner
+    metadata:
+      created_at: 2026-03-24T00:26:38.727Z
+      updated_at: 2026-03-24T00:26:38.727Z
+      version: 1
+  timestamp: 2026-03-24T00:26:38.760Z
+  sequenceNumber: 36

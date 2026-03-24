@@ -1,0 +1,86 @@
+security.permission.git-hub-repository-read-write:
+  id: 9ddcd0e6-f50a-45d0-a4aa-c5e83dbd2f50
+  path: security.permission.git-hub-repository-read-write
+  spec_node_id: security.permission
+  type: permission
+  layer_id: security
+  name: GitHub Repository Read-Write
+  description: Contents, issues, pull requests read and write access to managed repositories
+  attributes:
+    scope: write
+    resource: github-repository
+    action: update
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: documentation/github-authentication.md
+        symbol: RepositoryPermissions
+  metadata:
+    created_at: 2026-03-24T00:25:51.132Z
+    updated_at: 2026-03-24T00:25:51.132Z
+    version: 1
+security.permission.git-hub-projects-board-admin:
+  id: 7b0cc75c-817c-4811-b214-3b7732854ba3
+  path: security.permission.git-hub-projects-board-admin
+  spec_node_id: security.permission
+  type: permission
+  layer_id: security
+  name: GitHub Projects Board Admin
+  description: Read and write access to GitHub Projects v2 Kanban boards
+  attributes:
+    scope: admin
+    resource: github-project
+    action: update
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: documentation/github-authentication.md
+        symbol: ProjectPermissions
+  metadata:
+    created_at: 2026-03-24T00:25:51.671Z
+    updated_at: 2026-03-24T00:25:51.671Z
+    version: 1
+security.permission.git-hub-discussions-write:
+  id: 01670f3a-c063-4e5f-948e-dd7cbc8510f0
+  path: security.permission.git-hub-discussions-write
+  spec_node_id: security.permission
+  type: permission
+  layer_id: security
+  name: GitHub Discussions Write
+  description: createDiscussion and addDiscussionComment mutations require GitHub
+    App installation token
+  attributes:
+    scope: write
+    resource: github-discussions
+    action: create
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: documentation/github-authentication.md
+        symbol: GitHubApp
+  metadata:
+    created_at: 2026-03-24T00:25:52.224Z
+    updated_at: 2026-03-24T00:25:52.224Z
+    version: 1
+security.permission.docker-socket-access:
+  id: d3e4f7b9-7f30-4533-aa6c-4ca042225b4e
+  path: security.permission.docker-socket-access
+  spec_node_id: security.permission
+  type: permission
+  layer_id: security
+  name: Docker Socket Access
+  description: Orchestrator and observability containers have access to Docker
+    socket for container management
+  attributes:
+    scope: admin
+    resource: docker-socket
+    action: execute
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: docker-compose.yml
+        symbol: docker.sock
+  metadata:
+    created_at: 2026-03-24T00:25:52.783Z
+    updated_at: 2026-03-24T00:25:52.783Z
+    version: 1

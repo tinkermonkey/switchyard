@@ -1,0 +1,414 @@
+application.applicationfunction.agent-task-dispatcher:
+  id: 21f2b094-bcd4-4714-a8a3-f1bc201c3766
+  path: application.applicationfunction.agent-task-dispatcher
+  spec_node_id: application.applicationfunction
+  type: applicationfunction
+  layer_id: application
+  name: Agent Task Dispatcher
+  description: Dequeues tasks from the priority queue and routes them to the
+    appropriate agent via process_task_integrated; supports single-threaded and
+    worker-pool execution modes
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: agents/orchestrator_integration.py
+        symbol: process_task_integrated
+  metadata:
+    created_at: 2026-03-24T00:06:03.665Z
+    updated_at: 2026-03-24T00:06:03.665Z
+    version: 1
+application.applicationfunction.git-hub-auth-provider:
+  id: 99199dd6-6d45-4027-9cfb-70a1ec750e41
+  path: application.applicationfunction.git-hub-auth-provider
+  spec_node_id: application.applicationfunction
+  type: applicationfunction
+  layer_id: application
+  name: GitHub Auth Provider
+  description: Provides GitHub authentication via GitHub App JWT tokens or
+    Personal Access Token fallback; caches installation tokens and
+    auto-refreshes on expiry
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/github_app_auth.py
+        symbol: GitHubAppAuth
+  metadata:
+    created_at: 2026-03-24T00:06:04.175Z
+    updated_at: 2026-03-24T00:06:04.175Z
+    version: 1
+application.applicationfunction.review-filter-manager:
+  id: 9c48ff58-e16d-44c7-95d6-7728a3f6dac1
+  path: application.applicationfunction.review-filter-manager
+  spec_node_id: application.applicationfunction
+  type: applicationfunction
+  layer_id: application
+  name: Review Filter Manager
+  description: Filters and classifies code review comments to distinguish
+    actionable feedback from noise, reducing unnecessary revision cycles
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/review_filter_manager.py
+        symbol: ReviewFilterManager
+  metadata:
+    created_at: 2026-03-24T00:06:04.712Z
+    updated_at: 2026-03-24T00:06:04.712Z
+    version: 1
+application.applicationfunction.pipeline-context-writer:
+  id: 11963fc4-7937-42d6-b9df-1ac6936fe563
+  path: application.applicationfunction.pipeline-context-writer
+  spec_node_id: application.applicationfunction
+  type: applicationfunction
+  layer_id: application
+  name: Pipeline Context Writer
+  description: Writes pipeline context (prior stage outputs, issue body, design
+    docs) to files for agent consumption before Docker container launch
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/pipeline_context_writer.py
+        symbol: PipelineContextWriter
+  metadata:
+    created_at: 2026-03-24T00:06:12.238Z
+    updated_at: 2026-03-24T00:06:12.238Z
+    version: 1
+application.applicationfunction.auto-commit-service:
+  id: b4ad0f47-a715-4789-8654-98d39d909536
+  path: application.applicationfunction.auto-commit-service
+  spec_node_id: application.applicationfunction
+  type: applicationfunction
+  layer_id: application
+  name: Auto Commit Service
+  description: Automatically stages and commits code changes made by
+    senior_software_engineer agent to the feature branch after implementation
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/auto_commit.py
+        symbol: AutoCommitService
+  metadata:
+    created_at: 2026-03-24T00:06:12.770Z
+    updated_at: 2026-03-24T00:06:12.770Z
+    version: 1
+application.applicationfunction.docker-command-builder:
+  id: cc6d8cf3-aa20-4394-9ff8-5d06c6a9f0d9
+  path: application.applicationfunction.docker-command-builder
+  spec_node_id: application.applicationfunction
+  type: applicationfunction
+  layer_id: application
+  name: Docker Command Builder
+  description: "Builds the full 'docker run' command for each agent container
+    (_build_docker_command in docker_runner.py): resolves host workspace path
+    from /proc/self/mountinfo to support Snap Docker, applies volume mounts
+    (/workspace rw/ro per filesystem_write_allowed, ~/.ssh read-only,
+    ~/.gitconfig, wrapper script, optional MCP config, optional
+    review_cycle_context at /review_cycle_context, optional pipeline_context at
+    /pipeline_context), attaches Docker network, sets container labels
+    (org.switchyard.*), and passes environment variables (GITHUB_TOKEN, auth
+    token, REDIS_HOST, AGENT, PROJECT, ISSUE_NUMBER, PIPELINE_RUN_ID)"
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: claude/docker_runner.py
+        symbol: DockerAgentRunner._build_docker_command
+  metadata:
+    created_at: 2026-03-24T08:33:59.433Z
+    updated_at: 2026-03-24T08:33:59.433Z
+    version: 1
+application.applicationfunction.container-image-selector:
+  id: d8429b16-3469-4868-a92f-34f7ac1ce25b
+  path: application.applicationfunction.container-image-selector
+  spec_node_id: application.applicationfunction
+  type: applicationfunction
+  layer_id: application
+  name: Container Image Selector
+  description: "Determines which Docker image to use for each agent
+    (_get_image_for_agent in docker_runner.py): if agent has
+    requires_dev_container=true AND DevContainerStateManager reports the project
+    image as verified, uses the project-specific image (e.g.
+    myproject-agent:latest); otherwise falls back to
+    switchyard-orchestrator:latest; dev_environment_setup additionally receives
+    a Docker socket mount (/var/run/docker.sock) to enable image building from
+    inside the container"
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: claude/docker_runner.py
+        symbol: DockerAgentRunner._get_image_for_agent
+  metadata:
+    created_at: 2026-03-24T08:34:05.134Z
+    updated_at: 2026-03-24T08:34:05.134Z
+    version: 1
+application.applicationfunction.host-path-detector:
+  id: 9db48865-4b36-45cd-9f8b-5e7804a58c45
+  path: application.applicationfunction.host-path-detector
+  spec_node_id: application.applicationfunction
+  type: applicationfunction
+  layer_id: application
+  name: Host Path Detector
+  description: "Resolves actual host filesystem paths for Docker-in-Docker volume
+    mounts (_detect_host_workspace_path and _detect_host_home_path in
+    docker_runner.py): reads /proc/self/mountinfo to find the real host path
+    bound to /workspace (avoids Snap Docker snap-versioned path issue); requires
+    HOST_HOME env var to be set explicitly in .env for SSH/git mounts because
+    /proc inference is unreliable under Snap Docker; falls back to
+    HOST_WORKSPACE_PATH env var or /workspace if detection fails"
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: claude/docker_runner.py
+        symbol: DockerAgentRunner._detect_host_workspace_path
+  metadata:
+    created_at: 2026-03-24T08:34:11.658Z
+    updated_at: 2026-03-24T08:34:11.658Z
+    version: 1
+application.applicationfunction.container-write-verifier:
+  id: 2afa853f-87b6-4435-a4ef-d457f2bc29cd
+  path: application.applicationfunction.container-write-verifier
+  spec_node_id: application.applicationfunction
+  type: applicationfunction
+  layer_id: application
+  name: Container Write Verifier
+  description: Pre-launch safety check (_verify_container_write_access in
+    docker_runner.py) that spawns a lightweight test container using
+    switchyard-orchestrator:latest before launching the expensive Claude agent;
+    tests that the container can write, read, and delete a file in /workspace;
+    retries up to 3 times with 2-second backoff; aborts the agent launch if
+    write access cannot be confirmed, preventing wasted API calls when the
+    volume mount has permission issues
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: claude/docker_runner.py
+        symbol: DockerAgentRunner._verify_container_write_access
+  metadata:
+    created_at: 2026-03-24T08:34:16.442Z
+    updated_at: 2026-03-24T08:34:16.442Z
+    version: 1
+application.applicationfunction.mcp-config-manager:
+  id: 202fe78c-29aa-41cd-a746-69845d55f8d3
+  path: application.applicationfunction.mcp-config-manager
+  spec_node_id: application.applicationfunction
+  type: applicationfunction
+  layer_id: application
+  name: MCP Config Manager
+  description: "Manages Model Context Protocol server configuration for agent
+    containers (_prepare_mcp_config and _write_mcp_config_file in
+    docker_runner.py): translates per-agent MCP server definitions (http or
+    stdio type) into a .mcp.json file written to /workspace/.orchestrator/tmp
+    (preferred), /app/tmp, or /tmp as fallback; substitutes {work_dir} template
+    in stdio args with /workspace (container path); sanitizes task_id colons and
+    special characters to prevent Docker mount parsing errors; mounts the file
+    read-only at /home/orchestrator/.mcp_config.json inside the agent container;
+    cleans up the temp file after container exit"
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: claude/docker_runner.py
+        symbol: DockerAgentRunner._prepare_mcp_config
+  metadata:
+    created_at: 2026-03-24T08:34:23.751Z
+    updated_at: 2026-03-24T08:34:23.751Z
+    version: 1
+application.applicationfunction.container-recovery-reconnector:
+  id: 7f1d2d07-a6c3-4703-a424-1bc475b78029
+  path: application.applicationfunction.container-recovery-reconnector
+  spec_node_id: application.applicationfunction
+  type: applicationfunction
+  layer_id: application
+  name: Container Recovery Reconnector
+  description: "Reconnects to and monitors running agent containers after
+    orchestrator restart (reconnect_to_container and
+    _monitor_recovered_container in docker_runner.py): spawns a daemon thread
+    that runs 'docker wait' with the agent's configured hard timeout; on
+    container exit, attempts output retrieval in priority order: 1) Redis key
+    agent_result:{project}:{issue}:{task_id}, 2) fallback file
+    /tmp/agent_result_{task_id}.json via docker cp, 3) docker logs; parses raw
+    stream-json events if the output contains unparsed JSON lines
+    (_parse_stream_json_output); delegates to _complete_agent_execution for
+    GitHub posting and outcome recording"
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: claude/docker_runner.py
+        symbol: DockerAgentRunner.reconnect_to_container
+  metadata:
+    created_at: 2026-03-24T08:34:31.073Z
+    updated_at: 2026-03-24T08:34:31.073Z
+    version: 1
+application.applicationfunction.container-execution-validator:
+  id: 4d7c836b-2839-4370-a834-5c9f88d630db
+  path: application.applicationfunction.container-execution-validator
+  spec_node_id: application.applicationfunction
+  type: applicationfunction
+  layer_id: application
+  name: Container Execution Validator
+  description: "Validates agent output after container exit with code 0
+    (_validate_result in docker_runner.py): rejects empty output or output
+    shorter than 50 characters as a persistence failure (wrapper could not write
+    to Redis or file, or Claude crashed); scans first 1KB of output for error
+    markers (CRITICAL ERROR, FATAL:, Traceback, redis.exceptions,
+    ConnectionRefusedError) that indicate a failure despite a zero exit code; on
+    validation failure, persists a failure result to Redis and records the
+    outcome before returning empty string to trigger retry"
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: claude/docker_runner.py
+        symbol: DockerAgentRunner._validate_result
+  metadata:
+    created_at: 2026-03-24T08:34:37.664Z
+    updated_at: 2026-03-24T08:34:37.664Z
+    version: 1
+application.applicationfunction.prompt-file-writer-and-stdin-pipe:
+  id: 15425f2f-5cff-4db6-a87c-5968ebcc1f8b
+  path: application.applicationfunction.prompt-file-writer-and-stdin-pipe
+  spec_node_id: application.applicationfunction
+  type: applicationfunction
+  layer_id: application
+  name: Prompt File Writer and Stdin Pipe
+  description: "Prompts are written to .claude_prompt_{safe_task_id}.txt inside
+    the mounted project directory; inside the container the shell command is:
+    cat /workspace/{filename} | python3 /app/scripts/docker-claude-wrapper.py
+    --print --verbose --output-format stream-json --model {model}
+    --permission-mode bypassPermissions [-]; this avoids shell command-length
+    limits and allows orchestrator to inspect the prompt file after the run"
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: claude/docker_runner.py
+        symbol: DockerAgentRunner._execute_in_container
+  metadata:
+    created_at: 2026-03-24T09:00:44.059Z
+    updated_at: 2026-03-24T09:00:44.059Z
+    version: 1
+application.applicationfunction.container-image-selection-decision-tree:
+  id: 1df3ba26-de85-44fc-873f-24478b92e8a0
+  path: application.applicationfunction.container-image-selection-decision-tree
+  spec_node_id: application.applicationfunction
+  type: applicationfunction
+  layer_id: application
+  name: Container Image Selection Decision Tree
+  description: "Decision: if agent config has requires_dev_container=true AND
+    dev_container_state.is_verified(project) is true AND get_image_name(project)
+    returns a value, use the project-specific dev container image; otherwise
+    fall back to switchyard-orchestrator:latest; dev_environment_setup agent
+    always falls back to orchestrator image (no project config)"
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: claude/docker_runner.py
+        symbol: DockerAgentRunner._get_image_for_agent
+  metadata:
+    created_at: 2026-03-24T09:00:57.051Z
+    updated_at: 2026-03-24T09:00:57.051Z
+    version: 1
+application.applicationfunction.exit-code-zero-empty-output-failure-detection:
+  id: 95805839-4915-47db-93d2-c4721a45ce9e
+  path: application.applicationfunction.exit-code-zero-empty-output-failure-detection
+  spec_node_id: application.applicationfunction
+  type: applicationfunction
+  layer_id: application
+  name: Exit-Code-Zero Empty Output Failure Detection
+  description: "After container exits with code 0, the result text is validated:
+    if result_text is empty (wrapper failed to persist, Claude crashed
+    silently), the run is treated as a failure — exit code 0 is not sufficient
+    for success; failure is persisted to Redis and recorded in
+    work_execution_tracker before returning empty string"
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: claude/docker_runner.py
+        symbol: DockerAgentRunner._execute_in_container
+  metadata:
+    created_at: 2026-03-24T09:01:04.055Z
+    updated_at: 2026-03-24T09:01:04.055Z
+    version: 1
+application.applicationfunction.claude-session-id-capture-and-resume:
+  id: 1f82961b-b8ea-4005-accb-b38cdb9546d9
+  path: application.applicationfunction.claude-session-id-capture-and-resume
+  spec_node_id: application.applicationfunction
+  type: applicationfunction
+  layer_id: application
+  name: Claude Session ID Capture and Resume
+  description: The first JSON event emitted by Claude Code that contains a
+    session_id field is captured from the stdout stream; the session_id is
+    stored in context['claude_session_id']; on subsequent agent invocations for
+    the same issue, the --resume {session_id} flag is passed to the claude
+    command, enabling multi-turn conversation continuity across separate
+    container launches
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: claude/docker_runner.py
+        symbol: DockerAgentRunner._execute_in_container
+  metadata:
+    created_at: 2026-03-24T09:01:16.631Z
+    updated_at: 2026-03-24T09:01:16.631Z
+    version: 1
+application.applicationfunction.pr-review-in-process-thread-execution:
+  id: 055493e3-5f4f-4fc9-b6e4-685f8af08b1e
+  path: application.applicationfunction.pr-review-in-process-thread-execution
+  spec_node_id: application.applicationfunction
+  type: applicationfunction
+  layer_id: application
+  name: PR Review In-Process Thread Execution
+  description: stage_type='pr_review' stages run PRReviewStage in-process inside a
+    background thread (not in a Docker container); this is the only agent
+    execution path that does not use DockerAgentRunner; it allows the PR review
+    to access internal Python services (pipeline_run_manager, state files)
+    directly without container boundary overhead
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/project_monitor.py
+        symbol: ProjectMonitor._start_pr_review_for_issue
+  metadata:
+    created_at: 2026-03-24T09:02:04.424Z
+    updated_at: 2026-03-24T09:02:04.424Z
+    version: 1
+application.applicationfunction.sub-issue-discussion-lookup-via-part-of-pattern:
+  id: 09d8e475-89e4-41b4-aa01-d20c0465d77c
+  path: application.applicationfunction.sub-issue-discussion-lookup-via-part-of-pattern
+  spec_node_id: application.applicationfunction
+  type: applicationfunction
+  layer_id: application
+  name: Sub-Issue Discussion Lookup via Part-Of Pattern
+  description: "When a sub-issue needs pipeline context from its parent epic's
+    discussion: (1) check issue_discussion_links in github_state.yaml for the
+    sub-issue's number; (2) if not found, fetch the issue body via 'gh issue
+    view --json body' and parse 'Part of #NNN' with regex; (3) look up the
+    parent issue number's discussion in issue_discussion_links; this is the
+    cross-workspace context propagation mechanism for the planning-to-execution
+    handoff"
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/project_monitor.py
+        symbol: ProjectMonitor.get_previous_stage_context
+  metadata:
+    created_at: 2026-03-24T09:02:10.757Z
+    updated_at: 2026-03-24T09:02:10.757Z
+    version: 1
+application.applicationfunction.mcp-config-task-id-sanitization:
+  id: e8bd6b48-a5b4-4b40-bcd4-d8f6cf981c5b
+  path: application.applicationfunction.mcp-config-task-id-sanitization
+  spec_node_id: application.applicationfunction
+  type: applicationfunction
+  layer_id: application
+  name: MCP Config Task-ID Sanitization
+  description: "Before writing the MCP config file, the task_id is sanitized:
+    colons (:) are replaced with underscores because Docker interprets colons as
+    volume mount separators causing 'too many colons' errors; additional
+    problematic characters (/, \\, space, *, ?, \", <, >, |) are also replaced;
+    the config is written to the first writable candidate directory in priority
+    order: /workspace/.orchestrator/tmp, /app/tmp, ./tmp, /tmp"
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: claude/docker_runner.py
+        symbol: DockerAgentRunner._write_mcp_config_file
+  metadata:
+    created_at: 2026-03-24T09:02:48.056Z
+    updated_at: 2026-03-24T09:02:48.056Z
+    version: 1

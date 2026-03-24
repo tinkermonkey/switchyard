@@ -1,0 +1,124 @@
+testing.testcoveragetarget.pipeline-orchestration:
+  id: a920bd2d-ac5d-466a-926a-8c8eb318b5e9
+  path: testing.testcoveragetarget.pipeline-orchestration
+  spec_node_id: testing.testcoveragetarget
+  type: testcoveragetarget
+  layer_id: testing
+  name: Pipeline Orchestration
+  description: Sequential pipeline execution with circuit breaker protection and
+    checkpoint-based recovery
+  attributes:
+    targetType: business-workflow
+    priority: high
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: pipeline/orchestrator.py
+        symbol: SequentialPipeline
+  metadata:
+    created_at: 2026-03-24T00:20:35.296Z
+    updated_at: 2026-03-24T00:20:35.296Z
+    version: 1
+testing.testcoveragetarget.review-cycle-state-machine:
+  id: 33ebceff-452d-485e-a2b7-a09b984cb4fb
+  path: testing.testcoveragetarget.review-cycle-state-machine
+  spec_node_id: testing.testcoveragetarget
+  type: testcoveragetarget
+  layer_id: testing
+  name: Review Cycle State Machine
+  description: Maker-checker review loop state transitions, iteration counting,
+    approval/rejection handling, and escalation logic
+  attributes:
+    targetType: business-workflow
+    priority: high
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/review_cycle.py
+        symbol: ReviewCycleState
+  metadata:
+    created_at: 2026-03-24T00:20:35.785Z
+    updated_at: 2026-03-24T00:20:35.785Z
+    version: 1
+testing.testcoveragetarget.task-queue-management:
+  id: 70fa96d8-4a21-4f5e-9ebb-46a0c15b1232
+  path: testing.testcoveragetarget.task-queue-management
+  spec_node_id: testing.testcoveragetarget
+  type: testcoveragetarget
+  layer_id: testing
+  name: Task Queue Management
+  description: Redis priority queue enqueue/dequeue, not_before scheduling,
+    priority ordering, and in-memory fallback
+  attributes:
+    targetType: integration-flow
+    priority: high
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: task_queue/task_manager.py
+        symbol: TaskQueue
+  metadata:
+    created_at: 2026-03-24T00:20:36.301Z
+    updated_at: 2026-03-24T00:20:36.301Z
+    version: 1
+testing.testcoveragetarget.pipeline-lock-management:
+  id: 086968f5-2de5-44bf-b1d5-b40e1e56955f
+  path: testing.testcoveragetarget.pipeline-lock-management
+  spec_node_id: testing.testcoveragetarget
+  type: testcoveragetarget
+  layer_id: testing
+  name: Pipeline Lock Management
+  description: Exclusive pipeline lock acquire/release, YAML-Redis sync, startup
+    lock recovery, and queue management
+  attributes:
+    targetType: business-workflow
+    priority: high
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/pipeline_lock_manager.py
+  metadata:
+    created_at: 2026-03-24T00:20:44.285Z
+    updated_at: 2026-03-24T00:20:44.285Z
+    version: 1
+testing.testcoveragetarget.observability-api-endpoints:
+  id: 68f0e88d-f575-4c79-a525-017f0fc6c2df
+  path: testing.testcoveragetarget.observability-api-endpoints
+  spec_node_id: testing.testcoveragetarget
+  type: testcoveragetarget
+  layer_id: testing
+  name: Observability API Endpoints
+  description: "REST endpoints: /health, /agents/active, /history,
+    /pipeline-run-events, /api/circuit-breakers, /api/projects and WebSocket
+    event streaming"
+  attributes:
+    targetType: api-endpoint
+    priority: medium
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/observability_server.py
+  metadata:
+    created_at: 2026-03-24T00:20:44.787Z
+    updated_at: 2026-03-24T00:20:44.787Z
+    version: 1
+testing.testcoveragetarget.feature-branch-workflow:
+  id: 3da63575-e036-46f8-86f4-7ce11cead2a7
+  path: testing.testcoveragetarget.feature-branch-workflow
+  spec_node_id: testing.testcoveragetarget
+  type: testcoveragetarget
+  layer_id: testing
+  name: Feature Branch Workflow
+  description: Branch creation, sub-issue contribution tracking, merge conflict
+    detection, stale branch handling, and PR lifecycle management
+  attributes:
+    targetType: business-workflow
+    priority: high
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/feature_branch_manager.py
+  metadata:
+    created_at: 2026-03-24T00:20:45.324Z
+    updated_at: 2026-03-24T00:20:45.324Z
+    version: 1

@@ -1,0 +1,52 @@
+business.businessactor.software-development-team:
+  id: 766897b5-f8dd-4c1d-b8c2-0c0af4ae9de3
+  path: business.businessactor.software-development-team
+  spec_node_id: business.businessactor
+  type: businessactor
+  layer_id: business
+  name: Software Development Team
+  description: Human developers who create GitHub issues and move cards on Kanban boards
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: config/foundations/pipelines.yaml
+        symbol: planning_design
+  metadata:
+    created_at: 2026-03-24T00:27:22.256Z
+    updated_at: 2026-03-24T00:27:22.256Z
+    version: 1
+business.businessactor.claude-ai-models:
+  id: 933ebb6c-7010-4fb5-84dc-067cd6309b93
+  path: business.businessactor.claude-ai-models
+  spec_node_id: business.businessactor
+  type: businessactor
+  layer_id: business
+  name: Claude AI Models
+  description: Anthropic Claude models (Opus, Sonnet, Haiku) that execute
+    autonomous agent tasks
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: config/foundations/agents.yaml
+        symbol: agents
+  metadata:
+    created_at: 2026-03-24T00:27:22.763Z
+    updated_at: 2026-03-24T00:27:22.763Z
+    version: 1
+business.businessactor.git-hub-projects-v2:
+  id: 5e9df5f1-3795-4306-99f9-7ffb52693bd1
+  path: business.businessactor.git-hub-projects-v2
+  spec_node_id: business.businessactor
+  type: businessactor
+  layer_id: business
+  name: GitHub Projects v2
+  description: External GitHub service providing Kanban board columns and issue tracking
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/github_project_manager.py
+        symbol: GitHubProjectManager
+  metadata:
+    created_at: 2026-03-24T00:27:23.279Z
+    updated_at: 2026-03-24T00:27:23.279Z
+    version: 1

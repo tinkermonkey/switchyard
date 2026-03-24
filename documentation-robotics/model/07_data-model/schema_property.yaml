@@ -1,0 +1,63 @@
+data-model.schemaproperty.taskid:
+  id: 9593cede-db79-4c7a-9b2d-73fd32a0525a
+  path: data-model.schemaproperty.taskid
+  spec_node_id: data-model.schemaproperty
+  type: schemaproperty
+  layer_id: data-model
+  name: task.id
+  description: Unique UUID identifier for a task, used for deduplication and
+    tracking in Redis and logs
+  attributes:
+    type: string
+    format: uuid
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: task_queue/task_manager.py
+        symbol: Task.id
+  metadata:
+    created_at: 2026-03-24T00:12:54.631Z
+    updated_at: 2026-03-24T00:12:54.631Z
+    version: 1
+data-model.schemaproperty.taskpriority:
+  id: 63edcf45-8ae3-4037-bf01-a8e4c7e8039a
+  path: data-model.schemaproperty.taskpriority
+  spec_node_id: data-model.schemaproperty
+  type: schemaproperty
+  layer_id: data-model
+  name: task.priority
+  description: "Task priority level determining queue order: HIGH (PR reviews,
+    blocking), MEDIUM (development tasks), LOW (documentation, cleanup)"
+  attributes:
+    type: string
+    enum: HIGH MEDIUM LOW
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: task_queue/task_manager.py
+        symbol: TaskPriority
+  metadata:
+    created_at: 2026-03-24T00:12:55.019Z
+    updated_at: 2026-03-24T00:12:55.019Z
+    version: 1
+data-model.schemaproperty.pipeline-runstatus:
+  id: 9076a88a-bb1b-49cc-9c88-01f467ca6ca4
+  path: data-model.schemaproperty.pipeline-runstatus
+  spec_node_id: data-model.schemaproperty
+  type: schemaproperty
+  layer_id: data-model
+  name: pipeline_run.status
+  description: "Pipeline run lifecycle status: active (processing), completed
+    (success), failed (error), or cancelled"
+  attributes:
+    type: string
+    enum: active completed failed cancelled
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/pipeline_run.py
+        symbol: PipelineRun.status
+  metadata:
+    created_at: 2026-03-24T00:12:55.494Z
+    updated_at: 2026-03-24T00:12:55.494Z
+    version: 1

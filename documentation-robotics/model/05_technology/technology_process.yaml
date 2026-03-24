@@ -1,0 +1,38 @@
+technology.technologyprocess.docker-build-process:
+  id: cc8d41b1-cc5d-412f-9cf1-1d4be8cc6f33
+  path: technology.technologyprocess.docker-build-process
+  spec_node_id: technology.technologyprocess
+  type: technologyprocess
+  layer_id: technology
+  name: Docker Build Process
+  description: docker build process that creates project-specific agent images
+    from Dockerfile.agent; executed by dev_environment_setup agent to provision
+    project dependencies
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: agents/dev_environment_setup_agent.py
+        symbol: DevEnvironmentSetupAgent
+  metadata:
+    created_at: 2026-03-24T00:09:06.295Z
+    updated_at: 2026-03-24T00:09:06.295Z
+    version: 1
+technology.technologyprocess.redis-stream-log-pipeline:
+  id: 35e47b15-6a1e-4b5f-bcc2-abee92eaa653
+  path: technology.technologyprocess.redis-stream-log-pipeline
+  spec_node_id: technology.technologyprocess
+  type: technologyprocess
+  layer_id: technology
+  name: Redis Stream Log Pipeline
+  description: Async pipeline that writes structured events to Redis streams, then
+    log-collector batches and bulk-indexes them to Elasticsearch for pattern
+    analysis
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/log_collector.py
+        symbol: LogCollector
+  metadata:
+    created_at: 2026-03-24T00:09:06.800Z
+    updated_at: 2026-03-24T00:09:06.800Z
+    version: 1

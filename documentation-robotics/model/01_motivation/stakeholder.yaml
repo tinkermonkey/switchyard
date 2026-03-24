@@ -1,0 +1,80 @@
+motivation.stakeholder.software-development-teams:
+  id: 216a0940-9a5c-4e67-a7d8-afd18f575349
+  path: motivation.stakeholder.software-development-teams
+  spec_node_id: motivation.stakeholder
+  type: stakeholder
+  layer_id: motivation
+  name: Software Development Teams
+  description: Internal engineering teams who use the orchestrator to automate
+    their SDLC workflows
+  attributes:
+    type: internal
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: main.py
+        symbol: main
+  metadata:
+    created_at: 2026-03-24T00:29:43.125Z
+    updated_at: 2026-03-24T00:29:43.125Z
+    version: 1
+motivation.stakeholder.platform-engineering:
+  id: 1ee7348c-3076-41bc-aaf7-5840e837334f
+  path: motivation.stakeholder.platform-engineering
+  spec_node_id: motivation.stakeholder
+  type: stakeholder
+  layer_id: motivation
+  name: Platform Engineering
+  description: DevOps engineers who deploy, configure, and maintain the
+    orchestrator infrastructure
+  attributes:
+    type: internal
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: docker-compose.yml
+        symbol: orchestrator
+  metadata:
+    created_at: 2026-03-24T00:29:43.650Z
+    updated_at: 2026-03-24T00:29:43.650Z
+    version: 1
+motivation.stakeholder.anthropic-claude-api:
+  id: 10166279-ac74-4d39-b7e5-023525f7d3bd
+  path: motivation.stakeholder.anthropic-claude-api
+  spec_node_id: motivation.stakeholder
+  type: stakeholder
+  layer_id: motivation
+  name: Anthropic Claude API
+  description: External AI model provider whose API pricing, rate limits, and
+    capabilities constrain system design
+  attributes:
+    type: external
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: requirements.txt
+        symbol: anthropic
+  metadata:
+    created_at: 2026-03-24T00:29:44.186Z
+    updated_at: 2026-03-24T00:29:44.186Z
+    version: 1
+motivation.stakeholder.git-hub-platform:
+  id: 524e62a2-a9fa-4283-870f-116deec668b8
+  path: motivation.stakeholder.git-hub-platform
+  spec_node_id: motivation.stakeholder
+  type: stakeholder
+  layer_id: motivation
+  name: GitHub Platform
+  description: External platform providing issue tracking, project boards, code
+    hosting, and CI/CD integration
+  attributes:
+    type: external
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/github_app.py
+        symbol: GitHubApp
+  metadata:
+    created_at: 2026-03-24T00:29:44.717Z
+    updated_at: 2026-03-24T00:29:44.717Z
+    version: 1

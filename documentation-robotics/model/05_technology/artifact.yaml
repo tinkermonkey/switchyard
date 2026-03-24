@@ -1,0 +1,165 @@
+technology.artifact.orchestrator-docker-image:
+  id: 17b96990-40f0-46be-9037-5bf3a9a53a42
+  path: technology.artifact.orchestrator-docker-image
+  spec_node_id: technology.artifact
+  type: artifact
+  layer_id: technology
+  name: Orchestrator Docker Image
+  description: Docker image built from Dockerfile; includes Python 3.11, Node.js
+    v22, Claude Code CLI, GitHub CLI, Docker CLI, Playwright dependencies, and
+    all Python requirements
+  attributes:
+    artifactType: container-image
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: Dockerfile
+        symbol: FROM python:3.11-slim
+  metadata:
+    created_at: 2026-03-24T00:08:08.679Z
+    updated_at: 2026-03-24T00:08:08.679Z
+    version: 1
+technology.artifact.project-agent-docker-image:
+  id: 4104e828-ddc6-4cb8-8082-88d8ec686cc5
+  path: technology.artifact.project-agent-docker-image
+  spec_node_id: technology.artifact
+  type: artifact
+  layer_id: technology
+  name: Project Agent Docker Image
+  description: Project-specific Docker agent image built from Dockerfile.agent in
+    the project workspace; includes project dependencies, Claude Code CLI, git,
+    and gh CLI
+  attributes:
+    artifactType: container-image
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: Dockerfile.agent
+        symbol: Dockerfile.agent
+  metadata:
+    created_at: 2026-03-24T00:08:09.144Z
+    updated_at: 2026-03-24T00:08:09.144Z
+    version: 1
+technology.artifact.react-web-ui-build:
+  id: b676f5b7-ce2a-46c1-8fd0-73d68bc64aa7
+  path: technology.artifact.react-web-ui-build
+  spec_node_id: technology.artifact
+  type: artifact
+  layer_id: technology
+  name: React Web UI Build
+  description: Vite-compiled React 19 web UI bundle; includes TanStack Router,
+    XYFlow pipeline graphs, Socket.IO client, Tailwind CSS, Flowbite components,
+    and Lucide icons
+  attributes:
+    artifactType: archive
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: web_ui/package.json
+        symbol: vite build
+  metadata:
+    created_at: 2026-03-24T00:08:18.282Z
+    updated_at: 2026-03-24T00:08:18.282Z
+    version: 1
+technology.artifact.pipeline-checkpoint-file:
+  id: d7758f9c-be7f-4156-a174-0005e75151fd
+  path: technology.artifact.pipeline-checkpoint-file
+  spec_node_id: technology.artifact
+  type: artifact
+  layer_id: technology
+  name: Pipeline Checkpoint File
+  description: JSON checkpoint file written to
+    orchestrator_data/state/checkpoints/ before each pipeline stage; enables
+    recovery by resuming from highest committed stage index
+  attributes:
+    artifactType: file
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: state_management/manager.py
+        symbol: StateManager.checkpoint
+  metadata:
+    created_at: 2026-03-24T00:08:18.799Z
+    updated_at: 2026-03-24T00:08:18.799Z
+    version: 1
+technology.artifact.requirements-configuration:
+  id: dc330373-b154-4120-bc2b-4874f7743621
+  path: technology.artifact.requirements-configuration
+  spec_node_id: technology.artifact
+  type: artifact
+  layer_id: technology
+  name: Requirements Configuration
+  description: requirements.txt defining Python package dependencies for the
+    orchestrator, including Redis, Elasticsearch, Flask, asyncio, PyJWT,
+    APScheduler, and testing tools
+  attributes:
+    artifactType: configuration
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: requirements.txt
+  metadata:
+    created_at: 2026-03-24T00:08:19.286Z
+    updated_at: 2026-03-24T00:08:19.286Z
+    version: 1
+technology.artifact.docker-compose-configuration:
+  id: 8faa11ca-1429-4f04-997c-3102fa2b7ed1
+  path: technology.artifact.docker-compose-configuration
+  spec_node_id: technology.artifact
+  type: artifact
+  layer_id: technology
+  name: Docker Compose Configuration
+  description: "docker-compose.yml orchestrating 7 services: redis, orchestrator,
+    observability-server, web-ui, log-collector, browserless, and elasticsearch
+    with named volumes and orchestrator-net bridge network"
+  attributes:
+    artifactType: configuration
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: docker-compose.yml
+  metadata:
+    created_at: 2026-03-24T00:08:26.968Z
+    updated_at: 2026-03-24T00:08:26.968Z
+    version: 1
+technology.artifact.project-configuration-files:
+  id: 24361f29-2c67-481b-81b6-4d0cba0fc350
+  path: technology.artifact.project-configuration-files
+  spec_node_id: technology.artifact
+  type: artifact
+  layer_id: technology
+  name: Project Configuration Files
+  description: "YAML files in config/projects/ defining per-project settings:
+    GitHub org/repo, tech stacks, enabled pipeline templates, board names, and
+    visibility flags"
+  attributes:
+    artifactType: configuration
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: config/projects/
+  metadata:
+    created_at: 2026-03-24T00:08:27.462Z
+    updated_at: 2026-03-24T00:08:27.462Z
+    version: 1
+technology.artifact.pipeline-lock-state-file:
+  id: 35a59dcd-11cb-46c9-b759-48be8343347c
+  path: technology.artifact.pipeline-lock-state-file
+  spec_node_id: technology.artifact
+  type: artifact
+  layer_id: technology
+  name: Pipeline Lock State File
+  description: YAML state files persisting pipeline locks in
+    state/pipeline_locks/; synced to Redis on startup for recovery after
+    orchestrator restart
+  attributes:
+    artifactType: file
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/pipeline_lock_manager.py
+        symbol: PipelineLockManager
+  metadata:
+    created_at: 2026-03-24T00:08:27.957Z
+    updated_at: 2026-03-24T00:08:27.957Z
+    version: 1

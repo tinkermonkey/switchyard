@@ -1,0 +1,813 @@
+- type: add
+  elementId: business.businessactor.software-development-team
+  layerName: business
+  after:
+    id: 766897b5-f8dd-4c1d-b8c2-0c0af4ae9de3
+    path: business.businessactor.software-development-team
+    spec_node_id: business.businessactor
+    type: businessactor
+    layer_id: business
+    name: Software Development Team
+    description: Human developers who create GitHub issues and move cards on Kanban boards
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: config/foundations/pipelines.yaml
+          symbol: planning_design
+    metadata:
+      created_at: 2026-03-24T00:27:22.256Z
+      updated_at: 2026-03-24T00:27:22.256Z
+      version: 1
+  timestamp: 2026-03-24T00:27:22.279Z
+  sequenceNumber: 0
+- type: add
+  elementId: business.businessactor.claude-ai-models
+  layerName: business
+  after:
+    id: 933ebb6c-7010-4fb5-84dc-067cd6309b93
+    path: business.businessactor.claude-ai-models
+    spec_node_id: business.businessactor
+    type: businessactor
+    layer_id: business
+    name: Claude AI Models
+    description: Anthropic Claude models (Opus, Sonnet, Haiku) that execute
+      autonomous agent tasks
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: config/foundations/agents.yaml
+          symbol: agents
+    metadata:
+      created_at: 2026-03-24T00:27:22.763Z
+      updated_at: 2026-03-24T00:27:22.763Z
+      version: 1
+  timestamp: 2026-03-24T00:27:22.793Z
+  sequenceNumber: 1
+- type: add
+  elementId: business.businessactor.git-hub-projects-v2
+  layerName: business
+  after:
+    id: 5e9df5f1-3795-4306-99f9-7ffb52693bd1
+    path: business.businessactor.git-hub-projects-v2
+    spec_node_id: business.businessactor
+    type: businessactor
+    layer_id: business
+    name: GitHub Projects v2
+    description: External GitHub service providing Kanban board columns and issue tracking
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/github_project_manager.py
+          symbol: GitHubProjectManager
+    metadata:
+      created_at: 2026-03-24T00:27:23.279Z
+      updated_at: 2026-03-24T00:27:23.279Z
+      version: 1
+  timestamp: 2026-03-24T00:27:23.305Z
+  sequenceNumber: 2
+- type: add
+  elementId: business.businessrole.epic-owner
+  layerName: business
+  after:
+    id: e1434978-aae2-4d3e-b1bf-5b148574d4b5
+    path: business.businessrole.epic-owner
+    spec_node_id: business.businessrole
+    type: businessrole
+    layer_id: business
+    name: Epic Owner
+    description: Team member who creates epic issues and drives feature planning
+      through the board
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: config/foundations/workflows.yaml
+          symbol: planning_design_workflow
+    metadata:
+      created_at: 2026-03-24T00:27:33.633Z
+      updated_at: 2026-03-24T00:27:33.633Z
+      version: 1
+  timestamp: 2026-03-24T00:27:33.656Z
+  sequenceNumber: 3
+- type: add
+  elementId: business.businessrole.pipeline-operator
+  layerName: business
+  after:
+    id: 49c9a285-fb41-4408-b497-8eb2206d22b2
+    path: business.businessrole.pipeline-operator
+    spec_node_id: business.businessrole
+    type: businessrole
+    layer_id: business
+    name: Pipeline Operator
+    description: DevOps engineer who configures projects, manages infrastructure,
+      and monitors orchestrator
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: main.py
+          symbol: main
+    metadata:
+      created_at: 2026-03-24T00:27:34.141Z
+      updated_at: 2026-03-24T00:27:34.141Z
+      version: 1
+  timestamp: 2026-03-24T00:27:34.163Z
+  sequenceNumber: 4
+- type: add
+  elementId: business.businessrole.code-reviewer
+  layerName: business
+  after:
+    id: 20305f7f-e6a9-42d6-bbfa-8ada65188df8
+    path: business.businessrole.code-reviewer
+    spec_node_id: business.businessrole
+    type: businessrole
+    layer_id: business
+    name: Code Reviewer
+    description: Autonomous code reviewer agent that validates implementation
+      quality against requirements
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: config/foundations/pipelines.yaml
+          symbol: sdlc_execution.stages.implementation
+    metadata:
+      created_at: 2026-03-24T00:27:34.649Z
+      updated_at: 2026-03-24T00:27:34.649Z
+      version: 1
+  timestamp: 2026-03-24T00:27:34.672Z
+  sequenceNumber: 5
+- type: add
+  elementId: business.businessservice.sdlc-automation-service
+  layerName: business
+  after:
+    id: 9197ef48-a103-47a5-9779-f2b081c1568a
+    path: business.businessservice.sdlc-automation-service
+    spec_node_id: business.businessservice
+    type: businessservice
+    layer_id: business
+    name: SDLC Automation Service
+    description: End-to-end software development lifecycle automation from issue to
+      staged PR
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: config/foundations/pipelines.yaml
+          symbol: sdlc_execution
+    metadata:
+      created_at: 2026-03-24T00:27:44.503Z
+      updated_at: 2026-03-24T00:27:44.503Z
+      version: 1
+  timestamp: 2026-03-24T00:27:44.528Z
+  sequenceNumber: 6
+- type: add
+  elementId: business.businessservice.epic-planning-service
+  layerName: business
+  after:
+    id: 7918584e-cfd7-4378-ad8d-252e70eb8cc7
+    path: business.businessservice.epic-planning-service
+    spec_node_id: business.businessservice
+    type: businessservice
+    layer_id: business
+    name: Epic Planning Service
+    description: AI-driven planning pipeline for research, requirements,
+      architecture, and work breakdown
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: config/foundations/pipelines.yaml
+          symbol: planning_design
+    metadata:
+      created_at: 2026-03-24T00:27:45.024Z
+      updated_at: 2026-03-24T00:27:45.024Z
+      version: 1
+  timestamp: 2026-03-24T00:27:45.048Z
+  sequenceNumber: 7
+- type: add
+  elementId: business.businessservice.development-environment-service
+  layerName: business
+  after:
+    id: 5cba1cd9-990b-4841-ab1a-a3d648900355
+    path: business.businessservice.development-environment-service
+    spec_node_id: business.businessservice
+    type: businessservice
+    layer_id: business
+    name: Development Environment Service
+    description: Automated Dockerfile generation and environment verification for
+      project dependencies
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: config/foundations/pipelines.yaml
+          symbol: environment_support
+    metadata:
+      created_at: 2026-03-24T00:27:45.547Z
+      updated_at: 2026-03-24T00:27:45.547Z
+      version: 1
+  timestamp: 2026-03-24T00:27:45.571Z
+  sequenceNumber: 8
+- type: add
+  elementId: business.businessservice.code-quality-assurance-service
+  layerName: business
+  after:
+    id: 21ebd11b-0724-4a80-af0e-cfc66a00d7da
+    path: business.businessservice.code-quality-assurance-service
+    spec_node_id: business.businessservice
+    type: businessservice
+    layer_id: business
+    name: Code Quality Assurance Service
+    description: Maker-checker code review loop with iterative revision cycles
+      against requirements
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: config/foundations/pipelines.yaml
+          symbol: sdlc_execution.stages.implementation
+    metadata:
+      created_at: 2026-03-24T00:27:46.086Z
+      updated_at: 2026-03-24T00:27:46.086Z
+      version: 1
+  timestamp: 2026-03-24T00:27:46.110Z
+  sequenceNumber: 9
+- type: add
+  elementId: business.businessservice.git-hub-project-board-service
+  layerName: business
+  after:
+    id: 0822d54e-7d2f-413b-8dc1-a9cb07325853
+    path: business.businessservice.git-hub-project-board-service
+    spec_node_id: business.businessservice
+    type: businessservice
+    layer_id: business
+    name: GitHub Project Board Service
+    description: Automated creation and reconciliation of GitHub Projects v2 Kanban
+      boards and columns
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/github_project_manager.py
+          symbol: GitHubProjectManager
+    metadata:
+      created_at: 2026-03-24T00:27:46.614Z
+      updated_at: 2026-03-24T00:27:46.614Z
+      version: 1
+  timestamp: 2026-03-24T00:27:46.641Z
+  sequenceNumber: 10
+- type: add
+  elementId: business.businessprocess.planning-and-design-pipeline-execution
+  layerName: business
+  after:
+    id: 96e1614e-172a-4b6a-b68c-f59c7407303e
+    path: business.businessprocess.planning-and-design-pipeline-execution
+    spec_node_id: business.businessprocess
+    type: businessprocess
+    layer_id: business
+    name: Planning and Design Pipeline Execution
+    description: "Sequential pipeline: research -> requirements analysis ->
+      architecture design -> work breakdown -> PR review"
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: config/foundations/pipelines.yaml
+          symbol: planning_design
+    metadata:
+      created_at: 2026-03-24T00:27:58.440Z
+      updated_at: 2026-03-24T00:27:58.440Z
+      version: 1
+  timestamp: 2026-03-24T00:27:58.465Z
+  sequenceNumber: 11
+- type: add
+  elementId: business.businessprocess.sdlc-execution-pipeline-execution
+  layerName: business
+  after:
+    id: 9a0e0680-fd7d-466a-9e8b-5b7ed40bdfbe
+    path: business.businessprocess.sdlc-execution-pipeline-execution
+    spec_node_id: business.businessprocess
+    type: businessprocess
+    layer_id: business
+    name: SDLC Execution Pipeline Execution
+    description: "Sequential pipeline: implementation -> code review cycle -> test
+      repair cycle -> staging"
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: config/foundations/pipelines.yaml
+          symbol: sdlc_execution
+    metadata:
+      created_at: 2026-03-24T00:27:58.959Z
+      updated_at: 2026-03-24T00:27:58.959Z
+      version: 1
+  timestamp: 2026-03-24T00:27:58.985Z
+  sequenceNumber: 12
+- type: add
+  elementId: business.businessprocess.kanban-board-monitoring
+  layerName: business
+  after:
+    id: c774da27-effa-41df-bdc1-991c4b8e8454
+    path: business.businessprocess.kanban-board-monitoring
+    spec_node_id: business.businessprocess
+    type: businessprocess
+    layer_id: business
+    name: Kanban Board Monitoring
+    description: Continuous 30-second polling loop that detects card movements and
+      enqueues pipeline tasks
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/project_monitor.py
+          symbol: ProjectMonitor
+    metadata:
+      created_at: 2026-03-24T00:27:59.506Z
+      updated_at: 2026-03-24T00:27:59.506Z
+      version: 1
+  timestamp: 2026-03-24T00:27:59.534Z
+  sequenceNumber: 13
+- type: add
+  elementId: business.businessprocess.agent-container-execution
+  layerName: business
+  after:
+    id: 0f70f69e-6903-495c-9cc6-e06632a458d6
+    path: business.businessprocess.agent-container-execution
+    spec_node_id: business.businessprocess
+    type: businessprocess
+    layer_id: business
+    name: Agent Container Execution
+    description: Isolated Docker container launch for each agent task with workspace
+      mount and credential injection
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: claude/docker_runner.py
+          symbol: DockerAgentRunner
+    metadata:
+      created_at: 2026-03-24T00:28:00.037Z
+      updated_at: 2026-03-24T00:28:00.037Z
+      version: 1
+  timestamp: 2026-03-24T00:28:00.065Z
+  sequenceNumber: 14
+- type: add
+  elementId: business.businessprocess.pr-merge-and-branch-cleanup
+  layerName: business
+  after:
+    id: b6305730-365b-4c35-9e2e-0e3da5642b37
+    path: business.businessprocess.pr-merge-and-branch-cleanup
+    spec_node_id: business.businessprocess
+    type: businessprocess
+    layer_id: business
+    name: PR Merge and Branch Cleanup
+    description: Auto-merge approved PRs and clean up feature branches after
+      pipeline completion
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/git_workflow_manager.py
+          symbol: GitWorkflowManager
+    metadata:
+      created_at: 2026-03-24T00:28:00.583Z
+      updated_at: 2026-03-24T00:28:00.583Z
+      version: 1
+  timestamp: 2026-03-24T00:28:00.617Z
+  sequenceNumber: 15
+- type: add
+  elementId: business.businessfunction.pipeline-orchestration
+  layerName: business
+  after:
+    id: 35b7dbe2-840c-429c-9bf2-47a899a7f08a
+    path: business.businessfunction.pipeline-orchestration
+    spec_node_id: business.businessfunction
+    type: businessfunction
+    layer_id: business
+    name: Pipeline Orchestration
+    description: Sequential stage execution with checkpointing, circuit breaker, and
+      resume-from-failure
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: pipeline/orchestrator.py
+          symbol: SequentialPipeline
+    metadata:
+      created_at: 2026-03-24T00:28:09.134Z
+      updated_at: 2026-03-24T00:28:09.134Z
+      version: 1
+  timestamp: 2026-03-24T00:28:09.161Z
+  sequenceNumber: 16
+- type: add
+  elementId: business.businessfunction.agent-task-routing
+  layerName: business
+  after:
+    id: 5f7e5cda-1362-41c5-b35d-b3a7c3b628ff
+    path: business.businessfunction.agent-task-routing
+    spec_node_id: business.businessfunction
+    type: businessfunction
+    layer_id: business
+    name: Agent Task Routing
+    description: Mapping of task types to specialist agent implementations from the
+      AGENT_REGISTRY
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: agents/__init__.py
+          symbol: get_agent_class
+    metadata:
+      created_at: 2026-03-24T00:28:09.699Z
+      updated_at: 2026-03-24T00:28:09.699Z
+      version: 1
+  timestamp: 2026-03-24T00:28:09.725Z
+  sequenceNumber: 17
+- type: add
+  elementId: business.businessfunction.project-configuration-management
+  layerName: business
+  after:
+    id: 37e7f5be-3ebe-48d9-b738-c257acef3894
+    path: business.businessfunction.project-configuration-management
+    spec_node_id: business.businessfunction
+    type: businessfunction
+    layer_id: business
+    name: Project Configuration Management
+    description: "Three-layer configuration: foundations
+      (agents/pipelines/workflows), projects, and runtime state"
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: config/foundations/agents.yaml
+          symbol: agents
+    metadata:
+      created_at: 2026-03-24T00:28:10.232Z
+      updated_at: 2026-03-24T00:28:10.232Z
+      version: 1
+  timestamp: 2026-03-24T00:28:10.258Z
+  sequenceNumber: 18
+- type: add
+  elementId: business.businessfunction.pipeline-state-recovery
+  layerName: business
+  after:
+    id: 455bfe24-0184-404c-b374-b3fb93385b13
+    path: business.businessfunction.pipeline-state-recovery
+    spec_node_id: business.businessfunction
+    type: businessfunction
+    layer_id: business
+    name: Pipeline State Recovery
+    description: Checkpoint-based pipeline recovery allowing resume after
+      orchestrator restart or container failure
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: state_management/manager.py
+          symbol: StateManager.checkpoint
+    metadata:
+      created_at: 2026-03-24T00:28:10.770Z
+      updated_at: 2026-03-24T00:28:10.770Z
+      version: 1
+  timestamp: 2026-03-24T00:28:10.799Z
+  sequenceNumber: 19
+- type: add
+  elementId: business.businessevent.git-hub-issue-moved-to-pipeline-column
+  layerName: business
+  after:
+    id: 922bab53-5d4d-4e8f-8c7f-17fc3bf831f6
+    path: business.businessevent.git-hub-issue-moved-to-pipeline-column
+    spec_node_id: business.businessevent
+    type: businessevent
+    layer_id: business
+    name: GitHub Issue Moved to Pipeline Column
+    description: Card movement on GitHub Kanban board detected during 30-second
+      polling cycle, triggers pipeline start
+    attributes:
+      type: external
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/project_monitor.py
+          symbol: ProjectMonitor
+    metadata:
+      created_at: 2026-03-24T00:28:20.649Z
+      updated_at: 2026-03-24T00:28:20.649Z
+      version: 1
+  timestamp: 2026-03-24T00:28:20.678Z
+  sequenceNumber: 20
+- type: add
+  elementId: business.businessevent.pipeline-stage-completed
+  layerName: business
+  after:
+    id: 43803cbc-1715-4870-ba2d-806fc64995f8
+    path: business.businessevent.pipeline-stage-completed
+    spec_node_id: business.businessevent
+    type: businessevent
+    layer_id: business
+    name: Pipeline Stage Completed
+    description: Agent stage finishes successfully; pipeline progresses to next
+      stage and moves board card
+    attributes:
+      type: internal
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: pipeline/orchestrator.py
+          symbol: SequentialPipeline.execute
+    metadata:
+      created_at: 2026-03-24T00:28:21.185Z
+      updated_at: 2026-03-24T00:28:21.185Z
+      version: 1
+  timestamp: 2026-03-24T00:28:21.212Z
+  sequenceNumber: 21
+- type: add
+  elementId: business.businessevent.all-sub-issues-completed
+  layerName: business
+  after:
+    id: 2ed7553f-264c-4fec-bc67-55daf56d3e5f
+    path: business.businessevent.all-sub-issues-completed
+    spec_node_id: business.businessevent
+    type: businessevent
+    layer_id: business
+    name: All Sub-Issues Completed
+    description: All sub-issues of an epic are done; epic card automatically moves
+      to In Review column
+    attributes:
+      type: internal
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: config/foundations/workflows.yaml
+          symbol: all_subtasks_completed
+    metadata:
+      created_at: 2026-03-24T00:28:21.721Z
+      updated_at: 2026-03-24T00:28:21.721Z
+      version: 1
+  timestamp: 2026-03-24T00:28:21.750Z
+  sequenceNumber: 22
+- type: add
+  elementId: business.businessevent.orchestrator-startup
+  layerName: business
+  after:
+    id: 361a7dac-49ba-419f-a449-b36e93290283
+    path: business.businessevent.orchestrator-startup
+    spec_node_id: business.businessevent
+    type: businessevent
+    layer_id: business
+    name: Orchestrator Startup
+    description: "Orchestrator container starts: zombie reaper, ES readiness,
+      container recovery, board reconciliation"
+    attributes:
+      type: timer
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: main.py
+          symbol: main
+    metadata:
+      created_at: 2026-03-24T00:28:22.286Z
+      updated_at: 2026-03-24T00:28:22.286Z
+      version: 1
+  timestamp: 2026-03-24T00:28:22.317Z
+  sequenceNumber: 23
+- type: add
+  elementId: business.businessobject.pipeline-task
+  layerName: business
+  after:
+    id: 3cf6f5e3-3f12-447c-bd5a-7d0d7993485b
+    path: business.businessobject.pipeline-task
+    spec_node_id: business.businessobject
+    type: businessobject
+    layer_id: business
+    name: Pipeline Task
+    description: Unit of work with agent, project, priority, context, and not_before
+      scheduling
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: task_queue/task_manager.py
+          symbol: Task
+    metadata:
+      created_at: 2026-03-24T00:28:31.128Z
+      updated_at: 2026-03-24T00:28:31.128Z
+      version: 1
+  timestamp: 2026-03-24T00:28:31.156Z
+  sequenceNumber: 24
+- type: add
+  elementId: business.businessobject.pipeline-run
+  layerName: business
+  after:
+    id: dcdfe97d-d885-4301-9eb7-c4caf8e410ed
+    path: business.businessobject.pipeline-run
+    spec_node_id: business.businessobject
+    type: businessobject
+    layer_id: business
+    name: Pipeline Run
+    description: Execution record for a complete pipeline run including stage
+      results and current state
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/pipeline_run.py
+          symbol: PipelineRun
+    metadata:
+      created_at: 2026-03-24T00:28:31.674Z
+      updated_at: 2026-03-24T00:28:31.674Z
+      version: 1
+  timestamp: 2026-03-24T00:28:31.703Z
+  sequenceNumber: 25
+- type: add
+  elementId: business.businessobject.agent-output-artifact
+  layerName: business
+  after:
+    id: ae354db9-87ba-48a7-9326-aa1c2952c3c8
+    path: business.businessobject.agent-output-artifact
+    spec_node_id: business.businessobject
+    type: businessobject
+    layer_id: business
+    name: Agent Output Artifact
+    description: "Structured output produced by an agent: code changes, PR comments,
+      design documents, or test results"
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: claude/claude_integration.py
+          symbol: ClaudeIntegration
+    metadata:
+      created_at: 2026-03-24T00:28:32.226Z
+      updated_at: 2026-03-24T00:28:32.226Z
+      version: 1
+  timestamp: 2026-03-24T00:28:32.257Z
+  sequenceNumber: 26
+- type: add
+  elementId: business.businessobject.feature-branch
+  layerName: business
+  after:
+    id: 11e9b1e1-ce89-45ca-9fad-fd99d77e1114
+    path: business.businessobject.feature-branch
+    spec_node_id: business.businessobject
+    type: businessobject
+    layer_id: business
+    name: Feature Branch
+    description: Git branch created per issue for implementation; merged by
+      GitWorkflowManager on pipeline completion
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/feature_branch_manager.py
+          symbol: FeatureBranchManager
+    metadata:
+      created_at: 2026-03-24T00:28:32.774Z
+      updated_at: 2026-03-24T00:28:32.774Z
+      version: 1
+  timestamp: 2026-03-24T00:28:32.802Z
+  sequenceNumber: 27
+- type: add
+  elementId: business.businessinterface.git-hub-kanban-board
+  layerName: business
+  after:
+    id: 3369fba7-f816-4001-bb40-4f81b7e949b9
+    path: business.businessinterface.git-hub-kanban-board
+    spec_node_id: business.businessinterface
+    type: businessinterface
+    layer_id: business
+    name: GitHub Kanban Board
+    description: GitHub Projects v2 board as the primary interface between human
+      operators and the pipeline system
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/github_project_manager.py
+          symbol: GitHubProjectManager
+    metadata:
+      created_at: 2026-03-24T00:28:41.675Z
+      updated_at: 2026-03-24T00:28:41.675Z
+      version: 1
+  timestamp: 2026-03-24T00:28:41.704Z
+  sequenceNumber: 28
+- type: add
+  elementId: business.businessinterface.observability-web-dashboard
+  layerName: business
+  after:
+    id: 9f533ae6-9164-4a85-a4a8-813bf0dffeb9
+    path: business.businessinterface.observability-web-dashboard
+    spec_node_id: business.businessinterface
+    type: businessinterface
+    layer_id: business
+    name: Observability Web Dashboard
+    description: React web UI providing real-time pipeline status, agent activity,
+      and historical metrics
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/observability_server.py
+          symbol: ObservabilityServer
+    metadata:
+      created_at: 2026-03-24T00:28:42.222Z
+      updated_at: 2026-03-24T00:28:42.222Z
+      version: 1
+  timestamp: 2026-03-24T00:28:42.252Z
+  sequenceNumber: 29
+- type: add
+  elementId: business.businessinterface.rest-health-and-control-api
+  layerName: business
+  after:
+    id: 30278fd9-362d-4ef6-956d-65e9009aae12
+    path: business.businessinterface.rest-health-and-control-api
+    spec_node_id: business.businessinterface
+    type: businessinterface
+    layer_id: business
+    name: REST Health and Control API
+    description: HTTP API on port 5001 for health checks, agent kill controls, and
+      pipeline inspection
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/observability_server.py
+          symbol: ObservabilityServer
+    metadata:
+      created_at: 2026-03-24T00:28:42.774Z
+      updated_at: 2026-03-24T00:28:42.774Z
+      version: 1
+  timestamp: 2026-03-24T00:28:42.803Z
+  sequenceNumber: 30
+- type: add
+  elementId: business.product.claude-code-agent-orchestrator
+  layerName: business
+  after:
+    id: e33dc7b1-3597-4f26-8e4b-6f536ac9623e
+    path: business.product.claude-code-agent-orchestrator
+    spec_node_id: business.product
+    type: product
+    layer_id: business
+    name: Claude Code Agent Orchestrator
+    description: Autonomous AI development system that manages full SDLC pipelines
+      via GitHub Projects Kanban boards
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: main.py
+          symbol: main
+    metadata:
+      created_at: 2026-03-24T00:28:50.744Z
+      updated_at: 2026-03-24T00:28:50.744Z
+      version: 1
+  timestamp: 2026-03-24T00:28:50.772Z
+  sequenceNumber: 31
+- type: add
+  elementId: business.businesscollaboration.maker-checker-review-collaboration
+  layerName: business
+  after:
+    id: acbcc64d-936f-483a-863e-46a640935ac8
+    path: business.businesscollaboration.maker-checker-review-collaboration
+    spec_node_id: business.businesscollaboration
+    type: businesscollaboration
+    layer_id: business
+    name: Maker-Checker Review Collaboration
+    description: Collaborative interaction between maker agent (SSE) and checker
+      agent (code_reviewer) through iterative review cycles
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: config/foundations/pipelines.yaml
+          symbol: sdlc_execution.stages.implementation
+    metadata:
+      created_at: 2026-03-24T00:28:51.303Z
+      updated_at: 2026-03-24T00:28:51.303Z
+      version: 1
+  timestamp: 2026-03-24T00:28:51.333Z
+  sequenceNumber: 32
+- type: add
+  elementId: business.representation.git-hub-issue-comment
+  layerName: business
+  after:
+    id: cd1f5267-8585-450f-b80b-db6c7b2e51f6
+    path: business.representation.git-hub-issue-comment
+    spec_node_id: business.representation
+    type: representation
+    layer_id: business
+    name: GitHub Issue Comment
+    description: Agent outputs posted as GitHub issue comments in Markdown format
+    attributes:
+      format: html
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/github_api_client.py
+          symbol: GitHubAPIClient
+    metadata:
+      created_at: 2026-03-24T00:28:57.396Z
+      updated_at: 2026-03-24T00:28:57.396Z
+      version: 1
+  timestamp: 2026-03-24T00:28:57.429Z
+  sequenceNumber: 33
+- type: add
+  elementId: business.representation.pipeline-checkpoint-json
+  layerName: business
+  after:
+    id: 375a39bc-f36d-494b-814c-681a0ade6076
+    path: business.representation.pipeline-checkpoint-json
+    spec_node_id: business.representation
+    type: representation
+    layer_id: business
+    name: Pipeline Checkpoint JSON
+    description: Pipeline stage checkpoint persisted as JSON file for crash recovery
+    attributes:
+      format: json
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: state_management/manager.py
+          symbol: StateManager.checkpoint
+    metadata:
+      created_at: 2026-03-24T00:28:57.991Z
+      updated_at: 2026-03-24T00:28:57.991Z
+      version: 1
+  timestamp: 2026-03-24T00:28:58.026Z
+  sequenceNumber: 34

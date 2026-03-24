@@ -1,0 +1,40 @@
+motivation.outcome.autonomous-feature-development-end-to-end:
+  id: cc4e136b-e44a-4a31-9017-bfd8abcde500
+  path: motivation.outcome.autonomous-feature-development-end-to-end
+  spec_node_id: motivation.outcome
+  type: outcome
+  layer_id: motivation
+  name: Autonomous Feature Development End-to-End
+  description: Issues move from Backlog to Staged with full code implementation,
+    review, and testing without human intervention
+  attributes:
+    status: in-progress
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: config/foundations/pipelines.yaml
+        symbol: sdlc_execution
+  metadata:
+    created_at: 2026-03-24T00:31:16.216Z
+    updated_at: 2026-03-24T00:31:16.216Z
+    version: 1
+motivation.outcome.stable-multi-project-orchestration:
+  id: f26f4a53-19e0-4cd3-85d7-f2d2441e5573
+  path: motivation.outcome.stable-multi-project-orchestration
+  spec_node_id: motivation.outcome
+  type: outcome
+  layer_id: motivation
+  name: Stable Multi-Project Orchestration
+  description: Multiple projects run concurrent pipelines reliably with lock-based
+    serialization and crash recovery
+  attributes:
+    status: in-progress
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/pipeline_lock_manager.py
+        symbol: PipelineLockManager
+  metadata:
+    created_at: 2026-03-24T00:31:16.775Z
+    updated_at: 2026-03-24T00:31:16.775Z
+    version: 1

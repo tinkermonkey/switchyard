@@ -1,0 +1,1367 @@
+api.operation.get-health:
+  id: b0624117-065f-4421-94ba-e62ed87dec87
+  path: api.operation.get-health
+  spec_node_id: api.operation
+  type: operation
+  layer_id: api
+  name: GET /health
+  description: Returns system health status including Redis, GitHub auth, Docker
+    socket, disk space, and memory checks
+  attributes:
+    operationId: getHealth
+    summary: Get system health status
+    tags: Health
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/observability_server.py
+        symbol: /health
+  metadata:
+    created_at: 2026-03-24T00:10:39.587Z
+    updated_at: 2026-03-24T00:10:39.587Z
+    version: 1
+api.operation.get-agentsactive:
+  id: 101d5997-269e-489e-a5bc-a483cec2cac2
+  path: api.operation.get-agentsactive
+  spec_node_id: api.operation
+  type: operation
+  layer_id: api
+  name: GET /agents/active
+  description: Returns list of currently active agent containers running for all
+    projects, including container name, agent type, project, issue number, and
+    start time
+  attributes:
+    operationId: getActiveAgents
+    summary: List active agent containers
+    tags: Agents
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/observability_server.py
+        symbol: /agents/active
+  metadata:
+    created_at: 2026-03-24T00:10:40.042Z
+    updated_at: 2026-03-24T00:10:40.042Z
+    version: 1
+api.operation.post-agentskillcontainer-name:
+  id: 46dc4f76-a338-4f1c-9e15-d288d4532fad
+  path: api.operation.post-agentskillcontainer-name
+  spec_node_id: api.operation
+  type: operation
+  layer_id: api
+  name: POST /agents/kill/:containerName
+  description: Terminates a running agent container by name; used for manual
+    intervention when an agent is stuck or producing bad results
+  attributes:
+    operationId: killAgent
+    summary: Kill a running agent container
+    tags: Agents
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/observability_server.py
+        symbol: /agents/kill
+  metadata:
+    created_at: 2026-03-24T00:10:40.511Z
+    updated_at: 2026-03-24T00:10:40.511Z
+    version: 1
+api.operation.get-history:
+  id: 8ed5d537-53b0-4e2d-ba18-ee73bd3058fd
+  path: api.operation.get-history
+  spec_node_id: api.operation
+  type: operation
+  layer_id: api
+  name: GET /history
+  description: Returns agent execution history from Elasticsearch, including
+    completed task metadata, agent names, durations, and outcomes
+  attributes:
+    operationId: getHistory
+    summary: Get agent execution history
+    tags: Metrics
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/observability_server.py
+        symbol: /history
+  metadata:
+    created_at: 2026-03-24T00:10:48.136Z
+    updated_at: 2026-03-24T00:10:48.136Z
+    version: 1
+api.operation.get-claude-logs-history:
+  id: c7181a80-b45f-4a08-b6ee-e9b3bdccc6ff
+  path: api.operation.get-claude-logs-history
+  spec_node_id: api.operation
+  type: operation
+  layer_id: api
+  name: GET /claude-logs-history
+  description: Returns Claude Code session log history from Elasticsearch indexed
+    logs for analysis of agent behavior and token usage
+  attributes:
+    operationId: getClaudeLogsHistory
+    summary: Get Claude Code execution logs history
+    tags: Metrics
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/observability_server.py
+        symbol: /claude-logs-history
+  metadata:
+    created_at: 2026-03-24T00:10:48.614Z
+    updated_at: 2026-03-24T00:10:48.614Z
+    version: 1
+api.operation.get-current-pipeline:
+  id: 9870a3a7-7b34-44cf-a221-cf3b4deae232
+  path: api.operation.get-current-pipeline
+  spec_node_id: api.operation
+  type: operation
+  layer_id: api
+  name: GET /current-pipeline
+  description: Returns the current active pipeline state for all projects,
+    including stage, agent, issue number, and elapsed time
+  attributes:
+    operationId: getCurrentPipeline
+    summary: Get current pipeline state
+    tags: Pipeline
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/observability_server.py
+        symbol: /current-pipeline
+  metadata:
+    created_at: 2026-03-24T00:10:49.123Z
+    updated_at: 2026-03-24T00:10:49.123Z
+    version: 1
+api.operation.get-pipeline-run-events:
+  id: a66b6dc4-43c9-4506-bcdf-17e5afad6dfd
+  path: api.operation.get-pipeline-run-events
+  spec_node_id: api.operation
+  type: operation
+  layer_id: api
+  name: GET /pipeline-run-events
+  description: Returns paginated list of pipeline run events from Elasticsearch
+    with filtering by project, issue, and time range
+  attributes:
+    operationId: getPipelineRunEvents
+    summary: Get pipeline run events
+    tags: Pipeline
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/observability_server.py
+        symbol: /pipeline-run-events
+  metadata:
+    created_at: 2026-03-24T00:10:56.840Z
+    updated_at: 2026-03-24T00:10:56.840Z
+    version: 1
+api.operation.get-active-pipeline-runs:
+  id: c3d3ce2e-e59f-400c-8105-e5d9bf3d6565
+  path: api.operation.get-active-pipeline-runs
+  spec_node_id: api.operation
+  type: operation
+  layer_id: api
+  name: GET /active-pipeline-runs
+  description: Returns all currently active pipeline runs from Elasticsearch,
+    showing which issues are actively being processed across all projects
+  attributes:
+    operationId: getActivePipelineRuns
+    summary: Get active pipeline runs
+    tags: Pipeline
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/observability_server.py
+        symbol: /active-pipeline-runs
+  metadata:
+    created_at: 2026-03-24T00:10:57.333Z
+    updated_at: 2026-03-24T00:10:57.333Z
+    version: 1
+api.operation.get-apicircuit-breakers:
+  id: 6917c119-181b-4346-aba4-84395e555e89
+  path: api.operation.get-apicircuit-breakers
+  spec_node_id: api.operation
+  type: operation
+  layer_id: api
+  name: GET /api/circuit-breakers
+  description: "Returns state of all registered circuit breakers: GitHub API,
+    agent execution, and health check circuit breakers with failure counts and
+    recovery times"
+  attributes:
+    operationId: getCircuitBreakers
+    summary: Get circuit breaker states
+    tags: Health
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/observability_server.py
+        symbol: /api/circuit-breakers
+  metadata:
+    created_at: 2026-03-24T00:10:57.833Z
+    updated_at: 2026-03-24T00:10:57.833Z
+    version: 1
+api.operation.get-apiprojects:
+  id: d29c4dc7-5b8a-4721-b05d-5d4db716aa93
+  path: api.operation.get-apiprojects
+  spec_node_id: api.operation
+  type: operation
+  layer_id: api
+  name: GET /api/projects
+  description: Returns list of all configured projects with their pipeline status,
+    board names, last reconciliation time, and enabled workflows
+  attributes:
+    operationId: getProjects
+    summary: Get project list and status
+    tags: Projects
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/observability_server.py
+        symbol: /api/projects
+  metadata:
+    created_at: 2026-03-24T00:11:04.405Z
+    updated_at: 2026-03-24T00:11:04.405Z
+    version: 1
+api.operation.web-socket-connectdisconnect:
+  id: 9194f361-c3d9-45a5-8733-42bc4727107c
+  path: api.operation.web-socket-connectdisconnect
+  spec_node_id: api.operation
+  type: operation
+  layer_id: api
+  name: WebSocket connect/disconnect
+  description: Socket.IO WebSocket lifecycle events; clients connect to receive
+    real-time agent event stream including tool calls, completions, and pipeline
+    state changes
+  attributes:
+    operationId: websocketConnect
+    summary: Real-time agent event streaming
+    tags: Agents
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/observability_server.py
+        symbol: socketio
+  metadata:
+    created_at: 2026-03-24T00:11:04.887Z
+    updated_at: 2026-03-24T00:11:04.887Z
+    version: 1
+api.operation.query-project-v2-items-user:
+  id: 73a5961b-f723-424f-bb64-6121b3e07524
+  path: api.operation.query-project-v2-items-user
+  spec_node_id: api.operation
+  type: operation
+  layer_id: api
+  name: Query projectV2 Items (User)
+  description: Queries all items in a user-owned Projects v2 board, returning
+    issue number, title, state, repository name, updatedAt, and Status
+    single-select field value. Used by ProjectMonitor.get_project_items and
+    execute_board_query_cached.
+  attributes:
+    operationId: queryProjectV2ItemsUser
+    summary: List all items in a user-owned Projects v2 board
+    tags: Board Management
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/github_owner_utils.py
+        symbol: build_projects_v2_query
+  metadata:
+    created_at: 2026-03-24T10:29:22.376Z
+    updated_at: 2026-03-24T10:29:22.376Z
+    version: 1
+api.operation.query-project-v2-items-organization:
+  id: 6678d6b6-9594-478c-89eb-047a83bd6117
+  path: api.operation.query-project-v2-items-organization
+  spec_node_id: api.operation
+  type: operation
+  layer_id: api
+  name: Query projectV2 Items (Organization)
+  description: Queries all items in an organization-owned Projects v2 board,
+    returning issue number, title, state, repository name, updatedAt, and Status
+    single-select field value. Used by ProjectMonitor.get_project_items and
+    execute_board_query_cached.
+  attributes:
+    operationId: queryProjectV2ItemsOrg
+    summary: List all items in an org-owned Projects v2 board
+    tags: Board Management
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/github_owner_utils.py
+        symbol: build_projects_v2_query
+  metadata:
+    created_at: 2026-03-24T10:29:29.472Z
+    updated_at: 2026-03-24T10:29:29.472Z
+    version: 1
+api.operation.query-project-v2-exists-user:
+  id: 49eaadd7-e861-4c4d-ba4a-2b0d4be3e125
+  path: api.operation.query-project-v2-exists-user
+  spec_node_id: api.operation
+  type: operation
+  layer_id: api
+  name: Query projectV2 Exists (User)
+  description: Verifies a user-owned Projects v2 board still exists by number.
+    Returns project id and number or null. Used by
+    GitHubProjectManager._verify_board_exists.
+  attributes:
+    operationId: queryProjectV2ExistsUser
+    summary: Verify a user-owned Projects v2 board exists
+    tags: Board Management
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/github_project_manager.py
+        symbol: GitHubProjectManager._verify_board_exists
+  metadata:
+    created_at: 2026-03-24T10:29:30.021Z
+    updated_at: 2026-03-24T10:29:30.021Z
+    version: 1
+api.operation.query-project-v2-exists-organization:
+  id: d2bbb315-83b8-4860-bcb0-04f6dc888b04
+  path: api.operation.query-project-v2-exists-organization
+  spec_node_id: api.operation
+  type: operation
+  layer_id: api
+  name: Query projectV2 Exists (Organization)
+  description: Verifies an org-owned Projects v2 board still exists by number.
+    Returns project id and number or null. Used by
+    GitHubProjectManager._verify_board_exists.
+  attributes:
+    operationId: queryProjectV2ExistsOrg
+    summary: Verify an org-owned Projects v2 board exists
+    tags: Board Management
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/github_project_manager.py
+        symbol: GitHubProjectManager._verify_board_exists
+  metadata:
+    created_at: 2026-03-24T10:29:30.539Z
+    updated_at: 2026-03-24T10:29:30.539Z
+    version: 1
+api.operation.query-projects-v2-list-user:
+  id: 6b61ccb3-8ce9-42a2-ad33-2e6827c85fd9
+  path: api.operation.query-projects-v2-list-user
+  spec_node_id: api.operation
+  type: operation
+  layer_id: api
+  name: Query projectsV2 List (User)
+  description: Lists all Projects v2 for a user owner, returning id, number,
+    title, url. Used by github_owner_utils.get_projects_list_for_owner for board
+    discovery.
+  attributes:
+    operationId: queryProjectsV2ListUser
+    summary: List all Projects v2 for a user
+    tags: Board Management
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/github_owner_utils.py
+        symbol: get_projects_list_for_owner
+  metadata:
+    created_at: 2026-03-24T10:29:40.674Z
+    updated_at: 2026-03-24T10:29:40.674Z
+    version: 1
+api.operation.query-projects-v2-list-organization:
+  id: 292b7b0e-d1eb-49a3-a172-3786abb5a489
+  path: api.operation.query-projects-v2-list-organization
+  spec_node_id: api.operation
+  type: operation
+  layer_id: api
+  name: Query projectsV2 List (Organization)
+  description: Lists all Projects v2 for an org owner, returning id, number,
+    title, url. Used by github_owner_utils.get_projects_list_for_owner for board
+    discovery.
+  attributes:
+    operationId: queryProjectsV2ListOrg
+    summary: List all Projects v2 for an organization
+    tags: Board Management
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/github_owner_utils.py
+        symbol: get_projects_list_for_owner
+  metadata:
+    created_at: 2026-03-24T10:29:41.223Z
+    updated_at: 2026-03-24T10:29:41.223Z
+    version: 1
+api.operation.mutation-update-project-v2field-status-options:
+  id: 0dc503d0-259c-447d-b1b0-7a16f0f6553f
+  path: api.operation.mutation-update-project-v2field-status-options
+  spec_node_id: api.operation
+  type: operation
+  layer_id: api
+  name: Mutation updateProjectV2Field (Status Options)
+  description: "Updates the Status single-select field options on a Projects v2
+    board to match workflow configuration. Variables: input.fieldId,
+    input.singleSelectOptions[]. Response: field id, name, and options[id,
+    name]. Used by GitHubProjectManager._update_status_field_graphql."
+  attributes:
+    operationId: mutationUpdateProjectV2Field
+    summary: Reconfigure Status field options on a Projects v2 board
+    tags: Board Management
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/github_project_manager.py
+        symbol: GitHubProjectManager._update_status_field_graphql
+  metadata:
+    created_at: 2026-03-24T10:29:41.785Z
+    updated_at: 2026-03-24T10:29:41.785Z
+    version: 1
+api.operation.query-issue-project-items-by-issue-number:
+  id: b84b2157-b94b-447e-8bbd-93941eabf12e
+  path: api.operation.query-issue-project-items-by-issue-number
+  spec_node_id: api.operation
+  type: operation
+  layer_id: api
+  name: Query Issue projectItems (by Issue Number)
+  description: Queries a repository issue's project memberships and current Status
+    field value by project number. Returns projectItems[].id, project.number,
+    fieldValueByName(Status).name. Used by
+    PipelineProgression.move_issue_to_column and get_issue_column_sync.
+  attributes:
+    operationId: queryIssueProjectItems
+    summary: Get issue project memberships and current status
+    tags: Issue Tracking
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/pipeline_progression.py
+        symbol: PipelineProgression.move_issue_to_column
+  metadata:
+    created_at: 2026-03-24T10:29:56.380Z
+    updated_at: 2026-03-24T10:29:56.380Z
+    version: 1
+api.operation.mutation-update-project-v2item-field-value-status:
+  id: 19017eaa-a617-4c63-b740-3c18ac2f9ae4
+  path: api.operation.mutation-update-project-v2item-field-value-status
+  spec_node_id: api.operation
+  type: operation
+  layer_id: api
+  name: Mutation updateProjectV2ItemFieldValue (Status)
+  description: "Moves an issue to a new column by setting its Status single-select
+    field. Variables: projectId, itemId, fieldId, value.singleSelectOptionId.
+    Response: projectV2Item.id. Used by PipelineProgression, pr_review_stage,
+    and work_breakdown_agent."
+  attributes:
+    operationId: mutationUpdateProjectV2ItemFieldValue
+    summary: Set an issue card status to move it to a new column
+    tags: Issue Tracking
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/pipeline_progression.py
+        symbol: PipelineProgression.move_issue_to_column
+  metadata:
+    created_at: 2026-03-24T10:29:56.909Z
+    updated_at: 2026-03-24T10:29:56.909Z
+    version: 1
+api.operation.mutation-delete-project-v2item:
+  id: f32b0d85-fb0b-4f52-954e-f8e81b2b83eb
+  path: api.operation.mutation-delete-project-v2item
+  spec_node_id: api.operation
+  type: operation
+  layer_id: api
+  name: Mutation deleteProjectV2Item
+  description: "Removes an issue from a Projects v2 board. Variables: projectId,
+    itemId. Response: deletedItemId. Used by work_breakdown_agent to remove
+    issues from non-SDLC boards before placement."
+  attributes:
+    operationId: mutationDeleteProjectV2Item
+    summary: Remove an issue from a Projects v2 board
+    tags: Issue Tracking
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: agents/work_breakdown_agent.py
+        symbol: WorkBreakdownAgent._place_issues_on_board
+  metadata:
+    created_at: 2026-03-24T10:29:57.465Z
+    updated_at: 2026-03-24T10:29:57.465Z
+    version: 1
+api.operation.mutation-add-sub-issue:
+  id: 7a72767b-fff5-4308-9043-efc6c1d00b09
+  path: api.operation.mutation-add-sub-issue
+  spec_node_id: api.operation
+  type: operation
+  layer_id: api
+  name: Mutation addSubIssue
+  description: "Links a child issue as a sub-issue of a parent issue via GitHub's
+    sub-issues API. Variables: issueId (parent), subIssueId (child). Used by
+    work_breakdown_agent and pr_review_stage._link_sub_issue."
+  attributes:
+    operationId: mutationAddSubIssue
+    summary: Link a child issue as a sub-issue of a parent
+    tags: Issue Tracking
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: pipeline/pr_review_stage.py
+        symbol: PRReviewStage._link_sub_issue
+  metadata:
+    created_at: 2026-03-24T10:30:04.739Z
+    updated_at: 2026-03-24T10:30:04.739Z
+    version: 1
+api.operation.query-issue-project-items-with-field-value-by-name:
+  id: 496ba7aa-372c-4ef6-9355-39ee8770cd31
+  path: api.operation.query-issue-project-items-with-field-value-by-name
+  spec_node_id: api.operation
+  type: operation
+  layer_id: api
+  name: Query Issue projectItems with fieldValueByName
+  description: Queries a repository issue to get project item ID and board
+    membership for a specific project number. Also resolves current status by
+    fieldValueByName. Used by project_monitor.get_issue_column_sync to guard
+    against stale queue cache.
+  attributes:
+    operationId: queryIssueProjectItemsForColumn
+    summary: Get issue project item ID for a specific board
+    tags: Issue Tracking
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/project_monitor.py
+        symbol: ProjectMonitor.get_issue_column_sync
+  metadata:
+    created_at: 2026-03-24T10:30:05.308Z
+    updated_at: 2026-03-24T10:30:05.308Z
+    version: 1
+api.operation.query-repository-id:
+  id: 9857b9e0-1cd6-434c-a2d2-b79e280c6150
+  path: api.operation.query-repository-id
+  spec_node_id: api.operation
+  type: operation
+  layer_id: api
+  name: Query repository ID
+  description: "Fetches the node ID (global ID) of a repository for use as input
+    to createDiscussion and other mutations. Variables: owner, repo. Response:
+    repository.id. Used by GitHubDiscussions.get_repository_id."
+  attributes:
+    operationId: queryRepositoryId
+    summary: Get repository node ID for GraphQL mutations
+    tags: Repository
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/github_discussions.py
+        symbol: GitHubDiscussions.get_repository_id
+  metadata:
+    created_at: 2026-03-24T10:30:15.142Z
+    updated_at: 2026-03-24T10:30:15.142Z
+    version: 1
+api.operation.query-repository-discussion-categories:
+  id: f05bcb04-6e4c-42d8-ba0d-a15580debf67
+  path: api.operation.query-repository-discussion-categories
+  spec_node_id: api.operation
+  type: operation
+  layer_id: api
+  name: Query repository discussionCategories
+  description: "Lists all discussion categories for a repository (id, name, emoji,
+    description). Used to look up category ID before creating a discussion.
+    Variables: owner, repo. Used by
+    GitHubDiscussions.get_discussion_categories."
+  attributes:
+    operationId: queryDiscussionCategories
+    summary: List discussion categories for a repository
+    tags: Discussions
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/github_discussions.py
+        symbol: GitHubDiscussions.get_discussion_categories
+  metadata:
+    created_at: 2026-03-24T10:30:15.700Z
+    updated_at: 2026-03-24T10:30:15.700Z
+    version: 1
+api.operation.mutation-create-discussion:
+  id: 2f328fa7-366f-4802-88c6-d77627923b66
+  path: api.operation.mutation-create-discussion
+  spec_node_id: api.operation
+  type: operation
+  layer_id: api
+  name: Mutation createDiscussion
+  description: "Creates a new GitHub Discussion in a repository. Variables:
+    repositoryId, categoryId, title, body. Response: discussion id, number, url.
+    Used by GitHubDiscussions.create_discussion for per-issue feedback threads."
+  attributes:
+    operationId: mutationCreateDiscussion
+    summary: Create a new GitHub Discussion
+    tags: Discussions
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/github_discussions.py
+        symbol: GitHubDiscussions.create_discussion
+  metadata:
+    created_at: 2026-03-24T10:30:16.303Z
+    updated_at: 2026-03-24T10:30:16.303Z
+    version: 1
+api.operation.mutation-add-discussion-comment:
+  id: e971589a-a69d-4058-b5e7-de676a13c50c
+  path: api.operation.mutation-add-discussion-comment
+  spec_node_id: api.operation
+  type: operation
+  layer_id: api
+  name: Mutation addDiscussionComment
+  description: "Adds a comment (or threaded reply) to a GitHub Discussion.
+    Variables: discussionId, body, replyToId (optional). Response: comment id,
+    url, createdAt. Used by GitHubDiscussions.add_discussion_comment for agent
+    output posting."
+  attributes:
+    operationId: mutationAddDiscussionComment
+    summary: Add a comment or reply to a GitHub Discussion
+    tags: Discussions
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/github_discussions.py
+        symbol: GitHubDiscussions.add_discussion_comment
+  metadata:
+    created_at: 2026-03-24T10:30:25.143Z
+    updated_at: 2026-03-24T10:30:25.143Z
+    version: 1
+api.operation.query-node-discussion-by-id:
+  id: 399bf1c0-fa19-4c92-b271-78a274bc0837
+  path: api.operation.query-node-discussion-by-id
+  spec_node_id: api.operation
+  type: operation
+  layer_id: api
+  name: Query node Discussion (by ID)
+  description: Fetches a single Discussion by its node ID. Returns id, number,
+    title, body, url, createdAt, updatedAt, author.login, category id/name. Used
+    by GitHubDiscussions.get_discussion.
+  attributes:
+    operationId: queryDiscussionById
+    summary: Fetch a Discussion by node ID
+    tags: Discussions
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/github_discussions.py
+        symbol: GitHubDiscussions.get_discussion
+  metadata:
+    created_at: 2026-03-24T10:30:25.715Z
+    updated_at: 2026-03-24T10:30:25.715Z
+    version: 1
+api.operation.query-discussion-comments-by-id:
+  id: a073e2c1-02c8-4f92-aaf3-fe5efba6d787
+  path: api.operation.query-discussion-comments-by-id
+  spec_node_id: api.operation
+  type: operation
+  layer_id: api
+  name: Query Discussion comments (by ID)
+  description: "Fetches a Discussion's comments including nested replies (up to 50
+    per comment). Used by GitHubDiscussions.get_discussion_comments and
+    project_monitor threaded feedback loops. Variables: discussionId. Returns
+    comments[].id, body, createdAt, author.login, replies[]."
+  attributes:
+    operationId: queryDiscussionComments
+    summary: Fetch all comments and replies for a Discussion
+    tags: Discussions
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/github_discussions.py
+        symbol: GitHubDiscussions.get_discussion_comments
+  metadata:
+    created_at: 2026-03-24T10:30:26.278Z
+    updated_at: 2026-03-24T10:30:26.278Z
+    version: 1
+api.operation.query-discussion-by-repository-number:
+  id: c4f29784-0320-4a12-95dc-1b1589d109a8
+  path: api.operation.query-discussion-by-repository-number
+  spec_node_id: api.operation
+  type: operation
+  layer_id: api
+  name: Query Discussion by repository number
+  description: "Fetches a Discussion by its integer number within a repository.
+    Returns full discussion body, comments with nested replies. Variables:
+    owner, repo, number. Used by GitHubDiscussions.get_discussion_by_number."
+  attributes:
+    operationId: queryDiscussionByNumber
+    summary: Fetch a Discussion by repository number
+    tags: Discussions
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/github_discussions.py
+        symbol: GitHubDiscussions.get_discussion_by_number
+  metadata:
+    created_at: 2026-03-24T10:30:34.856Z
+    updated_at: 2026-03-24T10:30:34.856Z
+    version: 1
+api.operation.query-repository-discussions-list:
+  id: 3dadaf95-f14d-4f43-a744-b4642a7ed8e9
+  path: api.operation.query-repository-discussions-list
+  spec_node_id: api.operation
+  type: operation
+  layer_id: api
+  name: Query repository discussions list
+  description: "Lists recent discussions in a repository, optionally filtered by
+    categoryId. Returns id, number, title, body, createdAt, updatedAt,
+    author.login, category, comments.totalCount. Variables: owner, repo, first,
+    categoryId. Used by GitHubDiscussions.list_discussions."
+  attributes:
+    operationId: queryRepositoryDiscussions
+    summary: List discussions in a repository
+    tags: Discussions
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/github_discussions.py
+        symbol: GitHubDiscussions.list_discussions
+  metadata:
+    created_at: 2026-03-24T10:30:35.431Z
+    updated_at: 2026-03-24T10:30:35.431Z
+    version: 1
+api.operation.query-batch-discussion-updated-at:
+  id: c882cadb-6b84-441d-b90e-f6bef1af194f
+  path: api.operation.query-batch-discussion-updated-at
+  spec_node_id: api.operation
+  type: operation
+  layer_id: api
+  name: Query batch Discussion updatedAt
+  description: Batch-fetches updatedAt timestamps for up to 50 discussions in a
+    single query using aliased node() lookups. Used by
+    GitHubDiscussions.get_discussions_updated_at to detect discussion activity
+    cheaply.
+  attributes:
+    operationId: queryBatchDiscussionUpdatedAt
+    summary: Batch fetch updatedAt for multiple Discussions
+    tags: Discussions
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/github_discussions.py
+        symbol: GitHubDiscussions._fetch_updated_at_batch
+  metadata:
+    created_at: 2026-03-24T10:30:36.026Z
+    updated_at: 2026-03-24T10:30:36.026Z
+    version: 1
+api.operation.post-pipeline-runsidkill:
+  id: 15a397d0-8b65-47be-b1df-dfc5b9ca992d
+  path: api.operation.post-pipeline-runsidkill
+  spec_node_id: api.operation
+  type: operation
+  layer_id: api
+  name: POST /pipeline-runs/:id/kill
+  description: "Emergency stop for a specific pipeline run. Kills associated agent
+    containers and marks the run as killed. Body: optional reason string.
+    Source: services/observability_server.py:956."
+  attributes:
+    operationId: killPipelineRun
+    summary: Emergency kill a pipeline run by ID
+    tags: Pipeline
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/observability_server.py
+        symbol: kill_pipeline_run
+  metadata:
+    created_at: 2026-03-24T10:30:47.740Z
+    updated_at: 2026-03-24T10:30:47.740Z
+    version: 1
+api.operation.get-apiactive-agents:
+  id: 127a9113-a4f5-4c52-bb98-1e0ff080c8c7
+  path: api.operation.get-apiactive-agents
+  spec_node_id: api.operation
+  type: operation
+  layer_id: api
+  name: GET /api/active-agents
+  description: "Returns currently active agents derived from active pipeline runs
+    (not just Docker containers). Enriches with pipeline_run_id and stage
+    context. Source: services/observability_server.py:1166."
+  attributes:
+    operationId: getActiveAgentsFromPipelines
+    summary: List active agents from pipeline run state
+    tags: Agents
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/observability_server.py
+        symbol: get_active_agents_from_pipelines
+  metadata:
+    created_at: 2026-03-24T10:30:48.304Z
+    updated_at: 2026-03-24T10:30:48.304Z
+    version: 1
+api.operation.get-completed-pipeline-runs:
+  id: cb70a5c8-9b42-43d8-a444-67eb5bff4647
+  path: api.operation.get-completed-pipeline-runs
+  spec_node_id: api.operation
+  type: operation
+  layer_id: api
+  name: GET /completed-pipeline-runs
+  description: "Paginated list of completed pipeline runs with optional filters
+    (project, board, outcome). Source: services/observability_server.py:1315."
+  attributes:
+    operationId: getCompletedPipelineRuns
+    summary: List completed pipeline runs with pagination
+    tags: Pipeline
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/observability_server.py
+        symbol: get_completed_pipeline_runs
+  metadata:
+    created_at: 2026-03-24T10:30:48.872Z
+    updated_at: 2026-03-24T10:30:48.872Z
+    version: 1
+api.operation.post-apicircuit-breakersclaude-codereset:
+  id: d7ce80aa-0ef1-4fbc-931a-8cfe5f282cb3
+  path: api.operation.post-apicircuit-breakersclaude-codereset
+  spec_node_id: api.operation
+  type: operation
+  layer_id: api
+  name: POST /api/circuit-breakers/claude-code/reset
+  description: "Manually resets the Claude Code circuit breaker to closed state.
+    Source: services/observability_server.py:2792."
+  attributes:
+    operationId: resetClaudeCodeBreaker
+    summary: Reset Claude Code circuit breaker
+    tags: Metrics
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/observability_server.py
+        symbol: reset_claude_code_breaker
+  metadata:
+    created_at: 2026-03-24T10:30:56.365Z
+    updated_at: 2026-03-24T10:30:56.365Z
+    version: 1
+api.operation.post-apicircuit-breakersagentagent-namereset:
+  id: 6efc0439-df86-4e6f-ba7f-3145cff64528
+  path: api.operation.post-apicircuit-breakersagentagent-namereset
+  spec_node_id: api.operation
+  type: operation
+  layer_id: api
+  name: POST /api/circuit-breakers/agent/:agentName/reset
+  description: "Manually resets an agent-specific circuit breaker. Path param:
+    agentName. Source: services/observability_server.py:2823."
+  attributes:
+    operationId: resetAgentBreaker
+    summary: Reset an agent-specific circuit breaker
+    tags: Metrics
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/observability_server.py
+        symbol: reset_agent_breaker
+  metadata:
+    created_at: 2026-03-24T10:30:56.979Z
+    updated_at: 2026-03-24T10:30:56.979Z
+    version: 1
+api.operation.post-apicircuit-breakersgithub-apireset:
+  id: fea64ed9-2728-4a62-a24c-a805169924ed
+  path: api.operation.post-apicircuit-breakersgithub-apireset
+  spec_node_id: api.operation
+  type: operation
+  layer_id: api
+  name: POST /api/circuit-breakers/github-api/reset
+  description: "Manually resets the GitHub API circuit breaker. Source:
+    services/observability_server.py:2853."
+  attributes:
+    operationId: resetGitHubApiBreaker
+    summary: Reset GitHub API circuit breaker
+    tags: Metrics
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/observability_server.py
+        symbol: reset_github_api_breaker
+  metadata:
+    created_at: 2026-03-24T10:30:57.635Z
+    updated_at: 2026-03-24T10:30:57.635Z
+    version: 1
+api.operation.get-apigithub-api-status:
+  id: 5fa83ce2-2f9e-45a2-b78f-807d99419533
+  path: api.operation.get-apigithub-api-status
+  spec_node_id: api.operation
+  type: operation
+  layer_id: api
+  name: GET /api/github-api-status
+  description: "Returns GitHub API client status including rate limit state and
+    circuit breaker. Source: services/observability_server.py:2889."
+  attributes:
+    operationId: getGitHubApiStatus
+    summary: Get GitHub API client status and rate limit
+    tags: Metrics
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/observability_server.py
+        symbol: get_github_api_status
+  metadata:
+    created_at: 2026-03-24T10:31:05.739Z
+    updated_at: 2026-03-24T10:31:05.739Z
+    version: 1
+api.operation.post-apiprojectsprojectpipelinesboardrelease-lock:
+  id: 940cc437-d742-4443-925a-93494f348cea
+  path: api.operation.post-apiprojectsprojectpipelinesboardrelease-lock
+  spec_node_id: api.operation
+  type: operation
+  layer_id: api
+  name: POST /api/projects/:project/pipelines/:board/release-lock
+  description: "Releases the pipeline lock for a specific project board,
+    unblocking the next issue from processing. Path params: project, board.
+    Source: services/observability_server.py:3311."
+  attributes:
+    operationId: releasePipelineLock
+    summary: Release pipeline lock for a project board
+    tags: Pipeline
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/observability_server.py
+        symbol: release_pipeline_lock
+  metadata:
+    created_at: 2026-03-24T10:31:06.354Z
+    updated_at: 2026-03-24T10:31:06.354Z
+    version: 1
+api.operation.post-apireconcile-state:
+  id: 9c033401-08fa-42f2-ae0b-dbb0092eb581
+  path: api.operation.post-apireconcile-state
+  spec_node_id: api.operation
+  type: operation
+  layer_id: api
+  name: POST /api/reconcile-state
+  description: "Triggers a manual reconciliation of GitHub project board state
+    against configuration. Source: services/observability_server.py:3397."
+  attributes:
+    operationId: reconcileState
+    summary: Trigger GitHub board state reconciliation
+    tags: Projects
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/observability_server.py
+        symbol: reconcile_state
+  metadata:
+    created_at: 2026-03-24T10:31:06.958Z
+    updated_at: 2026-03-24T10:31:06.958Z
+    version: 1
+api.operation.get-apiworkflow-configprojectboard:
+  id: 248ff5e6-cc31-4977-898f-a046094f6159
+  path: api.operation.get-apiworkflow-configprojectboard
+  spec_node_id: api.operation
+  type: operation
+  layer_id: api
+  name: GET /api/workflow-config/:project/:board
+  description: "Returns the workflow configuration (columns, agents, stage
+    mappings) for a specific project board. Path params: project, board. Source:
+    services/observability_server.py:3461."
+  attributes:
+    operationId: getWorkflowConfig
+    summary: Get workflow configuration for a project board
+    tags: Projects
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/observability_server.py
+        symbol: get_workflow_config
+  metadata:
+    created_at: 2026-03-24T10:31:17.261Z
+    updated_at: 2026-03-24T10:31:17.261Z
+    version: 1
+api.operation.get-apipipeline-queueprojectboard:
+  id: 5e76aba6-3e57-4d86-a918-f99ec9a695a9
+  path: api.operation.get-apipipeline-queueprojectboard
+  spec_node_id: api.operation
+  type: operation
+  layer_id: api
+  name: GET /api/pipeline-queue/:project/:board
+  description: "Returns the ordered queue of issues waiting for processing on a
+    specific board, including current status and position. Path params: project,
+    board. Source: services/observability_server.py:3546."
+  attributes:
+    operationId: getPipelineQueueStatus
+    summary: Get ordered issue queue for a project board
+    tags: Pipeline
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/observability_server.py
+        symbol: get_pipeline_queue_status
+  metadata:
+    created_at: 2026-03-24T10:31:17.845Z
+    updated_at: 2026-03-24T10:31:17.845Z
+    version: 1
+api.operation.get-apipipeline-locks:
+  id: 63d1a6e0-3763-4a9b-9134-3b0be8237d7d
+  path: api.operation.get-apipipeline-locks
+  spec_node_id: api.operation
+  type: operation
+  layer_id: api
+  name: GET /api/pipeline-locks
+  description: "Returns the status of all active pipeline locks across all
+    projects and boards. Source: services/observability_server.py:3619."
+  attributes:
+    operationId: getAllPipelineLocks
+    summary: Get all active pipeline locks
+    tags: Pipeline
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/observability_server.py
+        symbol: get_all_pipeline_locks
+  metadata:
+    created_at: 2026-03-24T10:31:18.461Z
+    updated_at: 2026-03-24T10:31:18.461Z
+    version: 1
+api.operation.post-apipipeline-queueprojectboardrefresh:
+  id: f1e31782-3fb5-494c-9f3c-e523d191af10
+  path: api.operation.post-apipipeline-queueprojectboardrefresh
+  spec_node_id: api.operation
+  type: operation
+  layer_id: api
+  name: POST /api/pipeline-queue/:project/:board/refresh
+  description: "Forces a refresh of the pipeline queue order for a board by
+    re-fetching from GitHub. Path params: project, board. Source:
+    services/observability_server.py:3668."
+  attributes:
+    operationId: refreshPipelineQueueOrder
+    summary: Refresh pipeline queue order from GitHub
+    tags: Pipeline
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/observability_server.py
+        symbol: refresh_pipeline_queue_order
+  metadata:
+    created_at: 2026-03-24T10:31:19.145Z
+    updated_at: 2026-03-24T10:31:19.145Z
+    version: 1
+api.operation.get-apiblocked-issues:
+  id: 9db0134d-82e1-4877-a019-2827cf833943
+  path: api.operation.get-apiblocked-issues
+  spec_node_id: api.operation
+  type: operation
+  layer_id: api
+  name: GET /api/blocked-issues
+  description: "Returns issues that are currently blocked from processing (e.g.,
+    due to lock contention, circuit breaker open, or missing agent). Source:
+    services/observability_server.py:3700."
+  attributes:
+    operationId: getBlockedIssues
+    summary: List issues blocked from pipeline processing
+    tags: Pipeline
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/observability_server.py
+        symbol: get_blocked_issues
+  metadata:
+    created_at: 2026-03-24T10:31:19.791Z
+    updated_at: 2026-03-24T10:31:19.791Z
+    version: 1
+api.operation.get-apipipeline-run-filter-options:
+  id: 187caeb6-e5a4-40dd-b493-cdd06557ee81
+  path: api.operation.get-apipipeline-run-filter-options
+  spec_node_id: api.operation
+  type: operation
+  layer_id: api
+  name: GET /api/pipeline-run-filter-options
+  description: "Returns distinct project, board, and outcome values for use in
+    completed-pipeline-runs filter UI. Source:
+    services/observability_server.py:1409."
+  attributes:
+    operationId: getPipelineRunFilterOptions
+    summary: Get filter options for pipeline run history
+    tags: Pipeline
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/observability_server.py
+        symbol: get_pipeline_run_filter_options
+  metadata:
+    created_at: 2026-03-24T10:31:30.629Z
+    updated_at: 2026-03-24T10:31:30.629Z
+    version: 1
+api.operation.get-apipipeline-recommendations:
+  id: e499a749-9a47-4e00-87d2-a46be744ea87
+  path: api.operation.get-apipipeline-recommendations
+  spec_node_id: api.operation
+  type: operation
+  layer_id: api
+  name: GET /api/pipeline-recommendations
+  description: "Returns all AI-generated recommendations from completed pipeline
+    runs, enriched with run context. Source:
+    services/observability_server.py:1435."
+  attributes:
+    operationId: getPipelineRecommendations
+    summary: List AI recommendations from pipeline runs
+    tags: Pipeline
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/observability_server.py
+        symbol: get_pipeline_recommendations
+  metadata:
+    created_at: 2026-03-24T10:31:31.214Z
+    updated_at: 2026-03-24T10:31:31.214Z
+    version: 1
+api.operation.get-apifeedback-loopsactive:
+  id: 90811131-6db7-4339-b0fb-9108ce4ef939
+  path: api.operation.get-apifeedback-loopsactive
+  spec_node_id: api.operation
+  type: operation
+  layer_id: api
+  name: GET /api/feedback-loops/active
+  description: "Returns active feedback loops (conversational Q&A sessions between
+    issues and agents). Source: services/observability_server.py:1493."
+  attributes:
+    operationId: getActiveFeedbackLoops
+    summary: List active conversational feedback loops
+    tags: Pipeline
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/observability_server.py
+        symbol: get_active_feedback_loops
+  metadata:
+    created_at: 2026-03-24T10:31:31.806Z
+    updated_at: 2026-03-24T10:31:31.806Z
+    version: 1
+api.operation.get-apiagent-executionexecution-id:
+  id: b47c57db-d457-454a-b32a-38a330930a47
+  path: api.operation.get-apiagent-executionexecution-id
+  spec_node_id: api.operation
+  type: operation
+  layer_id: api
+  name: GET /api/agent-execution/:executionId
+  description: "Returns detailed execution data for a specific agent run,
+    including prompt, output, token usage, and events. Source:
+    services/observability_server.py:1574."
+  attributes:
+    operationId: getAgentExecution
+    summary: Get details for a specific agent execution
+    tags: Agents
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/observability_server.py
+        symbol: get_agent_execution
+  metadata:
+    created_at: 2026-03-24T10:31:32.402Z
+    updated_at: 2026-03-24T10:31:32.402Z
+    version: 1
+api.operation.get-apipipeline-runidtoken-usage:
+  id: 98528c15-c5bc-4430-ae0b-a2dda38fc2af
+  path: api.operation.get-apipipeline-runidtoken-usage
+  spec_node_id: api.operation
+  type: operation
+  layer_id: api
+  name: GET /api/pipeline-run/:id/token-usage
+  description: "Returns aggregate token usage breakdown for a specific pipeline
+    run. Source: services/observability_server.py:1796."
+  attributes:
+    operationId: getPipelineRunTokenUsage
+    summary: Get token usage for a pipeline run
+    tags: Metrics
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/observability_server.py
+        symbol: get_pipeline_run_token_usage
+  metadata:
+    created_at: 2026-03-24T10:31:40.121Z
+    updated_at: 2026-03-24T10:31:40.121Z
+    version: 1
+api.operation.get-apipipeline-runidanalysis:
+  id: 3afc65fc-19ec-44c0-a7f4-cf460018eadc
+  path: api.operation.get-apipipeline-runidanalysis
+  spec_node_id: api.operation
+  type: operation
+  layer_id: api
+  name: GET /api/pipeline-run/:id/analysis
+  description: "Returns analysis and quality scoring for a specific pipeline run.
+    Source: services/observability_server.py:1844."
+  attributes:
+    operationId: getPipelineRunAnalysis
+    summary: Get analysis and quality scores for a pipeline run
+    tags: Pipeline
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/observability_server.py
+        symbol: get_pipeline_run_analysis
+  metadata:
+    created_at: 2026-03-24T10:31:40.715Z
+    updated_at: 2026-03-24T10:31:40.715Z
+    version: 1
+api.operation.get-apimetricsagents:
+  id: d3b4204d-04fd-46b2-b191-0b70cde3c436
+  path: api.operation.get-apimetricsagents
+  spec_node_id: api.operation
+  type: operation
+  layer_id: api
+  name: GET /api/metrics/agents
+  description: "Returns aggregate performance metrics per agent (avg duration,
+    success rate, token usage). Source: services/observability_server.py:1876."
+  attributes:
+    operationId: getAgentMetrics
+    summary: Get aggregate performance metrics per agent
+    tags: Metrics
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/observability_server.py
+        symbol: get_agent_metrics
+  metadata:
+    created_at: 2026-03-24T10:31:41.315Z
+    updated_at: 2026-03-24T10:31:41.315Z
+    version: 1
+api.operation.get-apimetricscycles:
+  id: a60fa0e6-1a51-42b9-9114-612f9d1d6fa7
+  path: api.operation.get-apimetricscycles
+  spec_node_id: api.operation
+  type: operation
+  layer_id: api
+  name: GET /api/metrics/cycles
+  description: "Returns aggregate cycle metrics (review cycles, repair cycles)
+    across all pipeline runs. Source: services/observability_server.py:1950."
+  attributes:
+    operationId: getCycleMetrics
+    summary: Get aggregate review and repair cycle metrics
+    tags: Metrics
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/observability_server.py
+        symbol: get_cycle_metrics
+  metadata:
+    created_at: 2026-03-24T10:31:41.923Z
+    updated_at: 2026-03-24T10:31:41.923Z
+    version: 1
+api.operation.get-apimetricsprojects:
+  id: 1fc88750-16f4-4a0b-926a-4436ab5e72ba
+  path: api.operation.get-apimetricsprojects
+  spec_node_id: api.operation
+  type: operation
+  layer_id: api
+  name: GET /api/metrics/projects
+  description: "Returns aggregate metrics per project (pipeline run counts,
+    success rates, cycle counts). Source:
+    services/observability_server.py:2018."
+  attributes:
+    operationId: getProjectMetrics
+    summary: Get aggregate metrics per project
+    tags: Metrics
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/observability_server.py
+        symbol: get_project_metrics
+  metadata:
+    created_at: 2026-03-24T10:31:49.927Z
+    updated_at: 2026-03-24T10:31:49.927Z
+    version: 1
+api.operation.get-apimetricsexecutionstop:
+  id: eafa2659-288b-4b96-8046-e7533865af11
+  path: api.operation.get-apimetricsexecutionstop
+  spec_node_id: api.operation
+  type: operation
+  layer_id: api
+  name: GET /api/metrics/executions/top
+  description: "Returns top agent executions by cost or duration, used for
+    identifying expensive runs. Source: services/observability_server.py:2245."
+  attributes:
+    operationId: getTopExecutions
+    summary: Get top agent executions by cost or duration
+    tags: Metrics
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/observability_server.py
+        symbol: get_top_executions
+  metadata:
+    created_at: 2026-03-24T10:31:50.565Z
+    updated_at: 2026-03-24T10:31:50.565Z
+    version: 1
+api.operation.post-apimetricsrun-now:
+  id: 7fb8cc17-fb45-4b24-8dc0-b4bc2e52c37c
+  path: api.operation.post-apimetricsrun-now
+  spec_node_id: api.operation
+  type: operation
+  layer_id: api
+  name: POST /api/metrics/run-now
+  description: "Triggers an immediate token metrics computation job outside the
+    normal scheduler cycle. Source: services/observability_server.py:2323."
+  attributes:
+    operationId: triggerTokenMetrics
+    summary: Trigger immediate token metrics computation
+    tags: Metrics
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/observability_server.py
+        symbol: trigger_token_metrics
+  metadata:
+    created_at: 2026-03-24T10:31:51.219Z
+    updated_at: 2026-03-24T10:31:51.219Z
+    version: 1
+api.operation.post-apimetricsprojectsrun-now:
+  id: c62898ad-9b05-40de-bcb2-425f1d1187fc
+  path: api.operation.post-apimetricsprojectsrun-now
+  spec_node_id: api.operation
+  type: operation
+  layer_id: api
+  name: POST /api/metrics/projects/run-now
+  description: "Triggers an immediate project metrics backfill with 7-day
+    lookback. Source: services/observability_server.py:2340."
+  attributes:
+    operationId: triggerProjectMetrics
+    summary: Trigger immediate project metrics backfill
+    tags: Metrics
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/observability_server.py
+        symbol: trigger_project_metrics
+  metadata:
+    created_at: 2026-03-24T10:31:51.837Z
+    updated_at: 2026-03-24T10:31:51.837Z
+    version: 1
+api.operation.post-apimetricsrun-full-history:
+  id: 5d0eeba1-9c2e-49dc-b0e5-dfc93ffcfae3
+  path: api.operation.post-apimetricsrun-full-history
+  spec_node_id: api.operation
+  type: operation
+  layer_id: api
+  name: POST /api/metrics/run-full-history
+  description: "Backfills token metrics across all available event history (no
+    time bound). Source: services/observability_server.py:2357."
+  attributes:
+    operationId: triggerTokenMetricsFullHistory
+    summary: Backfill token metrics across full event history
+    tags: Metrics
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/observability_server.py
+        symbol: trigger_token_metrics_full_history
+  metadata:
+    created_at: 2026-03-24T10:31:58.638Z
+    updated_at: 2026-03-24T10:31:58.638Z
+    version: 1
+api.operation.get-debugtest-pubsub:
+  id: 55c6877b-1499-4b1c-8986-e43ec5fca32d
+  path: api.operation.get-debugtest-pubsub
+  spec_node_id: api.operation
+  type: operation
+  layer_id: api
+  name: GET /debug/test-pubsub
+  description: "Debug-only endpoint to publish a test message to Redis pub/sub,
+    verifying the Socket.IO event pipeline. Source:
+    services/observability_server.py:134."
+  attributes:
+    operationId: debugTestPubsub
+    summary: Publish a test event to Redis pub/sub
+    tags: Health
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/observability_server.py
+        symbol: test_pubsub
+  metadata:
+    created_at: 2026-03-24T10:31:59.298Z
+    updated_at: 2026-03-24T10:31:59.298Z
+    version: 1

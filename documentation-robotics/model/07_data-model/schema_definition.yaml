@@ -1,0 +1,272 @@
+data-model.schemadefinition.task:
+  id: 5de3ca9b-2b89-4ce8-a17d-2122353aba54
+  path: data-model.schemadefinition.task
+  spec_node_id: data-model.schemadefinition
+  type: schemadefinition
+  layer_id: data-model
+  name: Task
+  description: Priority queue work item with agent name, project, priority level,
+    context payload, creation timestamp, status, and optional not_before
+    scheduling
+  attributes:
+    title: Task
+    type: object
+    format: dataclass
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: task_queue/task_manager.py
+        symbol: Task
+  metadata:
+    created_at: 2026-03-24T00:12:01.225Z
+    updated_at: 2026-03-24T00:12:01.225Z
+    version: 1
+data-model.schemadefinition.pipeline-run:
+  id: 7752277b-2391-4111-a08b-843225efdf82
+  path: data-model.schemadefinition.pipeline-run
+  spec_node_id: data-model.schemadefinition
+  type: schemadefinition
+  layer_id: data-model
+  name: Pipeline Run
+  description: Full lifecycle record of an issue traversing the pipeline; includes
+    project, issue number, board, status, current stage, events list,
+    timestamps, and pipeline_run_id
+  attributes:
+    title: PipelineRun
+    type: object
+    format: dataclass
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/pipeline_run.py
+        symbol: PipelineRun
+  metadata:
+    created_at: 2026-03-24T00:12:01.702Z
+    updated_at: 2026-03-24T00:12:01.702Z
+    version: 1
+data-model.schemadefinition.pipeline-lock:
+  id: 324e1a5c-42b0-48f1-aea0-824663fbabd7
+  path: data-model.schemadefinition.pipeline-lock
+  spec_node_id: data-model.schemadefinition
+  type: schemadefinition
+  layer_id: data-model
+  name: Pipeline Lock
+  description: "Exclusive lock record for pipeline serialization; fields: project,
+    board, locked_by_issue, lock_acquired_at (ISO8601), lock_status
+    (locked|unlocked)"
+  attributes:
+    title: PipelineLock
+    type: object
+    format: dataclass
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/pipeline_lock_manager.py
+        symbol: PipelineLock
+  metadata:
+    created_at: 2026-03-24T00:12:02.176Z
+    updated_at: 2026-03-24T00:12:02.176Z
+    version: 1
+data-model.schemadefinition.agent-config:
+  id: 3ed5ee3f-5748-41fc-91dd-5faa8d559871
+  path: data-model.schemadefinition.agent-config
+  spec_node_id: data-model.schemadefinition
+  type: schemadefinition
+  layer_id: data-model
+  name: Agent Config
+  description: Agent capability definition from agents.yaml; includes model,
+    timeout, retries, makes_code_changes, filesystem_write_allowed,
+    requires_dev_container, requires_docker, capabilities, tools_enabled,
+    mcp_servers
+  attributes:
+    title: AgentConfig
+    type: object
+    format: yaml
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: config/foundations/agents.yaml
+  metadata:
+    created_at: 2026-03-24T00:12:10.372Z
+    updated_at: 2026-03-24T00:12:10.372Z
+    version: 1
+data-model.schemadefinition.project-config:
+  id: eef80829-d468-438b-9de8-df25f354fc4e
+  path: data-model.schemadefinition.project-config
+  spec_node_id: data-model.schemadefinition
+  type: schemadefinition
+  layer_id: data-model
+  name: Project Config
+  description: Per-project configuration including GitHub org/repo, tech_stacks,
+    enabled pipeline templates with workflow mappings, board names, and
+    visibility flags
+  attributes:
+    title: ProjectConfig
+    type: object
+    format: yaml
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: config/projects/context-studio.yaml
+  metadata:
+    created_at: 2026-03-24T00:12:10.837Z
+    updated_at: 2026-03-24T00:12:10.837Z
+    version: 1
+data-model.schemadefinition.pipeline-template:
+  id: d261197e-79a4-427b-b98c-16defde07435
+  path: data-model.schemadefinition.pipeline-template
+  spec_node_id: data-model.schemadefinition
+  type: schemadefinition
+  layer_id: data-model
+  name: Pipeline Template
+  description: "Reusable pipeline stage sequence definition: name, description,
+    workflow_type, workspace, discussion_category, and ordered stages with
+    agent, capabilities, retries, and review config"
+  attributes:
+    title: PipelineTemplate
+    type: object
+    format: yaml
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: config/foundations/pipelines.yaml
+  metadata:
+    created_at: 2026-03-24T00:12:11.334Z
+    updated_at: 2026-03-24T00:12:11.334Z
+    version: 1
+data-model.schemadefinition.workflow-template:
+  id: 58d23f59-ea62-4e09-a941-c3a725ce7bef
+  path: data-model.schemadefinition.workflow-template
+  spec_node_id: data-model.schemadefinition
+  type: schemadefinition
+  layer_id: data-model
+  name: Workflow Template
+  description: "Kanban board structure definition: pipeline mapping, trigger/exit
+    columns, and ordered column definitions with stage mappings, agents, and
+    automation rules"
+  attributes:
+    title: WorkflowTemplate
+    type: object
+    format: yaml
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: config/foundations/workflows.yaml
+  metadata:
+    created_at: 2026-03-24T00:12:20.466Z
+    updated_at: 2026-03-24T00:12:20.466Z
+    version: 1
+data-model.schemadefinition.review-cycle-state:
+  id: 3ad189cf-2e9f-4851-b244-5b27f308226a
+  path: data-model.schemadefinition.review-cycle-state
+  spec_node_id: data-model.schemadefinition
+  type: schemadefinition
+  layer_id: data-model
+  name: Review Cycle State
+  description: "Active review cycle tracking object: issue_number, repository,
+    maker_agent, reviewer_agent, max_iterations, project, board, workspace type,
+    current iteration, and cycle stack"
+  attributes:
+    title: ReviewCycleState
+    type: object
+    format: class
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/review_cycle.py
+        symbol: ReviewCycleState
+  metadata:
+    created_at: 2026-03-24T00:12:20.957Z
+    updated_at: 2026-03-24T00:12:20.957Z
+    version: 1
+data-model.schemadefinition.pr-review-state:
+  id: 2542da5b-050f-4f2b-8b88-7238b21bff99
+  path: data-model.schemadefinition.pr-review-state
+  spec_node_id: data-model.schemadefinition
+  type: schemadefinition
+  layer_id: data-model
+  name: PR Review State
+  description: "Persisted review cycle count tracking: maps issue numbers to
+    pr_reviews dict with cycle_count, history list, and last_reviewed_at; stored
+    in state/projects/<project>/pr_review_state.yaml"
+  attributes:
+    title: PRReviewState
+    type: object
+    format: yaml
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: state_management/pr_review_state_manager.py
+        symbol: PRReviewStateManager
+  metadata:
+    created_at: 2026-03-24T00:12:21.484Z
+    updated_at: 2026-03-24T00:12:21.484Z
+    version: 1
+data-model.schemadefinition.feature-branch-state:
+  id: 93126767-815e-4288-bd76-cbaf13ba762a
+  path: data-model.schemadefinition.feature-branch-state
+  spec_node_id: data-model.schemadefinition
+  type: schemadefinition
+  layer_id: data-model
+  name: Feature Branch State
+  description: "Branch lifecycle record: branch_name, parent_issue, sub-issues
+    list (SubIssueState), created_at; persisted to YAML tracking hierarchical
+    branch contributions to a shared PR"
+  attributes:
+    title: FeatureBranchState
+    type: object
+    format: dataclass
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/feature_branch_manager.py
+        symbol: SubIssueState
+  metadata:
+    created_at: 2026-03-24T00:12:29.720Z
+    updated_at: 2026-03-24T00:12:29.720Z
+    version: 1
+data-model.schemadefinition.git-hub-state:
+  id: 32c1e229-5908-4883-a4c2-cfcf83d98832
+  path: data-model.schemadefinition.git-hub-state
+  spec_node_id: data-model.schemadefinition
+  type: schemadefinition
+  layer_id: data-model
+  name: GitHub State
+  description: "Auto-managed runtime GitHub state: project board IDs, column IDs,
+    label IDs, sync timestamps, and reconciliation freshness; stored in
+    state/projects/<project>/github_state.yaml"
+  attributes:
+    title: GitHubState
+    type: object
+    format: yaml
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: config/state_manager.py
+  metadata:
+    created_at: 2026-03-24T00:12:30.053Z
+    updated_at: 2026-03-24T00:12:30.053Z
+    version: 1
+data-model.schemadefinition.observability-event:
+  id: a20b354c-87a0-42f7-90e7-edd1c3f7bf9a
+  path: data-model.schemadefinition.observability-event
+  spec_node_id: data-model.schemadefinition
+  type: schemadefinition
+  layer_id: data-model
+  name: Observability Event
+  description: "Structured event record emitted by agents and pipeline:
+    event_type, agent, project, task_id, pipeline_run_id, timestamp, and
+    event-specific payload fields"
+  attributes:
+    title: ObservabilityEvent
+    type: object
+    format: dataclass
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: monitoring/observability.py
+        symbol: ObservabilityManager
+  metadata:
+    created_at: 2026-03-24T00:12:30.401Z
+    updated_at: 2026-03-24T00:12:30.401Z
+    version: 1

@@ -1,0 +1,63 @@
+security.role.orchestrator-operator:
+  id: 3018059f-a6a7-4998-b201-6c54a7bc18bb
+  path: security.role.orchestrator-operator
+  spec_node_id: security.role
+  type: role
+  layer_id: security
+  name: Orchestrator Operator
+  description: Human operator with full access to configure and operate the orchestrator
+  attributes:
+    displayName: Orchestrator Operator
+    level: 100
+    inheritsFrom: ""
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: documentation/github-authentication.md
+        symbol: PersonalAccessToken
+  metadata:
+    created_at: 2026-03-24T00:24:52.006Z
+    updated_at: 2026-03-24T00:24:52.006Z
+    version: 1
+security.role.pipeline-executor:
+  id: a58faf3b-0391-46b8-9bfc-502231af4e0d
+  path: security.role.pipeline-executor
+  spec_node_id: security.role
+  type: role
+  layer_id: security
+  name: Pipeline Executor
+  description: GitHub App bot identity executing pipeline stages and posting to GitHub
+  attributes:
+    displayName: Pipeline Executor
+    level: 50
+    inheritsFrom: ""
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/github_app.py
+        symbol: GitHubApp
+  metadata:
+    created_at: 2026-03-24T00:24:52.516Z
+    updated_at: 2026-03-24T00:24:52.516Z
+    version: 1
+security.role.agent-sandbox:
+  id: a22b5781-6761-4ef8-bc85-c3f0f099b06e
+  path: security.role.agent-sandbox
+  spec_node_id: security.role
+  type: role
+  layer_id: security
+  name: Agent Sandbox
+  description: Isolated container role with write access only to project workspace
+  attributes:
+    displayName: Agent Sandbox
+    level: 10
+    inheritsFrom: ""
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: claude/docker_runner.py
+        symbol: DockerAgentRunner
+  metadata:
+    created_at: 2026-03-24T00:24:53.032Z
+    updated_at: 2026-03-24T00:24:53.032Z
+    version: 1

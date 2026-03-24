@@ -1,0 +1,41 @@
+technology.communicationnetwork.orchestrator-docker-network:
+  id: 9b247910-71db-4068-a580-580e1ee0f9e5
+  path: technology.communicationnetwork.orchestrator-docker-network
+  spec_node_id: technology.communicationnetwork
+  type: communicationnetwork
+  layer_id: technology
+  name: Orchestrator Docker Network
+  description: "orchestrator-net bridge network in Docker Compose connecting all
+    services: redis, orchestrator, observability-server, web-ui, log-collector,
+    browserless, and elasticsearch"
+  attributes:
+    networkType: intranet
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: docker-compose.yml
+        symbol: orchestrator-net
+  metadata:
+    created_at: 2026-03-24T00:08:43.253Z
+    updated_at: 2026-03-24T00:08:43.253Z
+    version: 1
+technology.communicationnetwork.public-internet:
+  id: d6acafd6-b260-486b-9d58-6097a786f74c
+  path: technology.communicationnetwork.public-internet
+  spec_node_id: technology.communicationnetwork
+  type: communicationnetwork
+  layer_id: technology
+  name: Public Internet
+  description: Public internet connectivity used by agents to reach GitHub API,
+    Anthropic API, and Context7 MCP server; also used for web UI browser access
+    on port 3000
+  attributes:
+    networkType: internet
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: docker-compose.yml
+  metadata:
+    created_at: 2026-03-24T00:08:43.747Z
+    updated_at: 2026-03-24T00:08:43.747Z
+    version: 1

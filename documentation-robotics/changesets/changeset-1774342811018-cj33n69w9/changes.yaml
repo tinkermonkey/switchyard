@@ -1,0 +1,680 @@
+- type: add
+  elementId: application.applicationprocess.pipeline-checkpoint-before-execute-sequence
+  layerName: application
+  after:
+    id: fa82243c-415e-40c4-b406-ee26fb4d01d3
+    path: application.applicationprocess.pipeline-checkpoint-before-execute-sequence
+    spec_node_id: application.applicationprocess
+    type: applicationprocess
+    layer_id: application
+    name: Pipeline Checkpoint-Before-Execute Sequence
+    description: Before each stage executes, a checkpoint is written at stage_index
+      N; on recovery the pipeline loads the highest-indexed checkpoint file and
+      resumes from that stage index — meaning the failed stage re-runs, not the
+      next one
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: pipeline/orchestrator.py
+          symbol: SequentialPipeline.execute
+    metadata:
+      created_at: 2026-03-24T09:00:17.626Z
+      updated_at: 2026-03-24T09:00:17.626Z
+      version: 1
+  timestamp: 2026-03-24T09:00:17.646Z
+  sequenceNumber: 0
+- type: add
+  elementId: application.applicationprocess.circuit-breaker-halt-and-retry-logic
+  layerName: application
+  after:
+    id: 7d4a625b-9d91-40dc-a315-66051b40c238
+    path: application.applicationprocess.circuit-breaker-halt-and-retry-logic
+    spec_node_id: application.applicationprocess
+    type: applicationprocess
+    layer_id: application
+    name: Circuit Breaker Halt and Retry Logic
+    description: "On stage exception: if circuit breaker state is open, raise
+      immediately and halt the pipeline; if closed or half-open, sleep 5 seconds
+      and allow retry by looping back — no explicit max retry count in the base
+      loop"
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: pipeline/orchestrator.py
+          symbol: SequentialPipeline.execute
+    metadata:
+      created_at: 2026-03-24T09:00:22.294Z
+      updated_at: 2026-03-24T09:00:22.294Z
+      version: 1
+  timestamp: 2026-03-24T09:00:22.316Z
+  sequenceNumber: 1
+- type: add
+  elementId: application.applicationprocess.container-two-phase-pre-flight-check
+  layerName: application
+  after:
+    id: 294e8dda-14c5-4059-9b19-80e98aab59f7
+    path: application.applicationprocess.container-two-phase-pre-flight-check
+    spec_node_id: application.applicationprocess
+    type: applicationprocess
+    layer_id: application
+    name: Container Two-Phase Pre-Flight Check
+    description: "Before launching a write-enabled agent container: (1) verify host
+      filesystem write access by creating and deleting a test file at
+      project_dir; (2) run a throw-away container using the orchestrator image
+      to verify the container can write to /workspace — if either check fails,
+      abort and raise before spending API tokens"
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: claude/docker_runner.py
+          symbol: DockerAgentRunner._execute_in_container
+    metadata:
+      created_at: 2026-03-24T09:00:29.317Z
+      updated_at: 2026-03-24T09:00:29.317Z
+      version: 1
+  timestamp: 2026-03-24T09:00:29.340Z
+  sequenceNumber: 2
+- type: add
+  elementId: application.applicationprocess.detached-container-execution-and-log-streaming
+  layerName: application
+  after:
+    id: 1b813660-c728-4d95-ad2f-b0b9a65eba04
+    path: application.applicationprocess.detached-container-execution-and-log-streaming
+    spec_node_id: application.applicationprocess
+    type: applicationprocess
+    layer_id: application
+    name: Detached Container Execution and Log Streaming
+    description: Agent containers run detached (docker run -d); a separate Popen
+      runs 'docker logs -f container_name' with stdout and stderr captured in
+      two concurrent reader threads; 'docker wait container_name' (not
+      process.wait) enforces the hard timeout from agents.yaml; on timeout
+      docker kill is sent, then docker wait is called again to collect the exit
+      code
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: claude/docker_runner.py
+          symbol: DockerAgentRunner._execute_in_container
+    metadata:
+      created_at: 2026-03-24T09:00:37.393Z
+      updated_at: 2026-03-24T09:00:37.393Z
+      version: 1
+  timestamp: 2026-03-24T09:00:37.414Z
+  sequenceNumber: 3
+- type: add
+  elementId: application.applicationfunction.prompt-file-writer-and-stdin-pipe
+  layerName: application
+  after:
+    id: 15425f2f-5cff-4db6-a87c-5968ebcc1f8b
+    path: application.applicationfunction.prompt-file-writer-and-stdin-pipe
+    spec_node_id: application.applicationfunction
+    type: applicationfunction
+    layer_id: application
+    name: Prompt File Writer and Stdin Pipe
+    description: "Prompts are written to .claude_prompt_{safe_task_id}.txt inside
+      the mounted project directory; inside the container the shell command is:
+      cat /workspace/{filename} | python3 /app/scripts/docker-claude-wrapper.py
+      --print --verbose --output-format stream-json --model {model}
+      --permission-mode bypassPermissions [-]; this avoids shell command-length
+      limits and allows orchestrator to inspect the prompt file after the run"
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: claude/docker_runner.py
+          symbol: DockerAgentRunner._execute_in_container
+    metadata:
+      created_at: 2026-03-24T09:00:44.059Z
+      updated_at: 2026-03-24T09:00:44.059Z
+      version: 1
+  timestamp: 2026-03-24T09:00:44.080Z
+  sequenceNumber: 4
+- type: add
+  elementId: application.dataobject.docker-container-label-set
+  layerName: application
+  after:
+    id: 04062b3d-a78e-4764-8fe6-87fa5dac27ac
+    path: application.dataobject.docker-container-label-set
+    spec_node_id: application.dataobject
+    type: dataobject
+    layer_id: application
+    name: Docker Container Label Set
+    description: "Every agent container is launched with five labels:
+      org.switchyard.project, org.switchyard.agent, org.switchyard.task_id,
+      org.switchyard.execution_type, org.switchyard.managed=true; optional:
+      org.switchyard.issue_number, org.switchyard.pipeline_run_id — these labels
+      enable the recovery system to identify orphaned containers after an
+      orchestrator restart without relying on Redis state"
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: claude/docker_runner.py
+          symbol: DockerAgentRunner._build_docker_command
+    metadata:
+      created_at: 2026-03-24T09:00:50.679Z
+      updated_at: 2026-03-24T09:00:50.679Z
+      version: 1
+  timestamp: 2026-03-24T09:00:50.702Z
+  sequenceNumber: 5
+- type: add
+  elementId: application.applicationfunction.container-image-selection-decision-tree
+  layerName: application
+  after:
+    id: 1df3ba26-de85-44fc-873f-24478b92e8a0
+    path: application.applicationfunction.container-image-selection-decision-tree
+    spec_node_id: application.applicationfunction
+    type: applicationfunction
+    layer_id: application
+    name: Container Image Selection Decision Tree
+    description: "Decision: if agent config has requires_dev_container=true AND
+      dev_container_state.is_verified(project) is true AND
+      get_image_name(project) returns a value, use the project-specific dev
+      container image; otherwise fall back to switchyard-orchestrator:latest;
+      dev_environment_setup agent always falls back to orchestrator image (no
+      project config)"
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: claude/docker_runner.py
+          symbol: DockerAgentRunner._get_image_for_agent
+    metadata:
+      created_at: 2026-03-24T09:00:57.051Z
+      updated_at: 2026-03-24T09:00:57.051Z
+      version: 1
+  timestamp: 2026-03-24T09:00:57.074Z
+  sequenceNumber: 6
+- type: add
+  elementId: application.applicationfunction.exit-code-zero-empty-output-failure-detection
+  layerName: application
+  after:
+    id: 95805839-4915-47db-93d2-c4721a45ce9e
+    path: application.applicationfunction.exit-code-zero-empty-output-failure-detection
+    spec_node_id: application.applicationfunction
+    type: applicationfunction
+    layer_id: application
+    name: Exit-Code-Zero Empty Output Failure Detection
+    description: "After container exits with code 0, the result text is validated:
+      if result_text is empty (wrapper failed to persist, Claude crashed
+      silently), the run is treated as a failure — exit code 0 is not sufficient
+      for success; failure is persisted to Redis and recorded in
+      work_execution_tracker before returning empty string"
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: claude/docker_runner.py
+          symbol: DockerAgentRunner._execute_in_container
+    metadata:
+      created_at: 2026-03-24T09:01:04.055Z
+      updated_at: 2026-03-24T09:01:04.055Z
+      version: 1
+  timestamp: 2026-03-24T09:01:04.076Z
+  sequenceNumber: 7
+- type: add
+  elementId: application.applicationprocess.rate-limit-detection-and-breaker-trip-cascade
+  layerName: application
+  after:
+    id: b075c94b-ec77-4cf4-bfd4-99dc3f301ce2
+    path: application.applicationprocess.rate-limit-detection-and-breaker-trip-cascade
+    spec_node_id: application.applicationprocess
+    type: applicationprocess
+    layer_id: application
+    name: Rate Limit Detection and Breaker Trip Cascade
+    description: "On exit code 1: (1) check if stderr contains only debug output and
+      no real error keywords; if so, (2) query Elasticsearch index
+      claude-streams-* for recent raw_event.event.error=rate_limit events in the
+      last 5 minutes; (3) if found, parse the reset time from the message text
+      using ClaudeCodeBreaker.detect_session_limit(); (4) trip the circuit
+      breaker with the reset time; (5) raise ClaudeCodeRateLimitError — if
+      Elasticsearch query fails or no rate limit found, treat as regular failure
+      without tripping breaker"
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: claude/docker_runner.py
+          symbol: DockerAgentRunner._execute_in_container
+    metadata:
+      created_at: 2026-03-24T09:01:11.340Z
+      updated_at: 2026-03-24T09:01:11.340Z
+      version: 1
+  timestamp: 2026-03-24T09:01:11.363Z
+  sequenceNumber: 8
+- type: add
+  elementId: application.applicationfunction.claude-session-id-capture-and-resume
+  layerName: application
+  after:
+    id: 1f82961b-b8ea-4005-accb-b38cdb9546d9
+    path: application.applicationfunction.claude-session-id-capture-and-resume
+    spec_node_id: application.applicationfunction
+    type: applicationfunction
+    layer_id: application
+    name: Claude Session ID Capture and Resume
+    description: The first JSON event emitted by Claude Code that contains a
+      session_id field is captured from the stdout stream; the session_id is
+      stored in context['claude_session_id']; on subsequent agent invocations
+      for the same issue, the --resume {session_id} flag is passed to the claude
+      command, enabling multi-turn conversation continuity across separate
+      container launches
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: claude/docker_runner.py
+          symbol: DockerAgentRunner._execute_in_container
+    metadata:
+      created_at: 2026-03-24T09:01:16.631Z
+      updated_at: 2026-03-24T09:01:16.631Z
+      version: 1
+  timestamp: 2026-03-24T09:01:16.654Z
+  sequenceNumber: 9
+- type: add
+  elementId: application.applicationprocess.git-hub-board-poll-with-adaptive-backoff
+  layerName: application
+  after:
+    id: a04ec6cc-ff56-4b93-b82b-4f92d4369fa5
+    path: application.applicationprocess.git-hub-board-poll-with-adaptive-backoff
+    spec_node_id: application.applicationprocess
+    type: applicationprocess
+    layer_id: application
+    name: GitHub Board Poll with Adaptive Backoff
+    description: ProjectMonitor polls all configured boards on a base interval
+      (default 15-30s from project config); after _idle_backoff_threshold (4)
+      consecutive idle cycles with no status changes, the interval backs off
+      toward _max_poll_interval (60s); any detected status change resets the
+      interval to base; circuit breaker open state causes the board query to be
+      skipped entirely for the current cycle
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/project_monitor.py
+          symbol: ProjectMonitor
+    metadata:
+      created_at: 2026-03-24T09:01:23.836Z
+      updated_at: 2026-03-24T09:01:23.836Z
+      version: 1
+  timestamp: 2026-03-24T09:01:23.862Z
+  sequenceNumber: 10
+- type: add
+  elementId: application.applicationprocess.board-status-validation-retry-loop
+  layerName: application
+  after:
+    id: 79ac760c-9602-4fe8-af04-30cda38af9e7
+    path: application.applicationprocess.board-status-validation-retry-loop
+    spec_node_id: application.applicationprocess
+    type: applicationprocess
+    layer_id: application
+    name: Board Status Validation Retry Loop
+    description: "After fetching board items, each item's status is validated
+      against valid_columns (from workflow config or GitHub API fallback); if
+      invalid statuses exist and attempts < 3: invalidate the board query cache
+      and retry after exponential backoff (2s, 4s); on final failure, filter out
+      invalid items and emit status_validation_failure decision event; if
+      valid_columns cannot be determined at all, return items without
+      validation"
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/project_monitor.py
+          symbol: ProjectMonitor.get_project_items
+    metadata:
+      created_at: 2026-03-24T09:01:30.275Z
+      updated_at: 2026-03-24T09:01:30.275Z
+      version: 1
+  timestamp: 2026-03-24T09:01:30.300Z
+  sequenceNumber: 11
+- type: add
+  elementId: application.applicationprocess.pipeline-lock-acquisition-and-queue-ordering
+  layerName: application
+  after:
+    id: 0a51232c-bfed-4d78-bae0-9edd92208cc8
+    path: application.applicationprocess.pipeline-lock-acquisition-and-queue-ordering
+    spec_node_id: application.applicationprocess
+    type: applicationprocess
+    layer_id: application
+    name: Pipeline Lock Acquisition and Queue Ordering
+    description: "On trigger-column entry: (1) enqueue the issue (idempotent); (2)
+      query get_next_waiting_issue() which returns the issue with the lowest
+      position on the GitHub board; (3) if current issue is not next, return
+      None and wait; (4) call try_acquire_lock(); (5) if lock is held by another
+      issue, return None; (6) on lock success, mark_issue_active() and proceed;
+      conversational columns bypass this entire flow and run without a lock"
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/project_monitor.py
+          symbol: ProjectMonitor.trigger_agent_for_status
+    metadata:
+      created_at: 2026-03-24T09:01:37.418Z
+      updated_at: 2026-03-24T09:01:37.418Z
+      version: 1
+  timestamp: 2026-03-24T09:01:37.443Z
+  sequenceNumber: 12
+- type: add
+  elementId: application.applicationprocess.column-type-routing-decision
+  layerName: application
+  after:
+    id: ebc89330-a5ab-4241-9f35-786889cc8940
+    path: application.applicationprocess.column-type-routing-decision
+    spec_node_id: application.applicationprocess
+    type: applicationprocess
+    layer_id: application
+    name: Column-Type Routing Decision
+    description: "trigger_agent_for_status branches on column.type: 'review' →
+      _start_review_cycle_for_issue (synchronous maker-checker loop);
+      'conversational' → human_feedback_loop_executor (background thread, no
+      pipeline lock); stage_type='repair_cycle' → _start_repair_cycle_for_issue
+      (launches separate Docker container running pipeline.repair_cycle_runner);
+      stage_type='pr_review' → _start_pr_review_for_issue (runs in-process in
+      background thread, NOT in Docker); default → enqueue Docker agent task"
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/project_monitor.py
+          symbol: ProjectMonitor.trigger_agent_for_status
+    metadata:
+      created_at: 2026-03-24T09:01:44.449Z
+      updated_at: 2026-03-24T09:01:44.449Z
+      version: 1
+  timestamp: 2026-03-24T09:01:44.474Z
+  sequenceNumber: 13
+- type: add
+  elementId: application.applicationprocess.programmatic-change-deduplication
+  layerName: application
+  after:
+    id: 4c3189ef-b5fe-4c6d-bf09-64cf905eef4d
+    path: application.applicationprocess.programmatic-change-deduplication
+    spec_node_id: application.applicationprocess
+    type: applicationprocess
+    layer_id: application
+    name: Programmatic Change Deduplication
+    description: "When detect_changes() fires for a status change,
+      work_execution_tracker.was_recent_programmatic_change() is checked with a
+      configurable time window (default 60s, env:
+      PROGRAMMATIC_CHANGE_WINDOW_SECONDS); if the change was made
+      programmatically by the pipeline, skip emitting a status_progression event
+      (already emitted by pipeline_progression); this prevents double-counting
+      manual vs automated card moves"
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/project_monitor.py
+          symbol: ProjectMonitor.detect_changes
+    metadata:
+      created_at: 2026-03-24T09:01:49.986Z
+      updated_at: 2026-03-24T09:01:49.986Z
+      version: 1
+  timestamp: 2026-03-24T09:01:50.012Z
+  sequenceNumber: 14
+- type: add
+  elementId: application.applicationprocess.pr-review-cycle-limit-with-one-shot-notification
+  layerName: application
+  after:
+    id: bfbb62a1-5f90-423f-85e9-5717611a05b9
+    path: application.applicationprocess.pr-review-cycle-limit-with-one-shot-notification
+    spec_node_id: application.applicationprocess
+    type: applicationprocess
+    layer_id: application
+    name: PR Review Cycle Limit with One-Shot Notification
+    description: "PRReviewStateManager tracks review_count per parent issue in
+      state/projects/{project}/pr_review_state.yaml; when count reaches
+      max_cycles: (1) check is_cycle_limit_notified() — if false, post a comment
+      to GitHub and call mark_cycle_limit_notified() which sets
+      cycle_limit_notified=true in YAML; (2) return without running another
+      cycle; human can call reset_review_count() to zero the counter (preserves
+      iteration history) and re-enable cycles"
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: state_management/pr_review_state_manager.py
+          symbol: PRReviewStateManager
+    metadata:
+      created_at: 2026-03-24T09:01:58.831Z
+      updated_at: 2026-03-24T09:01:58.831Z
+      version: 1
+  timestamp: 2026-03-24T09:01:58.856Z
+  sequenceNumber: 15
+- type: add
+  elementId: application.applicationfunction.pr-review-in-process-thread-execution
+  layerName: application
+  after:
+    id: 055493e3-5f4f-4fc9-b6e4-685f8af08b1e
+    path: application.applicationfunction.pr-review-in-process-thread-execution
+    spec_node_id: application.applicationfunction
+    type: applicationfunction
+    layer_id: application
+    name: PR Review In-Process Thread Execution
+    description: stage_type='pr_review' stages run PRReviewStage in-process inside a
+      background thread (not in a Docker container); this is the only agent
+      execution path that does not use DockerAgentRunner; it allows the PR
+      review to access internal Python services (pipeline_run_manager, state
+      files) directly without container boundary overhead
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/project_monitor.py
+          symbol: ProjectMonitor._start_pr_review_for_issue
+    metadata:
+      created_at: 2026-03-24T09:02:04.424Z
+      updated_at: 2026-03-24T09:02:04.424Z
+      version: 1
+  timestamp: 2026-03-24T09:02:04.450Z
+  sequenceNumber: 16
+- type: add
+  elementId: application.applicationfunction.sub-issue-discussion-lookup-via-part-of-pattern
+  layerName: application
+  after:
+    id: 09d8e475-89e4-41b4-aa01-d20c0465d77c
+    path: application.applicationfunction.sub-issue-discussion-lookup-via-part-of-pattern
+    spec_node_id: application.applicationfunction
+    type: applicationfunction
+    layer_id: application
+    name: Sub-Issue Discussion Lookup via Part-Of Pattern
+    description: "When a sub-issue needs pipeline context from its parent epic's
+      discussion: (1) check issue_discussion_links in github_state.yaml for the
+      sub-issue's number; (2) if not found, fetch the issue body via 'gh issue
+      view --json body' and parse 'Part of #NNN' with regex; (3) look up the
+      parent issue number's discussion in issue_discussion_links; this is the
+      cross-workspace context propagation mechanism for the
+      planning-to-execution handoff"
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/project_monitor.py
+          symbol: ProjectMonitor.get_previous_stage_context
+    metadata:
+      created_at: 2026-03-24T09:02:10.757Z
+      updated_at: 2026-03-24T09:02:10.757Z
+      version: 1
+  timestamp: 2026-03-24T09:02:10.787Z
+  sequenceNumber: 17
+- type: add
+  elementId: application.applicationprocess.checkpoint-file-naming-and-recovery-ordering
+  layerName: application
+  after:
+    id: d43a6460-7f73-454a-a109-9514425aab4a
+    path: application.applicationprocess.checkpoint-file-naming-and-recovery-ordering
+    spec_node_id: application.applicationprocess
+    type: applicationprocess
+    layer_id: application
+    name: Checkpoint File Naming and Recovery Ordering
+    description: "Checkpoint files are named {pipeline_id}_stage_{stage_index}.json
+      in orchestrator_data/state/checkpoints/; recovery finds the checkpoint
+      with the highest stage_index by parsing the filename suffix with
+      max(checkpoints, key=lambda x: int(x.stem.split('_stage_')[1]));
+      non-serializable context values (state_manager, logger, mcp_integration)
+      are silently dropped before writing; on load the full context dict is
+      restored and pipeline resumes from the checkpointed stage_index"
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: state_management/manager.py
+          symbol: StateManager
+    metadata:
+      created_at: 2026-03-24T09:02:17.906Z
+      updated_at: 2026-03-24T09:02:17.906Z
+      version: 1
+  timestamp: 2026-03-24T09:02:17.933Z
+  sequenceNumber: 18
+- type: add
+  elementId: application.dataobject.redis-container-registry-entry
+  layerName: application
+  after:
+    id: 3f12d025-1329-44dc-af51-75e2b3d56f03
+    path: application.dataobject.redis-container-registry-entry
+    spec_node_id: application.dataobject
+    type: dataobject
+    layer_id: application
+    name: Redis Container Registry Entry
+    description: "Each running agent container is registered in Redis under the key
+      agent:container:{container_name} as a hash with fields: container_name,
+      agent, project, task_id, pipeline_run_id, started_at; repair cycle
+      containers use key repair_cycle:container:{project}:{issue} with a 7200s
+      TTL; these entries enable orphan detection after orchestrator restart by
+      scanning keys matching agent:container:claude-agent-*"
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: claude/docker_runner.py
+          symbol: DockerAgentRunner._register_active_container
+    metadata:
+      created_at: 2026-03-24T09:02:25.410Z
+      updated_at: 2026-03-24T09:02:25.410Z
+      version: 1
+  timestamp: 2026-03-24T09:02:25.437Z
+  sequenceNumber: 19
+- type: add
+  elementId: application.applicationprocess.repair-cycle-stall-detection-and-container-kill
+  layerName: application
+  after:
+    id: e46b0174-c8d3-4308-b8c7-b295dda732da
+    path: application.applicationprocess.repair-cycle-stall-detection-and-container-kill
+    spec_node_id: application.applicationprocess
+    type: applicationprocess
+    layer_id: application
+    name: Repair Cycle Stall Detection and Container Kill
+    description: "The pipeline watchdog periodically checks running repair cycle
+      containers: queries Elasticsearch across decision-events-*,
+      agent-events-*, and claude-streams-* indices for the pipeline_run_id; if
+      no events in the last stall_seconds (default 3600), the outer repair cycle
+      container is killed via docker kill; then Redis is scanned for matching
+      child agent containers (agent:container:claude-agent-* with matching
+      pipeline_run_id) and each is also killed; fails open if Elasticsearch is
+      unavailable"
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/project_monitor.py
+          symbol: _is_repair_cycle_stalled
+    metadata:
+      created_at: 2026-03-24T09:02:32.170Z
+      updated_at: 2026-03-24T09:02:32.170Z
+      version: 1
+  timestamp: 2026-03-24T09:02:32.199Z
+  sequenceNumber: 20
+- type: add
+  elementId: application.applicationprocess.issue-closed-lock-release-on-poll
+  layerName: application
+  after:
+    id: 6bca5e3e-495a-4796-a107-644d5ecb644a
+    path: application.applicationprocess.issue-closed-lock-release-on-poll
+    spec_node_id: application.applicationprocess
+    type: applicationprocess
+    layer_id: application
+    name: Issue-Closed Lock Release on Poll
+    description: "When trigger_agent_for_status is called for a CLOSED issue: check
+      if the pipeline lock on this board is currently held by this issue's
+      number; if yes, call _release_pipeline_lock_and_process_next() which
+      releases the lock and immediately checks for the next waiting issue in the
+      queue to start its pipeline — preventing starvation when issues are closed
+      mid-pipeline"
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/project_monitor.py
+          symbol: ProjectMonitor.trigger_agent_for_status
+    metadata:
+      created_at: 2026-03-24T09:02:39.014Z
+      updated_at: 2026-03-24T09:02:39.014Z
+      version: 1
+  timestamp: 2026-03-24T09:02:39.038Z
+  sequenceNumber: 21
+- type: add
+  elementId: application.applicationfunction.mcp-config-task-id-sanitization
+  layerName: application
+  after:
+    id: e8bd6b48-a5b4-4b40-bcd4-d8f6cf981c5b
+    path: application.applicationfunction.mcp-config-task-id-sanitization
+    spec_node_id: application.applicationfunction
+    type: applicationfunction
+    layer_id: application
+    name: MCP Config Task-ID Sanitization
+    description: "Before writing the MCP config file, the task_id is sanitized:
+      colons (:) are replaced with underscores because Docker interprets colons
+      as volume mount separators causing 'too many colons' errors; additional
+      problematic characters (/, \\, space, *, ?, \", <, >, |) are also
+      replaced; the config is written to the first writable candidate directory
+      in priority order: /workspace/.orchestrator/tmp, /app/tmp, ./tmp, /tmp"
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: claude/docker_runner.py
+          symbol: DockerAgentRunner._write_mcp_config_file
+    metadata:
+      created_at: 2026-03-24T09:02:48.056Z
+      updated_at: 2026-03-24T09:02:48.056Z
+      version: 1
+  timestamp: 2026-03-24T09:02:48.084Z
+  sequenceNumber: 22
+- type: add
+  elementId: application.applicationprocess.result-persistence-to-redis-before-git-hub-post
+  layerName: application
+  after:
+    id: 3815ec70-5041-4eea-b8af-01191b80696c
+    path: application.applicationprocess.result-persistence-to-redis-before-git-hub-post
+    spec_node_id: application.applicationprocess
+    type: applicationprocess
+    layer_id: application
+    name: Result Persistence to Redis Before GitHub Post
+    description: Immediately after container exit (both success and failure), the
+      raw output is persisted to Redis under a key that includes project,
+      issue_number, and agent, before any GitHub comment is posted; this ensures
+      the result survives an orchestrator crash during the GitHub posting phase;
+      the GitHub post happens via _complete_agent_execution() which is called
+      after Redis persistence; failure outcome is recorded in
+      work_execution_tracker immediately before raising any exception
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: claude/docker_runner.py
+          symbol: DockerAgentRunner._execute_in_container
+    metadata:
+      created_at: 2026-03-24T09:02:54.710Z
+      updated_at: 2026-03-24T09:02:54.710Z
+      version: 1
+  timestamp: 2026-03-24T09:02:54.741Z
+  sequenceNumber: 23
+- type: add
+  elementId: application.applicationprocess.conversational-session-continuity-across-restarts
+  layerName: application
+  after:
+    id: 0ad43fee-23c9-4106-b939-cf1ce2c77159
+    path: application.applicationprocess.conversational-session-continuity-across-restarts
+    spec_node_id: application.applicationprocess
+    type: applicationprocess
+    layer_id: application
+    name: Conversational Session Continuity Across Restarts
+    description: Conversational feedback loops persist their Claude Code session_id
+      to conversational_session_state (YAML file); on ProjectMonitor restart
+      detection, the session is loaded (max_age_hours=24); if an active pipeline
+      run exists with the recovered pipeline_run_id, it is reused; previous
+      agent outputs are reloaded from the discussion or issue to rebuild
+      conversation history; the feedback loop resumes from where it left off
+      without re-running the initial agent response
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/project_monitor.py
+          symbol: ProjectMonitor.trigger_agent_for_status
+    metadata:
+      created_at: 2026-03-24T09:03:01.655Z
+      updated_at: 2026-03-24T09:03:01.655Z
+      version: 1
+  timestamp: 2026-03-24T09:03:01.680Z
+  sequenceNumber: 24

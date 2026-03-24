@@ -1,0 +1,43 @@
+data-model.stringschema.iso8601-timestamp:
+  id: c25658cc-294f-4dc0-a687-8a26ffb8aead
+  path: data-model.stringschema.iso8601-timestamp
+  spec_node_id: data-model.stringschema
+  type: stringschema
+  layer_id: data-model
+  name: ISO8601 Timestamp
+  description: UTC ISO8601 datetime string used consistently across all timestamps
+    in tasks, pipeline runs, locks, and events
+  attributes:
+    format: date-time
+    pattern: ^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: monitoring/timestamp_utils.py
+        symbol: utc_isoformat
+  metadata:
+    created_at: 2026-03-24T00:13:10.124Z
+    updated_at: 2026-03-24T00:13:10.124Z
+    version: 1
+data-model.stringschema.pipeline-run-id:
+  id: 06c1ffbb-094e-46cc-a39e-169978ce40ac
+  path: data-model.stringschema.pipeline-run-id
+  spec_node_id: data-model.stringschema
+  type: stringschema
+  layer_id: data-model
+  name: Pipeline Run ID
+  description: UUID string identifying a pipeline run; used as tag across all
+    observability events, agent logs, and ES documents for cross-document
+    correlation
+  attributes:
+    format: uuid
+    pattern: ^[0-9a-f-]{36}$
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/pipeline_run.py
+        symbol: pipeline_run_id
+  metadata:
+    created_at: 2026-03-24T00:13:10.475Z
+    updated_at: 2026-03-24T00:13:10.475Z
+    version: 1

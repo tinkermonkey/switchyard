@@ -1,0 +1,38 @@
+business.representation.git-hub-issue-comment:
+  id: cd1f5267-8585-450f-b80b-db6c7b2e51f6
+  path: business.representation.git-hub-issue-comment
+  spec_node_id: business.representation
+  type: representation
+  layer_id: business
+  name: GitHub Issue Comment
+  description: Agent outputs posted as GitHub issue comments in Markdown format
+  attributes:
+    format: html
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/github_api_client.py
+        symbol: GitHubAPIClient
+  metadata:
+    created_at: 2026-03-24T00:28:57.396Z
+    updated_at: 2026-03-24T00:28:57.396Z
+    version: 1
+business.representation.pipeline-checkpoint-json:
+  id: 375a39bc-f36d-494b-814c-681a0ade6076
+  path: business.representation.pipeline-checkpoint-json
+  spec_node_id: business.representation
+  type: representation
+  layer_id: business
+  name: Pipeline Checkpoint JSON
+  description: Pipeline stage checkpoint persisted as JSON file for crash recovery
+  attributes:
+    format: json
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: state_management/manager.py
+        symbol: StateManager.checkpoint
+  metadata:
+    created_at: 2026-03-24T00:28:57.991Z
+    updated_at: 2026-03-24T00:28:57.991Z
+    version: 1

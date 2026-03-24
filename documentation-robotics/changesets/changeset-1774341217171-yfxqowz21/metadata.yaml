@@ -1,0 +1,10 @@
+id: changeset-1774341217171-yfxqowz21
+name: docker-container-interfaces-gaps
+created: 2026-03-24T08:33:37.181Z
+modified: 2026-03-24T08:38:45.153Z
+status: committed
+baseSnapshot: sha256:6c854c5a95410308f9418acaf433437a36cf1f0b62e9d485504d11d50bffa032
+stats:
+  additions: 39
+  modifications: 1
+  deletions: 0

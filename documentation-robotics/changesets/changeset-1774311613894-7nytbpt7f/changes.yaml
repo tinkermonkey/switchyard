@@ -1,0 +1,464 @@
+- type: add
+  elementId: testing.testcoveragemodel.orchestrator-test-suite
+  layerName: testing
+  after:
+    id: e1499117-b0be-4052-80e7-4f2ab282725b
+    path: testing.testcoveragemodel.orchestrator-test-suite
+    spec_node_id: testing.testcoveragemodel
+    type: testcoveragemodel
+    layer_id: testing
+    name: Orchestrator Test Suite
+    description: Pytest-based test suite covering unit, integration, and end-to-end
+      tests; organized in tests/unit/, tests/integration/, and tests/e2e/
+      directories
+    attributes:
+      version: "1.0"
+      application: switchyard
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: pytest.ini
+    metadata:
+      created_at: 2026-03-24T00:20:19.474Z
+      updated_at: 2026-03-24T00:20:19.474Z
+      version: 1
+  timestamp: 2026-03-24T00:20:19.505Z
+  sequenceNumber: 0
+- type: add
+  elementId: testing.testcoveragetarget.pipeline-orchestration
+  layerName: testing
+  after:
+    id: a920bd2d-ac5d-466a-926a-8c8eb318b5e9
+    path: testing.testcoveragetarget.pipeline-orchestration
+    spec_node_id: testing.testcoveragetarget
+    type: testcoveragetarget
+    layer_id: testing
+    name: Pipeline Orchestration
+    description: Sequential pipeline execution with circuit breaker protection and
+      checkpoint-based recovery
+    attributes:
+      targetType: business-workflow
+      priority: high
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: pipeline/orchestrator.py
+          symbol: SequentialPipeline
+    metadata:
+      created_at: 2026-03-24T00:20:35.296Z
+      updated_at: 2026-03-24T00:20:35.296Z
+      version: 1
+  timestamp: 2026-03-24T00:20:35.321Z
+  sequenceNumber: 1
+- type: add
+  elementId: testing.testcoveragetarget.review-cycle-state-machine
+  layerName: testing
+  after:
+    id: 33ebceff-452d-485e-a2b7-a09b984cb4fb
+    path: testing.testcoveragetarget.review-cycle-state-machine
+    spec_node_id: testing.testcoveragetarget
+    type: testcoveragetarget
+    layer_id: testing
+    name: Review Cycle State Machine
+    description: Maker-checker review loop state transitions, iteration counting,
+      approval/rejection handling, and escalation logic
+    attributes:
+      targetType: business-workflow
+      priority: high
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/review_cycle.py
+          symbol: ReviewCycleState
+    metadata:
+      created_at: 2026-03-24T00:20:35.785Z
+      updated_at: 2026-03-24T00:20:35.785Z
+      version: 1
+  timestamp: 2026-03-24T00:20:35.810Z
+  sequenceNumber: 2
+- type: add
+  elementId: testing.testcoveragetarget.task-queue-management
+  layerName: testing
+  after:
+    id: 70fa96d8-4a21-4f5e-9ebb-46a0c15b1232
+    path: testing.testcoveragetarget.task-queue-management
+    spec_node_id: testing.testcoveragetarget
+    type: testcoveragetarget
+    layer_id: testing
+    name: Task Queue Management
+    description: Redis priority queue enqueue/dequeue, not_before scheduling,
+      priority ordering, and in-memory fallback
+    attributes:
+      targetType: integration-flow
+      priority: high
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: task_queue/task_manager.py
+          symbol: TaskQueue
+    metadata:
+      created_at: 2026-03-24T00:20:36.301Z
+      updated_at: 2026-03-24T00:20:36.301Z
+      version: 1
+  timestamp: 2026-03-24T00:20:36.324Z
+  sequenceNumber: 3
+- type: add
+  elementId: testing.testcoveragetarget.pipeline-lock-management
+  layerName: testing
+  after:
+    id: 086968f5-2de5-44bf-b1d5-b40e1e56955f
+    path: testing.testcoveragetarget.pipeline-lock-management
+    spec_node_id: testing.testcoveragetarget
+    type: testcoveragetarget
+    layer_id: testing
+    name: Pipeline Lock Management
+    description: Exclusive pipeline lock acquire/release, YAML-Redis sync, startup
+      lock recovery, and queue management
+    attributes:
+      targetType: business-workflow
+      priority: high
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/pipeline_lock_manager.py
+    metadata:
+      created_at: 2026-03-24T00:20:44.285Z
+      updated_at: 2026-03-24T00:20:44.285Z
+      version: 1
+  timestamp: 2026-03-24T00:20:44.313Z
+  sequenceNumber: 4
+- type: add
+  elementId: testing.testcoveragetarget.observability-api-endpoints
+  layerName: testing
+  after:
+    id: 68f0e88d-f575-4c79-a525-017f0fc6c2df
+    path: testing.testcoveragetarget.observability-api-endpoints
+    spec_node_id: testing.testcoveragetarget
+    type: testcoveragetarget
+    layer_id: testing
+    name: Observability API Endpoints
+    description: "REST endpoints: /health, /agents/active, /history,
+      /pipeline-run-events, /api/circuit-breakers, /api/projects and WebSocket
+      event streaming"
+    attributes:
+      targetType: api-endpoint
+      priority: medium
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/observability_server.py
+    metadata:
+      created_at: 2026-03-24T00:20:44.787Z
+      updated_at: 2026-03-24T00:20:44.787Z
+      version: 1
+  timestamp: 2026-03-24T00:20:44.811Z
+  sequenceNumber: 5
+- type: add
+  elementId: testing.testcoveragetarget.feature-branch-workflow
+  layerName: testing
+  after:
+    id: 3da63575-e036-46f8-86f4-7ce11cead2a7
+    path: testing.testcoveragetarget.feature-branch-workflow
+    spec_node_id: testing.testcoveragetarget
+    type: testcoveragetarget
+    layer_id: testing
+    name: Feature Branch Workflow
+    description: Branch creation, sub-issue contribution tracking, merge conflict
+      detection, stale branch handling, and PR lifecycle management
+    attributes:
+      targetType: business-workflow
+      priority: high
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/feature_branch_manager.py
+    metadata:
+      created_at: 2026-03-24T00:20:45.324Z
+      updated_at: 2026-03-24T00:20:45.324Z
+      version: 1
+  timestamp: 2026-03-24T00:20:45.349Z
+  sequenceNumber: 6
+- type: add
+  elementId: testing.testcasesketch.test-pipeline-checkpoint-recovery
+  layerName: testing
+  after:
+    id: ef430230-64ff-4b28-b25b-0328cfe0e3fc
+    path: testing.testcasesketch.test-pipeline-checkpoint-recovery
+    spec_node_id: testing.testcasesketch
+    type: testcasesketch
+    layer_id: testing
+    name: "Test: Pipeline Checkpoint Recovery"
+    description: Verifies that a pipeline resumes from the correct stage after
+      simulated orchestrator restart by reading the highest-numbered checkpoint
+      file
+    attributes:
+      status: implemented
+      implementationFormat: automated
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: tests/unit/test_state_recovery.py
+    metadata:
+      created_at: 2026-03-24T00:21:00.475Z
+      updated_at: 2026-03-24T00:21:00.475Z
+      version: 1
+  timestamp: 2026-03-24T00:21:00.499Z
+  sequenceNumber: 7
+- type: add
+  elementId: testing.testcasesketch.test-review-cycle-state-transitions
+  layerName: testing
+  after:
+    id: 9661dd02-82d0-4d18-9a38-a05267bf8976
+    path: testing.testcasesketch.test-review-cycle-state-transitions
+    spec_node_id: testing.testcasesketch
+    type: testcasesketch
+    layer_id: testing
+    name: "Test: Review Cycle State Transitions"
+    description: Verifies review cycle correctly transitions through PENDING ->
+      REVIEWING -> APPROVED/NEEDS_REVISION/BLOCKED states with correct iteration
+      tracking
+    attributes:
+      status: implemented
+      implementationFormat: automated
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: tests/unit/test_review_cycle_state_transitions.py
+    metadata:
+      created_at: 2026-03-24T00:21:00.989Z
+      updated_at: 2026-03-24T00:21:00.989Z
+      version: 1
+  timestamp: 2026-03-24T00:21:01.018Z
+  sequenceNumber: 8
+- type: add
+  elementId: testing.testcasesketch.test-pr-review-state-manager
+  layerName: testing
+  after:
+    id: 611fb8e5-0022-40ba-acef-ad3b51575bfe
+    path: testing.testcasesketch.test-pr-review-state-manager
+    spec_node_id: testing.testcasesketch
+    type: testcasesketch
+    layer_id: testing
+    name: "Test: PR Review State Manager"
+    description: Verifies PR review cycle count persistence, max cycle enforcement,
+      and YAML state file correctness
+    attributes:
+      status: implemented
+      implementationFormat: automated
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: tests/unit/test_pr_review_state_manager.py
+    metadata:
+      created_at: 2026-03-24T00:21:01.488Z
+      updated_at: 2026-03-24T00:21:01.488Z
+      version: 1
+  timestamp: 2026-03-24T00:21:01.513Z
+  sequenceNumber: 9
+- type: add
+  elementId: testing.testcasesketch.test-docker-runner-validation
+  layerName: testing
+  after:
+    id: d48b6fd6-5c8f-4c5f-a750-0d01b15eaba3
+    path: testing.testcasesketch.test-docker-runner-validation
+    spec_node_id: testing.testcasesketch
+    type: testcasesketch
+    layer_id: testing
+    name: "Test: Docker Runner Validation"
+    description: Verifies Docker runner builds correct docker run commands with
+      proper volume mounts, labels, and environment variables
+    attributes:
+      status: implemented
+      implementationFormat: automated
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: tests/unit/test_docker_runner_validation.py
+    metadata:
+      created_at: 2026-03-24T00:21:08.801Z
+      updated_at: 2026-03-24T00:21:08.801Z
+      version: 1
+  timestamp: 2026-03-24T00:21:08.828Z
+  sequenceNumber: 10
+- type: add
+  elementId: testing.testcasesketch.test-pipeline-run-cleanup
+  layerName: testing
+  after:
+    id: 9f51bcf5-6735-4da0-8f3c-58521a10890e
+    path: testing.testcasesketch.test-pipeline-run-cleanup
+    spec_node_id: testing.testcasesketch
+    type: testcasesketch
+    layer_id: testing
+    name: "Test: Pipeline Run Cleanup"
+    description: Verifies stale active pipeline runs are correctly identified and
+      cleaned up on startup without affecting re-triggered issues
+    attributes:
+      status: implemented
+      implementationFormat: automated
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: tests/unit/test_pipeline_run_cleanup.py
+    metadata:
+      created_at: 2026-03-24T00:21:09.307Z
+      updated_at: 2026-03-24T00:21:09.307Z
+      version: 1
+  timestamp: 2026-03-24T00:21:09.332Z
+  sequenceNumber: 11
+- type: add
+  elementId: testing.testcasesketch.test-repair-cycle-checkpoint
+  layerName: testing
+  after:
+    id: b1744952-a23f-4cad-a63b-feacb758ac91
+    path: testing.testcasesketch.test-repair-cycle-checkpoint
+    spec_node_id: testing.testcasesketch
+    type: testcasesketch
+    layer_id: testing
+    name: "Test: Repair Cycle Checkpoint"
+    description: Verifies repair cycle checkpoints correctly persist intermediate
+      state and can resume from last checkpoint after container restart
+    attributes:
+      status: implemented
+      implementationFormat: automated
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: tests/unit/test_repair_cycle_checkpoint.py
+    metadata:
+      created_at: 2026-03-24T00:21:09.815Z
+      updated_at: 2026-03-24T00:21:09.815Z
+      version: 1
+  timestamp: 2026-03-24T00:21:09.841Z
+  sequenceNumber: 12
+- type: add
+  elementId: testing.coveragerequirement.pipeline-stage-path-coverage
+  layerName: testing
+  after:
+    id: b0f22642-c1e0-4221-b252-71cc1af6a4dd
+    path: testing.coveragerequirement.pipeline-stage-path-coverage
+    spec_node_id: testing.coveragerequirement
+    type: coveragerequirement
+    layer_id: testing
+    name: Pipeline Stage Path Coverage
+    description: Each pipeline stage must have tests covering happy path,
+      failure/retry, and circuit breaker interaction paths
+    attributes:
+      coverageCriteria: path-coverage
+      priority: high
+      description: Stage execute() happy path, failure, and circuit breaker open paths
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: tests/unit/pipeline/
+    metadata:
+      created_at: 2026-03-24T00:21:25.106Z
+      updated_at: 2026-03-24T00:21:25.106Z
+      version: 1
+  timestamp: 2026-03-24T00:21:25.134Z
+  sequenceNumber: 13
+- type: add
+  elementId: testing.coveragerequirement.review-cycle-partition-coverage
+  layerName: testing
+  after:
+    id: 5dac9734-b8fb-49b6-98a8-4415350879a3
+    path: testing.coveragerequirement.review-cycle-partition-coverage
+    spec_node_id: testing.coveragerequirement
+    type: coveragerequirement
+    layer_id: testing
+    name: Review Cycle Partition Coverage
+    description: "Review cycle tests must cover all partition values: APPROVED,
+      NEEDS_REVISION, BLOCKED outcomes and iteration boundary (max_iterations)"
+    attributes:
+      coverageCriteria: all-partitions
+      priority: high
+      description: All ReviewStatus enum values and iteration boundary conditions
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: tests/unit/test_review_cycle_state_transitions.py
+    metadata:
+      created_at: 2026-03-24T00:21:25.625Z
+      updated_at: 2026-03-24T00:21:25.625Z
+      version: 1
+  timestamp: 2026-03-24T00:21:25.652Z
+  sequenceNumber: 14
+- type: add
+  elementId: testing.coveragegap.no-git-hub-api-integration-tests-in-ci
+  layerName: testing
+  after:
+    id: d7dc6247-5106-48d7-8bfe-2c3fb162fcd7
+    path: testing.coveragegap.no-git-hub-api-integration-tests-in-ci
+    spec_node_id: testing.coveragegap
+    type: coveragegap
+    layer_id: testing
+    name: No GitHub API Integration Tests in CI
+    description: Integration tests for GitHub GraphQL queries and board
+      reconciliation require live GitHub API access; not safe to run in standard
+      CI without dedicated test org
+    attributes:
+      severity: medium
+      affectedRequirements: GitHub project board reconciliation, label management
+      remediationStatus: open
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: tests/integration/test_github_resilience_integration.py
+    metadata:
+      created_at: 2026-03-24T00:21:35.450Z
+      updated_at: 2026-03-24T00:21:35.450Z
+      version: 1
+  timestamp: 2026-03-24T00:21:35.480Z
+  sequenceNumber: 15
+- type: add
+  elementId: testing.contextvariation.redis-connectivity-variation
+  layerName: testing
+  after:
+    id: 6a57d828-ecd6-4e9b-abdc-0107b1843f03
+    path: testing.contextvariation.redis-connectivity-variation
+    spec_node_id: testing.contextvariation
+    type: contextvariation
+    layer_id: testing
+    name: Redis Connectivity Variation
+    description: Tests must cover both Redis-connected and in-memory fallback modes
+      for TaskQueue; Redis unavailability should degrade gracefully to in-memory
+      PriorityQueues
+    attributes:
+      contextType: functional
+      description: Redis connected vs unavailable (falls back to in-memory queue)
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: task_queue/task_manager.py
+          symbol: TaskQueue
+    metadata:
+      created_at: 2026-03-24T00:21:42.687Z
+      updated_at: 2026-03-24T00:21:42.687Z
+      version: 1
+  timestamp: 2026-03-24T00:21:42.715Z
+  sequenceNumber: 16
+- type: add
+  elementId: testing.contextvariation.docker-in-docker-variation
+  layerName: testing
+  after:
+    id: c9a3d0bf-24aa-4923-97fb-8a7b4ba6fd56
+    path: testing.contextvariation.docker-in-docker-variation
+    spec_node_id: testing.contextvariation
+    type: contextvariation
+    layer_id: testing
+    name: Docker-in-Docker Variation
+    description: Agent execution tests must cover both Docker-available and
+      Docker-unavailable contexts; requires mock of DockerAgentRunner in unit
+      tests
+    attributes:
+      contextType: functional
+      description: Docker socket available vs absent
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: tests/unit/test_docker_runner_validation.py
+    metadata:
+      created_at: 2026-03-24T00:21:43.208Z
+      updated_at: 2026-03-24T00:21:43.208Z
+      version: 1
+  timestamp: 2026-03-24T00:21:43.236Z
+  sequenceNumber: 17

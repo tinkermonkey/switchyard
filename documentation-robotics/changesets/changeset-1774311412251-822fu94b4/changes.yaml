@@ -1,0 +1,291 @@
+- type: add
+  elementId: navigation.navigationgraph.orchestrator-web-ui-navigation
+  layerName: navigation
+  after:
+    id: 5dce52e0-3437-43fa-85f6-fa31335cc919
+    path: navigation.navigationgraph.orchestrator-web-ui-navigation
+    spec_node_id: navigation.navigationgraph
+    type: navigationgraph
+    layer_id: navigation
+    name: Orchestrator Web UI Navigation
+    description: TanStack Router-based client-side navigation graph for the React
+      SPA; all routes are public (no auth) with client-side rendering
+    attributes:
+      version: "1.0"
+      application: Orchestrator Web UI
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: web_ui/src/routeTree.gen.ts
+    metadata:
+      created_at: 2026-03-24T00:17:37.396Z
+      updated_at: 2026-03-24T00:17:37.396Z
+      version: 1
+  timestamp: 2026-03-24T00:17:37.418Z
+  sequenceNumber: 0
+- type: add
+  elementId: navigation.route.route-dashboard
+  layerName: navigation
+  after:
+    id: 003955cd-7b31-4bc3-80ee-bfbe6423e423
+    path: navigation.route.route-dashboard
+    spec_node_id: navigation.route
+    type: route
+    layer_id: navigation
+    name: "Route: Dashboard"
+    description: Root '/' route rendering the main monitoring dashboard
+    attributes:
+      type: public
+      title: Dashboard
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: web_ui/src/routes/index.jsx
+    metadata:
+      created_at: 2026-03-24T00:17:57.455Z
+      updated_at: 2026-03-24T00:17:57.455Z
+      version: 1
+  timestamp: 2026-03-24T00:17:57.476Z
+  sequenceNumber: 1
+- type: add
+  elementId: navigation.route.route-pipeline-run
+  layerName: navigation
+  after:
+    id: fb2009d5-aead-4612-925e-03b6609f6afd
+    path: navigation.route.route-pipeline-run
+    spec_node_id: navigation.route
+    type: route
+    layer_id: navigation
+    name: "Route: Pipeline Run"
+    description: "'/pipeline-run' detail route for a specific pipeline run"
+    attributes:
+      type: public
+      title: Pipeline Run Detail
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: web_ui/src/routes/pipeline-run.jsx
+    metadata:
+      created_at: 2026-03-24T00:17:57.911Z
+      updated_at: 2026-03-24T00:17:57.911Z
+      version: 1
+  timestamp: 2026-03-24T00:17:57.933Z
+  sequenceNumber: 2
+- type: add
+  elementId: navigation.route.route-agent-execution
+  layerName: navigation
+  after:
+    id: fca86792-f421-4fe5-b050-698d48f0381e
+    path: navigation.route.route-agent-execution
+    spec_node_id: navigation.route
+    type: route
+    layer_id: navigation
+    name: "Route: Agent Execution"
+    description: "'/agent-execution/:executionId' parameterized route for a specific
+      agent execution"
+    attributes:
+      type: public
+      title: Agent Execution Detail
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: web_ui/src/routes/agent-execution.executionId.jsx
+    metadata:
+      created_at: 2026-03-24T00:17:58.380Z
+      updated_at: 2026-03-24T00:17:58.380Z
+      version: 1
+  timestamp: 2026-03-24T00:17:58.402Z
+  sequenceNumber: 3
+- type: add
+  elementId: navigation.route.route-projects
+  layerName: navigation
+  after:
+    id: 7439b309-bf96-4241-8dac-691e06612d18
+    path: navigation.route.route-projects
+    spec_node_id: navigation.route
+    type: route
+    layer_id: navigation
+    name: "Route: Projects"
+    description: "'/projects' route showing project cards grid with status summaries"
+    attributes:
+      type: public
+      title: Projects
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: web_ui/src/routes/projects.jsx
+    metadata:
+      created_at: 2026-03-24T00:18:04.494Z
+      updated_at: 2026-03-24T00:18:04.494Z
+      version: 1
+  timestamp: 2026-03-24T00:18:04.517Z
+  sequenceNumber: 4
+- type: add
+  elementId: navigation.route.route-agent-metrics
+  layerName: navigation
+  after:
+    id: 929c2fea-fd86-4fd5-97d6-ba2f305c2575
+    path: navigation.route.route-agent-metrics
+    spec_node_id: navigation.route
+    type: route
+    layer_id: navigation
+    name: "Route: Agent Metrics"
+    description: "'/agent-metrics' route showing per-agent performance statistics
+      and trend charts"
+    attributes:
+      type: public
+      title: Agent Metrics
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: web_ui/src/routes/agent-metrics.jsx
+    metadata:
+      created_at: 2026-03-24T00:18:04.995Z
+      updated_at: 2026-03-24T00:18:04.995Z
+      version: 1
+  timestamp: 2026-03-24T00:18:05.020Z
+  sequenceNumber: 5
+- type: add
+  elementId: navigation.route.route-cycle-metrics
+  layerName: navigation
+  after:
+    id: 76f3cc2e-ef71-47c6-9c76-c6f0ea5bdaa4
+    path: navigation.route.route-cycle-metrics
+    spec_node_id: navigation.route
+    type: route
+    layer_id: navigation
+    name: "Route: Cycle Metrics"
+    description: "'/cycle-metrics' route showing review and repair cycle statistics"
+    attributes:
+      type: public
+      title: Cycle Metrics
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: web_ui/src/routes/cycle-metrics.jsx
+    metadata:
+      created_at: 2026-03-24T00:18:05.501Z
+      updated_at: 2026-03-24T00:18:05.501Z
+      version: 1
+  timestamp: 2026-03-24T00:18:05.525Z
+  sequenceNumber: 6
+- type: add
+  elementId: navigation.route.route-pipeline-reports
+  layerName: navigation
+  after:
+    id: b0dd2f76-bea3-4442-91c9-3be267c64566
+    path: navigation.route.route-pipeline-reports
+    spec_node_id: navigation.route
+    type: route
+    layer_id: navigation
+    name: "Route: Pipeline Reports"
+    description: "'/pipeline-reports' route for historical pipeline run analysis reports"
+    attributes:
+      type: public
+      title: Pipeline Reports
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: web_ui/src/routes/pipeline-reports.jsx
+    metadata:
+      created_at: 2026-03-24T00:18:12.610Z
+      updated_at: 2026-03-24T00:18:12.610Z
+      version: 1
+  timestamp: 2026-03-24T00:18:12.637Z
+  sequenceNumber: 7
+- type: add
+  elementId: navigation.route.route-project-metrics
+  layerName: navigation
+  after:
+    id: 2c4e5791-e74b-44c4-8faa-2d1e37381dbe
+    path: navigation.route.route-project-metrics
+    spec_node_id: navigation.route
+    type: route
+    layer_id: navigation
+    name: "Route: Project Metrics"
+    description: "'/project-metrics' route showing per-project metrics and
+      throughput analysis"
+    attributes:
+      type: public
+      title: Project Metrics
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: web_ui/src/routes/project-metrics.jsx
+    metadata:
+      created_at: 2026-03-24T00:18:13.094Z
+      updated_at: 2026-03-24T00:18:13.094Z
+      version: 1
+  timestamp: 2026-03-24T00:18:13.132Z
+  sequenceNumber: 8
+- type: add
+  elementId: navigation.route.route-recommendation-reports
+  layerName: navigation
+  after:
+    id: 564837e6-29b7-485f-b407-239e64da18fa
+    path: navigation.route.route-recommendation-reports
+    spec_node_id: navigation.route
+    type: route
+    layer_id: navigation
+    name: "Route: Recommendation Reports"
+    description: "'/recommendation-reports' route for AI-generated improvement
+      recommendations"
+    attributes:
+      type: public
+      title: Recommendation Reports
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: web_ui/src/routes/recommendation-reports.jsx
+    metadata:
+      created_at: 2026-03-24T00:18:13.608Z
+      updated_at: 2026-03-24T00:18:13.608Z
+      version: 1
+  timestamp: 2026-03-24T00:18:13.633Z
+  sequenceNumber: 9
+- type: add
+  elementId: navigation.navigationflow.main-navigation-flow
+  layerName: navigation
+  after:
+    id: c16eff5d-b1c1-435b-be83-070f0ea4d1ab
+    path: navigation.navigationflow.main-navigation-flow
+    spec_node_id: navigation.navigationflow
+    type: navigationflow
+    layer_id: navigation
+    name: Main Navigation Flow
+    description: Top-level tab navigation flow between all 8 dashboard views via
+      NavigationTabs component; TanStack Router handles client-side routing
+      without page reload
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: web_ui/src/components/NavigationTabs.jsx
+    metadata:
+      created_at: 2026-03-24T00:18:22.143Z
+      updated_at: 2026-03-24T00:18:22.143Z
+      version: 1
+  timestamp: 2026-03-24T00:18:22.169Z
+  sequenceNumber: 10
+- type: add
+  elementId: navigation.navigationflow.pipeline-run-detail-flow
+  layerName: navigation
+  after:
+    id: 35d40813-9655-4a37-8695-957eb4dd8c7e
+    path: navigation.navigationflow.pipeline-run-detail-flow
+    spec_node_id: navigation.navigationflow
+    type: navigationflow
+    layer_id: navigation
+    name: Pipeline Run Detail Flow
+    description: Navigation flow from dashboard pipeline event click to pipeline run
+      detail, and from detail to agent execution detail for individual stage
+      inspection
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: web_ui/src/routes/pipeline-run.jsx
+    metadata:
+      created_at: 2026-03-24T00:18:22.665Z
+      updated_at: 2026-03-24T00:18:22.665Z
+      version: 1
+  timestamp: 2026-03-24T00:18:22.691Z
+  sequenceNumber: 11

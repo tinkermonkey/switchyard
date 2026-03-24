@@ -1,0 +1,83 @@
+technology.technologyinterface.redis-task-queue-interface:
+  id: d712cbae-bf5a-4d5b-9217-1867747143b0
+  path: technology.technologyinterface.redis-task-queue-interface
+  spec_node_id: technology.technologyinterface
+  type: technologyinterface
+  layer_id: technology
+  name: Redis Task Queue Interface
+  description: "Redis list-based priority queue interface: RPUSH to
+    tasks:high/medium/low, BLPOP for dequeue with not_before scheduling support"
+  attributes:
+    protocol: tcp
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: task_queue/task_manager.py
+        symbol: TaskQueue._enqueue_redis
+  metadata:
+    created_at: 2026-03-24T00:08:57.210Z
+    updated_at: 2026-03-24T00:08:57.210Z
+    version: 1
+technology.technologyinterface.elasticsearch-http-interface:
+  id: f5a6cbe4-da4c-4cf6-9a82-9a1b17cf7d4d
+  path: technology.technologyinterface.elasticsearch-http-interface
+  spec_node_id: technology.technologyinterface
+  type: technologyinterface
+  layer_id: technology
+  name: Elasticsearch HTTP Interface
+  description: HTTP REST interface to Elasticsearch on port 9200; used by log
+    collector, metrics, observability, pipeline run manager, and watchdog for
+    indexing and querying
+  attributes:
+    protocol: http
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/log_collector.py
+        symbol: Elasticsearch
+  metadata:
+    created_at: 2026-03-24T00:08:57.717Z
+    updated_at: 2026-03-24T00:08:57.717Z
+    version: 1
+technology.technologyinterface.docker-socket-interface:
+  id: d5b0c69f-8b1a-460d-a8ec-9913bdbf56cb
+  path: technology.technologyinterface.docker-socket-interface
+  spec_node_id: technology.technologyinterface
+  type: technologyinterface
+  layer_id: technology
+  name: Docker Socket Interface
+  description: Unix domain socket /var/run/docker.sock mounted into orchestrator
+    and observability-server containers; enables DinD container management for
+    agent execution
+  attributes:
+    protocol: tcp
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: docker-compose.yml
+        symbol: /var/run/docker.sock
+  metadata:
+    created_at: 2026-03-24T00:08:58.241Z
+    updated_at: 2026-03-24T00:08:58.241Z
+    version: 1
+technology.technologyinterface.git-hub-rest-api-interface:
+  id: 66539dcc-c7ad-42f7-a418-60361558349e
+  path: technology.technologyinterface.git-hub-rest-api-interface
+  spec_node_id: technology.technologyinterface
+  type: technologyinterface
+  layer_id: technology
+  name: GitHub REST API Interface
+  description: HTTPS interface to GitHub REST API v3 used for owner-type
+    resolution (/users/{login}), org access checks, and label creation via gh
+    CLI
+  attributes:
+    protocol: https
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/github_owner_utils.py
+        symbol: get_owner_type
+  metadata:
+    created_at: 2026-03-24T10:28:46.342Z
+    updated_at: 2026-03-24T10:28:46.342Z
+    version: 1

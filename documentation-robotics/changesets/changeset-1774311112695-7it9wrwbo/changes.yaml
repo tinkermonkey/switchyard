@@ -1,0 +1,515 @@
+- type: add
+  elementId: data-model.schemadefinition.task
+  layerName: data-model
+  after:
+    id: 5de3ca9b-2b89-4ce8-a17d-2122353aba54
+    path: data-model.schemadefinition.task
+    spec_node_id: data-model.schemadefinition
+    type: schemadefinition
+    layer_id: data-model
+    name: Task
+    description: Priority queue work item with agent name, project, priority level,
+      context payload, creation timestamp, status, and optional not_before
+      scheduling
+    attributes:
+      title: Task
+      type: object
+      format: dataclass
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: task_queue/task_manager.py
+          symbol: Task
+    metadata:
+      created_at: 2026-03-24T00:12:01.225Z
+      updated_at: 2026-03-24T00:12:01.225Z
+      version: 1
+  timestamp: 2026-03-24T00:12:01.250Z
+  sequenceNumber: 0
+- type: add
+  elementId: data-model.schemadefinition.pipeline-run
+  layerName: data-model
+  after:
+    id: 7752277b-2391-4111-a08b-843225efdf82
+    path: data-model.schemadefinition.pipeline-run
+    spec_node_id: data-model.schemadefinition
+    type: schemadefinition
+    layer_id: data-model
+    name: Pipeline Run
+    description: Full lifecycle record of an issue traversing the pipeline; includes
+      project, issue number, board, status, current stage, events list,
+      timestamps, and pipeline_run_id
+    attributes:
+      title: PipelineRun
+      type: object
+      format: dataclass
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/pipeline_run.py
+          symbol: PipelineRun
+    metadata:
+      created_at: 2026-03-24T00:12:01.702Z
+      updated_at: 2026-03-24T00:12:01.702Z
+      version: 1
+  timestamp: 2026-03-24T00:12:01.726Z
+  sequenceNumber: 1
+- type: add
+  elementId: data-model.schemadefinition.pipeline-lock
+  layerName: data-model
+  after:
+    id: 324e1a5c-42b0-48f1-aea0-824663fbabd7
+    path: data-model.schemadefinition.pipeline-lock
+    spec_node_id: data-model.schemadefinition
+    type: schemadefinition
+    layer_id: data-model
+    name: Pipeline Lock
+    description: "Exclusive lock record for pipeline serialization; fields: project,
+      board, locked_by_issue, lock_acquired_at (ISO8601), lock_status
+      (locked|unlocked)"
+    attributes:
+      title: PipelineLock
+      type: object
+      format: dataclass
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/pipeline_lock_manager.py
+          symbol: PipelineLock
+    metadata:
+      created_at: 2026-03-24T00:12:02.176Z
+      updated_at: 2026-03-24T00:12:02.176Z
+      version: 1
+  timestamp: 2026-03-24T00:12:02.202Z
+  sequenceNumber: 2
+- type: add
+  elementId: data-model.schemadefinition.agent-config
+  layerName: data-model
+  after:
+    id: 3ed5ee3f-5748-41fc-91dd-5faa8d559871
+    path: data-model.schemadefinition.agent-config
+    spec_node_id: data-model.schemadefinition
+    type: schemadefinition
+    layer_id: data-model
+    name: Agent Config
+    description: Agent capability definition from agents.yaml; includes model,
+      timeout, retries, makes_code_changes, filesystem_write_allowed,
+      requires_dev_container, requires_docker, capabilities, tools_enabled,
+      mcp_servers
+    attributes:
+      title: AgentConfig
+      type: object
+      format: yaml
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: config/foundations/agents.yaml
+    metadata:
+      created_at: 2026-03-24T00:12:10.372Z
+      updated_at: 2026-03-24T00:12:10.372Z
+      version: 1
+  timestamp: 2026-03-24T00:12:10.395Z
+  sequenceNumber: 3
+- type: add
+  elementId: data-model.schemadefinition.project-config
+  layerName: data-model
+  after:
+    id: eef80829-d468-438b-9de8-df25f354fc4e
+    path: data-model.schemadefinition.project-config
+    spec_node_id: data-model.schemadefinition
+    type: schemadefinition
+    layer_id: data-model
+    name: Project Config
+    description: Per-project configuration including GitHub org/repo, tech_stacks,
+      enabled pipeline templates with workflow mappings, board names, and
+      visibility flags
+    attributes:
+      title: ProjectConfig
+      type: object
+      format: yaml
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: config/projects/context-studio.yaml
+    metadata:
+      created_at: 2026-03-24T00:12:10.837Z
+      updated_at: 2026-03-24T00:12:10.837Z
+      version: 1
+  timestamp: 2026-03-24T00:12:10.864Z
+  sequenceNumber: 4
+- type: add
+  elementId: data-model.schemadefinition.pipeline-template
+  layerName: data-model
+  after:
+    id: d261197e-79a4-427b-b98c-16defde07435
+    path: data-model.schemadefinition.pipeline-template
+    spec_node_id: data-model.schemadefinition
+    type: schemadefinition
+    layer_id: data-model
+    name: Pipeline Template
+    description: "Reusable pipeline stage sequence definition: name, description,
+      workflow_type, workspace, discussion_category, and ordered stages with
+      agent, capabilities, retries, and review config"
+    attributes:
+      title: PipelineTemplate
+      type: object
+      format: yaml
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: config/foundations/pipelines.yaml
+    metadata:
+      created_at: 2026-03-24T00:12:11.334Z
+      updated_at: 2026-03-24T00:12:11.334Z
+      version: 1
+  timestamp: 2026-03-24T00:12:11.358Z
+  sequenceNumber: 5
+- type: add
+  elementId: data-model.schemadefinition.workflow-template
+  layerName: data-model
+  after:
+    id: 58d23f59-ea62-4e09-a941-c3a725ce7bef
+    path: data-model.schemadefinition.workflow-template
+    spec_node_id: data-model.schemadefinition
+    type: schemadefinition
+    layer_id: data-model
+    name: Workflow Template
+    description: "Kanban board structure definition: pipeline mapping, trigger/exit
+      columns, and ordered column definitions with stage mappings, agents, and
+      automation rules"
+    attributes:
+      title: WorkflowTemplate
+      type: object
+      format: yaml
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: config/foundations/workflows.yaml
+    metadata:
+      created_at: 2026-03-24T00:12:20.466Z
+      updated_at: 2026-03-24T00:12:20.466Z
+      version: 1
+  timestamp: 2026-03-24T00:12:20.493Z
+  sequenceNumber: 6
+- type: add
+  elementId: data-model.schemadefinition.review-cycle-state
+  layerName: data-model
+  after:
+    id: 3ad189cf-2e9f-4851-b244-5b27f308226a
+    path: data-model.schemadefinition.review-cycle-state
+    spec_node_id: data-model.schemadefinition
+    type: schemadefinition
+    layer_id: data-model
+    name: Review Cycle State
+    description: "Active review cycle tracking object: issue_number, repository,
+      maker_agent, reviewer_agent, max_iterations, project, board, workspace
+      type, current iteration, and cycle stack"
+    attributes:
+      title: ReviewCycleState
+      type: object
+      format: class
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/review_cycle.py
+          symbol: ReviewCycleState
+    metadata:
+      created_at: 2026-03-24T00:12:20.957Z
+      updated_at: 2026-03-24T00:12:20.957Z
+      version: 1
+  timestamp: 2026-03-24T00:12:20.984Z
+  sequenceNumber: 7
+- type: add
+  elementId: data-model.schemadefinition.pr-review-state
+  layerName: data-model
+  after:
+    id: 2542da5b-050f-4f2b-8b88-7238b21bff99
+    path: data-model.schemadefinition.pr-review-state
+    spec_node_id: data-model.schemadefinition
+    type: schemadefinition
+    layer_id: data-model
+    name: PR Review State
+    description: "Persisted review cycle count tracking: maps issue numbers to
+      pr_reviews dict with cycle_count, history list, and last_reviewed_at;
+      stored in state/projects/<project>/pr_review_state.yaml"
+    attributes:
+      title: PRReviewState
+      type: object
+      format: yaml
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: state_management/pr_review_state_manager.py
+          symbol: PRReviewStateManager
+    metadata:
+      created_at: 2026-03-24T00:12:21.484Z
+      updated_at: 2026-03-24T00:12:21.484Z
+      version: 1
+  timestamp: 2026-03-24T00:12:21.515Z
+  sequenceNumber: 8
+- type: add
+  elementId: data-model.schemadefinition.feature-branch-state
+  layerName: data-model
+  after:
+    id: 93126767-815e-4288-bd76-cbaf13ba762a
+    path: data-model.schemadefinition.feature-branch-state
+    spec_node_id: data-model.schemadefinition
+    type: schemadefinition
+    layer_id: data-model
+    name: Feature Branch State
+    description: "Branch lifecycle record: branch_name, parent_issue, sub-issues
+      list (SubIssueState), created_at; persisted to YAML tracking hierarchical
+      branch contributions to a shared PR"
+    attributes:
+      title: FeatureBranchState
+      type: object
+      format: dataclass
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/feature_branch_manager.py
+          symbol: SubIssueState
+    metadata:
+      created_at: 2026-03-24T00:12:29.720Z
+      updated_at: 2026-03-24T00:12:29.720Z
+      version: 1
+  timestamp: 2026-03-24T00:12:29.744Z
+  sequenceNumber: 9
+- type: add
+  elementId: data-model.schemadefinition.git-hub-state
+  layerName: data-model
+  after:
+    id: 32c1e229-5908-4883-a4c2-cfcf83d98832
+    path: data-model.schemadefinition.git-hub-state
+    spec_node_id: data-model.schemadefinition
+    type: schemadefinition
+    layer_id: data-model
+    name: GitHub State
+    description: "Auto-managed runtime GitHub state: project board IDs, column IDs,
+      label IDs, sync timestamps, and reconciliation freshness; stored in
+      state/projects/<project>/github_state.yaml"
+    attributes:
+      title: GitHubState
+      type: object
+      format: yaml
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: config/state_manager.py
+    metadata:
+      created_at: 2026-03-24T00:12:30.053Z
+      updated_at: 2026-03-24T00:12:30.053Z
+      version: 1
+  timestamp: 2026-03-24T00:12:30.079Z
+  sequenceNumber: 10
+- type: add
+  elementId: data-model.schemadefinition.observability-event
+  layerName: data-model
+  after:
+    id: a20b354c-87a0-42f7-90e7-edd1c3f7bf9a
+    path: data-model.schemadefinition.observability-event
+    spec_node_id: data-model.schemadefinition
+    type: schemadefinition
+    layer_id: data-model
+    name: Observability Event
+    description: "Structured event record emitted by agents and pipeline:
+      event_type, agent, project, task_id, pipeline_run_id, timestamp, and
+      event-specific payload fields"
+    attributes:
+      title: ObservabilityEvent
+      type: object
+      format: dataclass
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: monitoring/observability.py
+          symbol: ObservabilityManager
+    metadata:
+      created_at: 2026-03-24T00:12:30.401Z
+      updated_at: 2026-03-24T00:12:30.401Z
+      version: 1
+  timestamp: 2026-03-24T00:12:30.427Z
+  sequenceNumber: 11
+- type: add
+  elementId: data-model.objectschema.task-object-schema
+  layerName: data-model
+  after:
+    id: 3c9ccb75-a387-4192-bacc-8b81d45523b0
+    path: data-model.objectschema.task-object-schema
+    spec_node_id: data-model.objectschema
+    type: objectschema
+    layer_id: data-model
+    name: Task Object Schema
+    description: "JSON Schema for Task dataclass: id (UUID), agent (string), project
+      (string), priority (HIGH|MEDIUM|LOW enum), context (object), created_at
+      (ISO8601), status, optional not_before (ISO8601)"
+    attributes:
+      type: object
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: task_queue/task_manager.py
+          symbol: Task
+    metadata:
+      created_at: 2026-03-24T00:12:46.632Z
+      updated_at: 2026-03-24T00:12:46.632Z
+      version: 1
+  timestamp: 2026-03-24T00:12:46.656Z
+  sequenceNumber: 12
+- type: add
+  elementId: data-model.objectschema.agent-log-event-schema
+  layerName: data-model
+  after:
+    id: ea45e238-c199-437b-b452-1bd0fc0a5747
+    path: data-model.objectschema.agent-log-event-schema
+    spec_node_id: data-model.objectschema
+    type: objectschema
+    layer_id: data-model
+    name: Agent Log Event Schema
+    description: "Elasticsearch mapping for agent logs: timestamp (date),
+      session_id, agent_name, project, task_id (keywords), event_type,
+      event_category, tool_name, tool_params (object), result, pipeline_run_id"
+    attributes:
+      type: object
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/pattern_detection_schema.py
+          symbol: AGENT_LOGS_MAPPING
+    metadata:
+      created_at: 2026-03-24T00:12:46.961Z
+      updated_at: 2026-03-24T00:12:46.961Z
+      version: 1
+  timestamp: 2026-03-24T00:12:46.986Z
+  sequenceNumber: 13
+- type: add
+  elementId: data-model.schemaproperty.taskid
+  layerName: data-model
+  after:
+    id: 9593cede-db79-4c7a-9b2d-73fd32a0525a
+    path: data-model.schemaproperty.taskid
+    spec_node_id: data-model.schemaproperty
+    type: schemaproperty
+    layer_id: data-model
+    name: task.id
+    description: Unique UUID identifier for a task, used for deduplication and
+      tracking in Redis and logs
+    attributes:
+      type: string
+      format: uuid
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: task_queue/task_manager.py
+          symbol: Task.id
+    metadata:
+      created_at: 2026-03-24T00:12:54.631Z
+      updated_at: 2026-03-24T00:12:54.631Z
+      version: 1
+  timestamp: 2026-03-24T00:12:54.660Z
+  sequenceNumber: 14
+- type: add
+  elementId: data-model.schemaproperty.taskpriority
+  layerName: data-model
+  after:
+    id: 63edcf45-8ae3-4037-bf01-a8e4c7e8039a
+    path: data-model.schemaproperty.taskpriority
+    spec_node_id: data-model.schemaproperty
+    type: schemaproperty
+    layer_id: data-model
+    name: task.priority
+    description: "Task priority level determining queue order: HIGH (PR reviews,
+      blocking), MEDIUM (development tasks), LOW (documentation, cleanup)"
+    attributes:
+      type: string
+      enum: HIGH MEDIUM LOW
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: task_queue/task_manager.py
+          symbol: TaskPriority
+    metadata:
+      created_at: 2026-03-24T00:12:55.019Z
+      updated_at: 2026-03-24T00:12:55.019Z
+      version: 1
+  timestamp: 2026-03-24T00:12:55.048Z
+  sequenceNumber: 15
+- type: add
+  elementId: data-model.schemaproperty.pipeline-runstatus
+  layerName: data-model
+  after:
+    id: 9076a88a-bb1b-49cc-9c88-01f467ca6ca4
+    path: data-model.schemaproperty.pipeline-runstatus
+    spec_node_id: data-model.schemaproperty
+    type: schemaproperty
+    layer_id: data-model
+    name: pipeline_run.status
+    description: "Pipeline run lifecycle status: active (processing), completed
+      (success), failed (error), or cancelled"
+    attributes:
+      type: string
+      enum: active completed failed cancelled
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/pipeline_run.py
+          symbol: PipelineRun.status
+    metadata:
+      created_at: 2026-03-24T00:12:55.494Z
+      updated_at: 2026-03-24T00:12:55.494Z
+      version: 1
+  timestamp: 2026-03-24T00:12:55.521Z
+  sequenceNumber: 16
+- type: add
+  elementId: data-model.stringschema.iso8601-timestamp
+  layerName: data-model
+  after:
+    id: c25658cc-294f-4dc0-a687-8a26ffb8aead
+    path: data-model.stringschema.iso8601-timestamp
+    spec_node_id: data-model.stringschema
+    type: stringschema
+    layer_id: data-model
+    name: ISO8601 Timestamp
+    description: UTC ISO8601 datetime string used consistently across all timestamps
+      in tasks, pipeline runs, locks, and events
+    attributes:
+      format: date-time
+      pattern: ^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: monitoring/timestamp_utils.py
+          symbol: utc_isoformat
+    metadata:
+      created_at: 2026-03-24T00:13:10.124Z
+      updated_at: 2026-03-24T00:13:10.124Z
+      version: 1
+  timestamp: 2026-03-24T00:13:10.153Z
+  sequenceNumber: 17
+- type: add
+  elementId: data-model.stringschema.pipeline-run-id
+  layerName: data-model
+  after:
+    id: 06c1ffbb-094e-46cc-a39e-169978ce40ac
+    path: data-model.stringschema.pipeline-run-id
+    spec_node_id: data-model.stringschema
+    type: stringschema
+    layer_id: data-model
+    name: Pipeline Run ID
+    description: UUID string identifying a pipeline run; used as tag across all
+      observability events, agent logs, and ES documents for cross-document
+      correlation
+    attributes:
+      format: uuid
+      pattern: ^[0-9a-f-]{36}$
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/pipeline_run.py
+          symbol: pipeline_run_id
+    metadata:
+      created_at: 2026-03-24T00:13:10.475Z
+      updated_at: 2026-03-24T00:13:10.475Z
+      version: 1
+  timestamp: 2026-03-24T00:13:10.501Z
+  sequenceNumber: 18

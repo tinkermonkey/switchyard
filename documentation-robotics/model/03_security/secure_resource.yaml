@@ -1,0 +1,83 @@
+security.secureresource.git-hub-api-endpoint:
+  id: 5bfe61a3-00f2-4ced-aea5-f5bff66e4c6b
+  path: security.secureresource.git-hub-api-endpoint
+  spec_node_id: security.secureresource
+  type: secureresource
+  layer_id: security
+  name: GitHub API Endpoint
+  description: GitHub REST and GraphQL API endpoints protected by token authentication
+  attributes:
+    resource: https://api.github.com
+    type: api
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/github_app.py
+        symbol: GitHubApp.rest_request
+  metadata:
+    created_at: 2026-03-24T00:26:07.876Z
+    updated_at: 2026-03-24T00:26:07.876Z
+    version: 1
+security.secureresource.docker-socket:
+  id: 278dfc17-7bab-46a1-942e-3a3408ad105c
+  path: security.secureresource.docker-socket
+  spec_node_id: security.secureresource
+  type: secureresource
+  layer_id: security
+  name: Docker Socket
+  description: Unix socket granting full Docker daemon control, mounted into
+    orchestrator container
+  attributes:
+    resource: /var/run/docker.sock
+    type: file
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: docker-compose.yml
+        symbol: docker.sock
+  metadata:
+    created_at: 2026-03-24T00:26:08.440Z
+    updated_at: 2026-03-24T00:26:08.440Z
+    version: 1
+security.secureresource.project-workspace-directory:
+  id: 17a2ae72-7427-49bf-9ef2-08e1823a76dd
+  path: security.secureresource.project-workspace-directory
+  spec_node_id: security.secureresource
+  type: secureresource
+  layer_id: security
+  name: Project Workspace Directory
+  description: Filesystem path /workspace/<project> mounted into agent containers
+    with write access
+  attributes:
+    resource: /workspace/<project>
+    type: file
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: claude/docker_runner.py
+        symbol: DockerAgentRunner
+  metadata:
+    created_at: 2026-03-24T00:26:08.994Z
+    updated_at: 2026-03-24T00:26:08.994Z
+    version: 1
+security.secureresource.orchestrator-redis-state:
+  id: b96d2662-8f43-41cf-b15e-6cc9b3a79577
+  path: security.secureresource.orchestrator-redis-state
+  spec_node_id: security.secureresource
+  type: secureresource
+  layer_id: security
+  name: Orchestrator Redis State
+  description: Redis instance storing task queue, pipeline locks, circuit breaker
+    state, and rate limit data
+  attributes:
+    resource: redis://redis:6379
+    type: database
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: task_queue/task_manager.py
+        symbol: TaskQueue
+  metadata:
+    created_at: 2026-03-24T00:26:09.565Z
+    updated_at: 2026-03-24T00:26:09.565Z
+    version: 1

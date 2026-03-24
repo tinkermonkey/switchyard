@@ -1,0 +1,100 @@
+motivation.principle.maker-checker-quality-assurance:
+  id: f60f85a5-044a-46a9-8536-259d4aaa6097
+  path: motivation.principle.maker-checker-quality-assurance
+  spec_node_id: motivation.principle
+  type: principle
+  layer_id: motivation
+  name: Maker-Checker Quality Assurance
+  description: Every artifact produced by a maker agent is independently verified
+    by a checker agent before progression
+  attributes:
+    category: architecture
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: config/foundations/pipelines.yaml
+        symbol: sdlc_execution.stages.implementation
+  metadata:
+    created_at: 2026-03-24T00:30:21.033Z
+    updated_at: 2026-03-24T00:30:21.033Z
+    version: 1
+motivation.principle.container-isolation-per-task:
+  id: 4763de3e-15c6-45ce-82a4-80b381b5e84c
+  path: motivation.principle.container-isolation-per-task
+  spec_node_id: motivation.principle
+  type: principle
+  layer_id: motivation
+  name: Container Isolation Per Task
+  description: Each agent execution is isolated in a fresh Docker container to
+    prevent cross-task contamination and limit blast radius
+  attributes:
+    category: security
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: claude/docker_runner.py
+        symbol: DockerAgentRunner
+  metadata:
+    created_at: 2026-03-24T00:30:21.587Z
+    updated_at: 2026-03-24T00:30:21.587Z
+    version: 1
+motivation.principle.git-hub-as-source-of-truth:
+  id: c45fc1df-fa26-4386-a971-5663e70329cf
+  path: motivation.principle.git-hub-as-source-of-truth
+  spec_node_id: motivation.principle
+  type: principle
+  layer_id: motivation
+  name: GitHub as Source of Truth
+  description: GitHub issue state and board position are the authoritative source
+    of pipeline state; local state reconciles to GitHub
+  attributes:
+    category: architecture
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/project_monitor.py
+        symbol: ProjectMonitor
+  metadata:
+    created_at: 2026-03-24T00:30:22.132Z
+    updated_at: 2026-03-24T00:30:22.132Z
+    version: 1
+motivation.principle.graceful-degradation:
+  id: 6c0f5b2b-bc92-4119-b418-05591e759963
+  path: motivation.principle.graceful-degradation
+  spec_node_id: motivation.principle
+  type: principle
+  layer_id: motivation
+  name: Graceful Degradation
+  description: "System falls back to lower-capability mode rather than failing:
+    App->PAT auth, Redis->in-memory queue"
+  attributes:
+    category: operational
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/github_app.py
+        symbol: GitHubApp._get_token
+  metadata:
+    created_at: 2026-03-24T00:30:22.677Z
+    updated_at: 2026-03-24T00:30:22.677Z
+    version: 1
+motivation.principle.pipeline-serialization-per-project:
+  id: 88f747fe-5789-45b3-b44a-89328bf9b11f
+  path: motivation.principle.pipeline-serialization-per-project
+  spec_node_id: motivation.principle
+  type: principle
+  layer_id: motivation
+  name: Pipeline Serialization Per Project
+  description: One active pipeline per project/board at a time to prevent
+    conflicting concurrent changes to the same codebase
+  attributes:
+    category: architecture
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/pipeline_lock_manager.py
+        symbol: PipelineLockManager
+  metadata:
+    created_at: 2026-03-24T00:30:23.265Z
+    updated_at: 2026-03-24T00:30:23.265Z
+    version: 1

@@ -1,0 +1,265 @@
+ux.librarycomponent.header:
+  id: ee8cb64c-766b-4a7f-b1ac-4015e5dc6eb7
+  path: ux.librarycomponent.header
+  spec_node_id: ux.librarycomponent
+  type: librarycomponent
+  layer_id: ux
+  name: Header
+  description: Top navigation header with active agent count badge, circuit
+    breaker status, Claude token usage indicator, and system health dot
+  attributes:
+    type: layout
+    category: navigation
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: web_ui/src/components/Header.jsx
+  metadata:
+    created_at: 2026-03-24T00:15:52.928Z
+    updated_at: 2026-03-24T00:15:52.928Z
+    version: 1
+ux.librarycomponent.pipeline-flow-graph:
+  id: b98dfaf7-6b7f-4a53-adcb-06ff7a7d44d0
+  path: ux.librarycomponent.pipeline-flow-graph
+  spec_node_id: ux.librarycomponent
+  type: librarycomponent
+  layer_id: ux
+  name: Pipeline Flow Graph
+  description: XYFlow-powered DAG visualization rendering pipeline stage nodes as
+    interactive graph; shows current stage, agent assignments, and completion
+    status with smart edges
+  attributes:
+    type: chart
+    category: pipeline
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: web_ui/src/components/PipelineFlowGraph.jsx
+  metadata:
+    created_at: 2026-03-24T00:15:59.573Z
+    updated_at: 2026-03-24T00:15:59.573Z
+    version: 1
+ux.librarycomponent.event-timeline:
+  id: cb4472e5-b536-463d-bc5b-281533425f58
+  path: ux.librarycomponent.event-timeline
+  spec_node_id: ux.librarycomponent
+  type: librarycomponent
+  layer_id: ux
+  name: Event Timeline
+  description: Chronological timeline of pipeline run events with event type
+    icons, timestamps, and expandable JSON modal for detailed payload inspection
+  attributes:
+    type: display
+    category: observability
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: web_ui/src/components/EventTimeline.jsx
+  metadata:
+    created_at: 2026-03-24T00:15:59.906Z
+    updated_at: 2026-03-24T00:15:59.906Z
+    version: 1
+ux.librarycomponent.active-agents:
+  id: c16e4ae4-b0c4-4841-acb4-01832cf2eb72
+  path: ux.librarycomponent.active-agents
+  spec_node_id: ux.librarycomponent
+  type: librarycomponent
+  layer_id: ux
+  name: Active Agents
+  description: Real-time panel showing currently running agent containers with
+    kill action buttons, agent type badges, project names, and elapsed time
+  attributes:
+    type: table
+    category: monitoring
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: web_ui/src/components/ActiveAgents.jsx
+  metadata:
+    created_at: 2026-03-24T00:16:00.253Z
+    updated_at: 2026-03-24T00:16:00.253Z
+    version: 1
+ux.librarycomponent.live-logs:
+  id: 8db06f5b-4d5c-4ed0-b9cf-a0d4caae1a1f
+  path: ux.librarycomponent.live-logs
+  spec_node_id: ux.librarycomponent
+  type: librarycomponent
+  layer_id: ux
+  name: Live Logs
+  description: Auto-scrolling log viewer showing structured JSON logs from Redis
+    stream in near real-time with log level color coding and agent name
+    filtering
+  attributes:
+    type: display
+    category: monitoring
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: web_ui/src/components/LiveLogs.jsx
+  metadata:
+    created_at: 2026-03-24T00:16:08.060Z
+    updated_at: 2026-03-24T00:16:08.060Z
+    version: 1
+ux.librarycomponent.pipelines-status:
+  id: 2ced2a04-121d-47d2-81b4-143b27e1e2bd
+  path: ux.librarycomponent.pipelines-status
+  spec_node_id: ux.librarycomponent
+  type: librarycomponent
+  layer_id: ux
+  name: Pipelines Status
+  description: Overview panel showing all pipeline states across projects with
+    current stage, holding issue, elapsed time, and lock status
+  attributes:
+    type: display
+    category: pipeline
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: web_ui/src/components/PipelinesStatus.jsx
+  metadata:
+    created_at: 2026-03-24T00:16:08.446Z
+    updated_at: 2026-03-24T00:16:08.446Z
+    version: 1
+ux.librarycomponent.agent-metrics:
+  id: 6320628b-ffb7-44f7-aed4-6486da9ed73f
+  path: ux.librarycomponent.agent-metrics
+  spec_node_id: ux.librarycomponent
+  type: librarycomponent
+  layer_id: ux
+  name: Agent Metrics
+  description: Performance metrics table and trend charts per agent type showing
+    execution count, success rate, average duration, and token usage
+  attributes:
+    type: chart
+    category: metrics
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: web_ui/src/components/AgentMetrics.jsx
+  metadata:
+    created_at: 2026-03-24T00:16:08.817Z
+    updated_at: 2026-03-24T00:16:08.817Z
+    version: 1
+ux.librarycomponent.repair-cycle-status:
+  id: 7485fe87-c074-498a-b914-9b1eee68211f
+  path: ux.librarycomponent.repair-cycle-status
+  spec_node_id: ux.librarycomponent
+  type: librarycomponent
+  layer_id: ux
+  name: Repair Cycle Status
+  description: Status panel for test-fix-validate repair cycles showing current
+    iteration, test results, pass/fail counts, and cycle progress within the
+    testing stage
+  attributes:
+    type: display
+    category: pipeline
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: web_ui/src/components/RepairCycleStatus.jsx
+  metadata:
+    created_at: 2026-03-24T00:16:16.295Z
+    updated_at: 2026-03-24T00:16:16.295Z
+    version: 1
+ux.librarycomponent.dev-container-status:
+  id: d84a2431-e720-45cf-8aa3-7e0c0c3a90a4
+  path: ux.librarycomponent.dev-container-status
+  spec_node_id: ux.librarycomponent
+  type: librarycomponent
+  layer_id: ux
+  name: Dev Container Status
+  description: "Shows Docker image verification status per project: verified
+    (green), missing (red), needs setup (yellow) with one-click environment
+    setup trigger"
+  attributes:
+    type: display
+    category: infrastructure
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: web_ui/src/components/DevContainerStatus.jsx
+  metadata:
+    created_at: 2026-03-24T00:16:16.666Z
+    updated_at: 2026-03-24T00:16:16.666Z
+    version: 1
+ux.librarycomponent.token-usage-panel:
+  id: deae19f7-55b2-429c-8afd-7b3ad1b2cd26
+  path: ux.librarycomponent.token-usage-panel
+  spec_node_id: ux.librarycomponent
+  type: librarycomponent
+  layer_id: ux
+  name: Token Usage Panel
+  description: Displays Claude API token consumption against weekly (630M) and
+    per-session (50M) quotas with bar chart and threshold warnings
+  attributes:
+    type: chart
+    category: metrics
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: web_ui/src/components/TokenUsagePanel.jsx
+  metadata:
+    created_at: 2026-03-24T00:16:17.032Z
+    updated_at: 2026-03-24T00:16:17.032Z
+    version: 1
+ux.librarycomponent.navigation-tabs:
+  id: 9df88c49-8831-463d-bbe4-34fc4c0581ef
+  path: ux.librarycomponent.navigation-tabs
+  spec_node_id: ux.librarycomponent
+  type: librarycomponent
+  layer_id: ux
+  name: Navigation Tabs
+  description: Top-level navigation tabs component routing between Dashboard,
+    Projects, Pipeline Reports, Agent Metrics, Cycle Metrics, Project Metrics,
+    and Recommendations
+  attributes:
+    type: navigation
+    category: navigation
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: web_ui/src/components/NavigationTabs.jsx
+  metadata:
+    created_at: 2026-03-24T00:16:24.565Z
+    updated_at: 2026-03-24T00:16:24.565Z
+    version: 1
+ux.librarycomponent.project-card:
+  id: 1987185f-bfd9-45e3-bb82-619c1892dd46
+  path: ux.librarycomponent.project-card
+  spec_node_id: ux.librarycomponent
+  type: librarycomponent
+  layer_id: ux
+  name: Project Card
+  description: "Card component displaying a single project: name, GitHub repo
+    link, active issues, pipeline health, and quick navigation to pipeline runs"
+  attributes:
+    type: display
+    category: project
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: web_ui/src/components/ProjectCard.jsx
+  metadata:
+    created_at: 2026-03-24T00:16:24.949Z
+    updated_at: 2026-03-24T00:16:24.949Z
+    version: 1
+ux.librarycomponent.confirmation-modal:
+  id: 16d286e3-f71b-4e8a-a433-032788b05d2d
+  path: ux.librarycomponent.confirmation-modal
+  spec_node_id: ux.librarycomponent
+  type: librarycomponent
+  layer_id: ux
+  name: Confirmation Modal
+  description: Reusable modal dialog for destructive actions such as killing an
+    agent container; requires explicit confirmation before proceeding
+  attributes:
+    type: feedback
+    category: interaction
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: web_ui/src/components/ConfirmationModal.jsx
+  metadata:
+    created_at: 2026-03-24T00:16:25.337Z
+    updated_at: 2026-03-24T00:16:25.337Z
+    version: 1

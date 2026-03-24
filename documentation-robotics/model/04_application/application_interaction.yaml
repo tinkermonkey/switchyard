@@ -1,0 +1,74 @@
+application.applicationinteraction.agent-execution-via-docker:
+  id: b0b2259a-de33-484a-b4b2-0f0bf574f1dc
+  path: application.applicationinteraction.agent-execution-via-docker
+  spec_node_id: application.applicationinteraction
+  type: applicationinteraction
+  layer_id: application
+  name: Agent Execution via Docker
+  description: Docker-in-Docker pattern where orchestrator container spawns
+    isolated agent containers with project workspace mounts and labeled with
+    project/issue metadata
+  attributes:
+    pattern: request-reply
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: claude/docker_runner.py
+        symbol: DockerAgentRunner.run_agent
+  metadata:
+    created_at: 2026-03-24T00:06:23.945Z
+    updated_at: 2026-03-24T00:06:23.945Z
+    version: 1
+application.applicationinteraction.detached-container-log-streaming:
+  id: 71dfefde-81f5-4958-842d-4b0bb7178a1c
+  path: application.applicationinteraction.detached-container-log-streaming
+  spec_node_id: application.applicationinteraction
+  type: applicationinteraction
+  layer_id: application
+  name: Detached Container Log Streaming
+  description: Pattern where the orchestrator launches an agent container in
+    detached mode ('docker run -d') and then streams its logs via 'docker logs
+    -f {container_name}'; the container runs independently and survives
+    orchestrator crashes; 'docker wait {container_name}' blocks until container
+    exits using the agent's configured hard timeout (default 3 hours); stdout
+    (Claude JSON events) and stderr (debug/error output) are read in parallel
+    daemon threads; allows orchestrator restart without killing running agent
+    containers
+  attributes:
+    pattern: fire-and-forget
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: claude/docker_runner.py
+        symbol: DockerAgentRunner._execute_in_container
+  metadata:
+    created_at: 2026-03-24T08:35:56.448Z
+    updated_at: 2026-03-24T08:35:56.448Z
+    version: 1
+application.applicationinteraction.container-side-redis-event-streaming:
+  id: 7fdc90bf-0b65-4fd0-9466-ff6204090306
+  path: application.applicationinteraction.container-side-redis-event-streaming
+  spec_node_id: application.applicationinteraction
+  type: applicationinteraction
+  layer_id: application
+  name: Container-Side Redis Event Streaming
+  description: Direct Redis communication from inside agent containers via
+    docker-claude-wrapper.py; each Claude JSON event is written to Redis Stream
+    (orchestrator:claude_logs_stream, maxlen 500) and published to Redis Pub/Sub
+    channel (orchestrator:claude_stream) for real-time WebSocket forwarding;
+    container connects with 1-second write timeout and 2-second connect timeout;
+    if Redis is unavailable, events are discarded and execution continues
+    (fire-and-forget); final result is written to
+    agent_result:{project}:{issue}:{task_id} with SETEX (2-hour TTL) as the
+    durability guarantee
+  attributes:
+    pattern: publish-subscribe
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: scripts/docker-claude-wrapper.py
+        symbol: ClaudeWrapper.write_claude_event
+  metadata:
+    created_at: 2026-03-24T08:36:03.897Z
+    updated_at: 2026-03-24T08:36:03.897Z
+    version: 1

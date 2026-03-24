@@ -1,0 +1,18 @@
+business.businesscollaboration.maker-checker-review-collaboration:
+  id: acbcc64d-936f-483a-863e-46a640935ac8
+  path: business.businesscollaboration.maker-checker-review-collaboration
+  spec_node_id: business.businesscollaboration
+  type: businesscollaboration
+  layer_id: business
+  name: Maker-Checker Review Collaboration
+  description: Collaborative interaction between maker agent (SSE) and checker
+    agent (code_reviewer) through iterative review cycles
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: config/foundations/pipelines.yaml
+        symbol: sdlc_execution.stages.implementation
+  metadata:
+    created_at: 2026-03-24T00:28:51.303Z
+    updated_at: 2026-03-24T00:28:51.303Z
+    version: 1

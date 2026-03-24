@@ -1,0 +1,80 @@
+motivation.driver.developer-productivity-bottleneck:
+  id: fcdccc7d-8230-4d83-96cf-b8fe596961d8
+  path: motivation.driver.developer-productivity-bottleneck
+  spec_node_id: motivation.driver
+  type: driver
+  layer_id: motivation
+  name: Developer Productivity Bottleneck
+  description: Repetitive SDLC tasks (research, requirements, code review,
+    testing) consume significant developer time
+  attributes:
+    category: operational
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: config/foundations/pipelines.yaml
+        symbol: planning_design
+  metadata:
+    created_at: 2026-03-24T00:29:55.020Z
+    updated_at: 2026-03-24T00:29:55.020Z
+    version: 1
+motivation.driver.ai-capability-advancement:
+  id: 6a19b626-1a98-4c2a-8c63-e26cf3dc77a5
+  path: motivation.driver.ai-capability-advancement
+  spec_node_id: motivation.driver
+  type: driver
+  layer_id: motivation
+  name: AI Capability Advancement
+  description: Claude models (Opus, Sonnet, Haiku) now have sufficient capability
+    to execute complex SDLC stages autonomously
+  attributes:
+    category: technological
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: config/foundations/agents.yaml
+        symbol: agents
+  metadata:
+    created_at: 2026-03-24T00:29:55.568Z
+    updated_at: 2026-03-24T00:29:55.568Z
+    version: 1
+motivation.driver.git-hub-ecosystem-ubiquity:
+  id: c7fb9a3f-7d35-49e1-b18a-37da45cd563b
+  path: motivation.driver.git-hub-ecosystem-ubiquity
+  spec_node_id: motivation.driver
+  type: driver
+  layer_id: motivation
+  name: GitHub Ecosystem Ubiquity
+  description: GitHub Projects v2 and issue tracking are the standard workflow
+    interface for most development teams
+  attributes:
+    category: strategic
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/github_project_manager.py
+        symbol: GitHubProjectManager
+  metadata:
+    created_at: 2026-03-24T00:29:56.103Z
+    updated_at: 2026-03-24T00:29:56.103Z
+    version: 1
+motivation.driver.software-delivery-speed-pressure:
+  id: e0782646-b6e3-44a0-8f08-38731ed6a912
+  path: motivation.driver.software-delivery-speed-pressure
+  spec_node_id: motivation.driver
+  type: driver
+  layer_id: motivation
+  name: Software Delivery Speed Pressure
+  description: Competitive pressure to reduce time-to-production for features
+    while maintaining quality standards
+  attributes:
+    category: competitive
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: config/foundations/pipelines.yaml
+        symbol: sdlc_execution
+  metadata:
+    created_at: 2026-03-24T00:29:56.635Z
+    updated_at: 2026-03-24T00:29:56.635Z
+    version: 1

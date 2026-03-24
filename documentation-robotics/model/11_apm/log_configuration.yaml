@@ -1,0 +1,22 @@
+apm.logconfiguration.orchestrator-json-logger:
+  id: 1d1631ec-0099-40f0-b6c0-cdb2a1489b4f
+  path: apm.logconfiguration.orchestrator-json-logger
+  spec_node_id: apm.logconfiguration
+  type: logconfiguration
+  layer_id: apm
+  name: Orchestrator JSON Logger
+  description: Python JSON structured logging using python-json-logger; all logs
+    formatted as JSON with timestamp, name, level, and message fields; written
+    to stdout and orchestrator_data/logs/orchestrator_all.log
+  attributes:
+    serviceName: orchestrator
+    minimumSeverity: INFO
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: monitoring/logging.py
+        symbol: OrchestratorLogger
+  metadata:
+    created_at: 2026-03-24T00:18:58.717Z
+    updated_at: 2026-03-24T00:18:58.717Z
+    version: 1

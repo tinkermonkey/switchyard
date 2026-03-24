@@ -1,0 +1,90 @@
+business.businessprocess.planning-and-design-pipeline-execution:
+  id: 96e1614e-172a-4b6a-b68c-f59c7407303e
+  path: business.businessprocess.planning-and-design-pipeline-execution
+  spec_node_id: business.businessprocess
+  type: businessprocess
+  layer_id: business
+  name: Planning and Design Pipeline Execution
+  description: "Sequential pipeline: research -> requirements analysis ->
+    architecture design -> work breakdown -> PR review"
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: config/foundations/pipelines.yaml
+        symbol: planning_design
+  metadata:
+    created_at: 2026-03-24T00:27:58.440Z
+    updated_at: 2026-03-24T00:27:58.440Z
+    version: 1
+business.businessprocess.sdlc-execution-pipeline-execution:
+  id: 9a0e0680-fd7d-466a-9e8b-5b7ed40bdfbe
+  path: business.businessprocess.sdlc-execution-pipeline-execution
+  spec_node_id: business.businessprocess
+  type: businessprocess
+  layer_id: business
+  name: SDLC Execution Pipeline Execution
+  description: "Sequential pipeline: implementation -> code review cycle -> test
+    repair cycle -> staging"
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: config/foundations/pipelines.yaml
+        symbol: sdlc_execution
+  metadata:
+    created_at: 2026-03-24T00:27:58.959Z
+    updated_at: 2026-03-24T00:27:58.959Z
+    version: 1
+business.businessprocess.kanban-board-monitoring:
+  id: c774da27-effa-41df-bdc1-991c4b8e8454
+  path: business.businessprocess.kanban-board-monitoring
+  spec_node_id: business.businessprocess
+  type: businessprocess
+  layer_id: business
+  name: Kanban Board Monitoring
+  description: Continuous 30-second polling loop that detects card movements and
+    enqueues pipeline tasks
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/project_monitor.py
+        symbol: ProjectMonitor
+  metadata:
+    created_at: 2026-03-24T00:27:59.506Z
+    updated_at: 2026-03-24T00:27:59.506Z
+    version: 1
+business.businessprocess.agent-container-execution:
+  id: 0f70f69e-6903-495c-9cc6-e06632a458d6
+  path: business.businessprocess.agent-container-execution
+  spec_node_id: business.businessprocess
+  type: businessprocess
+  layer_id: business
+  name: Agent Container Execution
+  description: Isolated Docker container launch for each agent task with workspace
+    mount and credential injection
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: claude/docker_runner.py
+        symbol: DockerAgentRunner
+  metadata:
+    created_at: 2026-03-24T00:28:00.037Z
+    updated_at: 2026-03-24T00:28:00.037Z
+    version: 1
+business.businessprocess.pr-merge-and-branch-cleanup:
+  id: b6305730-365b-4c35-9e2e-0e3da5642b37
+  path: business.businessprocess.pr-merge-and-branch-cleanup
+  spec_node_id: business.businessprocess
+  type: businessprocess
+  layer_id: business
+  name: PR Merge and Branch Cleanup
+  description: Auto-merge approved PRs and clean up feature branches after
+    pipeline completion
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/git_workflow_manager.py
+        symbol: GitWorkflowManager
+  metadata:
+    created_at: 2026-03-24T00:28:00.583Z
+    updated_at: 2026-03-24T00:28:00.583Z
+    version: 1

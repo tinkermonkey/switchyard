@@ -1,0 +1,80 @@
+security.actor.human-operator:
+  id: c0843a1b-c96d-475b-92ce-1b5f7726a10a
+  path: security.actor.human-operator
+  spec_node_id: security.actor
+  type: actor
+  layer_id: security
+  name: Human Operator
+  description: DevOps engineer who configures and operates the orchestrator
+  attributes:
+    type: human
+    trustLevel: high
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: documentation/github-authentication.md
+        symbol: PersonalAccessToken
+  metadata:
+    created_at: 2026-03-24T00:24:38.601Z
+    updated_at: 2026-03-24T00:24:38.601Z
+    version: 1
+security.actor.orchestrator-bot:
+  id: 23513e4d-3ccf-4abe-bc5d-1d01665747e7
+  path: security.actor.orchestrator-bot
+  spec_node_id: security.actor
+  type: actor
+  layer_id: security
+  name: Orchestrator Bot
+  description: GitHub App bot identity that posts comments as orchestrator-bot[bot]
+  attributes:
+    type: service
+    trustLevel: high
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/github_app.py
+        symbol: GitHubApp
+  metadata:
+    created_at: 2026-03-24T00:24:39.121Z
+    updated_at: 2026-03-24T00:24:39.121Z
+    version: 1
+security.actor.claude-agent-container:
+  id: 6d764b3b-2103-49c2-9551-67036b3ad12b
+  path: security.actor.claude-agent-container
+  spec_node_id: security.actor
+  type: actor
+  layer_id: security
+  name: Claude Agent Container
+  description: Isolated Docker container executing Claude agents for a single task
+  attributes:
+    type: system
+    trustLevel: medium
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: claude/docker_runner.py
+        symbol: DockerAgentRunner
+  metadata:
+    created_at: 2026-03-24T00:24:39.632Z
+    updated_at: 2026-03-24T00:24:39.632Z
+    version: 1
+security.actor.git-hub-api:
+  id: 00d1ecbd-ae07-4db7-a8e0-7bef87c37b53
+  path: security.actor.git-hub-api
+  spec_node_id: security.actor
+  type: actor
+  layer_id: security
+  name: GitHub API
+  description: External GitHub REST and GraphQL API endpoints
+  attributes:
+    type: external-entity
+    trustLevel: high
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/github_app.py
+        symbol: GitHubApp.graphql_request
+  metadata:
+    created_at: 2026-03-24T00:24:40.153Z
+    updated_at: 2026-03-24T00:24:40.153Z
+    version: 1

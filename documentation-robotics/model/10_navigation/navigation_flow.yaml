@@ -1,0 +1,36 @@
+navigation.navigationflow.main-navigation-flow:
+  id: c16eff5d-b1c1-435b-be83-070f0ea4d1ab
+  path: navigation.navigationflow.main-navigation-flow
+  spec_node_id: navigation.navigationflow
+  type: navigationflow
+  layer_id: navigation
+  name: Main Navigation Flow
+  description: Top-level tab navigation flow between all 8 dashboard views via
+    NavigationTabs component; TanStack Router handles client-side routing
+    without page reload
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: web_ui/src/components/NavigationTabs.jsx
+  metadata:
+    created_at: 2026-03-24T00:18:22.143Z
+    updated_at: 2026-03-24T00:18:22.143Z
+    version: 1
+navigation.navigationflow.pipeline-run-detail-flow:
+  id: 35d40813-9655-4a37-8695-957eb4dd8c7e
+  path: navigation.navigationflow.pipeline-run-detail-flow
+  spec_node_id: navigation.navigationflow
+  type: navigationflow
+  layer_id: navigation
+  name: Pipeline Run Detail Flow
+  description: Navigation flow from dashboard pipeline event click to pipeline run
+    detail, and from detail to agent execution detail for individual stage
+    inspection
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: web_ui/src/routes/pipeline-run.jsx
+  metadata:
+    created_at: 2026-03-24T00:18:22.665Z
+    updated_at: 2026-03-24T00:18:22.665Z
+    version: 1

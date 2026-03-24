@@ -1,0 +1,126 @@
+technology.technologyservice.claude-code-cli:
+  id: 70ae8624-5bab-4f0e-84ff-6136176771b0
+  path: technology.technologyservice.claude-code-cli
+  spec_node_id: technology.technologyservice
+  type: technologyservice
+  layer_id: technology
+  name: Claude Code CLI
+  description: Anthropic Claude Code CLI tool (@anthropic-ai/claude-code) executed
+    inside agent containers; provides AI code generation, analysis, and tool use
+    with MCP server support
+  attributes:
+    serviceType: compute
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: Dockerfile
+        symbol: npm install -g @anthropic-ai/claude-code
+  metadata:
+    created_at: 2026-03-24T00:07:50.205Z
+    updated_at: 2026-03-24T00:07:50.205Z
+    version: 1
+technology.technologyservice.git-hub-api-external:
+  id: e95e4bdb-1714-4178-9afa-1b9cea5334e0
+  path: technology.technologyservice.git-hub-api-external
+  spec_node_id: technology.technologyservice
+  type: technologyservice
+  layer_id: technology
+  name: GitHub API (External)
+  description: External GitHub GraphQL v4 and REST APIs used for project board
+    management, issue operations, PR management, discussions, and label
+    automation
+  attributes:
+    serviceType: compute
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/github_api_client.py
+        symbol: GitHubAPIClient
+  metadata:
+    created_at: 2026-03-24T00:07:50.695Z
+    updated_at: 2026-03-24T00:07:50.695Z
+    version: 1
+technology.technologyservice.anthropic-api:
+  id: 02ec155f-b631-4a90-a47a-50cb6b760dcf
+  path: technology.technologyservice.anthropic-api
+  spec_node_id: technology.technologyservice
+  type: technologyservice
+  layer_id: technology
+  name: Anthropic API
+  description: External Anthropic Claude API providing claude-opus-4-6,
+    claude-sonnet-4-6, and claude-haiku-4-5 model access; used directly or via
+    Claude Code CLI with OAuth token billing
+  attributes:
+    serviceType: compute
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: config/foundations/agents.yaml
+        symbol: model
+  metadata:
+    created_at: 2026-03-24T00:07:51.176Z
+    updated_at: 2026-03-24T00:07:51.176Z
+    version: 1
+technology.technologyservice.context7-mcp-server:
+  id: f433d2ed-13c4-4ed6-a783-e15b7ee2c78a
+  path: technology.technologyservice.context7-mcp-server
+  spec_node_id: technology.technologyservice
+  type: technologyservice
+  layer_id: technology
+  name: Context7 MCP Server
+  description: External Model Context Protocol server at mcp.context7.com
+    providing agents with up-to-date library documentation and code context
+    during execution
+  attributes:
+    serviceType: compute
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: docker-compose.yml
+        symbol: CONTEXT7_MCP_URL
+  metadata:
+    created_at: 2026-03-24T00:07:58.540Z
+    updated_at: 2026-03-24T00:07:58.540Z
+    version: 1
+technology.technologyservice.playwright-mcp-server:
+  id: c1984410-58bb-4eb9-bc27-8073b58f3de1
+  path: technology.technologyservice.playwright-mcp-server
+  spec_node_id: technology.technologyservice
+  type: technologyservice
+  layer_id: technology
+  name: Playwright MCP Server
+  description: Local Playwright MCP server (@playwright/mcp) installed in agent
+    containers; enables browser automation for senior_software_engineer agent
+    via Browserless
+  attributes:
+    serviceType: compute
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: Dockerfile
+        symbol: "@playwright/mcp"
+  metadata:
+    created_at: 2026-03-24T00:07:59.021Z
+    updated_at: 2026-03-24T00:07:59.021Z
+    version: 1
+technology.technologyservice.browserless-chromium:
+  id: cd18d305-41b6-4035-9be9-c1b353a22964
+  path: technology.technologyservice.browserless-chromium
+  spec_node_id: technology.technologyservice
+  type: technologyservice
+  layer_id: technology
+  name: Browserless Chromium
+  description: Headless Chromium service (ghcr.io/browserless/chromium) on port
+    3080; provides browser execution for Playwright MCP with 5 concurrent
+    sessions and 30s timeout
+  attributes:
+    serviceType: compute
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: docker-compose.yml
+        symbol: browserless
+  metadata:
+    created_at: 2026-03-24T00:07:59.497Z
+    updated_at: 2026-03-24T00:07:59.497Z
+    version: 1

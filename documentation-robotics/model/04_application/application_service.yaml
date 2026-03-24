@@ -1,0 +1,449 @@
+application.applicationservice.pipeline-orchestrator:
+  id: d1032acf-486d-4360-b365-0daa76c744fb
+  path: application.applicationservice.pipeline-orchestrator
+  spec_node_id: application.applicationservice
+  type: applicationservice
+  layer_id: application
+  name: Pipeline Orchestrator
+  description: Sequential pipeline executor that coordinates agent stages with
+    circuit breaker protection and checkpoint-based recovery
+  attributes:
+    serviceType: asynchronous
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: pipeline/orchestrator.py
+        symbol: SequentialPipeline
+  metadata:
+    created_at: 2026-03-24T00:03:25.891Z
+    updated_at: 2026-03-24T00:03:25.891Z
+    version: 1
+application.applicationservice.task-queue-service:
+  id: 72cf0362-a8b5-4362-98b8-b74b6d109e0f
+  path: application.applicationservice.task-queue-service
+  spec_node_id: application.applicationservice
+  type: applicationservice
+  layer_id: application
+  name: Task Queue Service
+  description: Redis-backed priority task queue with in-memory fallback that
+    manages agent task lifecycle across HIGH, MEDIUM, and LOW priority tiers
+  attributes:
+    serviceType: asynchronous
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: task_queue/task_manager.py
+        symbol: TaskQueue
+  metadata:
+    created_at: 2026-03-24T00:03:33.800Z
+    updated_at: 2026-03-24T00:03:33.800Z
+    version: 1
+application.applicationservice.project-monitor:
+  id: f9fb3fb4-5ee9-41c0-bd63-7f5a094a1d99
+  path: application.applicationservice.project-monitor
+  spec_node_id: application.applicationservice
+  type: applicationservice
+  layer_id: application
+  name: Project Monitor
+  description: Polling service that continuously monitors GitHub Projects v2
+    Kanban boards for card movements and triggers appropriate agent tasks
+  attributes:
+    serviceType: event-driven
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/project_monitor.py
+        symbol: ProjectMonitor
+  metadata:
+    created_at: 2026-03-24T00:03:34.209Z
+    updated_at: 2026-03-24T00:03:34.209Z
+    version: 1
+application.applicationservice.git-hub-project-manager:
+  id: 9e90ef45-fd35-46b9-96c3-a46d2fa26005
+  path: application.applicationservice.git-hub-project-manager
+  spec_node_id: application.applicationservice
+  type: applicationservice
+  layer_id: application
+  name: GitHub Project Manager
+  description: Reconciliation service that ensures GitHub project boards match
+    declarative configuration, creating and updating boards and columns
+  attributes:
+    serviceType: synchronous
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/github_project_manager.py
+        symbol: GitHubProjectManager
+  metadata:
+    created_at: 2026-03-24T00:03:34.614Z
+    updated_at: 2026-03-24T00:03:34.614Z
+    version: 1
+application.applicationservice.git-workflow-manager:
+  id: d993caf0-0514-4985-8fef-f065c68cd443
+  path: application.applicationservice.git-workflow-manager
+  spec_node_id: application.applicationservice
+  type: applicationservice
+  layer_id: application
+  name: Git Workflow Manager
+  description: Manages complete git workflow lifecycle including branch creation,
+    pull request management, PR status updates, and integration with code review
+  attributes:
+    serviceType: synchronous
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/git_workflow_manager.py
+        symbol: GitWorkflowManager
+  metadata:
+    created_at: 2026-03-24T00:03:42.074Z
+    updated_at: 2026-03-24T00:03:42.074Z
+    version: 1
+application.applicationservice.feature-branch-manager:
+  id: 6d9dccfc-f1d5-421f-95ba-f92378481d49
+  path: application.applicationservice.feature-branch-manager
+  spec_node_id: application.applicationservice
+  type: applicationservice
+  layer_id: application
+  name: Feature Branch Manager
+  description: Manages hierarchical feature branch workflows where sub-issues
+    contribute to parent issue branches, accumulating all changes in a single PR
+  attributes:
+    serviceType: synchronous
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/feature_branch_manager.py
+        symbol: FeatureBranchManager
+  metadata:
+    created_at: 2026-03-24T00:03:42.488Z
+    updated_at: 2026-03-24T00:03:42.489Z
+    version: 1
+application.applicationservice.review-cycle-service:
+  id: 98bddd3d-72e3-45b5-895c-ca7788dac028
+  path: application.applicationservice.review-cycle-service
+  spec_node_id: application.applicationservice
+  type: applicationservice
+  layer_id: application
+  name: Review Cycle Service
+  description: Implements the synchronous maker-checker review loop with iteration
+    tracking, managing state for active review cycles between maker and reviewer
+    agents
+  attributes:
+    serviceType: synchronous
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/review_cycle.py
+        symbol: ReviewCycleState
+  metadata:
+    created_at: 2026-03-24T00:03:42.906Z
+    updated_at: 2026-03-24T00:03:42.906Z
+    version: 1
+application.applicationservice.observability-server:
+  id: ae1ae0fc-f23a-49a9-98d6-3899b3c2951b
+  path: application.applicationservice.observability-server
+  spec_node_id: application.applicationservice
+  type: applicationservice
+  layer_id: application
+  name: Observability Server
+  description: Flask/Socket.IO server on port 5001 that streams real-time agent
+    observability events to the web UI via WebSocket and exposes REST APIs for
+    pipeline and agent monitoring
+  attributes:
+    serviceType: event-driven
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/observability_server.py
+        symbol: app
+  metadata:
+    created_at: 2026-03-24T00:03:53.691Z
+    updated_at: 2026-03-24T00:03:53.691Z
+    version: 1
+application.applicationservice.pipeline-progression-service:
+  id: ffc7dbeb-9610-4940-b443-20b84f0b5c19
+  path: application.applicationservice.pipeline-progression-service
+  spec_node_id: application.applicationservice
+  type: applicationservice
+  layer_id: application
+  name: Pipeline Progression Service
+  description: Handles automatic issue progression through pipeline stages by
+    moving GitHub project board items and triggering next agents in sequence
+  attributes:
+    serviceType: event-driven
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/pipeline_progression.py
+        symbol: PipelineProgression
+  metadata:
+    created_at: 2026-03-24T00:03:54.125Z
+    updated_at: 2026-03-24T00:03:54.125Z
+    version: 1
+application.applicationservice.pipeline-lock-manager:
+  id: 37bf5e52-cb1f-46d6-acf3-b7b38a272d3a
+  path: application.applicationservice.pipeline-lock-manager
+  spec_node_id: application.applicationservice
+  type: applicationservice
+  layer_id: application
+  name: Pipeline Lock Manager
+  description: Manages exclusive execution locks ensuring only one issue at a time
+    holds the pipeline lock per project/board, with Redis and YAML persistence
+  attributes:
+    serviceType: synchronous
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/pipeline_lock_manager.py
+        symbol: PipelineLockManager
+  metadata:
+    created_at: 2026-03-24T00:03:54.577Z
+    updated_at: 2026-03-24T00:03:54.577Z
+    version: 1
+application.applicationservice.log-collector-service:
+  id: b6f0db15-fca5-4b8a-b8f3-f577989ffb86
+  path: application.applicationservice.log-collector-service
+  spec_node_id: application.applicationservice
+  type: applicationservice
+  layer_id: application
+  name: Log Collector Service
+  description: Consumes events from Redis streams and publishes to Elasticsearch
+    for long-term storage and pattern analysis, using batch processing
+  attributes:
+    serviceType: batch
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/log_collector.py
+        symbol: LogCollector
+  metadata:
+    created_at: 2026-03-24T00:04:01.973Z
+    updated_at: 2026-03-24T00:04:01.973Z
+    version: 1
+application.applicationservice.scheduled-tasks-service:
+  id: 8a5252f3-d0c0-48d2-9cc0-3a4dc4e8f68c
+  path: application.applicationservice.scheduled-tasks-service
+  spec_node_id: application.applicationservice
+  type: applicationservice
+  layer_id: application
+  name: Scheduled Tasks Service
+  description: "APScheduler-based service managing periodic maintenance tasks:
+    daily orphaned branch cleanup at 2 AM and stale branch warnings at 9 AM"
+  attributes:
+    serviceType: batch
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/scheduled_tasks.py
+        symbol: ScheduledTasksService
+  metadata:
+    created_at: 2026-03-24T00:04:02.419Z
+    updated_at: 2026-03-24T00:04:02.419Z
+    version: 1
+application.applicationservice.worker-pool-manager:
+  id: 9ae03ab1-edac-4190-ac2d-5a5cd9198db8
+  path: application.applicationservice.worker-pool-manager
+  spec_node_id: application.applicationservice
+  type: applicationservice
+  layer_id: application
+  name: Worker Pool Manager
+  description: Manages a pool of worker threads for parallel task processing
+    across projects; each worker independently dequeues and executes tasks in
+    priority order
+  attributes:
+    serviceType: asynchronous
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/worker_pool.py
+        symbol: WorkerPoolManager
+  metadata:
+    created_at: 2026-03-24T00:04:02.855Z
+    updated_at: 2026-03-24T00:04:02.855Z
+    version: 1
+application.applicationservice.pipeline-run-manager:
+  id: a6771963-3b39-4f92-beca-b0c5d79683b1
+  path: application.applicationservice.pipeline-run-manager
+  spec_node_id: application.applicationservice
+  type: applicationservice
+  layer_id: application
+  name: Pipeline Run Manager
+  description: Tracks the lifecycle of an issue through the workflow pipeline,
+    storing pipeline run state in Elasticsearch with 7-day retention via ILM
+    policy
+  attributes:
+    serviceType: synchronous
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/pipeline_run.py
+        symbol: PipelineRunManager
+  metadata:
+    created_at: 2026-03-24T00:04:11.328Z
+    updated_at: 2026-03-24T00:04:11.328Z
+    version: 1
+application.applicationservice.pipeline-watchdog:
+  id: d4dbdea5-6866-4b89-bdf9-47732cbd3e2d
+  path: application.applicationservice.pipeline-watchdog
+  spec_node_id: application.applicationservice
+  type: applicationservice
+  layer_id: application
+  name: Pipeline Watchdog
+  description: Detects and cleans up zombie pipeline runs that are stuck in active
+    state with no corresponding agent container; runs periodically to prevent
+    queue deadlock
+  attributes:
+    serviceType: batch
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/pipeline_watchdog.py
+        symbol: PipelineWatchdog
+  metadata:
+    created_at: 2026-03-24T00:04:11.784Z
+    updated_at: 2026-03-24T00:04:11.784Z
+    version: 1
+application.applicationservice.git-hub-integration-service:
+  id: 58ea3388-942f-4928-af00-b70212adf6f1
+  path: application.applicationservice.git-hub-integration-service
+  spec_node_id: application.applicationservice
+  type: applicationservice
+  layer_id: application
+  name: GitHub Integration Service
+  description: "Handles GitHub API interactions for agent collaboration: posting
+    comments, creating issues, managing PR state, and fetching review threads"
+  attributes:
+    serviceType: synchronous
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/github_integration.py
+        symbol: GitHubIntegration
+  metadata:
+    created_at: 2026-03-24T00:04:12.240Z
+    updated_at: 2026-03-24T00:04:12.240Z
+    version: 1
+application.applicationservice.git-hub-discussions-service:
+  id: 80d9ddbd-892b-4b08-8e4e-4ebe964dd60c
+  path: application.applicationservice.git-hub-discussions-service
+  spec_node_id: application.applicationservice
+  type: applicationservice
+  layer_id: application
+  name: GitHub Discussions Service
+  description: Provides high-level interface for GitHub Discussions via GraphQL,
+    supporting the planning pipeline conversational workspace for idea research
+    and requirements
+  attributes:
+    serviceType: synchronous
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/github_discussions.py
+        symbol: GitHubDiscussions
+  metadata:
+    created_at: 2026-03-24T00:04:20.124Z
+    updated_at: 2026-03-24T00:04:20.124Z
+    version: 1
+application.applicationservice.git-hub-api-client:
+  id: c6224dd8-5f02-4c84-958c-06a2f850a5f5
+  path: application.applicationservice.git-hub-api-client
+  spec_node_id: application.applicationservice
+  type: applicationservice
+  layer_id: application
+  name: GitHub API Client
+  description: Centralized GitHub API client with rate limiting, usage tracking,
+    circuit breaker integration, exponential backoff, and request throttling for
+    all GitHub interactions
+  attributes:
+    serviceType: synchronous
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/github_api_client.py
+        symbol: GitHubAPIClient
+  metadata:
+    created_at: 2026-03-24T00:04:20.617Z
+    updated_at: 2026-03-24T00:04:20.617Z
+    version: 1
+application.applicationservice.agent-container-recovery:
+  id: d13f8d05-ce8d-4f38-9c33-52c5005cc289
+  path: application.applicationservice.agent-container-recovery
+  spec_node_id: application.applicationservice
+  type: applicationservice
+  layer_id: application
+  name: Agent Container Recovery
+  description: Recovers or cleans up running agent containers on orchestrator
+    restart, ensuring work is not duplicated and containers from prior runs are
+    properly handled
+  attributes:
+    serviceType: synchronous
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/agent_container_recovery.py
+        symbol: AgentContainerRecovery
+  metadata:
+    created_at: 2026-03-24T00:04:21.085Z
+    updated_at: 2026-03-24T00:04:21.085Z
+    version: 1
+application.applicationservice.project-workspace-manager:
+  id: d34f98ba-6389-4efe-b1e7-6d23cc9444e0
+  path: application.applicationservice.project-workspace-manager
+  spec_node_id: application.applicationservice
+  type: applicationservice
+  layer_id: application
+  name: Project Workspace Manager
+  description: Initializes and manages project workspace directories on startup,
+    cloning repos into isolated orchestrator workspace for agent use
+  attributes:
+    serviceType: synchronous
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/project_workspace.py
+        symbol: workspace_manager
+  metadata:
+    created_at: 2026-03-24T00:04:29.023Z
+    updated_at: 2026-03-24T00:04:29.023Z
+    version: 1
+application.applicationservice.dev-container-state-manager:
+  id: c9d0e173-0cf1-4c14-815b-ec2f71e8ec60
+  path: application.applicationservice.dev-container-state-manager
+  spec_node_id: application.applicationservice
+  type: applicationservice
+  layer_id: application
+  name: Dev Container State Manager
+  description: Tracks Docker image verification state for projects, checking
+    whether project agent images exist and are ready for use
+  attributes:
+    serviceType: synchronous
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/dev_container_state.py
+        symbol: DevContainerStateManager
+  metadata:
+    created_at: 2026-03-24T00:04:29.497Z
+    updated_at: 2026-03-24T00:04:29.497Z
+    version: 1
+application.applicationservice.health-monitor:
+  id: a9d39c59-c89d-4188-b21e-c7345e00b40b
+  path: application.applicationservice.health-monitor
+  spec_node_id: application.applicationservice
+  type: applicationservice
+  layer_id: application
+  name: Health Monitor
+  description: Monitors system health by running checks for GitHub, Claude, disk
+    space, and memory; triggers recovery and logs results with circuit-breaker
+    protection
+  attributes:
+    serviceType: synchronous
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: monitoring/health_monitor.py
+        symbol: HealthMonitor
+  metadata:
+    created_at: 2026-03-24T00:04:29.953Z
+    updated_at: 2026-03-24T00:04:29.953Z
+    version: 1

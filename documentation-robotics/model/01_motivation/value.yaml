@@ -1,0 +1,59 @@
+motivation.value.developer-productivity:
+  id: 4fc61c1e-b231-4c4a-9f03-49701553a757
+  path: motivation.value.developer-productivity
+  spec_node_id: motivation.value
+  type: value
+  layer_id: motivation
+  name: Developer Productivity
+  description: Reduction in manual effort for repetitive SDLC tasks through AI automation
+  attributes:
+    valueType: operational
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: config/foundations/pipelines.yaml
+        symbol: planning_design
+  metadata:
+    created_at: 2026-03-24T00:31:05.193Z
+    updated_at: 2026-03-24T00:31:05.193Z
+    version: 1
+motivation.value.software-delivery-velocity:
+  id: ac53e06e-c0a1-41cd-a66a-25ef81a4163a
+  path: motivation.value.software-delivery-velocity
+  spec_node_id: motivation.value
+  type: value
+  layer_id: motivation
+  name: Software Delivery Velocity
+  description: Faster time-to-production by parallelizing agent work and
+    eliminating human wait times
+  attributes:
+    valueType: strategic
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: config/foundations/pipelines.yaml
+        symbol: sdlc_execution
+  metadata:
+    created_at: 2026-03-24T00:31:05.756Z
+    updated_at: 2026-03-24T00:31:05.756Z
+    version: 1
+motivation.value.consistent-code-quality:
+  id: c32f1f3b-9b8d-4d22-95c9-1517aac4be4f
+  path: motivation.value.consistent-code-quality
+  spec_node_id: motivation.value
+  type: value
+  layer_id: motivation
+  name: Consistent Code Quality
+  description: Uniform application of code review standards through automated
+    checker agents on every PR
+  attributes:
+    valueType: operational
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: config/foundations/pipelines.yaml
+        symbol: sdlc_execution.stages.implementation
+  metadata:
+    created_at: 2026-03-24T00:31:06.320Z
+    updated_at: 2026-03-24T00:31:06.320Z
+    version: 1

@@ -1,0 +1,42 @@
+testing.coveragerequirement.pipeline-stage-path-coverage:
+  id: b0f22642-c1e0-4221-b252-71cc1af6a4dd
+  path: testing.coveragerequirement.pipeline-stage-path-coverage
+  spec_node_id: testing.coveragerequirement
+  type: coveragerequirement
+  layer_id: testing
+  name: Pipeline Stage Path Coverage
+  description: Each pipeline stage must have tests covering happy path,
+    failure/retry, and circuit breaker interaction paths
+  attributes:
+    coverageCriteria: path-coverage
+    priority: high
+    description: Stage execute() happy path, failure, and circuit breaker open paths
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: tests/unit/pipeline/
+  metadata:
+    created_at: 2026-03-24T00:21:25.106Z
+    updated_at: 2026-03-24T00:21:25.106Z
+    version: 1
+testing.coveragerequirement.review-cycle-partition-coverage:
+  id: 5dac9734-b8fb-49b6-98a8-4415350879a3
+  path: testing.coveragerequirement.review-cycle-partition-coverage
+  spec_node_id: testing.coveragerequirement
+  type: coveragerequirement
+  layer_id: testing
+  name: Review Cycle Partition Coverage
+  description: "Review cycle tests must cover all partition values: APPROVED,
+    NEEDS_REVISION, BLOCKED outcomes and iteration boundary (max_iterations)"
+  attributes:
+    coverageCriteria: all-partitions
+    priority: high
+    description: All ReviewStatus enum values and iteration boundary conditions
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: tests/unit/test_review_cycle_state_transitions.py
+  metadata:
+    created_at: 2026-03-24T00:21:25.625Z
+    updated_at: 2026-03-24T00:21:25.625Z
+    version: 1

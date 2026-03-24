@@ -1,0 +1,138 @@
+api.tag.health:
+  id: 76fd1b82-8625-44a8-8afd-6f7bdb25a05f
+  path: api.tag.health
+  spec_node_id: api.tag
+  type: tag
+  layer_id: api
+  name: Health
+  description: System health monitoring endpoints
+  attributes:
+    description: System health checks and status
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/observability_server.py
+  metadata:
+    created_at: 2026-03-24T00:10:15.903Z
+    updated_at: 2026-03-24T00:10:15.903Z
+    version: 1
+api.tag.agents:
+  id: 211b06e0-3569-4810-825c-db0b61626836
+  path: api.tag.agents
+  spec_node_id: api.tag
+  type: tag
+  layer_id: api
+  name: Agents
+  description: Agent execution monitoring and control endpoints
+  attributes:
+    description: Active agent monitoring and kill operations
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/observability_server.py
+  metadata:
+    created_at: 2026-03-24T00:10:16.362Z
+    updated_at: 2026-03-24T00:10:16.362Z
+    version: 1
+api.tag.pipeline:
+  id: 2b899084-b685-45e9-8b3c-1ee9318d5a30
+  path: api.tag.pipeline
+  spec_node_id: api.tag
+  type: tag
+  layer_id: api
+  name: Pipeline
+  description: Pipeline run and state monitoring endpoints
+  attributes:
+    description: Pipeline execution monitoring
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/observability_server.py
+  metadata:
+    created_at: 2026-03-24T00:10:21.674Z
+    updated_at: 2026-03-24T00:10:21.674Z
+    version: 1
+api.tag.projects:
+  id: 68b47019-3c41-439a-a36b-d557f75e008b
+  path: api.tag.projects
+  spec_node_id: api.tag
+  type: tag
+  layer_id: api
+  name: Projects
+  description: Project configuration and status endpoints
+  attributes:
+    description: Project management and status
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/observability_server.py
+  metadata:
+    created_at: 2026-03-24T00:10:22.131Z
+    updated_at: 2026-03-24T00:10:22.131Z
+    version: 1
+api.tag.metrics:
+  id: 19af717d-4eb2-4344-8b17-a70245cd0596
+  path: api.tag.metrics
+  spec_node_id: api.tag
+  type: tag
+  layer_id: api
+  name: Metrics
+  description: Agent execution history and metrics endpoints
+  attributes:
+    description: Agent execution history and performance metrics
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/observability_server.py
+  metadata:
+    created_at: 2026-03-24T00:10:22.597Z
+    updated_at: 2026-03-24T00:10:22.597Z
+    version: 1
+api.tag.board-management:
+  id: b1db695e-9187-464c-a25d-aad03195683b
+  path: api.tag.board-management
+  spec_node_id: api.tag
+  type: tag
+  layer_id: api
+  name: Board Management
+  description: GitHub Projects v2 board and column management operations
+  metadata:
+    created_at: 2026-03-24T10:29:02.430Z
+    updated_at: 2026-03-24T10:29:02.430Z
+    version: 1
+api.tag.issue-tracking:
+  id: 24e00367-beb6-4340-b769-3dbbae2b7d55
+  path: api.tag.issue-tracking
+  spec_node_id: api.tag
+  type: tag
+  layer_id: api
+  name: Issue Tracking
+  description: Issue and project item status/field operations
+  metadata:
+    created_at: 2026-03-24T10:29:02.855Z
+    updated_at: 2026-03-24T10:29:02.855Z
+    version: 1
+api.tag.discussions:
+  id: e73d82ec-309f-4da8-8714-bd07503b6924
+  path: api.tag.discussions
+  spec_node_id: api.tag
+  type: tag
+  layer_id: api
+  name: Discussions
+  description: GitHub Discussions CRUD and comment operations
+  metadata:
+    created_at: 2026-03-24T10:29:03.319Z
+    updated_at: 2026-03-24T10:29:03.319Z
+    version: 1
+api.tag.repository:
+  id: a8fe7fe5-ebdb-4bb6-8f6f-215382362ee1
+  path: api.tag.repository
+  spec_node_id: api.tag
+  type: tag
+  layer_id: api
+  name: Repository
+  description: Repository metadata and label operations
+  metadata:
+    created_at: 2026-03-24T10:29:03.743Z
+    updated_at: 2026-03-24T10:29:03.743Z
+    version: 1

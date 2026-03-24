@@ -1,0 +1,45 @@
+security.auditconfig.git-hub-action-audit-logging:
+  id: ff61253c-80d7-446c-950c-3092a1c567e6
+  path: security.auditconfig.git-hub-action-audit-logging
+  spec_node_id: security.auditconfig
+  type: auditconfig
+  layer_id: security
+  name: GitHub Action Audit Logging
+  description: All GitHub API calls logged with caller identifier, rate limit
+    usage, and response status
+  attributes:
+    level: standard
+    sanitizeFields: authorization
+    enabled: true
+    includeHeaders: false
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/github_api_client.py
+        symbol: GitHubAPIClient
+  metadata:
+    created_at: 2026-03-24T00:26:38.169Z
+    updated_at: 2026-03-24T00:26:38.169Z
+    version: 1
+security.auditconfig.agent-execution-audit-logging:
+  id: 860b0187-ac4a-4266-8cdd-d4f383683620
+  path: security.auditconfig.agent-execution-audit-logging
+  spec_node_id: security.auditconfig
+  type: auditconfig
+  layer_id: security
+  name: Agent Execution Audit Logging
+  description: Agent container start, completion, exit code, and task details
+    logged to structured output
+  attributes:
+    level: standard
+    sanitizeFields: ANTHROPIC_API_KEY,GITHUB_TOKEN
+    enabled: true
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: claude/docker_runner.py
+        symbol: DockerAgentRunner
+  metadata:
+    created_at: 2026-03-24T00:26:38.727Z
+    updated_at: 2026-03-24T00:26:38.727Z
+    version: 1

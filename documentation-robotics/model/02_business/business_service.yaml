@@ -1,0 +1,89 @@
+business.businessservice.sdlc-automation-service:
+  id: 9197ef48-a103-47a5-9779-f2b081c1568a
+  path: business.businessservice.sdlc-automation-service
+  spec_node_id: business.businessservice
+  type: businessservice
+  layer_id: business
+  name: SDLC Automation Service
+  description: End-to-end software development lifecycle automation from issue to staged PR
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: config/foundations/pipelines.yaml
+        symbol: sdlc_execution
+  metadata:
+    created_at: 2026-03-24T00:27:44.503Z
+    updated_at: 2026-03-24T00:27:44.503Z
+    version: 1
+business.businessservice.epic-planning-service:
+  id: 7918584e-cfd7-4378-ad8d-252e70eb8cc7
+  path: business.businessservice.epic-planning-service
+  spec_node_id: business.businessservice
+  type: businessservice
+  layer_id: business
+  name: Epic Planning Service
+  description: AI-driven planning pipeline for research, requirements,
+    architecture, and work breakdown
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: config/foundations/pipelines.yaml
+        symbol: planning_design
+  metadata:
+    created_at: 2026-03-24T00:27:45.024Z
+    updated_at: 2026-03-24T00:27:45.024Z
+    version: 1
+business.businessservice.development-environment-service:
+  id: 5cba1cd9-990b-4841-ab1a-a3d648900355
+  path: business.businessservice.development-environment-service
+  spec_node_id: business.businessservice
+  type: businessservice
+  layer_id: business
+  name: Development Environment Service
+  description: Automated Dockerfile generation and environment verification for
+    project dependencies
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: config/foundations/pipelines.yaml
+        symbol: environment_support
+  metadata:
+    created_at: 2026-03-24T00:27:45.547Z
+    updated_at: 2026-03-24T00:27:45.547Z
+    version: 1
+business.businessservice.code-quality-assurance-service:
+  id: 21ebd11b-0724-4a80-af0e-cfc66a00d7da
+  path: business.businessservice.code-quality-assurance-service
+  spec_node_id: business.businessservice
+  type: businessservice
+  layer_id: business
+  name: Code Quality Assurance Service
+  description: Maker-checker code review loop with iterative revision cycles
+    against requirements
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: config/foundations/pipelines.yaml
+        symbol: sdlc_execution.stages.implementation
+  metadata:
+    created_at: 2026-03-24T00:27:46.086Z
+    updated_at: 2026-03-24T00:27:46.086Z
+    version: 1
+business.businessservice.git-hub-project-board-service:
+  id: 0822d54e-7d2f-413b-8dc1-a9cb07325853
+  path: business.businessservice.git-hub-project-board-service
+  spec_node_id: business.businessservice
+  type: businessservice
+  layer_id: business
+  name: GitHub Project Board Service
+  description: Automated creation and reconciliation of GitHub Projects v2 Kanban
+    boards and columns
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/github_project_manager.py
+        symbol: GitHubProjectManager
+  metadata:
+    created_at: 2026-03-24T00:27:46.614Z
+    updated_at: 2026-03-24T00:27:46.614Z
+    version: 1

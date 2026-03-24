@@ -1,0 +1,68 @@
+api.securityscheme.git-hub-app-jwt:
+  id: eea118ea-6f7b-4861-a636-e7c9d6e6c2d0
+  path: api.securityscheme.git-hub-app-jwt
+  spec_node_id: api.securityscheme
+  type: securityscheme
+  layer_id: api
+  name: GitHub App JWT
+  description: GitHub App JWT-based authentication; generates JWT signed with RSA
+    private key and exchanges for installation token used as bearer token for
+    all GitHub API calls
+  attributes:
+    type: http
+    scheme: bearer
+    bearerFormat: JWT
+    description: GitHub App installation token
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/github_app_auth.py
+        symbol: GitHubAppAuth
+  metadata:
+    created_at: 2026-03-24T00:11:12.871Z
+    updated_at: 2026-03-24T00:11:12.871Z
+    version: 1
+api.securityscheme.git-hub-personal-access-token:
+  id: 6b278505-7bcb-401d-ba01-784206339495
+  path: api.securityscheme.git-hub-personal-access-token
+  spec_node_id: api.securityscheme
+  type: securityscheme
+  layer_id: api
+  name: GitHub Personal Access Token
+  description: Fallback PAT-based authentication for GitHub API when GitHub App is
+    not configured; set via GITHUB_TOKEN environment variable
+  attributes:
+    type: apiKey
+    in: header
+    description: GitHub Personal Access Token
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/github_integration.py
+        symbol: GitHubIntegration
+  metadata:
+    created_at: 2026-03-24T00:11:13.388Z
+    updated_at: 2026-03-24T00:11:13.388Z
+    version: 1
+api.securityscheme.anthropic-oauth-token:
+  id: 936071cd-2e3d-428d-b4e0-4f2875900e95
+  path: api.securityscheme.anthropic-oauth-token
+  spec_node_id: api.securityscheme
+  type: securityscheme
+  layer_id: api
+  name: Anthropic OAuth Token
+  description: Claude Code OAuth token for subscription-based billing of Claude
+    API calls; set via CLAUDE_CODE_OAUTH_TOKEN environment variable
+  attributes:
+    type: http
+    scheme: bearer
+    description: Anthropic Claude Code OAuth token
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: config/environment.py
+        symbol: claude_code_oauth_token
+  metadata:
+    created_at: 2026-03-24T00:11:13.912Z
+    updated_at: 2026-03-24T00:11:13.912Z
+    version: 1

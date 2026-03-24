@@ -1,0 +1,60 @@
+api.response.health-response:
+  id: 6a382046-38cf-4ed9-94d3-717cde6c0966
+  path: api.response.health-response
+  spec_node_id: api.response
+  type: response
+  layer_id: api
+  name: Health Response
+  description: JSON response containing healthy boolean, nested checks object with
+    per-service status, and ISO8601 timestamp
+  attributes:
+    description: System health check response with component statuses
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: monitoring/health_monitor.py
+        symbol: HealthMonitor.check_health
+  metadata:
+    created_at: 2026-03-24T00:11:22.242Z
+    updated_at: 2026-03-24T00:11:22.242Z
+    version: 1
+api.response.active-agents-response:
+  id: 3dcdb1f3-d613-49ab-b214-66c6c4666919
+  path: api.response.active-agents-response
+  spec_node_id: api.response
+  type: response
+  layer_id: api
+  name: Active Agents Response
+  description: JSON array of running agent container objects with container_name,
+    agent, project, issue_number, started_at fields
+  attributes:
+    description: List of currently active agent containers
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/observability_server.py
+        symbol: /agents/active
+  metadata:
+    created_at: 2026-03-24T00:11:22.747Z
+    updated_at: 2026-03-24T00:11:22.747Z
+    version: 1
+api.response.pipeline-run-response:
+  id: a1e6a4d0-7322-44a6-912b-354a0a7fa192
+  path: api.response.pipeline-run-response
+  spec_node_id: api.response
+  type: response
+  layer_id: api
+  name: Pipeline Run Response
+  description: JSON object representing a pipeline run with pipeline_run_id,
+    project, issue_number, status, current_stage, started_at, and events array
+  attributes:
+    description: Pipeline run state and event history
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/pipeline_run.py
+        symbol: PipelineRun
+  metadata:
+    created_at: 2026-03-24T00:11:23.261Z
+    updated_at: 2026-03-24T00:11:23.261Z
+    version: 1

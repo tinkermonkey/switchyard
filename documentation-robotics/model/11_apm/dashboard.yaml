@@ -1,0 +1,42 @@
+apm.dashboard.orchestrator-monitoring-dashboard:
+  id: c1351cdc-2d88-4bc3-9c26-b948ffc34f30
+  path: apm.dashboard.orchestrator-monitoring-dashboard
+  spec_node_id: apm.dashboard
+  type: dashboard
+  layer_id: apm
+  name: Orchestrator Monitoring Dashboard
+  description: "React web UI dashboard (port 3000) providing real-time monitoring:
+    pipeline graph, active agents, live logs, circuit breakers, token usage,
+    project health, and historical metrics"
+  attributes:
+    tool: custom
+    description: Real-time orchestrator monitoring dashboard
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: web_ui/src/routes/index.jsx
+  metadata:
+    created_at: 2026-03-24T00:19:33.647Z
+    updated_at: 2026-03-24T00:19:33.647Z
+    version: 1
+apm.dashboard.kibana-analytics-dashboard:
+  id: 3e67b391-bbaa-493f-ae2e-67129cf72bfb
+  path: apm.dashboard.kibana-analytics-dashboard
+  spec_node_id: apm.dashboard
+  type: dashboard
+  layer_id: apm
+  name: Kibana Analytics Dashboard
+  description: "Kibana dashboard providing Elasticsearch analytics: agent log
+    patterns, pipeline run distributions, failure analysis, and trend
+    visualization"
+  attributes:
+    tool: grafana
+    description: Elasticsearch-backed analytics and pattern detection
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: config/kibana_dashboard.ndjson
+  metadata:
+    created_at: 2026-03-24T00:19:34.143Z
+    updated_at: 2026-03-24T00:19:34.143Z
+    version: 1

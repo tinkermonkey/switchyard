@@ -1,0 +1,176 @@
+version: 0.1.0
+schema: documentation-robotics-v1
+cli_version: 0.1.3
+spec_version: 0.8.3
+created: 2026-03-23T23:56:24.177Z
+updated: 2026-03-24T10:32:30.015Z
+project:
+  name: switchyard
+  description: ""
+  version: 0.1.0
+documentation: .dr/README.md
+layers:
+  motivation:
+    order: 1
+    name: Motivation
+    path: documentation-robotics/model/01_motivation/
+    enabled: true
+    elements:
+      assessment: 2
+      constraint: 4
+      driver: 4
+      goal: 5
+      meaning: 1
+      outcome: 2
+      principle: 5
+      requirement: 5
+      stakeholder: 4
+      value: 3
+  business:
+    order: 2
+    name: Business
+    path: documentation-robotics/model/02_business/
+    enabled: true
+    elements:
+      businessactor: 3
+      businesscollaboration: 1
+      businessevent: 4
+      businessfunction: 4
+      businessinterface: 3
+      businessobject: 4
+      businessprocess: 5
+      businessrole: 3
+      businessservice: 5
+      product: 1
+      representation: 2
+  security:
+    order: 3
+    name: Security
+    path: documentation-robotics/model/03_security/
+    enabled: true
+    elements:
+      actor: 4
+      auditconfig: 2
+      authenticationconfig: 3
+      countermeasure: 5
+      dataclassification: 3
+      permission: 4
+      role: 3
+      secureresource: 4
+      securitymodel: 1
+      securitypolicy: 4
+      threat: 4
+  application:
+    order: 4
+    name: Application
+    path: documentation-robotics/model/04_application/
+    enabled: true
+    elements:
+      applicationcomponent: 14
+      applicationevent: 11
+      applicationfunction: 19
+      applicationinteraction: 3
+      applicationinterface: 3
+      applicationprocess: 50
+      applicationservice: 22
+      dataobject: 9
+  technology:
+    order: 5
+    name: Technology
+    path: documentation-robotics/model/05_technology/
+    enabled: true
+    elements:
+      artifact: 8
+      communicationnetwork: 2
+      node: 6
+      path: 1
+      systemsoftware: 6
+      technologyevent: 2
+      technologyfunction: 1
+      technologyinterface: 4
+      technologyprocess: 2
+      technologyservice: 6
+  api:
+    order: 6
+    name: Api
+    path: documentation-robotics/model/06_api/
+    enabled: true
+    elements:
+      openapidocument: 1
+      operation: 60
+      pathitem: 1
+      ratelimit: 1
+      response: 3
+      securityscheme: 3
+      server: 2
+      tag: 9
+  data-model:
+    order: 7
+    name: Data model
+    path: documentation-robotics/model/07_data-model/
+    enabled: true
+    elements:
+      objectschema: 2
+      schemadefinition: 12
+      schemaproperty: 3
+      stringschema: 2
+  data-store:
+    order: 8
+    name: Data store
+    path: documentation-robotics/model/08_data-store/
+    enabled: true
+    elements:
+      collection: 12
+      database: 3
+      namespace: 2
+      retentionpolicy: 2
+  ux:
+    order: 9
+    name: Ux
+    path: documentation-robotics/model/09_ux/
+    enabled: true
+    elements:
+      experiencestate: 2
+      librarycomponent: 13
+      uxapplication: 1
+      uxspec: 1
+      view: 9
+  navigation:
+    order: 10
+    name: Navigation
+    path: documentation-robotics/model/10_navigation/
+    enabled: true
+    elements:
+      navigationflow: 2
+      navigationgraph: 1
+      route: 9
+  apm:
+    order: 11
+    name: Apm
+    path: documentation-robotics/model/11_apm/
+    enabled: true
+    elements:
+      alert: 4
+      dashboard: 2
+      instrumentationconfig: 1
+      logconfiguration: 1
+      logprocessor: 1
+      metricconfiguration: 1
+      metricinstrument: 3
+      resource: 2
+  testing:
+    order: 12
+    name: Testing
+    path: documentation-robotics/model/12_testing/
+    enabled: true
+    elements:
+      contextvariation: 2
+      coveragegap: 1
+      coveragerequirement: 2
+      testcasesketch: 6
+      testcoveragemodel: 1
+      testcoveragetarget: 6
+changeset_history:
+  - name: github-external-modeling-and-api-coverage
+    committed_at: 2026-03-24T10:32:30.015Z
+    action: committed

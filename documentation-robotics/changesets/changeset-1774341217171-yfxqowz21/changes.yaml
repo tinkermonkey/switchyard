@@ -1,0 +1,840 @@
+- type: add
+  elementId: application.applicationcomponent.docker-claude-wrapper
+  layerName: application
+  after:
+    id: 17c603d5-4fbe-4ae1-9db0-0e1529b617c4
+    path: application.applicationcomponent.docker-claude-wrapper
+    spec_node_id: application.applicationcomponent
+    type: applicationcomponent
+    layer_id: application
+    name: Docker Claude Wrapper
+    description: Container-side Python wrapper script
+      (scripts/docker-claude-wrapper.py) that runs inside agent containers;
+      streams Claude Code JSON events directly to Redis Stream
+      (orchestrator:claude_logs_stream) and pub/sub
+      (orchestrator:claude_stream); persists final agent result to Redis key
+      agent_result:{project}:{issue}:{task_id} with 2-hour TTL; writes fallback
+      result file /tmp/agent_result_{task_id}.json when Redis is unavailable;
+      handles SIGTERM/SIGINT for graceful shutdown during orchestrator restarts
+    attributes:
+      type: internal
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: scripts/docker-claude-wrapper.py
+          symbol: ClaudeWrapper
+    metadata:
+      created_at: 2026-03-24T08:33:45.284Z
+      updated_at: 2026-03-24T08:33:45.284Z
+      version: 1
+  timestamp: 2026-03-24T08:33:45.306Z
+  sequenceNumber: 0
+- type: add
+  elementId: application.applicationcomponent.claude-code-circuit-breaker
+  layerName: application
+  after:
+    id: e2d1d7ac-6688-4b06-802f-af6a02809dfb
+    path: application.applicationcomponent.claude-code-circuit-breaker
+    spec_node_id: application.applicationcomponent
+    type: applicationcomponent
+    layer_id: application
+    name: Claude Code Circuit Breaker
+    description: Token-limit-specific circuit breaker
+      (monitoring/claude_code_breaker.py) with CLOSED/OPEN/HALF_OPEN states that
+      detects Claude Code session limit messages (e.g. 'hit your limit · resets
+      5pm UTC'), trips with a precise reset time, and blocks new agent container
+      launches until the limit resets; distinct from the generic CircuitBreaker
+      and consulted by DockerAgentRunner before every container launch
+    attributes:
+      type: internal
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: monitoring/claude_code_breaker.py
+          symbol: ClaudeCodeBreaker
+    metadata:
+      created_at: 2026-03-24T08:33:51.433Z
+      updated_at: 2026-03-24T08:33:51.433Z
+      version: 1
+  timestamp: 2026-03-24T08:33:51.454Z
+  sequenceNumber: 1
+- type: add
+  elementId: application.applicationfunction.docker-command-builder
+  layerName: application
+  after:
+    id: cc6d8cf3-aa20-4394-9ff8-5d06c6a9f0d9
+    path: application.applicationfunction.docker-command-builder
+    spec_node_id: application.applicationfunction
+    type: applicationfunction
+    layer_id: application
+    name: Docker Command Builder
+    description: "Builds the full 'docker run' command for each agent container
+      (_build_docker_command in docker_runner.py): resolves host workspace path
+      from /proc/self/mountinfo to support Snap Docker, applies volume mounts
+      (/workspace rw/ro per filesystem_write_allowed, ~/.ssh read-only,
+      ~/.gitconfig, wrapper script, optional MCP config, optional
+      review_cycle_context at /review_cycle_context, optional pipeline_context
+      at /pipeline_context), attaches Docker network, sets container labels
+      (org.switchyard.*), and passes environment variables (GITHUB_TOKEN, auth
+      token, REDIS_HOST, AGENT, PROJECT, ISSUE_NUMBER, PIPELINE_RUN_ID)"
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: claude/docker_runner.py
+          symbol: DockerAgentRunner._build_docker_command
+    metadata:
+      created_at: 2026-03-24T08:33:59.433Z
+      updated_at: 2026-03-24T08:33:59.433Z
+      version: 1
+  timestamp: 2026-03-24T08:33:59.454Z
+  sequenceNumber: 2
+- type: add
+  elementId: application.applicationfunction.container-image-selector
+  layerName: application
+  after:
+    id: d8429b16-3469-4868-a92f-34f7ac1ce25b
+    path: application.applicationfunction.container-image-selector
+    spec_node_id: application.applicationfunction
+    type: applicationfunction
+    layer_id: application
+    name: Container Image Selector
+    description: "Determines which Docker image to use for each agent
+      (_get_image_for_agent in docker_runner.py): if agent has
+      requires_dev_container=true AND DevContainerStateManager reports the
+      project image as verified, uses the project-specific image (e.g.
+      myproject-agent:latest); otherwise falls back to
+      switchyard-orchestrator:latest; dev_environment_setup additionally
+      receives a Docker socket mount (/var/run/docker.sock) to enable image
+      building from inside the container"
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: claude/docker_runner.py
+          symbol: DockerAgentRunner._get_image_for_agent
+    metadata:
+      created_at: 2026-03-24T08:34:05.134Z
+      updated_at: 2026-03-24T08:34:05.134Z
+      version: 1
+  timestamp: 2026-03-24T08:34:05.154Z
+  sequenceNumber: 3
+- type: add
+  elementId: application.applicationfunction.host-path-detector
+  layerName: application
+  after:
+    id: 9db48865-4b36-45cd-9f8b-5e7804a58c45
+    path: application.applicationfunction.host-path-detector
+    spec_node_id: application.applicationfunction
+    type: applicationfunction
+    layer_id: application
+    name: Host Path Detector
+    description: "Resolves actual host filesystem paths for Docker-in-Docker volume
+      mounts (_detect_host_workspace_path and _detect_host_home_path in
+      docker_runner.py): reads /proc/self/mountinfo to find the real host path
+      bound to /workspace (avoids Snap Docker snap-versioned path issue);
+      requires HOST_HOME env var to be set explicitly in .env for SSH/git mounts
+      because /proc inference is unreliable under Snap Docker; falls back to
+      HOST_WORKSPACE_PATH env var or /workspace if detection fails"
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: claude/docker_runner.py
+          symbol: DockerAgentRunner._detect_host_workspace_path
+    metadata:
+      created_at: 2026-03-24T08:34:11.658Z
+      updated_at: 2026-03-24T08:34:11.658Z
+      version: 1
+  timestamp: 2026-03-24T08:34:11.680Z
+  sequenceNumber: 4
+- type: add
+  elementId: application.applicationfunction.container-write-verifier
+  layerName: application
+  after:
+    id: 2afa853f-87b6-4435-a4ef-d457f2bc29cd
+    path: application.applicationfunction.container-write-verifier
+    spec_node_id: application.applicationfunction
+    type: applicationfunction
+    layer_id: application
+    name: Container Write Verifier
+    description: Pre-launch safety check (_verify_container_write_access in
+      docker_runner.py) that spawns a lightweight test container using
+      switchyard-orchestrator:latest before launching the expensive Claude
+      agent; tests that the container can write, read, and delete a file in
+      /workspace; retries up to 3 times with 2-second backoff; aborts the agent
+      launch if write access cannot be confirmed, preventing wasted API calls
+      when the volume mount has permission issues
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: claude/docker_runner.py
+          symbol: DockerAgentRunner._verify_container_write_access
+    metadata:
+      created_at: 2026-03-24T08:34:16.442Z
+      updated_at: 2026-03-24T08:34:16.442Z
+      version: 1
+  timestamp: 2026-03-24T08:34:16.464Z
+  sequenceNumber: 5
+- type: add
+  elementId: application.applicationfunction.mcp-config-manager
+  layerName: application
+  after:
+    id: 202fe78c-29aa-41cd-a746-69845d55f8d3
+    path: application.applicationfunction.mcp-config-manager
+    spec_node_id: application.applicationfunction
+    type: applicationfunction
+    layer_id: application
+    name: MCP Config Manager
+    description: "Manages Model Context Protocol server configuration for agent
+      containers (_prepare_mcp_config and _write_mcp_config_file in
+      docker_runner.py): translates per-agent MCP server definitions (http or
+      stdio type) into a .mcp.json file written to /workspace/.orchestrator/tmp
+      (preferred), /app/tmp, or /tmp as fallback; substitutes {work_dir}
+      template in stdio args with /workspace (container path); sanitizes task_id
+      colons and special characters to prevent Docker mount parsing errors;
+      mounts the file read-only at /home/orchestrator/.mcp_config.json inside
+      the agent container; cleans up the temp file after container exit"
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: claude/docker_runner.py
+          symbol: DockerAgentRunner._prepare_mcp_config
+    metadata:
+      created_at: 2026-03-24T08:34:23.751Z
+      updated_at: 2026-03-24T08:34:23.751Z
+      version: 1
+  timestamp: 2026-03-24T08:34:23.774Z
+  sequenceNumber: 6
+- type: add
+  elementId: application.applicationfunction.container-recovery-reconnector
+  layerName: application
+  after:
+    id: 7f1d2d07-a6c3-4703-a424-1bc475b78029
+    path: application.applicationfunction.container-recovery-reconnector
+    spec_node_id: application.applicationfunction
+    type: applicationfunction
+    layer_id: application
+    name: Container Recovery Reconnector
+    description: "Reconnects to and monitors running agent containers after
+      orchestrator restart (reconnect_to_container and
+      _monitor_recovered_container in docker_runner.py): spawns a daemon thread
+      that runs 'docker wait' with the agent's configured hard timeout; on
+      container exit, attempts output retrieval in priority order: 1) Redis key
+      agent_result:{project}:{issue}:{task_id}, 2) fallback file
+      /tmp/agent_result_{task_id}.json via docker cp, 3) docker logs; parses raw
+      stream-json events if the output contains unparsed JSON lines
+      (_parse_stream_json_output); delegates to _complete_agent_execution for
+      GitHub posting and outcome recording"
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: claude/docker_runner.py
+          symbol: DockerAgentRunner.reconnect_to_container
+    metadata:
+      created_at: 2026-03-24T08:34:31.073Z
+      updated_at: 2026-03-24T08:34:31.073Z
+      version: 1
+  timestamp: 2026-03-24T08:34:31.096Z
+  sequenceNumber: 7
+- type: add
+  elementId: application.applicationfunction.container-execution-validator
+  layerName: application
+  after:
+    id: 4d7c836b-2839-4370-a834-5c9f88d630db
+    path: application.applicationfunction.container-execution-validator
+    spec_node_id: application.applicationfunction
+    type: applicationfunction
+    layer_id: application
+    name: Container Execution Validator
+    description: "Validates agent output after container exit with code 0
+      (_validate_result in docker_runner.py): rejects empty output or output
+      shorter than 50 characters as a persistence failure (wrapper could not
+      write to Redis or file, or Claude crashed); scans first 1KB of output for
+      error markers (CRITICAL ERROR, FATAL:, Traceback, redis.exceptions,
+      ConnectionRefusedError) that indicate a failure despite a zero exit code;
+      on validation failure, persists a failure result to Redis and records the
+      outcome before returning empty string to trigger retry"
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: claude/docker_runner.py
+          symbol: DockerAgentRunner._validate_result
+    metadata:
+      created_at: 2026-03-24T08:34:37.664Z
+      updated_at: 2026-03-24T08:34:37.664Z
+      version: 1
+  timestamp: 2026-03-24T08:34:37.687Z
+  sequenceNumber: 8
+- type: add
+  elementId: application.applicationevent.container-launch-started
+  layerName: application
+  after:
+    id: 466beba7-c71c-478e-8bb7-20a8ae190742
+    path: application.applicationevent.container-launch-started
+    spec_node_id: application.applicationevent
+    type: applicationevent
+    layer_id: application
+    name: Container Launch Started
+    description: Observability event emitted by ObservabilityManager immediately
+      before 'docker run -d' is executed for an agent container; tagged with
+      agent, task_id, project, container_name, and image_name for correlation
+      with container execution events
+    attributes:
+      eventType: system
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: claude/docker_runner.py
+          symbol: DockerAgentRunner._execute_in_container
+    metadata:
+      created_at: 2026-03-24T08:34:50.900Z
+      updated_at: 2026-03-24T08:34:50.900Z
+      version: 1
+  timestamp: 2026-03-24T08:34:50.924Z
+  sequenceNumber: 9
+- type: add
+  elementId: application.applicationevent.container-launch-succeeded
+  layerName: application
+  after:
+    id: 601c3363-9bfd-4bbf-9e34-c11673460388
+    path: application.applicationevent.container-launch-succeeded
+    spec_node_id: application.applicationevent
+    type: applicationevent
+    layer_id: application
+    name: Container Launch Succeeded
+    description: Observability event emitted after 'docker run -d' returns exit code
+      0 and a container ID is obtained; the container_id (short 12-char form) is
+      included for correlation with Docker daemon events and Redis tracking
+    attributes:
+      eventType: system
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: claude/docker_runner.py
+          symbol: DockerAgentRunner._execute_in_container
+    metadata:
+      created_at: 2026-03-24T08:34:57.783Z
+      updated_at: 2026-03-24T08:34:57.783Z
+      version: 1
+  timestamp: 2026-03-24T08:34:57.805Z
+  sequenceNumber: 10
+- type: add
+  elementId: application.applicationevent.container-launch-failed
+  layerName: application
+  after:
+    id: 19efca61-5311-43ae-86ab-59eda6a15eae
+    path: application.applicationevent.container-launch-failed
+    spec_node_id: application.applicationevent
+    type: applicationevent
+    layer_id: application
+    name: Container Launch Failed
+    description: Observability event emitted when 'docker run -d' returns a non-zero
+      exit code, preventing agent execution; includes the error message from
+      docker run stderr; triggers no retry by itself — the calling pipeline
+      stage handles retry/failure logic
+    attributes:
+      eventType: system
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: claude/docker_runner.py
+          symbol: DockerAgentRunner._execute_in_container
+    metadata:
+      created_at: 2026-03-24T08:35:02.029Z
+      updated_at: 2026-03-24T08:35:02.029Z
+      version: 1
+  timestamp: 2026-03-24T08:35:02.054Z
+  sequenceNumber: 11
+- type: add
+  elementId: application.applicationevent.container-execution-completed
+  layerName: application
+  after:
+    id: b575eefe-37b5-4295-9d1c-112611fd36db
+    path: application.applicationevent.container-execution-completed
+    spec_node_id: application.applicationevent
+    type: applicationevent
+    layer_id: application
+    name: Container Execution Completed
+    description: Observability event emitted after 'docker wait' returns (container
+      has exited); includes container_name, exit_code, and duration_ms; emitted
+      regardless of whether the exit was successful or failed; paired with
+      Container Execution Failed event for non-zero exit codes
+    attributes:
+      eventType: system
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: claude/docker_runner.py
+          symbol: DockerAgentRunner._execute_in_container
+    metadata:
+      created_at: 2026-03-24T08:35:06.967Z
+      updated_at: 2026-03-24T08:35:06.967Z
+      version: 1
+  timestamp: 2026-03-24T08:35:06.991Z
+  sequenceNumber: 12
+- type: add
+  elementId: application.applicationevent.container-execution-failed
+  layerName: application
+  after:
+    id: b88d984f-bb85-410d-aa40-a37285127025
+    path: application.applicationevent.container-execution-failed
+    spec_node_id: application.applicationevent
+    type: applicationevent
+    layer_id: application
+    name: Container Execution Failed
+    description: Observability event emitted when container exits with a non-zero
+      exit code; exit codes 137 (SIGKILL) and 143 (SIGTERM) are treated as
+      NonRetryableAgentError (deliberate termination); exit code 1 with only
+      debug output in stderr triggers a check for Claude Code rate limit via
+      Elasticsearch query before raising ClaudeCodeRateLimitError and tripping
+      the Claude Code circuit breaker
+    attributes:
+      eventType: system
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: claude/docker_runner.py
+          symbol: DockerAgentRunner._raise_for_failed_exit_code
+    metadata:
+      created_at: 2026-03-24T08:35:12.644Z
+      updated_at: 2026-03-24T08:35:12.644Z
+      version: 1
+  timestamp: 2026-03-24T08:35:12.671Z
+  sequenceNumber: 13
+- type: add
+  elementId: application.dataobject.agent-container-registry-entry
+  layerName: application
+  after:
+    id: c84e6088-75b5-40c6-b95c-2e9d4c0631d0
+    path: application.dataobject.agent-container-registry-entry
+    spec_node_id: application.dataobject
+    type: dataobject
+    layer_id: application
+    name: Agent Container Registry Entry
+    description: "Redis hash (key: agent:container:{container_name}) that tracks
+      each running agent container with 2-hour TTL; fields: container_name,
+      container_id (full Docker ID), agent, project, task_id, started_at (ISO
+      timestamp), issue_number, pipeline_run_id, execution_type; registered
+      after 'docker run -d' succeeds with real container_id; unregistered on
+      container completion; used by the kill-switch API and container recovery
+      service to enumerate active containers across orchestrator restarts"
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: claude/docker_runner.py
+          symbol: DockerAgentRunner._register_active_container
+    metadata:
+      created_at: 2026-03-24T08:35:19.931Z
+      updated_at: 2026-03-24T08:35:19.931Z
+      version: 1
+  timestamp: 2026-03-24T08:35:19.963Z
+  sequenceNumber: 14
+- type: add
+  elementId: application.dataobject.agent-result-record
+  layerName: application
+  after:
+    id: 383498f1-6aab-4fce-9729-a933671c6591
+    path: application.dataobject.agent-result-record
+    spec_node_id: application.dataobject
+    type: dataobject
+    layer_id: application
+    name: Agent Result Record
+    description: "Redis key (agent_result:{project}:{issue_number}:{task_id}) with
+      2-hour TTL that persists agent execution results for crash recovery;
+      fields: container_name, project, issue_number, agent, task_id, exit_code,
+      output (raw stream-json lines or extracted text, capped at 5MB),
+      completed_at (ISO UTC), recovered (boolean flag); written by both
+      DockerClaudeWrapper (inside container via Redis SETEX) and
+      DockerAgentRunner (orchestrator side as a duplicate safety net); read by
+      Container Recovery Reconnector on orchestrator restart; if output is
+      unparsed stream-json, _parse_stream_json_output extracts the text before
+      posting to GitHub"
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: scripts/docker-claude-wrapper.py
+          symbol: ClaudeWrapper._write_final_result_attempt
+    metadata:
+      created_at: 2026-03-24T08:35:28.158Z
+      updated_at: 2026-03-24T08:35:28.158Z
+      version: 1
+  timestamp: 2026-03-24T08:35:28.187Z
+  sequenceNumber: 15
+- type: add
+  elementId: application.dataobject.mcp-server-configuration
+  layerName: application
+  after:
+    id: 13ed7d1a-86d8-4b89-b86b-d95372801871
+    path: application.dataobject.mcp-server-configuration
+    spec_node_id: application.dataobject
+    type: dataobject
+    layer_id: application
+    name: MCP Server Configuration
+    description: "JSON file (.mcp.json) written to
+      /home/orchestrator/.mcp_config.json inside agent containers; structure
+      follows Claude Code MCP config format with top-level 'mcpServers' key;
+      supports two server types: 'http' (URL-based, e.g. context7) and 'stdio'
+      (command + args, e.g. Puppeteer, Serena); {work_dir} template in stdio
+      args is substituted with /workspace (container path); passed to Claude CLI
+      via --mcp-config flag; task-scoped (one file per agent run), written to
+      /workspace/.orchestrator/tmp with orchestrator-side path translated to
+      host path for Docker volume mount"
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: claude/docker_runner.py
+          symbol: DockerAgentRunner._prepare_mcp_config
+    metadata:
+      created_at: 2026-03-24T08:35:36.131Z
+      updated_at: 2026-03-24T08:35:36.131Z
+      version: 1
+  timestamp: 2026-03-24T08:35:36.159Z
+  sequenceNumber: 16
+- type: add
+  elementId: application.dataobject.agent-prompt-file
+  layerName: application
+  after:
+    id: b549c0ca-f57e-4dcd-952f-8ad1c5afeee0
+    path: application.dataobject.agent-prompt-file
+    spec_node_id: application.dataobject
+    type: dataobject
+    layer_id: application
+    name: Agent Prompt File
+    description: Temporary text file (.claude_prompt_{safe_task_id}.txt) written to
+      the project directory before container launch; contains the full assembled
+      prompt for the Claude agent; mounted via the project workspace volume so
+      the container can read it at /workspace/.claude_prompt_{task_id}.txt;
+      cat-piped into the docker-claude-wrapper via 'cat {file} | wrapper -';
+      cleaned up after container exit (both on success and exception); all
+      prompt files matching .claude_prompt_*.txt are cleaned to handle
+      accumulation from multiple runs
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: claude/docker_runner.py
+          symbol: DockerAgentRunner._execute_in_container
+    metadata:
+      created_at: 2026-03-24T08:35:42.572Z
+      updated_at: 2026-03-24T08:35:42.572Z
+      version: 1
+  timestamp: 2026-03-24T08:35:42.601Z
+  sequenceNumber: 17
+- type: add
+  elementId: application.applicationinteraction.detached-container-log-streaming
+  layerName: application
+  after:
+    id: 71dfefde-81f5-4958-842d-4b0bb7178a1c
+    path: application.applicationinteraction.detached-container-log-streaming
+    spec_node_id: application.applicationinteraction
+    type: applicationinteraction
+    layer_id: application
+    name: Detached Container Log Streaming
+    description: Pattern where the orchestrator launches an agent container in
+      detached mode ('docker run -d') and then streams its logs via 'docker logs
+      -f {container_name}'; the container runs independently and survives
+      orchestrator crashes; 'docker wait {container_name}' blocks until
+      container exits using the agent's configured hard timeout (default 3
+      hours); stdout (Claude JSON events) and stderr (debug/error output) are
+      read in parallel daemon threads; allows orchestrator restart without
+      killing running agent containers
+    attributes:
+      pattern: fire-and-forget
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: claude/docker_runner.py
+          symbol: DockerAgentRunner._execute_in_container
+    metadata:
+      created_at: 2026-03-24T08:35:56.448Z
+      updated_at: 2026-03-24T08:35:56.448Z
+      version: 1
+  timestamp: 2026-03-24T08:35:56.476Z
+  sequenceNumber: 18
+- type: add
+  elementId: application.applicationinteraction.container-side-redis-event-streaming
+  layerName: application
+  after:
+    id: 7fdc90bf-0b65-4fd0-9466-ff6204090306
+    path: application.applicationinteraction.container-side-redis-event-streaming
+    spec_node_id: application.applicationinteraction
+    type: applicationinteraction
+    layer_id: application
+    name: Container-Side Redis Event Streaming
+    description: Direct Redis communication from inside agent containers via
+      docker-claude-wrapper.py; each Claude JSON event is written to Redis
+      Stream (orchestrator:claude_logs_stream, maxlen 500) and published to
+      Redis Pub/Sub channel (orchestrator:claude_stream) for real-time WebSocket
+      forwarding; container connects with 1-second write timeout and 2-second
+      connect timeout; if Redis is unavailable, events are discarded and
+      execution continues (fire-and-forget); final result is written to
+      agent_result:{project}:{issue}:{task_id} with SETEX (2-hour TTL) as the
+      durability guarantee
+    attributes:
+      pattern: publish-subscribe
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: scripts/docker-claude-wrapper.py
+          symbol: ClaudeWrapper.write_claude_event
+    metadata:
+      created_at: 2026-03-24T08:36:03.897Z
+      updated_at: 2026-03-24T08:36:03.897Z
+      version: 1
+  timestamp: 2026-03-24T08:36:03.926Z
+  sequenceNumber: 19
+- type: update
+  elementId: application.applicationcomponent.docker-agent-runner
+  layerName: application
+  before:
+    id: a9510f91-bf4c-4e04-9b75-1049a255e609
+    path: application.applicationcomponent.docker-agent-runner
+    spec_node_id: application.applicationcomponent
+    type: applicationcomponent
+    layer_id: application
+    name: Docker Agent Runner
+    description: Runs Claude Code agents in isolated Docker containers with project
+      workspace mounts; handles host path detection, container labeling, Redis
+      tracking, and DinD volume configuration
+    attributes: &a1
+      type: internal
+    source_reference: &a2
+      provenance: extracted
+      locations:
+        - file: claude/docker_runner.py
+          symbol: DockerAgentRunner
+    metadata: &a3
+      created_at: 2026-03-24T00:04:39.661Z
+      updated_at: 2026-03-24T00:04:39.661Z
+      version: 1
+  after:
+    id: a9510f91-bf4c-4e04-9b75-1049a255e609
+    path: application.applicationcomponent.docker-agent-runner
+    spec_node_id: application.applicationcomponent
+    type: applicationcomponent
+    layer_id: application
+    name: Docker Agent Runner
+    description: "Singleton (claude/docker_runner.py::docker_runner) that
+      orchestrates the full Docker-in-Docker agent execution lifecycle:
+      pre-launch write verification, command construction, detached container
+      launch, log streaming, hard-timeout enforcement via 'docker wait', output
+      validation, Redis persistence, GitHub posting, and cleanup; manages a lazy
+      Redis connection for container tracking (agent:container:{name} hashes
+      with 2-hour TTL); on non-zero exit translates exit codes 137/143 to
+      NonRetryableAgentError and detects Claude Code rate limits via
+      Elasticsearch query before tripping the Claude Code circuit breaker"
+    attributes: *a1
+    source_reference: *a2
+    metadata: *a3
+  timestamp: 2026-03-24T08:36:41.521Z
+  sequenceNumber: 20
+- type: relationship-add
+  elementId: application.applicationcomponent.docker-agent-runner::uses::application.applicationcomponent.docker-claude-wrapper
+  layerName: application
+  after:
+    source: application.applicationcomponent.docker-agent-runner
+    target: application.applicationcomponent.docker-claude-wrapper
+    predicate: uses
+    layer: application
+    category: structural
+  timestamp: 2026-03-24T08:36:55.164Z
+  sequenceNumber: 21
+- type: relationship-add
+  elementId: application.applicationcomponent.docker-agent-runner::uses::application.applicationcomponent.claude-code-circuit-breaker
+  layerName: application
+  after:
+    source: application.applicationcomponent.docker-agent-runner
+    target: application.applicationcomponent.claude-code-circuit-breaker
+    predicate: uses
+    layer: application
+    category: structural
+  timestamp: 2026-03-24T08:36:59.572Z
+  sequenceNumber: 22
+- type: relationship-add
+  elementId: application.applicationfunction.docker-command-builder::depends-on::application.applicationfunction.host-path-detector
+  layerName: application
+  after:
+    source: application.applicationfunction.docker-command-builder
+    target: application.applicationfunction.host-path-detector
+    predicate: depends-on
+    layer: application
+    category: structural
+  timestamp: 2026-03-24T08:37:00.105Z
+  sequenceNumber: 23
+- type: relationship-add
+  elementId: application.applicationfunction.docker-command-builder::depends-on::application.applicationfunction.mcp-config-manager
+  layerName: application
+  after:
+    source: application.applicationfunction.docker-command-builder
+    target: application.applicationfunction.mcp-config-manager
+    predicate: depends-on
+    layer: application
+    category: structural
+  timestamp: 2026-03-24T08:37:00.629Z
+  sequenceNumber: 24
+- type: relationship-add
+  elementId: application.applicationfunction.container-recovery-reconnector::accesses::application.dataobject.agent-result-record
+  layerName: application
+  after:
+    source: application.applicationfunction.container-recovery-reconnector
+    target: application.dataobject.agent-result-record
+    predicate: accesses
+    layer: application
+    category: structural
+  timestamp: 2026-03-24T08:37:14.654Z
+  sequenceNumber: 25
+- type: relationship-add
+  elementId: application.applicationcomponent.docker-claude-wrapper::accesses::application.dataobject.agent-result-record
+  layerName: application
+  after:
+    source: application.applicationcomponent.docker-claude-wrapper
+    target: application.dataobject.agent-result-record
+    predicate: accesses
+    layer: application
+    category: structural
+  timestamp: 2026-03-24T08:37:15.192Z
+  sequenceNumber: 26
+- type: relationship-add
+  elementId: application.applicationcomponent.docker-agent-runner::accesses::application.dataobject.agent-container-registry-entry
+  layerName: application
+  after:
+    source: application.applicationcomponent.docker-agent-runner
+    target: application.dataobject.agent-container-registry-entry
+    predicate: accesses
+    layer: application
+    category: structural
+  timestamp: 2026-03-24T08:37:15.748Z
+  sequenceNumber: 27
+- type: relationship-add
+  elementId: application.applicationfunction.container-recovery-reconnector::accesses::application.dataobject.agent-container-registry-entry
+  layerName: application
+  after:
+    source: application.applicationfunction.container-recovery-reconnector
+    target: application.dataobject.agent-container-registry-entry
+    predicate: accesses
+    layer: application
+    category: structural
+  timestamp: 2026-03-24T08:37:16.280Z
+  sequenceNumber: 28
+- type: relationship-add
+  elementId: application.applicationcomponent.docker-agent-runner::accesses::application.dataobject.agent-prompt-file
+  layerName: application
+  after:
+    source: application.applicationcomponent.docker-agent-runner
+    target: application.dataobject.agent-prompt-file
+    predicate: accesses
+    layer: application
+    category: structural
+  timestamp: 2026-03-24T08:37:21.168Z
+  sequenceNumber: 29
+- type: relationship-add
+  elementId: application.applicationcomponent.docker-agent-runner::accesses::application.dataobject.agent-result-record
+  layerName: application
+  after:
+    source: application.applicationcomponent.docker-agent-runner
+    target: application.dataobject.agent-result-record
+    predicate: accesses
+    layer: application
+    category: structural
+  timestamp: 2026-03-24T08:37:21.746Z
+  sequenceNumber: 30
+- type: relationship-add
+  elementId: application.applicationcomponent.docker-agent-runner::accesses::application.dataobject.mcp-server-configuration
+  layerName: application
+  after:
+    source: application.applicationcomponent.docker-agent-runner
+    target: application.dataobject.mcp-server-configuration
+    predicate: accesses
+    layer: application
+    category: structural
+  timestamp: 2026-03-24T08:37:22.340Z
+  sequenceNumber: 31
+- type: relationship-add
+  elementId: application.applicationcomponent.docker-agent-runner::satisfies::motivation.requirement.agent-docker-in-docker-execution
+  layerName: application
+  after:
+    source: application.applicationcomponent.docker-agent-runner
+    target: motivation.requirement.agent-docker-in-docker-execution
+    predicate: satisfies
+    layer: application
+    targetLayer: motivation
+    category: structural
+  timestamp: 2026-03-24T08:37:37.550Z
+  sequenceNumber: 32
+- type: relationship-add
+  elementId: application.applicationcomponent.docker-claude-wrapper::satisfies::motivation.requirement.agent-docker-in-docker-execution
+  layerName: application
+  after:
+    source: application.applicationcomponent.docker-claude-wrapper
+    target: motivation.requirement.agent-docker-in-docker-execution
+    predicate: satisfies
+    layer: application
+    targetLayer: motivation
+    category: structural
+  timestamp: 2026-03-24T08:37:38.106Z
+  sequenceNumber: 33
+- type: relationship-add
+  elementId: technology.systemsoftware.docker-engine::serves::application.applicationcomponent.docker-agent-runner
+  layerName: technology
+  after:
+    source: technology.systemsoftware.docker-engine
+    target: application.applicationcomponent.docker-agent-runner
+    predicate: serves
+    layer: technology
+    targetLayer: application
+    category: structural
+  timestamp: 2026-03-24T08:37:50.330Z
+  sequenceNumber: 34
+- type: relationship-add
+  elementId: technology.node.agent-docker-container::serves::application.applicationcomponent.docker-claude-wrapper
+  layerName: technology
+  after:
+    source: technology.node.agent-docker-container
+    target: application.applicationcomponent.docker-claude-wrapper
+    predicate: serves
+    layer: technology
+    targetLayer: application
+    category: structural
+  timestamp: 2026-03-24T08:37:50.885Z
+  sequenceNumber: 35
+- type: relationship-add
+  elementId: application.applicationservice.agent-container-recovery::depends-on::application.dataobject.agent-container-registry-entry
+  layerName: application
+  after:
+    source: application.applicationservice.agent-container-recovery
+    target: application.dataobject.agent-container-registry-entry
+    predicate: depends-on
+    layer: application
+    category: structural
+  timestamp: 2026-03-24T08:38:17.664Z
+  sequenceNumber: 36
+- type: relationship-add
+  elementId: application.applicationservice.agent-container-recovery::depends-on::application.dataobject.agent-result-record
+  layerName: application
+  after:
+    source: application.applicationservice.agent-container-recovery
+    target: application.dataobject.agent-result-record
+    predicate: depends-on
+    layer: application
+    category: structural
+  timestamp: 2026-03-24T08:38:18.272Z
+  sequenceNumber: 37
+- type: relationship-add
+  elementId: application.applicationcomponent.claude-integration::uses::application.applicationcomponent.docker-agent-runner
+  layerName: application
+  after:
+    source: application.applicationcomponent.claude-integration
+    target: application.applicationcomponent.docker-agent-runner
+    predicate: uses
+    layer: application
+    category: structural
+  timestamp: 2026-03-24T08:38:22.722Z
+  sequenceNumber: 38
+- type: relationship-add
+  elementId: application.applicationcomponent.claude-integration::uses::application.applicationcomponent.claude-code-circuit-breaker
+  layerName: application
+  after:
+    source: application.applicationcomponent.claude-integration
+    target: application.applicationcomponent.claude-code-circuit-breaker
+    predicate: uses
+    layer: application
+    category: structural
+  timestamp: 2026-03-24T08:38:23.273Z
+  sequenceNumber: 39

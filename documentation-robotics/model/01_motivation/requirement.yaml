@@ -1,0 +1,105 @@
+motivation.requirement.git-hub-projects-v2-board-automation:
+  id: 74b7d147-ea1f-482f-8f6c-36c13f828760
+  path: motivation.requirement.git-hub-projects-v2-board-automation
+  spec_node_id: motivation.requirement
+  type: requirement
+  layer_id: motivation
+  name: GitHub Projects v2 Board Automation
+  description: System must automatically create and reconcile GitHub Projects v2
+    boards from YAML configuration
+  attributes:
+    requirementType: functional
+    priority: critical
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/github_project_manager.py
+        symbol: GitHubProjectManager
+  metadata:
+    created_at: 2026-03-24T00:30:36.869Z
+    updated_at: 2026-03-24T00:30:36.869Z
+    version: 1
+motivation.requirement.agent-docker-in-docker-execution:
+  id: 29082f57-95d2-4613-b0c8-b997303f48e4
+  path: motivation.requirement.agent-docker-in-docker-execution
+  spec_node_id: motivation.requirement
+  type: requirement
+  layer_id: motivation
+  name: Agent Docker-in-Docker Execution
+  description: Each agent must execute in an isolated Docker container with
+    project-specific dependencies
+  attributes:
+    requirementType: non-functional
+    priority: critical
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: claude/docker_runner.py
+        symbol: DockerAgentRunner
+  metadata:
+    created_at: 2026-03-24T00:30:37.422Z
+    updated_at: 2026-03-24T00:30:37.422Z
+    version: 1
+motivation.requirement.pipeline-checkpoint-and-recovery:
+  id: cc94a0bd-c533-44f6-8e50-50ee8cd28115
+  path: motivation.requirement.pipeline-checkpoint-and-recovery
+  spec_node_id: motivation.requirement
+  type: requirement
+  layer_id: motivation
+  name: Pipeline Checkpoint and Recovery
+  description: Pipeline must checkpoint after each stage and resume from last
+    successful stage on restart
+  attributes:
+    requirementType: non-functional
+    priority: high
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: state_management/manager.py
+        symbol: StateManager.checkpoint
+  metadata:
+    created_at: 2026-03-24T00:30:37.983Z
+    updated_at: 2026-03-24T00:30:37.983Z
+    version: 1
+motivation.requirement.multi-turn-conversational-agent-interaction:
+  id: 3150314c-4c77-4701-a9f1-f4f67cf8d6f4
+  path: motivation.requirement.multi-turn-conversational-agent-interaction
+  spec_node_id: motivation.requirement
+  type: requirement
+  layer_id: motivation
+  name: Multi-Turn Conversational Agent Interaction
+  description: Agents must support initial, revision, and question execution modes
+    with conversation history
+  attributes:
+    requirementType: functional
+    priority: high
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: claude/session_manager.py
+        symbol: SessionManager
+  metadata:
+    created_at: 2026-03-24T00:30:38.537Z
+    updated_at: 2026-03-24T00:30:38.537Z
+    version: 1
+motivation.requirement.git-hub-rate-limit-compliance:
+  id: 4b66c6a5-54a7-4455-bfd2-872d1c048ea3
+  path: motivation.requirement.git-hub-rate-limit-compliance
+  spec_node_id: motivation.requirement
+  type: requirement
+  layer_id: motivation
+  name: GitHub Rate Limit Compliance
+  description: System must not exceed GitHub API rate limits; back-off, circuit
+    breaker, and monitoring required
+  attributes:
+    requirementType: non-functional
+    priority: high
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/github_api_client.py
+        symbol: GitHubRateLimitStatus
+  metadata:
+    created_at: 2026-03-24T00:30:39.077Z
+    updated_at: 2026-03-24T00:30:39.077Z
+    version: 1

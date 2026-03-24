@@ -1,0 +1,22 @@
+testing.coveragegap.no-git-hub-api-integration-tests-in-ci:
+  id: d7dc6247-5106-48d7-8bfe-2c3fb162fcd7
+  path: testing.coveragegap.no-git-hub-api-integration-tests-in-ci
+  spec_node_id: testing.coveragegap
+  type: coveragegap
+  layer_id: testing
+  name: No GitHub API Integration Tests in CI
+  description: Integration tests for GitHub GraphQL queries and board
+    reconciliation require live GitHub API access; not safe to run in standard
+    CI without dedicated test org
+  attributes:
+    severity: medium
+    affectedRequirements: GitHub project board reconciliation, label management
+    remediationStatus: open
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: tests/integration/test_github_resilience_integration.py
+  metadata:
+    created_at: 2026-03-24T00:21:35.450Z
+    updated_at: 2026-03-24T00:21:35.450Z
+    version: 1

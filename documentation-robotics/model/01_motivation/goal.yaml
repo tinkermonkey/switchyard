@@ -1,0 +1,100 @@
+motivation.goal.fully-autonomous-sdlc-execution:
+  id: 1761551e-d21b-4a59-95e4-deb4b3ec7ede
+  path: motivation.goal.fully-autonomous-sdlc-execution
+  spec_node_id: motivation.goal
+  type: goal
+  layer_id: motivation
+  name: Fully Autonomous SDLC Execution
+  description: Execute complete software development lifecycle from issue to
+    staged PR without human intervention
+  attributes:
+    priority: critical
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: config/foundations/pipelines.yaml
+        symbol: sdlc_execution
+  metadata:
+    created_at: 2026-03-24T00:30:06.054Z
+    updated_at: 2026-03-24T00:30:06.054Z
+    version: 1
+motivation.goal.git-hub-native-developer-experience:
+  id: 95e3dcc7-94ce-4930-a3ca-6430e18b4618
+  path: motivation.goal.git-hub-native-developer-experience
+  spec_node_id: motivation.goal
+  type: goal
+  layer_id: motivation
+  name: GitHub-Native Developer Experience
+  description: Pipeline initiation and monitoring exclusively through GitHub
+    project boards; no separate tooling required
+  attributes:
+    priority: high
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/github_project_manager.py
+        symbol: GitHubProjectManager
+  metadata:
+    created_at: 2026-03-24T00:30:06.609Z
+    updated_at: 2026-03-24T00:30:06.609Z
+    version: 1
+motivation.goal.multi-project-parallel-pipeline-management:
+  id: 096a56e2-7e3a-475d-aee6-e903ef6341ca
+  path: motivation.goal.multi-project-parallel-pipeline-management
+  spec_node_id: motivation.goal
+  type: goal
+  layer_id: motivation
+  name: Multi-Project Parallel Pipeline Management
+  description: Support concurrent pipelines across multiple projects with proper
+    serialization and isolation
+  attributes:
+    priority: high
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/pipeline_lock_manager.py
+        symbol: PipelineLockManager
+  metadata:
+    created_at: 2026-03-24T00:30:07.162Z
+    updated_at: 2026-03-24T00:30:07.162Z
+    version: 1
+motivation.goal.fault-tolerant-pipeline-recovery:
+  id: c6c13691-42f0-4afc-8225-9950670cdcc2
+  path: motivation.goal.fault-tolerant-pipeline-recovery
+  spec_node_id: motivation.goal
+  type: goal
+  layer_id: motivation
+  name: Fault-Tolerant Pipeline Recovery
+  description: Recover from container crashes, API failures, and orchestrator
+    restarts without losing pipeline state
+  attributes:
+    priority: high
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: state_management/manager.py
+        symbol: StateManager.checkpoint
+  metadata:
+    created_at: 2026-03-24T00:30:07.722Z
+    updated_at: 2026-03-24T00:30:07.722Z
+    version: 1
+motivation.goal.transparent-execution-observability:
+  id: 95dc79b0-cd7e-4c5d-90d0-353630b9b8fd
+  path: motivation.goal.transparent-execution-observability
+  spec_node_id: motivation.goal
+  type: goal
+  layer_id: motivation
+  name: Transparent Execution Observability
+  description: Full visibility into agent execution, pipeline state, and system
+    health through web UI and metrics
+  attributes:
+    priority: medium
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/observability_server.py
+        symbol: ObservabilityServer
+  metadata:
+    created_at: 2026-03-24T00:30:08.283Z
+    updated_at: 2026-03-24T00:30:08.283Z
+    version: 1

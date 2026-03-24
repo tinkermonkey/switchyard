@@ -1,0 +1,124 @@
+technology.node.orchestrator-container:
+  id: a778db03-292f-48f8-a64d-3c84eb1b4a23
+  path: technology.node.orchestrator-container
+  spec_node_id: technology.node
+  type: node
+  layer_id: technology
+  name: Orchestrator Container
+  description: Python 3.11-slim Docker container running the main orchestrator
+    process; mounts workspace, SSH keys, git config, GitHub App keys, and Docker
+    socket for DinD
+  attributes:
+    nodeType: container
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: Dockerfile
+        symbol: orchestrator
+  metadata:
+    created_at: 2026-03-24T00:07:01.375Z
+    updated_at: 2026-03-24T00:07:01.375Z
+    version: 1
+technology.node.observability-server-container:
+  id: 9bbd3aa0-3ad8-49d6-bcc4-4d16f861640e
+  path: technology.node.observability-server-container
+  spec_node_id: technology.node
+  type: node
+  layer_id: technology
+  name: Observability Server Container
+  description: Docker container running the Flask/Socket.IO observability server
+    on port 5001; shares workspace and Docker socket mounts with the
+    orchestrator
+  attributes:
+    nodeType: container
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: docker-compose.yml
+        symbol: observability-server
+  metadata:
+    created_at: 2026-03-24T00:07:01.813Z
+    updated_at: 2026-03-24T00:07:01.813Z
+    version: 1
+technology.node.agent-docker-container:
+  id: fc94116b-0a1e-4400-b2d5-fc12507104c2
+  path: technology.node.agent-docker-container
+  spec_node_id: technology.node
+  type: node
+  layer_id: technology
+  name: Agent Docker Container
+  description: Ephemeral Docker container created per agent task execution;
+    labeled with project and issue metadata, mounts project workspace, SSH keys,
+    and git config
+  attributes:
+    nodeType: container
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: claude/docker_runner.py
+        symbol: DockerAgentRunner
+  metadata:
+    created_at: 2026-03-24T00:07:02.241Z
+    updated_at: 2026-03-24T00:07:02.241Z
+    version: 1
+technology.node.web-ui-container:
+  id: c746ade7-9eb2-4697-9732-30e8d2d5b2b8
+  path: technology.node.web-ui-container
+  spec_node_id: technology.node
+  type: node
+  layer_id: technology
+  name: Web UI Container
+  description: Docker container serving the React web UI static assets via Nginx
+    on port 3000; depends on observability server for WebSocket and REST API
+    connectivity
+  attributes:
+    nodeType: container
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: docker-compose.yml
+        symbol: web-ui
+  metadata:
+    created_at: 2026-03-24T00:07:09.364Z
+    updated_at: 2026-03-24T00:07:09.364Z
+    version: 1
+technology.node.log-collector-container:
+  id: 57dab289-5802-434e-8d7a-815976d62daf
+  path: technology.node.log-collector-container
+  spec_node_id: technology.node
+  type: node
+  layer_id: technology
+  name: Log Collector Container
+  description: Docker container running the log collector service that consumes
+    Redis streams and publishes batched events to Elasticsearch
+  attributes:
+    nodeType: container
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: docker-compose.yml
+        symbol: log-collector
+  metadata:
+    created_at: 2026-03-24T00:07:09.809Z
+    updated_at: 2026-03-24T00:07:09.809Z
+    version: 1
+technology.node.repair-cycle-container:
+  id: 8c34de7f-87c6-414f-a6aa-3799a88d7a20
+  path: technology.node.repair-cycle-container
+  spec_node_id: technology.node
+  type: node
+  layer_id: technology
+  name: Repair Cycle Container
+  description: Ephemeral Docker container running isolated test-fix-validate
+    repair cycles; survives orchestrator restarts by persisting results to Redis
+  attributes:
+    nodeType: container
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: pipeline/repair_cycle_runner.py
+        symbol: RepairCycleRunner
+  metadata:
+    created_at: 2026-03-24T00:07:10.281Z
+    updated_at: 2026-03-24T00:07:10.281Z
+    version: 1

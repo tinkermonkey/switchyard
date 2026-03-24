@@ -1,0 +1,80 @@
+business.businessevent.git-hub-issue-moved-to-pipeline-column:
+  id: 922bab53-5d4d-4e8f-8c7f-17fc3bf831f6
+  path: business.businessevent.git-hub-issue-moved-to-pipeline-column
+  spec_node_id: business.businessevent
+  type: businessevent
+  layer_id: business
+  name: GitHub Issue Moved to Pipeline Column
+  description: Card movement on GitHub Kanban board detected during 30-second
+    polling cycle, triggers pipeline start
+  attributes:
+    type: external
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/project_monitor.py
+        symbol: ProjectMonitor
+  metadata:
+    created_at: 2026-03-24T00:28:20.649Z
+    updated_at: 2026-03-24T00:28:20.649Z
+    version: 1
+business.businessevent.pipeline-stage-completed:
+  id: 43803cbc-1715-4870-ba2d-806fc64995f8
+  path: business.businessevent.pipeline-stage-completed
+  spec_node_id: business.businessevent
+  type: businessevent
+  layer_id: business
+  name: Pipeline Stage Completed
+  description: Agent stage finishes successfully; pipeline progresses to next
+    stage and moves board card
+  attributes:
+    type: internal
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: pipeline/orchestrator.py
+        symbol: SequentialPipeline.execute
+  metadata:
+    created_at: 2026-03-24T00:28:21.185Z
+    updated_at: 2026-03-24T00:28:21.185Z
+    version: 1
+business.businessevent.all-sub-issues-completed:
+  id: 2ed7553f-264c-4fec-bc67-55daf56d3e5f
+  path: business.businessevent.all-sub-issues-completed
+  spec_node_id: business.businessevent
+  type: businessevent
+  layer_id: business
+  name: All Sub-Issues Completed
+  description: All sub-issues of an epic are done; epic card automatically moves
+    to In Review column
+  attributes:
+    type: internal
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: config/foundations/workflows.yaml
+        symbol: all_subtasks_completed
+  metadata:
+    created_at: 2026-03-24T00:28:21.721Z
+    updated_at: 2026-03-24T00:28:21.721Z
+    version: 1
+business.businessevent.orchestrator-startup:
+  id: 361a7dac-49ba-419f-a449-b36e93290283
+  path: business.businessevent.orchestrator-startup
+  spec_node_id: business.businessevent
+  type: businessevent
+  layer_id: business
+  name: Orchestrator Startup
+  description: "Orchestrator container starts: zombie reaper, ES readiness,
+    container recovery, board reconciliation"
+  attributes:
+    type: timer
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: main.py
+        symbol: main
+  metadata:
+    created_at: 2026-03-24T00:28:22.286Z
+    updated_at: 2026-03-24T00:28:22.286Z
+    version: 1

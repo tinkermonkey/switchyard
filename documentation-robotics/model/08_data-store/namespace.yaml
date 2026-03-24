@@ -1,0 +1,36 @@
+data-store.namespace.orchestrator-data:
+  id: 4db70f94-df1c-4892-a5da-8032456389f4
+  path: data-store.namespace.orchestrator-data
+  spec_node_id: data-store.namespace
+  type: namespace
+  layer_id: data-store
+  name: orchestrator_data
+  description: "Root directory namespace for all runtime data: state/checkpoints,
+    handoffs, logs, metrics; mounted in orchestrator container at
+    /app/orchestrator_data"
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: main.py
+        symbol: orchestrator_data
+  metadata:
+    created_at: 2026-03-24T00:14:50.872Z
+    updated_at: 2026-03-24T00:14:50.872Z
+    version: 1
+data-store.namespace.stateprojects:
+  id: f55402a9-dc55-4ddd-9fb6-a01e99462f44
+  path: data-store.namespace.stateprojects
+  spec_node_id: data-store.namespace
+  type: namespace
+  layer_id: data-store
+  name: state/projects
+  description: "Project-scoped namespace for YAML state files:
+    pr_review_state.yaml per project; auto-managed, never edited manually"
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: state_management/pr_review_state_manager.py
+  metadata:
+    created_at: 2026-03-24T00:14:51.223Z
+    updated_at: 2026-03-24T00:14:51.223Z
+    version: 1

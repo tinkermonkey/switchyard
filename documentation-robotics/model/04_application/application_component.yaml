@@ -1,0 +1,303 @@
+application.applicationcomponent.agent-system:
+  id: e9f22ab1-325c-4ea7-a128-b0fa6d0e321e
+  path: application.applicationcomponent.agent-system
+  spec_node_id: application.applicationcomponent
+  type: applicationcomponent
+  layer_id: application
+  name: Agent System
+  description: "Collection of 13 specialized AI agents (registered in
+    AGENT_REGISTRY) covering the full SDLC: environment setup, research,
+    requirements, design, implementation, review, testing, documentation, and PR
+    review"
+  attributes:
+    type: internal
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: agents/__init__.py
+        symbol: AGENT_REGISTRY
+  metadata:
+    created_at: 2026-03-24T00:04:38.706Z
+    updated_at: 2026-03-24T00:04:38.706Z
+    version: 1
+application.applicationcomponent.maker-agent-base:
+  id: bd5e4e18-19a2-4aef-9a90-35ebb1639925
+  path: application.applicationcomponent.maker-agent-base
+  spec_node_id: application.applicationcomponent
+  type: applicationcomponent
+  layer_id: application
+  name: MakerAgent Base
+  description: "Base class for all agents that produce output; supports three
+    execution modes: Initial (first creation), Revision (review feedback), and
+    Question (conversational Q&A)"
+  attributes:
+    type: internal
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: agents/base_maker_agent.py
+        symbol: MakerAgent
+  metadata:
+    created_at: 2026-03-24T00:04:39.179Z
+    updated_at: 2026-03-24T00:04:39.179Z
+    version: 1
+application.applicationcomponent.docker-agent-runner:
+  id: a9510f91-bf4c-4e04-9b75-1049a255e609
+  path: application.applicationcomponent.docker-agent-runner
+  spec_node_id: application.applicationcomponent
+  type: applicationcomponent
+  layer_id: application
+  name: Docker Agent Runner
+  description: Runs Claude Code agents in isolated Docker containers with project
+    workspace mounts; handles host path detection, container labeling, Redis
+    tracking, and DinD volume configuration
+  attributes:
+    type: internal
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: claude/docker_runner.py
+        symbol: DockerAgentRunner
+  metadata:
+    created_at: 2026-03-24T00:04:39.661Z
+    updated_at: 2026-03-24T00:04:39.661Z
+    version: 1
+application.applicationcomponent.claude-integration:
+  id: 8160ba4d-cfa6-4f36-9a4f-a45c077e1e05
+  path: application.applicationcomponent.claude-integration
+  spec_node_id: application.applicationcomponent
+  type: applicationcomponent
+  layer_id: application
+  name: Claude Integration
+  description: Claude Code execution wrapper that constructs prompts, selects
+    Docker vs local execution per agent config, emits observability events, and
+    manages MCP server connections
+  attributes:
+    type: internal
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: claude/claude_integration.py
+        symbol: run_claude_code
+  metadata:
+    created_at: 2026-03-24T00:04:48.851Z
+    updated_at: 2026-03-24T00:04:48.851Z
+    version: 1
+application.applicationcomponent.configuration-manager:
+  id: e5b718c6-6ead-4208-88df-b0f5b3a3cbde
+  path: application.applicationcomponent.configuration-manager
+  spec_node_id: application.applicationcomponent
+  type: applicationcomponent
+  layer_id: application
+  name: Configuration Manager
+  description: Three-layer configuration system managing foundations (agent
+    definitions, pipeline templates, workflow templates), project-specific
+    configs, and runtime GitHub state
+  attributes:
+    type: internal
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: config/manager.py
+        symbol: ConfigManager
+  metadata:
+    created_at: 2026-03-24T00:04:49.355Z
+    updated_at: 2026-03-24T00:04:49.355Z
+    version: 1
+application.applicationcomponent.state-management:
+  id: 5fddef2e-f21a-4059-913d-092e8e01fafe
+  path: application.applicationcomponent.state-management
+  spec_node_id: application.applicationcomponent
+  type: applicationcomponent
+  layer_id: application
+  name: State Management
+  description: Async state management for pipeline checkpointing and recovery,
+    persisting stage context to JSON files with highest-stage-index retrieval
+    for resumption
+  attributes:
+    type: internal
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: state_management/manager.py
+        symbol: StateManager
+  metadata:
+    created_at: 2026-03-24T00:04:49.851Z
+    updated_at: 2026-03-24T00:04:49.851Z
+    version: 1
+application.applicationcomponent.circuit-breaker:
+  id: 371d497a-ac2d-4c84-99b1-ef0442ef31ab
+  path: application.applicationcomponent.circuit-breaker
+  spec_node_id: application.applicationcomponent
+  type: applicationcomponent
+  layer_id: application
+  name: Circuit Breaker
+  description: Circuit breaker pattern implementation with CLOSED/OPEN/HALF_OPEN
+    states; prevents cascading failures for GitHub, agent execution, and other
+    services
+  attributes:
+    type: internal
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/circuit_breaker.py
+        symbol: CircuitBreaker
+  metadata:
+    created_at: 2026-03-24T00:04:57.110Z
+    updated_at: 2026-03-24T00:04:57.110Z
+    version: 1
+application.applicationcomponent.pr-review-stage:
+  id: 89a029e9-99c5-427c-a5cd-531ff237640c
+  path: application.applicationcomponent.pr-review-stage
+  spec_node_id: application.applicationcomponent
+  type: applicationcomponent
+  layer_id: application
+  name: PR Review Stage
+  description: Dedicated pipeline stage for PR code review and requirements
+    verification; orchestrates pr_code_reviewer and requirements_verifier agents
+    against pull requests
+  attributes:
+    type: internal
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: pipeline/pr_review_stage.py
+        symbol: PRReviewStage
+  metadata:
+    created_at: 2026-03-24T00:04:57.606Z
+    updated_at: 2026-03-24T00:04:57.606Z
+    version: 1
+application.applicationcomponent.repair-cycle-runner:
+  id: 394dfcce-f04c-4ba2-a713-8404e203e41b
+  path: application.applicationcomponent.repair-cycle-runner
+  spec_node_id: application.applicationcomponent
+  type: applicationcomponent
+  layer_id: application
+  name: Repair Cycle Runner
+  description: Entry point for running test-fix-validate repair cycles in isolated
+    Docker containers; survives orchestrator restarts via file-based context and
+    Redis result persistence
+  attributes:
+    type: internal
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: pipeline/repair_cycle_runner.py
+        symbol: RepairCycleRunner
+  metadata:
+    created_at: 2026-03-24T00:04:58.083Z
+    updated_at: 2026-03-24T00:04:58.083Z
+    version: 1
+application.applicationcomponent.claude-session-manager:
+  id: 5da2f004-5f76-4b80-9747-5d5b7bb95342
+  path: application.applicationcomponent.claude-session-manager
+  spec_node_id: application.applicationcomponent
+  type: applicationcomponent
+  layer_id: application
+  name: Claude Session Manager
+  description: Manages Claude Code conversation session state for multi-turn agent
+    interactions, supporting threaded conversation context in the feedback loop
+    mode
+  attributes:
+    type: internal
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: claude/session_manager.py
+        symbol: ClaudeSessionManager
+  metadata:
+    created_at: 2026-03-24T00:05:07.171Z
+    updated_at: 2026-03-24T00:05:07.171Z
+    version: 1
+application.applicationcomponent.metrics-collector:
+  id: cffa7840-2521-4ff5-b33c-88c50d66dce1
+  path: application.applicationcomponent.metrics-collector
+  spec_node_id: application.applicationcomponent
+  type: applicationcomponent
+  layer_id: application
+  name: Metrics Collector
+  description: Collects and publishes task execution and quality metrics to
+    Elasticsearch indices with ILM-managed 7-day retention; falls back to JSON
+    file logging
+  attributes:
+    type: internal
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: monitoring/metrics.py
+        symbol: MetricsCollector
+  metadata:
+    created_at: 2026-03-24T00:05:07.660Z
+    updated_at: 2026-03-24T00:05:07.660Z
+    version: 1
+application.applicationcomponent.observability-manager:
+  id: 651cfab0-940c-444c-a77d-3cfcbc1cdf48
+  path: application.applicationcomponent.observability-manager
+  spec_node_id: application.applicationcomponent
+  type: applicationcomponent
+  layer_id: application
+  name: Observability Manager
+  description: Core observability event emitter that streams agent lifecycle,
+    decision, tool call, and pipeline events to Redis pub/sub and Elasticsearch
+    with retry logic
+  attributes:
+    type: internal
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: monitoring/observability.py
+        symbol: ObservabilityManager
+  metadata:
+    created_at: 2026-03-24T00:05:08.133Z
+    updated_at: 2026-03-24T00:05:08.133Z
+    version: 1
+application.applicationcomponent.docker-claude-wrapper:
+  id: 17c603d5-4fbe-4ae1-9db0-0e1529b617c4
+  path: application.applicationcomponent.docker-claude-wrapper
+  spec_node_id: application.applicationcomponent
+  type: applicationcomponent
+  layer_id: application
+  name: Docker Claude Wrapper
+  description: Container-side Python wrapper script
+    (scripts/docker-claude-wrapper.py) that runs inside agent containers;
+    streams Claude Code JSON events directly to Redis Stream
+    (orchestrator:claude_logs_stream) and pub/sub (orchestrator:claude_stream);
+    persists final agent result to Redis key
+    agent_result:{project}:{issue}:{task_id} with 2-hour TTL; writes fallback
+    result file /tmp/agent_result_{task_id}.json when Redis is unavailable;
+    handles SIGTERM/SIGINT for graceful shutdown during orchestrator restarts
+  attributes:
+    type: internal
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: scripts/docker-claude-wrapper.py
+        symbol: ClaudeWrapper
+  metadata:
+    created_at: 2026-03-24T08:33:45.284Z
+    updated_at: 2026-03-24T08:33:45.284Z
+    version: 1
+application.applicationcomponent.claude-code-circuit-breaker:
+  id: e2d1d7ac-6688-4b06-802f-af6a02809dfb
+  path: application.applicationcomponent.claude-code-circuit-breaker
+  spec_node_id: application.applicationcomponent
+  type: applicationcomponent
+  layer_id: application
+  name: Claude Code Circuit Breaker
+  description: Token-limit-specific circuit breaker
+    (monitoring/claude_code_breaker.py) with CLOSED/OPEN/HALF_OPEN states that
+    detects Claude Code session limit messages (e.g. 'hit your limit · resets
+    5pm UTC'), trips with a precise reset time, and blocks new agent container
+    launches until the limit resets; distinct from the generic CircuitBreaker
+    and consulted by DockerAgentRunner before every container launch
+  attributes:
+    type: internal
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: monitoring/claude_code_breaker.py
+        symbol: ClaudeCodeBreaker
+  metadata:
+    created_at: 2026-03-24T08:33:51.433Z
+    updated_at: 2026-03-24T08:33:51.433Z
+    version: 1

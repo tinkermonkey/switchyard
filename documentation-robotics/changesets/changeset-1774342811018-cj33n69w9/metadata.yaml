@@ -1,0 +1,10 @@
+id: changeset-1774342811018-cj33n69w9
+name: behavioral-completeness-gaps
+created: 2026-03-24T09:00:11.029Z
+modified: 2026-03-24T09:03:13.043Z
+status: committed
+baseSnapshot: sha256:3bf64ab0c73b89d88220f38fff04ae8d2cff410fbdd25277c1e7efa56abede93
+stats:
+  additions: 25
+  modifications: 0
+  deletions: 0

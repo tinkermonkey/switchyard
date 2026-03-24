@@ -1,0 +1,234 @@
+application.applicationevent.issue-moved-to-column:
+  id: ee63a87a-37ad-422a-89e1-6c1a2797df78
+  path: application.applicationevent.issue-moved-to-column
+  spec_node_id: application.applicationevent
+  type: applicationevent
+  layer_id: application
+  name: Issue Moved to Column
+  description: Triggered when a GitHub Projects v2 board item moves to a new
+    column; detected by polling in ProjectMonitor and used to enqueue agent
+    tasks
+  attributes:
+    eventType: integration
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/project_monitor.py
+        symbol: ProjectMonitor
+  metadata:
+    created_at: 2026-03-24T00:05:46.671Z
+    updated_at: 2026-03-24T00:05:46.671Z
+    version: 1
+application.applicationevent.agent-task-enqueued:
+  id: e1bc53d7-4e8c-4e44-b8c0-42bdad4afd36
+  path: application.applicationevent.agent-task-enqueued
+  spec_node_id: application.applicationevent
+  type: applicationevent
+  layer_id: application
+  name: Agent Task Enqueued
+  description: System event emitted when a Task is added to the Redis priority
+    queue; triggers worker pool or main loop to dequeue and execute
+  attributes:
+    eventType: system
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: task_queue/task_manager.py
+        symbol: TaskQueue.enqueue
+  metadata:
+    created_at: 2026-03-24T00:05:47.176Z
+    updated_at: 2026-03-24T00:05:47.176Z
+    version: 1
+application.applicationevent.pipeline-stage-completed:
+  id: aa6e2a9a-0422-4896-9dbf-793c3199a002
+  path: application.applicationevent.pipeline-stage-completed
+  spec_node_id: application.applicationevent
+  type: applicationevent
+  layer_id: application
+  name: Pipeline Stage Completed
+  description: Domain event fired when a pipeline stage succeeds, triggering
+    automatic column progression and next-stage agent execution
+  attributes:
+    eventType: domain
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/pipeline_progression.py
+        symbol: PipelineProgression
+  metadata:
+    created_at: 2026-03-24T00:05:47.700Z
+    updated_at: 2026-03-24T00:05:47.700Z
+    version: 1
+application.applicationevent.agent-execution-started:
+  id: 5c8d8b97-23b1-4634-924b-28be97a73ec2
+  path: application.applicationevent.agent-execution-started
+  spec_node_id: application.applicationevent
+  type: applicationevent
+  layer_id: application
+  name: Agent Execution Started
+  description: Observability event emitted when a Claude Code agent container
+    starts executing, tagged with task_id, project, agent name, and
+    pipeline_run_id for traceability
+  attributes:
+    eventType: system
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: monitoring/observability.py
+        symbol: ObservabilityManager
+  metadata:
+    created_at: 2026-03-24T00:05:55.961Z
+    updated_at: 2026-03-24T00:05:55.961Z
+    version: 1
+application.applicationevent.review-cycle-outcome:
+  id: 9299d3e2-b5d6-4104-8f1a-13ae7a8c285d
+  path: application.applicationevent.review-cycle-outcome
+  spec_node_id: application.applicationevent
+  type: applicationevent
+  layer_id: application
+  name: Review Cycle Outcome
+  description: Domain event emitted when a review cycle iteration completes with
+    an APPROVED, NEEDS_REVISION, or BLOCKED status, driving maker-checker loop
+    progression
+  attributes:
+    eventType: domain
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/review_cycle.py
+        symbol: ReviewCycleState
+  metadata:
+    created_at: 2026-03-24T00:05:56.470Z
+    updated_at: 2026-03-24T00:05:56.470Z
+    version: 1
+application.applicationevent.pipeline-lock-acquired:
+  id: 88402cf0-8d21-422b-9dcc-2697da8e6376
+  path: application.applicationevent.pipeline-lock-acquired
+  spec_node_id: application.applicationevent
+  type: applicationevent
+  layer_id: application
+  name: Pipeline Lock Acquired
+  description: System event emitted when an issue acquires the exclusive pipeline
+    lock for its project/board; queues other issues waiting to execute
+  attributes:
+    eventType: system
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/pipeline_lock_manager.py
+        symbol: PipelineLockManager
+  metadata:
+    created_at: 2026-03-24T00:05:57.002Z
+    updated_at: 2026-03-24T00:05:57.002Z
+    version: 1
+application.applicationevent.container-launch-started:
+  id: 466beba7-c71c-478e-8bb7-20a8ae190742
+  path: application.applicationevent.container-launch-started
+  spec_node_id: application.applicationevent
+  type: applicationevent
+  layer_id: application
+  name: Container Launch Started
+  description: Observability event emitted by ObservabilityManager immediately
+    before 'docker run -d' is executed for an agent container; tagged with
+    agent, task_id, project, container_name, and image_name for correlation with
+    container execution events
+  attributes:
+    eventType: system
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: claude/docker_runner.py
+        symbol: DockerAgentRunner._execute_in_container
+  metadata:
+    created_at: 2026-03-24T08:34:50.900Z
+    updated_at: 2026-03-24T08:34:50.900Z
+    version: 1
+application.applicationevent.container-launch-succeeded:
+  id: 601c3363-9bfd-4bbf-9e34-c11673460388
+  path: application.applicationevent.container-launch-succeeded
+  spec_node_id: application.applicationevent
+  type: applicationevent
+  layer_id: application
+  name: Container Launch Succeeded
+  description: Observability event emitted after 'docker run -d' returns exit code
+    0 and a container ID is obtained; the container_id (short 12-char form) is
+    included for correlation with Docker daemon events and Redis tracking
+  attributes:
+    eventType: system
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: claude/docker_runner.py
+        symbol: DockerAgentRunner._execute_in_container
+  metadata:
+    created_at: 2026-03-24T08:34:57.783Z
+    updated_at: 2026-03-24T08:34:57.783Z
+    version: 1
+application.applicationevent.container-launch-failed:
+  id: 19efca61-5311-43ae-86ab-59eda6a15eae
+  path: application.applicationevent.container-launch-failed
+  spec_node_id: application.applicationevent
+  type: applicationevent
+  layer_id: application
+  name: Container Launch Failed
+  description: Observability event emitted when 'docker run -d' returns a non-zero
+    exit code, preventing agent execution; includes the error message from
+    docker run stderr; triggers no retry by itself — the calling pipeline stage
+    handles retry/failure logic
+  attributes:
+    eventType: system
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: claude/docker_runner.py
+        symbol: DockerAgentRunner._execute_in_container
+  metadata:
+    created_at: 2026-03-24T08:35:02.029Z
+    updated_at: 2026-03-24T08:35:02.029Z
+    version: 1
+application.applicationevent.container-execution-completed:
+  id: b575eefe-37b5-4295-9d1c-112611fd36db
+  path: application.applicationevent.container-execution-completed
+  spec_node_id: application.applicationevent
+  type: applicationevent
+  layer_id: application
+  name: Container Execution Completed
+  description: Observability event emitted after 'docker wait' returns (container
+    has exited); includes container_name, exit_code, and duration_ms; emitted
+    regardless of whether the exit was successful or failed; paired with
+    Container Execution Failed event for non-zero exit codes
+  attributes:
+    eventType: system
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: claude/docker_runner.py
+        symbol: DockerAgentRunner._execute_in_container
+  metadata:
+    created_at: 2026-03-24T08:35:06.967Z
+    updated_at: 2026-03-24T08:35:06.967Z
+    version: 1
+application.applicationevent.container-execution-failed:
+  id: b88d984f-bb85-410d-aa40-a37285127025
+  path: application.applicationevent.container-execution-failed
+  spec_node_id: application.applicationevent
+  type: applicationevent
+  layer_id: application
+  name: Container Execution Failed
+  description: Observability event emitted when container exits with a non-zero
+    exit code; exit codes 137 (SIGKILL) and 143 (SIGTERM) are treated as
+    NonRetryableAgentError (deliberate termination); exit code 1 with only debug
+    output in stderr triggers a check for Claude Code rate limit via
+    Elasticsearch query before raising ClaudeCodeRateLimitError and tripping the
+    Claude Code circuit breaker
+  attributes:
+    eventType: system
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: claude/docker_runner.py
+        symbol: DockerAgentRunner._raise_for_failed_exit_code
+  metadata:
+    created_at: 2026-03-24T08:35:12.644Z
+    updated_at: 2026-03-24T08:35:12.644Z
+    version: 1

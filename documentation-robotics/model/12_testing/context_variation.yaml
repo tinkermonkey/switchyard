@@ -1,0 +1,43 @@
+testing.contextvariation.redis-connectivity-variation:
+  id: 6a57d828-ecd6-4e9b-abdc-0107b1843f03
+  path: testing.contextvariation.redis-connectivity-variation
+  spec_node_id: testing.contextvariation
+  type: contextvariation
+  layer_id: testing
+  name: Redis Connectivity Variation
+  description: Tests must cover both Redis-connected and in-memory fallback modes
+    for TaskQueue; Redis unavailability should degrade gracefully to in-memory
+    PriorityQueues
+  attributes:
+    contextType: functional
+    description: Redis connected vs unavailable (falls back to in-memory queue)
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: task_queue/task_manager.py
+        symbol: TaskQueue
+  metadata:
+    created_at: 2026-03-24T00:21:42.687Z
+    updated_at: 2026-03-24T00:21:42.687Z
+    version: 1
+testing.contextvariation.docker-in-docker-variation:
+  id: c9a3d0bf-24aa-4923-97fb-8a7b4ba6fd56
+  path: testing.contextvariation.docker-in-docker-variation
+  spec_node_id: testing.contextvariation
+  type: contextvariation
+  layer_id: testing
+  name: Docker-in-Docker Variation
+  description: Agent execution tests must cover both Docker-available and
+    Docker-unavailable contexts; requires mock of DockerAgentRunner in unit
+    tests
+  attributes:
+    contextType: functional
+    description: Docker socket available vs absent
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: tests/unit/test_docker_runner_validation.py
+  metadata:
+    created_at: 2026-03-24T00:21:43.208Z
+    updated_at: 2026-03-24T00:21:43.208Z
+    version: 1

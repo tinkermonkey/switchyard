@@ -1,0 +1,42 @@
+technology.technologyevent.elasticsearch-ilm-rollover:
+  id: 561ed3b5-e0fc-4a10-ac39-25bdc13f4317
+  path: technology.technologyevent.elasticsearch-ilm-rollover
+  spec_node_id: technology.technologyevent
+  type: technologyevent
+  layer_id: technology
+  name: Elasticsearch ILM Rollover
+  description: Index Lifecycle Management scheduled event that automatically rolls
+    over and deletes indices after 7 days; applied to pipeline-runs,
+    agent-events, decision-events, and metrics indices
+  attributes:
+    eventType: scheduled
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: monitoring/observability.py
+        symbol: DECISION_EVENTS_ILM_POLICY
+  metadata:
+    created_at: 2026-03-24T00:09:27.987Z
+    updated_at: 2026-03-24T00:09:27.987Z
+    version: 1
+technology.technologyevent.circuit-breaker-state-transition:
+  id: 00f063e6-0b03-4619-adeb-31474a720cb2
+  path: technology.technologyevent.circuit-breaker-state-transition
+  spec_node_id: technology.technologyevent
+  type: technologyevent
+  layer_id: technology
+  name: Circuit Breaker State Transition
+  description: Infrastructure event triggered when a circuit breaker transitions
+    between CLOSED, OPEN, and HALF_OPEN states based on failure thresholds and
+    recovery timeouts
+  attributes:
+    eventType: threshold-breach
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/circuit_breaker.py
+        symbol: CircuitBreaker
+  metadata:
+    created_at: 2026-03-24T00:09:28.510Z
+    updated_at: 2026-03-24T00:09:28.510Z
+    version: 1

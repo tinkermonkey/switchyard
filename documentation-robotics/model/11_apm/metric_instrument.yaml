@@ -1,0 +1,67 @@
+apm.metricinstrument.task-execution-duration:
+  id: e97dd04e-ac9d-4217-93bc-7be27bcca8e3
+  path: apm.metricinstrument.task-execution-duration
+  spec_node_id: apm.metricinstrument
+  type: metricinstrument
+  layer_id: apm
+  name: Task Execution Duration
+  description: Histogram metric measuring time in seconds from task dequeue to
+    completion; recorded per agent with success flag in Elasticsearch task
+    metrics index
+  attributes:
+    type: Histogram
+    unit: seconds
+    description: Task execution duration by agent
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: monitoring/metrics.py
+        symbol: MetricsCollector.record_task_complete
+  metadata:
+    created_at: 2026-03-24T00:19:18.115Z
+    updated_at: 2026-03-24T00:19:18.115Z
+    version: 1
+apm.metricinstrument.task-success-counter:
+  id: 0ab5cc8e-504d-402d-ad86-d5c67c8739af
+  path: apm.metricinstrument.task-success-counter
+  spec_node_id: apm.metricinstrument
+  type: metricinstrument
+  layer_id: apm
+  name: Task Success Counter
+  description: Counter tracking task success/failure per agent; used to compute
+    rolling success rates and trigger circuit breaker thresholds
+  attributes:
+    type: Counter
+    unit: "1"
+    description: Task success/failure count by agent
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: monitoring/metrics.py
+        symbol: MetricsCollector.record_task_complete
+  metadata:
+    created_at: 2026-03-24T00:19:18.603Z
+    updated_at: 2026-03-24T00:19:18.603Z
+    version: 1
+apm.metricinstrument.quality-metric-score:
+  id: 2835819d-3167-4bd8-bd8d-34461d5746a7
+  path: apm.metricinstrument.quality-metric-score
+  spec_node_id: apm.metricinstrument
+  type: metricinstrument
+  layer_id: apm
+  name: Quality Metric Score
+  description: Gauge metric recording quality scores (0.0-1.0) per metric_name per
+    agent; stored in Elasticsearch quality-metrics index
+  attributes:
+    type: Gauge
+    unit: "1"
+    description: Quality score by agent and metric_name
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: monitoring/metrics.py
+        symbol: MetricsCollector.record_quality_metric
+  metadata:
+    created_at: 2026-03-24T00:19:19.125Z
+    updated_at: 2026-03-24T00:19:19.125Z
+    version: 1

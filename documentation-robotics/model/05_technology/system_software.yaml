@@ -1,0 +1,123 @@
+technology.systemsoftware.python-311-runtime:
+  id: 63a47df5-3aca-475b-8d2a-485dbf3f5e37
+  path: technology.systemsoftware.python-311-runtime
+  spec_node_id: technology.systemsoftware
+  type: systemsoftware
+  layer_id: technology
+  name: Python 3.11 Runtime
+  description: Primary runtime for the orchestrator; uses asyncio/await for async
+    pipeline execution and threading for background services
+  attributes:
+    softwareType: middleware
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: Dockerfile
+        symbol: python:3.11-slim
+  metadata:
+    created_at: 2026-03-24T00:07:24.367Z
+    updated_at: 2026-03-24T00:07:24.367Z
+    version: 1
+technology.systemsoftware.redis-7:
+  id: 6d4b01d3-96d0-4690-87a7-919d3c48d3b2
+  path: technology.systemsoftware.redis-7
+  spec_node_id: technology.systemsoftware
+  type: systemsoftware
+  layer_id: technology
+  name: Redis 7
+  description: Redis 7 Alpine backing store for task priority queues
+    (tasks:high/medium/low), pipeline locks, agent container tracking, pipeline
+    run results, and pub/sub event streaming
+  attributes:
+    softwareType: cache
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: docker-compose.yml
+        symbol: redis
+  metadata:
+    created_at: 2026-03-24T00:07:24.835Z
+    updated_at: 2026-03-24T00:07:24.835Z
+    version: 1
+technology.systemsoftware.elasticsearch-90:
+  id: da59a61f-eb7f-4f36-883f-b6408f9ee2d0
+  path: technology.systemsoftware.elasticsearch-90
+  spec_node_id: technology.systemsoftware
+  type: systemsoftware
+  layer_id: technology
+  name: Elasticsearch 9.0
+  description: Single-node Elasticsearch cluster (xpack.security disabled) storing
+    agent logs, pipeline runs, observability events, metrics, and decision
+    events with ILM 7-day retention
+  attributes:
+    softwareType: dbms
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: docker-compose.yml
+        symbol: elasticsearch
+  metadata:
+    created_at: 2026-03-24T00:07:25.292Z
+    updated_at: 2026-03-24T00:07:25.292Z
+    version: 1
+technology.systemsoftware.docker-engine:
+  id: 441a2462-cc71-402d-b8e2-ffdff4f42da6
+  path: technology.systemsoftware.docker-engine
+  spec_node_id: technology.systemsoftware
+  type: systemsoftware
+  layer_id: technology
+  name: Docker Engine
+  description: Container runtime providing Docker-in-Docker (DinD) execution via
+    /var/run/docker.sock mount; used to spawn ephemeral agent and repair cycle
+    containers
+  attributes:
+    softwareType: container-runtime
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: docker-compose.yml
+        symbol: /var/run/docker.sock
+  metadata:
+    created_at: 2026-03-24T00:07:35.465Z
+    updated_at: 2026-03-24T00:07:35.465Z
+    version: 1
+technology.systemsoftware.nodejs-v22:
+  id: 4bec561b-be90-4aca-bed1-6f8db73b36f4
+  path: technology.systemsoftware.nodejs-v22
+  spec_node_id: technology.systemsoftware
+  type: systemsoftware
+  layer_id: technology
+  name: Node.js v22
+  description: Node.js v22.20.0 runtime installed in orchestrator containers to
+    support Claude Code CLI and Playwright MCP server execution
+  attributes:
+    softwareType: middleware
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: Dockerfile
+        symbol: NODE_VERSION=v22.20.0
+  metadata:
+    created_at: 2026-03-24T00:07:35.932Z
+    updated_at: 2026-03-24T00:07:35.932Z
+    version: 1
+technology.systemsoftware.nginx:
+  id: a647585b-4101-428c-a739-27fe641acdf4
+  path: technology.systemsoftware.nginx
+  spec_node_id: technology.systemsoftware
+  type: systemsoftware
+  layer_id: technology
+  name: Nginx
+  description: Web server in the web-ui container serving compiled React static
+    assets on port 80 (mapped to host port 3000)
+  attributes:
+    softwareType: middleware
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: web_ui/nginx.conf
+        symbol: nginx
+  metadata:
+    created_at: 2026-03-24T00:07:36.399Z
+    updated_at: 2026-03-24T00:07:36.399Z
+    version: 1

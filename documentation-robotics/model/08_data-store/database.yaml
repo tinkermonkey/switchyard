@@ -1,0 +1,71 @@
+data-store.database.redis-task-store:
+  id: 4b23fc61-aa31-4daa-940b-fced22ddc89a
+  path: data-store.database.redis-task-store
+  spec_node_id: data-store.database
+  type: database
+  layer_id: data-store
+  name: Redis Task Store
+  description: Redis 7 database for task queue priority lists
+    (tasks:high/medium/low), pipeline locks, agent container tracking keys,
+    repair cycle results (24h TTL), and pub/sub event streaming
+  attributes:
+    engine: Redis
+    paradigm: KEY_VALUE
+    version: "7"
+    deploymentModel: STANDALONE
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: docker-compose.yml
+        symbol: redis
+  metadata:
+    created_at: 2026-03-24T00:13:43.775Z
+    updated_at: 2026-03-24T00:13:43.775Z
+    version: 1
+data-store.database.elasticsearch-indices:
+  id: 04d1de05-f8a5-4445-987a-1c865b818085
+  path: data-store.database.elasticsearch-indices
+  spec_node_id: data-store.database
+  type: database
+  layer_id: data-store
+  name: Elasticsearch Indices
+  description: Single-node Elasticsearch 9.0 cluster storing agent logs, pipeline
+    runs, observability events, decision events, and metrics with ILM-managed
+    7-day retention policies
+  attributes:
+    engine: Elasticsearch
+    paradigm: SEARCH_ENGINE
+    version: "9.0"
+    deploymentModel: STANDALONE
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: docker-compose.yml
+        symbol: elasticsearch
+  metadata:
+    created_at: 2026-03-24T00:13:44.081Z
+    updated_at: 2026-03-24T00:13:44.081Z
+    version: 1
+data-store.database.file-system-state-store:
+  id: 061183f0-bb10-422d-ba12-6c9d18b4afcf
+  path: data-store.database.file-system-state-store
+  spec_node_id: data-store.database
+  type: database
+  layer_id: data-store
+  name: File System State Store
+  description: File-based persistence in orchestrator_data/ for pipeline
+    checkpoints, agent state, metrics JSONL, and logs; plus state/ for YAML
+    pipeline locks and PR review state
+  attributes:
+    engine: filesystem
+    paradigm: DOCUMENT
+    deploymentModel: EMBEDDED
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: state_management/manager.py
+        symbol: StateManager
+  metadata:
+    created_at: 2026-03-24T00:13:44.397Z
+    updated_at: 2026-03-24T00:13:44.397Z
+    version: 1

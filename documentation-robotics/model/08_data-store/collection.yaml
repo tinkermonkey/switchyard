@@ -1,0 +1,258 @@
+data-store.collection.task-queuehigh:
+  id: 6a15ce27-ba23-4a21-adb2-aede3a289a54
+  path: data-store.collection.task-queuehigh
+  spec_node_id: data-store.collection
+  type: collection
+  layer_id: data-store
+  name: task_queue:high
+  description: Redis list storing HIGH priority task JSON; used for PR reviews and
+    blocking issues; RPUSH/BLPOP pattern
+  attributes:
+    collectionType: HASH
+    partitionKey: priority
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: task_queue/task_manager.py
+        symbol: tasks:high
+  metadata:
+    created_at: 2026-03-24T00:13:57.678Z
+    updated_at: 2026-03-24T00:13:57.678Z
+    version: 1
+data-store.collection.task-queuemedium:
+  id: 64dd45a4-2e77-4e6b-8ca7-b6a232a71355
+  path: data-store.collection.task-queuemedium
+  spec_node_id: data-store.collection
+  type: collection
+  layer_id: data-store
+  name: task_queue:medium
+  description: Redis list storing MEDIUM priority task JSON; used for development tasks
+  attributes:
+    collectionType: HASH
+    partitionKey: priority
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: task_queue/task_manager.py
+        symbol: tasks:medium
+  metadata:
+    created_at: 2026-03-24T00:13:58.003Z
+    updated_at: 2026-03-24T00:13:58.003Z
+    version: 1
+data-store.collection.task-queuelow:
+  id: 077cbe40-63af-42a1-8c07-94f887fb83de
+  path: data-store.collection.task-queuelow
+  spec_node_id: data-store.collection
+  type: collection
+  layer_id: data-store
+  name: task_queue:low
+  description: Redis list storing LOW priority task JSON; used for documentation
+    and cleanup tasks
+  attributes:
+    collectionType: HASH
+    partitionKey: priority
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: task_queue/task_manager.py
+        symbol: tasks:low
+  metadata:
+    created_at: 2026-03-24T00:13:58.323Z
+    updated_at: 2026-03-24T00:13:58.323Z
+    version: 1
+data-store.collection.pipeline-locks:
+  id: c7d5c257-13c0-4e01-8074-4c6273b1eab0
+  path: data-store.collection.pipeline-locks
+  spec_node_id: data-store.collection
+  type: collection
+  layer_id: data-store
+  name: pipeline_locks
+  description: "Redis hash keys storing pipeline lock state per project/board:
+    serialized PipelineLock JSON with lock status, holder issue, and acquisition
+    time"
+  attributes:
+    collectionType: HASH
+    partitionKey: project:board
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/pipeline_lock_manager.py
+        symbol: PipelineLockManager
+  metadata:
+    created_at: 2026-03-24T00:14:06.308Z
+    updated_at: 2026-03-24T00:14:06.308Z
+    version: 1
+data-store.collection.repair-cycle-results:
+  id: 00e7e725-f21a-4815-b5a7-40abe8227f5c
+  path: data-store.collection.repair-cycle-results
+  spec_node_id: data-store.collection
+  type: collection
+  layer_id: data-store
+  name: repair_cycle_results
+  description: "Redis key-value store for repair cycle results with 24-hour TTL;
+    key pattern: repair_cycle:result:{project}:{issue}:{run_id}; survives
+    container removal"
+  attributes:
+    collectionType: HASH
+    partitionKey: project:issue
+    ttlDefault: 86400
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: pipeline/repair_cycle_runner.py
+        symbol: repair_cycle:result
+  metadata:
+    created_at: 2026-03-24T00:14:11.314Z
+    updated_at: 2026-03-24T00:14:11.314Z
+    version: 1
+data-store.collection.agent-events-stream:
+  id: 652d03d4-09df-41d5-bc01-463d753c5a06
+  path: data-store.collection.agent-events-stream
+  spec_node_id: data-store.collection
+  type: collection
+  layer_id: data-store
+  name: agent_events_stream
+  description: Redis pub/sub channel for real-time agent observability events;
+    consumed by observability server to relay to WebSocket clients
+  attributes:
+    collectionType: STREAM
+    partitionKey: event_type
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: monitoring/observability.py
+        symbol: ObservabilityManager
+  metadata:
+    created_at: 2026-03-24T00:14:11.641Z
+    updated_at: 2026-03-24T00:14:11.641Z
+    version: 1
+data-store.collection.orchestrator-pipeline-runs:
+  id: 633ed625-9459-45d1-9933-36af2330d19b
+  path: data-store.collection.orchestrator-pipeline-runs
+  spec_node_id: data-store.collection
+  type: collection
+  layer_id: data-store
+  name: orchestrator-pipeline-runs
+  description: Elasticsearch daily index (orchestrator-pipeline-runs-YYYY.MM.DD)
+    for pipeline run lifecycle documents with ILM 7-day retention
+  attributes:
+    collectionType: SEARCH_INDEX
+    partitionKey: pipeline_run_id
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/pipeline_run.py
+        symbol: pipeline-runs
+  metadata:
+    created_at: 2026-03-24T00:14:21.194Z
+    updated_at: 2026-03-24T00:14:21.194Z
+    version: 1
+data-store.collection.orchestrator-agent-events:
+  id: 272042d7-99a4-44eb-98a6-53bd10214050
+  path: data-store.collection.orchestrator-agent-events
+  spec_node_id: data-store.collection
+  type: collection
+  layer_id: data-store
+  name: orchestrator-agent-events
+  description: "Elasticsearch daily index for agent execution events: tool calls,
+    completions, decisions, and lifecycle events tagged with pipeline_run_id for
+    correlation"
+  attributes:
+    collectionType: SEARCH_INDEX
+    partitionKey: task_id
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: monitoring/observability.py
+        symbol: agent-events
+  metadata:
+    created_at: 2026-03-24T00:14:21.547Z
+    updated_at: 2026-03-24T00:14:21.547Z
+    version: 1
+data-store.collection.orchestrator-task-metrics:
+  id: 3066877b-5486-4e4b-a9ca-7387f84f2db1
+  path: data-store.collection.orchestrator-task-metrics
+  spec_node_id: data-store.collection
+  type: collection
+  layer_id: data-store
+  name: orchestrator-task-metrics
+  description: "Elasticsearch daily index for task execution metrics: agent name,
+    duration, success flag, quality scores; used for performance analysis and
+    dashboards"
+  attributes:
+    collectionType: SEARCH_INDEX
+    partitionKey: agent
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: monitoring/metrics.py
+        symbol: orchestrator-task-metrics
+  metadata:
+    created_at: 2026-03-24T00:14:21.894Z
+    updated_at: 2026-03-24T00:14:21.894Z
+    version: 1
+data-store.collection.pipeline-checkpoints:
+  id: f31160c1-c11c-4283-8eb6-1b754cfbddf5
+  path: data-store.collection.pipeline-checkpoints
+  spec_node_id: data-store.collection
+  type: collection
+  layer_id: data-store
+  name: pipeline_checkpoints
+  description: File-based JSON checkpoints in
+    orchestrator_data/state/checkpoints/{pipeline_id}_stage_{N}.json; enables
+    resume from last committed stage after crash/restart
+  attributes:
+    collectionType: BUCKET
+    partitionKey: pipeline_id
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: state_management/manager.py
+        symbol: StateManager.checkpoint
+  metadata:
+    created_at: 2026-03-24T00:14:30.431Z
+    updated_at: 2026-03-24T00:14:30.431Z
+    version: 1
+data-store.collection.pipeline-lock-yaml:
+  id: 7fc16364-a8eb-4689-8126-529a54a3489e
+  path: data-store.collection.pipeline-lock-yaml
+  spec_node_id: data-store.collection
+  type: collection
+  layer_id: data-store
+  name: pipeline_lock_yaml
+  description: YAML files in state/pipeline_locks/{project}_{board}.yaml
+    persisting pipeline lock state for cross-restart recovery; synced to Redis
+    on startup
+  attributes:
+    collectionType: BUCKET
+    partitionKey: project:board
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/pipeline_lock_manager.py
+        symbol: PipelineLockManager
+  metadata:
+    created_at: 2026-03-24T00:14:30.785Z
+    updated_at: 2026-03-24T00:14:30.785Z
+    version: 1
+data-store.collection.pr-review-state-yaml:
+  id: 9a93e4c6-8953-43e1-8d1e-1e1642f12523
+  path: data-store.collection.pr-review-state-yaml
+  spec_node_id: data-store.collection
+  type: collection
+  layer_id: data-store
+  name: pr_review_state_yaml
+  description: YAML files in state/projects/{project}/pr_review_state.yaml
+    tracking review cycle counts per issue to prevent infinite review loops
+  attributes:
+    collectionType: BUCKET
+    partitionKey: project:issue
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: state_management/pr_review_state_manager.py
+        symbol: PRReviewStateManager
+  metadata:
+    created_at: 2026-03-24T00:14:31.141Z
+    updated_at: 2026-03-24T00:14:31.141Z
+    version: 1

@@ -1,0 +1,947 @@
+- type: add
+  elementId: technology.node.orchestrator-container
+  layerName: technology
+  after:
+    id: a778db03-292f-48f8-a64d-3c84eb1b4a23
+    path: technology.node.orchestrator-container
+    spec_node_id: technology.node
+    type: node
+    layer_id: technology
+    name: Orchestrator Container
+    description: Python 3.11-slim Docker container running the main orchestrator
+      process; mounts workspace, SSH keys, git config, GitHub App keys, and
+      Docker socket for DinD
+    attributes:
+      nodeType: container
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: Dockerfile
+          symbol: orchestrator
+    metadata:
+      created_at: 2026-03-24T00:07:01.375Z
+      updated_at: 2026-03-24T00:07:01.375Z
+      version: 1
+  timestamp: 2026-03-24T00:07:01.402Z
+  sequenceNumber: 0
+- type: add
+  elementId: technology.node.observability-server-container
+  layerName: technology
+  after:
+    id: 9bbd3aa0-3ad8-49d6-bcc4-4d16f861640e
+    path: technology.node.observability-server-container
+    spec_node_id: technology.node
+    type: node
+    layer_id: technology
+    name: Observability Server Container
+    description: Docker container running the Flask/Socket.IO observability server
+      on port 5001; shares workspace and Docker socket mounts with the
+      orchestrator
+    attributes:
+      nodeType: container
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: docker-compose.yml
+          symbol: observability-server
+    metadata:
+      created_at: 2026-03-24T00:07:01.813Z
+      updated_at: 2026-03-24T00:07:01.813Z
+      version: 1
+  timestamp: 2026-03-24T00:07:01.838Z
+  sequenceNumber: 1
+- type: add
+  elementId: technology.node.agent-docker-container
+  layerName: technology
+  after:
+    id: fc94116b-0a1e-4400-b2d5-fc12507104c2
+    path: technology.node.agent-docker-container
+    spec_node_id: technology.node
+    type: node
+    layer_id: technology
+    name: Agent Docker Container
+    description: Ephemeral Docker container created per agent task execution;
+      labeled with project and issue metadata, mounts project workspace, SSH
+      keys, and git config
+    attributes:
+      nodeType: container
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: claude/docker_runner.py
+          symbol: DockerAgentRunner
+    metadata:
+      created_at: 2026-03-24T00:07:02.241Z
+      updated_at: 2026-03-24T00:07:02.241Z
+      version: 1
+  timestamp: 2026-03-24T00:07:02.268Z
+  sequenceNumber: 2
+- type: add
+  elementId: technology.node.web-ui-container
+  layerName: technology
+  after:
+    id: c746ade7-9eb2-4697-9732-30e8d2d5b2b8
+    path: technology.node.web-ui-container
+    spec_node_id: technology.node
+    type: node
+    layer_id: technology
+    name: Web UI Container
+    description: Docker container serving the React web UI static assets via Nginx
+      on port 3000; depends on observability server for WebSocket and REST API
+      connectivity
+    attributes:
+      nodeType: container
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: docker-compose.yml
+          symbol: web-ui
+    metadata:
+      created_at: 2026-03-24T00:07:09.364Z
+      updated_at: 2026-03-24T00:07:09.364Z
+      version: 1
+  timestamp: 2026-03-24T00:07:09.390Z
+  sequenceNumber: 3
+- type: add
+  elementId: technology.node.log-collector-container
+  layerName: technology
+  after:
+    id: 57dab289-5802-434e-8d7a-815976d62daf
+    path: technology.node.log-collector-container
+    spec_node_id: technology.node
+    type: node
+    layer_id: technology
+    name: Log Collector Container
+    description: Docker container running the log collector service that consumes
+      Redis streams and publishes batched events to Elasticsearch
+    attributes:
+      nodeType: container
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: docker-compose.yml
+          symbol: log-collector
+    metadata:
+      created_at: 2026-03-24T00:07:09.809Z
+      updated_at: 2026-03-24T00:07:09.809Z
+      version: 1
+  timestamp: 2026-03-24T00:07:09.836Z
+  sequenceNumber: 4
+- type: add
+  elementId: technology.node.repair-cycle-container
+  layerName: technology
+  after:
+    id: 8c34de7f-87c6-414f-a6aa-3799a88d7a20
+    path: technology.node.repair-cycle-container
+    spec_node_id: technology.node
+    type: node
+    layer_id: technology
+    name: Repair Cycle Container
+    description: Ephemeral Docker container running isolated test-fix-validate
+      repair cycles; survives orchestrator restarts by persisting results to
+      Redis
+    attributes:
+      nodeType: container
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: pipeline/repair_cycle_runner.py
+          symbol: RepairCycleRunner
+    metadata:
+      created_at: 2026-03-24T00:07:10.281Z
+      updated_at: 2026-03-24T00:07:10.281Z
+      version: 1
+  timestamp: 2026-03-24T00:07:10.307Z
+  sequenceNumber: 5
+- type: add
+  elementId: technology.systemsoftware.python-311-runtime
+  layerName: technology
+  after:
+    id: 63a47df5-3aca-475b-8d2a-485dbf3f5e37
+    path: technology.systemsoftware.python-311-runtime
+    spec_node_id: technology.systemsoftware
+    type: systemsoftware
+    layer_id: technology
+    name: Python 3.11 Runtime
+    description: Primary runtime for the orchestrator; uses asyncio/await for async
+      pipeline execution and threading for background services
+    attributes:
+      softwareType: middleware
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: Dockerfile
+          symbol: python:3.11-slim
+    metadata:
+      created_at: 2026-03-24T00:07:24.367Z
+      updated_at: 2026-03-24T00:07:24.367Z
+      version: 1
+  timestamp: 2026-03-24T00:07:24.391Z
+  sequenceNumber: 6
+- type: add
+  elementId: technology.systemsoftware.redis-7
+  layerName: technology
+  after:
+    id: 6d4b01d3-96d0-4690-87a7-919d3c48d3b2
+    path: technology.systemsoftware.redis-7
+    spec_node_id: technology.systemsoftware
+    type: systemsoftware
+    layer_id: technology
+    name: Redis 7
+    description: Redis 7 Alpine backing store for task priority queues
+      (tasks:high/medium/low), pipeline locks, agent container tracking,
+      pipeline run results, and pub/sub event streaming
+    attributes:
+      softwareType: cache
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: docker-compose.yml
+          symbol: redis
+    metadata:
+      created_at: 2026-03-24T00:07:24.835Z
+      updated_at: 2026-03-24T00:07:24.835Z
+      version: 1
+  timestamp: 2026-03-24T00:07:24.862Z
+  sequenceNumber: 7
+- type: add
+  elementId: technology.systemsoftware.elasticsearch-90
+  layerName: technology
+  after:
+    id: da59a61f-eb7f-4f36-883f-b6408f9ee2d0
+    path: technology.systemsoftware.elasticsearch-90
+    spec_node_id: technology.systemsoftware
+    type: systemsoftware
+    layer_id: technology
+    name: Elasticsearch 9.0
+    description: Single-node Elasticsearch cluster (xpack.security disabled) storing
+      agent logs, pipeline runs, observability events, metrics, and decision
+      events with ILM 7-day retention
+    attributes:
+      softwareType: dbms
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: docker-compose.yml
+          symbol: elasticsearch
+    metadata:
+      created_at: 2026-03-24T00:07:25.292Z
+      updated_at: 2026-03-24T00:07:25.292Z
+      version: 1
+  timestamp: 2026-03-24T00:07:25.318Z
+  sequenceNumber: 8
+- type: add
+  elementId: technology.systemsoftware.docker-engine
+  layerName: technology
+  after:
+    id: 441a2462-cc71-402d-b8e2-ffdff4f42da6
+    path: technology.systemsoftware.docker-engine
+    spec_node_id: technology.systemsoftware
+    type: systemsoftware
+    layer_id: technology
+    name: Docker Engine
+    description: Container runtime providing Docker-in-Docker (DinD) execution via
+      /var/run/docker.sock mount; used to spawn ephemeral agent and repair cycle
+      containers
+    attributes:
+      softwareType: container-runtime
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: docker-compose.yml
+          symbol: /var/run/docker.sock
+    metadata:
+      created_at: 2026-03-24T00:07:35.465Z
+      updated_at: 2026-03-24T00:07:35.465Z
+      version: 1
+  timestamp: 2026-03-24T00:07:35.494Z
+  sequenceNumber: 9
+- type: add
+  elementId: technology.systemsoftware.nodejs-v22
+  layerName: technology
+  after:
+    id: 4bec561b-be90-4aca-bed1-6f8db73b36f4
+    path: technology.systemsoftware.nodejs-v22
+    spec_node_id: technology.systemsoftware
+    type: systemsoftware
+    layer_id: technology
+    name: Node.js v22
+    description: Node.js v22.20.0 runtime installed in orchestrator containers to
+      support Claude Code CLI and Playwright MCP server execution
+    attributes:
+      softwareType: middleware
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: Dockerfile
+          symbol: NODE_VERSION=v22.20.0
+    metadata:
+      created_at: 2026-03-24T00:07:35.932Z
+      updated_at: 2026-03-24T00:07:35.932Z
+      version: 1
+  timestamp: 2026-03-24T00:07:35.960Z
+  sequenceNumber: 10
+- type: add
+  elementId: technology.systemsoftware.nginx
+  layerName: technology
+  after:
+    id: a647585b-4101-428c-a739-27fe641acdf4
+    path: technology.systemsoftware.nginx
+    spec_node_id: technology.systemsoftware
+    type: systemsoftware
+    layer_id: technology
+    name: Nginx
+    description: Web server in the web-ui container serving compiled React static
+      assets on port 80 (mapped to host port 3000)
+    attributes:
+      softwareType: middleware
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: web_ui/nginx.conf
+          symbol: nginx
+    metadata:
+      created_at: 2026-03-24T00:07:36.399Z
+      updated_at: 2026-03-24T00:07:36.399Z
+      version: 1
+  timestamp: 2026-03-24T00:07:36.423Z
+  sequenceNumber: 11
+- type: add
+  elementId: technology.technologyservice.claude-code-cli
+  layerName: technology
+  after:
+    id: 70ae8624-5bab-4f0e-84ff-6136176771b0
+    path: technology.technologyservice.claude-code-cli
+    spec_node_id: technology.technologyservice
+    type: technologyservice
+    layer_id: technology
+    name: Claude Code CLI
+    description: Anthropic Claude Code CLI tool (@anthropic-ai/claude-code) executed
+      inside agent containers; provides AI code generation, analysis, and tool
+      use with MCP server support
+    attributes:
+      serviceType: compute
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: Dockerfile
+          symbol: npm install -g @anthropic-ai/claude-code
+    metadata:
+      created_at: 2026-03-24T00:07:50.205Z
+      updated_at: 2026-03-24T00:07:50.205Z
+      version: 1
+  timestamp: 2026-03-24T00:07:50.231Z
+  sequenceNumber: 12
+- type: add
+  elementId: technology.technologyservice.git-hub-api-external
+  layerName: technology
+  after:
+    id: e95e4bdb-1714-4178-9afa-1b9cea5334e0
+    path: technology.technologyservice.git-hub-api-external
+    spec_node_id: technology.technologyservice
+    type: technologyservice
+    layer_id: technology
+    name: GitHub API (External)
+    description: External GitHub GraphQL v4 and REST APIs used for project board
+      management, issue operations, PR management, discussions, and label
+      automation
+    attributes:
+      serviceType: compute
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/github_api_client.py
+          symbol: GitHubAPIClient
+    metadata:
+      created_at: 2026-03-24T00:07:50.695Z
+      updated_at: 2026-03-24T00:07:50.695Z
+      version: 1
+  timestamp: 2026-03-24T00:07:50.727Z
+  sequenceNumber: 13
+- type: add
+  elementId: technology.technologyservice.anthropic-api
+  layerName: technology
+  after:
+    id: 02ec155f-b631-4a90-a47a-50cb6b760dcf
+    path: technology.technologyservice.anthropic-api
+    spec_node_id: technology.technologyservice
+    type: technologyservice
+    layer_id: technology
+    name: Anthropic API
+    description: External Anthropic Claude API providing claude-opus-4-6,
+      claude-sonnet-4-6, and claude-haiku-4-5 model access; used directly or via
+      Claude Code CLI with OAuth token billing
+    attributes:
+      serviceType: compute
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: config/foundations/agents.yaml
+          symbol: model
+    metadata:
+      created_at: 2026-03-24T00:07:51.176Z
+      updated_at: 2026-03-24T00:07:51.176Z
+      version: 1
+  timestamp: 2026-03-24T00:07:51.217Z
+  sequenceNumber: 14
+- type: add
+  elementId: technology.technologyservice.context7-mcp-server
+  layerName: technology
+  after:
+    id: f433d2ed-13c4-4ed6-a783-e15b7ee2c78a
+    path: technology.technologyservice.context7-mcp-server
+    spec_node_id: technology.technologyservice
+    type: technologyservice
+    layer_id: technology
+    name: Context7 MCP Server
+    description: External Model Context Protocol server at mcp.context7.com
+      providing agents with up-to-date library documentation and code context
+      during execution
+    attributes:
+      serviceType: compute
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: docker-compose.yml
+          symbol: CONTEXT7_MCP_URL
+    metadata:
+      created_at: 2026-03-24T00:07:58.540Z
+      updated_at: 2026-03-24T00:07:58.540Z
+      version: 1
+  timestamp: 2026-03-24T00:07:58.567Z
+  sequenceNumber: 15
+- type: add
+  elementId: technology.technologyservice.playwright-mcp-server
+  layerName: technology
+  after:
+    id: c1984410-58bb-4eb9-bc27-8073b58f3de1
+    path: technology.technologyservice.playwright-mcp-server
+    spec_node_id: technology.technologyservice
+    type: technologyservice
+    layer_id: technology
+    name: Playwright MCP Server
+    description: Local Playwright MCP server (@playwright/mcp) installed in agent
+      containers; enables browser automation for senior_software_engineer agent
+      via Browserless
+    attributes:
+      serviceType: compute
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: Dockerfile
+          symbol: "@playwright/mcp"
+    metadata:
+      created_at: 2026-03-24T00:07:59.021Z
+      updated_at: 2026-03-24T00:07:59.021Z
+      version: 1
+  timestamp: 2026-03-24T00:07:59.052Z
+  sequenceNumber: 16
+- type: add
+  elementId: technology.technologyservice.browserless-chromium
+  layerName: technology
+  after:
+    id: cd18d305-41b6-4035-9be9-c1b353a22964
+    path: technology.technologyservice.browserless-chromium
+    spec_node_id: technology.technologyservice
+    type: technologyservice
+    layer_id: technology
+    name: Browserless Chromium
+    description: Headless Chromium service (ghcr.io/browserless/chromium) on port
+      3080; provides browser execution for Playwright MCP with 5 concurrent
+      sessions and 30s timeout
+    attributes:
+      serviceType: compute
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: docker-compose.yml
+          symbol: browserless
+    metadata:
+      created_at: 2026-03-24T00:07:59.497Z
+      updated_at: 2026-03-24T00:07:59.497Z
+      version: 1
+  timestamp: 2026-03-24T00:07:59.524Z
+  sequenceNumber: 17
+- type: add
+  elementId: technology.artifact.orchestrator-docker-image
+  layerName: technology
+  after:
+    id: 17b96990-40f0-46be-9037-5bf3a9a53a42
+    path: technology.artifact.orchestrator-docker-image
+    spec_node_id: technology.artifact
+    type: artifact
+    layer_id: technology
+    name: Orchestrator Docker Image
+    description: Docker image built from Dockerfile; includes Python 3.11, Node.js
+      v22, Claude Code CLI, GitHub CLI, Docker CLI, Playwright dependencies, and
+      all Python requirements
+    attributes:
+      artifactType: container-image
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: Dockerfile
+          symbol: FROM python:3.11-slim
+    metadata:
+      created_at: 2026-03-24T00:08:08.679Z
+      updated_at: 2026-03-24T00:08:08.679Z
+      version: 1
+  timestamp: 2026-03-24T00:08:08.708Z
+  sequenceNumber: 18
+- type: add
+  elementId: technology.artifact.project-agent-docker-image
+  layerName: technology
+  after:
+    id: 4104e828-ddc6-4cb8-8082-88d8ec686cc5
+    path: technology.artifact.project-agent-docker-image
+    spec_node_id: technology.artifact
+    type: artifact
+    layer_id: technology
+    name: Project Agent Docker Image
+    description: Project-specific Docker agent image built from Dockerfile.agent in
+      the project workspace; includes project dependencies, Claude Code CLI,
+      git, and gh CLI
+    attributes:
+      artifactType: container-image
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: Dockerfile.agent
+          symbol: Dockerfile.agent
+    metadata:
+      created_at: 2026-03-24T00:08:09.144Z
+      updated_at: 2026-03-24T00:08:09.144Z
+      version: 1
+  timestamp: 2026-03-24T00:08:09.175Z
+  sequenceNumber: 19
+- type: add
+  elementId: technology.artifact.react-web-ui-build
+  layerName: technology
+  after:
+    id: b676f5b7-ce2a-46c1-8fd0-73d68bc64aa7
+    path: technology.artifact.react-web-ui-build
+    spec_node_id: technology.artifact
+    type: artifact
+    layer_id: technology
+    name: React Web UI Build
+    description: Vite-compiled React 19 web UI bundle; includes TanStack Router,
+      XYFlow pipeline graphs, Socket.IO client, Tailwind CSS, Flowbite
+      components, and Lucide icons
+    attributes:
+      artifactType: archive
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: web_ui/package.json
+          symbol: vite build
+    metadata:
+      created_at: 2026-03-24T00:08:18.282Z
+      updated_at: 2026-03-24T00:08:18.282Z
+      version: 1
+  timestamp: 2026-03-24T00:08:18.310Z
+  sequenceNumber: 20
+- type: add
+  elementId: technology.artifact.pipeline-checkpoint-file
+  layerName: technology
+  after:
+    id: d7758f9c-be7f-4156-a174-0005e75151fd
+    path: technology.artifact.pipeline-checkpoint-file
+    spec_node_id: technology.artifact
+    type: artifact
+    layer_id: technology
+    name: Pipeline Checkpoint File
+    description: JSON checkpoint file written to
+      orchestrator_data/state/checkpoints/ before each pipeline stage; enables
+      recovery by resuming from highest committed stage index
+    attributes:
+      artifactType: file
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: state_management/manager.py
+          symbol: StateManager.checkpoint
+    metadata:
+      created_at: 2026-03-24T00:08:18.799Z
+      updated_at: 2026-03-24T00:08:18.799Z
+      version: 1
+  timestamp: 2026-03-24T00:08:18.829Z
+  sequenceNumber: 21
+- type: add
+  elementId: technology.artifact.requirements-configuration
+  layerName: technology
+  after:
+    id: dc330373-b154-4120-bc2b-4874f7743621
+    path: technology.artifact.requirements-configuration
+    spec_node_id: technology.artifact
+    type: artifact
+    layer_id: technology
+    name: Requirements Configuration
+    description: requirements.txt defining Python package dependencies for the
+      orchestrator, including Redis, Elasticsearch, Flask, asyncio, PyJWT,
+      APScheduler, and testing tools
+    attributes:
+      artifactType: configuration
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: requirements.txt
+    metadata:
+      created_at: 2026-03-24T00:08:19.286Z
+      updated_at: 2026-03-24T00:08:19.286Z
+      version: 1
+  timestamp: 2026-03-24T00:08:19.321Z
+  sequenceNumber: 22
+- type: add
+  elementId: technology.artifact.docker-compose-configuration
+  layerName: technology
+  after:
+    id: 8faa11ca-1429-4f04-997c-3102fa2b7ed1
+    path: technology.artifact.docker-compose-configuration
+    spec_node_id: technology.artifact
+    type: artifact
+    layer_id: technology
+    name: Docker Compose Configuration
+    description: "docker-compose.yml orchestrating 7 services: redis, orchestrator,
+      observability-server, web-ui, log-collector, browserless, and
+      elasticsearch with named volumes and orchestrator-net bridge network"
+    attributes:
+      artifactType: configuration
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: docker-compose.yml
+    metadata:
+      created_at: 2026-03-24T00:08:26.968Z
+      updated_at: 2026-03-24T00:08:26.968Z
+      version: 1
+  timestamp: 2026-03-24T00:08:26.998Z
+  sequenceNumber: 23
+- type: add
+  elementId: technology.artifact.project-configuration-files
+  layerName: technology
+  after:
+    id: 24361f29-2c67-481b-81b6-4d0cba0fc350
+    path: technology.artifact.project-configuration-files
+    spec_node_id: technology.artifact
+    type: artifact
+    layer_id: technology
+    name: Project Configuration Files
+    description: "YAML files in config/projects/ defining per-project settings:
+      GitHub org/repo, tech stacks, enabled pipeline templates, board names, and
+      visibility flags"
+    attributes:
+      artifactType: configuration
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: config/projects/
+    metadata:
+      created_at: 2026-03-24T00:08:27.462Z
+      updated_at: 2026-03-24T00:08:27.462Z
+      version: 1
+  timestamp: 2026-03-24T00:08:27.492Z
+  sequenceNumber: 24
+- type: add
+  elementId: technology.artifact.pipeline-lock-state-file
+  layerName: technology
+  after:
+    id: 35a59dcd-11cb-46c9-b759-48be8343347c
+    path: technology.artifact.pipeline-lock-state-file
+    spec_node_id: technology.artifact
+    type: artifact
+    layer_id: technology
+    name: Pipeline Lock State File
+    description: YAML state files persisting pipeline locks in
+      state/pipeline_locks/; synced to Redis on startup for recovery after
+      orchestrator restart
+    attributes:
+      artifactType: file
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/pipeline_lock_manager.py
+          symbol: PipelineLockManager
+    metadata:
+      created_at: 2026-03-24T00:08:27.957Z
+      updated_at: 2026-03-24T00:08:27.957Z
+      version: 1
+  timestamp: 2026-03-24T00:08:27.989Z
+  sequenceNumber: 25
+- type: add
+  elementId: technology.communicationnetwork.orchestrator-docker-network
+  layerName: technology
+  after:
+    id: 9b247910-71db-4068-a580-580e1ee0f9e5
+    path: technology.communicationnetwork.orchestrator-docker-network
+    spec_node_id: technology.communicationnetwork
+    type: communicationnetwork
+    layer_id: technology
+    name: Orchestrator Docker Network
+    description: "orchestrator-net bridge network in Docker Compose connecting all
+      services: redis, orchestrator, observability-server, web-ui,
+      log-collector, browserless, and elasticsearch"
+    attributes:
+      networkType: intranet
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: docker-compose.yml
+          symbol: orchestrator-net
+    metadata:
+      created_at: 2026-03-24T00:08:43.253Z
+      updated_at: 2026-03-24T00:08:43.253Z
+      version: 1
+  timestamp: 2026-03-24T00:08:43.286Z
+  sequenceNumber: 26
+- type: add
+  elementId: technology.communicationnetwork.public-internet
+  layerName: technology
+  after:
+    id: d6acafd6-b260-486b-9d58-6097a786f74c
+    path: technology.communicationnetwork.public-internet
+    spec_node_id: technology.communicationnetwork
+    type: communicationnetwork
+    layer_id: technology
+    name: Public Internet
+    description: Public internet connectivity used by agents to reach GitHub API,
+      Anthropic API, and Context7 MCP server; also used for web UI browser
+      access on port 3000
+    attributes:
+      networkType: internet
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: docker-compose.yml
+    metadata:
+      created_at: 2026-03-24T00:08:43.747Z
+      updated_at: 2026-03-24T00:08:43.747Z
+      version: 1
+  timestamp: 2026-03-24T00:08:43.780Z
+  sequenceNumber: 27
+- type: add
+  elementId: technology.technologyinterface.redis-task-queue-interface
+  layerName: technology
+  after:
+    id: d712cbae-bf5a-4d5b-9217-1867747143b0
+    path: technology.technologyinterface.redis-task-queue-interface
+    spec_node_id: technology.technologyinterface
+    type: technologyinterface
+    layer_id: technology
+    name: Redis Task Queue Interface
+    description: "Redis list-based priority queue interface: RPUSH to
+      tasks:high/medium/low, BLPOP for dequeue with not_before scheduling
+      support"
+    attributes:
+      protocol: tcp
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: task_queue/task_manager.py
+          symbol: TaskQueue._enqueue_redis
+    metadata:
+      created_at: 2026-03-24T00:08:57.210Z
+      updated_at: 2026-03-24T00:08:57.210Z
+      version: 1
+  timestamp: 2026-03-24T00:08:57.240Z
+  sequenceNumber: 28
+- type: add
+  elementId: technology.technologyinterface.elasticsearch-http-interface
+  layerName: technology
+  after:
+    id: f5a6cbe4-da4c-4cf6-9a82-9a1b17cf7d4d
+    path: technology.technologyinterface.elasticsearch-http-interface
+    spec_node_id: technology.technologyinterface
+    type: technologyinterface
+    layer_id: technology
+    name: Elasticsearch HTTP Interface
+    description: HTTP REST interface to Elasticsearch on port 9200; used by log
+      collector, metrics, observability, pipeline run manager, and watchdog for
+      indexing and querying
+    attributes:
+      protocol: http
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/log_collector.py
+          symbol: Elasticsearch
+    metadata:
+      created_at: 2026-03-24T00:08:57.717Z
+      updated_at: 2026-03-24T00:08:57.717Z
+      version: 1
+  timestamp: 2026-03-24T00:08:57.748Z
+  sequenceNumber: 29
+- type: add
+  elementId: technology.technologyinterface.docker-socket-interface
+  layerName: technology
+  after:
+    id: d5b0c69f-8b1a-460d-a8ec-9913bdbf56cb
+    path: technology.technologyinterface.docker-socket-interface
+    spec_node_id: technology.technologyinterface
+    type: technologyinterface
+    layer_id: technology
+    name: Docker Socket Interface
+    description: Unix domain socket /var/run/docker.sock mounted into orchestrator
+      and observability-server containers; enables DinD container management for
+      agent execution
+    attributes:
+      protocol: tcp
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: docker-compose.yml
+          symbol: /var/run/docker.sock
+    metadata:
+      created_at: 2026-03-24T00:08:58.241Z
+      updated_at: 2026-03-24T00:08:58.241Z
+      version: 1
+  timestamp: 2026-03-24T00:08:58.272Z
+  sequenceNumber: 30
+- type: add
+  elementId: technology.technologyprocess.docker-build-process
+  layerName: technology
+  after:
+    id: cc8d41b1-cc5d-412f-9cf1-1d4be8cc6f33
+    path: technology.technologyprocess.docker-build-process
+    spec_node_id: technology.technologyprocess
+    type: technologyprocess
+    layer_id: technology
+    name: Docker Build Process
+    description: docker build process that creates project-specific agent images
+      from Dockerfile.agent; executed by dev_environment_setup agent to
+      provision project dependencies
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: agents/dev_environment_setup_agent.py
+          symbol: DevEnvironmentSetupAgent
+    metadata:
+      created_at: 2026-03-24T00:09:06.295Z
+      updated_at: 2026-03-24T00:09:06.295Z
+      version: 1
+  timestamp: 2026-03-24T00:09:06.326Z
+  sequenceNumber: 31
+- type: add
+  elementId: technology.technologyprocess.redis-stream-log-pipeline
+  layerName: technology
+  after:
+    id: 35e47b15-6a1e-4b5f-bcc2-abee92eaa653
+    path: technology.technologyprocess.redis-stream-log-pipeline
+    spec_node_id: technology.technologyprocess
+    type: technologyprocess
+    layer_id: technology
+    name: Redis Stream Log Pipeline
+    description: Async pipeline that writes structured events to Redis streams, then
+      log-collector batches and bulk-indexes them to Elasticsearch for pattern
+      analysis
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/log_collector.py
+          symbol: LogCollector
+    metadata:
+      created_at: 2026-03-24T00:09:06.800Z
+      updated_at: 2026-03-24T00:09:06.800Z
+      version: 1
+  timestamp: 2026-03-24T00:09:06.832Z
+  sequenceNumber: 32
+- type: add
+  elementId: technology.technologyfunction.git-hub-cli-execution
+  layerName: technology
+  after:
+    id: 80cc5367-d84b-4c49-8b14-2ca45711752b
+    path: technology.technologyfunction.git-hub-cli-execution
+    spec_node_id: technology.technologyfunction
+    type: technologyfunction
+    layer_id: technology
+    name: GitHub CLI Execution
+    description: "gh CLI invoked via subprocess for GitHub operations: GraphQL
+      queries, REST calls, issue/PR management; supports GitHub App token
+      injection via GH_TOKEN env var"
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/github_api_client.py
+          symbol: GitHubAPIClient
+    metadata:
+      created_at: 2026-03-24T00:09:07.309Z
+      updated_at: 2026-03-24T00:09:07.309Z
+      version: 1
+  timestamp: 2026-03-24T00:09:07.342Z
+  sequenceNumber: 33
+- type: add
+  elementId: technology.path.host-to-container-volume-mount
+  layerName: technology
+  after:
+    id: a45bec39-8a3f-458a-8697-ed4b96e19a59
+    path: technology.path.host-to-container-volume-mount
+    spec_node_id: technology.path
+    type: path
+    layer_id: technology
+    name: Host-to-Container Volume Mount
+    description: "Docker volume mount binding host directories into containers:
+      ..:/workspace, ./:/app, ~/.ssh, ~/.gitconfig, ~/.orchestrator, and
+      /var/run/docker.sock"
+    attributes:
+      pathType: bidirectional
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: docker-compose.yml
+    metadata:
+      created_at: 2026-03-24T00:09:20.585Z
+      updated_at: 2026-03-24T00:09:20.585Z
+      version: 1
+  timestamp: 2026-03-24T00:09:20.620Z
+  sequenceNumber: 34
+- type: add
+  elementId: technology.technologyevent.elasticsearch-ilm-rollover
+  layerName: technology
+  after:
+    id: 561ed3b5-e0fc-4a10-ac39-25bdc13f4317
+    path: technology.technologyevent.elasticsearch-ilm-rollover
+    spec_node_id: technology.technologyevent
+    type: technologyevent
+    layer_id: technology
+    name: Elasticsearch ILM Rollover
+    description: Index Lifecycle Management scheduled event that automatically rolls
+      over and deletes indices after 7 days; applied to pipeline-runs,
+      agent-events, decision-events, and metrics indices
+    attributes:
+      eventType: scheduled
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: monitoring/observability.py
+          symbol: DECISION_EVENTS_ILM_POLICY
+    metadata:
+      created_at: 2026-03-24T00:09:27.987Z
+      updated_at: 2026-03-24T00:09:27.987Z
+      version: 1
+  timestamp: 2026-03-24T00:09:28.021Z
+  sequenceNumber: 35
+- type: add
+  elementId: technology.technologyevent.circuit-breaker-state-transition
+  layerName: technology
+  after:
+    id: 00f063e6-0b03-4619-adeb-31474a720cb2
+    path: technology.technologyevent.circuit-breaker-state-transition
+    spec_node_id: technology.technologyevent
+    type: technologyevent
+    layer_id: technology
+    name: Circuit Breaker State Transition
+    description: Infrastructure event triggered when a circuit breaker transitions
+      between CLOSED, OPEN, and HALF_OPEN states based on failure thresholds and
+      recovery timeouts
+    attributes:
+      eventType: threshold-breach
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/circuit_breaker.py
+          symbol: CircuitBreaker
+    metadata:
+      created_at: 2026-03-24T00:09:28.510Z
+      updated_at: 2026-03-24T00:09:28.510Z
+      version: 1
+  timestamp: 2026-03-24T00:09:28.546Z
+  sequenceNumber: 36

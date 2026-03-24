@@ -1,0 +1,409 @@
+- type: add
+  elementId: apm.resource.orchestrator-service
+  layerName: apm
+  after:
+    id: ac4828c3-2877-40ac-8130-42e5af409c8d
+    path: apm.resource.orchestrator-service
+    spec_node_id: apm.resource
+    type: resource
+    layer_id: apm
+    name: Orchestrator Service
+    description: OpenTelemetry resource representing the orchestrator service;
+      identifies all metrics, logs, and events emitted by the main orchestrator
+      process
+    attributes:
+      droppedAttributesCount: 0
+      serviceName: orchestrator
+      serviceVersion: 0.1.0
+      deploymentEnvironment: production
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: monitoring/observability.py
+          symbol: ObservabilityManager
+    metadata:
+      created_at: 2026-03-24T00:18:49.712Z
+      updated_at: 2026-03-24T00:18:49.712Z
+      version: 1
+  timestamp: 2026-03-24T00:18:49.734Z
+  sequenceNumber: 0
+- type: add
+  elementId: apm.resource.agent-container-service
+  layerName: apm
+  after:
+    id: 67f5dba8-3a6b-4f91-b73b-acf2e7aa3bef
+    path: apm.resource.agent-container-service
+    spec_node_id: apm.resource
+    type: resource
+    layer_id: apm
+    name: Agent Container Service
+    description: Resource identifying ephemeral Claude Code agent containers; each
+      run tagged with agent name, project, issue number, and pipeline_run_id
+    attributes:
+      droppedAttributesCount: 0
+      serviceName: agent-container
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: claude/docker_runner.py
+          symbol: DockerAgentRunner
+    metadata:
+      created_at: 2026-03-24T00:18:50.184Z
+      updated_at: 2026-03-24T00:18:50.184Z
+      version: 1
+  timestamp: 2026-03-24T00:18:50.207Z
+  sequenceNumber: 1
+- type: add
+  elementId: apm.logconfiguration.orchestrator-json-logger
+  layerName: apm
+  after:
+    id: 1d1631ec-0099-40f0-b6c0-cdb2a1489b4f
+    path: apm.logconfiguration.orchestrator-json-logger
+    spec_node_id: apm.logconfiguration
+    type: logconfiguration
+    layer_id: apm
+    name: Orchestrator JSON Logger
+    description: Python JSON structured logging using python-json-logger; all logs
+      formatted as JSON with timestamp, name, level, and message fields; written
+      to stdout and orchestrator_data/logs/orchestrator_all.log
+    attributes:
+      serviceName: orchestrator
+      minimumSeverity: INFO
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: monitoring/logging.py
+          symbol: OrchestratorLogger
+    metadata:
+      created_at: 2026-03-24T00:18:58.717Z
+      updated_at: 2026-03-24T00:18:58.717Z
+      version: 1
+  timestamp: 2026-03-24T00:18:58.740Z
+  sequenceNumber: 2
+- type: add
+  elementId: apm.logprocessor.elasticsearch-log-indexer
+  layerName: apm
+  after:
+    id: fbd6de33-b798-4676-9a28-8e09e3881fa6
+    path: apm.logprocessor.elasticsearch-log-indexer
+    spec_node_id: apm.logprocessor
+    type: logprocessor
+    layer_id: apm
+    name: Elasticsearch Log Indexer
+    description: Log collector service batches structured JSON events from Redis
+      streams and bulk-indexes them to Elasticsearch daily indices with batch
+      size 50 and 5s timeout
+    attributes:
+      type: batch
+      order: 1
+      enabled: true
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/log_collector.py
+          symbol: LogCollector
+    metadata:
+      created_at: 2026-03-24T00:18:59.191Z
+      updated_at: 2026-03-24T00:18:59.191Z
+      version: 1
+  timestamp: 2026-03-24T00:18:59.214Z
+  sequenceNumber: 3
+- type: add
+  elementId: apm.metricconfiguration.task-execution-metrics
+  layerName: apm
+  after:
+    id: 19ba4fd3-d106-4ff1-8afd-f3fbe5bb73d1
+    path: apm.metricconfiguration.task-execution-metrics
+    spec_node_id: apm.metricconfiguration
+    type: metricconfiguration
+    layer_id: apm
+    name: Task Execution Metrics
+    description: MetricsCollector writes task_metrics to Elasticsearch
+      orchestrator-task-metrics-{date} index and JSONL backup at
+      orchestrator_data/metrics/task_metrics_{date}.jsonl
+    attributes:
+      serviceName: orchestrator
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: monitoring/metrics.py
+          symbol: MetricsCollector
+    metadata:
+      created_at: 2026-03-24T00:19:09.758Z
+      updated_at: 2026-03-24T00:19:09.758Z
+      version: 1
+  timestamp: 2026-03-24T00:19:09.781Z
+  sequenceNumber: 4
+- type: add
+  elementId: apm.metricinstrument.task-execution-duration
+  layerName: apm
+  after:
+    id: e97dd04e-ac9d-4217-93bc-7be27bcca8e3
+    path: apm.metricinstrument.task-execution-duration
+    spec_node_id: apm.metricinstrument
+    type: metricinstrument
+    layer_id: apm
+    name: Task Execution Duration
+    description: Histogram metric measuring time in seconds from task dequeue to
+      completion; recorded per agent with success flag in Elasticsearch task
+      metrics index
+    attributes:
+      type: Histogram
+      unit: seconds
+      description: Task execution duration by agent
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: monitoring/metrics.py
+          symbol: MetricsCollector.record_task_complete
+    metadata:
+      created_at: 2026-03-24T00:19:18.115Z
+      updated_at: 2026-03-24T00:19:18.115Z
+      version: 1
+  timestamp: 2026-03-24T00:19:18.140Z
+  sequenceNumber: 5
+- type: add
+  elementId: apm.metricinstrument.task-success-counter
+  layerName: apm
+  after:
+    id: 0ab5cc8e-504d-402d-ad86-d5c67c8739af
+    path: apm.metricinstrument.task-success-counter
+    spec_node_id: apm.metricinstrument
+    type: metricinstrument
+    layer_id: apm
+    name: Task Success Counter
+    description: Counter tracking task success/failure per agent; used to compute
+      rolling success rates and trigger circuit breaker thresholds
+    attributes:
+      type: Counter
+      unit: "1"
+      description: Task success/failure count by agent
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: monitoring/metrics.py
+          symbol: MetricsCollector.record_task_complete
+    metadata:
+      created_at: 2026-03-24T00:19:18.603Z
+      updated_at: 2026-03-24T00:19:18.603Z
+      version: 1
+  timestamp: 2026-03-24T00:19:18.628Z
+  sequenceNumber: 6
+- type: add
+  elementId: apm.metricinstrument.quality-metric-score
+  layerName: apm
+  after:
+    id: 2835819d-3167-4bd8-bd8d-34461d5746a7
+    path: apm.metricinstrument.quality-metric-score
+    spec_node_id: apm.metricinstrument
+    type: metricinstrument
+    layer_id: apm
+    name: Quality Metric Score
+    description: Gauge metric recording quality scores (0.0-1.0) per metric_name per
+      agent; stored in Elasticsearch quality-metrics index
+    attributes:
+      type: Gauge
+      unit: "1"
+      description: Quality score by agent and metric_name
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: monitoring/metrics.py
+          symbol: MetricsCollector.record_quality_metric
+    metadata:
+      created_at: 2026-03-24T00:19:19.125Z
+      updated_at: 2026-03-24T00:19:19.125Z
+      version: 1
+  timestamp: 2026-03-24T00:19:19.155Z
+  sequenceNumber: 7
+- type: add
+  elementId: apm.dashboard.orchestrator-monitoring-dashboard
+  layerName: apm
+  after:
+    id: c1351cdc-2d88-4bc3-9c26-b948ffc34f30
+    path: apm.dashboard.orchestrator-monitoring-dashboard
+    spec_node_id: apm.dashboard
+    type: dashboard
+    layer_id: apm
+    name: Orchestrator Monitoring Dashboard
+    description: "React web UI dashboard (port 3000) providing real-time monitoring:
+      pipeline graph, active agents, live logs, circuit breakers, token usage,
+      project health, and historical metrics"
+    attributes:
+      tool: custom
+      description: Real-time orchestrator monitoring dashboard
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: web_ui/src/routes/index.jsx
+    metadata:
+      created_at: 2026-03-24T00:19:33.647Z
+      updated_at: 2026-03-24T00:19:33.647Z
+      version: 1
+  timestamp: 2026-03-24T00:19:33.672Z
+  sequenceNumber: 8
+- type: add
+  elementId: apm.dashboard.kibana-analytics-dashboard
+  layerName: apm
+  after:
+    id: 3e67b391-bbaa-493f-ae2e-67129cf72bfb
+    path: apm.dashboard.kibana-analytics-dashboard
+    spec_node_id: apm.dashboard
+    type: dashboard
+    layer_id: apm
+    name: Kibana Analytics Dashboard
+    description: "Kibana dashboard providing Elasticsearch analytics: agent log
+      patterns, pipeline run distributions, failure analysis, and trend
+      visualization"
+    attributes:
+      tool: grafana
+      description: Elasticsearch-backed analytics and pattern detection
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: config/kibana_dashboard.ndjson
+    metadata:
+      created_at: 2026-03-24T00:19:34.143Z
+      updated_at: 2026-03-24T00:19:34.143Z
+      version: 1
+  timestamp: 2026-03-24T00:19:34.168Z
+  sequenceNumber: 9
+- type: add
+  elementId: apm.alert.git-hub-circuit-breaker-open
+  layerName: apm
+  after:
+    id: 9cdb06b0-5624-4dd1-8a49-324c377eac77
+    path: apm.alert.git-hub-circuit-breaker-open
+    spec_node_id: apm.alert
+    type: alert
+    layer_id: apm
+    name: GitHub Circuit Breaker Open
+    description: Alert triggered when the GitHub API circuit breaker opens after
+      exceeding failure_threshold (3 failures in monitoring, 6 for
+      senior_software_engineer); orchestrator logs error and exits after 15
+      consecutive health failures
+    attributes:
+      severity: critical
+      condition: github_circuit_breaker.state == OPEN
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/circuit_breaker.py
+          symbol: CircuitBreaker
+    metadata:
+      created_at: 2026-03-24T00:19:45.322Z
+      updated_at: 2026-03-24T00:19:45.322Z
+      version: 1
+  timestamp: 2026-03-24T00:19:45.347Z
+  sequenceNumber: 10
+- type: add
+  elementId: apm.alert.agent-execution-timeout
+  layerName: apm
+  after:
+    id: ec3d0726-c018-45f4-b958-eabb5df5b610
+    path: apm.alert.agent-execution-timeout
+    spec_node_id: apm.alert
+    type: alert
+    layer_id: apm
+    name: Agent Execution Timeout
+    description: Alert when a senior_software_engineer agent container exceeds the
+      3-hour (10800s) hard timeout; container is killed and task marked as
+      failed
+    attributes:
+      severity: warning
+      condition: agent_execution_duration > timeout_seconds
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: claude/docker_runner.py
+          symbol: DockerAgentRunner
+    metadata:
+      created_at: 2026-03-24T00:19:45.819Z
+      updated_at: 2026-03-24T00:19:45.819Z
+      version: 1
+  timestamp: 2026-03-24T00:19:45.846Z
+  sequenceNumber: 11
+- type: add
+  elementId: apm.alert.zombie-pipeline-run-detected
+  layerName: apm
+  after:
+    id: bd825a29-748a-496c-99c2-88fa3b353cd1
+    path: apm.alert.zombie-pipeline-run-detected
+    spec_node_id: apm.alert
+    type: alert
+    layer_id: apm
+    name: Zombie Pipeline Run Detected
+    description: Alert when PipelineWatchdog detects a pipeline run stuck in active
+      state for over 30 minutes with no corresponding agent container; triggers
+      automatic cleanup
+    attributes:
+      severity: warning
+      condition: active_pipeline_age > 30min AND no_running_container
+      evaluationInterval: 5m
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/pipeline_watchdog.py
+          symbol: PipelineWatchdog
+    metadata:
+      created_at: 2026-03-24T00:19:46.322Z
+      updated_at: 2026-03-24T00:19:46.322Z
+      version: 1
+  timestamp: 2026-03-24T00:19:46.349Z
+  sequenceNumber: 12
+- type: add
+  elementId: apm.alert.claude-token-quota-warning
+  layerName: apm
+  after:
+    id: 13af7d49-060f-4dda-95ae-3fc6ad319b05
+    path: apm.alert.claude-token-quota-warning
+    spec_node_id: apm.alert
+    type: alert
+    layer_id: apm
+    name: Claude Token Quota Warning
+    description: Warning when Claude Code weekly token quota (630M) or per-session
+      quota (50M) approaches threshold; tracked by claude_code_breaker and
+      token_metrics_service
+    attributes:
+      severity: warning
+      condition: token_usage > quota_threshold
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: monitoring/claude_code_breaker.py
+          symbol: ClaudeCodeBreaker
+    metadata:
+      created_at: 2026-03-24T00:19:55.470Z
+      updated_at: 2026-03-24T00:19:55.470Z
+      version: 1
+  timestamp: 2026-03-24T00:19:55.500Z
+  sequenceNumber: 13
+- type: add
+  elementId: apm.instrumentationconfig.agent-event-instrumentation
+  layerName: apm
+  after:
+    id: 7c558610-bb28-496e-8bfe-526c30e93e9c
+    path: apm.instrumentationconfig.agent-event-instrumentation
+    spec_node_id: apm.instrumentationconfig
+    type: instrumentationconfig
+    layer_id: apm
+    name: Agent Event Instrumentation
+    description: Custom instrumentation emitting structured observability events for
+      agent lifecycle (start/complete/fail), tool calls, review cycle decisions,
+      and pipeline stage transitions to Redis pub/sub
+    attributes:
+      type: custom
+      libraryName: monitoring.observability
+      enabled: true
+      description: Custom agent execution observability
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: monitoring/observability.py
+          symbol: ObservabilityManager
+    metadata:
+      created_at: 2026-03-24T00:19:55.984Z
+      updated_at: 2026-03-24T00:19:55.984Z
+      version: 1
+  timestamp: 2026-03-24T00:19:56.011Z
+  sequenceNumber: 14

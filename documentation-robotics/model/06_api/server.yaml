@@ -1,0 +1,42 @@
+api.server.observability-server:
+  id: a98a8b98-bbe2-4f6b-b0f4-02f8eaf79465
+  path: api.server.observability-server
+  spec_node_id: api.server
+  type: server
+  layer_id: api
+  name: Observability Server
+  description: Flask server running on port 5001 within the Docker Compose network
+  attributes:
+    url: http://localhost:5001
+    description: Observability and monitoring API server
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/observability_server.py
+        symbol: app
+  metadata:
+    created_at: 2026-03-24T00:10:15.446Z
+    updated_at: 2026-03-24T00:10:15.446Z
+    version: 1
+api.server.git-hub-graph-ql-api:
+  id: 95d87e5a-2df9-41c7-a8fd-8f571fc6bf54
+  path: api.server.git-hub-graph-ql-api
+  spec_node_id: api.server
+  type: server
+  layer_id: api
+  name: GitHub GraphQL API
+  description: External GitHub GraphQL API v4 endpoint consumed by this
+    orchestrator for all Projects v2, Discussion, and Issue mutations and
+    queries
+  attributes:
+    url: https://api.github.com/graphql
+    description: GitHub GraphQL API v4 (consumed/external)
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/github_api_client.py
+        symbol: GitHubAPIClient.graphql
+  metadata:
+    created_at: 2026-03-24T10:28:53.362Z
+    updated_at: 2026-03-24T10:28:53.362Z
+    version: 1

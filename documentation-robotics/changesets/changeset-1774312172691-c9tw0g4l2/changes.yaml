@@ -1,0 +1,878 @@
+- type: add
+  elementId: motivation.stakeholder.software-development-teams
+  layerName: motivation
+  after:
+    id: 216a0940-9a5c-4e67-a7d8-afd18f575349
+    path: motivation.stakeholder.software-development-teams
+    spec_node_id: motivation.stakeholder
+    type: stakeholder
+    layer_id: motivation
+    name: Software Development Teams
+    description: Internal engineering teams who use the orchestrator to automate
+      their SDLC workflows
+    attributes:
+      type: internal
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: main.py
+          symbol: main
+    metadata:
+      created_at: 2026-03-24T00:29:43.125Z
+      updated_at: 2026-03-24T00:29:43.125Z
+      version: 1
+  timestamp: 2026-03-24T00:29:43.148Z
+  sequenceNumber: 0
+- type: add
+  elementId: motivation.stakeholder.platform-engineering
+  layerName: motivation
+  after:
+    id: 1ee7348c-3076-41bc-aaf7-5840e837334f
+    path: motivation.stakeholder.platform-engineering
+    spec_node_id: motivation.stakeholder
+    type: stakeholder
+    layer_id: motivation
+    name: Platform Engineering
+    description: DevOps engineers who deploy, configure, and maintain the
+      orchestrator infrastructure
+    attributes:
+      type: internal
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: docker-compose.yml
+          symbol: orchestrator
+    metadata:
+      created_at: 2026-03-24T00:29:43.650Z
+      updated_at: 2026-03-24T00:29:43.650Z
+      version: 1
+  timestamp: 2026-03-24T00:29:43.675Z
+  sequenceNumber: 1
+- type: add
+  elementId: motivation.stakeholder.anthropic-claude-api
+  layerName: motivation
+  after:
+    id: 10166279-ac74-4d39-b7e5-023525f7d3bd
+    path: motivation.stakeholder.anthropic-claude-api
+    spec_node_id: motivation.stakeholder
+    type: stakeholder
+    layer_id: motivation
+    name: Anthropic Claude API
+    description: External AI model provider whose API pricing, rate limits, and
+      capabilities constrain system design
+    attributes:
+      type: external
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: requirements.txt
+          symbol: anthropic
+    metadata:
+      created_at: 2026-03-24T00:29:44.186Z
+      updated_at: 2026-03-24T00:29:44.186Z
+      version: 1
+  timestamp: 2026-03-24T00:29:44.212Z
+  sequenceNumber: 2
+- type: add
+  elementId: motivation.stakeholder.git-hub-platform
+  layerName: motivation
+  after:
+    id: 524e62a2-a9fa-4283-870f-116deec668b8
+    path: motivation.stakeholder.git-hub-platform
+    spec_node_id: motivation.stakeholder
+    type: stakeholder
+    layer_id: motivation
+    name: GitHub Platform
+    description: External platform providing issue tracking, project boards, code
+      hosting, and CI/CD integration
+    attributes:
+      type: external
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/github_app.py
+          symbol: GitHubApp
+    metadata:
+      created_at: 2026-03-24T00:29:44.717Z
+      updated_at: 2026-03-24T00:29:44.717Z
+      version: 1
+  timestamp: 2026-03-24T00:29:44.740Z
+  sequenceNumber: 3
+- type: add
+  elementId: motivation.driver.developer-productivity-bottleneck
+  layerName: motivation
+  after:
+    id: fcdccc7d-8230-4d83-96cf-b8fe596961d8
+    path: motivation.driver.developer-productivity-bottleneck
+    spec_node_id: motivation.driver
+    type: driver
+    layer_id: motivation
+    name: Developer Productivity Bottleneck
+    description: Repetitive SDLC tasks (research, requirements, code review,
+      testing) consume significant developer time
+    attributes:
+      category: operational
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: config/foundations/pipelines.yaml
+          symbol: planning_design
+    metadata:
+      created_at: 2026-03-24T00:29:55.020Z
+      updated_at: 2026-03-24T00:29:55.020Z
+      version: 1
+  timestamp: 2026-03-24T00:29:55.044Z
+  sequenceNumber: 4
+- type: add
+  elementId: motivation.driver.ai-capability-advancement
+  layerName: motivation
+  after:
+    id: 6a19b626-1a98-4c2a-8c63-e26cf3dc77a5
+    path: motivation.driver.ai-capability-advancement
+    spec_node_id: motivation.driver
+    type: driver
+    layer_id: motivation
+    name: AI Capability Advancement
+    description: Claude models (Opus, Sonnet, Haiku) now have sufficient capability
+      to execute complex SDLC stages autonomously
+    attributes:
+      category: technological
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: config/foundations/agents.yaml
+          symbol: agents
+    metadata:
+      created_at: 2026-03-24T00:29:55.568Z
+      updated_at: 2026-03-24T00:29:55.568Z
+      version: 1
+  timestamp: 2026-03-24T00:29:55.592Z
+  sequenceNumber: 5
+- type: add
+  elementId: motivation.driver.git-hub-ecosystem-ubiquity
+  layerName: motivation
+  after:
+    id: c7fb9a3f-7d35-49e1-b18a-37da45cd563b
+    path: motivation.driver.git-hub-ecosystem-ubiquity
+    spec_node_id: motivation.driver
+    type: driver
+    layer_id: motivation
+    name: GitHub Ecosystem Ubiquity
+    description: GitHub Projects v2 and issue tracking are the standard workflow
+      interface for most development teams
+    attributes:
+      category: strategic
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/github_project_manager.py
+          symbol: GitHubProjectManager
+    metadata:
+      created_at: 2026-03-24T00:29:56.103Z
+      updated_at: 2026-03-24T00:29:56.103Z
+      version: 1
+  timestamp: 2026-03-24T00:29:56.127Z
+  sequenceNumber: 6
+- type: add
+  elementId: motivation.driver.software-delivery-speed-pressure
+  layerName: motivation
+  after:
+    id: e0782646-b6e3-44a0-8f08-38731ed6a912
+    path: motivation.driver.software-delivery-speed-pressure
+    spec_node_id: motivation.driver
+    type: driver
+    layer_id: motivation
+    name: Software Delivery Speed Pressure
+    description: Competitive pressure to reduce time-to-production for features
+      while maintaining quality standards
+    attributes:
+      category: competitive
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: config/foundations/pipelines.yaml
+          symbol: sdlc_execution
+    metadata:
+      created_at: 2026-03-24T00:29:56.635Z
+      updated_at: 2026-03-24T00:29:56.635Z
+      version: 1
+  timestamp: 2026-03-24T00:29:56.659Z
+  sequenceNumber: 7
+- type: add
+  elementId: motivation.goal.fully-autonomous-sdlc-execution
+  layerName: motivation
+  after:
+    id: 1761551e-d21b-4a59-95e4-deb4b3ec7ede
+    path: motivation.goal.fully-autonomous-sdlc-execution
+    spec_node_id: motivation.goal
+    type: goal
+    layer_id: motivation
+    name: Fully Autonomous SDLC Execution
+    description: Execute complete software development lifecycle from issue to
+      staged PR without human intervention
+    attributes:
+      priority: critical
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: config/foundations/pipelines.yaml
+          symbol: sdlc_execution
+    metadata:
+      created_at: 2026-03-24T00:30:06.054Z
+      updated_at: 2026-03-24T00:30:06.054Z
+      version: 1
+  timestamp: 2026-03-24T00:30:06.080Z
+  sequenceNumber: 8
+- type: add
+  elementId: motivation.goal.git-hub-native-developer-experience
+  layerName: motivation
+  after:
+    id: 95e3dcc7-94ce-4930-a3ca-6430e18b4618
+    path: motivation.goal.git-hub-native-developer-experience
+    spec_node_id: motivation.goal
+    type: goal
+    layer_id: motivation
+    name: GitHub-Native Developer Experience
+    description: Pipeline initiation and monitoring exclusively through GitHub
+      project boards; no separate tooling required
+    attributes:
+      priority: high
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/github_project_manager.py
+          symbol: GitHubProjectManager
+    metadata:
+      created_at: 2026-03-24T00:30:06.609Z
+      updated_at: 2026-03-24T00:30:06.609Z
+      version: 1
+  timestamp: 2026-03-24T00:30:06.634Z
+  sequenceNumber: 9
+- type: add
+  elementId: motivation.goal.multi-project-parallel-pipeline-management
+  layerName: motivation
+  after:
+    id: 096a56e2-7e3a-475d-aee6-e903ef6341ca
+    path: motivation.goal.multi-project-parallel-pipeline-management
+    spec_node_id: motivation.goal
+    type: goal
+    layer_id: motivation
+    name: Multi-Project Parallel Pipeline Management
+    description: Support concurrent pipelines across multiple projects with proper
+      serialization and isolation
+    attributes:
+      priority: high
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/pipeline_lock_manager.py
+          symbol: PipelineLockManager
+    metadata:
+      created_at: 2026-03-24T00:30:07.162Z
+      updated_at: 2026-03-24T00:30:07.162Z
+      version: 1
+  timestamp: 2026-03-24T00:30:07.188Z
+  sequenceNumber: 10
+- type: add
+  elementId: motivation.goal.fault-tolerant-pipeline-recovery
+  layerName: motivation
+  after:
+    id: c6c13691-42f0-4afc-8225-9950670cdcc2
+    path: motivation.goal.fault-tolerant-pipeline-recovery
+    spec_node_id: motivation.goal
+    type: goal
+    layer_id: motivation
+    name: Fault-Tolerant Pipeline Recovery
+    description: Recover from container crashes, API failures, and orchestrator
+      restarts without losing pipeline state
+    attributes:
+      priority: high
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: state_management/manager.py
+          symbol: StateManager.checkpoint
+    metadata:
+      created_at: 2026-03-24T00:30:07.722Z
+      updated_at: 2026-03-24T00:30:07.722Z
+      version: 1
+  timestamp: 2026-03-24T00:30:07.746Z
+  sequenceNumber: 11
+- type: add
+  elementId: motivation.goal.transparent-execution-observability
+  layerName: motivation
+  after:
+    id: 95dc79b0-cd7e-4c5d-90d0-353630b9b8fd
+    path: motivation.goal.transparent-execution-observability
+    spec_node_id: motivation.goal
+    type: goal
+    layer_id: motivation
+    name: Transparent Execution Observability
+    description: Full visibility into agent execution, pipeline state, and system
+      health through web UI and metrics
+    attributes:
+      priority: medium
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/observability_server.py
+          symbol: ObservabilityServer
+    metadata:
+      created_at: 2026-03-24T00:30:08.283Z
+      updated_at: 2026-03-24T00:30:08.283Z
+      version: 1
+  timestamp: 2026-03-24T00:30:08.308Z
+  sequenceNumber: 12
+- type: add
+  elementId: motivation.principle.maker-checker-quality-assurance
+  layerName: motivation
+  after:
+    id: f60f85a5-044a-46a9-8536-259d4aaa6097
+    path: motivation.principle.maker-checker-quality-assurance
+    spec_node_id: motivation.principle
+    type: principle
+    layer_id: motivation
+    name: Maker-Checker Quality Assurance
+    description: Every artifact produced by a maker agent is independently verified
+      by a checker agent before progression
+    attributes:
+      category: architecture
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: config/foundations/pipelines.yaml
+          symbol: sdlc_execution.stages.implementation
+    metadata:
+      created_at: 2026-03-24T00:30:21.033Z
+      updated_at: 2026-03-24T00:30:21.033Z
+      version: 1
+  timestamp: 2026-03-24T00:30:21.058Z
+  sequenceNumber: 13
+- type: add
+  elementId: motivation.principle.container-isolation-per-task
+  layerName: motivation
+  after:
+    id: 4763de3e-15c6-45ce-82a4-80b381b5e84c
+    path: motivation.principle.container-isolation-per-task
+    spec_node_id: motivation.principle
+    type: principle
+    layer_id: motivation
+    name: Container Isolation Per Task
+    description: Each agent execution is isolated in a fresh Docker container to
+      prevent cross-task contamination and limit blast radius
+    attributes:
+      category: security
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: claude/docker_runner.py
+          symbol: DockerAgentRunner
+    metadata:
+      created_at: 2026-03-24T00:30:21.587Z
+      updated_at: 2026-03-24T00:30:21.587Z
+      version: 1
+  timestamp: 2026-03-24T00:30:21.612Z
+  sequenceNumber: 14
+- type: add
+  elementId: motivation.principle.git-hub-as-source-of-truth
+  layerName: motivation
+  after:
+    id: c45fc1df-fa26-4386-a971-5663e70329cf
+    path: motivation.principle.git-hub-as-source-of-truth
+    spec_node_id: motivation.principle
+    type: principle
+    layer_id: motivation
+    name: GitHub as Source of Truth
+    description: GitHub issue state and board position are the authoritative source
+      of pipeline state; local state reconciles to GitHub
+    attributes:
+      category: architecture
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/project_monitor.py
+          symbol: ProjectMonitor
+    metadata:
+      created_at: 2026-03-24T00:30:22.132Z
+      updated_at: 2026-03-24T00:30:22.132Z
+      version: 1
+  timestamp: 2026-03-24T00:30:22.159Z
+  sequenceNumber: 15
+- type: add
+  elementId: motivation.principle.graceful-degradation
+  layerName: motivation
+  after:
+    id: 6c0f5b2b-bc92-4119-b418-05591e759963
+    path: motivation.principle.graceful-degradation
+    spec_node_id: motivation.principle
+    type: principle
+    layer_id: motivation
+    name: Graceful Degradation
+    description: "System falls back to lower-capability mode rather than failing:
+      App->PAT auth, Redis->in-memory queue"
+    attributes:
+      category: operational
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/github_app.py
+          symbol: GitHubApp._get_token
+    metadata:
+      created_at: 2026-03-24T00:30:22.677Z
+      updated_at: 2026-03-24T00:30:22.677Z
+      version: 1
+  timestamp: 2026-03-24T00:30:22.708Z
+  sequenceNumber: 16
+- type: add
+  elementId: motivation.principle.pipeline-serialization-per-project
+  layerName: motivation
+  after:
+    id: 88f747fe-5789-45b3-b44a-89328bf9b11f
+    path: motivation.principle.pipeline-serialization-per-project
+    spec_node_id: motivation.principle
+    type: principle
+    layer_id: motivation
+    name: Pipeline Serialization Per Project
+    description: One active pipeline per project/board at a time to prevent
+      conflicting concurrent changes to the same codebase
+    attributes:
+      category: architecture
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/pipeline_lock_manager.py
+          symbol: PipelineLockManager
+    metadata:
+      created_at: 2026-03-24T00:30:23.265Z
+      updated_at: 2026-03-24T00:30:23.265Z
+      version: 1
+  timestamp: 2026-03-24T00:30:23.297Z
+  sequenceNumber: 17
+- type: add
+  elementId: motivation.requirement.git-hub-projects-v2-board-automation
+  layerName: motivation
+  after:
+    id: 74b7d147-ea1f-482f-8f6c-36c13f828760
+    path: motivation.requirement.git-hub-projects-v2-board-automation
+    spec_node_id: motivation.requirement
+    type: requirement
+    layer_id: motivation
+    name: GitHub Projects v2 Board Automation
+    description: System must automatically create and reconcile GitHub Projects v2
+      boards from YAML configuration
+    attributes:
+      requirementType: functional
+      priority: critical
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/github_project_manager.py
+          symbol: GitHubProjectManager
+    metadata:
+      created_at: 2026-03-24T00:30:36.869Z
+      updated_at: 2026-03-24T00:30:36.869Z
+      version: 1
+  timestamp: 2026-03-24T00:30:36.897Z
+  sequenceNumber: 18
+- type: add
+  elementId: motivation.requirement.agent-docker-in-docker-execution
+  layerName: motivation
+  after:
+    id: 29082f57-95d2-4613-b0c8-b997303f48e4
+    path: motivation.requirement.agent-docker-in-docker-execution
+    spec_node_id: motivation.requirement
+    type: requirement
+    layer_id: motivation
+    name: Agent Docker-in-Docker Execution
+    description: Each agent must execute in an isolated Docker container with
+      project-specific dependencies
+    attributes:
+      requirementType: non-functional
+      priority: critical
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: claude/docker_runner.py
+          symbol: DockerAgentRunner
+    metadata:
+      created_at: 2026-03-24T00:30:37.422Z
+      updated_at: 2026-03-24T00:30:37.422Z
+      version: 1
+  timestamp: 2026-03-24T00:30:37.451Z
+  sequenceNumber: 19
+- type: add
+  elementId: motivation.requirement.pipeline-checkpoint-and-recovery
+  layerName: motivation
+  after:
+    id: cc94a0bd-c533-44f6-8e50-50ee8cd28115
+    path: motivation.requirement.pipeline-checkpoint-and-recovery
+    spec_node_id: motivation.requirement
+    type: requirement
+    layer_id: motivation
+    name: Pipeline Checkpoint and Recovery
+    description: Pipeline must checkpoint after each stage and resume from last
+      successful stage on restart
+    attributes:
+      requirementType: non-functional
+      priority: high
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: state_management/manager.py
+          symbol: StateManager.checkpoint
+    metadata:
+      created_at: 2026-03-24T00:30:37.983Z
+      updated_at: 2026-03-24T00:30:37.983Z
+      version: 1
+  timestamp: 2026-03-24T00:30:38.011Z
+  sequenceNumber: 20
+- type: add
+  elementId: motivation.requirement.multi-turn-conversational-agent-interaction
+  layerName: motivation
+  after:
+    id: 3150314c-4c77-4701-a9f1-f4f67cf8d6f4
+    path: motivation.requirement.multi-turn-conversational-agent-interaction
+    spec_node_id: motivation.requirement
+    type: requirement
+    layer_id: motivation
+    name: Multi-Turn Conversational Agent Interaction
+    description: Agents must support initial, revision, and question execution modes
+      with conversation history
+    attributes:
+      requirementType: functional
+      priority: high
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: claude/session_manager.py
+          symbol: SessionManager
+    metadata:
+      created_at: 2026-03-24T00:30:38.537Z
+      updated_at: 2026-03-24T00:30:38.537Z
+      version: 1
+  timestamp: 2026-03-24T00:30:38.566Z
+  sequenceNumber: 21
+- type: add
+  elementId: motivation.requirement.git-hub-rate-limit-compliance
+  layerName: motivation
+  after:
+    id: 4b66c6a5-54a7-4455-bfd2-872d1c048ea3
+    path: motivation.requirement.git-hub-rate-limit-compliance
+    spec_node_id: motivation.requirement
+    type: requirement
+    layer_id: motivation
+    name: GitHub Rate Limit Compliance
+    description: System must not exceed GitHub API rate limits; back-off, circuit
+      breaker, and monitoring required
+    attributes:
+      requirementType: non-functional
+      priority: high
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/github_api_client.py
+          symbol: GitHubRateLimitStatus
+    metadata:
+      created_at: 2026-03-24T00:30:39.077Z
+      updated_at: 2026-03-24T00:30:39.077Z
+      version: 1
+  timestamp: 2026-03-24T00:30:39.106Z
+  sequenceNumber: 22
+- type: add
+  elementId: motivation.constraint.git-hub-api-rate-limit-5000-requests-per-hour
+  layerName: motivation
+  after:
+    id: 0c8071b4-6df6-4148-bb9e-8242b0d92b8f
+    path: motivation.constraint.git-hub-api-rate-limit-5000-requests-per-hour
+    spec_node_id: motivation.constraint
+    type: constraint
+    layer_id: motivation
+    name: GitHub API Rate Limit 5000 Requests Per Hour
+    description: GitHub App installation token rate limit of 5000 requests per hour
+      per installation
+    attributes:
+      constraintType: external
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: documentation/github-authentication.md
+          symbol: GitHubBreaker
+    metadata:
+      created_at: 2026-03-24T00:30:49.090Z
+      updated_at: 2026-03-24T00:30:49.090Z
+      version: 1
+  timestamp: 2026-03-24T00:30:49.120Z
+  sequenceNumber: 23
+- type: add
+  elementId: motivation.constraint.rootful-docker-required-for-docker-in-docker
+  layerName: motivation
+  after:
+    id: cbffa6f8-dee7-4a21-864d-40cf7c9ea22e
+    path: motivation.constraint.rootful-docker-required-for-docker-in-docker
+    spec_node_id: motivation.constraint
+    type: constraint
+    layer_id: motivation
+    name: Rootful Docker Required for Docker-in-Docker
+    description: Rootless Docker-in-Docker is not yet stable; requires rootful
+      Docker with socket mount
+    attributes:
+      constraintType: technical
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: Dockerfile
+          symbol: DOCKER_GID
+    metadata:
+      created_at: 2026-03-24T00:30:49.651Z
+      updated_at: 2026-03-24T00:30:49.651Z
+      version: 1
+  timestamp: 2026-03-24T00:30:49.679Z
+  sequenceNumber: 24
+- type: add
+  elementId: motivation.constraint.anthropic-api-token-cost
+  layerName: motivation
+  after:
+    id: 6e1ad742-7b94-410b-b393-8cfbda282dd0
+    path: motivation.constraint.anthropic-api-token-cost
+    spec_node_id: motivation.constraint
+    type: constraint
+    layer_id: motivation
+    name: Anthropic API Token Cost
+    description: Agent execution costs tokens; max_total_agent_calls (100) circuit
+      breaker limits cost per repair cycle
+    attributes:
+      constraintType: financial
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: config/foundations/agents.yaml
+          symbol: agents
+    metadata:
+      created_at: 2026-03-24T00:30:50.221Z
+      updated_at: 2026-03-24T00:30:50.221Z
+      version: 1
+  timestamp: 2026-03-24T00:30:50.251Z
+  sequenceNumber: 25
+- type: add
+  elementId: motivation.constraint.single-orchestrator-instance-per-workspace
+  layerName: motivation
+  after:
+    id: a800f339-0e1d-4e11-8cba-e5846d5b608d
+    path: motivation.constraint.single-orchestrator-instance-per-workspace
+    spec_node_id: motivation.constraint
+    type: constraint
+    layer_id: motivation
+    name: Single Orchestrator Instance Per Workspace
+    description: Pipeline lock model assumes single orchestrator instance; no
+      horizontal scaling in current design
+    attributes:
+      constraintType: technical
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/pipeline_lock_manager.py
+          symbol: PipelineLockManager
+    metadata:
+      created_at: 2026-03-24T00:30:50.804Z
+      updated_at: 2026-03-24T00:30:50.804Z
+      version: 1
+  timestamp: 2026-03-24T00:30:50.836Z
+  sequenceNumber: 26
+- type: add
+  elementId: motivation.value.developer-productivity
+  layerName: motivation
+  after:
+    id: 4fc61c1e-b231-4c4a-9f03-49701553a757
+    path: motivation.value.developer-productivity
+    spec_node_id: motivation.value
+    type: value
+    layer_id: motivation
+    name: Developer Productivity
+    description: Reduction in manual effort for repetitive SDLC tasks through AI automation
+    attributes:
+      valueType: operational
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: config/foundations/pipelines.yaml
+          symbol: planning_design
+    metadata:
+      created_at: 2026-03-24T00:31:05.193Z
+      updated_at: 2026-03-24T00:31:05.193Z
+      version: 1
+  timestamp: 2026-03-24T00:31:05.223Z
+  sequenceNumber: 27
+- type: add
+  elementId: motivation.value.software-delivery-velocity
+  layerName: motivation
+  after:
+    id: ac53e06e-c0a1-41cd-a66a-25ef81a4163a
+    path: motivation.value.software-delivery-velocity
+    spec_node_id: motivation.value
+    type: value
+    layer_id: motivation
+    name: Software Delivery Velocity
+    description: Faster time-to-production by parallelizing agent work and
+      eliminating human wait times
+    attributes:
+      valueType: strategic
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: config/foundations/pipelines.yaml
+          symbol: sdlc_execution
+    metadata:
+      created_at: 2026-03-24T00:31:05.756Z
+      updated_at: 2026-03-24T00:31:05.756Z
+      version: 1
+  timestamp: 2026-03-24T00:31:05.786Z
+  sequenceNumber: 28
+- type: add
+  elementId: motivation.value.consistent-code-quality
+  layerName: motivation
+  after:
+    id: c32f1f3b-9b8d-4d22-95c9-1517aac4be4f
+    path: motivation.value.consistent-code-quality
+    spec_node_id: motivation.value
+    type: value
+    layer_id: motivation
+    name: Consistent Code Quality
+    description: Uniform application of code review standards through automated
+      checker agents on every PR
+    attributes:
+      valueType: operational
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: config/foundations/pipelines.yaml
+          symbol: sdlc_execution.stages.implementation
+    metadata:
+      created_at: 2026-03-24T00:31:06.320Z
+      updated_at: 2026-03-24T00:31:06.320Z
+      version: 1
+  timestamp: 2026-03-24T00:31:06.350Z
+  sequenceNumber: 29
+- type: add
+  elementId: motivation.outcome.autonomous-feature-development-end-to-end
+  layerName: motivation
+  after:
+    id: cc4e136b-e44a-4a31-9017-bfd8abcde500
+    path: motivation.outcome.autonomous-feature-development-end-to-end
+    spec_node_id: motivation.outcome
+    type: outcome
+    layer_id: motivation
+    name: Autonomous Feature Development End-to-End
+    description: Issues move from Backlog to Staged with full code implementation,
+      review, and testing without human intervention
+    attributes:
+      status: in-progress
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: config/foundations/pipelines.yaml
+          symbol: sdlc_execution
+    metadata:
+      created_at: 2026-03-24T00:31:16.216Z
+      updated_at: 2026-03-24T00:31:16.216Z
+      version: 1
+  timestamp: 2026-03-24T00:31:16.246Z
+  sequenceNumber: 30
+- type: add
+  elementId: motivation.outcome.stable-multi-project-orchestration
+  layerName: motivation
+  after:
+    id: f26f4a53-19e0-4cd3-85d7-f2d2441e5573
+    path: motivation.outcome.stable-multi-project-orchestration
+    spec_node_id: motivation.outcome
+    type: outcome
+    layer_id: motivation
+    name: Stable Multi-Project Orchestration
+    description: Multiple projects run concurrent pipelines reliably with lock-based
+      serialization and crash recovery
+    attributes:
+      status: in-progress
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/pipeline_lock_manager.py
+          symbol: PipelineLockManager
+    metadata:
+      created_at: 2026-03-24T00:31:16.775Z
+      updated_at: 2026-03-24T00:31:16.775Z
+      version: 1
+  timestamp: 2026-03-24T00:31:16.806Z
+  sequenceNumber: 31
+- type: add
+  elementId: motivation.assessment.docker-in-docker-stability-risk
+  layerName: motivation
+  after:
+    id: bdf233f4-dc28-4349-8306-73ef27782e3e
+    path: motivation.assessment.docker-in-docker-stability-risk
+    spec_node_id: motivation.assessment
+    type: assessment
+    layer_id: motivation
+    name: Docker-in-Docker Stability Risk
+    description: Rootful Docker-in-Docker dependency creates security surface;
+      rootless alternative not yet viable
+    attributes:
+      assessmentType: risk
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: Dockerfile
+          symbol: DOCKER_GID
+    metadata:
+      created_at: 2026-03-24T00:31:25.011Z
+      updated_at: 2026-03-24T00:31:25.011Z
+      version: 1
+  timestamp: 2026-03-24T00:31:25.045Z
+  sequenceNumber: 32
+- type: add
+  elementId: motivation.assessment.single-instance-scalability-gap
+  layerName: motivation
+  after:
+    id: 22ec298f-75dc-447a-8eb5-7480c6d434d2
+    path: motivation.assessment.single-instance-scalability-gap
+    spec_node_id: motivation.assessment
+    type: assessment
+    layer_id: motivation
+    name: Single-Instance Scalability Gap
+    description: Pipeline lock assumes single orchestrator instance; horizontal
+      scaling would require distributed lock coordination
+    attributes:
+      assessmentType: gap
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/pipeline_lock_manager.py
+          symbol: PipelineLockManager
+    metadata:
+      created_at: 2026-03-24T00:31:25.631Z
+      updated_at: 2026-03-24T00:31:25.631Z
+      version: 1
+  timestamp: 2026-03-24T00:31:25.666Z
+  sequenceNumber: 33
+- type: add
+  elementId: motivation.meaning.autonomous-ai-development-partnership
+  layerName: motivation
+  after:
+    id: 2a159b9c-6fb4-4eb8-8577-6875d7b95e29
+    path: motivation.meaning.autonomous-ai-development-partnership
+    spec_node_id: motivation.meaning
+    type: meaning
+    layer_id: motivation
+    name: Autonomous AI Development Partnership
+    description: AI agents are partners in the development process, not merely
+      tools; the system enables a new modality of human-AI collaborative
+      software engineering
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: main.py
+          symbol: main
+    metadata:
+      created_at: 2026-03-24T00:31:30.644Z
+      updated_at: 2026-03-24T00:31:30.644Z
+      version: 1
+  timestamp: 2026-03-24T00:31:30.676Z
+  sequenceNumber: 34

@@ -1,0 +1,23 @@
+apm.logprocessor.elasticsearch-log-indexer:
+  id: fbd6de33-b798-4676-9a28-8e09e3881fa6
+  path: apm.logprocessor.elasticsearch-log-indexer
+  spec_node_id: apm.logprocessor
+  type: logprocessor
+  layer_id: apm
+  name: Elasticsearch Log Indexer
+  description: Log collector service batches structured JSON events from Redis
+    streams and bulk-indexes them to Elasticsearch daily indices with batch size
+    50 and 5s timeout
+  attributes:
+    type: batch
+    order: 1
+    enabled: true
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/log_collector.py
+        symbol: LogCollector
+  metadata:
+    created_at: 2026-03-24T00:18:59.191Z
+    updated_at: 2026-03-24T00:18:59.191Z
+    version: 1

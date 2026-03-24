@@ -1,0 +1,20 @@
+navigation.navigationgraph.orchestrator-web-ui-navigation:
+  id: 5dce52e0-3437-43fa-85f6-fa31335cc919
+  path: navigation.navigationgraph.orchestrator-web-ui-navigation
+  spec_node_id: navigation.navigationgraph
+  type: navigationgraph
+  layer_id: navigation
+  name: Orchestrator Web UI Navigation
+  description: TanStack Router-based client-side navigation graph for the React
+    SPA; all routes are public (no auth) with client-side rendering
+  attributes:
+    version: "1.0"
+    application: Orchestrator Web UI
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: web_ui/src/routeTree.gen.ts
+  metadata:
+    created_at: 2026-03-24T00:17:37.396Z
+    updated_at: 2026-03-24T00:17:37.396Z
+    version: 1

@@ -1,0 +1,10 @@
+id: changeset-1774311412251-822fu94b4
+name: extract-navigation-layer
+created: 2026-03-24T00:16:52.260Z
+modified: 2026-03-24T00:18:32.470Z
+status: committed
+baseSnapshot: sha256:08192688866cd16e6db9f904f5bfec9f7b6ed0f2edcc46ff226d2111cf5b12e2
+stats:
+  additions: 12
+  modifications: 0
+  deletions: 0

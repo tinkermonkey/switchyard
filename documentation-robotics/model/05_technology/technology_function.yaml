@@ -1,0 +1,19 @@
+technology.technologyfunction.git-hub-cli-execution:
+  id: 80cc5367-d84b-4c49-8b14-2ca45711752b
+  path: technology.technologyfunction.git-hub-cli-execution
+  spec_node_id: technology.technologyfunction
+  type: technologyfunction
+  layer_id: technology
+  name: GitHub CLI Execution
+  description: "gh CLI invoked via subprocess for GitHub operations: GraphQL
+    queries, REST calls, issue/PR management; supports GitHub App token
+    injection via GH_TOKEN env var"
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/github_api_client.py
+        symbol: GitHubAPIClient
+  metadata:
+    created_at: 2026-03-24T00:09:07.309Z
+    updated_at: 2026-03-24T00:09:07.309Z
+    version: 1

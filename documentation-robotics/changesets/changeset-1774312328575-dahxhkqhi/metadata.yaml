@@ -1,0 +1,10 @@
+id: changeset-1774312328575-dahxhkqhi
+name: cross-layer-relationships
+created: 2026-03-24T00:32:08.585Z
+modified: 2026-03-24T00:55:29.169Z
+status: committed
+baseSnapshot: sha256:1d0a58dd55147fcaa75ec31d4ee6fea780fb37bf9e4535da28a8599777ba48d9
+stats:
+  additions: 82
+  modifications: 1
+  deletions: 0

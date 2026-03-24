@@ -1,0 +1,89 @@
+apm.alert.git-hub-circuit-breaker-open:
+  id: 9cdb06b0-5624-4dd1-8a49-324c377eac77
+  path: apm.alert.git-hub-circuit-breaker-open
+  spec_node_id: apm.alert
+  type: alert
+  layer_id: apm
+  name: GitHub Circuit Breaker Open
+  description: Alert triggered when the GitHub API circuit breaker opens after
+    exceeding failure_threshold (3 failures in monitoring, 6 for
+    senior_software_engineer); orchestrator logs error and exits after 15
+    consecutive health failures
+  attributes:
+    severity: critical
+    condition: github_circuit_breaker.state == OPEN
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/circuit_breaker.py
+        symbol: CircuitBreaker
+  metadata:
+    created_at: 2026-03-24T00:19:45.322Z
+    updated_at: 2026-03-24T00:19:45.322Z
+    version: 1
+apm.alert.agent-execution-timeout:
+  id: ec3d0726-c018-45f4-b958-eabb5df5b610
+  path: apm.alert.agent-execution-timeout
+  spec_node_id: apm.alert
+  type: alert
+  layer_id: apm
+  name: Agent Execution Timeout
+  description: Alert when a senior_software_engineer agent container exceeds the
+    3-hour (10800s) hard timeout; container is killed and task marked as failed
+  attributes:
+    severity: warning
+    condition: agent_execution_duration > timeout_seconds
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: claude/docker_runner.py
+        symbol: DockerAgentRunner
+  metadata:
+    created_at: 2026-03-24T00:19:45.819Z
+    updated_at: 2026-03-24T00:19:45.819Z
+    version: 1
+apm.alert.zombie-pipeline-run-detected:
+  id: bd825a29-748a-496c-99c2-88fa3b353cd1
+  path: apm.alert.zombie-pipeline-run-detected
+  spec_node_id: apm.alert
+  type: alert
+  layer_id: apm
+  name: Zombie Pipeline Run Detected
+  description: Alert when PipelineWatchdog detects a pipeline run stuck in active
+    state for over 30 minutes with no corresponding agent container; triggers
+    automatic cleanup
+  attributes:
+    severity: warning
+    condition: active_pipeline_age > 30min AND no_running_container
+    evaluationInterval: 5m
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/pipeline_watchdog.py
+        symbol: PipelineWatchdog
+  metadata:
+    created_at: 2026-03-24T00:19:46.322Z
+    updated_at: 2026-03-24T00:19:46.322Z
+    version: 1
+apm.alert.claude-token-quota-warning:
+  id: 13af7d49-060f-4dda-95ae-3fc6ad319b05
+  path: apm.alert.claude-token-quota-warning
+  spec_node_id: apm.alert
+  type: alert
+  layer_id: apm
+  name: Claude Token Quota Warning
+  description: Warning when Claude Code weekly token quota (630M) or per-session
+    quota (50M) approaches threshold; tracked by claude_code_breaker and
+    token_metrics_service
+  attributes:
+    severity: warning
+    condition: token_usage > quota_threshold
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: monitoring/claude_code_breaker.py
+        symbol: ClaudeCodeBreaker
+  metadata:
+    created_at: 2026-03-24T00:19:55.470Z
+    updated_at: 2026-03-24T00:19:55.470Z
+    version: 1

@@ -1,0 +1,673 @@
+- type: add
+  elementId: ux.uxapplication.orchestrator-web-ui
+  layerName: ux
+  after:
+    id: 922e0318-6a9b-4d56-ae0e-720408b658a1
+    path: ux.uxapplication.orchestrator-web-ui
+    spec_node_id: ux.uxapplication
+    type: uxapplication
+    layer_id: ux
+    name: Orchestrator Web UI
+    description: React 19 SPA served on port 3000 by Nginx; provides real-time
+      monitoring of agent execution, pipeline state, project health, metrics,
+      and circuit breakers via WebSocket and REST
+    attributes:
+      channel: web
+      version: 0.0.0
+      description: Orchestrator real-time monitoring dashboard
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: web_ui/src/main.jsx
+    metadata:
+      created_at: 2026-03-24T00:15:17.797Z
+      updated_at: 2026-03-24T00:15:17.797Z
+      version: 1
+  timestamp: 2026-03-24T00:15:17.819Z
+  sequenceNumber: 0
+- type: add
+  elementId: ux.view.dashboard-index
+  layerName: ux
+  after:
+    id: fd70ea25-4a30-4c8f-ae72-99ab5a9386b9
+    path: ux.view.dashboard-index
+    spec_node_id: ux.view
+    type: view
+    layer_id: ux
+    name: Dashboard (Index)
+    description: Main dashboard view showing header stats (active agents, circuit
+      breakers, Claude usage), pipeline flow graph, active agent list, live
+      logs, and project cards
+    attributes:
+      type: page
+      title: Dashboard
+      routable: true
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: web_ui/src/routes/index.jsx
+    metadata:
+      created_at: 2026-03-24T00:15:26.046Z
+      updated_at: 2026-03-24T00:15:26.046Z
+      version: 1
+  timestamp: 2026-03-24T00:15:26.067Z
+  sequenceNumber: 1
+- type: add
+  elementId: ux.view.pipeline-run-detail
+  layerName: ux
+  after:
+    id: e567a3b1-aa63-4715-a135-39768b4446e1
+    path: ux.view.pipeline-run-detail
+    spec_node_id: ux.view
+    type: view
+    layer_id: ux
+    name: Pipeline Run Detail
+    description: Detailed view for a single pipeline run showing header, event log,
+      repair cycle status, and sidebar with agent execution state and issue
+      context
+    attributes:
+      type: page
+      title: Pipeline Run
+      routable: true
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: web_ui/src/routes/pipeline-run.jsx
+    metadata:
+      created_at: 2026-03-24T00:15:26.363Z
+      updated_at: 2026-03-24T00:15:26.363Z
+      version: 1
+  timestamp: 2026-03-24T00:15:26.385Z
+  sequenceNumber: 2
+- type: add
+  elementId: ux.view.agent-execution-detail
+  layerName: ux
+  after:
+    id: 5e11c671-75fb-4c2d-b464-6b00e6830e0f
+    path: ux.view.agent-execution-detail
+    spec_node_id: ux.view
+    type: view
+    layer_id: ux
+    name: Agent Execution Detail
+    description: Detail view for a specific agent execution showing tool calls,
+      Claude logs, timing, and execution state
+    attributes:
+      type: page
+      title: Agent Execution
+      routable: true
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: web_ui/src/routes/agent-execution..jsx
+    metadata:
+      created_at: 2026-03-24T00:15:26.680Z
+      updated_at: 2026-03-24T00:15:26.680Z
+      version: 1
+  timestamp: 2026-03-24T00:15:26.703Z
+  sequenceNumber: 3
+- type: add
+  elementId: ux.view.projects-view
+  layerName: ux
+  after:
+    id: e348b884-dfd3-4d91-b8f3-187eac02bb5b
+    path: ux.view.projects-view
+    spec_node_id: ux.view
+    type: view
+    layer_id: ux
+    name: Projects View
+    description: Grid of project cards showing each project's status, active
+      pipeline count, last activity, and board names
+    attributes:
+      type: page
+      title: Projects
+      routable: true
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: web_ui/src/routes/projects.jsx
+    metadata:
+      created_at: 2026-03-24T00:15:32.786Z
+      updated_at: 2026-03-24T00:15:32.786Z
+      version: 1
+  timestamp: 2026-03-24T00:15:32.808Z
+  sequenceNumber: 4
+- type: add
+  elementId: ux.view.agent-metrics-view
+  layerName: ux
+  after:
+    id: 6e177646-905f-4bd4-837b-2d96c60c0f71
+    path: ux.view.agent-metrics-view
+    spec_node_id: ux.view
+    type: view
+    layer_id: ux
+    name: Agent Metrics View
+    description: Performance metrics view showing agent execution statistics,
+      success rates, average durations, and trend charts per agent type
+    attributes:
+      type: page
+      title: Agent Metrics
+      routable: true
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: web_ui/src/routes/agent-metrics.jsx
+    metadata:
+      created_at: 2026-03-24T00:15:33.109Z
+      updated_at: 2026-03-24T00:15:33.109Z
+      version: 1
+  timestamp: 2026-03-24T00:15:33.133Z
+  sequenceNumber: 5
+- type: add
+  elementId: ux.view.cycle-metrics-view
+  layerName: ux
+  after:
+    id: 574132fd-b498-4909-8a25-11a220ef6225
+    path: ux.view.cycle-metrics-view
+    spec_node_id: ux.view
+    type: view
+    layer_id: ux
+    name: Cycle Metrics View
+    description: Review cycle and repair cycle metrics view showing iteration
+      counts, approval rates, and cycle duration trends
+    attributes:
+      type: page
+      title: Cycle Metrics
+      routable: true
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: web_ui/src/routes/cycle-metrics.jsx
+    metadata:
+      created_at: 2026-03-24T00:15:33.432Z
+      updated_at: 2026-03-24T00:15:33.432Z
+      version: 1
+  timestamp: 2026-03-24T00:15:33.455Z
+  sequenceNumber: 6
+- type: add
+  elementId: ux.view.pipeline-reports-view
+  layerName: ux
+  after:
+    id: 145b1791-fd16-4a3f-a990-82e364cca481
+    path: ux.view.pipeline-reports-view
+    spec_node_id: ux.view
+    type: view
+    layer_id: ux
+    name: Pipeline Reports View
+    description: Historical pipeline run reports with status distribution, stage
+      duration breakdowns, and failure analysis summaries
+    attributes:
+      type: page
+      title: Pipeline Reports
+      routable: true
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: web_ui/src/routes/pipeline-reports.jsx
+    metadata:
+      created_at: 2026-03-24T00:15:43.647Z
+      updated_at: 2026-03-24T00:15:43.647Z
+      version: 1
+  timestamp: 2026-03-24T00:15:43.673Z
+  sequenceNumber: 7
+- type: add
+  elementId: ux.view.project-metrics-view
+  layerName: ux
+  after:
+    id: 78bfda00-56f6-4d64-a897-c1005432e30e
+    path: ux.view.project-metrics-view
+    spec_node_id: ux.view
+    type: view
+    layer_id: ux
+    name: Project Metrics View
+    description: Per-project metrics view with issue throughput, pipeline
+      efficiency, agent utilization, and quality score trends
+    attributes:
+      type: page
+      title: Project Metrics
+      routable: true
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: web_ui/src/routes/project-metrics.jsx
+    metadata:
+      created_at: 2026-03-24T00:15:43.990Z
+      updated_at: 2026-03-24T00:15:43.990Z
+      version: 1
+  timestamp: 2026-03-24T00:15:44.015Z
+  sequenceNumber: 8
+- type: add
+  elementId: ux.view.recommendation-reports-view
+  layerName: ux
+  after:
+    id: ea5210e7-5f28-4658-ae58-417c806f8759
+    path: ux.view.recommendation-reports-view
+    spec_node_id: ux.view
+    type: view
+    layer_id: ux
+    name: Recommendation Reports View
+    description: AI-generated recommendations from claude_advisor pattern analysis,
+      suggesting pipeline improvements, agent configuration changes, and process
+      optimizations
+    attributes:
+      type: page
+      title: Recommendation Reports
+      routable: true
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: web_ui/src/routes/recommendation-reports.jsx
+    metadata:
+      created_at: 2026-03-24T00:15:44.341Z
+      updated_at: 2026-03-24T00:15:44.341Z
+      version: 1
+  timestamp: 2026-03-24T00:15:44.365Z
+  sequenceNumber: 9
+- type: add
+  elementId: ux.librarycomponent.header
+  layerName: ux
+  after:
+    id: ee8cb64c-766b-4a7f-b1ac-4015e5dc6eb7
+    path: ux.librarycomponent.header
+    spec_node_id: ux.librarycomponent
+    type: librarycomponent
+    layer_id: ux
+    name: Header
+    description: Top navigation header with active agent count badge, circuit
+      breaker status, Claude token usage indicator, and system health dot
+    attributes:
+      type: layout
+      category: navigation
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: web_ui/src/components/Header.jsx
+    metadata:
+      created_at: 2026-03-24T00:15:52.928Z
+      updated_at: 2026-03-24T00:15:52.928Z
+      version: 1
+  timestamp: 2026-03-24T00:15:52.957Z
+  sequenceNumber: 10
+- type: add
+  elementId: ux.librarycomponent.pipeline-flow-graph
+  layerName: ux
+  after:
+    id: b98dfaf7-6b7f-4a53-adcb-06ff7a7d44d0
+    path: ux.librarycomponent.pipeline-flow-graph
+    spec_node_id: ux.librarycomponent
+    type: librarycomponent
+    layer_id: ux
+    name: Pipeline Flow Graph
+    description: XYFlow-powered DAG visualization rendering pipeline stage nodes as
+      interactive graph; shows current stage, agent assignments, and completion
+      status with smart edges
+    attributes:
+      type: chart
+      category: pipeline
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: web_ui/src/components/PipelineFlowGraph.jsx
+    metadata:
+      created_at: 2026-03-24T00:15:59.573Z
+      updated_at: 2026-03-24T00:15:59.573Z
+      version: 1
+  timestamp: 2026-03-24T00:15:59.600Z
+  sequenceNumber: 11
+- type: add
+  elementId: ux.librarycomponent.event-timeline
+  layerName: ux
+  after:
+    id: cb4472e5-b536-463d-bc5b-281533425f58
+    path: ux.librarycomponent.event-timeline
+    spec_node_id: ux.librarycomponent
+    type: librarycomponent
+    layer_id: ux
+    name: Event Timeline
+    description: Chronological timeline of pipeline run events with event type
+      icons, timestamps, and expandable JSON modal for detailed payload
+      inspection
+    attributes:
+      type: display
+      category: observability
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: web_ui/src/components/EventTimeline.jsx
+    metadata:
+      created_at: 2026-03-24T00:15:59.906Z
+      updated_at: 2026-03-24T00:15:59.906Z
+      version: 1
+  timestamp: 2026-03-24T00:15:59.936Z
+  sequenceNumber: 12
+- type: add
+  elementId: ux.librarycomponent.active-agents
+  layerName: ux
+  after:
+    id: c16e4ae4-b0c4-4841-acb4-01832cf2eb72
+    path: ux.librarycomponent.active-agents
+    spec_node_id: ux.librarycomponent
+    type: librarycomponent
+    layer_id: ux
+    name: Active Agents
+    description: Real-time panel showing currently running agent containers with
+      kill action buttons, agent type badges, project names, and elapsed time
+    attributes:
+      type: table
+      category: monitoring
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: web_ui/src/components/ActiveAgents.jsx
+    metadata:
+      created_at: 2026-03-24T00:16:00.253Z
+      updated_at: 2026-03-24T00:16:00.253Z
+      version: 1
+  timestamp: 2026-03-24T00:16:00.283Z
+  sequenceNumber: 13
+- type: add
+  elementId: ux.librarycomponent.live-logs
+  layerName: ux
+  after:
+    id: 8db06f5b-4d5c-4ed0-b9cf-a0d4caae1a1f
+    path: ux.librarycomponent.live-logs
+    spec_node_id: ux.librarycomponent
+    type: librarycomponent
+    layer_id: ux
+    name: Live Logs
+    description: Auto-scrolling log viewer showing structured JSON logs from Redis
+      stream in near real-time with log level color coding and agent name
+      filtering
+    attributes:
+      type: display
+      category: monitoring
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: web_ui/src/components/LiveLogs.jsx
+    metadata:
+      created_at: 2026-03-24T00:16:08.060Z
+      updated_at: 2026-03-24T00:16:08.060Z
+      version: 1
+  timestamp: 2026-03-24T00:16:08.090Z
+  sequenceNumber: 14
+- type: add
+  elementId: ux.librarycomponent.pipelines-status
+  layerName: ux
+  after:
+    id: 2ced2a04-121d-47d2-81b4-143b27e1e2bd
+    path: ux.librarycomponent.pipelines-status
+    spec_node_id: ux.librarycomponent
+    type: librarycomponent
+    layer_id: ux
+    name: Pipelines Status
+    description: Overview panel showing all pipeline states across projects with
+      current stage, holding issue, elapsed time, and lock status
+    attributes:
+      type: display
+      category: pipeline
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: web_ui/src/components/PipelinesStatus.jsx
+    metadata:
+      created_at: 2026-03-24T00:16:08.446Z
+      updated_at: 2026-03-24T00:16:08.446Z
+      version: 1
+  timestamp: 2026-03-24T00:16:08.482Z
+  sequenceNumber: 15
+- type: add
+  elementId: ux.librarycomponent.agent-metrics
+  layerName: ux
+  after:
+    id: 6320628b-ffb7-44f7-aed4-6486da9ed73f
+    path: ux.librarycomponent.agent-metrics
+    spec_node_id: ux.librarycomponent
+    type: librarycomponent
+    layer_id: ux
+    name: Agent Metrics
+    description: Performance metrics table and trend charts per agent type showing
+      execution count, success rate, average duration, and token usage
+    attributes:
+      type: chart
+      category: metrics
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: web_ui/src/components/AgentMetrics.jsx
+    metadata:
+      created_at: 2026-03-24T00:16:08.817Z
+      updated_at: 2026-03-24T00:16:08.817Z
+      version: 1
+  timestamp: 2026-03-24T00:16:08.851Z
+  sequenceNumber: 16
+- type: add
+  elementId: ux.librarycomponent.repair-cycle-status
+  layerName: ux
+  after:
+    id: 7485fe87-c074-498a-b914-9b1eee68211f
+    path: ux.librarycomponent.repair-cycle-status
+    spec_node_id: ux.librarycomponent
+    type: librarycomponent
+    layer_id: ux
+    name: Repair Cycle Status
+    description: Status panel for test-fix-validate repair cycles showing current
+      iteration, test results, pass/fail counts, and cycle progress within the
+      testing stage
+    attributes:
+      type: display
+      category: pipeline
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: web_ui/src/components/RepairCycleStatus.jsx
+    metadata:
+      created_at: 2026-03-24T00:16:16.295Z
+      updated_at: 2026-03-24T00:16:16.295Z
+      version: 1
+  timestamp: 2026-03-24T00:16:16.328Z
+  sequenceNumber: 17
+- type: add
+  elementId: ux.librarycomponent.dev-container-status
+  layerName: ux
+  after:
+    id: d84a2431-e720-45cf-8aa3-7e0c0c3a90a4
+    path: ux.librarycomponent.dev-container-status
+    spec_node_id: ux.librarycomponent
+    type: librarycomponent
+    layer_id: ux
+    name: Dev Container Status
+    description: "Shows Docker image verification status per project: verified
+      (green), missing (red), needs setup (yellow) with one-click environment
+      setup trigger"
+    attributes:
+      type: display
+      category: infrastructure
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: web_ui/src/components/DevContainerStatus.jsx
+    metadata:
+      created_at: 2026-03-24T00:16:16.666Z
+      updated_at: 2026-03-24T00:16:16.666Z
+      version: 1
+  timestamp: 2026-03-24T00:16:16.696Z
+  sequenceNumber: 18
+- type: add
+  elementId: ux.librarycomponent.token-usage-panel
+  layerName: ux
+  after:
+    id: deae19f7-55b2-429c-8afd-7b3ad1b2cd26
+    path: ux.librarycomponent.token-usage-panel
+    spec_node_id: ux.librarycomponent
+    type: librarycomponent
+    layer_id: ux
+    name: Token Usage Panel
+    description: Displays Claude API token consumption against weekly (630M) and
+      per-session (50M) quotas with bar chart and threshold warnings
+    attributes:
+      type: chart
+      category: metrics
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: web_ui/src/components/TokenUsagePanel.jsx
+    metadata:
+      created_at: 2026-03-24T00:16:17.032Z
+      updated_at: 2026-03-24T00:16:17.032Z
+      version: 1
+  timestamp: 2026-03-24T00:16:17.078Z
+  sequenceNumber: 19
+- type: add
+  elementId: ux.librarycomponent.navigation-tabs
+  layerName: ux
+  after:
+    id: 9df88c49-8831-463d-bbe4-34fc4c0581ef
+    path: ux.librarycomponent.navigation-tabs
+    spec_node_id: ux.librarycomponent
+    type: librarycomponent
+    layer_id: ux
+    name: Navigation Tabs
+    description: Top-level navigation tabs component routing between Dashboard,
+      Projects, Pipeline Reports, Agent Metrics, Cycle Metrics, Project Metrics,
+      and Recommendations
+    attributes:
+      type: navigation
+      category: navigation
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: web_ui/src/components/NavigationTabs.jsx
+    metadata:
+      created_at: 2026-03-24T00:16:24.565Z
+      updated_at: 2026-03-24T00:16:24.565Z
+      version: 1
+  timestamp: 2026-03-24T00:16:24.594Z
+  sequenceNumber: 20
+- type: add
+  elementId: ux.librarycomponent.project-card
+  layerName: ux
+  after:
+    id: 1987185f-bfd9-45e3-bb82-619c1892dd46
+    path: ux.librarycomponent.project-card
+    spec_node_id: ux.librarycomponent
+    type: librarycomponent
+    layer_id: ux
+    name: Project Card
+    description: "Card component displaying a single project: name, GitHub repo
+      link, active issues, pipeline health, and quick navigation to pipeline
+      runs"
+    attributes:
+      type: display
+      category: project
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: web_ui/src/components/ProjectCard.jsx
+    metadata:
+      created_at: 2026-03-24T00:16:24.949Z
+      updated_at: 2026-03-24T00:16:24.949Z
+      version: 1
+  timestamp: 2026-03-24T00:16:24.981Z
+  sequenceNumber: 21
+- type: add
+  elementId: ux.librarycomponent.confirmation-modal
+  layerName: ux
+  after:
+    id: 16d286e3-f71b-4e8a-a433-032788b05d2d
+    path: ux.librarycomponent.confirmation-modal
+    spec_node_id: ux.librarycomponent
+    type: librarycomponent
+    layer_id: ux
+    name: Confirmation Modal
+    description: Reusable modal dialog for destructive actions such as killing an
+      agent container; requires explicit confirmation before proceeding
+    attributes:
+      type: feedback
+      category: interaction
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: web_ui/src/components/ConfirmationModal.jsx
+    metadata:
+      created_at: 2026-03-24T00:16:25.337Z
+      updated_at: 2026-03-24T00:16:25.337Z
+      version: 1
+  timestamp: 2026-03-24T00:16:25.373Z
+  sequenceNumber: 22
+- type: add
+  elementId: ux.uxspec.dashboard-ux-spec
+  layerName: ux
+  after:
+    id: cccbd9a9-1fc5-4e24-b8d9-bde9bc107cf0
+    path: ux.uxspec.dashboard-ux-spec
+    spec_node_id: ux.uxspec
+    type: uxspec
+    layer_id: ux
+    name: Dashboard UX Spec
+    description: "UX specification for the main dashboard: three-panel layout with
+      header stats, central pipeline flow graph, and side panels for active
+      agents, logs, and workspace status"
+    attributes:
+      version: "1.0"
+      title: Dashboard
+      description: Main monitoring dashboard layout spec
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: web_ui/src/routes/index.jsx
+    metadata:
+      created_at: 2026-03-24T00:16:35.103Z
+      updated_at: 2026-03-24T00:16:35.103Z
+      version: 1
+  timestamp: 2026-03-24T00:16:35.134Z
+  sequenceNumber: 23
+- type: add
+  elementId: ux.experiencestate.real-time-connected
+  layerName: ux
+  after:
+    id: 66b65564-75ec-4145-8ca3-ee49928720cf
+    path: ux.experiencestate.real-time-connected
+    spec_node_id: ux.experiencestate
+    type: experiencestate
+    layer_id: ux
+    name: Real-Time Connected
+    description: WebSocket connected state where live agent events, log updates, and
+      pipeline state changes stream to the UI in real time
+    attributes:
+      initial: true
+      description: WebSocket connected - receiving live events
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: web_ui/src/components/ActiveAgents.jsx
+    metadata:
+      created_at: 2026-03-24T00:16:35.486Z
+      updated_at: 2026-03-24T00:16:35.486Z
+      version: 1
+  timestamp: 2026-03-24T00:16:35.529Z
+  sequenceNumber: 24
+- type: add
+  elementId: ux.experiencestate.disconnected-reconnecting
+  layerName: ux
+  after:
+    id: f56a4435-51c5-49d7-b012-4edb97110ca1
+    path: ux.experiencestate.disconnected-reconnecting
+    spec_node_id: ux.experiencestate
+    type: experiencestate
+    layer_id: ux
+    name: Disconnected / Reconnecting
+    description: WebSocket disconnected state showing stale indicator; client
+      attempts automatic reconnection with Socket.IO backoff strategy
+    attributes:
+      initial: false
+      description: WebSocket disconnected - attempting reconnection
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: web_ui/src/components/HeaderSystemHealth.jsx
+    metadata:
+      created_at: 2026-03-24T00:16:35.911Z
+      updated_at: 2026-03-24T00:16:35.911Z
+      version: 1
+  timestamp: 2026-03-24T00:16:35.943Z
+  sequenceNumber: 25

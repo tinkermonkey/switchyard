@@ -1,0 +1,122 @@
+testing.testcasesketch.test-pipeline-checkpoint-recovery:
+  id: ef430230-64ff-4b28-b25b-0328cfe0e3fc
+  path: testing.testcasesketch.test-pipeline-checkpoint-recovery
+  spec_node_id: testing.testcasesketch
+  type: testcasesketch
+  layer_id: testing
+  name: "Test: Pipeline Checkpoint Recovery"
+  description: Verifies that a pipeline resumes from the correct stage after
+    simulated orchestrator restart by reading the highest-numbered checkpoint
+    file
+  attributes:
+    status: implemented
+    implementationFormat: automated
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: tests/unit/test_state_recovery.py
+  metadata:
+    created_at: 2026-03-24T00:21:00.475Z
+    updated_at: 2026-03-24T00:21:00.475Z
+    version: 1
+testing.testcasesketch.test-review-cycle-state-transitions:
+  id: 9661dd02-82d0-4d18-9a38-a05267bf8976
+  path: testing.testcasesketch.test-review-cycle-state-transitions
+  spec_node_id: testing.testcasesketch
+  type: testcasesketch
+  layer_id: testing
+  name: "Test: Review Cycle State Transitions"
+  description: Verifies review cycle correctly transitions through PENDING ->
+    REVIEWING -> APPROVED/NEEDS_REVISION/BLOCKED states with correct iteration
+    tracking
+  attributes:
+    status: implemented
+    implementationFormat: automated
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: tests/unit/test_review_cycle_state_transitions.py
+  metadata:
+    created_at: 2026-03-24T00:21:00.989Z
+    updated_at: 2026-03-24T00:21:00.989Z
+    version: 1
+testing.testcasesketch.test-pr-review-state-manager:
+  id: 611fb8e5-0022-40ba-acef-ad3b51575bfe
+  path: testing.testcasesketch.test-pr-review-state-manager
+  spec_node_id: testing.testcasesketch
+  type: testcasesketch
+  layer_id: testing
+  name: "Test: PR Review State Manager"
+  description: Verifies PR review cycle count persistence, max cycle enforcement,
+    and YAML state file correctness
+  attributes:
+    status: implemented
+    implementationFormat: automated
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: tests/unit/test_pr_review_state_manager.py
+  metadata:
+    created_at: 2026-03-24T00:21:01.488Z
+    updated_at: 2026-03-24T00:21:01.488Z
+    version: 1
+testing.testcasesketch.test-docker-runner-validation:
+  id: d48b6fd6-5c8f-4c5f-a750-0d01b15eaba3
+  path: testing.testcasesketch.test-docker-runner-validation
+  spec_node_id: testing.testcasesketch
+  type: testcasesketch
+  layer_id: testing
+  name: "Test: Docker Runner Validation"
+  description: Verifies Docker runner builds correct docker run commands with
+    proper volume mounts, labels, and environment variables
+  attributes:
+    status: implemented
+    implementationFormat: automated
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: tests/unit/test_docker_runner_validation.py
+  metadata:
+    created_at: 2026-03-24T00:21:08.801Z
+    updated_at: 2026-03-24T00:21:08.801Z
+    version: 1
+testing.testcasesketch.test-pipeline-run-cleanup:
+  id: 9f51bcf5-6735-4da0-8f3c-58521a10890e
+  path: testing.testcasesketch.test-pipeline-run-cleanup
+  spec_node_id: testing.testcasesketch
+  type: testcasesketch
+  layer_id: testing
+  name: "Test: Pipeline Run Cleanup"
+  description: Verifies stale active pipeline runs are correctly identified and
+    cleaned up on startup without affecting re-triggered issues
+  attributes:
+    status: implemented
+    implementationFormat: automated
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: tests/unit/test_pipeline_run_cleanup.py
+  metadata:
+    created_at: 2026-03-24T00:21:09.307Z
+    updated_at: 2026-03-24T00:21:09.307Z
+    version: 1
+testing.testcasesketch.test-repair-cycle-checkpoint:
+  id: b1744952-a23f-4cad-a63b-feacb758ac91
+  path: testing.testcasesketch.test-repair-cycle-checkpoint
+  spec_node_id: testing.testcasesketch
+  type: testcasesketch
+  layer_id: testing
+  name: "Test: Repair Cycle Checkpoint"
+  description: Verifies repair cycle checkpoints correctly persist intermediate
+    state and can resume from last checkpoint after container restart
+  attributes:
+    status: implemented
+    implementationFormat: automated
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: tests/unit/test_repair_cycle_checkpoint.py
+  metadata:
+    created_at: 2026-03-24T00:21:09.815Z
+    updated_at: 2026-03-24T00:21:09.815Z
+    version: 1

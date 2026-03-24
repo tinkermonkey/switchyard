@@ -1,0 +1,72 @@
+business.businessfunction.pipeline-orchestration:
+  id: 35b7dbe2-840c-429c-9bf2-47a899a7f08a
+  path: business.businessfunction.pipeline-orchestration
+  spec_node_id: business.businessfunction
+  type: businessfunction
+  layer_id: business
+  name: Pipeline Orchestration
+  description: Sequential stage execution with checkpointing, circuit breaker, and
+    resume-from-failure
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: pipeline/orchestrator.py
+        symbol: SequentialPipeline
+  metadata:
+    created_at: 2026-03-24T00:28:09.134Z
+    updated_at: 2026-03-24T00:28:09.134Z
+    version: 1
+business.businessfunction.agent-task-routing:
+  id: 5f7e5cda-1362-41c5-b35d-b3a7c3b628ff
+  path: business.businessfunction.agent-task-routing
+  spec_node_id: business.businessfunction
+  type: businessfunction
+  layer_id: business
+  name: Agent Task Routing
+  description: Mapping of task types to specialist agent implementations from the
+    AGENT_REGISTRY
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: agents/__init__.py
+        symbol: get_agent_class
+  metadata:
+    created_at: 2026-03-24T00:28:09.699Z
+    updated_at: 2026-03-24T00:28:09.699Z
+    version: 1
+business.businessfunction.project-configuration-management:
+  id: 37e7f5be-3ebe-48d9-b738-c257acef3894
+  path: business.businessfunction.project-configuration-management
+  spec_node_id: business.businessfunction
+  type: businessfunction
+  layer_id: business
+  name: Project Configuration Management
+  description: "Three-layer configuration: foundations
+    (agents/pipelines/workflows), projects, and runtime state"
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: config/foundations/agents.yaml
+        symbol: agents
+  metadata:
+    created_at: 2026-03-24T00:28:10.232Z
+    updated_at: 2026-03-24T00:28:10.232Z
+    version: 1
+business.businessfunction.pipeline-state-recovery:
+  id: 455bfe24-0184-404c-b374-b3fb93385b13
+  path: business.businessfunction.pipeline-state-recovery
+  spec_node_id: business.businessfunction
+  type: businessfunction
+  layer_id: business
+  name: Pipeline State Recovery
+  description: Checkpoint-based pipeline recovery allowing resume after
+    orchestrator restart or container failure
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: state_management/manager.py
+        symbol: StateManager.checkpoint
+  metadata:
+    created_at: 2026-03-24T00:28:10.770Z
+    updated_at: 2026-03-24T00:28:10.770Z
+    version: 1

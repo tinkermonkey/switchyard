@@ -1,0 +1,45 @@
+data-store.retentionpolicy.elasticsearch-7-day-ilm:
+  id: 64bb773c-25dd-46b9-83c6-8c4aec427283
+  path: data-store.retentionpolicy.elasticsearch-7-day-ilm
+  spec_node_id: data-store.retentionpolicy
+  type: retentionpolicy
+  layer_id: data-store
+  name: Elasticsearch 7-Day ILM
+  description: "ILM policy applied to pipeline-runs, agent-events,
+    decision-events, and task-metrics indices: hot phase immediate, warm at 3
+    days, delete at 7 days"
+  attributes:
+    targetCollection: orchestrator-pipeline-runs
+    retentionDuration: 7d
+    action: DELETE
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: monitoring/observability.py
+        symbol: DECISION_EVENTS_ILM_POLICY
+  metadata:
+    created_at: 2026-03-24T00:14:44.090Z
+    updated_at: 2026-03-24T00:14:44.090Z
+    version: 1
+data-store.retentionpolicy.repair-cycle-result-24h-ttl:
+  id: 456c5cc6-03af-4c17-8fa3-107b383ad05f
+  path: data-store.retentionpolicy.repair-cycle-result-24h-ttl
+  spec_node_id: data-store.retentionpolicy
+  type: retentionpolicy
+  layer_id: data-store
+  name: Repair Cycle Result 24h TTL
+  description: Redis TTL of 86400 seconds (24 hours) on repair cycle result keys;
+    auto-expires results after orchestrator has had time to read them
+  attributes:
+    targetCollection: repair_cycle_results
+    retentionDuration: 24h
+    action: DELETE
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: pipeline/repair_cycle_runner.py
+        symbol: repair_cycle:result
+  metadata:
+    created_at: 2026-03-24T00:14:44.431Z
+    updated_at: 2026-03-24T00:14:44.431Z
+    version: 1

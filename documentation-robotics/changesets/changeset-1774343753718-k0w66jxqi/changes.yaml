@@ -1,0 +1,913 @@
+- type: add
+  elementId: application.applicationprocess.work-execution-gate-decision
+  layerName: application
+  after:
+    id: 0f397ca9-573a-47dc-ad89-d0d4490d1c8a
+    path: application.applicationprocess.work-execution-gate-decision
+    spec_node_id: application.applicationprocess
+    type: applicationprocess
+    layer_id: application
+    name: Work Execution Gate Decision
+    description: "Six-case decision tree in
+      WorkExecutionStateTracker.should_execute_work()
+      (services/work_execution_state.py:298-404) determining whether an agent
+      executes or is skipped for a given issue+column+agent+trigger_source. Case
+      1 (first_execution): no prior execution record for this column+agent →
+      execute. Case 2 (manual_rework_detected): a status change to this column
+      has timestamp AFTER the last execution timestamp → execute. Case 3
+      (retry_after_*): last execution outcome is failure, blocked, cancelled, or
+      abandoned → execute. Case 4 (skip_auto_progression_after_success):
+      trigger_source==pipeline_progression AND last outcome==success AND the
+      last status change to this column is older than the last execution (or no
+      status change exists) → skip. Case 5 (work_already_in_progress): last
+      outcome is in_progress → skip. Case 6 (explicit_manual_trigger):
+      trigger_source in [manual_move, webhook, manual] → execute even after
+      prior success. Default fallback: skip (already_processed_successfully).
+      Returns Tuple[bool, str] of (should_execute, reason_code)."
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/work_execution_state.py
+          symbol: WorkExecutionStateTracker.should_execute_work
+    metadata:
+      created_at: 2026-03-24T09:16:23.928Z
+      updated_at: 2026-03-24T09:16:23.928Z
+      version: 1
+  timestamp: 2026-03-24T09:16:23.947Z
+  sequenceNumber: 0
+- type: add
+  elementId: application.applicationprocess.has-active-execution-multi-check
+  layerName: application
+  after:
+    id: 3089b75e-f00f-41cf-b39c-778af94e6a16
+    path: application.applicationprocess.has-active-execution-multi-check
+    spec_node_id: application.applicationprocess
+    type: applicationprocess
+    layer_id: application
+    name: Has Active Execution Multi-Check
+    description: "WorkExecutionStateTracker.has_active_execution()
+      (services/work_execution_state.py:432-576) performs four sequential checks
+      to determine if ANY type of work is currently active for an issue,
+      preventing race conditions. Check 1: scan execution_history for entries
+      with outcome==in_progress; stale pre-enqueue probes are auto-cleared if
+      trigger_source==pipeline_progression AND no task_id is stamped AND age >
+      300s (STALE_ENQUEUE_PROBE_SECS) — cleared by setting outcome=abandoned.
+      Check 2: check review_cycle_executor.active_cycles in-memory dict for this
+      project+issue. Check 3: scan Redis for repair cycle container tracking
+      keys (agent:container:*). Check 4: check
+      human_feedback_loop_executor.active_loops in-memory dict. Fail-safe: if
+      >=2 of checks 2/3/4 raise ImportError or AttributeError (services not
+      initialized), return True to prevent duplicate scheduling during degraded
+      state. Returns bool."
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/work_execution_state.py
+          symbol: WorkExecutionStateTracker.has_active_execution
+    metadata:
+      created_at: 2026-03-24T09:16:34.736Z
+      updated_at: 2026-03-24T09:16:34.736Z
+      version: 1
+  timestamp: 2026-03-24T09:16:34.755Z
+  sequenceNumber: 1
+- type: add
+  elementId: application.applicationprocess.stale-execution-state-cleanup-on-in-progress
+  layerName: application
+  after:
+    id: 64cb725b-db57-4b8c-8c57-e1a2e1d839c4
+    path: application.applicationprocess.stale-execution-state-cleanup-on-in-progress
+    spec_node_id: application.applicationprocess
+    type: applicationprocess
+    layer_id: application
+    name: Stale Execution State Cleanup on In-Progress
+    description: "In project_monitor.py (lines 2460-2494), when should_execute_work
+      returns work_already_in_progress and already_handled is True: first
+      queries pipeline_run_manager.get_active_pipeline_run() as source of truth.
+      If an active run exists and is_active() → do not disturb; return None and
+      let the container complete. If no active run exists → execution state is
+      stale; call record_execution_outcome(outcome='failure', error='Stale
+      execution state') to clear the in_progress record, then return None. This
+      prevents issues from being permanently stuck when the orchestrator
+      restarted mid-execution."
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/project_monitor.py
+          symbol: _handle_card_event
+    metadata:
+      created_at: 2026-03-24T09:16:43.987Z
+      updated_at: 2026-03-24T09:16:43.987Z
+      version: 1
+  timestamp: 2026-03-24T09:16:44.008Z
+  sequenceNumber: 2
+- type: add
+  elementId: application.applicationprocess.pre-enqueue-execution-record-ordering
+  layerName: application
+  after:
+    id: 68743ffb-8d8c-4a7c-a8e9-b2d19ea20364
+    path: application.applicationprocess.pre-enqueue-execution-record-ordering
+    spec_node_id: application.applicationprocess
+    type: applicationprocess
+    layer_id: application
+    name: Pre-Enqueue Execution Record Ordering
+    description: "Critical sequencing rule enforced in both pipeline_progression.py
+      (lines 618-630) and project_monitor.py:
+      work_execution_tracker.record_execution_start() MUST be called BEFORE
+      task_queue.enqueue(). This creates the in_progress record before the Redis
+      worker can pick up the task and call stamp_execution_task_id(). If enqueue
+      were called first, a fast worker could complete and try to record the
+      outcome before the in_progress record exists, leaving a permanent
+      in_progress entry. The record_execution_start() sets outcome=in_progress
+      and trigger_source; agent_executor then stamps the task_id via
+      stamp_execution_task_id() once the task_id UUID is generated."
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/pipeline_progression.py
+          symbol: PipelineProgression.progress_to_next_stage
+    metadata:
+      created_at: 2026-03-24T09:16:52.383Z
+      updated_at: 2026-03-24T09:16:52.383Z
+      version: 1
+  timestamp: 2026-03-24T09:16:52.404Z
+  sequenceNumber: 3
+- type: add
+  elementId: application.applicationprocess.conversational-session-recovery-three-way-branch
+  layerName: application
+  after:
+    id: a23d3cf9-a12b-46cb-a546-821399efaeda
+    path: application.applicationprocess.conversational-session-recovery-three-way-branch
+    spec_node_id: application.applicationprocess
+    type: applicationprocess
+    layer_id: application
+    name: Conversational Session Recovery Three-Way Branch
+    description: "In project_monitor._handle_card_event (discussions workspace path,
+      lines 2248-2346): when entering a conversational column with prior work,
+      the recovery logic branches three ways. Step 1: load persisted session
+      from ConversationalSessionState
+      (state/conversational_sessions/<project>_issue_<n>.yaml,
+      max_age_hours=24). Step 2: if session has pipeline_run_id, query
+      pipeline_run_manager.get_pipeline_run() — Branch A: run exists AND
+      status==active → reuse the existing pipeline_run_id
+      (recovered_pipeline_run_id = session.pipeline_run_id). Branch B: run
+      exists but status != active → log that run is non-active, create new run
+      (final_pipeline_run_id falls back to current pipeline_run.id). Branch C:
+      run not found (expired from Redis) → log expiry, create new run. Step 3:
+      regardless of branch, restore session.session_id to
+      HumanFeedbackState.claude_session_id if session exists. Step 4: call
+      _load_previous_outputs_from_discussion() to rebuild conversation history.
+      Step 5: register state in active_loops and call _conversational_loop() in
+      a new background daemon thread."
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/project_monitor.py
+          symbol: _handle_card_event.resume_feedback_loop
+    metadata:
+      created_at: 2026-03-24T09:17:03.586Z
+      updated_at: 2026-03-24T09:17:03.586Z
+      version: 1
+  timestamp: 2026-03-24T09:17:03.607Z
+  sequenceNumber: 4
+- type: add
+  elementId: application.applicationprocess.issues-workspace-conversational-recovery
+  layerName: application
+  after:
+    id: 80c6fbce-f8ec-4937-9f53-b9cbd51e77b3
+    path: application.applicationprocess.issues-workspace-conversational-recovery
+    spec_node_id: application.applicationprocess
+    type: applicationprocess
+    layer_id: application
+    name: Issues Workspace Conversational Recovery
+    description: "In project_monitor._handle_card_event (issues workspace path,
+      lines 2356-2454) when column.type==conversational: check
+      _check_agent_processed_issue_sync() for prior work. If prior work exists:
+      create HumanFeedbackState with pipeline_run.id (NOT the recovered pipeline
+      run — issues workspace path does not attempt pipeline run recovery), load
+      persisted session_id from ConversationalSessionState (max_age_hours=24)
+      and restore to state.claude_session_id if found, then branch on
+      workspace_type: if discussions → call
+      _load_previous_outputs_from_discussion(); else → call
+      _load_previous_outputs_from_issue(). Register in active_loops, call
+      _conversational_loop() in a background daemon thread, then return agent
+      (not None) to signal caller not to start fresh work. If no prior work
+      found: fall through to normal fresh conversational loop start."
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/project_monitor.py
+          symbol: _handle_card_event.resume_feedback_loop.issues_workspace
+    metadata:
+      created_at: 2026-03-24T09:17:12.250Z
+      updated_at: 2026-03-24T09:17:12.250Z
+      version: 1
+  timestamp: 2026-03-24T09:17:12.273Z
+  sequenceNumber: 5
+- type: add
+  elementId: application.applicationprocess.complete-agent-execution-git-hub-routing
+  layerName: application
+  after:
+    id: 509173f1-ff5d-4fa5-8ff8-0e2f20886099
+    path: application.applicationprocess.complete-agent-execution-git-hub-routing
+    spec_node_id: application.applicationprocess
+    type: applicationprocess
+    layer_id: application
+    name: Complete Agent Execution GitHub Routing
+    description: "DockerAgentRunner._complete_agent_execution()
+      (claude/docker_runner.py:2163-2262) is the unified completion handler for
+      both fresh and recovered containers. Routing logic: if exit_code==0 AND
+      output is non-empty → derive workspace_type by calling
+      _get_workspace_type_from_column(project, column) which looks up the
+      pipeline config for the column and returns its workspace property
+      (defaults to 'issues' if column=='unknown' or unmatched). Then call
+      _build_completion_context() which reads discussion_id from state_manager
+      ONLY if workspace_type is 'discussions' or 'hybrid'; otherwise
+      discussion_id=None. If reply_to_comment_id is provided (fresh
+      human-feedback-loop response only), add to context so post lands
+      in-thread. Call github.post_agent_output() with the context. On success,
+      call FeedbackManager().set_last_agent_comment_time(). If exit_code\\!=0 OR
+      output is empty → skip GitHub posting. Always record execution outcome via
+      work_execution_tracker.record_execution_outcome() if column \\!=
+      'unknown'. Sets output_posted=True on result so agent_executor skips the
+      duplicate _post_agent_output_to_github() call."
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: claude/docker_runner.py
+          symbol: DockerAgentRunner._complete_agent_execution
+    metadata:
+      created_at: 2026-03-24T09:17:27.528Z
+      updated_at: 2026-03-24T09:17:27.528Z
+      version: 1
+  timestamp: 2026-03-24T09:17:27.551Z
+  sequenceNumber: 6
+- type: add
+  elementId: application.applicationprocess.workspace-type-derivation-from-pipeline-config
+  layerName: application
+  after:
+    id: 2e59ee80-ecd7-4e45-b72c-de8454a88017
+    path: application.applicationprocess.workspace-type-derivation-from-pipeline-config
+    spec_node_id: application.applicationprocess
+    type: applicationprocess
+    layer_id: application
+    name: Workspace Type Derivation from Pipeline Config
+    description: "_get_workspace_type_from_column(project, column)
+      (claude/docker_runner.py:2137-2161): iterates project_config.pipelines,
+      for each pipeline fetches its workflow_template, and checks if any column
+      in that template matches the given column name. If matched, returns
+      pipeline.workspace attribute (e.g., 'issues' for sdlc_execution,
+      'discussions' for planning_design). Falls back to 'issues' if
+      column=='unknown', no project config found, or no pipeline matches.
+      Critically: workspace_type is a property of the PIPELINE (not inferred
+      from discussion_id presence in state). An issue may have a discussion_id
+      in state for context without that being the target posting workspace."
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: claude/docker_runner.py
+          symbol: DockerAgentRunner._get_workspace_type_from_column
+    metadata:
+      created_at: 2026-03-24T09:17:34.483Z
+      updated_at: 2026-03-24T09:17:34.483Z
+      version: 1
+  timestamp: 2026-03-24T09:17:34.506Z
+  sequenceNumber: 7
+- type: add
+  elementId: application.applicationprocess.task-queue-not-before-deferred-execution
+  layerName: application
+  after:
+    id: 49a4d7ba-3241-4097-b00f-e8717d5ed9af
+    path: application.applicationprocess.task-queue-not-before-deferred-execution
+    spec_node_id: application.applicationprocess
+    type: applicationprocess
+    layer_id: application
+    name: Task Queue Not-Before Deferred Execution
+    description: "TaskQueue.dequeue() in both Redis (_dequeue_redis,
+      task_queue/task_manager.py:106-148) and in-memory (_dequeue_fallback,
+      lines 151-187) implementations support a not_before field (ISO8601 UTC
+      timestamp). Redis path: scans queue up to current llen() to prevent
+      infinite loop; if not_before is set and nb_dt > now(), lpush task back to
+      head and increment skip counter, then continue scanning for a ready task.
+      In-memory path: drains all queue items, collecting deferred items in a
+      list; first ready item (not_before absent or past) is returned; deferred
+      items are put back. Callers set not_before on retried/deferred tasks to
+      implement backoff without removing from the queue."
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: task_queue/task_manager.py
+          symbol: TaskQueue._dequeue_redis
+    metadata:
+      created_at: 2026-03-24T09:17:48.662Z
+      updated_at: 2026-03-24T09:17:48.662Z
+      version: 1
+  timestamp: 2026-03-24T09:17:48.698Z
+  sequenceNumber: 8
+- type: add
+  elementId: application.applicationprocess.task-queue-priority-and-redis-fallback
+  layerName: application
+  after:
+    id: 9f542130-c2a8-47b5-8060-f976fc855c13
+    path: application.applicationprocess.task-queue-priority-and-redis-fallback
+    spec_node_id: application.applicationprocess
+    type: applicationprocess
+    layer_id: application
+    name: Task Queue Priority and Redis Fallback
+    description: "TaskQueue (task_queue/task_manager.py) uses three priority levels:
+      HIGH (1, PR reviews/blocking issues), MEDIUM (2, development tasks), LOW
+      (3, documentation/cleanup). Redis path: tasks are stored as hashes at
+      task:{id} and their IDs pushed to lists named tasks:high, tasks:medium,
+      tasks:low. Dequeue pops from HIGH first, then MEDIUM, then LOW (strict
+      priority order). In-memory fallback: uses Python PriorityQueue objects
+      keyed by (priority_value, timestamp, task); fallback activates on Redis
+      connection failure at startup and stays active for the session. Pending
+      task inspection scans all priority queues. clear_all() deletes all Redis
+      lists or drains all in-memory queues."
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: task_queue/task_manager.py
+          symbol: TaskQueue
+    metadata:
+      created_at: 2026-03-24T09:17:58.985Z
+      updated_at: 2026-03-24T09:17:58.985Z
+      version: 1
+  timestamp: 2026-03-24T09:17:59.009Z
+  sequenceNumber: 9
+- type: add
+  elementId: application.applicationprocess.pipeline-progression-exit-column-lock-release
+  layerName: application
+  after:
+    id: 408e8862-cbf9-4a1d-9fb6-e363031da7f8
+    path: application.applicationprocess.pipeline-progression-exit-column-lock-release
+    spec_node_id: application.applicationprocess
+    type: applicationprocess
+    layer_id: application
+    name: Pipeline Progression Exit Column Lock Release
+    description: "PipelineProgression.progress_to_next_stage()
+      (services/pipeline_progression.py:520-636): after moving the issue to
+      next_column, checks if next_column is in
+      workflow_template.pipeline_exit_columns. If it is an exit column: calls
+      _release_lock_and_process_next() which (1) releases the pipeline lock, (2)
+      removes the issue from the pipeline queue, (3) calls
+      pipeline_run_manager.end_pipeline_run(outcome='success'), (4) checks
+      pipeline_queue for the next waiting issue. If a next issue exists and lock
+      acquisition succeeds: marks it active, fetches its issue_data, creates a
+      task with trigger='pipeline_progression', calls record_execution_start()
+      BEFORE enqueue(), then enqueues the task. If next_column is not an exit
+      column: creates a task for the next agent, calls record_execution_start()
+      BEFORE enqueue()."
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/pipeline_progression.py
+          symbol: PipelineProgression._release_lock_and_process_next
+    metadata:
+      created_at: 2026-03-24T09:18:07.997Z
+      updated_at: 2026-03-24T09:18:07.997Z
+      version: 1
+  timestamp: 2026-03-24T09:18:08.034Z
+  sequenceNumber: 10
+- type: add
+  elementId: application.applicationprocess.status-field-id-auto-repair-on-missing
+  layerName: application
+  after:
+    id: 869e4ff7-2be8-4266-aba0-cbbe69ccca18
+    path: application.applicationprocess.status-field-id-auto-repair-on-missing
+    spec_node_id: application.applicationprocess
+    type: applicationprocess
+    layer_id: application
+    name: Status Field ID Auto-Repair on Missing
+    description: "PipelineProgression.move_issue_to_column()
+      (services/pipeline_progression.py:83-384): if board_state.status_field_id
+      is None or empty, triggers auto-repair: calls
+      state_manager.refresh_board_field_ids(project_name, board_name) to
+      re-fetch field IDs from GitHub GraphQL API. On success, reloads state and
+      retries with the refreshed field ID. On any failure of the auto-repair,
+      returns False. This prevents permanent failures caused by stale state
+      files after board reconciliation. Also: the column option_id is always
+      looked up by scanning board_state.columns for the matching column.name; if
+      not found, emits a failure decision event and returns False."
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/pipeline_progression.py
+          symbol: PipelineProgression.move_issue_to_column
+    metadata:
+      created_at: 2026-03-24T09:18:15.929Z
+      updated_at: 2026-03-24T09:18:15.929Z
+      version: 1
+  timestamp: 2026-03-24T09:18:15.954Z
+  sequenceNumber: 11
+- type: add
+  elementId: application.applicationprocess.git-checkout-branch-with-stash-and-remote-tracking
+  layerName: application
+  after:
+    id: c48010bf-a4b6-47cc-94bf-fe63518f3722
+    path: application.applicationprocess.git-checkout-branch-with-stash-and-remote-tracking
+    spec_node_id: application.applicationprocess
+    type: applicationprocess
+    layer_id: application
+    name: Git Checkout Branch with Stash and Remote Tracking
+    description: "GitWorkflowManager.checkout_branch()
+      (services/git_workflow_manager.py:530-649): (1) runs git status
+      --porcelain; if dirty, stashes with git stash push --include-untracked
+      before proceeding. (2) Tries git rev-parse --verify {branch} to check if
+      branch exists locally. If not local: fetches origin, then checks
+      origin/{branch}. If remote exists: checkout -b {branch} --track
+      origin/{branch} and verifies tracking was configured via git config --get
+      branch.{branch}.remote. If neither local nor remote: attempts git checkout
+      {branch} (will fail with clear error). (3) If branch exists locally: git
+      checkout {branch}, then verifies tracking; if not configured, logs
+      warning. The tracking verification step handles legacy branches created
+      before the push-tracking fix."
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/git_workflow_manager.py
+          symbol: GitWorkflowManager.checkout_branch
+    metadata:
+      created_at: 2026-03-24T09:18:24.896Z
+      updated_at: 2026-03-24T09:18:24.896Z
+      version: 1
+  timestamp: 2026-03-24T09:18:24.921Z
+  sequenceNumber: 12
+- type: add
+  elementId: application.applicationprocess.pr-lifecycle-status-transitions
+  layerName: application
+  after:
+    id: 8924d3ce-1aef-461e-8f3b-6eb9235c9b97
+    path: application.applicationprocess.pr-lifecycle-status-transitions
+    spec_node_id: application.applicationprocess
+    type: applicationprocess
+    layer_id: application
+    name: PR Lifecycle Status Transitions
+    description: "GitWorkflowManager.update_pr_status()
+      (services/git_workflow_manager.py:280-416): manages four PR state
+      transitions. 'ready': if current pr_state=='draft', calls gh pr ready to
+      remove draft status, updates pr_state='open'. 'approved': adds 'approved'
+      label via gh pr edit --add-label; if label missing from repo ('not found'
+      in stderr), auto-creates it with color 0e8a16 then retries the add.
+      'merged': sets pr_state='merged' and calls _delete_branch() to git push
+      origin --delete {branch_name}. create_or_update_pr() uses gh pr create
+      --base main --head {branch} --draft and parses the returned URL to extract
+      the PR number; if PR already exists (stderr contains 'already exists'),
+      fetches existing PR details via gh pr list --head {branch} and updates
+      cache."
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/git_workflow_manager.py
+          symbol: GitWorkflowManager.update_pr_status
+    metadata:
+      created_at: 2026-03-24T09:18:33.809Z
+      updated_at: 2026-03-24T09:18:33.809Z
+      version: 1
+  timestamp: 2026-03-24T09:18:33.834Z
+  sequenceNumber: 13
+- type: add
+  elementId: application.applicationprocess.disallowed-markdown-commit-validation
+  layerName: application
+  after:
+    id: ff938545-e94f-43bb-9ec9-d94820f04d01
+    path: application.applicationprocess.disallowed-markdown-commit-validation
+    spec_node_id: application.applicationprocess
+    type: applicationprocess
+    layer_id: application
+    name: Disallowed Markdown Commit Validation
+    description: "validate_no_unwanted_docs()
+      (services/git_workflow_manager.py:37-109) is called before committing
+      agent output. Scans staged files for .md extensions. Allowed locations
+      (pass without check): .claude/**/*.md, documentation/**/*.md, README.md,
+      **/CLAUDE.md, docs/**/*.md, **/.github/**/*.md. Disallowed patterns
+      (blocked): *_REPORT.md, *_STATUS.md, *_CHECKLIST.md, *_REVIEW.md,
+      *_FIX.md, *_VERIFICATION.md, *_ANALYSIS.md, *_SUMMARY.md, *_TODO.md,
+      *_NOTES.md, CODE_REVIEW.md, DEPLOYMENT_CHECKLIST.md, IMPLEMENTATION_*.md,
+      REFACTOR_*.md. If any staged file matches a disallowed pattern AND is not
+      in an allowed location, it is reported as a violation. Returns {valid:
+      bool, violations: list}. This implements the CLAUDE.md
+      no-documentation-files policy at the git layer."
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/git_workflow_manager.py
+          symbol: validate_no_unwanted_docs
+    metadata:
+      created_at: 2026-03-24T09:18:42.525Z
+      updated_at: 2026-03-24T09:18:42.525Z
+      version: 1
+  timestamp: 2026-03-24T09:18:42.548Z
+  sequenceNumber: 14
+- type: add
+  elementId: application.applicationprocess.agent-pre-flight-empty-issue-body-rejection
+  layerName: application
+  after:
+    id: c0b8886e-f4a1-4b9c-95f4-e0e0e8b3f330
+    path: application.applicationprocess.agent-pre-flight-empty-issue-body-rejection
+    spec_node_id: application.applicationprocess
+    type: applicationprocess
+    layer_id: application
+    name: Agent Pre-Flight Empty Issue Body Rejection
+    description: "In AgentExecutor.execute_agent()
+      (services/agent_executor.py:426-443): before launching ANY Docker
+      container, if task_context contains an 'issue' dict with an empty or
+      whitespace-only 'body' field, raises NonRetryableAgentError immediately.
+      This prevents agents from executing on issues with no description, which
+      would silently produce garbage output with 'No description' placeholders.
+      The pipeline lock is retained (NonRetryableAgentError is not retried) and
+      the issue remains blocked until a human fills in the description and
+      re-triggers."
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/agent_executor.py
+          symbol: AgentExecutor.execute_agent.preflight_empty_body
+    metadata:
+      created_at: 2026-03-24T09:18:51.047Z
+      updated_at: 2026-03-24T09:18:51.047Z
+      version: 1
+  timestamp: 2026-03-24T09:18:51.072Z
+  sequenceNumber: 15
+- type: add
+  elementId: application.applicationprocess.agent-retry-backoff-with-circuit-breaker-awareness
+  layerName: application
+  after:
+    id: 875f42e9-714a-4673-a8b2-c7b687667864
+    path: application.applicationprocess.agent-retry-backoff-with-circuit-breaker-awareness
+    spec_node_id: application.applicationprocess
+    type: applicationprocess
+    layer_id: application
+    name: Agent Retry Backoff with Circuit Breaker Awareness
+    description: "AgentExecutor.execute_agent()
+      (services/agent_executor.py:414-537): retry count comes from
+      agent_config.retries (default 2), giving max_attempts = 1 + retries. On
+      each failed attempt that is not a CancellationError,
+      NonRetryableAgentError, or ClaudeCodeRateLimitError: wait wait_time = 15 *
+      attempt seconds (attempt 1→15s, attempt 2→30s) before retrying. This
+      backoff duration is intentionally long to span the circuit breaker's 30s
+      recovery timeout, allowing the circuit breaker to transition to HALF_OPEN
+      between retries. ClaudeCodeRateLimitError never retries and immediately
+      trips the global Claude Code circuit breaker if not already open.
+      CancellationError never retries and does not record as failure.
+      NonRetryableAgentError skips all retries."
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/agent_executor.py
+          symbol: AgentExecutor.execute_agent.retry_loop
+    metadata:
+      created_at: 2026-03-24T09:18:59.935Z
+      updated_at: 2026-03-24T09:18:59.935Z
+      version: 1
+  timestamp: 2026-03-24T09:18:59.966Z
+  sequenceNumber: 16
+- type: add
+  elementId: application.applicationprocess.workspace-finalization-failsafe-commit-check
+  layerName: application
+  after:
+    id: 9326b270-ca34-4aaa-abdd-7a24e9ec85a0
+    path: application.applicationprocess.workspace-finalization-failsafe-commit-check
+    spec_node_id: application.applicationprocess
+    type: applicationprocess
+    layer_id: application
+    name: Workspace Finalization Failsafe Commit Check
+    description: "AgentExecutor.execute_agent()
+      (services/agent_executor.py:570-650): after agent completes successfully,
+      calls workspace_context.finalize_execution() if workspace_context is not
+      None. If finalize returns success=False, or raises an exception, calls
+      _failsafe_commit_check() to handle any uncommitted changes left by the
+      agent. If workspace_context is None (repair cycle skip, workspace prep
+      failed, or no issue_number) and issue_number exists: still calls
+      _failsafe_commit_check() as a safety net. This prevents agent code changes
+      from being silently lost when the primary finalization path fails. The
+      failsafe uses git status to detect and commit uncommitted changes under an
+      auto-commit message."
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/agent_executor.py
+          symbol: AgentExecutor.execute_agent.finalization_failsafe
+    metadata:
+      created_at: 2026-03-24T09:19:07.224Z
+      updated_at: 2026-03-24T09:19:07.224Z
+      version: 1
+  timestamp: 2026-03-24T09:19:07.247Z
+  sequenceNumber: 17
+- type: add
+  elementId: application.applicationprocess.branch-error-human-intervention-lock-retain
+  layerName: application
+  after:
+    id: c76568a5-544b-4d09-8c5c-cfaf02b15f65
+    path: application.applicationprocess.branch-error-human-intervention-lock-retain
+    spec_node_id: application.applicationprocess
+    type: applicationprocess
+    layer_id: application
+    name: Branch Error Human Intervention Lock Retain
+    description: "AgentExecutor.execute_agent()
+      (services/agent_executor.py:277-325): when workspace preparation raises
+      StaleBranchError or BranchPullFailedError, the executor (1) posts a GitHub
+      comment explaining the problem and the rebase command needed, (2) calls
+      pipeline_run_manager.end_pipeline_run(retain_lock=True, outcome='failed')
+      to close the pipeline run while keeping the pipeline lock held, (3)
+      re-raises as NonRetryableAgentError. The retained lock prevents any new
+      work from starting on this issue. The comment instructs the user to rebase
+      and move back to Development. For StaleBranchError, the comment includes
+      the branch name and commits_behind count and the exact rebase commands.
+      For BranchPullFailedError, the comment explains the git pull failure and
+      diagnosis steps."
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/agent_executor.py
+          symbol: AgentExecutor.execute_agent.branch_error_handler
+    metadata:
+      created_at: 2026-03-24T09:19:15.071Z
+      updated_at: 2026-03-24T09:19:15.071Z
+      version: 1
+  timestamp: 2026-03-24T09:19:15.095Z
+  sequenceNumber: 18
+- type: add
+  elementId: application.applicationprocess.graph-ql-board-column-move-with-retry
+  layerName: application
+  after:
+    id: 3814b1d0-878b-41b3-9674-f85091523f38
+    path: application.applicationprocess.graph-ql-board-column-move-with-retry
+    spec_node_id: application.applicationprocess
+    type: applicationprocess
+    layer_id: application
+    name: GraphQL Board Column Move with Retry
+    description: "PipelineProgression.move_issue_to_column()
+      (services/pipeline_progression.py:245-351): uses two separate GitHub
+      GraphQL queries and one mutation. Query 1: fetches issue.projectItems to
+      get the project item ID matching board_state.project_number. If issue has
+      no items in the target board, returns False. Mutation:
+      updateProjectV2ItemFieldValue with projectId, itemId, fieldId
+      (status_field_id), and value.singleSelectOptionId (column_option_id).
+      Mutation has retry loop: max 3 attempts with exponential backoff
+      (2*attempt seconds). After successful mutation: calls
+      work_execution_tracker.record_status_change(trigger=trigger) to record the
+      status transition. Before mutation: pre-fetches current status via a
+      separate GraphQL query for decision event emission."
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/pipeline_progression.py
+          symbol: PipelineProgression.move_issue_to_column.graphql_mutation
+    metadata:
+      created_at: 2026-03-24T09:19:29.353Z
+      updated_at: 2026-03-24T09:19:29.353Z
+      version: 1
+  timestamp: 2026-03-24T09:19:29.378Z
+  sequenceNumber: 19
+- type: add
+  elementId: application.applicationprocess.was-recent-programmatic-change-detection
+  layerName: application
+  after:
+    id: d4ed6f3c-9680-41fa-95ed-aeb89d3ff284
+    path: application.applicationprocess.was-recent-programmatic-change-detection
+    spec_node_id: application.applicationprocess
+    type: applicationprocess
+    layer_id: application
+    name: Was Recent Programmatic Change Detection
+    description: "WorkExecutionStateTracker.was_recent_programmatic_change()
+      (services/work_execution_state.py:616-673): checks status_changes history
+      for a recent programmatic status change to a given to_status. Recognises
+      these trigger values as programmatic: agent_auto_advance,
+      pipeline_progression, review_cycle, review_cycle_completion,
+      repair_cycle_completion, agent_completion, auto, all_subtasks_completed.
+      Time window is configurable via PROGRAMMATIC_CHANGE_WINDOW_SECONDS env var
+      (default 60s). Used by project_monitor to avoid emitting duplicate
+      card-moved events when the pipeline progression service just moved the
+      issue. Returns bool."
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/work_execution_state.py
+          symbol: WorkExecutionStateTracker.was_recent_programmatic_change
+    metadata:
+      created_at: 2026-03-24T09:19:37.260Z
+      updated_at: 2026-03-24T09:19:37.260Z
+      version: 1
+  timestamp: 2026-03-24T09:19:37.290Z
+  sequenceNumber: 20
+- type: add
+  elementId: application.applicationprocess.conversational-session-state-file-management
+  layerName: application
+  after:
+    id: e07c8ff2-61c9-4aee-9f44-7ece454a577d
+    path: application.applicationprocess.conversational-session-state-file-management
+    spec_node_id: application.applicationprocess
+    type: applicationprocess
+    layer_id: application
+    name: Conversational Session State File Management
+    description: "ConversationalSessionStateManager
+      (services/conversational_session_state.py): state files stored at
+      {ORCHESTRATOR_ROOT}/state/conversational_sessions/{project}_issue_{n}.yam\
+      l. Fields: session_id (Claude Code session), issue_number, agent,
+      project_name, workspace_type ('issues' or 'discussions'), pipeline_run_id,
+      last_interaction (UTC ISO), updated_at. load_session() returns None if
+      file missing, or if age (now - last_interaction) > max_age_hours (default
+      24h). save_session() creates or overwrites the file atomically.
+      update_last_interaction() reads-modifies-writes only the timestamp fields.
+      delete_session() removes the file. get_all_sessions() scans all *.yaml in
+      the directory. State directory uses ORCHESTRATOR_ROOT env var (default
+      /app) to avoid path issues when agents run with a project working
+      directory."
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/conversational_session_state.py
+          symbol: ConversationalSessionStateManager
+    metadata:
+      created_at: 2026-03-24T09:19:47.094Z
+      updated_at: 2026-03-24T09:19:47.095Z
+      version: 1
+  timestamp: 2026-03-24T09:19:47.123Z
+  sequenceNumber: 21
+- type: add
+  elementId: application.applicationprocess.execution-outcome-double-recording-prevention
+  layerName: application
+  after:
+    id: a33647e9-5de6-4f28-be54-46619196ef78
+    path: application.applicationprocess.execution-outcome-double-recording-prevention
+    spec_node_id: application.applicationprocess
+    type: applicationprocess
+    layer_id: application
+    name: Execution Outcome Double-Recording Prevention
+    description: "In AgentExecutor.execute_agent() success and failure paths
+      (services/agent_executor.py:672-807): before calling
+      record_execution_outcome(), the executor walks execution_history in
+      reverse for the matching agent+column. Logic: if it finds an in_progress
+      entry first → the current execution is not yet recorded, so record it. If
+      it finds a terminal outcome (success, failure, cancelled, blocked) before
+      hitting any in_progress entry → docker_runner already recorded the outcome
+      for this execution, skip to avoid double-recording. This handles the case
+      where DockerAgentRunner._complete_agent_execution() records the outcome
+      early (from the container exit callback) before the agent_executor's outer
+      except block runs."
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/agent_executor.py
+          symbol: AgentExecutor.execute_agent.outcome_double_recording_prevention
+    metadata:
+      created_at: 2026-03-24T09:19:54.877Z
+      updated_at: 2026-03-24T09:19:54.877Z
+      version: 1
+  timestamp: 2026-03-24T09:19:54.904Z
+  sequenceNumber: 22
+- type: add
+  elementId: application.applicationprocess.phantom-probe-cleanup-on-outcome-recording
+  layerName: application
+  after:
+    id: f209ca0c-69fa-4fe4-8762-5f3bd5d5e6bd
+    path: application.applicationprocess.phantom-probe-cleanup-on-outcome-recording
+    spec_node_id: application.applicationprocess
+    type: applicationprocess
+    layer_id: application
+    name: Phantom Probe Cleanup on Outcome Recording
+    description: "WorkExecutionStateTracker.record_execution_outcome()
+      (services/work_execution_state.py:202-268): scans execution_history in
+      reverse for in_progress entries matching agent+column. The FIRST (most
+      recent) match is treated as the real execution entry and updated with the
+      final outcome. All older in_progress entries for the same agent+column are
+      treated as phantom pre-enqueue probes and also updated with the same
+      outcome, but with an error message explaining they were superseded. This
+      handles the edge case where pipeline_progression wrote a pre-enqueue probe
+      and then enqueued a second task for the same agent+column before the first
+      was consumed."
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/work_execution_state.py
+          symbol: WorkExecutionStateTracker.record_execution_outcome
+    metadata:
+      created_at: 2026-03-24T09:20:01.231Z
+      updated_at: 2026-03-24T09:20:01.231Z
+      version: 1
+  timestamp: 2026-03-24T09:20:01.260Z
+  sequenceNumber: 23
+- type: add
+  elementId: application.applicationprocess.dev-environment-setup-state-lifecycle
+  layerName: application
+  after:
+    id: 86f1fbdf-cc41-4ab5-927c-69a8ecc7e418
+    path: application.applicationprocess.dev-environment-setup-state-lifecycle
+    spec_node_id: application.applicationprocess
+    type: applicationprocess
+    layer_id: application
+    name: Dev Environment Setup State Lifecycle
+    description: "AgentExecutor.execute_agent() (services/agent_executor.py:403-411,
+      816-830): dev_environment_setup agent has special state lifecycle. Before
+      execution: set DevContainerStatus.IN_PROGRESS with
+      image_name='{project}-agent:latest'. On successful completion: call
+      _queue_environment_verifier() to enqueue dev_environment_verifier as the
+      next task. On failure (non-circuit-breaker): reset DevContainerStatus to
+      UNVERIFIED with error_message truncated to 200 chars. Circuit breaker
+      blocks are NOT reset to UNVERIFIED because the agent never ran — state
+      remains IN_PROGRESS to be retried when tokens reset."
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/agent_executor.py
+          symbol: AgentExecutor.execute_agent.dev_environment_setup_lifecycle
+    metadata:
+      created_at: 2026-03-24T09:20:09.117Z
+      updated_at: 2026-03-24T09:20:09.117Z
+      version: 1
+  timestamp: 2026-03-24T09:20:09.145Z
+  sequenceNumber: 24
+- type: add
+  elementId: application.applicationprocess.pull-rebase-via-fetch-and-hard-reset
+  layerName: application
+  after:
+    id: 41a559ef-aca1-40f7-8958-6e03f2a7276d
+    path: application.applicationprocess.pull-rebase-via-fetch-and-hard-reset
+    spec_node_id: application.applicationprocess
+    type: applicationprocess
+    layer_id: application
+    name: Pull Rebase via Fetch and Hard Reset
+    description: "GitWorkflowManager.pull_rebase()
+      (services/git_workflow_manager.py:740-823): replaces git pull --rebase to
+      avoid merge conflicts when shared workspace has local commits that
+      diverged from remote. Algorithm: (1) get current branch name via git
+      rev-parse --abbrev-ref HEAD. (2) git fetch origin. (3) check if
+      origin/{branch} exists; if not (new branch, first push), skip and return.
+      (4) count local commits ahead of remote via git rev-list --count
+      origin/{branch}..HEAD; if ahead_count > 0, log error that prior agent
+      committed without pushing. (5) git reset --hard origin/{branch} —
+      idempotent, conflict-free. (6) git clean -fd to remove untracked artifacts
+      from prior agent runs. If fetch fails, raises exception. If reset fails,
+      raises exception."
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/git_workflow_manager.py
+          symbol: GitWorkflowManager.pull_rebase
+    metadata:
+      created_at: 2026-03-24T09:20:22.260Z
+      updated_at: 2026-03-24T09:20:22.260Z
+      version: 1
+  timestamp: 2026-03-24T09:20:22.293Z
+  sequenceNumber: 25
+- type: add
+  elementId: application.applicationprocess.circuit-breaker-blocked-execution-auto-recovery
+  layerName: application
+  after:
+    id: 19ffd22f-49fe-4d1f-91d9-47333e1ced68
+    path: application.applicationprocess.circuit-breaker-blocked-execution-auto-recovery
+    spec_node_id: application.applicationprocess
+    type: applicationprocess
+    layer_id: application
+    name: Circuit Breaker Blocked Execution Auto-Recovery
+    description: "WorkExecutionStateTracker.is_blocked_by_circuit_breaker()
+      (services/work_execution_state.py:578-614): checks if the MOST RECENT
+      execution (regardless of column/agent) has outcome=='blocked' AND error
+      string contains 'circuit breaker' (case-insensitive). Used by
+      project_monitor to detect when a previously-blocked issue can be
+      re-triggered once the Claude Code circuit breaker closes and tokens reset.
+      Returns bool. The companion should_execute_work() Case 3 allows retry when
+      outcome==blocked."
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/work_execution_state.py
+          symbol: WorkExecutionStateTracker.is_blocked_by_circuit_breaker
+    metadata:
+      created_at: 2026-03-24T09:20:29.362Z
+      updated_at: 2026-03-24T09:20:29.362Z
+      version: 1
+  timestamp: 2026-03-24T09:20:29.393Z
+  sequenceNumber: 26
+- type: add
+  elementId: application.applicationprocess.git-commit-with-doc-validation-and-hook-skip
+  layerName: application
+  after:
+    id: 9030d0df-a9b6-4d12-bb83-c6db93a84083
+    path: application.applicationprocess.git-commit-with-doc-validation-and-hook-skip
+    spec_node_id: application.applicationprocess
+    type: applicationprocess
+    layer_id: application
+    name: Git Commit with Doc Validation and Hook Skip
+    description: "GitWorkflowManager.commit()
+      (services/git_workflow_manager.py:881-994): if validate_docs=True
+      (default), runs git diff --cached --name-only to get staged files, then
+      calls validate_no_unwanted_docs(). If violations found: for each violating
+      file, calls git reset HEAD -- {file} to unstage, then os.remove() to
+      delete the file from disk, preventing dirty state from blocking future git
+      operations. Returns False after cleanup. If no violations: runs git commit
+      -m {message} with --no-verify (skip_hooks=True by default) because
+      pre-commit hooks are for developer workflow, not CI/CD. 'nothing to
+      commit' in stdout is treated as success (returns True). push_branch() uses
+      git push -u origin {branch} with -u flag to set tracking on first push."
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/git_workflow_manager.py
+          symbol: GitWorkflowManager.commit
+    metadata:
+      created_at: 2026-03-24T09:20:45.891Z
+      updated_at: 2026-03-24T09:20:45.891Z
+      version: 1
+  timestamp: 2026-03-24T09:20:45.920Z
+  sequenceNumber: 27

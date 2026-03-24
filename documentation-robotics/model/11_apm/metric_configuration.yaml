@@ -1,0 +1,21 @@
+apm.metricconfiguration.task-execution-metrics:
+  id: 19ba4fd3-d106-4ff1-8afd-f3fbe5bb73d1
+  path: apm.metricconfiguration.task-execution-metrics
+  spec_node_id: apm.metricconfiguration
+  type: metricconfiguration
+  layer_id: apm
+  name: Task Execution Metrics
+  description: MetricsCollector writes task_metrics to Elasticsearch
+    orchestrator-task-metrics-{date} index and JSONL backup at
+    orchestrator_data/metrics/task_metrics_{date}.jsonl
+  attributes:
+    serviceName: orchestrator
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: monitoring/metrics.py
+        symbol: MetricsCollector
+  metadata:
+    created_at: 2026-03-24T00:19:09.758Z
+    updated_at: 2026-03-24T00:19:09.758Z
+    version: 1

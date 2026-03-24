@@ -1,0 +1,90 @@
+security.securitypolicy.git-hub-api-access-control-policy:
+  id: 8b081e1b-a9f4-4da0-a6ee-1d0e4e593a8b
+  path: security.securitypolicy.git-hub-api-access-control-policy
+  spec_node_id: security.securitypolicy
+  type: securitypolicy
+  layer_id: security
+  name: GitHub API Access Control Policy
+  description: All GitHub API requests must use App installation token; PAT only as fallback
+  attributes:
+    priority: 1
+    target: service
+    enabled: true
+    requirementLevel: mandatory
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/github_app.py
+        symbol: GitHubApp._get_token
+  metadata:
+    created_at: 2026-03-24T00:25:11.680Z
+    updated_at: 2026-03-24T00:25:11.680Z
+    version: 1
+security.securitypolicy.docker-container-isolation-policy:
+  id: d3a21405-839e-48ee-b1f9-79a11eb7d3c4
+  path: security.securitypolicy.docker-container-isolation-policy
+  spec_node_id: security.securitypolicy
+  type: securitypolicy
+  layer_id: security
+  name: Docker Container Isolation Policy
+  description: Each agent runs in an isolated Docker container with filesystem
+    scope limited to /workspace/<project>
+  attributes:
+    priority: 1
+    target: service
+    enabled: true
+    requirementLevel: mandatory
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: claude/docker_runner.py
+        symbol: DockerAgentRunner
+  metadata:
+    created_at: 2026-03-24T00:25:12.182Z
+    updated_at: 2026-03-24T00:25:12.182Z
+    version: 1
+security.securitypolicy.non-root-container-execution-policy:
+  id: b611f3d3-733a-4b4a-9c8a-3a2e7a7df2cc
+  path: security.securitypolicy.non-root-container-execution-policy
+  spec_node_id: security.securitypolicy
+  type: securitypolicy
+  layer_id: security
+  name: Non-Root Container Execution Policy
+  description: All containers run as non-root user (UID 1000) to limit privilege escalation
+  attributes:
+    priority: 2
+    target: service
+    enabled: true
+    requirementLevel: mandatory
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: Dockerfile
+        symbol: USER orchestrator
+  metadata:
+    created_at: 2026-03-24T00:25:12.729Z
+    updated_at: 2026-03-24T00:25:12.729Z
+    version: 1
+security.securitypolicy.secret-environment-variable-policy:
+  id: d7c8b2a0-18cd-4243-b600-9df4e464926a
+  path: security.securitypolicy.secret-environment-variable-policy
+  spec_node_id: security.securitypolicy
+  type: securitypolicy
+  layer_id: security
+  name: Secret Environment Variable Policy
+  description: API keys and tokens injected via environment variables from .env
+    file; never committed to source
+  attributes:
+    priority: 2
+    target: data
+    enabled: true
+    requirementLevel: mandatory
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: docker-compose.yml
+        symbol: environment
+  metadata:
+    created_at: 2026-03-24T00:25:13.247Z
+    updated_at: 2026-03-24T00:25:13.247Z
+    version: 1

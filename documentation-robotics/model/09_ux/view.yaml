@@ -1,0 +1,192 @@
+ux.view.dashboard-index:
+  id: fd70ea25-4a30-4c8f-ae72-99ab5a9386b9
+  path: ux.view.dashboard-index
+  spec_node_id: ux.view
+  type: view
+  layer_id: ux
+  name: Dashboard (Index)
+  description: Main dashboard view showing header stats (active agents, circuit
+    breakers, Claude usage), pipeline flow graph, active agent list, live logs,
+    and project cards
+  attributes:
+    type: page
+    title: Dashboard
+    routable: true
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: web_ui/src/routes/index.jsx
+  metadata:
+    created_at: 2026-03-24T00:15:26.046Z
+    updated_at: 2026-03-24T00:15:26.046Z
+    version: 1
+ux.view.pipeline-run-detail:
+  id: e567a3b1-aa63-4715-a135-39768b4446e1
+  path: ux.view.pipeline-run-detail
+  spec_node_id: ux.view
+  type: view
+  layer_id: ux
+  name: Pipeline Run Detail
+  description: Detailed view for a single pipeline run showing header, event log,
+    repair cycle status, and sidebar with agent execution state and issue
+    context
+  attributes:
+    type: page
+    title: Pipeline Run
+    routable: true
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: web_ui/src/routes/pipeline-run.jsx
+  metadata:
+    created_at: 2026-03-24T00:15:26.363Z
+    updated_at: 2026-03-24T00:15:26.363Z
+    version: 1
+ux.view.agent-execution-detail:
+  id: 5e11c671-75fb-4c2d-b464-6b00e6830e0f
+  path: ux.view.agent-execution-detail
+  spec_node_id: ux.view
+  type: view
+  layer_id: ux
+  name: Agent Execution Detail
+  description: Detail view for a specific agent execution showing tool calls,
+    Claude logs, timing, and execution state
+  attributes:
+    type: page
+    title: Agent Execution
+    routable: true
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: web_ui/src/routes/agent-execution..jsx
+  metadata:
+    created_at: 2026-03-24T00:15:26.680Z
+    updated_at: 2026-03-24T00:15:26.680Z
+    version: 1
+ux.view.projects-view:
+  id: e348b884-dfd3-4d91-b8f3-187eac02bb5b
+  path: ux.view.projects-view
+  spec_node_id: ux.view
+  type: view
+  layer_id: ux
+  name: Projects View
+  description: Grid of project cards showing each project's status, active
+    pipeline count, last activity, and board names
+  attributes:
+    type: page
+    title: Projects
+    routable: true
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: web_ui/src/routes/projects.jsx
+  metadata:
+    created_at: 2026-03-24T00:15:32.786Z
+    updated_at: 2026-03-24T00:15:32.786Z
+    version: 1
+ux.view.agent-metrics-view:
+  id: 6e177646-905f-4bd4-837b-2d96c60c0f71
+  path: ux.view.agent-metrics-view
+  spec_node_id: ux.view
+  type: view
+  layer_id: ux
+  name: Agent Metrics View
+  description: Performance metrics view showing agent execution statistics,
+    success rates, average durations, and trend charts per agent type
+  attributes:
+    type: page
+    title: Agent Metrics
+    routable: true
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: web_ui/src/routes/agent-metrics.jsx
+  metadata:
+    created_at: 2026-03-24T00:15:33.109Z
+    updated_at: 2026-03-24T00:15:33.109Z
+    version: 1
+ux.view.cycle-metrics-view:
+  id: 574132fd-b498-4909-8a25-11a220ef6225
+  path: ux.view.cycle-metrics-view
+  spec_node_id: ux.view
+  type: view
+  layer_id: ux
+  name: Cycle Metrics View
+  description: Review cycle and repair cycle metrics view showing iteration
+    counts, approval rates, and cycle duration trends
+  attributes:
+    type: page
+    title: Cycle Metrics
+    routable: true
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: web_ui/src/routes/cycle-metrics.jsx
+  metadata:
+    created_at: 2026-03-24T00:15:33.432Z
+    updated_at: 2026-03-24T00:15:33.432Z
+    version: 1
+ux.view.pipeline-reports-view:
+  id: 145b1791-fd16-4a3f-a990-82e364cca481
+  path: ux.view.pipeline-reports-view
+  spec_node_id: ux.view
+  type: view
+  layer_id: ux
+  name: Pipeline Reports View
+  description: Historical pipeline run reports with status distribution, stage
+    duration breakdowns, and failure analysis summaries
+  attributes:
+    type: page
+    title: Pipeline Reports
+    routable: true
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: web_ui/src/routes/pipeline-reports.jsx
+  metadata:
+    created_at: 2026-03-24T00:15:43.647Z
+    updated_at: 2026-03-24T00:15:43.647Z
+    version: 1
+ux.view.project-metrics-view:
+  id: 78bfda00-56f6-4d64-a897-c1005432e30e
+  path: ux.view.project-metrics-view
+  spec_node_id: ux.view
+  type: view
+  layer_id: ux
+  name: Project Metrics View
+  description: Per-project metrics view with issue throughput, pipeline
+    efficiency, agent utilization, and quality score trends
+  attributes:
+    type: page
+    title: Project Metrics
+    routable: true
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: web_ui/src/routes/project-metrics.jsx
+  metadata:
+    created_at: 2026-03-24T00:15:43.990Z
+    updated_at: 2026-03-24T00:15:43.990Z
+    version: 1
+ux.view.recommendation-reports-view:
+  id: ea5210e7-5f28-4658-ae58-417c806f8759
+  path: ux.view.recommendation-reports-view
+  spec_node_id: ux.view
+  type: view
+  layer_id: ux
+  name: Recommendation Reports View
+  description: AI-generated recommendations from claude_advisor pattern analysis,
+    suggesting pipeline improvements, agent configuration changes, and process
+    optimizations
+  attributes:
+    type: page
+    title: Recommendation Reports
+    routable: true
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: web_ui/src/routes/recommendation-reports.jsx
+  metadata:
+    created_at: 2026-03-24T00:15:44.341Z
+    updated_at: 2026-03-24T00:15:44.341Z
+    version: 1

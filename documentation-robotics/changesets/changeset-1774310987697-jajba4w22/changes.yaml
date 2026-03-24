@@ -1,0 +1,682 @@
+- type: add
+  elementId: api.openapidocument.observability-server-api
+  layerName: api
+  after:
+    id: 73677fd3-719a-4ff6-8355-d811544d3937
+    path: api.openapidocument.observability-server-api
+    spec_node_id: api.openapidocument
+    type: openapidocument
+    layer_id: api
+    name: Observability Server API
+    description: REST and WebSocket API provided by the observability server on port
+      5001 for monitoring agent execution, pipeline state, system health, and
+      real-time event streaming
+    attributes:
+      openapi: 3.0.3
+      info: Switchyard Observability API v1.0.0
+      paths: /health /agents/active /history /claude-logs-history /current-pipeline
+        /pipeline-run-events /active-pipeline-runs /api/circuit-breakers
+        /api/projects /agents/kill/:name
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/observability_server.py
+          symbol: app
+    metadata:
+      created_at: 2026-03-24T00:10:09.633Z
+      updated_at: 2026-03-24T00:10:09.633Z
+      version: 1
+  timestamp: 2026-03-24T00:10:09.657Z
+  sequenceNumber: 0
+- type: add
+  elementId: api.server.observability-server
+  layerName: api
+  after:
+    id: a98a8b98-bbe2-4f6b-b0f4-02f8eaf79465
+    path: api.server.observability-server
+    spec_node_id: api.server
+    type: server
+    layer_id: api
+    name: Observability Server
+    description: Flask server running on port 5001 within the Docker Compose network
+    attributes:
+      url: http://localhost:5001
+      description: Observability and monitoring API server
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/observability_server.py
+          symbol: app
+    metadata:
+      created_at: 2026-03-24T00:10:15.446Z
+      updated_at: 2026-03-24T00:10:15.446Z
+      version: 1
+  timestamp: 2026-03-24T00:10:15.469Z
+  sequenceNumber: 1
+- type: add
+  elementId: api.tag.health
+  layerName: api
+  after:
+    id: 76fd1b82-8625-44a8-8afd-6f7bdb25a05f
+    path: api.tag.health
+    spec_node_id: api.tag
+    type: tag
+    layer_id: api
+    name: Health
+    description: System health monitoring endpoints
+    attributes:
+      description: System health checks and status
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/observability_server.py
+    metadata:
+      created_at: 2026-03-24T00:10:15.903Z
+      updated_at: 2026-03-24T00:10:15.903Z
+      version: 1
+  timestamp: 2026-03-24T00:10:15.927Z
+  sequenceNumber: 2
+- type: add
+  elementId: api.tag.agents
+  layerName: api
+  after:
+    id: 211b06e0-3569-4810-825c-db0b61626836
+    path: api.tag.agents
+    spec_node_id: api.tag
+    type: tag
+    layer_id: api
+    name: Agents
+    description: Agent execution monitoring and control endpoints
+    attributes:
+      description: Active agent monitoring and kill operations
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/observability_server.py
+    metadata:
+      created_at: 2026-03-24T00:10:16.362Z
+      updated_at: 2026-03-24T00:10:16.362Z
+      version: 1
+  timestamp: 2026-03-24T00:10:16.386Z
+  sequenceNumber: 3
+- type: add
+  elementId: api.tag.pipeline
+  layerName: api
+  after:
+    id: 2b899084-b685-45e9-8b3c-1ee9318d5a30
+    path: api.tag.pipeline
+    spec_node_id: api.tag
+    type: tag
+    layer_id: api
+    name: Pipeline
+    description: Pipeline run and state monitoring endpoints
+    attributes:
+      description: Pipeline execution monitoring
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/observability_server.py
+    metadata:
+      created_at: 2026-03-24T00:10:21.674Z
+      updated_at: 2026-03-24T00:10:21.674Z
+      version: 1
+  timestamp: 2026-03-24T00:10:21.698Z
+  sequenceNumber: 4
+- type: add
+  elementId: api.tag.projects
+  layerName: api
+  after:
+    id: 68b47019-3c41-439a-a36b-d557f75e008b
+    path: api.tag.projects
+    spec_node_id: api.tag
+    type: tag
+    layer_id: api
+    name: Projects
+    description: Project configuration and status endpoints
+    attributes:
+      description: Project management and status
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/observability_server.py
+    metadata:
+      created_at: 2026-03-24T00:10:22.131Z
+      updated_at: 2026-03-24T00:10:22.131Z
+      version: 1
+  timestamp: 2026-03-24T00:10:22.156Z
+  sequenceNumber: 5
+- type: add
+  elementId: api.tag.metrics
+  layerName: api
+  after:
+    id: 19af717d-4eb2-4344-8b17-a70245cd0596
+    path: api.tag.metrics
+    spec_node_id: api.tag
+    type: tag
+    layer_id: api
+    name: Metrics
+    description: Agent execution history and metrics endpoints
+    attributes:
+      description: Agent execution history and performance metrics
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/observability_server.py
+    metadata:
+      created_at: 2026-03-24T00:10:22.597Z
+      updated_at: 2026-03-24T00:10:22.597Z
+      version: 1
+  timestamp: 2026-03-24T00:10:22.623Z
+  sequenceNumber: 6
+- type: add
+  elementId: api.operation.get-health
+  layerName: api
+  after:
+    id: b0624117-065f-4421-94ba-e62ed87dec87
+    path: api.operation.get-health
+    spec_node_id: api.operation
+    type: operation
+    layer_id: api
+    name: GET /health
+    description: Returns system health status including Redis, GitHub auth, Docker
+      socket, disk space, and memory checks
+    attributes:
+      operationId: getHealth
+      summary: Get system health status
+      tags: Health
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/observability_server.py
+          symbol: /health
+    metadata:
+      created_at: 2026-03-24T00:10:39.587Z
+      updated_at: 2026-03-24T00:10:39.587Z
+      version: 1
+  timestamp: 2026-03-24T00:10:39.614Z
+  sequenceNumber: 7
+- type: add
+  elementId: api.operation.get-agentsactive
+  layerName: api
+  after:
+    id: 101d5997-269e-489e-a5bc-a483cec2cac2
+    path: api.operation.get-agentsactive
+    spec_node_id: api.operation
+    type: operation
+    layer_id: api
+    name: GET /agents/active
+    description: Returns list of currently active agent containers running for all
+      projects, including container name, agent type, project, issue number, and
+      start time
+    attributes:
+      operationId: getActiveAgents
+      summary: List active agent containers
+      tags: Agents
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/observability_server.py
+          symbol: /agents/active
+    metadata:
+      created_at: 2026-03-24T00:10:40.042Z
+      updated_at: 2026-03-24T00:10:40.042Z
+      version: 1
+  timestamp: 2026-03-24T00:10:40.071Z
+  sequenceNumber: 8
+- type: add
+  elementId: api.operation.post-agentskillcontainer-name
+  layerName: api
+  after:
+    id: 46dc4f76-a338-4f1c-9e15-d288d4532fad
+    path: api.operation.post-agentskillcontainer-name
+    spec_node_id: api.operation
+    type: operation
+    layer_id: api
+    name: POST /agents/kill/:containerName
+    description: Terminates a running agent container by name; used for manual
+      intervention when an agent is stuck or producing bad results
+    attributes:
+      operationId: killAgent
+      summary: Kill a running agent container
+      tags: Agents
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/observability_server.py
+          symbol: /agents/kill
+    metadata:
+      created_at: 2026-03-24T00:10:40.511Z
+      updated_at: 2026-03-24T00:10:40.511Z
+      version: 1
+  timestamp: 2026-03-24T00:10:40.537Z
+  sequenceNumber: 9
+- type: add
+  elementId: api.operation.get-history
+  layerName: api
+  after:
+    id: 8ed5d537-53b0-4e2d-ba18-ee73bd3058fd
+    path: api.operation.get-history
+    spec_node_id: api.operation
+    type: operation
+    layer_id: api
+    name: GET /history
+    description: Returns agent execution history from Elasticsearch, including
+      completed task metadata, agent names, durations, and outcomes
+    attributes:
+      operationId: getHistory
+      summary: Get agent execution history
+      tags: Metrics
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/observability_server.py
+          symbol: /history
+    metadata:
+      created_at: 2026-03-24T00:10:48.136Z
+      updated_at: 2026-03-24T00:10:48.136Z
+      version: 1
+  timestamp: 2026-03-24T00:10:48.161Z
+  sequenceNumber: 10
+- type: add
+  elementId: api.operation.get-claude-logs-history
+  layerName: api
+  after:
+    id: c7181a80-b45f-4a08-b6ee-e9b3bdccc6ff
+    path: api.operation.get-claude-logs-history
+    spec_node_id: api.operation
+    type: operation
+    layer_id: api
+    name: GET /claude-logs-history
+    description: Returns Claude Code session log history from Elasticsearch indexed
+      logs for analysis of agent behavior and token usage
+    attributes:
+      operationId: getClaudeLogsHistory
+      summary: Get Claude Code execution logs history
+      tags: Metrics
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/observability_server.py
+          symbol: /claude-logs-history
+    metadata:
+      created_at: 2026-03-24T00:10:48.614Z
+      updated_at: 2026-03-24T00:10:48.614Z
+      version: 1
+  timestamp: 2026-03-24T00:10:48.640Z
+  sequenceNumber: 11
+- type: add
+  elementId: api.operation.get-current-pipeline
+  layerName: api
+  after:
+    id: 9870a3a7-7b34-44cf-a221-cf3b4deae232
+    path: api.operation.get-current-pipeline
+    spec_node_id: api.operation
+    type: operation
+    layer_id: api
+    name: GET /current-pipeline
+    description: Returns the current active pipeline state for all projects,
+      including stage, agent, issue number, and elapsed time
+    attributes:
+      operationId: getCurrentPipeline
+      summary: Get current pipeline state
+      tags: Pipeline
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/observability_server.py
+          symbol: /current-pipeline
+    metadata:
+      created_at: 2026-03-24T00:10:49.123Z
+      updated_at: 2026-03-24T00:10:49.123Z
+      version: 1
+  timestamp: 2026-03-24T00:10:49.150Z
+  sequenceNumber: 12
+- type: add
+  elementId: api.operation.get-pipeline-run-events
+  layerName: api
+  after:
+    id: a66b6dc4-43c9-4506-bcdf-17e5afad6dfd
+    path: api.operation.get-pipeline-run-events
+    spec_node_id: api.operation
+    type: operation
+    layer_id: api
+    name: GET /pipeline-run-events
+    description: Returns paginated list of pipeline run events from Elasticsearch
+      with filtering by project, issue, and time range
+    attributes:
+      operationId: getPipelineRunEvents
+      summary: Get pipeline run events
+      tags: Pipeline
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/observability_server.py
+          symbol: /pipeline-run-events
+    metadata:
+      created_at: 2026-03-24T00:10:56.840Z
+      updated_at: 2026-03-24T00:10:56.840Z
+      version: 1
+  timestamp: 2026-03-24T00:10:56.867Z
+  sequenceNumber: 13
+- type: add
+  elementId: api.operation.get-active-pipeline-runs
+  layerName: api
+  after:
+    id: c3d3ce2e-e59f-400c-8105-e5d9bf3d6565
+    path: api.operation.get-active-pipeline-runs
+    spec_node_id: api.operation
+    type: operation
+    layer_id: api
+    name: GET /active-pipeline-runs
+    description: Returns all currently active pipeline runs from Elasticsearch,
+      showing which issues are actively being processed across all projects
+    attributes:
+      operationId: getActivePipelineRuns
+      summary: Get active pipeline runs
+      tags: Pipeline
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/observability_server.py
+          symbol: /active-pipeline-runs
+    metadata:
+      created_at: 2026-03-24T00:10:57.333Z
+      updated_at: 2026-03-24T00:10:57.333Z
+      version: 1
+  timestamp: 2026-03-24T00:10:57.361Z
+  sequenceNumber: 14
+- type: add
+  elementId: api.operation.get-apicircuit-breakers
+  layerName: api
+  after:
+    id: 6917c119-181b-4346-aba4-84395e555e89
+    path: api.operation.get-apicircuit-breakers
+    spec_node_id: api.operation
+    type: operation
+    layer_id: api
+    name: GET /api/circuit-breakers
+    description: "Returns state of all registered circuit breakers: GitHub API,
+      agent execution, and health check circuit breakers with failure counts and
+      recovery times"
+    attributes:
+      operationId: getCircuitBreakers
+      summary: Get circuit breaker states
+      tags: Health
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/observability_server.py
+          symbol: /api/circuit-breakers
+    metadata:
+      created_at: 2026-03-24T00:10:57.833Z
+      updated_at: 2026-03-24T00:10:57.833Z
+      version: 1
+  timestamp: 2026-03-24T00:10:57.859Z
+  sequenceNumber: 15
+- type: add
+  elementId: api.operation.get-apiprojects
+  layerName: api
+  after:
+    id: d29c4dc7-5b8a-4721-b05d-5d4db716aa93
+    path: api.operation.get-apiprojects
+    spec_node_id: api.operation
+    type: operation
+    layer_id: api
+    name: GET /api/projects
+    description: Returns list of all configured projects with their pipeline status,
+      board names, last reconciliation time, and enabled workflows
+    attributes:
+      operationId: getProjects
+      summary: Get project list and status
+      tags: Projects
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/observability_server.py
+          symbol: /api/projects
+    metadata:
+      created_at: 2026-03-24T00:11:04.405Z
+      updated_at: 2026-03-24T00:11:04.405Z
+      version: 1
+  timestamp: 2026-03-24T00:11:04.433Z
+  sequenceNumber: 16
+- type: add
+  elementId: api.operation.web-socket-connectdisconnect
+  layerName: api
+  after:
+    id: 9194f361-c3d9-45a5-8733-42bc4727107c
+    path: api.operation.web-socket-connectdisconnect
+    spec_node_id: api.operation
+    type: operation
+    layer_id: api
+    name: WebSocket connect/disconnect
+    description: Socket.IO WebSocket lifecycle events; clients connect to receive
+      real-time agent event stream including tool calls, completions, and
+      pipeline state changes
+    attributes:
+      operationId: websocketConnect
+      summary: Real-time agent event streaming
+      tags: Agents
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/observability_server.py
+          symbol: socketio
+    metadata:
+      created_at: 2026-03-24T00:11:04.887Z
+      updated_at: 2026-03-24T00:11:04.887Z
+      version: 1
+  timestamp: 2026-03-24T00:11:04.915Z
+  sequenceNumber: 17
+- type: add
+  elementId: api.securityscheme.git-hub-app-jwt
+  layerName: api
+  after:
+    id: eea118ea-6f7b-4861-a636-e7c9d6e6c2d0
+    path: api.securityscheme.git-hub-app-jwt
+    spec_node_id: api.securityscheme
+    type: securityscheme
+    layer_id: api
+    name: GitHub App JWT
+    description: GitHub App JWT-based authentication; generates JWT signed with RSA
+      private key and exchanges for installation token used as bearer token for
+      all GitHub API calls
+    attributes:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: GitHub App installation token
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/github_app_auth.py
+          symbol: GitHubAppAuth
+    metadata:
+      created_at: 2026-03-24T00:11:12.871Z
+      updated_at: 2026-03-24T00:11:12.871Z
+      version: 1
+  timestamp: 2026-03-24T00:11:12.900Z
+  sequenceNumber: 18
+- type: add
+  elementId: api.securityscheme.git-hub-personal-access-token
+  layerName: api
+  after:
+    id: 6b278505-7bcb-401d-ba01-784206339495
+    path: api.securityscheme.git-hub-personal-access-token
+    spec_node_id: api.securityscheme
+    type: securityscheme
+    layer_id: api
+    name: GitHub Personal Access Token
+    description: Fallback PAT-based authentication for GitHub API when GitHub App is
+      not configured; set via GITHUB_TOKEN environment variable
+    attributes:
+      type: apiKey
+      in: header
+      description: GitHub Personal Access Token
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/github_integration.py
+          symbol: GitHubIntegration
+    metadata:
+      created_at: 2026-03-24T00:11:13.388Z
+      updated_at: 2026-03-24T00:11:13.388Z
+      version: 1
+  timestamp: 2026-03-24T00:11:13.420Z
+  sequenceNumber: 19
+- type: add
+  elementId: api.securityscheme.anthropic-oauth-token
+  layerName: api
+  after:
+    id: 936071cd-2e3d-428d-b4e0-4f2875900e95
+    path: api.securityscheme.anthropic-oauth-token
+    spec_node_id: api.securityscheme
+    type: securityscheme
+    layer_id: api
+    name: Anthropic OAuth Token
+    description: Claude Code OAuth token for subscription-based billing of Claude
+      API calls; set via CLAUDE_CODE_OAUTH_TOKEN environment variable
+    attributes:
+      type: http
+      scheme: bearer
+      description: Anthropic Claude Code OAuth token
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: config/environment.py
+          symbol: claude_code_oauth_token
+    metadata:
+      created_at: 2026-03-24T00:11:13.912Z
+      updated_at: 2026-03-24T00:11:13.912Z
+      version: 1
+  timestamp: 2026-03-24T00:11:13.943Z
+  sequenceNumber: 20
+- type: add
+  elementId: api.response.health-response
+  layerName: api
+  after:
+    id: 6a382046-38cf-4ed9-94d3-717cde6c0966
+    path: api.response.health-response
+    spec_node_id: api.response
+    type: response
+    layer_id: api
+    name: Health Response
+    description: JSON response containing healthy boolean, nested checks object with
+      per-service status, and ISO8601 timestamp
+    attributes:
+      description: System health check response with component statuses
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: monitoring/health_monitor.py
+          symbol: HealthMonitor.check_health
+    metadata:
+      created_at: 2026-03-24T00:11:22.242Z
+      updated_at: 2026-03-24T00:11:22.242Z
+      version: 1
+  timestamp: 2026-03-24T00:11:22.273Z
+  sequenceNumber: 21
+- type: add
+  elementId: api.response.active-agents-response
+  layerName: api
+  after:
+    id: 3dcdb1f3-d613-49ab-b214-66c6c4666919
+    path: api.response.active-agents-response
+    spec_node_id: api.response
+    type: response
+    layer_id: api
+    name: Active Agents Response
+    description: JSON array of running agent container objects with container_name,
+      agent, project, issue_number, started_at fields
+    attributes:
+      description: List of currently active agent containers
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/observability_server.py
+          symbol: /agents/active
+    metadata:
+      created_at: 2026-03-24T00:11:22.747Z
+      updated_at: 2026-03-24T00:11:22.747Z
+      version: 1
+  timestamp: 2026-03-24T00:11:22.777Z
+  sequenceNumber: 22
+- type: add
+  elementId: api.response.pipeline-run-response
+  layerName: api
+  after:
+    id: a1e6a4d0-7322-44a6-912b-354a0a7fa192
+    path: api.response.pipeline-run-response
+    spec_node_id: api.response
+    type: response
+    layer_id: api
+    name: Pipeline Run Response
+    description: JSON object representing a pipeline run with pipeline_run_id,
+      project, issue_number, status, current_stage, started_at, and events array
+    attributes:
+      description: Pipeline run state and event history
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/pipeline_run.py
+          symbol: PipelineRun
+    metadata:
+      created_at: 2026-03-24T00:11:23.261Z
+      updated_at: 2026-03-24T00:11:23.261Z
+      version: 1
+  timestamp: 2026-03-24T00:11:23.292Z
+  sequenceNumber: 23
+- type: add
+  elementId: api.ratelimit.git-hub-api-rate-limit
+  layerName: api
+  after:
+    id: f2c926b1-f8b6-4724-a06e-e86fc30e4b0c
+    path: api.ratelimit.git-hub-api-rate-limit
+    spec_node_id: api.ratelimit
+    type: ratelimit
+    layer_id: api
+    name: GitHub API Rate Limit
+    description: GitHub imposes 5000 points/hour for authenticated GraphQL requests;
+      the orchestrator tracks remaining quota via x-ratelimit-remaining headers
+      and applies exponential backoff
+    attributes:
+      requests: 5000
+      window: 3600s
+      keyBy: github_token
+      scope: per-api-key
+      action: throttle
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/github_api_client.py
+          symbol: GitHubRateLimitStatus
+    metadata:
+      created_at: 2026-03-24T00:11:35.271Z
+      updated_at: 2026-03-24T00:11:35.271Z
+      version: 1
+  timestamp: 2026-03-24T00:11:35.302Z
+  sequenceNumber: 24
+- type: add
+  elementId: api.pathitem.agent-execution-paths
+  layerName: api
+  after:
+    id: 73665947-9183-4a65-a9a6-0deeaa6ad678
+    path: api.pathitem.agent-execution-paths
+    spec_node_id: api.pathitem
+    type: pathitem
+    layer_id: api
+    name: Agent Execution Paths
+    description: "Path group for agent container management: /agents/active (GET),
+      /agents/kill/:name (POST)"
+    attributes:
+      summary: Agent execution management
+    source_reference:
+      provenance: extracted
+      locations:
+        - file: services/observability_server.py
+    metadata:
+      created_at: 2026-03-24T00:11:35.770Z
+      updated_at: 2026-03-24T00:11:35.770Z
+      version: 1
+  timestamp: 2026-03-24T00:11:35.801Z
+  sequenceNumber: 25

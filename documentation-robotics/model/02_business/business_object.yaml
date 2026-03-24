@@ -1,0 +1,72 @@
+business.businessobject.pipeline-task:
+  id: 3cf6f5e3-3f12-447c-bd5a-7d0d7993485b
+  path: business.businessobject.pipeline-task
+  spec_node_id: business.businessobject
+  type: businessobject
+  layer_id: business
+  name: Pipeline Task
+  description: Unit of work with agent, project, priority, context, and not_before
+    scheduling
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: task_queue/task_manager.py
+        symbol: Task
+  metadata:
+    created_at: 2026-03-24T00:28:31.128Z
+    updated_at: 2026-03-24T00:28:31.128Z
+    version: 1
+business.businessobject.pipeline-run:
+  id: dcdfe97d-d885-4301-9eb7-c4caf8e410ed
+  path: business.businessobject.pipeline-run
+  spec_node_id: business.businessobject
+  type: businessobject
+  layer_id: business
+  name: Pipeline Run
+  description: Execution record for a complete pipeline run including stage
+    results and current state
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/pipeline_run.py
+        symbol: PipelineRun
+  metadata:
+    created_at: 2026-03-24T00:28:31.674Z
+    updated_at: 2026-03-24T00:28:31.674Z
+    version: 1
+business.businessobject.agent-output-artifact:
+  id: ae354db9-87ba-48a7-9326-aa1c2952c3c8
+  path: business.businessobject.agent-output-artifact
+  spec_node_id: business.businessobject
+  type: businessobject
+  layer_id: business
+  name: Agent Output Artifact
+  description: "Structured output produced by an agent: code changes, PR comments,
+    design documents, or test results"
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: claude/claude_integration.py
+        symbol: ClaudeIntegration
+  metadata:
+    created_at: 2026-03-24T00:28:32.226Z
+    updated_at: 2026-03-24T00:28:32.226Z
+    version: 1
+business.businessobject.feature-branch:
+  id: 11e9b1e1-ce89-45ca-9fad-fd99d77e1114
+  path: business.businessobject.feature-branch
+  spec_node_id: business.businessobject
+  type: businessobject
+  layer_id: business
+  name: Feature Branch
+  description: Git branch created per issue for implementation; merged by
+    GitWorkflowManager on pipeline completion
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/feature_branch_manager.py
+        symbol: FeatureBranchManager
+  metadata:
+    created_at: 2026-03-24T00:28:32.774Z
+    updated_at: 2026-03-24T00:28:32.774Z
+    version: 1

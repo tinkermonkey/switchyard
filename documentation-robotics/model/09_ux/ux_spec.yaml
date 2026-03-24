@@ -1,0 +1,22 @@
+ux.uxspec.dashboard-ux-spec:
+  id: cccbd9a9-1fc5-4e24-b8d9-bde9bc107cf0
+  path: ux.uxspec.dashboard-ux-spec
+  spec_node_id: ux.uxspec
+  type: uxspec
+  layer_id: ux
+  name: Dashboard UX Spec
+  description: "UX specification for the main dashboard: three-panel layout with
+    header stats, central pipeline flow graph, and side panels for active
+    agents, logs, and workspace status"
+  attributes:
+    version: "1.0"
+    title: Dashboard
+    description: Main monitoring dashboard layout spec
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: web_ui/src/routes/index.jsx
+  metadata:
+    created_at: 2026-03-24T00:16:35.103Z
+    updated_at: 2026-03-24T00:16:35.103Z
+    version: 1

@@ -1,0 +1,80 @@
+motivation.constraint.git-hub-api-rate-limit-5000-requests-per-hour:
+  id: 0c8071b4-6df6-4148-bb9e-8242b0d92b8f
+  path: motivation.constraint.git-hub-api-rate-limit-5000-requests-per-hour
+  spec_node_id: motivation.constraint
+  type: constraint
+  layer_id: motivation
+  name: GitHub API Rate Limit 5000 Requests Per Hour
+  description: GitHub App installation token rate limit of 5000 requests per hour
+    per installation
+  attributes:
+    constraintType: external
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: documentation/github-authentication.md
+        symbol: GitHubBreaker
+  metadata:
+    created_at: 2026-03-24T00:30:49.090Z
+    updated_at: 2026-03-24T00:30:49.090Z
+    version: 1
+motivation.constraint.rootful-docker-required-for-docker-in-docker:
+  id: cbffa6f8-dee7-4a21-864d-40cf7c9ea22e
+  path: motivation.constraint.rootful-docker-required-for-docker-in-docker
+  spec_node_id: motivation.constraint
+  type: constraint
+  layer_id: motivation
+  name: Rootful Docker Required for Docker-in-Docker
+  description: Rootless Docker-in-Docker is not yet stable; requires rootful
+    Docker with socket mount
+  attributes:
+    constraintType: technical
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: Dockerfile
+        symbol: DOCKER_GID
+  metadata:
+    created_at: 2026-03-24T00:30:49.651Z
+    updated_at: 2026-03-24T00:30:49.651Z
+    version: 1
+motivation.constraint.anthropic-api-token-cost:
+  id: 6e1ad742-7b94-410b-b393-8cfbda282dd0
+  path: motivation.constraint.anthropic-api-token-cost
+  spec_node_id: motivation.constraint
+  type: constraint
+  layer_id: motivation
+  name: Anthropic API Token Cost
+  description: Agent execution costs tokens; max_total_agent_calls (100) circuit
+    breaker limits cost per repair cycle
+  attributes:
+    constraintType: financial
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: config/foundations/agents.yaml
+        symbol: agents
+  metadata:
+    created_at: 2026-03-24T00:30:50.221Z
+    updated_at: 2026-03-24T00:30:50.221Z
+    version: 1
+motivation.constraint.single-orchestrator-instance-per-workspace:
+  id: a800f339-0e1d-4e11-8cba-e5846d5b608d
+  path: motivation.constraint.single-orchestrator-instance-per-workspace
+  spec_node_id: motivation.constraint
+  type: constraint
+  layer_id: motivation
+  name: Single Orchestrator Instance Per Workspace
+  description: Pipeline lock model assumes single orchestrator instance; no
+    horizontal scaling in current design
+  attributes:
+    constraintType: technical
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/pipeline_lock_manager.py
+        symbol: PipelineLockManager
+  metadata:
+    created_at: 2026-03-24T00:30:50.804Z
+    updated_at: 2026-03-24T00:30:50.804Z
+    version: 1

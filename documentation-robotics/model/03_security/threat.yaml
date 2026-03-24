@@ -1,0 +1,91 @@
+security.threat.git-hub-token-credential-exposure:
+  id: 0066b263-2840-4051-b3d2-802d386adf64
+  path: security.threat.git-hub-token-credential-exposure
+  spec_node_id: security.threat
+  type: threat
+  layer_id: security
+  name: GitHub Token Credential Exposure
+  description: GITHUB_TOKEN or GitHub App private key could leak via environment
+    variable exposure or committed .env files
+  attributes:
+    threatens: service
+    likelihood: moderate
+    impact: high
+    criticality: high
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: docker-compose.yml
+        symbol: environment
+  metadata:
+    created_at: 2026-03-24T00:25:38.564Z
+    updated_at: 2026-03-24T00:25:38.564Z
+    version: 1
+security.threat.agent-container-privilege-escalation:
+  id: c0ceb70f-c862-4b34-af6a-7b5f6ad771f0
+  path: security.threat.agent-container-privilege-escalation
+  spec_node_id: security.threat
+  type: threat
+  layer_id: security
+  name: Agent Container Privilege Escalation
+  description: Agent running as UID 1000 with docker socket access could spawn
+    privileged containers
+  attributes:
+    threatens: service
+    likelihood: low
+    impact: high
+    criticality: high
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: Dockerfile
+        symbol: USER orchestrator
+  metadata:
+    created_at: 2026-03-24T00:25:39.088Z
+    updated_at: 2026-03-24T00:25:39.088Z
+    version: 1
+security.threat.workspace-path-traversal:
+  id: 32f33abb-5ea1-4f9d-b467-9b9a86bb4a13
+  path: security.threat.workspace-path-traversal
+  spec_node_id: security.threat
+  type: threat
+  layer_id: security
+  name: Workspace Path Traversal
+  description: Agent task prompt injection could cause filesystem writes outside
+    /workspace/<project>
+  attributes:
+    threatens: data
+    likelihood: low
+    impact: moderate
+    criticality: medium
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: claude/docker_runner.py
+        symbol: DockerAgentRunner
+  metadata:
+    created_at: 2026-03-24T00:25:39.633Z
+    updated_at: 2026-03-24T00:25:39.633Z
+    version: 1
+security.threat.git-hub-api-rate-limit-exhaustion:
+  id: 6ade4dd3-6a39-4c38-be3d-0b9571e89889
+  path: security.threat.git-hub-api-rate-limit-exhaustion
+  spec_node_id: security.threat
+  type: threat
+  layer_id: security
+  name: GitHub API Rate Limit Exhaustion
+  description: Burst of pipeline triggers could exhaust 5000 req/hour GitHub API rate limit
+  attributes:
+    threatens: service
+    likelihood: moderate
+    impact: moderate
+    criticality: medium
+  source_reference:
+    provenance: extracted
+    locations:
+      - file: services/github_api_client.py
+        symbol: GitHubRateLimitStatus
+  metadata:
+    created_at: 2026-03-24T00:25:40.211Z
+    updated_at: 2026-03-24T00:25:40.211Z
+    version: 1
