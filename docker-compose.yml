@@ -62,6 +62,7 @@ services:
       # Recommended: 2-3 workers for multi-project deployments
       - ORCHESTRATOR_WORKERS=${ORCHESTRATOR_WORKERS:-1}
       - PYTHONDONTWRITEBYTECODE=1
+      - OTEL_COLLECTOR_HOST=otel-collector
       # Host home directory for Docker-in-Docker SSH/git mounts.
       # Must be set explicitly in .env — path inference via /proc/self/mountinfo
       # is unreliable under Snap Docker (see .env.example for details).
@@ -134,6 +135,20 @@ services:
       - orchestrator-net
     working_dir: /app
     command: ["python", "-m", "services.log_collector"]
+    restart: unless-stopped
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    command: ["--config=/etc/otel-collector-config.yaml"]
+    volumes:
+      - ./config/otel-collector-config.yaml:/etc/otel-collector-config.yaml:ro
+    ports:
+      - "13133:13133" # Health check endpoint
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    networks:
+      - orchestrator-net
     restart: unless-stopped
 
   browserless:

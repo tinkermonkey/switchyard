@@ -707,45 +707,25 @@ class DockerAgentRunner:
         cmd.extend([
             # Working directory inside container
             '-w', '/workspace',
-
-            # Environment variables
-            '-e', f'GITHUB_TOKEN={os.environ.get("GITHUB_TOKEN", "")}',
-            '-e', 'GH_AUTH_SETUP_REQUIRED=true',
-            '-e', 'PYTHONDONTWRITEBYTECODE=1',
         ])
-        
-        # Pass PIPELINE_RUN_ID if available in context (for event tracking)
-        pipeline_run_id = task_context.get('pipeline_run_id') or context.get('pipeline_run_id')
-        if pipeline_run_id:
-            cmd.extend(['-e', f'PIPELINE_RUN_ID={pipeline_run_id}'])
-            logger.info(f"Passing PIPELINE_RUN_ID={pipeline_run_id} to agent container")
 
-        # Pass CLAUDE_CODE_OAUTH_TOKEN if available (subscription), else ANTHROPIC_API_KEY (pay-per-use)
-        oauth_token = os.environ.get('CLAUDE_CODE_OAUTH_TOKEN', '').strip()
-        anthropic_key = os.environ.get('ANTHROPIC_API_KEY', '').strip()
+        # Build and inject all Claude Code environment variables via the shared builder.
+        # This ensures auth, identification, and OTEL telemetry vars are injected
+        # consistently across all containerised launches. See claude/environment.py.
+        from claude.environment import ClaudeEnvironmentBuilder, ClaudeRunContext
 
-        if oauth_token:
-            cmd.extend(['-e', f'CLAUDE_CODE_OAUTH_TOKEN={oauth_token}'])
-            logger.info("Using CLAUDE_CODE_OAUTH_TOKEN (subscription billing)")
-            logger.info(f"DEBUG: OAuth token length: {len(oauth_token)}, starts with: {oauth_token[:10]}...")
-        elif anthropic_key:
-            cmd.extend(['-e', f'ANTHROPIC_API_KEY={anthropic_key}'])
-            logger.info("Using ANTHROPIC_API_KEY (API billing)")
-        else:
-            logger.warning("No authentication token found - agent will likely fail")
-
-        # Redis connection info for direct container writes (container-side Redis communication)
-        # Note: issue_number lives inside nested task_context, not top-level context
-        task_ctx = context.get('context', {})
-        resolved_issue_number = task_ctx.get('issue_number') or context.get('issue_number', 'unknown')
-        cmd.extend([
-            '-e', 'REDIS_HOST=redis',
-            '-e', 'REDIS_PORT=6379',
-            '-e', f'AGENT={agent}',
-            '-e', f'TASK_ID={context.get("task_id", "unknown")}',
-            '-e', f'PROJECT={context.get("project", "unknown")}',
-            '-e', f'ISSUE_NUMBER={resolved_issue_number}',
-        ])
+        run_ctx = ClaudeRunContext(
+            agent_name=agent,
+            task_id=context.get('task_id', 'unknown'),
+            project=context.get('project', 'unknown'),
+            issue_number=str(issue_number) if issue_number else 'unknown',
+            pipeline_run_id=pipeline_run_id,
+        )
+        env_builder = ClaudeEnvironmentBuilder(
+            otel_host=os.environ.get('OTEL_COLLECTOR_HOST', 'otel-collector')
+        )
+        for k, v in env_builder.build(run_ctx).items():
+            cmd.extend(['-e', f'{k}={v}'])
 
         # Special handling for dev_environment_setup agent: mount Docker socket for image building
         if agent == 'dev_environment_setup':
@@ -759,10 +739,6 @@ class DockerAgentRunner:
         # Note: With rootful Docker, no user namespace remapping by default
         # Container UID 1000 = host UID 1000 directly, giving proper file access
         # and allowing Claude Code to run with bypass permissions (not as root)
-
-        # Add CONTEXT7_API_KEY if present
-        if 'CONTEXT7_API_KEY' in os.environ:
-            cmd.extend(['-e', f'CONTEXT7_API_KEY={os.environ["CONTEXT7_API_KEY"]}'])
 
         # Determine which Docker image to use
         project_name = context.get('project', 'unknown')

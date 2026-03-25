@@ -1,0 +1,84 @@
+# OpenTelemetry Collector configuration for Claude Code agent telemetry.
+#
+# Receives OTLP data (metrics + logs) from Claude Code instances running in
+# agent containers and in the orchestrator process, then writes to Elasticsearch.
+#
+# Uses the ES exporter's default otel mode, writing to data streams that match
+# the built-in ES 9.0 OTEL templates (logs-otel@template, metrics-otel@template).
+# Custom ILM override templates (claude-otel-logs-ilm, claude-otel-metrics-ilm)
+# apply the 7-day claude-otel-ilm-policy to our specific data stream patterns.
+#
+# The elasticsearch exporter handles retry logic internally; the standalone
+# retry_on_failure key is not supported by this exporter. sending_queue IS
+# supported and buffers writes across multiple consumers to smooth burst load.
+#
+# Phase 2 addition (see documentation/otel-telemetry.md):
+# Uncomment the otlphttp/redis_bridge exporter to fan OTEL log events out to
+# Redis pub/sub, replacing docker-claude-wrapper.py's direct Redis writes.
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  memory_limiter:
+    # Prevent OOM if ES is slow to accept data
+    check_interval: 1s
+    limit_mib: 512
+    spike_limit_mib: 128
+
+  batch:
+    # Batch before writing to ES to reduce index request overhead
+    timeout: 5s
+    send_batch_size: 256
+    send_batch_max_size: 512
+
+  resource:
+    attributes:
+      # Set service.name only when Claude Code hasn't already set it
+      - key: service.name
+        value: claude-code-agent
+        action: insert
+
+exporters:
+  elasticsearch:
+    endpoints:
+      - http://elasticsearch:9200
+    # otel mode (default) targets data streams matched by the built-in ES 9.0 OTEL templates.
+    # Index names follow the logs-*.otel-* / metrics-*.otel-* convention required by those templates.
+    logs_index: logs-claude.otel-default
+    metrics_index: metrics-claude.otel-default
+    sending_queue:
+      enabled: true
+      num_consumers: 4
+      queue_size: 1000
+
+  # Phase 2: Redis fan-out for real-time pub/sub (replaces wrapper Redis writes).
+  # Uncomment when otel-redis-bridge service is deployed.
+  # See documentation/otel-telemetry.md — Phase 2.
+  #
+  # otlphttp/redis_bridge:
+  #   endpoint: http://otel-redis-bridge:4320
+  #   retry_on_failure:
+  #     enabled: false   # Best-effort; don't hold up the main pipeline for pub/sub
+
+service:
+  extensions: [health_check]
+  pipelines:
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, batch, resource]
+      exporters: [elasticsearch]
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, batch, resource]
+      exporters: [elasticsearch]
+      # Phase 2: add otlphttp/redis_bridge here

@@ -197,20 +197,22 @@ Files: {context.get('files', [])}
             else:
                 logger.info("No MCP servers configured for this agent")
 
-            # Set up environment with API keys
-            env = os.environ.copy()
-            if 'CONTEXT7_API_KEY' in os.environ:
-                env['CONTEXT7_API_KEY'] = os.environ['CONTEXT7_API_KEY']
+            # Build environment via the shared builder so auth, identification, and OTEL
+            # telemetry vars are injected consistently with the containerised launch path.
+            # The orchestrator process already runs inside Docker on orchestrator-net, so
+            # 'otel-collector' resolves correctly here too. See claude/environment.py.
+            from claude.environment import ClaudeEnvironmentBuilder, ClaudeRunContext
 
-            # Authentication: CLAUDE_CODE_OAUTH_TOKEN (subscription) or ANTHROPIC_API_KEY (pay-per-use)
-            if 'CLAUDE_CODE_OAUTH_TOKEN' in os.environ:
-                env['CLAUDE_CODE_OAUTH_TOKEN'] = os.environ['CLAUDE_CODE_OAUTH_TOKEN']
-                logger.info("Using CLAUDE_CODE_OAUTH_TOKEN for authentication (subscription billing)")
-            elif 'ANTHROPIC_API_KEY' in os.environ:
-                env['ANTHROPIC_API_KEY'] = os.environ['ANTHROPIC_API_KEY']
-                logger.warning("Using ANTHROPIC_API_KEY for authentication (API billing)")
-            else:
-                logger.warning("No authentication token found - Claude Code may fail if not authenticated")
+            run_ctx = ClaudeRunContext(
+                agent_name=agent,
+                task_id=task_id,
+                project=project,
+            )
+            env_builder = ClaudeEnvironmentBuilder(
+                otel_host=os.environ.get('OTEL_COLLECTOR_HOST', 'otel-collector')
+            )
+            # Inherit the full orchestrator environment then overlay Claude-specific vars
+            env = {**os.environ.copy(), **env_builder.build(run_ctx)}
 
             logger.debug(f"Executing Claude CLI in {work_dir}")
             logger.debug(f"Command: {' '.join(cmd[:3])}...")  # Don't log full prompt
