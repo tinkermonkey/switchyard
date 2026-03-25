@@ -280,6 +280,82 @@ CLAUDE_STREAMS_TEMPLATE = {
 }
 
 
+# ILM policy for OTEL data streams (logs-claude.otel-* and metrics-claude.otel-*)
+# Matches the 7-day retention used by agent-logs-ilm-policy.
+CLAUDE_OTEL_ILM_POLICY = {
+    "policy": {
+        "phases": {
+            "hot": {
+                "min_age": "0ms",
+                "actions": {
+                    "set_priority": {"priority": 100}
+                }
+            },
+            "warm": {
+                "min_age": "3d",
+                "actions": {
+                    "set_priority": {"priority": 50}
+                }
+            },
+            "delete": {
+                "min_age": "7d",
+                "actions": {
+                    "delete": {}
+                }
+            }
+        }
+    }
+}
+
+# Priority-300 override templates for OTEL data streams.
+# These win over the built-in logs-otel@template / metrics-otel@template (priority 120)
+# and attach claude-otel-ilm-policy while composing the same OTEL component chain.
+CLAUDE_OTEL_LOGS_TEMPLATE = {
+    "index_patterns": ["logs-claude.otel-*"],
+    "composed_of": [
+        "logs@mappings",
+        "logs@settings",
+        "otel@mappings",
+        "logs-otel@mappings",
+        "semconv-resource-to-ecs@mappings",
+        "ecs@mappings",
+    ],
+    "priority": 300,
+    "data_stream": {},
+    "template": {
+        "settings": {
+            "index": {
+                "lifecycle": {
+                    "name": "claude-otel-ilm-policy"
+                }
+            }
+        }
+    }
+}
+
+CLAUDE_OTEL_METRICS_TEMPLATE = {
+    "index_patterns": ["metrics-claude.otel-*"],
+    "composed_of": [
+        "metrics@tsdb-settings",
+        "otel@mappings",
+        "metrics-otel@mappings",
+        "semconv-resource-to-ecs@mappings",
+        "ecs-tsdb@mappings",
+    ],
+    "priority": 300,
+    "data_stream": {},
+    "template": {
+        "settings": {
+            "index": {
+                "lifecycle": {
+                    "name": "claude-otel-ilm-policy"
+                }
+            }
+        }
+    }
+}
+
+
 def get_index_name(date=None, event_category=None):
     """
     Generate index name for a given date and event category

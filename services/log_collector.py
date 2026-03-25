@@ -20,6 +20,9 @@ from services.pattern_detection_schema import (
     AGENT_LOGS_ILM_POLICY,
     AGENT_EVENTS_TEMPLATE,
     CLAUDE_STREAMS_TEMPLATE,
+    CLAUDE_OTEL_ILM_POLICY,
+    CLAUDE_OTEL_LOGS_TEMPLATE,
+    CLAUDE_OTEL_METRICS_TEMPLATE,
     get_index_name,
     enrich_event,
     enrich_claude_log
@@ -136,6 +139,25 @@ class LogCollector:
                 body=AGENT_LOGS_TEMPLATE
             )
             logger.info("Created index template: agent-logs-template (legacy, with ILM policy)")
+
+            # OTEL data stream ILM policy and override templates
+            self.es.ilm.put_lifecycle(
+                name="claude-otel-ilm-policy",
+                body=CLAUDE_OTEL_ILM_POLICY
+            )
+            logger.info("Created ILM policy: claude-otel-ilm-policy (7-day retention)")
+
+            self.es.indices.put_index_template(
+                name="claude-otel-logs-ilm",
+                body=CLAUDE_OTEL_LOGS_TEMPLATE
+            )
+            logger.info("Created index template: claude-otel-logs-ilm")
+
+            self.es.indices.put_index_template(
+                name="claude-otel-metrics-ilm",
+                body=CLAUDE_OTEL_METRICS_TEMPLATE
+            )
+            logger.info("Created index template: claude-otel-metrics-ilm")
 
             # Create today's indices for both types
             today_events = get_index_name(event_category='agent_lifecycle')
