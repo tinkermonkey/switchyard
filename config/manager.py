@@ -433,7 +433,7 @@ class ConfigManager:
             makes_code_changes=base_agent.makes_code_changes,
             requires_dev_container=base_agent.requires_dev_container,
             requires_docker=base_agent.requires_docker,
-            filesystem_write_allowed=base_agent.filesystem_write_allowed,
+            filesystem_write_allowed=customizations.get('filesystem_write_allowed', base_agent.filesystem_write_allowed),
             circuit_breaker_config=base_agent.circuit_breaker_config
         )
 
