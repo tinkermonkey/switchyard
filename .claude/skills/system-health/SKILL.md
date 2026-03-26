@@ -106,7 +106,7 @@ docker stats --no-stream --format "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\
 ## Step 8: Elasticsearch Index Health
 
 ```bash
-curl -s "http://localhost:9200/_cat/indices?v&s=index" | grep -E "(decision-events|agent-events|claude-streams|pipeline-runs|agent-logs|task-metrics)"
+curl -s "http://localhost:9200/_cat/indices?v&s=index" | grep -E "(logs-claude|metrics-claude|decision-events|agent-events|pipeline-runs|agent-logs|task-metrics)"
 ```
 
 Check for red/yellow indices or unexpectedly large doc counts.

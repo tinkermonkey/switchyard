@@ -57,14 +57,14 @@ If container no longer exists, note it. Check if it's still running:
 docker ps --filter "name=claude-agent-<project>-<task_id>" --format "{{.Names}}\t{{.Status}}\t{{.RunningFor}}"
 ```
 
-### Step 3: Query Claude Stream Events
+### Step 3: Query OTEL Execution Events
 
 ```bash
-curl -s "http://localhost:9200/claude-streams-*/_search" -H 'Content-Type: application/json' -d '{
-  "query": {"term": {"task_id": "<TASK_ID>"}},
-  "sort": [{"timestamp": "asc"}],
+curl -s "http://localhost:9200/logs-claude.otel-default/_search" -H 'Content-Type: application/json' -d '{
+  "query": {"term": {"resource.attributes.task_id.keyword": "<TASK_ID>"}},
+  "sort": [{"@timestamp": "asc"}],
   "size": 500
-}' | jq '.hits.hits[]._source | {timestamp, event_category, event_type, tool_name, success, error_message}'
+}' | jq '.hits.hits[]._source | {"@timestamp", event_name, "tool_name": .attributes.tool_name, "success": .attributes.success, "error": .attributes.error, "params": .attributes.tool_parameters}'
 ```
 
 ### Step 4: Analyze Tool Calls

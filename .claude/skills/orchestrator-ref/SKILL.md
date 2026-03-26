@@ -16,7 +16,7 @@ You are providing reference data for the Claude Code Agent Orchestrator. Print t
 |---|---|---|---|
 | `decision-events-*` | Orchestrator decisions: routing, progression, review/repair cycles, errors, queue ops, branch mgmt | `timestamp`, `event_type`, `event_category`, `agent`, `task_id`, `project`, `pipeline_run_id`, `decision_category`, `selected_agent`, `from_status`, `to_status`, `iteration`, `feedback_source` | `monitoring/observability.py` |
 | `agent-events-*` | Agent lifecycle: initialized, started, completed, failed | `timestamp`, `agent_name`, `project`, `task_id`, `event_type`, `event_category`, `duration_ms`, `context_tokens`, `success`, `error_message`, `issue_number`, `board`, `pipeline_type`, `pipeline_run_id` | `services/pattern_detection_schema.py` |
-| `claude-streams-*` | Claude Code streaming: tool calls, tool results, thinking, output | `timestamp`, `agent_name`, `project`, `task_id`, `event_type`, `event_category`, `tool_name`, `tool_params_text`, `success`, `error_message`, `pipeline_run_id` | `services/pattern_detection_schema.py` |
+| `logs-claude.otel-default` | Claude Code execution: tool results, API requests, API errors — OTEL data stream | `@timestamp`, `resource.attributes.task_id`, `resource.attributes.pipeline_run_id`, `resource.attributes.agent`, `event_name`, `attributes.tool_name`, `attributes.success`, `attributes.tool_parameters` | OTEL collector → ES |
 | `pipeline-runs-*` | Pipeline run tracking | `id`, `issue_number`, `issue_title`, `issue_url`, `project`, `board`, `started_at`, `ended_at`, `status`, `duration_ms` | `services/pattern_detection_schema.py` |
 | `agent-logs-*` | Legacy combined agent logs (tool calls, results, all events) | `timestamp`, `session_id`, `agent_name`, `project`, `task_id`, `event_type`, `event_category`, `tool_name`, `duration_ms`, `success`, `error_message`, `pipeline_run_id` | `services/pattern_detection_schema.py` |
 | `orchestrator-task-metrics-*` | Task execution metrics | `@timestamp`, `agent`, `duration`, `success` | `monitoring/` |
@@ -115,13 +115,13 @@ curl -s "http://localhost:9200/agent-events-*/_search" -H 'Content-Type: applica
 }' | jq '.hits.hits[]._source'
 ```
 
-### Get Claude stream events for a task
+### Get OTEL execution events for a task
 ```bash
-curl -s "http://localhost:9200/claude-streams-*/_search" -H 'Content-Type: application/json' -d '{
-  "query": {"term": {"task_id": "<TASK_ID>"}},
-  "sort": [{"timestamp": "asc"}],
+curl -s "http://localhost:9200/logs-claude.otel-default/_search" -H 'Content-Type: application/json' -d '{
+  "query": {"term": {"resource.attributes.task_id.keyword": "<TASK_ID>"}},
+  "sort": [{"@timestamp": "asc"}],
   "size": 500
-}' | jq '.hits.hits[]._source'
+}' | jq '.hits.hits[]._source | {"@timestamp", event_name, "tool_name": .attributes.tool_name, "success": .attributes.success}'
 ```
 
 ### Find recent errors (last 1 hour)
@@ -166,7 +166,7 @@ curl -s "http://localhost:9200/agent-events-*/_search" -H 'Content-Type: applica
 
 ### List all ES orchestrator indices
 ```bash
-curl -s "http://localhost:9200/_cat/indices?v&s=index" | grep -E "(decision-events|agent-events|claude-streams|pipeline-runs|agent-logs|task-metrics)"
+curl -s "http://localhost:9200/_cat/indices?v&s=index" | grep -E "(logs-claude|metrics-claude|decision-events|agent-events|pipeline-runs|agent-logs|task-metrics)"
 ```
 
 ## Access Points

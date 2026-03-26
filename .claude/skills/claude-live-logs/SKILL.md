@@ -1,6 +1,6 @@
 ---
 name: claude-live-logs
-description: Search and analyze Claude Code live execution logs captured in Elasticsearch - tool calls, tool results, agent output, and thinking for a specific task or pipeline run
+description: Search and analyze Claude Code live execution logs captured in Elasticsearch - tool calls, tool results, API usage, and errors for a specific task or pipeline run
 user_invocable: true
 args: "<task_id|pipeline_run_id|agent_name> [--recent [time_window]]"
 ---
@@ -21,36 +21,31 @@ All log data lives in Elasticsearch at `localhost:9200`. All indices are date-pa
 
 | Index | Content | Primary Keys |
 |---|---|---|
-| `claude-streams-*` | **Live Claude Code execution**: tool calls, tool results, text output, agent thinking | `task_id`, `pipeline_run_id`, `agent_name` |
-| `agent-events-*` | Agent lifecycle: initialized, started, completed, failed | `task_id`, `pipeline_run_id`, `agent_name` |
+| `logs-claude.otel-default` | **Live Claude Code execution**: tool results, API requests, API errors — from OTEL collector | `resource.attributes.task_id`, `resource.attributes.pipeline_run_id`, `resource.attributes.agent` |
+| `agent-events-*` | Agent lifecycle: initialized, started, completed, failed; container launch/execution events; prompt_constructed | `task_id`, `pipeline_run_id`, `agent_name` |
 | `decision-events-*` | Orchestrator routing, pipeline progression, errors | `task_id`, `pipeline_run_id`, `agent` |
 | `pipeline-runs-*` | Pipeline run metadata (issue, project, status, duration) | `id` (= `pipeline_run_id`) |
 
-### claude-streams-* Field Schema
+### logs-claude.otel-default Field Schema
 
 | Field | Type | Description |
 |---|---|---|
-| `timestamp` | date | When the event occurred |
-| `agent_name` | keyword | Agent that produced this event (e.g. `senior_software_engineer`) |
-| `project` | keyword | Project name |
-| `task_id` | keyword | Unique task execution ID — primary lookup key |
-| `pipeline_run_id` | keyword | Parent pipeline run ID — groups multiple agent executions |
-| `event_category` | keyword | Category: `tool_call`, `tool_result`, `claude_stream`, `agent_output`, `agent_thinking`, `other` |
-| `event_type` | keyword | Type: `tool_call`, `tool_result`, `assistant_message`, `text_output`, `thinking`, `user_message`, `unknown` |
-| `tool_name` | keyword | Name of tool called (Bash, Read, Write, Edit, Glob, Grep, Task, etc.) |
-| `tool_params` | object | Tool input parameters (stored, not indexed — use `tool_params_text` to search) |
-| `tool_params_text` | text | Searchable string version of tool parameters |
-| `success` | boolean | Whether the tool call/result succeeded |
-| `error_message` | text | Error details if `success=false` |
-| `raw_event` | object | Complete Claude Code event from the stream (not indexed, for reference) |
+| `@timestamp` | date | When the event occurred |
+| `resource.attributes.task_id.keyword` | keyword | Task execution ID — primary lookup key (use `.keyword` for term queries) |
+| `resource.attributes.pipeline_run_id.keyword` | keyword | Parent pipeline run ID |
+| `resource.attributes.agent.keyword` | keyword | Agent name (e.g. `senior_software_engineer`) |
+| `resource.attributes.project.keyword` | keyword | Project name |
+| `event_name.keyword` | keyword | OTEL event name: `claude_code.tool_result`, `claude_code.api_request`, `claude_code.api_error`, `claude_code.api_rate_limit_error` |
+| `attributes.tool_name.keyword` | keyword | Tool name for `tool_result` events (Bash, Read, Write, Edit, Glob, Grep, Task, etc.) |
+| `attributes.success` | boolean | Whether tool call succeeded |
+| `attributes.duration_ms` | float | Tool execution duration |
+| `attributes.tool_parameters` | object | Tool input parameters |
+| `attributes.input_tokens.keyword` | keyword | Input tokens (string — use script agg to sum) |
+| `attributes.output_tokens.keyword` | keyword | Output tokens (string) |
+| `attributes.cost_usd` | float | API call cost in USD |
+| `attributes.message.keyword` | keyword | Error message for `api_error` events |
 
-### event_category Values
-
-- `tool_call` — Claude invoked a tool (Bash, Read, Write, Edit, Glob, Grep, Task, etc.)
-- `tool_result` — Tool returned a result back to Claude
-- `agent_output` / `claude_stream` — Claude's text output or streaming message
-- `agent_thinking` — Claude's extended thinking content
-- `other` — Unknown or unclassified events
+> **Note**: Full text output and agent thinking are captured in real-time via Redis pub/sub (`orchestrator:claude_stream`) but are not persisted to Elasticsearch. Only tool calls, API calls, and errors are indexed in OTEL.
 
 ---
 
@@ -109,18 +104,18 @@ Build timeline: `agent_initialized` → `agent_started` → `agent_completed` or
 
 ---
 
-### Step 3: Get All Live Log Events (Chronological)
+### Step 3: Get All OTEL Events (Chronological)
 
-Full event stream for the execution:
+Full event stream for the execution from OTEL:
 ```bash
-curl -s "http://localhost:9200/claude-streams-*/_search" -H 'Content-Type: application/json' -d '{
-  "query": {"term": {"task_id": "<TASK_ID>"}},
-  "sort": [{"timestamp": "asc"}],
+curl -s "http://localhost:9200/logs-claude.otel-default/_search" -H 'Content-Type: application/json' -d '{
+  "query": {"term": {"resource.attributes.task_id.keyword": "<TASK_ID>"}},
+  "sort": [{"@timestamp": "asc"}],
   "size": 500
-}' | jq '.hits.hits[]._source | {timestamp, event_category, event_type, tool_name, success, error_message}'
+}' | jq '.hits.hits[]._source | {"@timestamp", event_name, "tool_name": .attributes.tool_name, "success": .attributes.success, "error": .attributes.message}'
 ```
 
-> Note: If a single execution has >500 events (long-running agents), paginate with `"from": 500`.
+> Note: If a single execution has >500 events, paginate with `"from": 500`.
 
 ---
 
@@ -128,19 +123,19 @@ curl -s "http://localhost:9200/claude-streams-*/_search" -H 'Content-Type: appli
 
 Count tool calls by type:
 ```bash
-curl -s "http://localhost:9200/claude-streams-*/_search" -H 'Content-Type: application/json' -d '{
+curl -s "http://localhost:9200/logs-claude.otel-default/_search" -H 'Content-Type: application/json' -d '{
   "query": {
     "bool": {
       "must": [
-        {"term": {"task_id": "<TASK_ID>"}},
-        {"term": {"event_category": "tool_call"}}
+        {"term": {"resource.attributes.task_id.keyword": "<TASK_ID>"}},
+        {"term": {"event_name.keyword": "claude_code.tool_result"}}
       ]
     }
   },
   "size": 0,
   "aggs": {
     "by_tool": {
-      "terms": {"field": "tool_name", "size": 20}
+      "terms": {"field": "attributes.tool_name.keyword", "size": 20}
     }
   }
 }' | jq '.aggregations.by_tool.buckets[] | {tool: .key, count: .doc_count}'
@@ -148,18 +143,18 @@ curl -s "http://localhost:9200/claude-streams-*/_search" -H 'Content-Type: appli
 
 Get tool calls with their parameters:
 ```bash
-curl -s "http://localhost:9200/claude-streams-*/_search" -H 'Content-Type: application/json' -d '{
+curl -s "http://localhost:9200/logs-claude.otel-default/_search" -H 'Content-Type: application/json' -d '{
   "query": {
     "bool": {
       "must": [
-        {"term": {"task_id": "<TASK_ID>"}},
-        {"term": {"event_category": "tool_call"}}
+        {"term": {"resource.attributes.task_id.keyword": "<TASK_ID>"}},
+        {"term": {"event_name.keyword": "claude_code.tool_result"}}
       ]
     }
   },
-  "sort": [{"timestamp": "asc"}],
+  "sort": [{"@timestamp": "asc"}],
   "size": 200
-}' | jq '.hits.hits[]._source | {timestamp, tool_name, tool_params_text, success}'
+}' | jq '.hits.hits[]._source | {"@timestamp", "tool_name": .attributes.tool_name, "params": .attributes.tool_parameters, "success": .attributes.success, "duration_ms": .attributes.duration_ms}'
 ```
 
 ---
@@ -167,76 +162,57 @@ curl -s "http://localhost:9200/claude-streams-*/_search" -H 'Content-Type: appli
 ### Step 5: Get Failed Tool Calls
 
 ```bash
-curl -s "http://localhost:9200/claude-streams-*/_search" -H 'Content-Type: application/json' -d '{
+curl -s "http://localhost:9200/logs-claude.otel-default/_search" -H 'Content-Type: application/json' -d '{
   "query": {
     "bool": {
       "must": [
-        {"term": {"task_id": "<TASK_ID>"}},
-        {"term": {"success": false}}
+        {"term": {"resource.attributes.task_id.keyword": "<TASK_ID>"}},
+        {"term": {"event_name.keyword": "claude_code.tool_result"}},
+        {"term": {"attributes.success": false}}
       ]
     }
   },
-  "sort": [{"timestamp": "asc"}],
+  "sort": [{"@timestamp": "asc"}],
   "size": 100
-}' | jq '.hits.hits[]._source | {timestamp, event_category, tool_name, error_message, tool_params_text}'
+}' | jq '.hits.hits[]._source | {"@timestamp", "tool_name": .attributes.tool_name, "error": .attributes.error, "params": .attributes.tool_parameters}'
 ```
 
 ---
 
-### Step 6: Read Agent Text Output and Thinking
+### Step 6: Get API Usage and Token Counts
 
-Get Claude's text output (what it communicated or its reasoning):
 ```bash
-curl -s "http://localhost:9200/claude-streams-*/_search" -H 'Content-Type: application/json' -d '{
+curl -s "http://localhost:9200/logs-claude.otel-default/_search" -H 'Content-Type: application/json' -d '{
   "query": {
     "bool": {
       "must": [
-        {"term": {"task_id": "<TASK_ID>"}},
-        {"terms": {"event_category": ["agent_output", "agent_thinking"]}}
+        {"term": {"resource.attributes.task_id.keyword": "<TASK_ID>"}},
+        {"term": {"event_name.keyword": "claude_code.api_request"}}
       ]
     }
   },
-  "sort": [{"timestamp": "asc"}],
+  "sort": [{"@timestamp": "asc"}],
   "size": 100
-}' | jq '.hits.hits[]._source | {timestamp, event_type, event_category}'
+}' | jq '.hits.hits[]._source | {"@timestamp", "input_tokens": .attributes.input_tokens, "output_tokens": .attributes.output_tokens, "cost_usd": .attributes.cost_usd, "model": .attributes.model}'
 ```
-
-> The full text content is in `raw_event` (not indexed). To retrieve it, use `| .raw_event` in the jq filter.
 
 ---
 
-### Step 7: Search Tool Params for Specific Content
+### Step 7: Get API Errors
 
-Find Bash commands containing a specific string:
 ```bash
-curl -s "http://localhost:9200/claude-streams-*/_search" -H 'Content-Type: application/json' -d '{
+curl -s "http://localhost:9200/logs-claude.otel-default/_search" -H 'Content-Type: application/json' -d '{
   "query": {
     "bool": {
       "must": [
-        {"term": {"task_id": "<TASK_ID>"}},
-        {"match": {"tool_params_text": "<search_term>"}}
+        {"term": {"resource.attributes.task_id.keyword": "<TASK_ID>"}},
+        {"terms": {"event_name.keyword": ["claude_code.api_error", "claude_code.api_rate_limit_error"]}}
       ]
     }
   },
-  "sort": [{"timestamp": "asc"}],
+  "sort": [{"@timestamp": "asc"}],
   "size": 50
-}' | jq '.hits.hits[]._source | {timestamp, tool_name, tool_params_text}'
-```
-
-Find all Bash tool calls:
-```bash
-curl -s "http://localhost:9200/claude-streams-*/_search" -H 'Content-Type: application/json' -d '{
-  "query": {
-    "bool": {
-      "must": [
-        {"term": {"task_id": "<TASK_ID>"}},
-        {"term": {"tool_name": "Bash"}}
-      ]
-    }
-  },
-  "sort": [{"timestamp": "asc"}],
-  "size": 100
-}' | jq '.hits.hits[]._source | {timestamp, tool_params_text, success, error_message}'
+}' | jq '.hits.hits[]._source | {"@timestamp", event_name, "message": .attributes.message, "code": .attributes.code}'
 ```
 
 ---
@@ -261,37 +237,38 @@ curl -s "http://localhost:9200/agent-events-*/_search" -H 'Content-Type: applica
 
 ### Find Recent Failures
 ```bash
-curl -s "http://localhost:9200/claude-streams-*/_search" -H 'Content-Type: application/json' -d '{
+curl -s "http://localhost:9200/logs-claude.otel-default/_search" -H 'Content-Type: application/json' -d '{
   "query": {
     "bool": {
       "must": [
-        {"term": {"success": false}},
-        {"range": {"timestamp": {"gte": "now-<TIME_WINDOW>"}}}
+        {"term": {"event_name.keyword": "claude_code.tool_result"}},
+        {"term": {"attributes.success": false}},
+        {"range": {"@timestamp": {"gte": "now-<TIME_WINDOW>"}}}
       ]
     }
   },
-  "sort": [{"timestamp": "desc"}],
+  "sort": [{"@timestamp": "desc"}],
   "size": 50
-}' | jq '.hits.hits[]._source | {timestamp, agent_name, project, task_id, event_category, tool_name, error_message}'
+}' | jq '.hits.hits[]._source | {"@timestamp", "agent": .resource.attributes.agent, "project": .resource.attributes.project, "task_id": .resource.attributes.task_id, "tool_name": .attributes.tool_name, "error": .attributes.error}'
 ```
 
 ### Error Rate by Tool
 ```bash
-curl -s "http://localhost:9200/claude-streams-*/_search" -H 'Content-Type: application/json' -d '{
+curl -s "http://localhost:9200/logs-claude.otel-default/_search" -H 'Content-Type: application/json' -d '{
   "query": {
     "bool": {
       "must": [
-        {"term": {"event_category": "tool_result"}},
-        {"range": {"timestamp": {"gte": "now-<TIME_WINDOW>"}}}
+        {"term": {"event_name.keyword": "claude_code.tool_result"}},
+        {"range": {"@timestamp": {"gte": "now-<TIME_WINDOW>"}}}
       ]
     }
   },
   "size": 0,
   "aggs": {
     "by_tool": {
-      "terms": {"field": "tool_name", "size": 20},
+      "terms": {"field": "attributes.tool_name.keyword", "size": 20},
       "aggs": {
-        "error_rate": {"avg": {"script": {"source": "doc['"'"'success'"'"'].value ? 0 : 1"}}}
+        "error_rate": {"avg": {"script": {"source": "doc['"'"'attributes.success'"'"'].value ? 0 : 1"}}}
       }
     }
   }
@@ -302,31 +279,17 @@ curl -s "http://localhost:9200/claude-streams-*/_search" -H 'Content-Type: appli
 
 ## Data Flow Reference
 
-Understanding how live logs are captured:
-
 ```
 Claude Code process (in Docker container)
-  ↓ JSON events on stdout (tool_call, tool_result, assistant, user, etc.)
+  ↓ OTEL SDK emits structured log events (tool_result, api_request, api_error, etc.)
+OTEL collector (otel-collector service)
+  ↓ Batches and exports to Elasticsearch
+Elasticsearch: logs-claude.otel-default
+
 docker-claude-wrapper.py
-  ↓ Wraps each event with {agent, task_id, project, issue_number, timestamp, event: <raw>}
-  ↓ Writes to Redis Stream: orchestrator:claude_logs_stream (maxlen=500, 2h TTL)
-  ↓ Publishes to Redis Pub/Sub: orchestrator:claude_stream (real-time UI)
-log_collector.py (consumer group: log_collector)
-  ↓ Reads from Redis Stream in batches
-  ↓ Calls enrich_claude_log() → extracts event_category, tool_name, success, etc.
-  ↓ Routes by event_category to correct ES index
-Elasticsearch: claude-streams-YYYY-MM-DD
+  ↓ Also publishes each JSON line to Redis Pub/Sub: orchestrator:claude_stream (real-time UI only)
+  → NOT persisted to ES — ephemeral pub/sub only
 ```
-
-Also note: `ObservabilityManager.emit_claude_stream_event()` in `monitoring/observability.py` is an alternative direct write path to `claude-streams-*` used by certain code paths (bypasses Redis, goes direct to ES with `event_type: 'claude_stream'`, `event_category: 'claude_stream'`).
-
-### raw_event Structure
-
-The `raw_event` field stores the original Claude Code JSON event. Key shapes:
-- **Tool call**: `{type: "assistant", message: {content: [{type: "tool_use", name: "Bash", input: {command: "..."}}]}}`
-- **Tool result**: `{type: "user", message: {content: [{type: "tool_result", tool_use_id: "...", is_error: false, content: "..."}]}}`
-- **Text output**: `{type: "assistant", message: {content: [{type: "text", text: "..."}]}}`
-- **Thinking**: `{type: "assistant", message: {content: [{type: "thinking", thinking: "..."}]}}`
 
 ---
 
@@ -334,13 +297,13 @@ The `raw_event` field stores the original Claude Code JSON event. Key shapes:
 
 | Pattern | What to look for |
 |---|---|
-| **Agent stuck/infinite loop** | Many repeated `tool_call` events for same tool with same params; no progress in `agent_output` |
-| **Test fix failures** | Repeated Bash tool calls with `pytest` / `npm test`; `success: false` on tool_result; repair cycle iteration count in `decision-events-*` |
-| **Git push rejected** | Bash tool calls containing `git push`; `error_message` containing `rejected` or `conflict` |
-| **Context length exceeded** | `error_message` containing `context` or `token`; agent_failed event shortly after |
-| **File not found** | `success: false` on Read/Glob/Grep tool results; `error_message` containing `not found` or `no such file` |
-| **Permission errors** | `success: false` on Write/Edit; `error_message` containing `permission denied` |
-| **No tool calls at all** | Only `claude_stream` or `agent_output` events; Claude may be confused or outputting plain text |
+| **Agent stuck/infinite loop** | Many repeated `tool_result` events for same tool with same `tool_parameters`; no progress |
+| **Test fix failures** | Repeated Bash tool calls with `pytest` / `npm test`; `attributes.success: false` |
+| **Git push rejected** | Bash tool calls with `git push` in `tool_parameters`; error in `attributes.error` |
+| **Rate limit errors** | `event_name: claude_code.api_rate_limit_error` events |
+| **API errors** | `event_name: claude_code.api_error` with `attributes.code` and `attributes.message` |
+| **File not found** | `success: false` on Read/Glob/Grep tool results; error in `attributes.error` |
+| **Permission errors** | `success: false` on Write/Edit; `attributes.error` containing `permission denied` |
 
 ---
 
@@ -354,14 +317,14 @@ curl -s "http://localhost:9200/agent-events-*/_search" -H 'Content-Type: applica
   jq '.hits.hits[]._source | {timestamp, event_type, duration_ms, success}'
 
 # 2. Tool call summary
-curl -s "http://localhost:9200/claude-streams-*/_search" -H 'Content-Type: application/json' \
-  -d '{"query":{"bool":{"must":[{"term":{"task_id":"<TASK_ID>"}},{"term":{"event_category":"tool_call"}}]}},"size":0,"aggs":{"by_tool":{"terms":{"field":"tool_name","size":20}}}}' | \
+curl -s "http://localhost:9200/logs-claude.otel-default/_search" -H 'Content-Type: application/json' \
+  -d '{"query":{"bool":{"must":[{"term":{"resource.attributes.task_id.keyword":"<TASK_ID>"}},{"term":{"event_name.keyword":"claude_code.tool_result"}}]}},"size":0,"aggs":{"by_tool":{"terms":{"field":"attributes.tool_name.keyword","size":20}}}}' | \
   jq '.aggregations.by_tool.buckets[]'
 
 # 3. Failures only
-curl -s "http://localhost:9200/claude-streams-*/_search" -H 'Content-Type: application/json' \
-  -d '{"query":{"bool":{"must":[{"term":{"task_id":"<TASK_ID>"}},{"term":{"success":false}}]}},"sort":[{"timestamp":"asc"}],"size":50}' | \
-  jq '.hits.hits[]._source | {timestamp, tool_name, error_message}'
+curl -s "http://localhost:9200/logs-claude.otel-default/_search" -H 'Content-Type: application/json' \
+  -d '{"query":{"bool":{"must":[{"term":{"resource.attributes.task_id.keyword":"<TASK_ID>"}},{"term":{"event_name.keyword":"claude_code.tool_result"}},{"term":{"attributes.success":false}}]}},"sort":[{"@timestamp":"asc"}],"size":50}' | \
+  jq '.hits.hits[]._source | {"@timestamp", "tool_name": .attributes.tool_name, "error": .attributes.error}'
 ```
 
 ### Correlate pipeline run with live logs
@@ -371,17 +334,17 @@ TASK_IDS=$(curl -s "http://localhost:9200/agent-events-*/_search" -H 'Content-Ty
   -d '{"query":{"bool":{"must":[{"term":{"pipeline_run_id":"<RUN_ID>"}},{"term":{"event_type":"agent_initialized"}}]}},"size":20}' | \
   jq -r '[.hits.hits[]._source.task_id] | join(" ")') && echo "$TASK_IDS"
 
-# Step 2: For each task_id, query claude-streams-*
+# Step 2: For each task_id, query logs-claude.otel-default
 # (Use each task_id from above output)
 ```
 
 ### Check total event count before paginating
 ```bash
-curl -s "http://localhost:9200/claude-streams-*/_count" -H 'Content-Type: application/json' \
-  -d '{"query":{"term":{"task_id":"<TASK_ID>"}}}' | jq '.count'
+curl -s "http://localhost:9200/logs-claude.otel-default/_count" -H 'Content-Type: application/json' \
+  -d '{"query":{"term":{"resource.attributes.task_id.keyword":"<TASK_ID>"}}}' | jq '.count'
 ```
 
 ### List all live indices
 ```bash
-curl -s "http://localhost:9200/_cat/indices?v&s=index" | grep -E "(claude-streams|agent-events|decision-events|pipeline-runs)"
+curl -s "http://localhost:9200/_cat/indices?v&s=index" | grep -E "(logs-claude|metrics-claude|agent-events|decision-events|pipeline-runs)"
 ```

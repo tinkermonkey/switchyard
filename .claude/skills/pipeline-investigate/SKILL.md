@@ -67,21 +67,21 @@ docker logs claude-agent-<project>-<task_id> 2>&1 | tail -500
 
 If the container no longer exists, note it and move on.
 
-## Step 6: If Failures Found, Query Claude Stream Events
+## Step 6: If Failures Found, Query OTEL Tool Events
 
 ```bash
-curl -s "http://localhost:9200/claude-streams-*/_search" -H 'Content-Type: application/json' -d '{
+curl -s "http://localhost:9200/logs-claude.otel-default/_search" -H 'Content-Type: application/json' -d '{
   "query": {
     "bool": {
       "must": [
-        {"term": {"pipeline_run_id": "<RUN_ID>"}},
-        {"terms": {"event_category": ["tool_call", "tool_result", "agent_output"]}}
+        {"term": {"resource.attributes.pipeline_run_id.keyword": "<RUN_ID>"}},
+        {"term": {"event_name.keyword": "claude_code.tool_result"}}
       ]
     }
   },
-  "sort": [{"timestamp": "asc"}],
+  "sort": [{"@timestamp": "asc"}],
   "size": 200
-}' | jq '.hits.hits[]._source | {timestamp, agent_name, event_type, event_category, tool_name, success, error_message}'
+}' | jq '.hits.hits[]._source | {"@timestamp", "agent": .resource.attributes.agent, event_name, "tool_name": .attributes.tool_name, "success": .attributes.success, "error": .attributes.error}'
 ```
 
 ## Step 7: Construct Timeline and Synthesize

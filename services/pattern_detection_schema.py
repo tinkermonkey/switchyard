@@ -200,44 +200,6 @@ AGENT_EVENTS_MAPPING = {
     }
 }
 
-# Separate mapping for Claude streaming logs
-CLAUDE_STREAMS_MAPPING = {
-    "mappings": {
-        "properties": {
-            "timestamp": {"type": "date"},
-            "agent_name": {"type": "keyword"},
-            "project": {"type": "keyword"},
-            "task_id": {"type": "keyword"},
-            "event_type": {"type": "keyword"},
-            "event_category": {"type": "keyword"},
-            "tool_name": {"type": "keyword"},
-            "tool_params": {"type": "object", "enabled": False},
-            "tool_params_text": {"type": "text", "analyzer": "standard"},
-            "success": {"type": "boolean"},
-            "error_message": {"type": "text", "fields": {"keyword": {"type": "keyword", "ignore_above": 512}}},
-            "raw_event": {"type": "object", "enabled": False},  # Store without indexing nested structure
-            "pipeline_run_id": {"type": "keyword"},  # Link to pipeline run
-            "token_input":           {"type": "integer"},
-            "token_cache_read":      {"type": "integer"},
-            "token_cache_creation":  {"type": "integer"},
-            "token_effective_input": {"type": "integer"},
-            "token_output":          {"type": "integer"},
-            "token_total":           {"type": "integer"},
-            "token_model":           {"type": "keyword"}
-        }
-    },
-    "settings": {
-        "index": {
-            "number_of_shards": 1,
-            "number_of_replicas": 0,
-            "refresh_interval": "10s",  # Can be slower for streaming logs
-            "lifecycle": {
-                "name": "agent-logs-ilm-policy"
-            }
-        }
-    }
-}
-
 # Mapping for pipeline runs
 PIPELINE_RUNS_MAPPING = {
     "mappings": {
@@ -272,13 +234,6 @@ AGENT_EVENTS_TEMPLATE = {
     "template": AGENT_EVENTS_MAPPING,
     "priority": 100
 }
-
-CLAUDE_STREAMS_TEMPLATE = {
-    "index_patterns": ["claude-streams-*"],
-    "template": CLAUDE_STREAMS_MAPPING,
-    "priority": 100
-}
-
 
 # ILM policy for OTEL data streams (logs-claude.otel-* and metrics-claude.otel-*)
 # Matches the 7-day retention used by agent-logs-ilm-policy.
@@ -365,7 +320,7 @@ def get_index_name(date=None, event_category=None):
         event_category: Category of event (determines index prefix)
 
     Returns:
-        Index name like 'agent-events-2025-10-05' or 'claude-streams-2025-10-05'
+        Index name like 'agent-events-2025-10-05' or 'decision-events-2025-10-05'
     """
     from datetime import datetime
 
@@ -375,10 +330,8 @@ def get_index_name(date=None, event_category=None):
     # Route to correct index based on category
     if event_category in ['agent_lifecycle', 'claude_api']:
         prefix = 'agent-events'
-    elif event_category in ['claude_stream', 'tool_call', 'tool_result', 'agent_output', 'agent_thinking']:
-        prefix = 'claude-streams'
     else:
-        # 'other' and anything unrecognised from event_stream → decision-events, not claude-streams
+        # 'other', 'decision', and anything unrecognised → decision-events
         prefix = 'decision-events'
 
     return f"{prefix}-{date.strftime('%Y-%m-%d')}"
