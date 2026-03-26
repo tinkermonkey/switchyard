@@ -49,18 +49,6 @@ def _index_name(prefix: str, dt: datetime) -> str:
     return f"{prefix}-{dt.strftime('%Y.%m')}"
 
 
-def _get_effective_tool_name(c: dict) -> str | None:
-    """Resolve Skill and Task tool names to their actual skill/subagent names."""
-    name = c.get('name')
-    if not name:
-        return name
-    inp = c.get('input') or {}
-    if name == 'Skill' and inp.get('skill'):
-        return inp['skill']
-    if name == 'Task' and inp.get('subagent_type'):
-        return inp['subagent_type']
-    return name
-
 
 def _empty_tool_entry() -> Dict[str, Any]:
     return {
@@ -71,6 +59,14 @@ def _empty_tool_entry() -> Dict[str, Any]:
         'sum_output': 0.0,
         'sum_context_growth': 0.0,
     }
+
+
+def _parse_otel_int(value) -> int:
+    """Parse an OTEL attribute value (typically stored as a string) to int."""
+    try:
+        return int(value) if value is not None else 0
+    except (ValueError, TypeError):
+        return 0
 
 
 
@@ -563,19 +559,16 @@ class TokenMetricsService:
 
     def _process_task_streams(self, task_ids: List[str]) -> Optional[Dict[str, Any]]:
         """
-        Fetch claude-streams docs for the given task_ids and produce per-task
-        token sums plus per-tool and per-model breakdowns.
+        Fetch OTEL api_request and tool_result log events for the given task_ids and
+        produce per-task token sums plus per-tool and per-model breakdowns.
 
-        All four token types are summed across ALL turns (not snapshot of last turn),
-        which gives the correct billable quantity:
-          - cache_read is charged on every API call that reads from cache
-          - cache_creation is charged when the cache is written
-          - direct input is the uncached input on every turn
-          - output is charged per token produced
+        All four token types are summed across ALL API calls, giving the correct
+        billable quantity.
 
-        Tool attribution:
-          - sum_output: output tokens in turns that invoke each tool (proportional split)
-          - sum_context_growth: delta effective_input in the NEXT turn after the tool call
+        Tool attribution uses timestamp ordering: each api_request's tokens are
+        attributed to the tool_result events that follow it (between it and the next
+        api_request). Context growth is the delta effective_input of the next
+        api_request vs the current one, attributed to the same tools.
 
         Returns a dict of raw per-task lists and aggregated breakdowns, or None.
         """
@@ -584,19 +577,26 @@ class TokenMetricsService:
 
         try:
             stream_result = self.es.search(
-                index='claude-streams-*',
+                index='logs-claude.otel-default',
                 body={
                     'size': 10000,
                     'sort': [
-                        {'task_id': {'order': 'asc'}},
-                        {'timestamp': {'order': 'asc'}}
+                        {'resource.attributes.task_id.keyword': {'order': 'asc'}},
+                        {'@timestamp': {'order': 'asc'}}
                     ],
-                    'query': {'terms': {'task_id': task_ids}},
-                    '_source': ['task_id', 'raw_event', 'timestamp']
+                    'query': {
+                        'bool': {
+                            'must': [
+                                {'terms': {'resource.attributes.task_id.keyword': task_ids}},
+                                {'terms': {'event.name': ['api_request', 'tool_result']}}
+                            ]
+                        }
+                    },
+                    '_source': ['resource.attributes.task_id', 'event', 'attributes', '@timestamp']
                 }
             )
         except Exception as e:
-            logger.error(f"Error querying claude-streams for tasks {task_ids[:3]}...: {e}")
+            logger.error(f"Error querying logs-claude.otel-default for tasks {task_ids[:3]}...: {e}")
             return None
 
         hits = stream_result['hits']['hits']
@@ -608,16 +608,16 @@ class TokenMetricsService:
             total_available = total_available.get('value', len(hits))
         if total_available > len(hits):
             logger.warning(
-                f"claude-streams query returned {len(hits)} of {total_available} total hits "
+                f"OTEL query returned {len(hits)} of {total_available} total hits "
                 f"for task_ids {task_ids[:3]}... - metrics may be incomplete"
             )
 
-        task_streams: Dict[str, List[Dict]] = {}
+        task_events: Dict[str, List[Dict]] = {}
         for hit in hits:
             src = hit['_source']
-            task_id = src.get('task_id')
+            task_id = src.get('resource', {}).get('attributes', {}).get('task_id')
             if task_id:
-                task_streams.setdefault(task_id, []).append(src)
+                task_events.setdefault(task_id, []).append(src)
 
         # Per-task accumulators (appended to lists after processing each task)
         per_task_sum_direct: List[int] = []
@@ -633,7 +633,7 @@ class TokenMetricsService:
         # Model breakdown: model → list of per-task dicts
         model_per_task: Dict[str, List[Dict]] = {}
 
-        for task_id, docs in task_streams.items():
+        for task_id, events in task_events.items():
             sum_direct = 0
             sum_cache_read = 0
             sum_cache_creation = 0
@@ -641,110 +641,89 @@ class TokenMetricsService:
             first_input: Optional[int] = None
             peak_input = 0
             task_model: Optional[str] = None
-            prev_effective_input: Optional[int] = None
-            prev_tool_uses: List[str] = []
 
-            # Pre-pass: record the last index of each unique Anthropic message ID.
-            # Claude Code re-emits the same message (same usage, same ID) each time a
-            # new content block is appended during streaming. The log_collector now uses
-            # message.id as the ES doc ID (so new data has at most one doc per message),
-            # but this dedup also correctly handles historical data ingested before that fix.
-            _last_idx_for_msg: Dict[str, int] = {}
-            for _i, _doc in enumerate(docs):
-                _raw = _doc.get('raw_event')
-                if not _raw:
-                    continue
-                if isinstance(_raw, str):
-                    try:
-                        _raw = json.loads(_raw)
-                    except Exception:
-                        continue
-                _event = _raw.get('event') if isinstance(_raw, dict) else None
-                if _event and _event.get('type') == 'assistant':
-                    _msg_id = _event.get('message', {}).get('id')
-                    if _msg_id:
-                        _last_idx_for_msg[_msg_id] = _i
-            _canonical_indices = set(_last_idx_for_msg.values())
+            # Pending api_request not yet attributed to tools
+            pending_attrs: Optional[Dict] = None
+            pending_effective_input: int = 0
+            tools_since_pending: List[str] = []
 
-            for _i, doc in enumerate(docs):
-                raw_event = doc.get('raw_event')
-                if not raw_event:
-                    continue
+            for event_doc in events:
+                event_name = event_doc.get('event', {}).get('name', '')
+                attrs = event_doc.get('attributes', {})
 
-                if isinstance(raw_event, str):
-                    try:
-                        raw_event = json.loads(raw_event)
-                    except Exception:
-                        continue
+                if event_name == 'api_request':
+                    # Attribute the previous pending api_request to tools collected since it
+                    if pending_attrs is not None:
+                        input_direct = _parse_otel_int(pending_attrs.get('input_tokens'))
+                        cache_read = _parse_otel_int(pending_attrs.get('cache_read_input_tokens'))
+                        cache_creation = _parse_otel_int(pending_attrs.get('cache_creation_input_tokens'))
+                        output_tokens = _parse_otel_int(pending_attrs.get('output_tokens'))
 
-                event = raw_event.get('event') if isinstance(raw_event, dict) else None
-                if not event or event.get('type') != 'assistant':
-                    continue
+                        sum_direct += input_direct
+                        sum_cache_read += cache_read
+                        sum_cache_creation += cache_creation
+                        sum_output += output_tokens
 
-                message = event.get('message', {})
-                msg_id = message.get('id')
-                if msg_id and _i not in _canonical_indices:
-                    continue  # skip streaming re-emission; only process last emission per message
+                        if first_input is None:
+                            first_input = pending_effective_input
+                        if pending_effective_input > peak_input:
+                            peak_input = pending_effective_input
 
-                usage = message.get('usage', {})
-                model = message.get('model')
+                        if tools_since_pending:
+                            k = len(tools_since_pending)
+                            for tool_name in tools_since_pending:
+                                td = tool_breakdown_raw.setdefault(tool_name, _empty_tool_entry())
+                                td['invocation_count'] += 1
+                                td['sum_direct_input'] += input_direct / k
+                                td['sum_cache_read'] += cache_read / k
+                                td['sum_cache_creation'] += cache_creation / k
+                                td['sum_output'] += output_tokens / k
 
-                if not usage:
-                    continue
+                            # Context growth: delta to THIS new api_request vs pending
+                            new_direct = _parse_otel_int(attrs.get('input_tokens'))
+                            new_cr = _parse_otel_int(attrs.get('cache_read_input_tokens'))
+                            new_cc = _parse_otel_int(attrs.get('cache_creation_input_tokens'))
+                            new_eff = new_direct + new_cr + new_cc
+                            delta = max(0, new_eff - pending_effective_input)
+                            for tool_name in tools_since_pending:
+                                td = tool_breakdown_raw.setdefault(tool_name, _empty_tool_entry())
+                                td['sum_context_growth'] += delta / k
 
-                input_direct = usage.get('input_tokens') or 0
-                cache_read = usage.get('cache_read_input_tokens') or 0
-                cache_creation = usage.get('cache_creation_input_tokens') or 0
-                output_tokens = usage.get('output_tokens') or 0
-                effective_input = input_direct + cache_read + cache_creation
+                        if pending_attrs.get('model'):
+                            task_model = pending_attrs['model']
 
-                # Sum all four types across all turns
+                    # Set up this api_request as pending
+                    new_direct = _parse_otel_int(attrs.get('input_tokens'))
+                    new_cr = _parse_otel_int(attrs.get('cache_read_input_tokens'))
+                    new_cc = _parse_otel_int(attrs.get('cache_creation_input_tokens'))
+                    pending_attrs = attrs
+                    pending_effective_input = new_direct + new_cr + new_cc
+                    tools_since_pending = []
+
+                elif event_name == 'tool_result':
+                    tool_name = attrs.get('tool_name')
+                    if tool_name and pending_attrs is not None:
+                        tools_since_pending.append(tool_name)
+
+            # Process the last pending api_request (final turn — no tools follow it)
+            if pending_attrs is not None:
+                input_direct = _parse_otel_int(pending_attrs.get('input_tokens'))
+                cache_read = _parse_otel_int(pending_attrs.get('cache_read_input_tokens'))
+                cache_creation = _parse_otel_int(pending_attrs.get('cache_creation_input_tokens'))
+                output_tokens = _parse_otel_int(pending_attrs.get('output_tokens'))
+
                 sum_direct += input_direct
                 sum_cache_read += cache_read
                 sum_cache_creation += cache_creation
                 sum_output += output_tokens
 
                 if first_input is None:
-                    first_input = effective_input
-                if effective_input > peak_input:
-                    peak_input = effective_input
-                if model:
-                    task_model = model
+                    first_input = pending_effective_input
+                if pending_effective_input > peak_input:
+                    peak_input = pending_effective_input
 
-                # Parse content blocks to find tool_use in this turn
-                contents = message.get('content') or []
-                if not isinstance(contents, list):
-                    contents = []
-
-                current_tool_uses: List[str] = []
-                for c in contents:
-                    if c.get('type') == 'tool_use':
-                        name = _get_effective_tool_name(c)
-                        if name:
-                            current_tool_uses.append(name)
-
-                # Attribute this turn's token costs to tools invoked in this turn
-                if current_tool_uses:
-                    k = len(current_tool_uses)
-                    for tool_name in current_tool_uses:
-                        td = tool_breakdown_raw.setdefault(tool_name, _empty_tool_entry())
-                        td['invocation_count'] += 1
-                        td['sum_direct_input'] += input_direct / k
-                        td['sum_cache_read'] += cache_read / k
-                        td['sum_cache_creation'] += cache_creation / k
-                        td['sum_output'] += output_tokens / k
-
-                # Context growth attribution: delta effective_input attributed to PREV turn's tools
-                if prev_effective_input is not None and prev_tool_uses:
-                    delta = max(0, effective_input - prev_effective_input)
-                    k = len(prev_tool_uses)
-                    per_tool_delta = delta / k if k > 0 else 0
-                    for tool_name in prev_tool_uses:
-                        td = tool_breakdown_raw.setdefault(tool_name, _empty_tool_entry())
-                        td['sum_context_growth'] += per_tool_delta
-
-                prev_effective_input = effective_input
-                prev_tool_uses = current_tool_uses
+                if pending_attrs.get('model'):
+                    task_model = pending_attrs['model']
 
             if first_input is not None:
                 per_task_sum_direct.append(sum_direct)
@@ -921,24 +900,26 @@ class TokenMetricsService:
 
         try:
             stream_result = self.es.search(
-                index='claude-streams-*',
+                index='logs-claude.otel-default',
                 body={
                     'size': 10000,
                     'sort': [
-                        {'task_id': {'order': 'asc'}},
-                        {'timestamp': {'order': 'asc'}}
+                        {'resource.attributes.task_id.keyword': {'order': 'asc'}},
+                        {'@timestamp': {'order': 'asc'}}
                     ],
                     'query': {
                         'bool': {
-                            'must': [{'terms': {'task_id': task_ids}}],
-                            'must_not': [{'term': {'event_type': 'prompt_constructed'}}],
+                            'must': [
+                                {'terms': {'resource.attributes.task_id.keyword': task_ids}},
+                                {'terms': {'event.name': ['api_request', 'tool_result']}}
+                            ]
                         }
                     },
-                    '_source': ['task_id', 'raw_event', 'timestamp']
+                    '_source': ['resource.attributes.task_id', 'event', 'attributes', '@timestamp']
                 }
             )
         except Exception as e:
-            logger.error(f"Error querying claude-streams for per-task summaries: {e}")
+            logger.error(f"Error querying logs-claude.otel-default for per-task summaries: {e}")
             return {}
 
         hits = stream_result['hits']['hits']
@@ -950,21 +931,20 @@ class TokenMetricsService:
             total_available = total_available.get('value', len(hits))
         if total_available > len(hits):
             logger.warning(
-                f"claude-streams per-task query returned {len(hits)} of {total_available} hits — "
+                f"OTEL per-task query returned {len(hits)} of {total_available} hits — "
                 f"execution summaries may be incomplete"
             )
 
-        # Group docs by task_id
-        task_streams: Dict[str, List[Dict]] = {}
+        task_events: Dict[str, List[Dict]] = {}
         for hit in hits:
             src = hit['_source']
-            tid = src.get('task_id')
+            tid = src.get('resource', {}).get('attributes', {}).get('task_id')
             if tid:
-                task_streams.setdefault(tid, []).append(src)
+                task_events.setdefault(tid, []).append(src)
 
         results: Dict[str, Dict[str, Any]] = {}
 
-        for task_id, docs in task_streams.items():
+        for task_id, events in task_events.items():
             sum_direct = 0
             sum_cache_read = 0
             sum_cache_creation = 0
@@ -972,55 +952,66 @@ class TokenMetricsService:
             first_input: Optional[int] = None
             peak_input = 0
             task_tool_breakdown: Dict[str, Dict] = {}
-            prev_effective_input: Optional[int] = None
-            prev_tool_uses: List[str] = []
 
-            # Dedup streaming re-emissions using message ID (same as _process_task_streams)
-            _last_idx_for_msg: Dict[str, int] = {}
-            for _i, _doc in enumerate(docs):
-                _raw = _doc.get('raw_event')
-                if not _raw:
-                    continue
-                if isinstance(_raw, str):
-                    try:
-                        _raw = json.loads(_raw)
-                    except Exception:
-                        continue
-                _event = _raw.get('event') if isinstance(_raw, dict) else None
-                if _event and _event.get('type') == 'assistant':
-                    _msg_id = _event.get('message', {}).get('id')
-                    if _msg_id:
-                        _last_idx_for_msg[_msg_id] = _i
-            _canonical_indices = set(_last_idx_for_msg.values())
+            pending_attrs: Optional[Dict] = None
+            pending_effective_input: int = 0
+            tools_since_pending: List[str] = []
 
-            for _i, doc in enumerate(docs):
-                raw_event = doc.get('raw_event')
-                if not raw_event:
-                    continue
-                if isinstance(raw_event, str):
-                    try:
-                        raw_event = json.loads(raw_event)
-                    except Exception:
-                        continue
+            for event_doc in events:
+                event_name = event_doc.get('event', {}).get('name', '')
+                attrs = event_doc.get('attributes', {})
 
-                event = raw_event.get('event') if isinstance(raw_event, dict) else None
-                if not event or event.get('type') != 'assistant':
-                    continue
+                if event_name == 'api_request':
+                    if pending_attrs is not None:
+                        input_direct = _parse_otel_int(pending_attrs.get('input_tokens'))
+                        cache_read = _parse_otel_int(pending_attrs.get('cache_read_input_tokens'))
+                        cache_creation = _parse_otel_int(pending_attrs.get('cache_creation_input_tokens'))
+                        output_tokens = _parse_otel_int(pending_attrs.get('output_tokens'))
 
-                message = event.get('message', {})
-                msg_id = message.get('id')
-                if msg_id and _i not in _canonical_indices:
-                    continue
+                        sum_direct += input_direct
+                        sum_cache_read += cache_read
+                        sum_cache_creation += cache_creation
+                        sum_output += output_tokens
 
-                usage = message.get('usage', {})
-                if not usage:
-                    continue
+                        if first_input is None:
+                            first_input = pending_effective_input
+                        if pending_effective_input > peak_input:
+                            peak_input = pending_effective_input
 
-                input_direct = usage.get('input_tokens') or 0
-                cache_read = usage.get('cache_read_input_tokens') or 0
-                cache_creation = usage.get('cache_creation_input_tokens') or 0
-                output_tokens = usage.get('output_tokens') or 0
-                effective_input = input_direct + cache_read + cache_creation
+                        if tools_since_pending:
+                            k = len(tools_since_pending)
+                            for tool_name in tools_since_pending:
+                                td = task_tool_breakdown.setdefault(tool_name, _empty_tool_entry())
+                                td['invocation_count'] += 1
+                                td['sum_output'] += output_tokens / k
+
+                            new_direct = _parse_otel_int(attrs.get('input_tokens'))
+                            new_cr = _parse_otel_int(attrs.get('cache_read_input_tokens'))
+                            new_cc = _parse_otel_int(attrs.get('cache_creation_input_tokens'))
+                            new_eff = new_direct + new_cr + new_cc
+                            delta = max(0, new_eff - pending_effective_input)
+                            for tool_name in tools_since_pending:
+                                td = task_tool_breakdown.setdefault(tool_name, _empty_tool_entry())
+                                td['sum_context_growth'] += delta / k
+
+                    new_direct = _parse_otel_int(attrs.get('input_tokens'))
+                    new_cr = _parse_otel_int(attrs.get('cache_read_input_tokens'))
+                    new_cc = _parse_otel_int(attrs.get('cache_creation_input_tokens'))
+                    pending_attrs = attrs
+                    pending_effective_input = new_direct + new_cr + new_cc
+                    tools_since_pending = []
+
+                elif event_name == 'tool_result':
+                    tool_name = attrs.get('tool_name')
+                    if tool_name and pending_attrs is not None:
+                        tools_since_pending.append(tool_name)
+
+            # Process the last pending api_request
+            if pending_attrs is not None:
+                input_direct = _parse_otel_int(pending_attrs.get('input_tokens'))
+                cache_read = _parse_otel_int(pending_attrs.get('cache_read_input_tokens'))
+                cache_creation = _parse_otel_int(pending_attrs.get('cache_creation_input_tokens'))
+                output_tokens = _parse_otel_int(pending_attrs.get('output_tokens'))
 
                 sum_direct += input_direct
                 sum_cache_read += cache_read
@@ -1028,39 +1019,9 @@ class TokenMetricsService:
                 sum_output += output_tokens
 
                 if first_input is None:
-                    first_input = effective_input
-                if effective_input > peak_input:
-                    peak_input = effective_input
-
-                contents = message.get('content') or []
-                if not isinstance(contents, list):
-                    contents = []
-                current_tool_uses: List[str] = []
-                for c in contents:
-                    if c.get('type') == 'tool_use':
-                        name = _get_effective_tool_name(c)
-                        if name:
-                            current_tool_uses.append(name)
-
-                # Attribute this turn's token costs to tools invoked in this turn
-                if current_tool_uses:
-                    k = len(current_tool_uses)
-                    for tool_name in current_tool_uses:
-                        td = task_tool_breakdown.setdefault(tool_name, _empty_tool_entry())
-                        td['invocation_count'] += 1
-                        td['sum_output'] += output_tokens / k
-
-                # Context growth attribution: delta effective_input attributed to PREV turn's tools
-                if prev_effective_input is not None and prev_tool_uses:
-                    delta = max(0, effective_input - prev_effective_input)
-                    k = len(prev_tool_uses)
-                    per_tool_delta = delta / k if k > 0 else 0
-                    for tool_name in prev_tool_uses:
-                        td = task_tool_breakdown.setdefault(tool_name, _empty_tool_entry())
-                        td['sum_context_growth'] += per_tool_delta
-
-                prev_effective_input = effective_input
-                prev_tool_uses = current_tool_uses
+                    first_input = pending_effective_input
+                if pending_effective_input > peak_input:
+                    peak_input = pending_effective_input
 
             if first_input is not None:
                 context_growth = max(0, peak_input - first_input)
@@ -1096,7 +1057,7 @@ class TokenMetricsService:
           1. Query agent_initialized events for started_at + metadata
           2. Query agent_completed/agent_failed for status + ended_at + duration_ms
           3. Call _process_task_streams_per_task for token stats
-          4. Query claude-streams-* for prompt_length (prompt_constructed events)
+          4. Query agent-events-* for prompt_length (prompt_constructed events)
           5. Merge all four sources into one doc per task_id
         """
         # Step 1: agent_initialized events
@@ -1193,11 +1154,11 @@ class TokenMetricsService:
         # Step 3: token stats per task
         token_map = self._process_task_streams_per_task(task_ids)
 
-        # Step 4: prompt_length from claude-streams-* prompt_constructed events
+        # Step 4: prompt_length from agent-events-* prompt_constructed events
         prompt_length_map: Dict[str, int] = {}
         try:
             prompt_result = self.es.search(
-                index='claude-streams-*',
+                index='agent-events-*',
                 body={
                     'size': 10000,
                     'query': {

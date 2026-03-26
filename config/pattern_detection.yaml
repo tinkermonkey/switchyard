@@ -14,7 +14,6 @@ redis:
   host: "redis"
   port: 6379
   event_stream: "orchestrator:event_stream"
-  claude_stream: "orchestrator:claude_logs_stream"
   consumer_group: "log_collector"
 
 # Pattern Detection Thresholds

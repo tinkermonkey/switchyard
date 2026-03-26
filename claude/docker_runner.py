@@ -790,9 +790,9 @@ class DockerAgentRunner:
         """
         Detect Claude Code rate limit reset time by querying Elasticsearch for recent rate limit errors.
 
-        Claude Code logs rate limit errors to claude-streams-* indices with:
-        - raw_event.event.error: "rate_limit"
-        - raw_event.event.message.content: [{type: "text", text: "You've hit your limit · resets 5pm (UTC)"}]
+        Claude Code emits api_error log events via OTEL to logs-claude.otel-default with:
+        - event.name: "api_error"
+        - body: error message text (e.g. "You've hit your limit · resets 5pm (UTC)")
 
         This method queries the structured logs which contain precise error classification and reset times,
         instead of trying to parse ephemeral stdout/stderr which often produces no output.
@@ -811,19 +811,24 @@ class DockerAgentRunner:
             es_port = os.environ.get('ELASTICSEARCH_PORT', '9200')
             es = Elasticsearch([f"http://{es_host}:{es_port}"])
 
-            # Query for rate limit errors in the last 5 minutes
+            # Query for api_error events in the last 5 minutes
             now_utc = datetime.now(timezone.utc)
             five_min_ago = now_utc - timedelta(minutes=5)
 
             query = {
                 "size": 5,
-                "sort": [{"timestamp": "desc"}],
+                "sort": [{"@timestamp": "desc"}],
                 "query": {
                     "bool": {
                         "must": [
                             {
+                                "term": {
+                                    "event.name": "api_error"
+                                }
+                            },
+                            {
                                 "range": {
-                                    "timestamp": {
+                                    "@timestamp": {
                                         "gte": five_min_ago.isoformat(),
                                         "lte": now_utc.isoformat()
                                     }
@@ -832,13 +837,8 @@ class DockerAgentRunner:
                         ],
                         "should": [
                             {
-                                "term": {
-                                    "raw_event.event.error.keyword": "rate_limit"
-                                }
-                            },
-                            {
                                 "match": {
-                                    "raw_event.event.message.content.text": "hit your limit"
+                                    "body": "hit your limit"
                                 }
                             }
                         ],
@@ -847,23 +847,16 @@ class DockerAgentRunner:
                 }
             }
 
-            result = es.search(index="claude-streams-*", body=query)
+            result = es.search(index="logs-claude.otel-default", body=query)
             hits = result.get("hits", {}).get("hits", [])
 
             if not hits:
                 logger.debug("No rate limit errors found in Elasticsearch (last 5 minutes)")
                 return None
 
-            # Extract the most recent rate limit event
-            event = hits[0]["_source"]["raw_event"]["event"]
-            message_content = event.get("message", {}).get("content", [])
-
-            # Find the text content with the reset time
-            limit_message = None
-            for content in message_content:
-                if content.get("type") == "text":
-                    limit_message = content.get("text", "")
-                    break
+            # Extract the message text from the OTEL log body
+            source = hits[0]["_source"]
+            limit_message = source.get("body") or source.get("attributes", {}).get("message", "")
 
             if not limit_message:
                 logger.warning("Rate limit event found but no message text")

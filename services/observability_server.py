@@ -551,91 +551,35 @@ def get_history():
 
 @app.route('/claude-logs-history')
 def get_claude_logs_history():
-    """Get recent Claude log history from Redis Stream or Elasticsearch"""
+    """Get recent Claude log history from Elasticsearch OTEL index"""
     try:
-        # Connect to Redis
-        redis_client = redis.Redis(
-            host='redis',
-            port=6379,
-            decode_responses=True
-        )
-
         # Get filter parameters
         count = int(request.args.get('count', 100))
         count = min(count, 500)  # Cap at 500 logs
         agent_filter = request.args.get('agent')
-        start_time = request.args.get('start_time')
-        end_time = request.args.get('end_time')
 
-        stream_key = "orchestrator:claude_logs_stream"
+        query = {
+            "size": count,
+            "sort": [{"@timestamp": {"order": "desc"}}],
+            "query": {"match_all": {}}
+        }
 
-        # Get total count in stream
-        total_count = redis_client.xlen(stream_key)
+        if agent_filter:
+            query["query"] = {
+                "term": {"resource.attributes.agent.keyword": agent_filter}
+            }
 
-        # Try Redis first for real-time logs
-        logs = redis_client.xrevrange(stream_key, '+', '-', count=count)
-
-        # Parse logs from Redis
+        total_count = 0
         history = []
-        for log_id, log_data in logs:
-            try:
-                log_json = log_data.get('log')
-                if log_json:
-                    log_entry = json.loads(log_json)
-
-                    # Apply filters if provided
-                    if agent_filter and log_entry.get('agent') != agent_filter:
-                        continue
-
-                    if start_time and log_entry.get('timestamp'):
-                        if log_entry['timestamp'] < float(start_time):
-                            continue
-
-                    if end_time and log_entry.get('timestamp'):
-                        if log_entry['timestamp'] > float(end_time):
-                            continue
-
-                    history.append(log_entry)
-            except Exception as e:
-                logger.error(f"Error parsing log: {e}")
-
-        # If Redis stream is empty, fall back to Elasticsearch
-        if len(history) == 0:
-            try:
-                # Query claude-streams-* index for streaming logs
-                query = {
-                    "size": count,
-                    "sort": [{"timestamp": {"order": "desc"}}],
-                    "query": {"match_all": {}}
-                }
-
-                # Add agent filter if provided
-                if agent_filter:
-                    query["query"] = {
-                        "term": {"agent_name.keyword": agent_filter}
-                    }
-
-                result = es_client.search(index="claude-streams-*", body=query)
-                hits = result['hits']['hits']
-
-                # Extract raw_event from each hit (this is the original Claude streaming log)
-                for hit in hits:
-                    source = hit['_source']
-                    if 'raw_event' in source and source['raw_event']:
-                        raw = source['raw_event']
-                        # Verify it has the event structure (Claude streaming log)
-                        if 'event' in raw and isinstance(raw['event'], dict):
-                            history.append(raw)
-
-                # Reverse to get chronological order (oldest first)
-                history.reverse()
-                total_count = result['hits']['total']['value']
-
-            except Exception as es_error:
-                logger.error(f"Error fetching from Elasticsearch: {es_error}")
-        else:
-            # Reverse so oldest is first (chronological order)
+        try:
+            result = es_client.search(index="logs-claude.otel-default", body=query)
+            hits = result['hits']['hits']
+            total_count = result['hits'].get('total', {}).get('value', len(hits))
+            for hit in hits:
+                history.append(hit['_source'])
             history.reverse()
+        except Exception as es_error:
+            logger.error(f"Error fetching from Elasticsearch: {es_error}")
 
         return jsonify({
             'success': True,
@@ -911,23 +855,23 @@ def get_pipeline_run_events():
         except Exception as e:
             logger.warning(f"Error fetching agent events: {e}")
         
-        # 3. Get Claude stream logs for detailed execution
+        # 3. Get Claude OTEL logs for detailed execution
         try:
             claude_logs_query = {
                 "query": {
                     "term": {
-                        "pipeline_run_id": pipeline_run_id  # Already keyword type, no .keyword needed
+                        "resource.attributes.pipeline_run_id.keyword": pipeline_run_id
                     }
                 },
-                "sort": [{"timestamp": "asc"}],
-                "size": 10000  # May be many logs
+                "sort": [{"@timestamp": "asc"}],
+                "size": 10000
             }
-            
+
             claude_result = es_client.search(
-                index="claude-streams-*",
+                index="logs-claude.otel-default",
                 body=claude_logs_query
             )
-            
+
             for hit in claude_result['hits']['hits']:
                 event_data = hit['_source']
                 event_data['event_category'] = 'claude_log'
@@ -936,8 +880,8 @@ def get_pipeline_run_events():
         except Exception as e:
             logger.warning(f"Error fetching Claude logs: {e}")
         
-        # Sort all events by timestamp
-        all_events.sort(key=lambda x: x.get('timestamp', ''))
+        # Sort all events by timestamp (orchestrator events use 'timestamp', OTEL uses '@timestamp')
+        all_events.sort(key=lambda x: x.get('timestamp') or x.get('@timestamp', ''))
         
         return jsonify({
             'success': True,
@@ -1703,57 +1647,28 @@ def get_agent_execution(execution_id):
 
         execution['trigger_source'] = trigger_source
         
-        # Fetch Claude logs for this execution
+        # Fetch Claude OTEL logs for this execution
         logs = []
         try:
-            # Query by task_id only - it's unique to this execution
             logs_query = {
                 "query": {
-                    "term": {"task_id": execution['task_id']}
+                    "term": {"resource.attributes.task_id.keyword": execution['task_id']}
                 },
-                "sort": [{"timestamp": "asc"}],
+                "sort": [{"@timestamp": "asc"}],
                 "size": 10000
             }
-            
+
             logs_result = es_client.search(
-                index="claude-streams-*",
+                index="logs-claude.otel-default",
                 body=logs_query
             )
 
-            # Deduplicate logs at the API level to prevent duplicate entries
-            # Create unique key from timestamp + event content
-            seen_keys = set()
             for hit in logs_result['hits']['hits']:
-                log_data = hit['_source']
-
-                # Create unique key similar to frontend deduplication
-                timestamp = log_data.get('timestamp', '')
-                agent = log_data.get('agent', '')
-                task_id = log_data.get('task_id', '')
-                event_type = log_data.get('event_type', '')
-
-                # Extract event content for uniqueness
-                event = log_data.get('event') or log_data.get('raw_event', {}).get('event', {})
-                msg_type = event.get('type', '') if isinstance(event, dict) else ''
-                msg_id = ''
-                msg_model = ''
-                if isinstance(event, dict) and isinstance(event.get('message'), dict):
-                    msg_id = event['message'].get('id', '')
-                    msg_model = event['message'].get('model', '')
-
-                content_hash = f"{msg_type}-{msg_id}-{msg_model}"
-                key = f"{timestamp}-{agent}-{task_id}-{event_type}-{content_hash}"
-
-                if key in seen_keys:
-                    logger.debug(f"[API] Filtering duplicate log: {key[:100]}")
-                    continue  # Skip duplicate
-
-                seen_keys.add(key)
-                logs.append(log_data)
+                logs.append(hit['_source'])
         except Exception as e:
             logger.warning(f"Error fetching logs for execution: {e}")
         
-        # Fetch prompt_constructed event for this execution
+        # Fetch prompt_constructed event for this execution from agent-events-*
         prompt_event = None
         try:
             prompt_query = {
@@ -1770,7 +1685,7 @@ def get_agent_execution(execution_id):
             }
 
             prompt_result = es_client.search(
-                index="claude-streams-*",
+                index="agent-events-*",
                 body=prompt_query
             )
 
@@ -1799,33 +1714,15 @@ def get_pipeline_run_token_usage(pipeline_run_id):
         logs = []
         try:
             logs_result = es_client.search(
-                index='claude-streams-*',
+                index='logs-claude.otel-default',
                 body={
-                    'query': {'term': {'pipeline_run_id': pipeline_run_id}},
-                    'sort': [{'timestamp': 'asc'}],
+                    'query': {'term': {'resource.attributes.pipeline_run_id.keyword': pipeline_run_id}},
+                    'sort': [{'@timestamp': 'asc'}],
                     'size': 10000
                 }
             )
-            seen_keys = set()
             for hit in logs_result['hits']['hits']:
-                log_data = hit['_source']
-                timestamp = log_data.get('timestamp', '')
-                agent = log_data.get('agent', '')
-                task_id = log_data.get('task_id', '')
-                event_type = log_data.get('event_type', '')
-                event = log_data.get('event') or log_data.get('raw_event', {}).get('event', {})
-                msg_type = event.get('type', '') if isinstance(event, dict) else ''
-                msg_id = ''
-                msg_model = ''
-                if isinstance(event, dict) and isinstance(event.get('message'), dict):
-                    msg_id = event['message'].get('id', '')
-                    msg_model = event['message'].get('model', '')
-                content_hash = f"{msg_type}-{msg_id}-{msg_model}"
-                key = f"{timestamp}-{agent}-{task_id}-{event_type}-{content_hash}"
-                if key in seen_keys:
-                    continue
-                seen_keys.add(key)
-                logs.append(log_data)
+                logs.append(hit['_source'])
         except Exception as e:
             if 'index_not_found_exception' in str(e).lower():
                 return jsonify({'success': True, 'logs': [], 'pipeline_run_id': pipeline_run_id, 'log_count': 0})

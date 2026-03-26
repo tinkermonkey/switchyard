@@ -102,15 +102,19 @@ def _is_repair_cycle_stalled(pipeline_run_id: str, stall_seconds: int = 3600) ->
     """
     Returns True if no events have been emitted for this pipeline run in the last stall_seconds.
 
-    Queries decision-events, agent-events, AND claude-streams so that activity from
-    inner agent containers (which only emit to claude-streams) keeps the repair cycle
-    alive.  Fails open (returns False) if Elasticsearch is unavailable.
+    Queries decision-events, agent-events, AND logs-claude.otel-default so that activity
+    from inner agent containers (which emit via OTEL) keeps the repair cycle alive.
+    Fails open (returns False) if Elasticsearch is unavailable.
     """
     try:
         import requests
         from datetime import datetime, timezone
+
+        last_ts = None
+
+        # Query orchestrator event indices (pipeline_run_id + timestamp fields)
         resp = requests.get(
-            "http://elasticsearch:9200/decision-events-*,agent-events-*,claude-streams-*/_search",
+            "http://elasticsearch:9200/decision-events-*,agent-events-*/_search",
             json={
                 "query": {"term": {"pipeline_run_id": pipeline_run_id}},
                 "sort": [{"timestamp": "desc"}],
@@ -121,9 +125,34 @@ def _is_repair_cycle_stalled(pipeline_run_id: str, stall_seconds: int = 3600) ->
         )
         resp.raise_for_status()
         hits = resp.json().get("hits", {}).get("hits", [])
-        if not hits:
+        if hits:
+            ts_str = hits[0]["_source"].get("timestamp", "")
+            if ts_str:
+                last_ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+
+        # Query OTEL index (resource.attributes.pipeline_run_id.keyword + @timestamp fields)
+        otel_resp = requests.get(
+            "http://elasticsearch:9200/logs-claude.otel-default/_search",
+            json={
+                "query": {"term": {"resource.attributes.pipeline_run_id.keyword": pipeline_run_id}},
+                "sort": [{"@timestamp": "desc"}],
+                "size": 1,
+                "_source": ["@timestamp"],
+            },
+            timeout=10,
+        )
+        otel_resp.raise_for_status()
+        otel_hits = otel_resp.json().get("hits", {}).get("hits", [])
+        if otel_hits:
+            otel_ts_str = otel_hits[0]["_source"].get("@timestamp", "")
+            if otel_ts_str:
+                otel_ts = datetime.fromisoformat(otel_ts_str.replace("Z", "+00:00"))
+                if last_ts is None or otel_ts > last_ts:
+                    last_ts = otel_ts
+
+        if last_ts is None:
             return False  # no events yet — cycle may still be starting up
-        last_ts = datetime.fromisoformat(hits[0]["_source"]["timestamp"].replace("Z", "+00:00"))
+
         age = (datetime.now(timezone.utc) - last_ts).total_seconds()
         return age > stall_seconds
     except Exception as e:

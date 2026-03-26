@@ -375,11 +375,11 @@ def get_index_name(date=None, event_category=None):
     # Route to correct index based on category
     if event_category in ['agent_lifecycle', 'claude_api']:
         prefix = 'agent-events'
-    elif event_category in ['claude_stream', 'tool_call', 'tool_result', 'other', 'agent_output', 'agent_thinking']:
+    elif event_category in ['claude_stream', 'tool_call', 'tool_result', 'agent_output', 'agent_thinking']:
         prefix = 'claude-streams'
     else:
-        # Default to agent-events for unknown categories (or when category not provided)
-        prefix = 'agent-logs'  # Old format for backwards compatibility
+        # 'other' and anything unrecognised from event_stream → decision-events, not claude-streams
+        prefix = 'decision-events'
 
     return f"{prefix}-{date.strftime('%Y-%m-%d')}"
 
@@ -412,6 +412,13 @@ def enrich_event(event_data: dict) -> dict:
     if "tool" in event_type.lower():
         enriched["event_category"] = "tool_execution"
     elif event_type in ["agent_initialized", "agent_completed", "agent_failed", "task_received"]:
+        enriched["event_category"] = "agent_lifecycle"
+    elif event_type in [
+        "container_launch_started", "container_launch_succeeded",
+        "container_launch_failed", "container_execution_started",
+        "container_execution_completed", "container_execution_failed",
+        "prompt_constructed",
+    ]:
         enriched["event_category"] = "agent_lifecycle"
     elif "claude" in event_type.lower():
         enriched["event_category"] = "claude_api"

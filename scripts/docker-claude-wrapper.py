@@ -116,7 +116,6 @@ class ClaudeWrapper:
         execution even if Redis write fails.
 
         Writes to:
-        - Redis Stream: orchestrator:claude_logs_stream (for log collector)
         - Redis Pub/Sub: orchestrator:claude_stream (for real-time websocket)
         """
         if not self.redis_available:
@@ -133,17 +132,6 @@ class ClaudeWrapper:
                 'timestamp': event.get('timestamp', time.time()),
                 'event': event
             }
-
-            # Write to Redis Stream (for log collector)
-            self.redis_client.xadd(
-                'orchestrator:claude_logs_stream',
-                {'log': json.dumps(event_data)},
-                maxlen=500,  # Keep last 500 events (prevents unbounded growth)
-                approximate=True  # Allow approximate trimming (more efficient)
-            )
-
-            # Update TTL (2 hours)
-            self.redis_client.expire('orchestrator:claude_logs_stream', 7200)
 
             # Publish to pub/sub (for real-time websocket updates)
             self.redis_client.publish(
