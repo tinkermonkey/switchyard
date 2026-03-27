@@ -708,7 +708,8 @@ class ObservabilityManager:
 
     def emit_prompt_constructed(self, agent: str, task_id: str, project: str,
                                prompt: str, estimated_tokens: Optional[int] = None,
-                               prompt_components: Optional[Dict[str, int]] = None):
+                               prompt_components: Optional[Dict[str, int]] = None,
+                               pipeline_run_id: Optional[str] = None):
         """Emit prompt constructed event"""
         prompt_length = len(prompt)
         prompt_preview = prompt[:1000] + "..." if prompt_length > 1000 else prompt
@@ -722,7 +723,7 @@ class ObservabilityManager:
         if prompt_components:
             data['prompt_components'] = prompt_components
 
-        self.emit(EventType.PROMPT_CONSTRUCTED, agent, task_id, project, data)
+        self.emit(EventType.PROMPT_CONSTRUCTED, agent, task_id, project, data, pipeline_run_id)
 
         if prompt_length > self._PROMPT_SIZE_WARNING_THRESHOLD:
             self.emit(EventType.PROMPT_SIZE_WARNING, agent, task_id, project, {

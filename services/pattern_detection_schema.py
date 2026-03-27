@@ -200,6 +200,47 @@ AGENT_EVENTS_MAPPING = {
     }
 }
 
+CLAUDE_STREAMS_MAPPING = {
+    "mappings": {
+        "properties": {
+            "timestamp":             {"type": "date"},
+            "agent_name":            {"type": "keyword"},
+            "project":               {"type": "keyword"},
+            "task_id":               {"type": "keyword"},
+            "pipeline_run_id":       {"type": "keyword"},
+            "event_type":            {"type": "keyword"},
+            "event_category":        {"type": "keyword"},
+            "tool_name":             {"type": "keyword"},
+            "tool_params":           {"type": "object", "enabled": False},
+            "tool_params_text":      {"type": "text", "analyzer": "standard"},
+            "success":               {"type": "boolean"},
+            "error_message":         {"type": "text", "fields": {"keyword": {"type": "keyword", "ignore_above": 512}}},
+            "raw_event":             {"type": "object", "enabled": False},
+            "token_input":           {"type": "integer"},
+            "token_cache_read":      {"type": "integer"},
+            "token_cache_creation":  {"type": "integer"},
+            "token_effective_input": {"type": "integer"},
+            "token_output":          {"type": "integer"},
+            "token_total":           {"type": "integer"},
+            "token_model":           {"type": "keyword"},
+        }
+    },
+    "settings": {
+        "index": {
+            "number_of_shards": 1,
+            "number_of_replicas": 0,
+            "refresh_interval": "10s",
+            "lifecycle": {"name": "agent-logs-ilm-policy"}
+        }
+    }
+}
+
+CLAUDE_STREAMS_TEMPLATE = {
+    "index_patterns": ["claude-streams-*"],
+    "template": CLAUDE_STREAMS_MAPPING,
+    "priority": 100
+}
+
 # Mapping for pipeline runs
 PIPELINE_RUNS_MAPPING = {
     "mappings": {
@@ -330,6 +371,8 @@ def get_index_name(date=None, event_category=None):
     # Route to correct index based on category
     if event_category in ['agent_lifecycle', 'claude_api']:
         prefix = 'agent-events'
+    elif event_category in ['claude_stream', 'tool_call', 'tool_result', 'agent_output', 'agent_thinking']:
+        prefix = 'claude-streams'
     else:
         # 'other', 'decision', and anything unrecognised → decision-events
         prefix = 'decision-events'
@@ -562,8 +605,11 @@ def enrich_claude_log(log_data: dict) -> dict:
         enriched["event_type"] = "thinking"
 
     else:
-        enriched["event_category"] = "other"
-        enriched["event_type"] = "unknown"
+        # Unrecognised event structure (e.g. Claude Code's 'system' init event,
+        # 'result' summary event). Still a claude streaming event — route to
+        # claude-streams-* so it stays with the rest of the conversation.
+        enriched["event_category"] = "claude_stream"
+        enriched["event_type"] = event.get("type", "unknown")
 
     return enriched
 

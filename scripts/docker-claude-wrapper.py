@@ -110,12 +110,13 @@ class ClaudeWrapper:
 
     def write_claude_event(self, event: Dict) -> bool:
         """
-        Write Claude event to Redis Stream.
+        Write Claude event to Redis.
 
         Returns True on success, False on failure. Non-blocking - continues
         execution even if Redis write fails.
 
         Writes to:
+        - Redis Stream: orchestrator:claude_logs_stream (for log_collector → ES persistence)
         - Redis Pub/Sub: orchestrator:claude_stream (for real-time websocket)
         """
         if not self.redis_available:
@@ -133,10 +134,20 @@ class ClaudeWrapper:
                 'event': event
             }
 
-            # Publish to pub/sub (for real-time websocket updates)
+            serialized = json.dumps(event_data)
+
+            # Write to Redis Stream (persistent, consumed by log_collector → ES)
+            self.redis_client.xadd(
+                'orchestrator:claude_logs_stream',
+                {'log': serialized},
+                maxlen=50000,
+                approximate=True
+            )
+
+            # Publish to pub/sub (real-time websocket updates only, no persistence)
             self.redis_client.publish(
                 'orchestrator:claude_stream',
-                json.dumps(event_data)
+                serialized
             )
 
             return True

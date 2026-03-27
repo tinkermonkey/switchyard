@@ -36,12 +36,14 @@ async def run_claude_code(prompt: str, context: Dict[str, Any]) -> str:
         task_chars = len(str(task_description))
         context_chars = len(str(task_context)) - task_chars
         system_prompt_chars = max(0, len(prompt) - task_chars - max(0, context_chars))
+        pipeline_run_id = task_context.get('pipeline_run_id') or context.get('pipeline_run_id')
         obs.emit_prompt_constructed(agent, task_id, project, prompt,
                                     prompt_components={
                                         'system_prompt_chars': system_prompt_chars,
                                         'context_chars': max(0, context_chars),
                                         'task_chars': task_chars
-                                    })
+                                    },
+                                    pipeline_run_id=pipeline_run_id)
 
     # Get MCP server configuration from context
     mcp_servers = context.get('mcp_servers', [])

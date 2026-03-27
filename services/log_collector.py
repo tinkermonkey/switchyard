@@ -19,11 +19,13 @@ from services.pattern_detection_schema import (
     AGENT_LOGS_TEMPLATE,
     AGENT_LOGS_ILM_POLICY,
     AGENT_EVENTS_TEMPLATE,
+    CLAUDE_STREAMS_TEMPLATE,
     CLAUDE_OTEL_ILM_POLICY,
     CLAUDE_OTEL_LOGS_TEMPLATE,
     CLAUDE_OTEL_METRICS_TEMPLATE,
     get_index_name,
     enrich_event,
+    enrich_claude_log,
 )
 from services.circuit_breaker import CircuitBreaker, CircuitBreakerOpen
 
@@ -73,11 +75,13 @@ class LogCollector:
 
         # Stream keys and consumer group info
         self.event_stream = "orchestrator:event_stream"
+        self.claude_stream = "orchestrator:claude_logs_stream"
         self.consumer_group = "log_collector"
         self.consumer_name = f"log_collector_{int(time.time())}"
 
         # Track last processed IDs for recovery
         self.last_event_id = "0-0"
+        self.last_claude_id = "0-0"
 
         # Batch buffer
         self.batch = []
@@ -123,6 +127,12 @@ class LogCollector:
             )
             logger.info("Created index template: agent-events-template")
 
+            self.es.indices.put_index_template(
+                name="claude-streams-template",
+                body=CLAUDE_STREAMS_TEMPLATE
+            )
+            logger.info("Created index template: claude-streams-template")
+
             # Keep old template for migration period (with ILM policy)
             self.es.indices.put_index_template(
                 name="agent-logs-template",
@@ -149,13 +159,19 @@ class LogCollector:
             )
             logger.info("Created index template: claude-otel-metrics-ilm")
 
-            # Create today's agent-events index
+            # Create today's indices for both types
             today_events = get_index_name(event_category='agent_lifecycle')
-            if not self.es.indices.exists(index=today_events):
-                self.es.indices.create(index=today_events, body=AGENT_EVENTS_TEMPLATE['template'])
-                logger.info(f"Created index: {today_events}")
-            else:
-                logger.info(f"Index already exists: {today_events}")
+            today_streams = get_index_name(event_category='claude_stream')
+
+            for index_name, mapping in [
+                (today_events, AGENT_EVENTS_TEMPLATE['template']),
+                (today_streams, CLAUDE_STREAMS_TEMPLATE['template']),
+            ]:
+                if not self.es.indices.exists(index=index_name):
+                    self.es.indices.create(index=index_name, body=mapping)
+                    logger.info(f"Created index: {index_name}")
+                else:
+                    logger.info(f"Index already exists: {index_name}")
 
             return True
 
@@ -165,7 +181,7 @@ class LogCollector:
 
     def setup_consumer_groups(self):
         """Setup Redis consumer groups for reliable consumption"""
-        for stream_key in [self.event_stream]:
+        for stream_key in [self.event_stream, self.claude_stream]:
             try:
                 # Try to create consumer group
                 self.redis.xgroup_create(
@@ -195,6 +211,11 @@ class LogCollector:
                     await self.redis_breaker.call(self._consume_agent_events)
                 except CircuitBreakerOpen as e:
                     logger.debug(f"Redis circuit open for agent events: {e}")
+
+                try:
+                    await self.redis_breaker.call(self._consume_claude_logs)
+                except CircuitBreakerOpen as e:
+                    logger.debug(f"Redis circuit open for claude logs: {e}")
 
                 # Flush batch if timeout reached
                 if time.time() - self.last_flush >= self.batch_timeout:
@@ -270,6 +291,65 @@ class LogCollector:
                 logger.error(f"Redis error consuming agent events: {e}")
         except Exception as e:
             logger.error(f"Error consuming agent events: {e}")
+
+    async def _consume_claude_logs(self):
+        """Consume from Claude logs stream"""
+        try:
+            messages = self.redis.xreadgroup(
+                groupname=self.consumer_group,
+                consumername=self.consumer_name,
+                streams={self.claude_stream: ">"},
+                count=10,
+                block=100
+            )
+
+            if not messages:
+                return
+
+            for stream_name, logs in messages:
+                for log_id, log_data_raw in logs:
+                    try:
+                        log_json = log_data_raw.get("log")
+                        if not log_json:
+                            continue
+
+                        log_data = json.loads(log_json)
+
+                        enriched = enrich_claude_log(log_data)
+                        # Use the Anthropic message ID as ES doc ID for assistant events so that
+                        # streaming re-emissions of the same message overwrite rather than duplicate.
+                        anthropic_msg_id = log_data.get("event", {}).get("message", {}).get("id")
+                        enriched["_id"] = anthropic_msg_id if anthropic_msg_id else log_id
+
+                        self.batch.append(enriched)
+                        self.events_processed += 1
+
+                        self.redis.xack(self.claude_stream, self.consumer_group, log_id)
+
+                        if len(self.batch) >= self.batch_size:
+                            await self._flush_batch()
+
+                    except Exception as e:
+                        logger.error(f"Error processing Claude log {log_id}: {e}")
+                        self.errors += 1
+
+        except redis.ResponseError as e:
+            if "NOGROUP" in str(e):
+                try:
+                    self.redis.xgroup_create(
+                        name=self.claude_stream,
+                        groupname=self.consumer_group,
+                        id="0",
+                        mkstream=True
+                    )
+                    logger.debug(f"Created consumer group for {self.claude_stream}")
+                except redis.ResponseError as create_error:
+                    if "BUSYGROUP" not in str(create_error):
+                        logger.error(f"Failed to create consumer group: {create_error}")
+            else:
+                logger.error(f"Redis error consuming Claude logs: {e}")
+        except Exception as e:
+            logger.error(f"Error consuming Claude logs: {e}")
 
     async def _flush_batch(self):
         """Flush batch to Elasticsearch with circuit breaker protection"""

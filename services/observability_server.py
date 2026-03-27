@@ -561,7 +561,7 @@ def get_history():
 
 @app.route('/claude-logs-history')
 def get_claude_logs_history():
-    """Get recent Claude log history from Elasticsearch OTEL index"""
+    """Get recent Claude log history from Elasticsearch claude-streams index"""
     try:
         # Get filter parameters
         count = int(request.args.get('count', 100))
@@ -570,19 +570,19 @@ def get_claude_logs_history():
 
         query = {
             "size": count,
-            "sort": [{"@timestamp": {"order": "desc"}}],
+            "sort": [{"timestamp": {"order": "desc"}}],
             "query": {"match_all": {}}
         }
 
         if agent_filter:
             query["query"] = {
-                "term": {"resource.attributes.agent.keyword": agent_filter}
+                "term": {"agent_name": agent_filter}
             }
 
         total_count = 0
         history = []
         try:
-            result = es_client.search(index="logs-claude.otel-default", body=query)
+            result = es_client.search(index="claude-streams-*", body=query)
             hits = result['hits']['hits']
             total_count = result['hits'].get('total', {}).get('value', len(hits))
             for hit in hits:
@@ -865,20 +865,20 @@ def get_pipeline_run_events():
         except Exception as e:
             logger.warning(f"Error fetching agent events: {e}")
         
-        # 3. Get Claude OTEL logs for detailed execution
+        # 3. Get Claude streaming logs for detailed execution
         try:
             claude_logs_query = {
                 "query": {
                     "term": {
-                        "resource.attributes.pipeline_run_id.keyword": pipeline_run_id
+                        "pipeline_run_id": pipeline_run_id
                     }
                 },
-                "sort": [{"@timestamp": "asc"}],
+                "sort": [{"timestamp": "asc"}],
                 "size": 10000
             }
 
             claude_result = es_client.search(
-                index="logs-claude.otel-default",
+                index="claude-streams-*",
                 body=claude_logs_query
             )
 
@@ -889,9 +889,10 @@ def get_pipeline_run_events():
                 all_events.append(event_data)
         except Exception as e:
             logger.warning(f"Error fetching Claude logs: {e}")
-        
-        # Sort all events by timestamp (orchestrator events use 'timestamp', OTEL uses '@timestamp')
-        all_events.sort(key=lambda x: x.get('timestamp') or x.get('@timestamp', ''))
+
+        # Sort all events by timestamp
+
+        all_events.sort(key=lambda x: x.get('timestamp') or '')
         
         return jsonify({
             'success': True,
@@ -1657,19 +1658,19 @@ def get_agent_execution(execution_id):
 
         execution['trigger_source'] = trigger_source
         
-        # Fetch Claude OTEL logs for this execution
+        # Fetch Claude streaming logs for this execution
         logs = []
         try:
             logs_query = {
                 "query": {
-                    "term": {"resource.attributes.task_id.keyword": execution['task_id']}
+                    "term": {"task_id": execution['task_id']}
                 },
-                "sort": [{"@timestamp": "asc"}],
+                "sort": [{"timestamp": "asc"}],
                 "size": 10000
             }
 
             logs_result = es_client.search(
-                index="logs-claude.otel-default",
+                index="claude-streams-*",
                 body=logs_query
             )
 
