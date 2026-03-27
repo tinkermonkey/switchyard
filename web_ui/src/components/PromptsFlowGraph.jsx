@@ -19,6 +19,8 @@ export default function PromptsFlowGraph({ events, selectedPipelineRun, loading 
   const [showOutput, setShowOutput] = useState(true)
 
   const rfRef = useRef(null)
+  const hasInitialized = useRef(false)
+  const prevPipelineRun = useRef(selectedPipelineRun)
   const [nodes, setNodes, onNodesChange] = useNodesState([])
   const [edges, setEdges, onEdgesChange] = useEdgesState([])
 
@@ -48,11 +50,18 @@ export default function PromptsFlowGraph({ events, selectedPipelineRun, loading 
   useEffect(() => {
     setNodes(rawNodes)
     setEdges(rawEdges)
-    const timer = setTimeout(() => {
-      rfRef.current?.fitView({ padding: 0.05 })
-    }, 50)
-    return () => clearTimeout(timer)
-  }, [rawNodes, rawEdges, setNodes, setEdges])
+
+    const pipelineRunChanged = prevPipelineRun.current !== selectedPipelineRun
+    prevPipelineRun.current = selectedPipelineRun
+
+    if ((!hasInitialized.current || pipelineRunChanged) && rawNodes.length > 0) {
+      hasInitialized.current = true
+      const timer = setTimeout(() => {
+        rfRef.current?.fitView({ padding: 0.05 })
+      }, 50)
+      return () => clearTimeout(timer)
+    }
+  }, [rawNodes, rawEdges, setNodes, setEdges, selectedPipelineRun])
 
   const onInit = useCallback(inst => { rfRef.current = inst }, [])
 
