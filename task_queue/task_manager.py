@@ -134,8 +134,9 @@ class TaskQueue:
                     except ValueError:
                         pass  # Malformed not_before — treat as no restriction
 
-                # Reconstruct Task object with proper types
-                return Task(
+                # Reconstruct Task object with proper types, then delete the hash —
+                # the ID has already been removed from the queue list by rpop above.
+                task = Task(
                     id=task_data['id'],
                     agent=task_data['agent'],
                     project=task_data['project'],
@@ -145,6 +146,8 @@ class TaskQueue:
                     status=task_data['status'],
                     not_before=not_before or None,
                 )
+                self.redis_client.delete(f"task:{task_id}")
+                return task
 
         return None
 
