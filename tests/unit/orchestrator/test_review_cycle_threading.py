@@ -112,7 +112,8 @@ class TestReviewCycleThreading:
                 issue_title='Test Issue #2000',
                 issue_url='https://github.com/test-org/test-repo/issues/2000',
                 project='test-project',
-                board='dev'
+                board='dev',
+                discussion_id=None
             )
             
             # Assert: Agent returned
@@ -147,20 +148,34 @@ class TestReviewCycleThreading:
                 pipeline_run_accessed.set()
             return ('Development', True)
         
+        mock_lock_mgr = Mock()
+        mock_lock_mgr.try_acquire_lock.return_value = (True, 'acquired')
+
+        mock_gh_integration = Mock()
+        mock_gh_integration.post_agent_output = AsyncMock(return_value={'success': True})
+        mock_gwm = Mock()
+        mock_gwm.create_or_update_pr = AsyncMock(return_value={'success': True, 'pr_url': 'https://github.com/test/test/pull/1'})
+
         with patch('services.project_monitor.ConfigManager', return_value=mock_config_manager), \
              patch('config.state_manager.state_manager', mock_state_manager), \
              patch('monitoring.observability.get_observability_manager', return_value=mock_observability[0]), \
-             patch('services.review_cycle.review_cycle_executor.start_review_cycle', 
-                   side_effect=mock_start_review_cycle):
-            
+             patch('services.review_cycle.review_cycle_executor.start_review_cycle',
+                   side_effect=mock_start_review_cycle), \
+             patch('services.pipeline_lock_manager.get_pipeline_lock_manager', return_value=mock_lock_mgr), \
+             patch('services.github_integration.GitHubIntegration', return_value=mock_gh_integration), \
+             patch('services.git_workflow_manager.git_workflow_manager', mock_gwm), \
+             patch('services.project_workspace.workspace_manager') as mock_wsm:
+
+            mock_wsm.get_project_dir.return_value = '/workspace/test-project'
+
             from services.project_monitor import ProjectMonitor
             from config.manager import WorkflowColumn
-            
+
             monitor = ProjectMonitor(task_queue=mock_task_queue, config_manager=mock_config_manager)
             monitor.github_client = mock_github
             monitor.pipeline_run_manager = mock_pipeline_mgr
             monitor.decision_events = mock_observability[1]
-            
+
             # Mock get_issue_details
             monitor.get_issue_details = lambda repo, num, org: {
                 'number': num,
@@ -168,7 +183,7 @@ class TestReviewCycleThreading:
                 'url': f'https://github.com/test-org/test-repo/issues/{num}',
                 'body': 'Test issue body'
             }
-            
+
             # Mock get_previous_stage_context
             monitor.get_previous_stage_context = Mock(return_value='Previous stage output')
             
@@ -324,27 +339,31 @@ class TestReviewCycleThreading:
         async def mock_review_cycle(*args, **kwargs):
             return ('Development', True)
         
+        mock_lock_mgr_posts = Mock()
+        mock_lock_mgr_posts.try_acquire_lock.return_value = (True, 'acquired')
+
         with patch('services.project_monitor.ConfigManager', return_value=mock_config_manager), \
              patch('config.state_manager.state_manager', mock_state_manager), \
              patch('monitoring.observability.get_observability_manager', return_value=mock_observability[0]), \
-             patch('services.review_cycle.review_cycle_executor.start_review_cycle', 
+             patch('services.review_cycle.review_cycle_executor.start_review_cycle',
                    side_effect=mock_review_cycle), \
-             patch('services.github_integration.GitHubIntegration', return_value=mock_github_integration):
-            
+             patch('services.github_integration.GitHubIntegration', return_value=mock_github_integration), \
+             patch('services.pipeline_lock_manager.get_pipeline_lock_manager', return_value=mock_lock_mgr_posts):
+
             from services.project_monitor import ProjectMonitor
             from config.manager import WorkflowColumn
-            
+
             monitor = ProjectMonitor(task_queue=mock_task_queue, config_manager=mock_config_manager)
             monitor.github_client = mock_github
             monitor.pipeline_run_manager = mock_pipeline_mgr
             monitor.decision_events = mock_observability[1]
-            
+
             monitor.get_issue_details = lambda repo, num, org: {
                 'number': num,
                 'title': f'Test Issue #{num}',
                 'url': f'https://github.com/test-org/test-repo/issues/{num}'
             }
-            
+
             monitor.get_previous_stage_context = Mock(return_value='Previous stage output')
             
             column = WorkflowColumn(
@@ -414,16 +433,20 @@ class TestReviewCycleThreading:
         # Patch the logger to detect error logging
         original_logger = None
         
+        mock_lock_mgr_err = Mock()
+        mock_lock_mgr_err.try_acquire_lock.return_value = (True, 'acquired')
+
         with patch('services.project_monitor.ConfigManager', return_value=mock_config_manager), \
              patch('config.state_manager.state_manager', mock_state_manager), \
              patch('monitoring.observability.get_observability_manager', return_value=mock_observability[0]), \
              patch('services.review_cycle.review_cycle_executor.start_review_cycle',
                    side_effect=mock_review_cycle_error), \
-             patch('services.github_integration.GitHubIntegration'):
-            
+             patch('services.github_integration.GitHubIntegration'), \
+             patch('services.pipeline_lock_manager.get_pipeline_lock_manager', return_value=mock_lock_mgr_err):
+
             from services.project_monitor import ProjectMonitor
             from config.manager import WorkflowColumn
-            
+
             # Patch the logger
             with patch('services.project_monitor.logger') as mock_logger:
                 monitor = ProjectMonitor(task_queue=mock_task_queue, config_manager=mock_config_manager)
@@ -503,24 +526,28 @@ class TestReviewCycleThreading:
         mock_pipeline_mgr = Mock()
         mock_pipeline_mgr.get_or_create_pipeline_run.return_value = (mock_run, False)
         
+        mock_lock_mgr_log = Mock()
+        mock_lock_mgr_log.try_acquire_lock.return_value = (True, 'acquired')
+
         with patch('services.project_monitor.ConfigManager', return_value=mock_config_manager), \
              patch('config.state_manager.state_manager', mock_state_manager), \
              patch('monitoring.observability.get_observability_manager', return_value=mock_observability[0]), \
-             patch('services.project_monitor.logger') as mock_logger:
-            
+             patch('services.project_monitor.logger') as mock_logger, \
+             patch('services.pipeline_lock_manager.get_pipeline_lock_manager', return_value=mock_lock_mgr_log):
+
             from services.project_monitor import ProjectMonitor
             from config.manager import WorkflowColumn
-            
+
             monitor = ProjectMonitor(task_queue=mock_task_queue, config_manager=mock_config_manager)
             monitor.github_client = mock_github
             monitor.pipeline_run_manager = mock_pipeline_mgr
-            
+
             monitor.get_issue_details = lambda repo, num, org: {
                 'number': num,
                 'title': f'Test Issue #{num}',
                 'url': f'https://github.com/test-org/test-repo/issues/{num}'
             }
-            
+
             monitor.get_previous_stage_context = Mock(return_value='Previous stage output')
             
             column = WorkflowColumn(
@@ -585,7 +612,7 @@ class TestReviewCycleThreadingEdgeCases:
         # Track both pipeline runs
         pipeline_runs_created = []
         
-        def track_pipeline_run(issue_number, issue_title, issue_url, project, board):
+        def track_pipeline_run(issue_number, issue_title, issue_url, project, board, discussion_id=None):
             run = Mock()
             run.id = f'run-{issue_number}'
             pipeline_runs_created.append(run.id)
@@ -594,14 +621,18 @@ class TestReviewCycleThreadingEdgeCases:
         mock_pipeline_mgr = Mock()
         mock_pipeline_mgr.get_or_create_pipeline_run.side_effect = track_pipeline_run
         
+        mock_lock_mgr_conc = Mock()
+        mock_lock_mgr_conc.try_acquire_lock.return_value = (True, 'acquired')
+
         with patch('services.project_monitor.ConfigManager', return_value=mock_config_manager), \
              patch('config.state_manager.state_manager', mock_state_manager), \
              patch('monitoring.observability.get_observability_manager', return_value=mock_observability[0]), \
-             patch('services.review_cycle.review_cycle_executor'):
-            
+             patch('services.review_cycle.review_cycle_executor'), \
+             patch('services.pipeline_lock_manager.get_pipeline_lock_manager', return_value=mock_lock_mgr_conc):
+
             from services.project_monitor import ProjectMonitor
             from config.manager import WorkflowColumn
-            
+
             monitor = ProjectMonitor(task_queue=mock_task_queue, config_manager=mock_config_manager)
             monitor.github_client = mock_github
             monitor.pipeline_run_manager = mock_pipeline_mgr

@@ -61,6 +61,7 @@ class TestFeatureBranchPreparation:
             # Mock agent
             mock_agent = MagicMock()
             mock_agent.execute = AsyncMock(return_value={'status': 'success'})
+            mock_agent.run_with_circuit_breaker = AsyncMock(return_value={'status': 'success'})
             mock_agent.agent_config = {}
             mock_create_agent.return_value = mock_agent
 
@@ -95,6 +96,7 @@ class TestFeatureBranchPreparation:
             # Mock agent
             mock_agent = MagicMock()
             mock_agent.execute = AsyncMock(return_value={'status': 'success'})
+            mock_agent.run_with_circuit_breaker = AsyncMock(return_value={'status': 'success'})
             mock_agent.agent_config = {}
             mock_create_agent.return_value = mock_agent
 
@@ -134,6 +136,7 @@ class TestFeatureBranchPreparation:
             # Mock agent
             mock_agent = MagicMock()
             mock_agent.execute = AsyncMock(return_value={'status': 'success'})
+            mock_agent.run_with_circuit_breaker = AsyncMock(return_value={'status': 'success'})
             mock_agent.agent_config = {}
             mock_create_agent.return_value = mock_agent
 
@@ -145,7 +148,7 @@ class TestFeatureBranchPreparation:
             )
 
             # Agent should still execute
-            mock_agent.execute.assert_called_once()
+            mock_agent.run_with_circuit_breaker.assert_called_once()
             assert result['status'] == 'success'
 
 
@@ -190,6 +193,7 @@ class TestFeatureBranchFinalization:
             # Mock agent
             mock_agent = MagicMock()
             mock_agent.execute = AsyncMock(return_value={'status': 'success'})
+            mock_agent.run_with_circuit_breaker = AsyncMock(return_value={'status': 'success'})
             mock_agent.agent_config = {}
             mock_create_agent.return_value = mock_agent
 
@@ -234,6 +238,7 @@ class TestFeatureBranchFinalization:
             # Mock agent
             mock_agent = MagicMock()
             mock_agent.execute = AsyncMock(return_value={'status': 'success'})
+            mock_agent.run_with_circuit_breaker = AsyncMock(return_value={'status': 'success'})
             mock_agent.agent_config = {}
             mock_create_agent.return_value = mock_agent
 
@@ -247,7 +252,7 @@ class TestFeatureBranchFinalization:
             )
 
             # Agent should still execute successfully
-            mock_agent.execute.assert_called_once()
+            mock_agent.run_with_circuit_breaker.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_finalize_failure_does_not_fail_execution(self, agent_executor):
@@ -283,6 +288,7 @@ class TestFeatureBranchFinalization:
             # Mock agent
             mock_agent = MagicMock()
             mock_agent.execute = AsyncMock(return_value={'status': 'success'})
+            mock_agent.run_with_circuit_breaker = AsyncMock(return_value={'status': 'success'})
             mock_agent.agent_config = {}
             mock_create_agent.return_value = mock_agent
 

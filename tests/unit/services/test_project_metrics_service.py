@@ -62,21 +62,21 @@ def service():
 
 class TestGetProjectsInWindow:
     def test_returns_project_names_from_buckets(self, service):
-        service.es.search.return_value = _agg_result([
-            {'key': 'proj-a'},
-            {'key': 'proj-b'},
+        service.es.search.return_value = _es_result([
+            _make_hit({'project': 'proj-a'}),
+            _make_hit({'project': 'proj-b'}),
         ])
         start = datetime(2026, 1, 1, tzinfo=timezone.utc)
         end = datetime(2026, 1, 2, tzinfo=timezone.utc)
 
         result = service._get_projects_in_window(start, end)
 
-        assert result == ['proj-a', 'proj-b']
+        assert set(result) == {'proj-a', 'proj-b'}
 
     def test_skips_empty_keys(self, service):
-        service.es.search.return_value = _agg_result([
-            {'key': 'proj-a'},
-            {'key': ''},
+        service.es.search.return_value = _es_result([
+            _make_hit({'project': 'proj-a'}),
+            _make_hit({'project': ''}),
         ])
         result = service._get_projects_in_window(
             datetime(2026, 1, 1, tzinfo=timezone.utc),
@@ -448,8 +448,7 @@ class TestUpsertProjectMetrics:
 # ---------------------------------------------------------------------------
 
 class TestRunMetricsJob:
-    @pytest.mark.asyncio
-    async def test_skips_upsert_when_no_runs(self, service):
+    def test_skips_upsert_when_no_runs(self, service):
         service._get_projects_in_window = MagicMock(return_value=['proj-a'])
         service._build_project_doc = MagicMock(return_value={
             'project': 'proj-a',
@@ -458,12 +457,11 @@ class TestRunMetricsJob:
         })
         service._upsert_project_metrics = MagicMock()
 
-        await service.run_metrics_job(lookback_days=1)
+        service.run_metrics_job(lookback_days=1)
 
         service._upsert_project_metrics.assert_not_called()
 
-    @pytest.mark.asyncio
-    async def test_upserts_when_runs_found(self, service):
+    def test_upserts_when_runs_found(self, service):
         service._get_projects_in_window = MagicMock(return_value=['proj-a'])
         service._build_project_doc = MagicMock(return_value={
             'project': 'proj-a',
@@ -472,17 +470,16 @@ class TestRunMetricsJob:
         })
         service._upsert_project_metrics = MagicMock()
 
-        await service.run_metrics_job(lookback_days=1)
+        service.run_metrics_job(lookback_days=1)
 
         assert service._upsert_project_metrics.call_count >= 1
 
-    @pytest.mark.asyncio
-    async def test_handles_empty_project_list(self, service):
+    def test_handles_empty_project_list(self, service):
         service._get_projects_in_window = MagicMock(return_value=[])
         service._build_project_doc = MagicMock()
         service._upsert_project_metrics = MagicMock()
 
-        await service.run_metrics_job(lookback_days=1)
+        service.run_metrics_job(lookback_days=1)
 
         service._build_project_doc.assert_not_called()
         service._upsert_project_metrics.assert_not_called()

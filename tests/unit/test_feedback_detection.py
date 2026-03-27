@@ -77,7 +77,7 @@ class TestFeedbackDetection:
             }
         }
 
-        async def mock_graphql(query, variables):
+        def mock_graphql(query, variables):
             return discussion
 
         from services.github_app import github_app
@@ -129,7 +129,7 @@ class TestFeedbackDetection:
             }
         }
 
-        async def mock_graphql(query, variables):
+        def mock_graphql(query, variables):
             return discussion
 
         from services.github_app import github_app
@@ -184,7 +184,7 @@ class TestFeedbackDetection:
             }
         }
 
-        async def mock_graphql(query, variables):
+        def mock_graphql(query, variables):
             return discussion
 
         from services.github_app import github_app
@@ -231,7 +231,7 @@ class TestFeedbackDetection:
             }
         }
 
-        async def mock_graphql(query, variables):
+        def mock_graphql(query, variables):
             return discussion
 
         from services.github_app import github_app
@@ -287,7 +287,7 @@ class TestFeedbackDetection:
             }
         }
 
-        async def mock_graphql(query, variables):
+        def mock_graphql(query, variables):
             return discussion
 
         from services.github_app import github_app
@@ -343,7 +343,7 @@ class TestParentCommentDetection:
             }
         }
 
-        async def mock_graphql(query, variables):
+        def mock_graphql(query, variables):
             return discussion
 
         from services.github_app import github_app
@@ -394,7 +394,7 @@ class TestParentCommentDetection:
             }
         }
 
-        async def mock_graphql(query, variables):
+        def mock_graphql(query, variables):
             return discussion
 
         from services.github_app import github_app
@@ -450,7 +450,7 @@ class TestParentCommentDetection:
             }
         }
 
-        async def mock_graphql(query, variables):
+        def mock_graphql(query, variables):
             return discussion
 
         from services.github_app import github_app
@@ -506,7 +506,7 @@ class TestTimezoneHandling:
         # Update state with timezone-aware timestamp
         feedback_state.agent_outputs[-1]['timestamp'] = '2025-10-03T13:00:00+00:00'
 
-        async def mock_graphql(query, variables):
+        def mock_graphql(query, variables):
             return discussion
 
         from services.github_app import github_app

@@ -41,10 +41,10 @@ def mock_logger():
 async def test_validation_error_message_includes_context(mock_task, mock_logger):
     """Test that validation error messages include helpful context"""
     # Import inside test to avoid Docker-only module issues
-    with patch('agents.orchestrator_integration.config_manager') as mock_config, \
-         patch('agents.orchestrator_integration.dev_container_state') as mock_dev_state, \
-         patch('agents.orchestrator_integration.DecisionEventEmitter') as mock_emitter, \
-         patch('agents.orchestrator_integration.get_observability_manager'):
+    with patch('config.manager.config_manager') as mock_config, \
+         patch('services.dev_container_state.dev_container_state') as mock_dev_state, \
+         patch('monitoring.decision_events.DecisionEventEmitter') as mock_emitter, \
+         patch('monitoring.observability.get_observability_manager'):
 
         # Setup mocks
         mock_agent_config = Mock()
@@ -84,10 +84,10 @@ async def test_validation_error_message_includes_context(mock_task, mock_logger)
 @pytest.mark.asyncio
 async def test_recovery_message_is_actionable(mock_task, mock_logger):
     """Test that recovery success messages are actionable"""
-    with patch('agents.orchestrator_integration.config_manager') as mock_config, \
-         patch('agents.orchestrator_integration.dev_container_state') as mock_dev_state, \
-         patch('agents.orchestrator_integration.DecisionEventEmitter') as mock_emitter, \
-         patch('agents.orchestrator_integration.get_observability_manager'), \
+    with patch('config.manager.config_manager') as mock_config, \
+         patch('services.dev_container_state.dev_container_state') as mock_dev_state, \
+         patch('monitoring.decision_events.DecisionEventEmitter') as mock_emitter, \
+         patch('monitoring.observability.get_observability_manager'), \
          patch('agents.orchestrator_integration.queue_dev_environment_setup') as mock_queue:
 
         # Setup mocks
@@ -122,10 +122,11 @@ async def test_recovery_message_is_actionable(mock_task, mock_logger):
 @pytest.mark.asyncio
 async def test_in_progress_message_is_clear(mock_task, mock_logger):
     """Test that in-progress status has clear messaging"""
-    with patch('agents.orchestrator_integration.config_manager') as mock_config, \
-         patch('agents.orchestrator_integration.dev_container_state') as mock_dev_state, \
-         patch('agents.orchestrator_integration.DecisionEventEmitter') as mock_emitter, \
-         patch('agents.orchestrator_integration.get_observability_manager'):
+    with patch('config.manager.config_manager') as mock_config, \
+         patch('services.dev_container_state.dev_container_state') as mock_dev_state, \
+         patch('monitoring.decision_events.DecisionEventEmitter') as mock_emitter, \
+         patch('monitoring.observability.get_observability_manager'), \
+         patch('task_queue.task_manager.TaskQueue') as mock_task_queue_cls:
 
         # Setup mocks
         mock_agent_config = Mock()
@@ -139,26 +140,27 @@ async def test_in_progress_message_is_clear(mock_task, mock_logger):
         mock_decision_emitter.emit_error_decision = Mock()
         mock_emitter.return_value = mock_decision_emitter
 
+        # Allow re-enqueue to succeed so we can inspect the right decision event
+        mock_task_queue_cls.return_value.enqueue = Mock(return_value=True)
+
         from agents.orchestrator_integration import process_task_integrated
         from agents.non_retryable import NonRetryableAgentError
 
         with pytest.raises(NonRetryableAgentError) as exc_info:
             await process_task_integrated(mock_task, Mock(), mock_logger)
 
-        # Verify error message mentions in progress
-        call_args = mock_decision_emitter.emit_error_decision.call_args_list[0][1]
-        error_message = call_args['error_message']
-        assert "in progress" in error_message.lower()
-        assert mock_task.project in error_message
+        # Verify exception message mentions in progress
+        assert "in progress" in str(exc_info.value).lower()
+        assert mock_task.project in str(exc_info.value)
 
 
 @pytest.mark.asyncio
 async def test_blocked_message_includes_troubleshooting(mock_task, mock_logger):
     """Test that blocked status includes troubleshooting guidance"""
-    with patch('agents.orchestrator_integration.config_manager') as mock_config, \
-         patch('agents.orchestrator_integration.dev_container_state') as mock_dev_state, \
-         patch('agents.orchestrator_integration.DecisionEventEmitter') as mock_emitter, \
-         patch('agents.orchestrator_integration.get_observability_manager'):
+    with patch('config.manager.config_manager') as mock_config, \
+         patch('services.dev_container_state.dev_container_state') as mock_dev_state, \
+         patch('monitoring.decision_events.DecisionEventEmitter') as mock_emitter, \
+         patch('monitoring.observability.get_observability_manager'):
 
         # Setup mocks
         mock_agent_config = Mock()

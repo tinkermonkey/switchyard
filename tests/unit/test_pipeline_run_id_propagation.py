@@ -60,16 +60,17 @@ class TestPipelineRunIdPropagation:
             
             mock_agent = MagicMock()
             mock_agent.execute = AsyncMock(return_value={'status': 'success'})
+            mock_agent.run_with_circuit_breaker = AsyncMock(return_value={'status': 'success'})
             mock_agent.agent_config = {'model': 'claude-sonnet-4.5', 'timeout': 3600}
             mock_create.return_value = mock_agent
-            
+
             # Execute
             await agent_executor.execute_agent(
                 agent_name='test_agent',
                 project_name='test-project',
                 task_context=task_context
             )
-            
+
             # Verify emit_agent_initialized was called with pipeline_run_id
             agent_executor.obs.emit_agent_initialized.assert_called_once()
             call_args = agent_executor.obs.emit_agent_initialized.call_args
@@ -118,20 +119,21 @@ class TestPipelineRunIdPropagation:
             
             mock_agent = MagicMock()
             mock_agent.execute = AsyncMock(return_value={'status': 'success'})
+            mock_agent.run_with_circuit_breaker = AsyncMock(return_value={'status': 'success'})
             mock_agent.agent_config = {}
             mock_create.return_value = mock_agent
-            
+
             # Execute
             await agent_executor.execute_agent(
                 agent_name='test_agent',
                 project_name='test-project',
                 task_context=task_context
             )
-            
+
             # Verify emit_agent_completed was called with pipeline_run_id
             agent_executor.obs.emit_agent_completed.assert_called_once()
             call_args = agent_executor.obs.emit_agent_completed.call_args
-            
+
             # Check that success=True and pipeline_run_id is passed
             assert call_args[0][4] is True  # success parameter
             
@@ -172,6 +174,7 @@ class TestPipelineRunIdPropagation:
             
             mock_agent = MagicMock()
             mock_agent.execute = AsyncMock(side_effect=Exception("Agent execution failed"))
+            mock_agent.run_with_circuit_breaker = AsyncMock(side_effect=Exception("Agent execution failed"))
             mock_agent.agent_config = {}
             mock_create.return_value = mock_agent
             
@@ -230,16 +233,17 @@ class TestPipelineRunIdPropagation:
             
             mock_agent = MagicMock()
             mock_agent.execute = AsyncMock(return_value={'status': 'success'})
+            mock_agent.run_with_circuit_breaker = AsyncMock(return_value={'status': 'success'})
             mock_agent.agent_config = {}
             mock_create.return_value = mock_agent
-            
+
             # Execute (should not raise exception)
             await agent_executor.execute_agent(
                 agent_name='test_agent',
                 project_name='test-project',
                 task_context=task_context
             )
-            
+
             # Verify methods were called (but pipeline_run_id should be None)
             agent_executor.obs.emit_agent_initialized.assert_called_once()
             agent_executor.obs.emit_agent_completed.assert_called_once()

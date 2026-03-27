@@ -35,12 +35,22 @@ class TestQueueProcessingFailsafe:
         project_config.github = {'repo': 'test-org/test-repo'}
         project_config.orchestrator = {"polling_interval": 30}
 
+        # Create mock workflow template with iterable columns
+        mock_column = Mock()
+        mock_column.name = 'Development'
+        mock_column.type = 'standard'
+        workflow_template = Mock()
+        workflow_template.columns = [mock_column]
+        workflow_template.pipeline_trigger_columns = None
+        workflow_template.pipeline_exit_columns = None
+
         # Mock list_projects to return empty list (for initialization)
         config_manager.list_projects.return_value = []
 
         # Mock list_visible_projects to return test project
         config_manager.list_visible_projects.return_value = ['test_project']
         config_manager.get_project_config.return_value = project_config
+        config_manager.get_workflow_template.return_value = workflow_template
 
         return config_manager
 
@@ -123,7 +133,8 @@ class TestQueueProcessingFailsafe:
             'SDLC Execution',
             155,
             'Development',
-            'test-org/test-repo'
+            'test-org/test-repo',
+            lock_already_acquired=True
         )
 
     def test_failsafe_skips_when_pipeline_locked(

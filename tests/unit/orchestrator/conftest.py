@@ -11,6 +11,23 @@ from tests.unit.orchestrator.mocks.mock_agents import success_result, approved_r
 from tests.unit.orchestrator.mocks.mock_parsers import approved_review_result, changes_requested_result
 
 
+@pytest.fixture(autouse=True)
+def mock_pipeline_lock_manager_auto():
+    """Auto-mock the pipeline lock manager for all orchestrator tests to prevent state leakage.
+
+    The lock manager uses Redis + YAML persistence which can leak state between tests.
+    This fixture replaces it with a fresh Mock that allows any lock acquisition to succeed.
+    """
+    mock_lock_mgr = Mock()
+    mock_lock_mgr.get_lock.return_value = None  # No existing lock
+    mock_lock_mgr.try_acquire_lock.return_value = (True, 'acquired')
+    mock_lock_mgr.release_lock.return_value = None
+    mock_lock_mgr.get_queue.return_value = None
+
+    with patch('services.pipeline_lock_manager.get_pipeline_lock_manager', return_value=mock_lock_mgr):
+        yield mock_lock_mgr
+
+
 # ============================================================================
 # Mock Service Fixtures
 # ============================================================================
@@ -159,8 +176,10 @@ def mock_config_manager(test_project_config, test_workflow_template):
         col.max_iterations = col_data.get('max_iterations', 3)
         workflow.columns.append(col)
     
+    workflow.pipeline_trigger_columns = None
+    workflow.pipeline_exit_columns = None
     mock.get_workflow_template.return_value = workflow
-    
+
     return mock
 
 

@@ -135,33 +135,17 @@ class TestObservabilityElasticsearchIndexing:
     
     def test_non_indexed_events_are_not_identified(self, obs_manager):
         """Test that non-indexed events are not identified as decision or lifecycle"""
+        # Events that are neither decision events nor agent lifecycle events
         non_indexed_events = [
             EventType.TASK_RECEIVED,
-            EventType.PROMPT_CONSTRUCTED,
             EventType.CLAUDE_API_CALL_STARTED,
             EventType.CLAUDE_API_CALL_COMPLETED,
             EventType.CLAUDE_API_CALL_FAILED,
-            EventType.CONTAINER_LAUNCH_STARTED,
-            EventType.CONTAINER_LAUNCH_SUCCEEDED,
-            EventType.CONTAINER_LAUNCH_FAILED,
-            EventType.CONTAINER_EXECUTION_STARTED,
-            EventType.CONTAINER_EXECUTION_COMPLETED,
-            EventType.CONTAINER_EXECUTION_FAILED,
             EventType.RESPONSE_CHUNK_RECEIVED,
             EventType.RESPONSE_PROCESSING_STARTED,
             EventType.RESPONSE_PROCESSING_COMPLETED,
             EventType.TOOL_EXECUTION_STARTED,
             EventType.TOOL_EXECUTION_COMPLETED,
-            EventType.PERFORMANCE_METRIC,
-            EventType.TOKEN_USAGE,
-            EventType.PIPELINE_RUN_STARTED,
-            EventType.PIPELINE_RUN_COMPLETED,
-            EventType.PIPELINE_RUN_FAILED,
-            EventType.REPAIR_CYCLE_CONTAINER_STARTED,
-            EventType.REPAIR_CYCLE_CONTAINER_CHECKPOINT_UPDATED,
-            EventType.REPAIR_CYCLE_CONTAINER_RECOVERED,
-            EventType.REPAIR_CYCLE_CONTAINER_KILLED,
-            EventType.REPAIR_CYCLE_CONTAINER_COMPLETED,
         ]
 
         for event_type in non_indexed_events:

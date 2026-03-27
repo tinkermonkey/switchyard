@@ -6237,7 +6237,6 @@ _Repair cycle initiated by Claude Code Orchestrator_
         from services.pipeline_queue_manager import get_pipeline_queue_manager
         from services.work_execution_state import work_execution_tracker
         from datetime import datetime, timedelta, timezone
-        from config.manager import ConfigManager
 
         stalled_issues = []
 

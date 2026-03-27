@@ -241,10 +241,25 @@ class TestAgentExecutorCancellation:
 
         from services.cancellation import CancellationError
 
+        mock_project_config = MagicMock()
+        mock_project_config.github = {'org': 'test-org', 'repo': 'test-repo'}
+
+        mock_agent_config = MagicMock()
+        mock_agent_config.retries = 2
+
         with patch('services.agent_executor.get_observability_manager'), \
-             patch('services.agent_executor.PipelineFactory'), \
+             patch('services.agent_executor.PipelineFactory') as mock_factory_cls, \
              patch('services.agent_executor.GitHubIntegration'), \
+             patch('services.agent_executor.config_manager') as mock_cm, \
              patch('services.cancellation.get_cancellation_signal') as mock_signal:
+
+            mock_cm.get_project_config.return_value = mock_project_config
+            mock_cm.get_project_agent_config.return_value = mock_agent_config
+
+            mock_agent_stage = MagicMock()
+            mock_agent_stage.agent_config = mock_agent_config
+            mock_agent_stage.run_with_circuit_breaker = AsyncMock(return_value={'status': 'success'})
+            mock_factory_cls.return_value.create_agent.return_value = mock_agent_stage
 
             mock_signal.return_value.is_cancelled.return_value = True
 
@@ -258,7 +273,8 @@ class TestAgentExecutorCancellation:
                     task_context={
                         'issue_number': 42,
                         'column': 'Testing',
-                        'repository': 'org/repo'
+                        'repository': 'org/repo',
+                        'skip_workspace_prep': True,
                     }
                 )
 

@@ -86,7 +86,7 @@ class TestBotUsernameFiltering:
         
         with patch('services.github_app.github_app') as mock_github_app:
             mock_github_app.enabled = True
-            mock_github_app.graphql_request = AsyncMock(return_value=mock_response)
+            mock_github_app.graphql_request = Mock(return_value=mock_response)
             
             await executor._load_previous_outputs_from_discussion(state, 'test-org')
         
@@ -129,7 +129,7 @@ class TestBotUsernameFiltering:
         
         with patch('services.github_app.github_app') as mock_github_app:
             mock_github_app.enabled = True
-            mock_github_app.graphql_request = AsyncMock(return_value=mock_response)
+            mock_github_app.graphql_request = Mock(return_value=mock_response)
             
             await executor._load_previous_outputs_from_discussion(state, 'test-org')
         
@@ -175,7 +175,7 @@ class TestBotUsernameFiltering:
         
         with patch('services.github_app.github_app') as mock_github_app:
             mock_github_app.enabled = True
-            mock_github_app.graphql_request = AsyncMock(return_value=mock_response)
+            mock_github_app.graphql_request = Mock(return_value=mock_response)
             
             feedback = await executor._get_human_feedback_since_last_agent(state, 'test-org')
         
@@ -221,7 +221,7 @@ class TestBotUsernameFiltering:
         
         with patch('services.github_app.github_app') as mock_github_app:
             mock_github_app.enabled = True
-            mock_github_app.graphql_request = AsyncMock(return_value=mock_response)
+            mock_github_app.graphql_request = Mock(return_value=mock_response)
             
             feedback = await executor._get_human_feedback_since_last_agent(state, 'test-org')
         
@@ -332,7 +332,7 @@ class TestBotUsernameFiltering:
         
         with patch('services.github_app.github_app') as mock_github_app:
             mock_github_app.enabled = True
-            mock_github_app.graphql_request = AsyncMock(return_value=mock_response)
+            mock_github_app.graphql_request = Mock(return_value=mock_response)
             
             feedback = await executor._get_human_feedback_since_last_agent(state, 'test-org')
         

@@ -25,20 +25,21 @@ class TestPipelineProgression:
     ):
         """Test next column calculation from Requirements"""
         with patch('config.manager.config_manager', mock_config_manager), \
+             patch('services.pipeline_progression.config_manager', mock_config_manager), \
              patch('monitoring.observability.get_observability_manager'):
-            
+
             from services.pipeline_progression import PipelineProgression
             progression = PipelineProgression(None)
-            
+
             next_column = progression.get_next_column(
                 'test-project',
                 'dev',
                 'Requirements'
             )
-            
+
             # Next column after Requirements is Requirements Review (review column)
             assert next_column == 'Requirements Review'
-    
+
     def test_calculate_next_column_from_middle_stage(
         self,
         mock_config_manager,
@@ -47,20 +48,21 @@ class TestPipelineProgression:
     ):
         """Test next column calculation from middle stage"""
         with patch('config.manager.config_manager', mock_config_manager), \
+             patch('services.pipeline_progression.config_manager', mock_config_manager), \
              patch('monitoring.observability.get_observability_manager'):
-            
+
             from services.pipeline_progression import PipelineProgression
             progression = PipelineProgression(None)
-            
+
             next_column = progression.get_next_column(
                 'test-project',
                 'dev',
                 'Design'
             )
-            
+
             # Next column after Design is Design Review (review column)
             assert next_column == 'Design Review'
-    
+
     def test_calculate_next_column_from_last_stage(
         self,
         mock_config_manager,
@@ -69,19 +71,20 @@ class TestPipelineProgression:
     ):
         """Test next column returns None when at final stage"""
         with patch('config.manager.config_manager', mock_config_manager), \
+             patch('services.pipeline_progression.config_manager', mock_config_manager), \
              patch('monitoring.observability.get_observability_manager'):
-            
+
             from services.pipeline_progression import PipelineProgression
             progression = PipelineProgression(None)
-            
+
             next_column = progression.get_next_column(
                 'test-project',
                 'dev',
                 'Done'
             )
-            
+
             assert next_column is None
-    
+
     def test_calculate_next_column_unknown_status(
         self,
         mock_config_manager,
@@ -90,17 +93,18 @@ class TestPipelineProgression:
     ):
         """Test next column returns None for unknown status"""
         with patch('config.manager.config_manager', mock_config_manager), \
+             patch('services.pipeline_progression.config_manager', mock_config_manager), \
              patch('monitoring.observability.get_observability_manager'):
-            
+
             from services.pipeline_progression import PipelineProgression
             progression = PipelineProgression(None)
-            
+
             next_column = progression.get_next_column(
                 'test-project',
                 'dev',
                 'NonExistentStatus'
             )
-            
+
             assert next_column is None
     
     def test_promote_issue_updates_github_status(

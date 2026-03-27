@@ -48,7 +48,7 @@ class TestBoardQueryCache:
         mock_client.graphql.return_value = (True, mock_data)
 
         with patch('services.github_owner_utils.build_projects_v2_query', return_value='query {}'), \
-             patch('services.github_owner_utils.get_github_client', return_value=mock_client):
+             patch('services.github_api_client.get_github_client', return_value=mock_client):
 
             # First call - cache miss
             result1 = execute_board_query_cached('test-owner', 1)
@@ -78,7 +78,7 @@ class TestBoardQueryCache:
         mock_client.graphql.return_value = (True, mock_data)
 
         with patch('services.github_owner_utils.build_projects_v2_query', return_value='query {}'), \
-             patch('services.github_owner_utils.get_github_client', return_value=mock_client):
+             patch('services.github_api_client.get_github_client', return_value=mock_client):
 
             # Prime cache
             execute_board_query_cached('test-owner', 1)
@@ -108,7 +108,7 @@ class TestBoardQueryCache:
         mock_client.graphql.return_value = (False, 'error')
 
         with patch('services.github_owner_utils.build_projects_v2_query', return_value='query {}'), \
-             patch('services.github_owner_utils.get_github_client', return_value=mock_client), \
+             patch('services.github_api_client.get_github_client', return_value=mock_client), \
              patch('services.github_owner_utils.time.sleep'):  # Skip retry delay
 
             result = execute_board_query_cached('test-owner', 1)
@@ -133,7 +133,7 @@ class TestBoardQueryCache:
         mock_client.graphql.side_effect = [(False, 'transient error'), (True, mock_data)]
 
         with patch('services.github_owner_utils.build_projects_v2_query', return_value='query {}'), \
-             patch('services.github_owner_utils.get_github_client', return_value=mock_client), \
+             patch('services.github_api_client.get_github_client', return_value=mock_client), \
              patch('services.github_owner_utils.time.sleep'):  # Skip retry delay
 
             result = execute_board_query_cached('test-owner', 1)
@@ -159,7 +159,7 @@ class TestBoardQueryCache:
         mock_client.graphql.side_effect = [(True, mock_data_1), (True, mock_data_2)]
 
         with patch('services.github_owner_utils.build_projects_v2_query', return_value='query {}'), \
-             patch('services.github_owner_utils.get_github_client', return_value=mock_client):
+             patch('services.github_api_client.get_github_client', return_value=mock_client):
 
             result1 = execute_board_query_cached('owner-a', 1)
             result2 = execute_board_query_cached('owner-b', 2)
@@ -321,6 +321,7 @@ class TestFailsafeCachedItems:
             mock_col.name = 'Done'
             mock_col.type = 'exit'
             mock_wf.columns = [mock_col]
+            mock_wf.pipeline_exit_columns = None
             MockCM.return_value.get_workflow_template.return_value = mock_wf
 
             mock_pqm.return_value.load_queue.return_value = []
@@ -359,6 +360,7 @@ class TestFailsafeCachedItems:
             mock_col.name = 'Done'
             mock_col.type = 'exit'
             mock_wf.columns = [mock_col]
+            mock_wf.pipeline_exit_columns = None
             MockCM.return_value.get_workflow_template.return_value = mock_wf
 
             mock_board_state = Mock()

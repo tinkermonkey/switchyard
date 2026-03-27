@@ -50,6 +50,7 @@ class TestWorkspaceGitOperations:
 
             mock_agent = MagicMock()
             mock_agent.execute = AsyncMock(return_value={'status': 'success'})
+            mock_agent.run_with_circuit_breaker = AsyncMock(return_value={'status': 'success'})
             mock_agent.agent_config = {}
             mock_create.return_value = mock_agent
 
@@ -79,7 +80,7 @@ class TestWorkspaceGitOperations:
              patch.object(agent_executor.obs, 'emit_agent_completed'):
 
             mock_fbm.prepare_feature_branch = AsyncMock()
-            
+
             mock_config.get_project_config.return_value = MagicMock(
                 github={'org': 'test', 'repo': 'test'}
             )
@@ -87,6 +88,7 @@ class TestWorkspaceGitOperations:
 
             mock_agent = MagicMock()
             mock_agent.execute = AsyncMock(return_value={'status': 'success'})
+            mock_agent.run_with_circuit_breaker = AsyncMock(return_value={'status': 'success'})
             mock_agent.agent_config = {}
             mock_create.return_value = mock_agent
 
@@ -124,6 +126,7 @@ class TestWorkspaceGitOperations:
 
             mock_agent = MagicMock()
             mock_agent.execute = AsyncMock(return_value={'status': 'success'})
+            mock_agent.run_with_circuit_breaker = AsyncMock(return_value={'status': 'success'})
             mock_agent.agent_config = {}
             mock_create.return_value = mock_agent
 
@@ -153,7 +156,7 @@ class TestWorkspaceGitOperations:
              patch.object(agent_executor.obs, 'emit_agent_completed'):
 
             mock_fbm.finalize_feature_branch_work = AsyncMock()
-            
+
             mock_config.get_project_config.return_value = MagicMock(
                 github={'org': 'test', 'repo': 'test'}
             )
@@ -161,6 +164,7 @@ class TestWorkspaceGitOperations:
 
             mock_agent = MagicMock()
             mock_agent.execute = AsyncMock(return_value={'status': 'success'})
+            mock_agent.run_with_circuit_breaker = AsyncMock(return_value={'status': 'success'})
             mock_agent.agent_config = {}
             mock_create.return_value = mock_agent
 
