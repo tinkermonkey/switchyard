@@ -188,8 +188,8 @@ async def test_blocked_message_includes_troubleshooting(mock_task, mock_logger):
 @pytest.mark.asyncio
 async def test_validate_task_can_run_messages():
     """Test validate_task_can_run returns user-friendly messages"""
-    with patch('agents.orchestrator_integration.config_manager') as mock_config, \
-         patch('agents.orchestrator_integration.dev_container_state') as mock_dev_state:
+    with patch('config.manager.config_manager') as mock_config, \
+         patch('services.dev_container_state.dev_container_state') as mock_dev_state:
 
         from agents.orchestrator_integration import validate_task_can_run
         from services.dev_container_state import DevContainerStatus

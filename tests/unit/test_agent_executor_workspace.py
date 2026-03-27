@@ -278,6 +278,7 @@ class TestAgentExecutorWorkspaceIntegration:
 
             mock_agent = MagicMock()
             mock_agent.execute = AsyncMock(return_value={'status': 'success'})
+            mock_agent.run_with_circuit_breaker = AsyncMock(return_value={'status': 'success'})
             mock_agent.agent_config = {}
             mock_create.return_value = mock_agent
 

@@ -143,16 +143,15 @@ class TestCleanupTask:
         """Test cleanup for single project"""
         # Mock dependencies
         mock_project_config = MagicMock()
-        mock_project_config.repository = "test-org/test-repo"
+        mock_project_config.github = {'org': 'test-org', 'repo': 'test-repo'}
 
         with patch('config.manager.config_manager') as mock_config, \
              patch('services.feature_branch_manager.feature_branch_manager') as mock_fbm, \
              patch('services.github_integration.GitHubIntegration') as mock_gh_class:
 
             # Setup mocks
-            mock_config.get_all_project_configs.return_value = {
-                'test-project': mock_project_config
-            }
+            mock_config.list_visible_projects.return_value = ['test-project']
+            mock_config.get_project_config.return_value = mock_project_config
 
             mock_gh = AsyncMock()
             mock_gh_class.return_value = mock_gh
@@ -173,19 +172,19 @@ class TestCleanupTask:
         """Test cleanup for multiple projects"""
         # Mock project configs
         mock_config1 = MagicMock()
-        mock_config1.repository = "org1/repo1"
+        mock_config1.github = {'org': 'org1', 'repo': 'repo1'}
 
         mock_config2 = MagicMock()
-        mock_config2.repository = "org2/repo2"
+        mock_config2.github = {'org': 'org2', 'repo': 'repo2'}
+
+        project_configs = {'project1': mock_config1, 'project2': mock_config2}
 
         with patch('config.manager.config_manager') as mock_config, \
              patch('services.feature_branch_manager.feature_branch_manager') as mock_fbm, \
              patch('services.github_integration.GitHubIntegration') as mock_gh_class:
 
-            mock_config.get_all_project_configs.return_value = {
-                'project1': mock_config1,
-                'project2': mock_config2
-            }
+            mock_config.list_visible_projects.return_value = ['project1', 'project2']
+            mock_config.get_project_config.side_effect = lambda name: project_configs[name]
 
             mock_fbm.cleanup_orphaned_branches = AsyncMock()
 
@@ -199,19 +198,19 @@ class TestCleanupTask:
     async def test_cleanup_handles_errors_gracefully(self, scheduled_tasks_service):
         """Test cleanup continues even if one project fails"""
         mock_config1 = MagicMock()
-        mock_config1.repository = "org1/repo1"
+        mock_config1.github = {'org': 'org1', 'repo': 'repo1'}
 
         mock_config2 = MagicMock()
-        mock_config2.repository = "org2/repo2"
+        mock_config2.github = {'org': 'org2', 'repo': 'repo2'}
+
+        project_configs = {'project1': mock_config1, 'project2': mock_config2}
 
         with patch('config.manager.config_manager') as mock_config, \
              patch('services.feature_branch_manager.feature_branch_manager') as mock_fbm, \
              patch('services.github_integration.GitHubIntegration') as mock_gh_class:
 
-            mock_config.get_all_project_configs.return_value = {
-                'project1': mock_config1,
-                'project2': mock_config2
-            }
+            mock_config.list_visible_projects.return_value = ['project1', 'project2']
+            mock_config.get_project_config.side_effect = lambda name: project_configs[name]
 
             # First project fails, second succeeds
             mock_fbm.cleanup_orphaned_branches = AsyncMock(
@@ -243,7 +242,7 @@ class TestStaleCheckTask:
         from services.feature_branch_manager import FeatureBranch, SubIssueState
 
         mock_project_config = MagicMock()
-        mock_project_config.repository = "test-org/test-repo"
+        mock_project_config.github = {'org': 'test-org', 'repo': 'test-repo'}
 
         # Create a stale branch
         stale_branch = FeatureBranch(
@@ -257,9 +256,8 @@ class TestStaleCheckTask:
              patch('services.feature_branch_manager.feature_branch_manager') as mock_fbm, \
              patch('services.github_integration.GitHubIntegration') as mock_gh_class:
 
-            mock_config.get_all_project_configs.return_value = {
-                'test-project': mock_project_config
-            }
+            mock_config.list_visible_projects.return_value = ['test-project']
+            mock_config.get_project_config.return_value = mock_project_config
 
             mock_fbm.get_all_feature_branches.return_value = [stale_branch]
             mock_fbm.get_commits_behind_main = AsyncMock(return_value=60)  # Very stale

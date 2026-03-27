@@ -75,7 +75,11 @@ class TestExecuteAgentUUID:
 
         with patch.object(executor, 'factory') as mock_factory, \
              patch.object(executor, '_build_execution_context') as mock_build, \
-             patch.object(executor, '_post_agent_output_to_github', new_callable=AsyncMock):
+             patch.object(executor, '_post_agent_output_to_github', new_callable=AsyncMock), \
+             patch('services.agent_executor.config_manager') as mock_config:
+
+            # Return None so workspace prep skips gracefully (no github config)
+            mock_config.get_project_config.return_value = None
 
             mock_agent = MagicMock()
             mock_agent.agent_config = {}
