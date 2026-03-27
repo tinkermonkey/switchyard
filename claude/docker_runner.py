@@ -1217,7 +1217,8 @@ class DockerAgentRunner:
                                 result_parts.extend(turn_parts)
                                 # Log Claude output to orchestrator logs for visibility
                                 # Truncate long outputs to avoid log spam
-                                log_text = turn_parts[0][:500] + '...' if len(turn_parts[0]) > 500 else turn_parts[0]
+                                combined = ''.join(turn_parts)
+                                log_text = combined[:500] + '...' if len(combined) > 500 else combined
                                 logger.info(f"[Claude] {log_text}")
 
                     except json.JSONDecodeError:
