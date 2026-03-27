@@ -325,13 +325,23 @@ class ReviewCycleExecutor:
         with open(state_file, 'w') as f:
             yaml.dump(data, f, default_flow_style=False)
 
-        # Clean up the file-based context directory (best-effort).
+        # Clean up the file-based context directory (best-effort), deferred by 15 minutes.
+        # The deferral outlasts the circuit breaker recovery window (10 min) so that maker
+        # agents scheduled during recovery still find the context dir on disk.
         # issue_data is not available here; if the dir was already lost (volume remount),
         # _ensure_context_writer returns None and cleanup is a silent no-op — which is fine,
         # since there is nothing to clean up in that case.
+        _CONTEXT_CLEANUP_DELAY_SECS = 900  # 15 min > circuit breaker recovery_timeout (10 min)
         writer = self._ensure_context_writer(cycle_state)
         if writer:
-            writer.cleanup()
+            import threading
+            t = threading.Timer(_CONTEXT_CLEANUP_DELAY_SECS, writer.cleanup)
+            t.daemon = True
+            t.start()
+            logger.info(
+                f"Scheduled context dir cleanup for issue {cycle_state.issue_number} "
+                f"in {_CONTEXT_CLEANUP_DELAY_SECS}s"
+            )
 
         logger.info(f"Removed completed cycle state for issue {cycle_state.issue_number}")
 

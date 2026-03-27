@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 # In normal operation the task_manager stamps a task_id within seconds of pickup.
 # If this threshold elapses with no task_id stamp, the Redis task was swept or lost
 # before being consumed and the probe is now a permanent blocker — clear it.
-_STALE_ENQUEUE_PROBE_SECS = 300  # 5 minutes
+_STALE_ENQUEUE_PROBE_SECS = 60  # 1 minute — a probe without a task_id stamp after 60s means the Redis task was lost
 
 
 @dataclass

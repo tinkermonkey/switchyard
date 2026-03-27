@@ -3,6 +3,7 @@ import { RefreshCw } from 'lucide-react'
 import Header from '../components/Header'
 import NavigationTabs from '../components/NavigationTabs'
 import PipelineFlowGraph from '../components/PipelineFlowGraph'
+import PromptsFlowGraph from '../components/PromptsFlowGraph'
 import PipelineRunEventLog from '../components/PipelineRunEventLog'
 import PipelineRunSidebar from '../components/PipelineRunSidebar'
 import PipelineRunHeader from '../components/PipelineRunHeader'
@@ -612,6 +613,16 @@ function PipelineRunView() {
                 >
                   Event Log
                 </button>
+                <button
+                  onClick={() => updateUrlParams({ contentTab: 'prompts' }, true)}
+                  className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors ${
+                    contentTab === 'prompts'
+                      ? 'border-gh-accent-emphasis text-gh-accent-fg'
+                      : 'border-transparent text-gh-fg-muted hover:text-gh-fg hover:border-gh-border-muted'
+                  }`}
+                >
+                  Prompts
+                </button>
                 {analysis && (
                   <button
                     onClick={() => updateUrlParams({ contentTab: 'report' }, true)}
@@ -630,7 +641,29 @@ function PipelineRunView() {
               <div className="flex-1 min-h-0 flex">
                 {contentTab === 'report' && analysis ? (
                   <PipelineAnalysisReport analysis={analysis} />
-                ) : contentTab !== 'log' ? (
+                ) : contentTab === 'prompts' ? (
+                  <div className="flex-1 min-h-0">
+                    <PromptsFlowGraph
+                      events={mergedEvents}
+                      selectedPipelineRun={selectedPipelineRun}
+                      loading={loadingEvents}
+                    />
+                  </div>
+                ) : contentTab === 'log' ? (
+                  <div className="flex-1 overflow-auto">
+                    {loadingEvents ? (
+                      <div className="flex items-center justify-center h-32 text-gh-fg-muted text-sm">
+                        Loading events…
+                      </div>
+                    ) : (
+                      <PipelineRunEventLog
+                        pipelineRun={selectedPipelineRun}
+                        events={eventLogEvents}
+                        isActive={selectedPipelineRun?.status === 'active'}
+                      />
+                    )}
+                  </div>
+                ) : (
                   <div className="flex-1 min-h-0">
                     <PipelineFlowGraph
                       graphEvents={graphEvents}
@@ -645,20 +678,6 @@ function PipelineRunView() {
                       fitViewAlign={selectedPipelineRun.status === 'active' ? 'active-node' : 'top'}
                       showAllNodes={false}
                     />
-                  </div>
-                ) : (
-                  <div className="flex-1 overflow-auto">
-                    {loadingEvents ? (
-                      <div className="flex items-center justify-center h-32 text-gh-fg-muted text-sm">
-                        Loading events…
-                      </div>
-                    ) : (
-                      <PipelineRunEventLog
-                        pipelineRun={selectedPipelineRun}
-                        events={eventLogEvents}
-                        isActive={selectedPipelineRun?.status === 'active'}
-                      />
-                    )}
                   </div>
                 )}
               </div>
@@ -689,7 +708,10 @@ export const Route = createFileRoute('/pipeline-run')({
   validateSearch: (search) => {
     return {
       runId: typeof search.runId === 'string' ? search.runId : undefined,
-      contentTab: search.contentTab === 'log' ? 'log' : search.contentTab === 'report' ? 'report' : 'graph',
+      contentTab: search.contentTab === 'log'     ? 'log'
+              : search.contentTab === 'report'  ? 'report'
+              : search.contentTab === 'prompts' ? 'prompts'
+              : 'graph',
     }
   },
 })

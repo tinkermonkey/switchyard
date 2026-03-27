@@ -97,24 +97,24 @@ class PipelineRun:
     board: str
     started_at: str
     ended_at: Optional[str] = None
-    status: str = "active"  # active, completed
+    status: str = "active"  # active, feedback_listening, completed
     discussion_id: Optional[str] = None  # GitHub discussion node ID for context continuity
     outcome: Optional[str] = None  # success, failed, or None for unknown
     context_dir: Optional[str] = None  # Path to pipeline context directory on host volume
-    
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for storage"""
         return asdict(self)
-    
+
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> 'PipelineRun':
         """Create from dictionary, ignoring unknown fields (e.g. analysis fields written back by pipeline_run_analysis)."""
         known = {f.name for f in fields(cls)}
         return cls(**{k: v for k, v in data.items() if k in known})
-    
+
     def is_active(self) -> bool:
-        """Check if pipeline run is still active"""
-        return self.status == "active" and self.ended_at is None
+        """Check if pipeline run is still active (executing or waiting for human feedback)"""
+        return self.status in ("active", "feedback_listening") and self.ended_at is None
 
 
 class PipelineRunManager:
@@ -312,10 +312,12 @@ class PipelineRunManager:
         # Check issue mapping
         issue_key = self._get_issue_key(project, issue_number)
         pipeline_run_id = self.redis.hget(self.redis_issue_mapping, issue_key)
-        
+
         if not pipeline_run_id:
             # FALLBACK: Check Elasticsearch for active runs that aged out of Redis
-            # This handles cases where pipeline runs are older than Redis TTL
+            # This handles cases where pipeline runs are older than Redis TTL.
+            # Include "feedback_listening" so human-feedback loops survive restarts
+            # without being recreated (they legitimately have no Docker container).
             if self.es:
                 try:
                     result = self.es.search(
@@ -326,7 +328,7 @@ class PipelineRunManager:
                                     "must": [
                                         {"term": {"project": project}},
                                         {"term": {"issue_number": issue_number}},
-                                        {"term": {"status": "active"}}
+                                        {"terms": {"status": ["active", "feedback_listening"]}}
                                     ]
                                 }
                             },
@@ -424,8 +426,13 @@ class PipelineRunManager:
                     )
                     return existing, False
                 
-                # Redis doesn't have an active run, but Elasticsearch might have old ones
-                # Query Elasticsearch for any active runs for this issue
+                # Redis doesn't have an active run, but Elasticsearch might have old ones.
+                # Two cases:
+                #   1. "feedback_listening" runs: the human feedback loop is still active
+                #      (or was active before a restart).  Restore to Redis and RETURN as-is —
+                #      do NOT end them; the feedback loop will call end_pipeline_run() itself.
+                #   2. "active" orphan runs: the orchestrator restarted and nobody owns them.
+                #      End them so a fresh run can be created.
                 if self.es:
                     try:
                         query = {
@@ -434,39 +441,58 @@ class PipelineRunManager:
                                     "must": [
                                         {"term": {"project": project}},
                                         {"term": {"issue_number": issue_number}},
-                                        {"term": {"status": "active"}}
+                                        {"terms": {"status": ["active", "feedback_listening"]}}
                                     ]
                                 }
                             },
-                            "size": 100  # Get all active runs for this issue
+                            "size": 100,
+                            "sort": [{"started_at": {"order": "desc"}}]
                         }
-                        
+
                         result = self.es.search(index="pipeline-runs-*", body=query)
-                        
+
                         if result['hits']['total']['value'] > 0:
-                            logger.warning(
-                                f"Found {result['hits']['total']['value']} orphaned active pipeline runs "
-                                f"in Elasticsearch for {project} issue #{issue_number}. Ending them."
-                            )
-                            
-                            # End all old active runs
+                            feedback_run_to_reuse = None
                             for hit in result['hits']['hits']:
                                 old_run_data = hit['_source']
                                 old_run_id = old_run_data['id']
-                                
-                                # Update the run in Elasticsearch to mark it as completed
-                                old_run_data['ended_at'] = datetime.utcnow().isoformat() + 'Z'
-                                old_run_data['status'] = 'completed'
-                                
-                                # Update in the same index where it was found
-                                # Extract the index from the hit's _index field
-                                old_index = hit['_index']
-                                es_index_with_retry(self.es, old_index, old_run_data, doc_id=old_run_id)
-                                
-                                logger.info(
-                                    f"Ended orphaned pipeline run {old_run_id} for "
-                                    f"{project} issue #{issue_number}"
-                                )
+                                old_status = old_run_data.get('status', 'active')
+
+                                if old_status == 'feedback_listening' and feedback_run_to_reuse is None:
+                                    # Keep the most-recent feedback-listening run to reuse;
+                                    # continue iterating to also clean up any orphaned "active" runs.
+                                    logger.info(
+                                        f"Found feedback_listening pipeline run {old_run_id} for "
+                                        f"{project} issue #{issue_number} — will restore to Redis and reuse"
+                                    )
+                                    feedback_run_to_reuse = (old_run_data, hit)
+                                elif old_status == 'feedback_listening':
+                                    # Duplicate feedback_listening run (shouldn't happen) — end it
+                                    logger.warning(
+                                        f"Ending duplicate feedback_listening pipeline run {old_run_id} for "
+                                        f"{project} issue #{issue_number}"
+                                    )
+                                    old_run_data['ended_at'] = datetime.utcnow().isoformat() + 'Z'
+                                    old_run_data['status'] = 'completed'
+                                    es_index_with_retry(self.es, hit['_index'], old_run_data, doc_id=old_run_id)
+                                else:
+                                    # Orphaned "active" run — end it
+                                    logger.warning(
+                                        f"Ending orphaned active pipeline run {old_run_id} for "
+                                        f"{project} issue #{issue_number}"
+                                    )
+                                    old_run_data['ended_at'] = datetime.utcnow().isoformat() + 'Z'
+                                    old_run_data['status'] = 'completed'
+                                    old_index = hit['_index']
+                                    es_index_with_retry(self.es, old_index, old_run_data, doc_id=old_run_id)
+
+                            if feedback_run_to_reuse is not None:
+                                run_data, _ = feedback_run_to_reuse
+                                pipeline_run = PipelineRun.from_dict(run_data)
+                                redis_key = self._get_redis_key(pipeline_run.id)
+                                self.redis.setex(redis_key, 3600, json.dumps(pipeline_run.to_dict()))
+                                self.redis.hset(self.redis_issue_mapping, issue_key, pipeline_run.id)
+                                return pipeline_run, False
                     except Exception as e:
                         logger.error(f"Error checking/ending old pipeline runs in Elasticsearch: {e}")
                 
@@ -632,6 +658,65 @@ class PipelineRunManager:
                 f"Failed to ensure pipeline run for {project} issue #{issue_number}: {e}"
             )
             return None
+
+    def update_run_status(
+        self,
+        project: str,
+        issue_number: int,
+        new_status: str,
+    ) -> bool:
+        """
+        Update the status of an active pipeline run without ending it.
+
+        Used to transition a run to "feedback_listening" when the human feedback
+        loop starts monitoring, so the zombie watchdog (which only queries for
+        status="active") does not kill the run.
+
+        Args:
+            project: Project name
+            issue_number: Issue number
+            new_status: New status value (e.g. "feedback_listening")
+
+        Returns:
+            True if the run was updated, False if no active run was found.
+        """
+        pipeline_run = self.get_active_pipeline_run(project, issue_number)
+        if not pipeline_run:
+            logger.debug(
+                f"update_run_status: no active run found for {project} issue #{issue_number}"
+            )
+            return False
+
+        pipeline_run.status = new_status
+
+        # Persist to Redis
+        try:
+            redis_key = self._get_redis_key(pipeline_run.id)
+            self.redis.setex(redis_key, 3600, json.dumps(pipeline_run.to_dict()))
+        except Exception as e:
+            logger.warning(f"Failed to update pipeline run status in Redis: {e}")
+
+        # Persist to Elasticsearch (use the same index the run was originally written to)
+        if self.es:
+            try:
+                index_name = self._get_es_index_name()
+                if pipeline_run.started_at:
+                    try:
+                        started_date = datetime.fromisoformat(
+                            pipeline_run.started_at.replace('Z', '+00:00')
+                        )
+                        index_name = self._get_es_index_name(started_date)
+                    except Exception:
+                        pass
+                es_index_with_retry(self.es, index_name, pipeline_run.to_dict(), doc_id=pipeline_run.id)
+            except Exception as e:
+                logger.warning(f"Failed to update pipeline run status in Elasticsearch: {e}")
+
+        logger.info(
+            f"Pipeline run {pipeline_run.id} for {project} issue #{issue_number} "
+            f"status → {new_status}"
+        )
+        return True
 
     def end_pipeline_run(
         self,

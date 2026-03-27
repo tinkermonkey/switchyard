@@ -244,63 +244,67 @@ def kill_agent(container_name):
 
 def get_claude_token_usage():
     """
-    Query Elasticsearch for Claude Code token usage metrics
-    Returns token usage for the last 4 hours and 7 days
+    Query Elasticsearch for Claude Code token usage metrics.
+
+    Uses pre-computed hourly bucket indices (token-metrics-agents-hourly-*)
+    which are populated from OTEL data by TokenMetricsService. The old approach
+    queried agent-events-* for a 'context_tokens' field that is no longer written
+    since the migration from claude-streams-* to OTEL.
+
+    Returns token breakdowns for the last 4 hours and 7 days.
     """
     try:
-        from datetime import datetime, timedelta
+        from datetime import datetime
 
-        # Calculate time ranges
+        def _sum_hourly_tokens(time_filter: str) -> dict:
+            try:
+                result = es_client.search(
+                    index='token-metrics-agents-hourly-*',
+                    body={
+                        'size': 0,
+                        'query': {'range': {'hour_bucket': {'gte': time_filter}}},
+                        'aggs': {
+                            'sum_direct': {'sum': {'field': 'sum_direct_input'}},
+                            'sum_cr':     {'sum': {'field': 'sum_cache_read'}},
+                            'sum_cc':     {'sum': {'field': 'sum_cache_creation'}},
+                            'sum_out':    {'sum': {'field': 'sum_output'}},
+                            'task_count': {'sum': {'field': 'task_count'}},
+                        },
+                    }
+                )
+                aggs = result.get('aggregations', {})
+                return {
+                    'sum_direct_input':   int(aggs.get('sum_direct', {}).get('value', 0) or 0),
+                    'sum_cache_read':     int(aggs.get('sum_cr',     {}).get('value', 0) or 0),
+                    'sum_cache_creation': int(aggs.get('sum_cc',     {}).get('value', 0) or 0),
+                    'sum_output':         int(aggs.get('sum_out',    {}).get('value', 0) or 0),
+                    'task_count':         int(aggs.get('task_count', {}).get('value', 0) or 0),
+                }
+            except Exception as e:
+                if 'index_not_found' in str(e).lower() or 'no such index' in str(e).lower():
+                    return {'sum_direct_input': 0, 'sum_cache_read': 0,
+                            'sum_cache_creation': 0, 'sum_output': 0, 'task_count': 0}
+                raise
+
         now = datetime.utcnow()
-        four_hours_ago = now - timedelta(hours=4)
-        seven_days_ago = now - timedelta(days=7)
+        s4h = _sum_hourly_tokens('now-4h')
+        s7d = _sum_hourly_tokens('now-7d')
 
-        # Query for last 4 hours
-        query_4h = {
-            "query": {
-                "bool": {
-                    "must": [
-                        {"exists": {"field": "context_tokens"}},
-                        {"range": {"timestamp": {"gte": four_hours_ago.isoformat()}}}
-                    ]
-                }
-            },
-            "aggs": {
-                "total_tokens": {
-                    "sum": {"field": "context_tokens"}
-                }
-            },
-            "size": 0
-        }
-
-        result_4h = es_client.search(index="agent-events-*", body=query_4h)
-        tokens_4h = int(result_4h.get('aggregations', {}).get('total_tokens', {}).get('value', 0))
-
-        # Query for last 7 days
-        query_7d = {
-            "query": {
-                "bool": {
-                    "must": [
-                        {"exists": {"field": "context_tokens"}},
-                        {"range": {"timestamp": {"gte": seven_days_ago.isoformat()}}}
-                    ]
-                }
-            },
-            "aggs": {
-                "total_tokens": {
-                    "sum": {"field": "context_tokens"}
-                }
-            },
-            "size": 0
-        }
-
-        result_7d = es_client.search(index="agent-events-*", body=query_7d)
-        tokens_7d = int(result_7d.get('aggregations', {}).get('total_tokens', {}).get('value', 0))
+        def _total_input(s):
+            return s['sum_direct_input'] + s['sum_cache_read'] + s['sum_cache_creation']
 
         return {
-            'tokens_4h': tokens_4h,
-            'tokens_7d': tokens_7d,
-            'collected_at': now.isoformat() + 'Z'
+            # Backward-compatible totals (input + output combined)
+            'tokens_4h': _total_input(s4h) + s4h['sum_output'],
+            'tokens_7d': _total_input(s7d) + s7d['sum_output'],
+            # Detailed breakdown
+            'input_tokens_4h':  _total_input(s4h),
+            'output_tokens_4h': s4h['sum_output'],
+            'task_count_4h':    s4h['task_count'],
+            'input_tokens_7d':  _total_input(s7d),
+            'output_tokens_7d': s7d['sum_output'],
+            'task_count_7d':    s7d['task_count'],
+            'collected_at': now.isoformat() + 'Z',
         }
 
     except Exception as e:
@@ -308,8 +312,14 @@ def get_claude_token_usage():
         return {
             'tokens_4h': 0,
             'tokens_7d': 0,
+            'input_tokens_4h': 0,
+            'output_tokens_4h': 0,
+            'task_count_4h': 0,
+            'input_tokens_7d': 0,
+            'output_tokens_7d': 0,
+            'task_count_7d': 0,
             'error': str(e),
-            'collected_at': datetime.utcnow().isoformat() + 'Z'
+            'collected_at': datetime.utcnow().isoformat() + 'Z',
         }
 
 @app.errorhandler(500)
@@ -1711,6 +1721,7 @@ def get_agent_execution(execution_id):
 @app.route('/api/pipeline-run/<pipeline_run_id>/token-usage')
 def get_pipeline_run_token_usage(pipeline_run_id):
     try:
+        # Fetch raw OTEL logs for this pipeline run
         logs = []
         try:
             logs_result = es_client.search(
@@ -1725,12 +1736,106 @@ def get_pipeline_run_token_usage(pipeline_run_id):
                 logs.append(hit['_source'])
         except Exception as e:
             if 'index_not_found_exception' in str(e).lower():
-                return jsonify({'success': True, 'logs': [], 'pipeline_run_id': pipeline_run_id, 'log_count': 0})
+                return jsonify({'success': True, 'logs': [], 'summary': None,
+                                'pipeline_run_id': pipeline_run_id, 'log_count': 0})
             raise
+
+        # Compute summary from pre-aggregated agent-execution-summaries for accuracy
+        summary = None
+        try:
+            exec_result = es_client.search(
+                index='agent-execution-summaries-*',
+                body={
+                    'size': 10000,
+                    'query': {'bool': {'should': [
+                        {'term': {'pipeline_run_id': pipeline_run_id}},
+                        {'term': {'pipeline_run_id.keyword': pipeline_run_id}},
+                    ], 'minimum_should_match': 1}},
+                    '_source': [
+                        'task_id', 'agent_name', 'status', 'duration_ms',
+                        'initial_context', 'peak_context', 'context_growth',
+                        'total_output', 'total_direct_input', 'total_cache_read',
+                        'total_cache_creation', 'tool_call_count',
+                    ],
+                }
+            )
+            exec_hits = exec_result['hits']['hits']
+            if exec_hits:
+                total_direct = total_cr = total_cc = total_out = 0
+                total_tool_calls = 0
+                peak_context = 0
+                per_agent: dict = {}
+                per_task = []
+
+                for hit in exec_hits:
+                    src = hit['_source']
+                    direct = src.get('total_direct_input') or 0
+                    cr     = src.get('total_cache_read') or 0
+                    cc     = src.get('total_cache_creation') or 0
+                    out    = src.get('total_output') or 0
+                    tc     = src.get('tool_call_count') or 0
+                    pk     = src.get('peak_context') or 0
+
+                    total_direct += direct
+                    total_cr     += cr
+                    total_cc     += cc
+                    total_out    += out
+                    total_tool_calls += tc
+                    if pk > peak_context:
+                        peak_context = pk
+
+                    agent = src.get('agent_name') or 'unknown'
+                    if agent not in per_agent:
+                        per_agent[agent] = {
+                            'task_count': 0, 'sum_direct_input': 0,
+                            'sum_cache_read': 0, 'sum_cache_creation': 0,
+                            'sum_output': 0, 'tool_call_count': 0,
+                        }
+                    ab = per_agent[agent]
+                    ab['task_count']          += 1
+                    ab['sum_direct_input']    += direct
+                    ab['sum_cache_read']      += cr
+                    ab['sum_cache_creation']  += cc
+                    ab['sum_output']          += out
+                    ab['tool_call_count']     += tc
+
+                    per_task.append({
+                        'task_id':       src.get('task_id'),
+                        'agent_name':    agent,
+                        'status':        src.get('status'),
+                        'duration_ms':   src.get('duration_ms'),
+                        'initial_context': src.get('initial_context'),
+                        'peak_context':  pk,
+                        'total_input':   direct + cr + cc,
+                        'total_direct_input': direct,
+                        'total_cache_read':   cr,
+                        'total_cache_creation': cc,
+                        'total_output':  out,
+                        'tool_call_count': tc,
+                    })
+
+                total_input = total_direct + total_cr + total_cc
+                summary = {
+                    'task_count':           len(exec_hits),
+                    'total_input_tokens':   total_input,
+                    'total_direct_input':   total_direct,
+                    'total_cache_read':     total_cr,
+                    'total_cache_creation': total_cc,
+                    'total_output_tokens':  total_out,
+                    'total_tool_calls':     total_tool_calls,
+                    'peak_context':         peak_context,
+                    'agent_breakdown':      per_agent,
+                    'per_task':             per_task,
+                }
+        except Exception as e:
+            err_str = str(e).lower()
+            if 'index_not_found' not in err_str and 'no such index' not in err_str:
+                logger.warning(f"Error computing pipeline run token summary for {pipeline_run_id}: {e}")
 
         return jsonify({
             'success': True,
             'logs': logs,
+            'summary': summary,
             'pipeline_run_id': pipeline_run_id,
             'log_count': len(logs)
         })
@@ -2221,12 +2326,11 @@ def get_top_executions():
 def trigger_token_metrics():
     """Trigger an immediate token metrics computation job."""
     import threading
-    import asyncio
 
     def _run():
         try:
             from services.token_metrics_service import get_token_metrics_service
-            asyncio.run(get_token_metrics_service().run_metrics_job())
+            get_token_metrics_service().run_metrics_job()
         except Exception as e:
             logger.error(f"Error in background token metrics job: {e}", exc_info=True)
 
@@ -2238,12 +2342,11 @@ def trigger_token_metrics():
 def trigger_project_metrics():
     """Trigger an immediate project metrics backfill (7-day lookback)."""
     import threading
-    import asyncio
 
     def _run():
         try:
             from services.project_metrics_service import get_project_metrics_service
-            asyncio.run(get_project_metrics_service().run_metrics_job(lookback_days=7))
+            get_project_metrics_service().run_metrics_job(lookback_days=7)
         except Exception as e:
             logger.error(f"Error in background project metrics job: {e}", exc_info=True)
 
@@ -2260,7 +2363,6 @@ def trigger_token_metrics_full_history():
     scheduled cron job cadence is not affected.
     """
     import threading
-    import asyncio
 
     def _run():
         try:
@@ -2268,7 +2370,7 @@ def trigger_token_metrics_full_history():
             svc = get_token_metrics_service()
             lookback_hours = svc.find_oldest_event_hours_ago()
             logger.info(f"Full-history token metrics backfill: oldest event ~{lookback_hours}h ago")
-            asyncio.run(svc.run_metrics_job(lookback_hours=lookback_hours))
+            svc.run_metrics_job(lookback_hours=lookback_hours)
         except Exception as e:
             logger.error(f"Error in background full-history token metrics job: {e}", exc_info=True)
 

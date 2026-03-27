@@ -528,6 +528,17 @@ class HumanFeedbackLoopExecutor:
             pipeline_run_id=state.pipeline_run_id
         )
 
+        # Mark the pipeline run as "feedback_listening" so the zombie watchdog
+        # (which only queries status="active") does not kill it while we wait
+        # for human input — which can legitimately take many hours.
+        try:
+            from services.pipeline_run import get_pipeline_run_manager
+            get_pipeline_run_manager().update_run_status(
+                state.project_name, state.issue_number, "feedback_listening"
+            )
+        except Exception as e:
+            logger.warning(f"Failed to set feedback_listening status for pipeline run: {e}")
+
         # Safety check: Verify we have valid state
         if not state.agent_outputs:
             logger.warning(
@@ -609,6 +620,7 @@ class HumanFeedbackLoopExecutor:
             logger.error(traceback.format_exc())
 
         # Check if stop was requested during initial feedback processing
+        _loop_exited_normally = False
         if stop_event.is_set():
             logger.info(
                 f"Stop signal received for issue #{state.issue_number} during initial processing. "
@@ -626,6 +638,7 @@ class HumanFeedbackLoopExecutor:
                 )
             except Exception as e:
                 logger.warning(f"Failed to emit feedback_listening_stopped event: {e}")
+            _loop_exited_normally = True
             return (None, True)
 
         try:
@@ -649,6 +662,7 @@ class HumanFeedbackLoopExecutor:
                             )
                         except Exception as e:
                             logger.warning(f"Failed to emit feedback_listening_stopped event: {e}")
+                        _loop_exited_normally = True
                         return (None, True)
                     await asyncio.sleep(1)
 
@@ -763,6 +777,7 @@ class HumanFeedbackLoopExecutor:
                             pipeline_run_id=state.pipeline_run_id
                         )
 
+                        _loop_exited_normally = True
                         return (None, True)  # Exit the loop
 
                     # Special case: If issue is in Backlog (no agent), stop monitoring
@@ -783,6 +798,7 @@ class HumanFeedbackLoopExecutor:
                             pipeline_run_id=state.pipeline_run_id
                         )
 
+                        _loop_exited_normally = True
                         return (None, True)  # Exit the loop
 
                 except Exception as e:
@@ -793,6 +809,17 @@ class HumanFeedbackLoopExecutor:
             if state.issue_number in self.active_loops:
                 del self.active_loops[state.issue_number]
                 logger.debug(f"Removed issue #{state.issue_number} from active_loops in _conversational_loop finally block")
+            # Close the pipeline run — end_pipeline_run is idempotent (returns False if already ended)
+            # so this is safe even when the caller has already closed the run.
+            try:
+                from services.pipeline_run import get_pipeline_run_manager
+                _outcome = "success" if _loop_exited_normally else "failed"
+                get_pipeline_run_manager().end_pipeline_run(
+                    state.project_name, state.issue_number,
+                    reason="feedback_loop_ended", outcome=_outcome
+                )
+            except Exception as e:
+                logger.warning(f"Failed to end pipeline run after feedback loop for #{state.issue_number}: {e}")
 
     async def _execute_agent(
         self,

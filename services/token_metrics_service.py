@@ -10,8 +10,8 @@ window (1d, 7d, etc.) produces accurate totals and weighted averages.
 
 Canonical token field meanings:
   sum_direct_input    : Σ input_tokens across all turns (uncached, 100% cost)
-  sum_cache_read      : Σ cache_read_input_tokens across all turns (10% cost per read)
-  sum_cache_creation  : Σ cache_creation_input_tokens across all turns (25% cost)
+  sum_cache_read      : Σ cache_read_tokens across all turns (10% cost per read)
+  sum_cache_creation  : Σ cache_creation_tokens across all turns (25% cost)
   sum_output          : Σ output_tokens across all turns
   sum_initial_input   : Σ first-turn effective_input per task (context startup size)
   sum_max_context     : Σ per-task peak effective_input (largest context window reached)
@@ -249,7 +249,7 @@ class TokenMetricsService:
             logger.warning(f"Could not determine oldest event timestamp: {e}; defaulting to 168h")
             return 168
 
-    async def run_metrics_job(self, lookback_hours: int = None):
+    def run_metrics_job(self, lookback_hours: int = None):
         """
         Run the full token metrics computation job.
 
@@ -261,9 +261,11 @@ class TokenMetricsService:
         TOKEN_METRICS_INTERVAL_HOURS * 2, preserving the existing scheduled-job
         behaviour.  Pass an explicit value to backfill a longer window without
         affecting the cron cadence.
-        """
-        import asyncio
 
+        Intentionally synchronous: the underlying ES queries are already I/O bound
+        and the per-hour calls are sequential, so async/await added no parallelism
+        and conflicted with eventlet's greenlet-based event loop model.
+        """
         if lookback_hours is None:
             interval_hours = int(os.environ.get('TOKEN_METRICS_INTERVAL_HOURS', '3'))
             lookback_hours = interval_hours * 2
@@ -274,8 +276,6 @@ class TokenMetricsService:
             f"Starting token metrics job: now={now.isoformat()}, "
             f"lookback={lookback_hours}h"
         )
-
-        loop = asyncio.get_running_loop()
 
         # Build list of hours: lookback complete hours + current partial hour
         hours_to_compute = []
@@ -296,9 +296,7 @@ class TokenMetricsService:
                 )
             # --- Agent hourly metrics ---
             try:
-                agent_hourly = await loop.run_in_executor(
-                    None, self._compute_hourly_agent_metrics, hour_start, hour_end
-                )
+                agent_hourly = self._compute_hourly_agent_metrics(hour_start, hour_end)
                 for doc in agent_hourly:
                     doc_id = f"{doc['agent_name']}_{int(hour_start.timestamp())}"
                     hourly_index = _index_name(AGENTS_HOURLY_INDEX_PREFIX, hour_start)
@@ -315,9 +313,7 @@ class TokenMetricsService:
 
             # --- Cycle hourly metrics ---
             try:
-                cycle_hourly = await loop.run_in_executor(
-                    None, self._compute_hourly_cycle_metrics, hour_start, hour_end
-                )
+                cycle_hourly = self._compute_hourly_cycle_metrics(hour_start, hour_end)
                 for doc in cycle_hourly:
                     doc_id = f"{doc['cycle_type']}_{int(hour_start.timestamp())}"
                     hourly_index = _index_name(CYCLES_HOURLY_INDEX_PREFIX, hour_start)
@@ -334,9 +330,7 @@ class TokenMetricsService:
 
             # --- Execution summaries ---
             try:
-                exec_docs = await loop.run_in_executor(
-                    None, self._compute_execution_summary_docs, hour_start, hour_end
-                )
+                exec_docs = self._compute_execution_summary_docs(hour_start, hour_end)
                 exec_index = _index_name(EXECUTION_SUMMARIES_INDEX_PREFIX, hour_start)
                 for doc in exec_docs:
                     try:
@@ -588,11 +582,11 @@ class TokenMetricsService:
                         'bool': {
                             'must': [
                                 {'terms': {'resource.attributes.task_id.keyword': task_ids}},
-                                {'terms': {'event.name': ['api_request', 'tool_result']}}
+                                {'terms': {'event_name.keyword': ['api_request', 'tool_result']}}
                             ]
                         }
                     },
-                    '_source': ['resource.attributes.task_id', 'event', 'attributes', '@timestamp']
+                    '_source': ['resource.attributes.task_id', 'event_name', 'attributes', '@timestamp']
                 }
             )
         except Exception as e:
@@ -648,15 +642,15 @@ class TokenMetricsService:
             tools_since_pending: List[str] = []
 
             for event_doc in events:
-                event_name = event_doc.get('event', {}).get('name', '')
+                event_name = event_doc.get('event_name', '')
                 attrs = event_doc.get('attributes', {})
 
                 if event_name == 'api_request':
                     # Attribute the previous pending api_request to tools collected since it
                     if pending_attrs is not None:
                         input_direct = _parse_otel_int(pending_attrs.get('input_tokens'))
-                        cache_read = _parse_otel_int(pending_attrs.get('cache_read_input_tokens'))
-                        cache_creation = _parse_otel_int(pending_attrs.get('cache_creation_input_tokens'))
+                        cache_read = _parse_otel_int(pending_attrs.get('cache_read_tokens'))
+                        cache_creation = _parse_otel_int(pending_attrs.get('cache_creation_tokens'))
                         output_tokens = _parse_otel_int(pending_attrs.get('output_tokens'))
 
                         sum_direct += input_direct
@@ -681,8 +675,8 @@ class TokenMetricsService:
 
                             # Context growth: delta to THIS new api_request vs pending
                             new_direct = _parse_otel_int(attrs.get('input_tokens'))
-                            new_cr = _parse_otel_int(attrs.get('cache_read_input_tokens'))
-                            new_cc = _parse_otel_int(attrs.get('cache_creation_input_tokens'))
+                            new_cr = _parse_otel_int(attrs.get('cache_read_tokens'))
+                            new_cc = _parse_otel_int(attrs.get('cache_creation_tokens'))
                             new_eff = new_direct + new_cr + new_cc
                             delta = max(0, new_eff - pending_effective_input)
                             for tool_name in tools_since_pending:
@@ -694,8 +688,8 @@ class TokenMetricsService:
 
                     # Set up this api_request as pending
                     new_direct = _parse_otel_int(attrs.get('input_tokens'))
-                    new_cr = _parse_otel_int(attrs.get('cache_read_input_tokens'))
-                    new_cc = _parse_otel_int(attrs.get('cache_creation_input_tokens'))
+                    new_cr = _parse_otel_int(attrs.get('cache_read_tokens'))
+                    new_cc = _parse_otel_int(attrs.get('cache_creation_tokens'))
                     pending_attrs = attrs
                     pending_effective_input = new_direct + new_cr + new_cc
                     tools_since_pending = []
@@ -708,8 +702,8 @@ class TokenMetricsService:
             # Process the last pending api_request (final turn — no tools follow it)
             if pending_attrs is not None:
                 input_direct = _parse_otel_int(pending_attrs.get('input_tokens'))
-                cache_read = _parse_otel_int(pending_attrs.get('cache_read_input_tokens'))
-                cache_creation = _parse_otel_int(pending_attrs.get('cache_creation_input_tokens'))
+                cache_read = _parse_otel_int(pending_attrs.get('cache_read_tokens'))
+                cache_creation = _parse_otel_int(pending_attrs.get('cache_creation_tokens'))
                 output_tokens = _parse_otel_int(pending_attrs.get('output_tokens'))
 
                 sum_direct += input_direct
@@ -911,11 +905,11 @@ class TokenMetricsService:
                         'bool': {
                             'must': [
                                 {'terms': {'resource.attributes.task_id.keyword': task_ids}},
-                                {'terms': {'event.name': ['api_request', 'tool_result']}}
+                                {'terms': {'event_name.keyword': ['api_request', 'tool_result']}}
                             ]
                         }
                     },
-                    '_source': ['resource.attributes.task_id', 'event', 'attributes', '@timestamp']
+                    '_source': ['resource.attributes.task_id', 'event_name', 'attributes', '@timestamp']
                 }
             )
         except Exception as e:
@@ -958,14 +952,14 @@ class TokenMetricsService:
             tools_since_pending: List[str] = []
 
             for event_doc in events:
-                event_name = event_doc.get('event', {}).get('name', '')
+                event_name = event_doc.get('event_name', '')
                 attrs = event_doc.get('attributes', {})
 
                 if event_name == 'api_request':
                     if pending_attrs is not None:
                         input_direct = _parse_otel_int(pending_attrs.get('input_tokens'))
-                        cache_read = _parse_otel_int(pending_attrs.get('cache_read_input_tokens'))
-                        cache_creation = _parse_otel_int(pending_attrs.get('cache_creation_input_tokens'))
+                        cache_read = _parse_otel_int(pending_attrs.get('cache_read_tokens'))
+                        cache_creation = _parse_otel_int(pending_attrs.get('cache_creation_tokens'))
                         output_tokens = _parse_otel_int(pending_attrs.get('output_tokens'))
 
                         sum_direct += input_direct
@@ -986,8 +980,8 @@ class TokenMetricsService:
                                 td['sum_output'] += output_tokens / k
 
                             new_direct = _parse_otel_int(attrs.get('input_tokens'))
-                            new_cr = _parse_otel_int(attrs.get('cache_read_input_tokens'))
-                            new_cc = _parse_otel_int(attrs.get('cache_creation_input_tokens'))
+                            new_cr = _parse_otel_int(attrs.get('cache_read_tokens'))
+                            new_cc = _parse_otel_int(attrs.get('cache_creation_tokens'))
                             new_eff = new_direct + new_cr + new_cc
                             delta = max(0, new_eff - pending_effective_input)
                             for tool_name in tools_since_pending:
@@ -995,8 +989,8 @@ class TokenMetricsService:
                                 td['sum_context_growth'] += delta / k
 
                     new_direct = _parse_otel_int(attrs.get('input_tokens'))
-                    new_cr = _parse_otel_int(attrs.get('cache_read_input_tokens'))
-                    new_cc = _parse_otel_int(attrs.get('cache_creation_input_tokens'))
+                    new_cr = _parse_otel_int(attrs.get('cache_read_tokens'))
+                    new_cc = _parse_otel_int(attrs.get('cache_creation_tokens'))
                     pending_attrs = attrs
                     pending_effective_input = new_direct + new_cr + new_cc
                     tools_since_pending = []
@@ -1009,8 +1003,8 @@ class TokenMetricsService:
             # Process the last pending api_request
             if pending_attrs is not None:
                 input_direct = _parse_otel_int(pending_attrs.get('input_tokens'))
-                cache_read = _parse_otel_int(pending_attrs.get('cache_read_input_tokens'))
-                cache_creation = _parse_otel_int(pending_attrs.get('cache_creation_input_tokens'))
+                cache_read = _parse_otel_int(pending_attrs.get('cache_read_tokens'))
+                cache_creation = _parse_otel_int(pending_attrs.get('cache_creation_tokens'))
                 output_tokens = _parse_otel_int(pending_attrs.get('output_tokens'))
 
                 sum_direct += input_direct
@@ -1078,7 +1072,7 @@ class TokenMetricsService:
                         }
                     },
                     '_source': [
-                        'task_id', 'agent_name', 'project', 'timestamp', 'raw_event',
+                        'task_id', 'agent', 'agent_name', 'project', 'timestamp', 'raw_event',
                         'cycle_type', 'cycle_iteration', 'cycle_stack',
                         'agent_execution_id', 'pipeline_run_id', 'execution_type'
                     ]
@@ -1105,7 +1099,7 @@ class TokenMetricsService:
             raw_data = raw.get('data') or {}
             entry = {
                 'task_id': tid,
-                'agent_name': src.get('agent_name') or raw.get('agent') or '',
+                'agent_name': src.get('agent_name') or src.get('agent') or raw.get('agent') or '',
                 'project': src.get('project') or raw.get('project') or '',
                 'timestamp': src.get('timestamp') or raw.get('timestamp'),
                 'agent_execution_id': src.get('agent_execution_id') or raw_data.get('agent_execution_id'),

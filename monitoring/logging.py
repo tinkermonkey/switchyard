@@ -7,6 +7,7 @@ class OrchestratorLogger:
     def __init__(self, name: str):
         self.logger = logging.getLogger(name)
         self.logger.setLevel(logging.INFO)
+        self.logger.propagate = False  # Prevent double-logging via root logger
 
         # Ensure orchestrator logs directory exists
         from pathlib import Path

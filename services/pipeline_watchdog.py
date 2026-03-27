@@ -157,7 +157,23 @@ class PipelineWatchdog:
                         )
                         continue
 
-                # No container, old enough, and no lock held = ZOMBIE
+                # Never clean up a run that has an active human feedback loop.
+                # Feedback-listening phases legitimately have no Docker container running —
+                # the agent has finished its turn and the orchestrator is waiting for a human
+                # reply, which can take many hours.
+                try:
+                    from services.human_feedback_loop import human_feedback_loop_executor
+                    if issue_number in human_feedback_loop_executor.active_loops:
+                        logger.info(
+                            f"Pipeline run {pipeline_run_id[:8]}... for {project} issue #{issue_number} "
+                            f"has an active feedback loop - skipping zombie cleanup"
+                        )
+                        continue
+                except Exception as e:
+                    logger.warning(f"Could not check feedback loop state for issue #{issue_number}: {e}")
+                    continue  # Fail-safe: don't kill a run we can't verify
+
+                # No container, old enough, no lock held, and no feedback loop = ZOMBIE
                 results['zombies_found'] += 1
 
                 age_minutes = (datetime.now(timezone.utc) - started_at).total_seconds() / 60

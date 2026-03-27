@@ -14,7 +14,6 @@ Writes one document per project per day to project-metrics-YYYY.MM indices.
 Upserts are idempotent, keyed on project + day_bucket.
 """
 
-import asyncio
 import logging
 import os
 from datetime import datetime, timedelta, timezone
@@ -127,12 +126,15 @@ class ProjectMetricsService:
         except Exception as e:
             logger.warning(f"Could not check index template {PROJECT_METRICS_TEMPLATE}: {e}")
 
-    async def run_metrics_job(self, lookback_days: int = 1):
+    def run_metrics_job(self, lookback_days: int = 1):
         """
         Compute project metrics for each day in the lookback window.
 
         Each day bucket is upserted independently so re-runs are idempotent.
         Skips upsert if no pipeline runs were found for that project+day.
+
+        Intentionally synchronous: async/await added no parallelism (all awaits
+        were sequential) and conflicted with eventlet's event loop model.
         """
         now = datetime.now(timezone.utc)
         today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -144,20 +146,15 @@ class ProjectMetricsService:
         days.append((today_start, now))
 
         logger.info(f"Starting project metrics job: lookback={lookback_days}d, {len(days)} buckets")
-        loop = asyncio.get_running_loop()
         total_docs = 0
 
         for day_start, day_end in days:
             day_bucket = day_start.strftime('%Y-%m-%d')
             try:
-                projects = await loop.run_in_executor(
-                    None, self._get_projects_in_window, day_start, day_end
-                )
+                projects = self._get_projects_in_window(day_start, day_end)
                 for project in projects:
                     try:
-                        doc = await loop.run_in_executor(
-                            None, self._build_project_doc, project, day_start, day_end, day_bucket
-                        )
+                        doc = self._build_project_doc(project, day_start, day_end, day_bucket)
                         if doc and doc.get('pipeline_run_count', 0) > 0:
                             self._upsert_project_metrics(doc)
                             total_docs += 1
@@ -176,30 +173,37 @@ class ProjectMetricsService:
     # -------------------------------------------------------------------------
 
     def _get_projects_in_window(self, start: datetime, end: datetime) -> List[str]:
-        """Discover distinct projects active in the given window via agent-execution-summaries."""
+        """Discover distinct projects active in the given window via agent-execution-summaries.
+
+        Fetches _source.project directly rather than using a terms aggregation so
+        that the query works across both old indices (project: text) and new indices
+        (project: keyword) without hitting the fielddata restriction on text fields.
+        """
         try:
             result = self.es.search(
                 index='agent-execution-summaries-*',
                 body={
-                    'size': 0,
+                    'size': 10000,
                     'query': {
                         'bool': {
-                            'must': [
+                            'filter': [
                                 {'range': {'ended_at': {
                                     'gte': start.isoformat(),
                                     'lt': end.isoformat(),
-                                }}}
+                                }}},
+                                {'exists': {'field': 'project'}},
                             ],
-                            'must_not': [{'term': {'project': ''}}],
                         }
                     },
-                    'aggs': {
-                        'projects': {'terms': {'field': 'project', 'size': 500}}
-                    },
+                    '_source': ['project'],
                 },
             )
-            buckets = result.get('aggregations', {}).get('projects', {}).get('buckets', [])
-            return [b['key'] for b in buckets if b.get('key')]
+            projects: set = set()
+            for hit in result['hits']['hits']:
+                p = (hit.get('_source') or {}).get('project', '').strip()
+                if p:
+                    projects.add(p)
+            return list(projects)
         except Exception as e:
             logger.error(f"Error discovering projects in window {start.date()}: {e}")
             return []
@@ -263,7 +267,10 @@ class ProjectMetricsService:
                     'query': {
                         'bool': {
                             'must': [
-                                {'term': {'project': project}},
+                                {'bool': {'should': [
+                                    {'term': {'project': project}},
+                                    {'term': {'project.keyword': project}},
+                                ], 'minimum_should_match': 1}},
                                 {'range': {'ended_at': {
                                     'gte': start.isoformat(),
                                     'lt': end.isoformat(),
@@ -345,7 +352,10 @@ class ProjectMetricsService:
         if pipeline_run_count == 0:
             pipeline_run_count = 1  # Some tasks ran, just without a run ID
 
-        n = len(runs)
+        # Use pipeline_run_count (not len(runs)) as the divisor so that tasks
+        # without a pipeline_run_id (collected in the __no_run__ sentinel bucket)
+        # don't inflate the denominator and produce understated per-run averages.
+        n = pipeline_run_count
         total_direct_input = sum(r['sum_direct_input'] for r in runs.values())
         total_cache_read = sum(r['sum_cache_read'] for r in runs.values())
         total_cache_creation = sum(r['sum_cache_creation'] for r in runs.values())
@@ -409,7 +419,7 @@ class ProjectMetricsService:
                         'bool': {
                             'must': [
                                 {'terms': {'resource.attributes.task_id.keyword': task_ids}},
-                                {'terms': {'event.name': ['api_request', 'tool_result']}}
+                                {'terms': {'event_name.keyword': ['api_request', 'tool_result']}}
                             ]
                         }
                     },
@@ -452,7 +462,7 @@ class ProjectMetricsService:
             tools_since_pending: List[str] = []
 
             for event_doc in events:
-                event_name = event_doc.get('event', {}).get('name', '')
+                event_name = event_doc.get('event_name', '')
                 attrs = event_doc.get('attributes', {})
 
                 if event_name == 'api_request':
@@ -465,8 +475,8 @@ class ProjectMetricsService:
                             td['sum_output'] += output_tokens / k
 
                         new_direct = _parse_otel_int(attrs.get('input_tokens'))
-                        new_cr = _parse_otel_int(attrs.get('cache_read_input_tokens'))
-                        new_cc = _parse_otel_int(attrs.get('cache_creation_input_tokens'))
+                        new_cr = _parse_otel_int(attrs.get('cache_read_tokens'))
+                        new_cc = _parse_otel_int(attrs.get('cache_creation_tokens'))
                         new_eff = new_direct + new_cr + new_cc
                         delta = max(0, new_eff - pending_effective_input)
                         for tool_name in tools_since_pending:
@@ -474,8 +484,8 @@ class ProjectMetricsService:
                             td['sum_context_growth'] += delta / k
 
                     new_direct = _parse_otel_int(attrs.get('input_tokens'))
-                    new_cr = _parse_otel_int(attrs.get('cache_read_input_tokens'))
-                    new_cc = _parse_otel_int(attrs.get('cache_creation_input_tokens'))
+                    new_cr = _parse_otel_int(attrs.get('cache_read_tokens'))
+                    new_cc = _parse_otel_int(attrs.get('cache_creation_tokens'))
                     pending_attrs = attrs
                     pending_effective_input = new_direct + new_cr + new_cc
                     tools_since_pending = []

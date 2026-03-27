@@ -674,8 +674,9 @@ class DockerAgentRunner:
                 )
             else:
                 logger.warning(
-                    f"Review cycle context dir not found ({review_cycle_context_dir}); "
-                    f"skipping mount — agents will use embedded context fallback"
+                    f"Review cycle context dir declared in task but missing on disk "
+                    f"({review_cycle_context_dir}); agent will run without /review_cycle_context. "
+                    f"This may indicate premature cleanup during circuit breaker recovery."
                 )
 
         # Mount pipeline context directory if provided (file-based context for planning agents)

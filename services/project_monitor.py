@@ -2821,7 +2821,11 @@ class ProjectMonitor:
             # Clean up review cycle state (but don't force-kill containers — they exit naturally with --rm)
             from services.cancellation import get_cancellation_signal
             signal = get_cancellation_signal()
-            signal.cancel(project_name, issue_number, f"Issue reached exit column '{exit_column}'")
+            # Only send a cancellation signal if there was active work to cancel.
+            # Guarding this prevents spurious cancel/clear churn on repeated polling
+            # of already-closed issues that hold no lock and have no active pipeline run.
+            if ended or lock_held_by_us:
+                signal.cancel(project_name, issue_number, f"Issue reached exit column '{exit_column}'")
 
             try:
                 from services.review_cycle import review_cycle_executor
@@ -6532,6 +6536,25 @@ _Repair cycle initiated by Claude Code Orchestrator_
                                     project_name, pipeline.board_name, issue_number
                                 )
                                 continue
+
+                            # Skip issues whose pipeline run is in feedback_listening state —
+                            # a human feedback loop is already active; triggering again would
+                            # create a duplicate run and corrupt metrics.
+                            try:
+                                existing_run = self.pipeline_run_manager.get_active_pipeline_run(
+                                    project_name, issue_number
+                                )
+                                if existing_run and existing_run.status == "feedback_listening":
+                                    logger.info(
+                                        f"⚡ FAILSAFE: Feedback loop active for #{issue_number} "
+                                        f"in {project_name}, skipping trigger"
+                                    )
+                                    lock_manager.release_lock(
+                                        project_name, pipeline.board_name, issue_number
+                                    )
+                                    continue
+                            except Exception as _e:
+                                logger.debug(f"Could not check pipeline run status for #{issue_number}: {_e}")
 
                             # Check if the column is conversational — if so, release the
                             # just-acquired lock before triggering (conversational loops

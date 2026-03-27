@@ -621,8 +621,8 @@ class ObservabilityManager:
                     if event_type == EventType.ERROR_ENCOUNTERED or event_type == EventType.ERROR_RECOVERED:
                         logger.info(f"[DIAGNOSTIC] Writing {event.event_type} to ES with pipeline_run_id: {pipeline_run_id} (is None: {pipeline_run_id is None}), project: {project}")
                     
-                    # Index the document
-                    self._es_write(index_name, doc)
+                    # Index the document (use event_id as doc_id for idempotent upserts)
+                    self._es_write(index_name, doc, doc_id=event.event_id)
                     logger.info(f"Indexed decision event {event_type.value} to {index_name}")
                 except Exception as e:
                     logger.error(f"Failed to index decision event to Elasticsearch: {e}")
@@ -648,8 +648,8 @@ class ObservabilityManager:
                         **data  # Flatten data into document
                     }
                     
-                    # Index the document
-                    self._es_write(index_name, doc)
+                    # Index the document (use event_id as doc_id for idempotent upserts)
+                    self._es_write(index_name, doc, doc_id=event.event_id)
                     logger.info(f"Indexed agent lifecycle event {event_type.value} to {index_name}")
                 except Exception as e:
                     logger.error(f"Failed to index agent lifecycle event to Elasticsearch: {e}")

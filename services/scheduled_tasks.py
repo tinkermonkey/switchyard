@@ -717,33 +717,30 @@ class ScheduledTasksService:
         except Exception as e:
             logger.error(f"Error in empty output detection: {e}", exc_info=True)
 
-    async def _run_token_metrics(self):
+    def _run_token_metrics(self):
         """Run token metrics computation job"""
         logger.info("Starting token metrics computation job")
         try:
             from services.token_metrics_service import get_token_metrics_service
-            service = get_token_metrics_service()
-            await service.run_metrics_job()
+            get_token_metrics_service().run_metrics_job()
         except Exception as e:
             logger.error(f"Fatal error in token metrics job: {e}", exc_info=True)
 
-    async def _run_project_metrics(self):
+    def _run_project_metrics(self):
         """Run daily project metrics rollup job (1-day lookback)."""
         logger.info("Starting project metrics rollup job")
         try:
             from services.project_metrics_service import get_project_metrics_service
-            service = get_project_metrics_service()
-            await service.run_metrics_job(lookback_days=1)
+            get_project_metrics_service().run_metrics_job(lookback_days=1)
         except Exception as e:
             logger.error(f"Fatal error in project metrics job: {e}", exc_info=True)
 
-    async def _run_project_metrics_backfill(self):
+    def _run_project_metrics_backfill(self):
         """Backfill project metrics with a 7-day lookback on startup."""
         logger.info("Starting project metrics startup backfill (7-day lookback)")
         try:
             from services.project_metrics_service import get_project_metrics_service
-            service = get_project_metrics_service()
-            await service.run_metrics_job(lookback_days=7)
+            get_project_metrics_service().run_metrics_job(lookback_days=7)
         except Exception as e:
             logger.error(f"Fatal error in project metrics backfill: {e}", exc_info=True)
 
@@ -865,35 +862,34 @@ class ScheduledTasksService:
     def run_token_metrics_now(self):
         """Run token metrics computation immediately (for testing/manual trigger)"""
         logger.info("Manually triggering token metrics computation")
-        asyncio.create_task(self._run_token_metrics())
+        self._run_token_metrics()
 
     def run_full_history_token_metrics_now(self):
         """Backfill token metrics across all available history without affecting the cron cadence."""
         logger.info("Manually triggering full-history token metrics backfill")
-        asyncio.create_task(self._run_full_history_token_metrics())
+        self._run_full_history_token_metrics()
 
-    async def _run_full_history_token_metrics(self):
+    def _run_full_history_token_metrics(self):
         """Run token metrics job with a lookback that covers all available event history."""
         logger.info("Starting full-history token metrics backfill")
         try:
             from services.token_metrics_service import get_token_metrics_service
             service = get_token_metrics_service()
-            loop = asyncio.get_running_loop()
-            lookback_hours = await loop.run_in_executor(None, service.find_oldest_event_hours_ago)
+            lookback_hours = service.find_oldest_event_hours_ago()
             logger.info(f"Full-history backfill: oldest event is ~{lookback_hours}h ago")
-            await service.run_metrics_job(lookback_hours=lookback_hours)
+            service.run_metrics_job(lookback_hours=lookback_hours)
         except Exception as e:
             logger.error(f"Fatal error in full-history token metrics backfill: {e}", exc_info=True)
 
     def run_project_metrics_now(self):
         """Run project metrics rollup immediately (for testing/manual trigger)."""
         logger.info("Manually triggering project metrics rollup")
-        asyncio.create_task(self._run_project_metrics())
+        self._run_project_metrics()
 
     def run_project_metrics_backfill_now(self):
         """Run project metrics 7-day backfill immediately (for testing/manual trigger)."""
         logger.info("Manually triggering project metrics backfill")
-        asyncio.create_task(self._run_project_metrics_backfill())
+        self._run_project_metrics_backfill()
 
 
 # Global instance
