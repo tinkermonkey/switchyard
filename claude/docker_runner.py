@@ -1206,15 +1206,19 @@ class DockerAgentRunner:
                         if event_type == 'assistant':
                             message = event.get('message', {})
                             content = message.get('content', [])
+                            turn_parts = []
                             for item in content:
                                 if isinstance(item, dict) and item.get('type') == 'text':
                                     text = item.get('text', '')
                                     if text:
-                                        result_parts.append(text)
-                                        # Log Claude output to orchestrator logs for visibility
-                                        # Truncate long outputs to avoid log spam
-                                        log_text = text[:500] + '...' if len(text) > 500 else text
-                                        logger.info(f"[Claude] {log_text}")
+                                        turn_parts.append(text)
+                            if turn_parts:
+                                result_parts.clear()
+                                result_parts.extend(turn_parts)
+                                # Log Claude output to orchestrator logs for visibility
+                                # Truncate long outputs to avoid log spam
+                                log_text = turn_parts[0][:500] + '...' if len(turn_parts[0]) > 500 else turn_parts[0]
+                                logger.info(f"[Claude] {log_text}")
 
                     except json.JSONDecodeError:
                         # Non-JSON output might be error messages or raw text
@@ -1894,11 +1898,14 @@ class DockerAgentRunner:
                 if event.get('type') == 'assistant':
                     message = event.get('message', {})
                     content = message.get('content', [])
+                    turn_parts = []
                     for item in content:
                         if isinstance(item, dict) and item.get('type') == 'text':
                             text = item.get('text', '')
                             if text:
-                                text_parts.append(text)
+                                turn_parts.append(text)
+                    if turn_parts:
+                        text_parts = turn_parts  # Replace — keep only last assistant turn
             except (_json.JSONDecodeError, TypeError):
                 pass
 

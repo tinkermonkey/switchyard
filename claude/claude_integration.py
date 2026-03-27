@@ -319,19 +319,21 @@ Files: {context.get('files', [])}
                             cache_read_tokens = event['usage'].get('cache_read_input_tokens', cache_read_tokens)
                             cache_creation_tokens = event['usage'].get('cache_creation_input_tokens', cache_creation_tokens)
 
-                        # Collect result text from assistant events only
-                        # Note: stream_callback above gets ALL events (including 'result') for observability
-                        # We only collect text from 'assistant' events to avoid duplication in final output
+                        # Capture only the final assistant message — replace on each event so
+                        # intermediate reasoning turns don't leak into the posted output.
                         if event_type == 'assistant':
-                            # Extract text from assistant message content
                             message = event.get('message', {})
                             content = message.get('content', [])
+                            turn_parts = []
                             for item in content:
                                 if isinstance(item, dict) and item.get('type') == 'text':
                                     text = item.get('text', '')
                                     if text:
-                                        result_parts.append(text)
-                                        logger.debug(f"Collected text from assistant event, total length: {sum(len(p) for p in result_parts)}")
+                                        turn_parts.append(text)
+                            if turn_parts:
+                                result_parts.clear()
+                                result_parts.extend(turn_parts)
+                                logger.debug(f"Captured assistant turn, length: {sum(len(p) for p in result_parts)}")
 
                     except json.JSONDecodeError:
                         # Non-JSON output, just log it
