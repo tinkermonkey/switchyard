@@ -205,6 +205,8 @@ class TaskQueue:
 
             for task_id in task_ids:
                 task_data = self.redis_client.hgetall(f"task:{task_id}")
+                if not task_data:
+                    continue  # Hash deleted by a concurrent dequeue — skip
                 if agent is None or task_data.get('agent') == agent:
                     # Reconstruct Task with proper types
                     task = Task(
@@ -249,9 +251,11 @@ class TaskQueue:
     def clear_all(self):
         """Clear all tasks from all queues (useful for testing)"""
         if self.redis_client:
-            # Clear Redis
+            # Clear Redis — delete hashes first, then the queue lists
             for priority in TaskPriority:
                 queue_name = f"tasks:{priority.name.lower()}"
+                for task_id in self.redis_client.lrange(queue_name, 0, -1):
+                    self.redis_client.delete(f"task:{task_id}")
                 self.redis_client.delete(queue_name)
         else:
             # Clear in-memory queues
