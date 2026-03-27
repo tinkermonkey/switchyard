@@ -158,6 +158,20 @@ class GitHubDiscussions:
             discussion_number = discussion_data['number']
             discussion_url = discussion_data['url']
             logger.info(f"Created discussion #{discussion_number}: {title}")
+
+            try:
+                from monitoring.decision_events import get_decision_event_emitter
+                get_decision_event_emitter().emit_github_comment_posted(
+                    object_type="discussion",
+                    object_number=discussion_number,
+                    title=title,
+                    body=body,
+                    repo=f"{owner}/{repo}",
+                    comment_id=discussion_id,
+                )
+            except Exception:
+                pass
+
             return {
                 'id': discussion_id,
                 'number': discussion_number,
@@ -204,6 +218,21 @@ class GitHubDiscussions:
         if result and 'addDiscussionComment' in result:
             comment_id = result['addDiscussionComment']['comment']['id']
             logger.info(f"Added comment to discussion {discussion_id} (reply_to: {reply_to_id})")
+
+            try:
+                from monitoring.decision_events import get_decision_event_emitter
+                from services.github_integration import _extract_comment_title
+                get_decision_event_emitter().emit_github_comment_posted(
+                    object_type="discussion",
+                    object_number=0,  # node ID, not a number; discussion_id in repo field
+                    title=_extract_comment_title(body),
+                    body=body,
+                    repo=discussion_id,  # node ID makes task_id unique per discussion
+                    comment_id=comment_id,
+                )
+            except Exception:
+                pass
+
             return comment_id
 
         logger.error(f"Failed to add comment to discussion {discussion_id}. Result: {result}")

@@ -19,6 +19,25 @@ logger = logging.getLogger(__name__)
 GITHUB_MAX_COMMENT_LENGTH = 65000
 
 
+def _extract_comment_title(body: str) -> str:
+    """Extract a brief title from a markdown comment body.
+
+    Returns the text of the first markdown heading found, or the first
+    non-empty line (truncated to 120 chars) if no heading is present.
+    """
+    for line in body.split('\n'):
+        stripped = line.strip()
+        if stripped.startswith('#'):
+            title = stripped.lstrip('#').strip()
+            if title:
+                return title[:120]
+    for line in body.split('\n'):
+        stripped = line.strip()
+        if stripped:
+            return stripped[:120]
+    return "Comment"
+
+
 class GitHubIntegration:
     """Handles GitHub API interactions for agent collaboration"""
 
@@ -143,11 +162,27 @@ class GitHubIntegration:
                 if first_result is None:
                     first_result = response
 
-            return {
+            result = {
                 'success': True,
                 'html_url': first_result.get('html_url'),
                 'id': first_result.get('id')
             }
+
+            try:
+                from monitoring.decision_events import get_decision_event_emitter
+                get_decision_event_emitter().emit_github_comment_posted(
+                    object_type="issue",
+                    object_number=issue_number,
+                    title=_extract_comment_title(comment),
+                    body=comment,
+                    project=repo_name,
+                    repo=f"{self.github_org}/{repo_name}",
+                    comment_id=str(first_result.get('id', ''))
+                )
+            except Exception:
+                pass
+
+            return result
 
         except Exception as e:
             logger.error(f"Failed to post GitHub comment: {e}", exc_info=True)
@@ -189,11 +224,27 @@ class GitHubIntegration:
                 if first_result is None:
                     first_result = response
 
-            return {
+            result = {
                 'success': True,
                 'html_url': first_result.get('html_url'),
                 'id': first_result.get('id')
             }
+
+            try:
+                from monitoring.decision_events import get_decision_event_emitter
+                get_decision_event_emitter().emit_github_comment_posted(
+                    object_type="pull_request",
+                    object_number=pr_number,
+                    title=_extract_comment_title(comment),
+                    body=comment,
+                    project=repo_name,
+                    repo=f"{self.github_org}/{repo_name}",
+                    comment_id=str(first_result.get('id', ''))
+                )
+            except Exception:
+                pass
+
+            return result
 
         except Exception as e:
             logger.error(f"Failed to post PR comment: {e}", exc_info=True)
@@ -231,7 +282,21 @@ class GitHubIntegration:
             if not success:
                 logger.error(f"Failed to create PR review: {response}")
                 return {'success': False, 'error': response.get('error', 'Unknown error')}
-            
+
+            try:
+                from monitoring.decision_events import get_decision_event_emitter
+                get_decision_event_emitter().emit_github_comment_posted(
+                    object_type="pull_request",
+                    object_number=pr_number,
+                    title=f"PR Review ({review_type}): {_extract_comment_title(body)}",
+                    body=body,
+                    project=repo_name,
+                    repo=f"{self.github_org}/{repo_name}",
+                    comment_id=str(response.get('id', ''))
+                )
+            except Exception:
+                pass
+
             return {'success': True, 'review_id': response.get('id')}
 
         except Exception as e:

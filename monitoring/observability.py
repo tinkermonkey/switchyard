@@ -263,6 +263,9 @@ class EventType(Enum):
     SUB_ISSUE_CREATED = "sub_issue_created"
     SUB_ISSUE_CREATION_FAILED = "sub_issue_creation_failed"
 
+    # GitHub Comment / Post Activity
+    GITHUB_COMMENT_POSTED = "github_comment_posted"
+
     # Prompt Health
     PROMPT_SIZE_WARNING = "prompt_size_warning"
 
@@ -522,6 +525,8 @@ class ObservabilityManager:
             # Issue Management
             EventType.SUB_ISSUE_CREATED,
             EventType.SUB_ISSUE_CREATION_FAILED,
+            # GitHub Comment / Post Activity
+            EventType.GITHUB_COMMENT_POSTED,
             # Prompt Health
             EventType.PROMPT_SIZE_WARNING,
             # Pipeline run lifecycle

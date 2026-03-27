@@ -333,6 +333,19 @@ class WorkBreakdownAgent(AnalysisAgent):
                     ['gh', 'issue', 'comment', str(issue_number), '--repo', repo, '--body', body],
                     check=True, capture_output=True, text=True,
                 )
+                try:
+                    from monitoring.decision_events import get_decision_event_emitter
+                    from services.github_integration import _extract_comment_title
+                    get_decision_event_emitter().emit_github_comment_posted(
+                        object_type="issue",
+                        object_number=issue_number,
+                        title=_extract_comment_title(body),
+                        body=body,
+                        project=project_name,
+                        repo=repo,
+                    )
+                except Exception:
+                    pass
         except Exception as e:
             logger.error(f"Failed to post comment: {e}", exc_info=True)
 

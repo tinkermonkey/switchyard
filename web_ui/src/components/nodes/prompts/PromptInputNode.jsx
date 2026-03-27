@@ -165,8 +165,6 @@ export default function PromptInputNode({ data }) {
       {/* Prompt content */}
       <div
         style={{
-          maxHeight: 600,
-          overflowY: 'auto',
           padding: '10px 14px',
           background: t.contentBg,
           lineHeight: 1.5,

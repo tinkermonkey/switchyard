@@ -1713,5 +1713,20 @@ Rules:
                 ['gh', 'issue', 'comment', str(issue_number), '-R', repo, '--body', comment],
                 capture_output=True, text=True, check=True, timeout=30
             )
+
+            try:
+                from monitoring.decision_events import get_decision_event_emitter
+                from services.github_integration import _extract_comment_title
+                get_decision_event_emitter().emit_github_comment_posted(
+                    object_type="issue",
+                    object_number=issue_number,
+                    title=_extract_comment_title(comment),
+                    body=comment,
+                    repo=repo,
+                    project=repo.split('/')[-1] if '/' in repo else repo,
+                )
+            except Exception:
+                pass
+
         except Exception as e:
             logger.error(f"Failed to post comment on #{issue_number}: {e}", exc_info=True)

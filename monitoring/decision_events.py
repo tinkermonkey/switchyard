@@ -1441,6 +1441,53 @@ class DecisionEventEmitter:
         )
 
 
+    def emit_github_comment_posted(
+        self,
+        object_type: str,
+        object_number: int,
+        title: str,
+        body: str,
+        project: str = "unknown",
+        repo: str = "unknown",
+        comment_id: Optional[str] = None,
+        pipeline_run_id: Optional[str] = None
+    ):
+        """
+        Emit event when a comment or post is made to GitHub.
+
+        Args:
+            object_type: Type of GitHub object ("issue", "pull_request", "discussion")
+            object_number: Issue/PR/discussion number (0 if unknown)
+            title: Brief title of the comment or post (first heading or derived label)
+            body: Full comment body (will be truncated to 1000 chars in event data)
+            project: Project name
+            repo: Repository name (e.g. "org/repo")
+            comment_id: GitHub comment ID if available
+            pipeline_run_id: Pipeline run ID for traceability
+        """
+        task_id = f"github_post_{project}_{object_type}_{object_number}"
+
+        truncated_body = body[:1000] + "..." if len(body) > 1000 else body
+
+        self.obs.emit(
+            EventType.GITHUB_COMMENT_POSTED,
+            agent="orchestrator",
+            task_id=task_id,
+            project=project,
+            data={
+                'decision_category': 'github_communication',
+                'object_type': object_type,
+                'object_number': object_number,
+                'repo': repo,
+                'title': title,
+                'body': truncated_body,
+                'body_length': len(body),
+                'comment_id': comment_id,
+            },
+            pipeline_run_id=pipeline_run_id
+        )
+
+
 # Singleton getter for convenience
 _decision_event_emitter: Optional[DecisionEventEmitter] = None
 
