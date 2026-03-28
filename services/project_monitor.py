@@ -5967,31 +5967,75 @@ _Repair cycle initiated by Claude Code Orchestrator_
                             project_name, item.issue_number
                         )
 
-                        # Skip if active pipeline run exists
+                        # Skip if active pipeline run exists — UNLESS this is a repair_cycle
+                        # stage with no container actually running. This handles the recovery
+                        # case where resume_active_cycles() completed a review cycle and moved
+                        # the card to Testing before the polling loop started. The pipeline run
+                        # remains active (it spans the full pipeline), but the Testing stage has
+                        # not been started. Without this exception the rescan always skips the
+                        # item and the repair cycle is never launched.
                         if has_active_run:
-                            logger.debug(
-                                f"Issue #{item.issue_number} in {item.status} already has active pipeline run - skipping"
-                            )
-                            continue
+                            if is_repair_cycle and self.task_queue.redis_client:
+                                try:
+                                    redis_key = f"repair_cycle:container:{project_name}:{item.issue_number}"
+                                    existing_container = self.task_queue.redis_client.get(redis_key)
+                                    if existing_container:
+                                        logger.debug(
+                                            f"Issue #{item.issue_number} in {item.status} has active pipeline run "
+                                            f"and repair cycle container {existing_container} - skipping"
+                                        )
+                                        continue
+                                    # No container key in Redis — the repair cycle has not been
+                                    # started. Note: we check only the Redis key here, not docker ps.
+                                    # _start_repair_cycle_for_issue performs a full docker ps check
+                                    # and cleans up any orphaned keys, so a stale key would cause
+                                    # a harmless skip on this rescan but be recovered on the next
+                                    # poll cycle. This is an acceptable trade-off for startup speed.
+                                    logger.info(
+                                        f"Issue #{item.issue_number} in {item.status} has active pipeline run "
+                                        f"but no repair cycle container — proceeding with repair cycle launch "
+                                        f"(pipeline run {has_active_run.id} carried over from review cycle)"
+                                    )
+                                except Exception as redis_err:
+                                    logger.warning(
+                                        f"Could not check repair cycle container for #{item.issue_number}: {redis_err} — skipping"
+                                    )
+                                    continue
+                            else:
+                                # Redis unavailable (in-memory queue fallback): skip conservatively.
+                                # Repair cycles require Redis for container tracking and cannot run
+                                # without it, so there is nothing to launch.
+                                logger.debug(
+                                    f"Issue #{item.issue_number} in {item.status} already has active pipeline run - skipping"
+                                )
+                                continue
 
                         # Check pipeline lock status
                         from services.pipeline_lock_manager import get_pipeline_lock_manager
                         lock_manager = get_pipeline_lock_manager()
                         current_lock = lock_manager.get_lock(project_name, pipeline.board_name)
 
-                        # Skip if pipeline is locked (by any issue)
+                        # Skip if pipeline is locked (by any issue) — UNLESS this is a repair_cycle
+                        # stage where the same issue holds the lock (expected: lock carried over from
+                        # the review cycle) and no container is running.
                         if current_lock and current_lock.lock_status == 'locked':
                             if current_lock.locked_by_issue == item.issue_number:
-                                # This issue holds the lock (may be re-triggering from recovery)
+                                if not is_repair_cycle:
+                                    logger.debug(
+                                        f"Issue #{item.issue_number} holds pipeline lock, likely being re-triggered by recovery, skipping"
+                                    )
+                                    continue
+                                # repair_cycle: same issue holds lock — this is expected and correct,
+                                # fall through so the repair cycle can be launched
                                 logger.debug(
-                                    f"Issue #{item.issue_number} holds pipeline lock, likely being re-triggered by recovery, skipping"
+                                    f"Issue #{item.issue_number} holds pipeline lock for repair_cycle stage — proceeding"
                                 )
                             else:
                                 # Another issue holds the lock - CRITICAL: don't dispatch this issue
                                 logger.debug(
                                     f"Issue #{item.issue_number} in {item.status} skipped - pipeline locked by issue #{current_lock.locked_by_issue}"
                                 )
-                            continue
+                                continue
 
                         # CRITICAL: Check if work has already been scheduled for this issue
                         # This prevents race condition where lock recovery re-triggered work
