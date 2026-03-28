@@ -754,15 +754,20 @@ class PipelineRunManager:
         pipeline_run.status = "completed"
         pipeline_run.outcome = outcome
 
-        # Set cancellation signal so in-flight repair cycles stop
-        try:
-            from services.cancellation import get_cancellation_signal
-            get_cancellation_signal().cancel(
-                project, issue_number,
-                f"Pipeline run ended: {reason or 'completed'}"
-            )
-        except Exception as e:
-            logger.warning(f"Failed to set cancellation signal on pipeline end: {e}")
+        # Set cancellation signal so in-flight repair cycles stop.
+        # Skip for feedback_loop_ended — that reason indicates a conversational loop
+        # exiting normally (e.g., stop requested, backlog). Setting the signal here
+        # would race against the next column's loop starting and cancel it immediately.
+        _effective_reason = reason or "completed"
+        if _effective_reason != "feedback_loop_ended":
+            try:
+                from services.cancellation import get_cancellation_signal
+                get_cancellation_signal().cancel(
+                    project, issue_number,
+                    f"Pipeline run ended: {_effective_reason}"
+                )
+            except Exception as e:
+                logger.warning(f"Failed to set cancellation signal on pipeline end: {e}")
 
         # Emit pipeline completion event BEFORE updating Redis
         # This ensures observability matches state transitions

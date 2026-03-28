@@ -1,5 +1,5 @@
 import { createFileRoute } from '@tanstack/react-router'
-import { RefreshCw } from 'lucide-react'
+import { RefreshCw, List } from 'lucide-react'
 import Header from '../components/Header'
 import NavigationTabs from '../components/NavigationTabs'
 import PipelineFlowGraph from '../components/PipelineFlowGraph'
@@ -92,6 +92,7 @@ function PipelineRunView() {
   const [activePipelineRuns, setActivePipelineRuns] = useState([])
   const [completedPipelineRuns, setCompletedPipelineRuns] = useState([])
   const [selectedPipelineRun, setSelectedPipelineRun] = useState(null)
+  const [sidebarOpen, setSidebarOpen] = useState(false)
   const [pipelineRunEvents, setPipelineRunEvents] = useState([])
   const [workflowConfig, setWorkflowConfig] = useState(null)
   const [loading, setLoading] = useState(true)
@@ -124,12 +125,11 @@ function PipelineRunView() {
   useEffect(() => { activeFiltersRef.current = activeFilters }, [activeFilters])
   useEffect(() => { urlRunIdRef.current = urlRunId }, [urlRunId])
 
-  // Re-fetch completed runs when filters change (also handles initial mount)
+  // Re-fetch completed runs when filters change (also handles initial mount).
+  // Uses replace mode so the list stays visible until new data arrives,
+  // avoiding a flash of "No runs match filters" during the fetch.
   useEffect(() => {
-    setCompletedPipelineRuns([])
-    setCompletedLoadedCount(0)
-    setHasMoreCompleted(true)
-    fetchCompletedPipelineRuns(0, false, null, activeFilters)
+    fetchCompletedPipelineRuns(0, false, null, activeFilters, true)
   }, [activeFilters]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // URL navigation helpers
@@ -142,6 +142,7 @@ function PipelineRunView() {
 
   const handleSelectRun = useCallback((run) => {
     updateUrlParams({ runId: run.id }, false)
+    setSidebarOpen(false)
   }, [updateUrlParams])
 
   const handleDeselectRun = useCallback(() => {
@@ -178,6 +179,25 @@ function PipelineRunView() {
     previousActiveRunIdsRef.current = new Set(activePipelineRuns.map(r => r.id))
   }, [activePipelineRuns])
 
+  // Fetch filter options from the dedicated aggregation endpoint (covers all projects/boards)
+  const fetchFilterOptions = useCallback(async () => {
+    try {
+      const response = await fetch('/api/pipeline-run-filter-options')
+      const data = await response.json()
+      if (data.success) {
+        setFilterOptions({
+          projects: data.projects || [],
+          boards: data.boards || [],
+          outcomes: data.outcomes || [],
+        })
+      } else {
+        console.warn('Filter options endpoint returned non-success:', data.error)
+      }
+    } catch (error) {
+      console.error('Error fetching filter options:', error)
+    }
+  }, [])
+
   // Fetch active pipeline runs — stable (no deps), ref-guarded
   const fetchActivePipelineRuns = useCallback(async (isInitialLoad = false) => {
     if (isFetchingActiveRef.current) return
@@ -210,9 +230,11 @@ function PipelineRunView() {
     }
   }, [])
 
-  // Fetch completed pipeline runs — stable, ref-guarded
-  const fetchCompletedPipelineRuns = useCallback(async (offset = 0, append = false, customLimit = null, filters = null) => {
-    if (isFetchingCompletedRef.current) return
+  // Fetch completed pipeline runs — stable, ref-guarded.
+  // replace=true atomically swaps the list with new data (used on filter change)
+  // so the UI never shows an empty intermediate state.
+  const fetchCompletedPipelineRuns = useCallback(async (offset = 0, append = false, customLimit = null, filters = null, replace = false) => {
+    if (isFetchingCompletedRef.current && !replace) return
 
     const resolvedFilters = filters ?? activeFiltersRef.current
 
@@ -229,13 +251,12 @@ function PipelineRunView() {
       const data = await response.json()
 
       if (data.success) {
-        let isInitialLoad = false
-
         setCompletedPipelineRuns(currentCompleted => {
-          isInitialLoad = currentCompleted.length === 0 && data.runs.length > 0
-
           let mergedRuns
-          if (append) {
+          if (replace) {
+            // Atomic swap — keeps old list visible until this moment
+            mergedRuns = data.runs
+          } else if (append) {
             const combined = [...currentCompleted, ...data.runs]
             mergedRuns = mergeArrayByIdStable(currentCompleted, combined)
           } else {
@@ -253,21 +274,13 @@ function PipelineRunView() {
           return mergedRuns
         })
 
-        // Accumulate filter option values from returned runs
-        setFilterOptions(prev => ({
-          projects: [...new Set([...prev.projects, ...data.runs.map(r => r.project).filter(Boolean)])].sort(),
-          boards: [...new Set([...prev.boards, ...data.runs.map(r => r.board).filter(Boolean)])].sort(),
-          outcomes: [...new Set([
-            ...prev.outcomes,
-            ...data.runs.map(r => r.outcome).filter(Boolean),
-            ...(data.runs.some(r => !r.outcome) ? ['unknown'] : []),
-          ])].sort(),
-        }))
-
-        if (append) {
+        if (replace) {
+          setCompletedLoadedCount(data.runs.length)
+          setHasMoreCompleted(data.runs.length === limit)
+        } else if (append) {
           setCompletedLoadedCount(prev => prev + data.runs.length)
           setHasMoreCompleted(data.runs.length === completedLimit)
-        } else if (isInitialLoad) {
+        } else if (completedLoadedCountRef.current === 0 && data.runs.length > 0) {
           setCompletedLoadedCount(data.runs.length)
           setHasMoreCompleted(data.runs.length === completedLimit)
         }
@@ -429,9 +442,11 @@ function PipelineRunView() {
   // Initial load (completed runs handled by the activeFilters effect above)
   useEffect(() => {
     fetchActivePipelineRuns(true)
-  }, [fetchActivePipelineRuns])
+    fetchFilterOptions()
+  }, [fetchActivePipelineRuns, fetchFilterOptions])
 
-  // Periodic refresh every 10 seconds
+  // Periodic refresh every 10 seconds (filter options refresh every 60s)
+  const filterRefreshCounterRef = useRef(0)
   useEffect(() => {
     const intervalId = setInterval(() => {
       fetchActivePipelineRuns(false)
@@ -439,9 +454,13 @@ function PipelineRunView() {
         const itemsToRefresh = Math.max(completedLoadedCountRef.current, completedLimit)
         fetchCompletedPipelineRuns(0, false, itemsToRefresh, activeFiltersRef.current)
       }
+      filterRefreshCounterRef.current += 1
+      if (filterRefreshCounterRef.current % 6 === 0) {
+        fetchFilterOptions()
+      }
     }, 10000)
     return () => clearInterval(intervalId)
-  }, [fetchActivePipelineRuns, fetchCompletedPipelineRuns, completedLimit])
+  }, [fetchActivePipelineRuns, fetchCompletedPipelineRuns, fetchFilterOptions, completedLimit])
 
   const selectedRunId = selectedPipelineRun?.id
 
@@ -544,24 +563,33 @@ function PipelineRunView() {
   }, [socketEvents, fetchActivePipelineRuns, fetchCompletedPipelineRuns])
 
   return (
-    <div className="h-screen flex flex-col p-5 bg-gh-canvas text-gh-fg">
+    <div className="min-h-screen flex flex-col p-2 md:p-5 bg-gh-canvas text-gh-fg">
       {!isFullscreen && <Header />}
 
       {!isFullscreen && (
         <div className="flex items-center justify-between my-3 flex-shrink-0">
           <NavigationTabs />
-          <button
-            onClick={() => fetchActivePipelineRuns(true)}
-            disabled={loading}
-            className="px-4 py-2 bg-gh-canvas-subtle border border-gh-border rounded-md hover:bg-gh-border-muted transition-colors text-sm"
-          >
-            <RefreshCw className={`inline w-4 h-4 mr-2 ${loading ? 'animate-spin' : ''}`} />
-            Refresh
-          </button>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => setSidebarOpen(true)}
+              className="md:hidden px-3 py-2 bg-gh-canvas-subtle border border-gh-border rounded-md hover:bg-gh-border-muted transition-colors text-sm"
+            >
+              <List className="inline w-4 h-4 mr-1" />
+              Runs
+            </button>
+            <button
+              onClick={() => fetchActivePipelineRuns(true)}
+              disabled={loading}
+              className="px-4 py-2 bg-gh-canvas-subtle border border-gh-border rounded-md hover:bg-gh-border-muted transition-colors text-sm"
+            >
+              <RefreshCw className={`inline w-4 h-4 mr-2 ${loading ? 'animate-spin' : ''}`} />
+              <span className="hidden md:inline">Refresh</span>
+            </button>
+          </div>
         </div>
       )}
 
-      <div className={`flex gap-4 ${isFullscreen ? 'fixed inset-0 z-50 p-5 bg-gh-canvas' : 'flex-1 min-h-0'}`}>
+      <div className={`flex gap-0 md:gap-4 ${isFullscreen ? 'fixed inset-0 z-50 p-5 bg-gh-canvas' : 'flex-1 min-h-0'}`}>
         <PipelineRunSidebar
           activePipelineRuns={activePipelineRuns}
           completedPipelineRuns={completedPipelineRuns}
@@ -574,10 +602,12 @@ function PipelineRunView() {
           activeFilters={activeFilters}
           onFiltersChange={setActiveFilters}
           filterOptions={filterOptions}
+          isOpen={sidebarOpen}
+          onToggle={() => setSidebarOpen(prev => !prev)}
         />
 
         {/* Main Content Area */}
-        <div className="relative bg-gh-canvas-subtle border border-gh-border p-4 flex flex-col flex-1 min-h-0 rounded-md">
+        <div className="relative bg-gh-canvas-subtle border border-gh-border p-2 md:p-4 flex flex-col flex-1 min-w-0 min-h-0 rounded-md overflow-hidden">
           {selectedPipelineRun ? (
             <>
               <PipelineRunHeader
@@ -638,7 +668,7 @@ function PipelineRunView() {
               </div>
 
               {/* Content Area */}
-              <div className="flex-1 min-h-0 flex">
+              <div className="flex-1 min-h-[800px] md:min-h-0 flex">
                 {contentTab === 'report' && analysis ? (
                   <PipelineAnalysisReport analysis={analysis} />
                 ) : contentTab === 'prompts' ? (

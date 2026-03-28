@@ -619,8 +619,13 @@ class HumanFeedbackLoopExecutor:
             import traceback
             logger.error(traceback.format_exc())
 
-        # Check if stop was requested during initial feedback processing
+        # Track why the loop exits so the finally block knows whether to end the pipeline run.
+        # Column transitions should NOT end the run — the next column's loop inherits it.
+        # Only stop_requested, backlog, or error should end the run.
         _loop_exited_normally = False
+        _exit_reason = "error"  # default; overwritten on clean exits
+
+        # Check if stop was requested during initial feedback processing
         if stop_event.is_set():
             logger.info(
                 f"Stop signal received for issue #{state.issue_number} during initial processing. "
@@ -639,6 +644,7 @@ class HumanFeedbackLoopExecutor:
             except Exception as e:
                 logger.warning(f"Failed to emit feedback_listening_stopped event: {e}")
             _loop_exited_normally = True
+            _exit_reason = "stop_requested"
             return (None, True)
 
         try:
@@ -663,6 +669,7 @@ class HumanFeedbackLoopExecutor:
                         except Exception as e:
                             logger.warning(f"Failed to emit feedback_listening_stopped event: {e}")
                         _loop_exited_normally = True
+                        _exit_reason = "stop_requested"
                         return (None, True)
                     await asyncio.sleep(1)
 
@@ -778,6 +785,7 @@ class HumanFeedbackLoopExecutor:
                         )
 
                         _loop_exited_normally = True
+                        _exit_reason = "column_changed"
                         return (None, True)  # Exit the loop
 
                     # Special case: If issue is in Backlog (no agent), stop monitoring
@@ -799,6 +807,7 @@ class HumanFeedbackLoopExecutor:
                         )
 
                         _loop_exited_normally = True
+                        _exit_reason = "backlog"
                         return (None, True)  # Exit the loop
 
                 except Exception as e:
@@ -809,17 +818,26 @@ class HumanFeedbackLoopExecutor:
             if state.issue_number in self.active_loops:
                 del self.active_loops[state.issue_number]
                 logger.debug(f"Removed issue #{state.issue_number} from active_loops in _conversational_loop finally block")
-            # Close the pipeline run — end_pipeline_run is idempotent (returns False if already ended)
-            # so this is safe even when the caller has already closed the run.
-            try:
-                from services.pipeline_run import get_pipeline_run_manager
-                _outcome = "success" if _loop_exited_normally else "failed"
-                get_pipeline_run_manager().end_pipeline_run(
-                    state.project_name, state.issue_number,
-                    reason="feedback_loop_ended", outcome=_outcome
+            # Only end the pipeline run when the workflow is truly done — not on column
+            # transitions, where the next column's loop should inherit the same run.
+            # Column changes (e.g., Requirements → Design) are healthy progressions;
+            # ending the run here would force a new pipeline run AND set a cancellation
+            # signal that races against the next loop starting.
+            if _exit_reason != "column_changed":
+                try:
+                    from services.pipeline_run import get_pipeline_run_manager
+                    _outcome = "success" if _loop_exited_normally else "failed"
+                    get_pipeline_run_manager().end_pipeline_run(
+                        state.project_name, state.issue_number,
+                        reason="feedback_loop_ended", outcome=_outcome
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to end pipeline run after feedback loop for #{state.issue_number}: {e}")
+            else:
+                logger.info(
+                    f"Feedback loop for #{state.issue_number} exiting due to column change — "
+                    f"pipeline run preserved for next column's loop"
                 )
-            except Exception as e:
-                logger.warning(f"Failed to end pipeline run after feedback loop for #{state.issue_number}: {e}")
 
     async def _execute_agent(
         self,

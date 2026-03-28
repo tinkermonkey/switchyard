@@ -298,7 +298,7 @@ class AgentExecutor:
                                 repo_name=project_config.github['repo']
                             )
                             comment = _build_branch_error_comment(e)
-                            await github.post_comment(issue_number, comment)
+                            await github.post_comment(issue_number, comment, pipeline_run_id=pipeline_run_id)
                         except Exception as comment_err:
                             logger.error(
                                 f"Failed to post branch error comment to issue #{issue_number}: {comment_err}"
@@ -715,10 +715,28 @@ class AgentExecutor:
         except Exception as e:
             duration_ms = (time.time() - start_time) * 1000
 
-            # CancellationError: deliberate stop — cancel_issue_work() already recorded outcome
+            # CancellationError: deliberate stop. cancel_issue_work() records outcome
+            # when it's the source, but end_pipeline_run() does NOT — so defensively
+            # record 'cancelled' here to prevent stuck in_progress entries.
             from services.cancellation import CancellationError
             if isinstance(e, CancellationError):
                 logger.info(f"Agent {agent_name} cancelled after {duration_ms:.0f}ms: {e}")
+                if 'issue_number' in task_context:
+                    try:
+                        from services.work_execution_state import work_execution_tracker
+                        column = task_context.get('column', 'unknown')
+                        work_execution_tracker.record_execution_outcome(
+                            issue_number=task_context['issue_number'],
+                            column=column,
+                            agent=agent_name,
+                            outcome='cancelled',
+                            project_name=project_name,
+                            error=str(e)
+                        )
+                    except Exception as cleanup_err:
+                        logger.warning(
+                            f"Failed to record cancelled outcome for {agent_name}: {cleanup_err}"
+                        )
                 raise
 
             error_message = str(e)
