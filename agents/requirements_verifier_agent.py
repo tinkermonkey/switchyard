@@ -77,8 +77,7 @@ class RequirementsVerifierAgent(AnalysisAgent):
         else:
             result_text = str(result)
 
-        context['markdown_analysis'] = result_text
-        context['raw_analysis_result'] = result_text
+        context['agent_output'] = result_text
 
         return context
 

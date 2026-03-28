@@ -269,6 +269,9 @@ class EventType(Enum):
     # Prompt Health
     PROMPT_SIZE_WARNING = "prompt_size_warning"
 
+    # Agent Output Health
+    AGENT_OUTPUT_FORMAT_UNEXPECTED = "agent_output_format_unexpected"
+
 @dataclass
 class ObservabilityEvent:
     """Structured event for agent observability"""
@@ -529,6 +532,8 @@ class ObservabilityManager:
             EventType.GITHUB_COMMENT_POSTED,
             # Prompt Health
             EventType.PROMPT_SIZE_WARNING,
+            # Agent Output Health
+            EventType.AGENT_OUTPUT_FORMAT_UNEXPECTED,
             # Pipeline run lifecycle
             EventType.PIPELINE_RUN_STARTED,
             EventType.PIPELINE_RUN_COMPLETED,

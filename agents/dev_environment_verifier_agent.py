@@ -265,9 +265,8 @@ REMEMBER: You MUST execute Python code to update the dev container state. Withou
         else:
             review_text = result if isinstance(result, str) else str(result)
 
-        # Store the markdown output for GitHub comment
-        context['markdown_review'] = review_text
-        context['raw_review_result'] = review_text
+        # Store the output for GitHub comment
+        context['agent_output'] = review_text
 
         # Parse the review to determine if we should mark as VERIFIED or BLOCKED
         # Look for the Status section
@@ -301,7 +300,5 @@ REMEMBER: You MUST execute Python code to update the dev container state. Withou
 
         return {
             'status': 'success',
-            'markdown_review': review_text,  # Primary key for review agents
-            'output': review_text,  # Fallback key
-            'verification_result': review_text  # Descriptive key
+            'agent_output': review_text,
         }

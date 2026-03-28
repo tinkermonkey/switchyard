@@ -120,7 +120,7 @@ class PRReviewStage(PipelineStage):
         parent_issue_number = self._resolve_parent_issue_number(task_context, project_name)
         if not parent_issue_number:
             logger.error("Could not determine parent issue number for PR review")
-            context['markdown_analysis'] = "## PR Review Failed\n\nCould not determine parent issue number."
+            context['agent_output'] = "## PR Review Failed\n\nCould not determine parent issue number."
             return context
 
         task_id = context.get("task_id", f"pr_review_{parent_issue_number}")
@@ -198,13 +198,13 @@ class PRReviewStage(PipelineStage):
             # Check for cancellation
             if issue_number and get_cancellation_signal().is_cancelled(project_name, issue_number):
                 logger.warning(f"PR review cancelled for {project_name}/#{issue_number}")
-                context['markdown_analysis'] = "## PR Review Cancelled\n\nPipeline run ended externally."
+                context['agent_output'] = "## PR Review Cancelled\n\nPipeline run ended externally."
                 return context
 
             # Check circuit breaker
             if self._agent_call_count >= self.max_agent_calls:
                 logger.error(f"Circuit breaker triggered: {self._agent_call_count} >= {self.max_agent_calls}")
-                context['markdown_analysis'] = "## PR Review Failed\n\nCircuit breaker triggered (max agent calls reached)."
+                context['agent_output'] = "## PR Review Failed\n\nCircuit breaker triggered (max agent calls reached)."
                 return context
 
             logger.info(f"Phase 1: Running PR code review for {pr_url}")
@@ -260,7 +260,7 @@ class PRReviewStage(PipelineStage):
                 )
 
                 # Collect text for Phase 4 consolidation (don't create issues yet)
-                pr_review_text = pr_review_result.get('markdown_analysis', '')
+                pr_review_text = pr_review_result.get('agent_output') or pr_review_result.get('markdown_analysis', '')
                 phase_outputs.append(("PR Code Review", pr_review_text))
                 review_summary_parts.append(f"### PR Code Review\n\n{pr_review_text}")
                 phases_completed += 1
@@ -316,13 +316,13 @@ class PRReviewStage(PipelineStage):
                 # Check for cancellation before each verification
                 if issue_number and get_cancellation_signal().is_cancelled(project_name, issue_number):
                     logger.warning(f"PR review cancelled for {project_name}/#{issue_number}")
-                    context['markdown_analysis'] = "## PR Review Cancelled\n\nPipeline run ended externally."
+                    context['agent_output'] = "## PR Review Cancelled\n\nPipeline run ended externally."
                     return context
 
                 # Check circuit breaker before each verification
                 if self._agent_call_count >= self.max_agent_calls:
                     logger.error(f"Circuit breaker triggered: {self._agent_call_count} >= {self.max_agent_calls}")
-                    context['markdown_analysis'] = "## PR Review Failed\n\nCircuit breaker triggered (max agent calls reached)."
+                    context['agent_output'] = "## PR Review Failed\n\nCircuit breaker triggered (max agent calls reached)."
                     return context
 
                 phase2_index += 1
@@ -382,7 +382,7 @@ class PRReviewStage(PipelineStage):
                     )
 
                     # Collect text for Phase 4 consolidation (don't create issues yet)
-                    verification_text = verification_result.get('markdown_analysis', '')
+                    verification_text = verification_result.get('agent_output') or verification_result.get('markdown_analysis', '')
                     phase_outputs.append((check_name, verification_text))
                     review_summary_parts.append(f"### {check_name} Verification\n\n{verification_text}")
                     phases_completed += 1
@@ -421,7 +421,7 @@ class PRReviewStage(PipelineStage):
             # Check for cancellation
             if issue_number and get_cancellation_signal().is_cancelled(project_name, issue_number):
                 logger.warning(f"PR review cancelled for {project_name}/#{issue_number}")
-                context['markdown_analysis'] = "## PR Review Cancelled\n\nPipeline run ended externally."
+                context['agent_output'] = "## PR Review Cancelled\n\nPipeline run ended externally."
                 return context
 
             if self.skip_ci_check:
@@ -502,13 +502,13 @@ class PRReviewStage(PipelineStage):
                 # Check for cancellation
                 if issue_number and get_cancellation_signal().is_cancelled(project_name, issue_number):
                     logger.warning(f"PR review cancelled for {project_name}/#{issue_number}")
-                    context['markdown_analysis'] = "## PR Review Cancelled\n\nPipeline run ended externally."
+                    context['agent_output'] = "## PR Review Cancelled\n\nPipeline run ended externally."
                     return context
 
                 # Check circuit breaker
                 if self._agent_call_count >= self.max_agent_calls:
                     logger.error(f"Circuit breaker triggered: {self._agent_call_count} >= {self.max_agent_calls}")
-                    context['markdown_analysis'] = "## PR Review Failed\n\nCircuit breaker triggered (max agent calls reached)."
+                    context['agent_output'] = "## PR Review Failed\n\nCircuit breaker triggered (max agent calls reached)."
                     return context
 
                 logger.info(f"Phase 4: Consolidating findings from {len(phase_outputs)} phase(s)")
@@ -635,7 +635,7 @@ class PRReviewStage(PipelineStage):
             else:
                 review_outcome = "Clean pass"
 
-            context['markdown_analysis'] = (
+            context['agent_output'] = (
                 f"## PR Review - Cycle {current_cycle}/{MAX_REVIEW_CYCLES}\n\n"
                 f"**PR**: {pr_url}\n"
                 f"**Parent Issue**: #{parent_issue_number}\n"
@@ -1609,7 +1609,7 @@ If all requirements are met, write "All requirements verified - no gaps found" a
             task_context=phase4_ctx,
             execution_type="pr_review_phase4"
         )
-        return result.get('markdown_analysis', '')
+        return result.get('agent_output') or result.get('markdown_analysis', '')
 
     def _build_consolidation_prompt(self, phase_outputs: List[Tuple[str, str]]) -> str:
         """Build the consolidation prompt requesting JSON output."""

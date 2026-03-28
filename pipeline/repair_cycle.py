@@ -1166,8 +1166,7 @@ Be mindful of environment setup steps like installing dependencies and activatin
                 )
 
                 # Extract result text from agent output
-                # Agent returns a context dict with markdown_analysis or raw_analysis_result
-                result_text = result.get("markdown_analysis") or result.get("raw_analysis_result")
+                result_text = result.get("agent_output") or result.get("markdown_analysis") or result.get("raw_analysis_result")
                 
                 if not result_text or not result_text.strip():
                     logger.error(f"Agent returned result with keys: {list(result.keys())}")
@@ -1965,7 +1964,7 @@ If the failures appear to be isolated per-file issues with different root causes
                 execution_type="repair_systemic_analysis",
             )
 
-            result_text = result.get("markdown_analysis") or result.get("raw_analysis_result", "")
+            result_text = result.get("agent_output") or result.get("markdown_analysis") or result.get("raw_analysis_result", "")
 
             if not result_text or not result_text.strip():
                 logger.warning("Systemic analysis returned empty output, skipping")

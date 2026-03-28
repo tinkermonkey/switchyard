@@ -537,13 +537,24 @@ class AgentExecutor:
                         raise e
 
             # Extract output from result for event emission
-            output_text = self._extract_markdown_output(agent_name, result) if isinstance(result, dict) else None
+            if isinstance(result, dict):
+                output_text, output_unexpected = self._extract_markdown_output(agent_name, result)
+            else:
+                output_text, output_unexpected = None, True
 
             duration_ms = (time.time() - start_time) * 1000
             self.obs.emit_agent_completed(
                 agent_name, task_id, project_name, duration_ms, True, None, pipeline_run_id, output_text, agent_execution_id,
                 execution_type=execution_type
             )
+
+            if output_unexpected and output_text is not None:
+                from monitoring.observability import EventType
+                self.obs.emit(EventType.AGENT_OUTPUT_FORMAT_UNEXPECTED, agent_name, task_id, project_name, {
+                    'result_keys': list(result.keys()) if isinstance(result, dict) else [],
+                    'output_length': len(output_text),
+                    'message': f"Agent {agent_name} output was extracted via fallback, not a known output key",
+                }, pipeline_run_id, execution_type=execution_type)
 
             # If dev_environment_setup completed successfully, queue verifier
             if agent_name == 'dev_environment_setup':
@@ -917,7 +928,7 @@ class AgentExecutor:
             return
 
         # Extract markdown output from result (different agents use different keys)
-        markdown_output = self._extract_markdown_output(agent_name, result)
+        markdown_output, _ = self._extract_markdown_output(agent_name, result)
 
         if not markdown_output:
             logger.warning(f"No markdown output found for {agent_name}, skipping GitHub post")
@@ -968,20 +979,34 @@ class AgentExecutor:
             logger.error(f"Error posting {agent_name} output to GitHub: {e}", exc_info=True)
             # Don't fail the agent execution if posting fails
 
-    def _extract_markdown_output(self, agent_name: str, result: Dict[str, Any]) -> Optional[str]:
+    # Markdown indicators: headings, bold, lists, code blocks, links
+    _MARKDOWN_INDICATORS = ('# ', '## ', '### ', '**', '- ', '* ', '```', '[')
+
+    # Keys that are part of the execution context infrastructure, not agent output.
+    # Fallback tiers skip these to avoid picking up prompts, config, or metadata.
+    _CONTEXT_KEYS = frozenset({
+        'pipeline_id', 'task_id', 'agent', 'project', 'context',
+        'work_dir', 'completed_work', 'decisions', 'metrics', 'validation',
+        'state_manager', 'observability', 'use_docker', 'claude_model',
+        'agent_config', 'mcp_servers', 'claude_session_id', 'output_posted',
+        'agent_hard_timeout', 'branch_name', 'container_name',
+    })
+
+    def _extract_markdown_output(self, agent_name: str, result: Dict[str, Any]) -> tuple:
         """
         Extract markdown output from agent result.
 
-        Different agents store their output in different keys:
-        - markdown_analysis (business_analyst, idea_researcher)
-        - markdown_review (reviewers)
-        - markdown_design (software_architect)
-        - etc.
+        All agents should store output under 'agent_output'. Legacy keys
+        (markdown_analysis, markdown_review, etc.) are checked as fallbacks
+        for in-flight executions during rollout.
 
-        This method tries common patterns to find the output.
+        Returns (output_text, unexpected) where unexpected is True if the
+        output was found via fallback rather than a known key.
         """
-        # Common output keys to try
+        # --- Tier 1: Known output keys ---
         output_keys = [
+            'agent_output',           # Standard key (all agents)
+            # Legacy keys (fallback for in-flight executions)
             'markdown_analysis',
             'markdown_review',
             'markdown_design',
@@ -990,23 +1015,73 @@ class AgentExecutor:
             'markdown_documentation',
             'markdown_output',
             'raw_analysis_result',
-            'output',  # Used by dev_environment_verifier
-            'verification_result',  # Used by dev_environment_verifier
+            'raw_review_result',
+            'output',
+            'verification_result',
         ]
 
         for key in output_keys:
             if key in result:
                 output = result[key]
                 if output and isinstance(output, str):
-                    return output
+                    return output, False
 
-        # Fallback: check if there's a dict with a 'full_markdown' key
-        for value in result.values():
+        # Check for nested full_markdown dicts (MakerAgent pattern)
+        for key, value in result.items():
+            if key in self._CONTEXT_KEYS:
+                continue
             if isinstance(value, dict) and 'full_markdown' in value:
-                return value['full_markdown']
+                fm = value['full_markdown']
+                if fm and isinstance(fm, str):
+                    return fm, False
 
-        logger.warning(f"Could not find markdown output for {agent_name} in keys: {list(result.keys())}")
-        return None
+        # --- Tier 2: Scan for any string value containing markdown ---
+        for key, value in result.items():
+            if key in self._CONTEXT_KEYS:
+                continue
+            if isinstance(value, str) and len(value) > 20:
+                if any(indicator in value for indicator in self._MARKDOWN_INDICATORS):
+                    logger.warning(
+                        f"Agent {agent_name}: output found via markdown scan in key '{key}' "
+                        f"(not a known output key). Available keys: {list(result.keys())}"
+                    )
+                    return value, True
+
+        # --- Tier 3: Scan for JSON-serializable content, render as markdown ---
+        for key, value in result.items():
+            if key in self._CONTEXT_KEYS:
+                continue
+            if isinstance(value, (dict, list)):
+                try:
+                    rendered = f"```json\n{json.dumps(value, indent=2, default=str)}\n```"
+                    logger.warning(
+                        f"Agent {agent_name}: output found via JSON scan in key '{key}' "
+                        f"(not a known output key). Available keys: {list(result.keys())}"
+                    )
+                    return rendered, True
+                except (TypeError, ValueError):
+                    continue
+
+        # --- Tier 4: Use longest raw string value as-is ---
+        longest_str = None
+        longest_key = None
+        for key, value in result.items():
+            if key in self._CONTEXT_KEYS:
+                continue
+            if isinstance(value, str) and len(value) > 0:
+                if longest_str is None or len(value) > len(longest_str):
+                    longest_str = value
+                    longest_key = key
+
+        if longest_str:
+            logger.warning(
+                f"Agent {agent_name}: no markdown or JSON output found, using raw string "
+                f"from key '{longest_key}' ({len(longest_str)} chars). Available keys: {list(result.keys())}"
+            )
+            return longest_str, True
+
+        logger.warning(f"Could not find any output for {agent_name} in keys: {list(result.keys())}")
+        return None, True
 
     async def _failsafe_commit_check(
         self,

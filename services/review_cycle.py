@@ -1323,11 +1323,11 @@ class ReviewCycleExecutor:
             )
 
             # Get updated review from context (avoids GitHub API timing issues)
-            updated_review = reviewer_context.get('markdown_review', '')
+            updated_review = reviewer_context.get('agent_output') or reviewer_context.get('markdown_review', '')
 
-            # Fallback: if no markdown_review in context, fetch from GitHub
+            # Fallback: if no agent_output in context, fetch from GitHub
             if not updated_review:
-                logger.warning(f"No markdown_review in context, fetching from GitHub for {cycle_state.reviewer_agent}")
+                logger.warning(f"No agent_output in context, fetching from GitHub for {cycle_state.reviewer_agent}")
                 updated_review = await self._get_latest_agent_comment(
                     cycle_state.issue_number,
                     cycle_state.repository,
@@ -1420,15 +1420,11 @@ class ReviewCycleExecutor:
                 )
 
                 # Get maker output from context (avoids GitHub API timing issues)
-                # Maker agents typically use 'completed_work' key for their output
-                maker_output = maker_context.get('markdown_output', '')
-                if not maker_output:
-                    # Some maker agents might use completed_work instead
-                    maker_output = str(maker_context.get('completed_work', ''))
+                maker_output = maker_context.get('agent_output', '')
 
-                # Fallback: if no output in context, fetch from GitHub
+                # Fallback: if no agent_output in context, fetch from GitHub
                 if not maker_output:
-                    logger.warning(f"No output in context, fetching from GitHub for {cycle_state.maker_agent}")
+                    logger.warning(f"No agent_output in context, fetching from GitHub for {cycle_state.maker_agent}")
                     maker_output = await self._get_latest_agent_comment(
                         cycle_state.issue_number,
                         cycle_state.repository,
@@ -1736,11 +1732,11 @@ class ReviewCycleExecutor:
                 )
 
                 # Get updated review from context (avoids GitHub API timing issues)
-                updated_review = reviewer_context.get('markdown_review', '')
+                updated_review = reviewer_context.get('agent_output') or reviewer_context.get('markdown_review', '')
 
-                # Fallback: if no markdown_review in context, fetch from GitHub
+                # Fallback: if no agent_output in context, fetch from GitHub
                 if not updated_review:
-                    logger.warning(f"No markdown_review in context, fetching from GitHub for {reviewer_agent}")
+                    logger.warning(f"No agent_output in context, fetching from GitHub for {reviewer_agent}")
                     updated_review = await self._get_latest_agent_comment(
                         issue_number,
                         repository,
@@ -1983,11 +1979,11 @@ class ReviewCycleExecutor:
             # Guard against a non-dict return (e.g. "" from a validation failure in the
             # docker runner) — treat it as no inline output and fall through to the GitHub
             # fetch below rather than crashing with AttributeError.
-            review_comment = reviewer_context.get('markdown_review', '') if isinstance(reviewer_context, dict) else ''
+            review_comment = (reviewer_context.get('agent_output') or reviewer_context.get('markdown_review', '')) if isinstance(reviewer_context, dict) else ''
 
-            # Fallback: if no markdown_review in context, fetch from GitHub
+            # Fallback: if no agent_output in context, fetch from GitHub
             if not review_comment:
-                logger.warning(f"No markdown_review in context, fetching from GitHub for {cycle_state.reviewer_agent}")
+                logger.warning(f"No agent_output in context, fetching from GitHub for {cycle_state.reviewer_agent}")
                 review_comment = await self._get_latest_agent_comment(
                     cycle_state.issue_number,
                     cycle_state.repository,

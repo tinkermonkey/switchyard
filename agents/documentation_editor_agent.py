@@ -302,8 +302,7 @@ Conduct a comprehensive documentation review covering:
                     context['output_posted'] = True
             else:
                 markdown_output = result if isinstance(result, str) else str(result)
-            context['markdown_review'] = markdown_output
-            context['raw_review_result'] = markdown_output
+            context['agent_output'] = markdown_output
 
             logger.info(f"Documentation review completed, output length: {len(markdown_output)}")
 

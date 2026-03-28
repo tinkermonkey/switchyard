@@ -608,19 +608,9 @@ This checklist is **CRITICAL** - it helps the reviewer see you addressed each po
                 # Backward compatibility: old string format
                 analysis_text = result if isinstance(result, str) else str(result)
 
-            # Store markdown output for GitHub comment
-            context['markdown_analysis'] = analysis_text
-            context['raw_analysis_result'] = analysis_text
+            # Store output for GitHub comment and downstream consumers
+            context['agent_output'] = analysis_text
 
-            # Build result structure
-            analysis = {
-                f"{self.name}_analysis": {
-                    "full_markdown": analysis_text
-                }
-            }
-
-            # Add to context for next stage
-            context[f'{self.name}_analysis'] = analysis.get(f'{self.name}_analysis', {})
             context['completed_work'] = context.get('completed_work', []) + [
                 f"{self.agent_display_name} analysis completed"
             ]

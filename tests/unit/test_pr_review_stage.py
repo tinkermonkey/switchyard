@@ -43,7 +43,7 @@ async def test_phase1_launches_pr_code_reviewer(pr_review_stage):
 
         mock_executor = AsyncMock()
         mock_executor.execute_agent = AsyncMock(return_value={
-            'markdown_analysis': '### Critical Issues\nNone found'
+            'agent_output': '### Critical Issues\nNone found'
         })
         mock_get_executor.return_value = mock_executor
         mock_state.get_review_count.return_value = 0
@@ -83,7 +83,7 @@ async def test_phase2_launches_requirements_verifier(pr_review_stage):
 
         mock_executor = AsyncMock()
         mock_executor.execute_agent = AsyncMock(return_value={
-            'markdown_analysis': '### Gaps Found\nNone found'
+            'agent_output': '### Gaps Found\nNone found'
         })
         mock_get_executor.return_value = mock_executor
         mock_state.get_review_count.return_value = 0
@@ -135,7 +135,7 @@ async def test_manual_progression_flag_set_when_issues_found(pr_review_stage):
 
         mock_executor = AsyncMock()
         mock_executor.execute_agent = AsyncMock(return_value={
-            'markdown_analysis': '{"groups": [], "filtered_out": []}'
+            'agent_output': '{"groups": [], "filtered_out": []}'
         })
         mock_get_executor.return_value = mock_executor
         mock_state.get_review_count.return_value = 0
@@ -167,7 +167,7 @@ async def test_manual_progression_flag_set_when_clean_pass(pr_review_stage):
 
         mock_executor = AsyncMock()
         mock_executor.execute_agent = AsyncMock(return_value={
-            'markdown_analysis': '### Critical Issues\nNone found'
+            'agent_output': '### Critical Issues\nNone found'
         })
         mock_get_executor.return_value = mock_executor
         mock_state.get_review_count.return_value = 0
@@ -229,7 +229,7 @@ async def test_phase3_runs_locally_no_docker(pr_review_stage):
 
         mock_executor = AsyncMock()
         mock_executor.execute_agent = AsyncMock(return_value={
-            'markdown_analysis': '### Critical Issues\nNone found'
+            'agent_output': '### Critical Issues\nNone found'
         })
         mock_get_executor.return_value = mock_executor
         mock_state.get_review_count.return_value = 0
@@ -275,7 +275,7 @@ async def test_cycle_limit_posts_comment_and_returns_to_development(pr_review_st
 
         mock_executor = AsyncMock()
         mock_executor.execute_agent = AsyncMock(return_value={
-            'markdown_analysis': '{"groups": [], "filtered_out": []}'
+            'agent_output': '{"groups": [], "filtered_out": []}'
         })
         mock_get_executor.return_value = mock_executor
         # Final allowed cycle: review_count=2 → current_cycle=3=MAX_REVIEW_CYCLES
@@ -312,7 +312,7 @@ async def test_skips_workspace_prep_false(pr_review_stage):
 
         mock_executor = AsyncMock()
         mock_executor.execute_agent = AsyncMock(return_value={
-            'markdown_analysis': '### Critical Issues\nNone found'
+            'agent_output': '### Critical Issues\nNone found'
         })
         mock_get_executor.return_value = mock_executor
         mock_state.get_review_count.return_value = 0
@@ -371,7 +371,7 @@ async def test_phase2_skipped_when_no_context(pr_review_stage):
 
         mock_executor = AsyncMock()
         mock_executor.execute_agent = AsyncMock(return_value={
-            'markdown_analysis': '### Critical Issues\nNone found'
+            'agent_output': '### Critical Issues\nNone found'
         })
         mock_get_executor.return_value = mock_executor
         mock_state.get_review_count.return_value = 0
@@ -414,7 +414,7 @@ async def test_creates_issues_for_ci_failures(pr_review_stage):
 
         mock_executor = AsyncMock()
         mock_executor.execute_agent = AsyncMock(return_value={
-            'markdown_analysis': '### Critical Issues\nNone found'
+            'agent_output': '### Critical Issues\nNone found'
         })
         mock_get_executor.return_value = mock_executor
         mock_state.get_review_count.return_value = 0
@@ -437,8 +437,8 @@ async def test_creates_issues_for_ci_failures(pr_review_stage):
 
 
 @pytest.mark.asyncio
-async def test_markdown_analysis_includes_summary(pr_review_stage):
-    """Verify markdown_analysis includes comprehensive summary"""
+async def test_agent_output_includes_summary(pr_review_stage):
+    """Verify agent_output includes comprehensive summary"""
     with patch('pipeline.pr_review_stage.get_agent_executor') as mock_get_executor, \
          patch('pipeline.pr_review_stage.pr_review_state_manager') as mock_state, \
          patch.object(pr_review_stage, '_find_pr_url', return_value='https://github.com/o/r/pull/123'), \
@@ -450,7 +450,7 @@ async def test_markdown_analysis_includes_summary(pr_review_stage):
 
         mock_executor = AsyncMock()
         mock_executor.execute_agent = AsyncMock(return_value={
-            'markdown_analysis': '### Critical Issues\nNone found'
+            'agent_output': '### Critical Issues\nNone found'
         })
         mock_get_executor.return_value = mock_executor
         mock_state.get_review_count.return_value = 0
@@ -464,8 +464,8 @@ async def test_markdown_analysis_includes_summary(pr_review_stage):
 
         result = await pr_review_stage.execute(context)
 
-        # Verify markdown_analysis contains key information
-        analysis = result['markdown_analysis']
+        # Verify agent_output contains key information
+        analysis = result['agent_output']
         assert '## PR Review - Cycle 1/3' in analysis
         assert 'https://github.com/o/r/pull/123' in analysis
         assert '**Parent Issue**: #42' in analysis

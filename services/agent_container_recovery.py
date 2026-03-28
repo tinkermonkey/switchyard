@@ -1624,7 +1624,7 @@ class AgentContainerRecovery:
                 current_active_run = pipeline_run_manager.get_active_pipeline_run(project, issue_number)
 
                 if current_active_run:
-                    current_run_id = current_active_run.get('id')
+                    current_run_id = current_active_run.id
 
                     if current_run_id != pipeline_run_id:
                         # The current active run is DIFFERENT from the one that started this container

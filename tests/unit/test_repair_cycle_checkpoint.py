@@ -534,7 +534,7 @@ class TestSystemicFailureDetection:
         # → agents import chain.
         mock_executor = MagicMock()
         mock_executor.execute_agent = AsyncMock(
-            return_value={"markdown_analysis": "This is not JSON at all!"}
+            return_value={"agent_output": "This is not JSON at all!"}
         )
         mock_agent_executor_mod = MagicMock()
         mock_agent_executor_mod.get_agent_executor = MagicMock(return_value=mock_executor)

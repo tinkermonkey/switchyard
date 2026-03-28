@@ -119,7 +119,7 @@ class WorkBreakdownAgent(AnalysisAgent):
         if mode == 'initial' or self._should_manage_sub_issues(task_context):
             project_name = task_context.get('project', 'unknown')
             try:
-                markdown_output = context.get('markdown_analysis', '')
+                markdown_output = context.get('agent_output') or context.get('markdown_analysis', '')
                 sub_issues = self._parse_sub_issues_from_output(markdown_output)
 
                 if sub_issues:

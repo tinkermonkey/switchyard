@@ -288,7 +288,7 @@ class TestDiscussionsWorkspaceContext:
 
         result = {
             'status': 'success',
-            'markdown_analysis': 'Test markdown output for discussion posting'
+            'agent_output': 'Test markdown output for discussion posting'
         }
 
         mock_project_config = MagicMock()
