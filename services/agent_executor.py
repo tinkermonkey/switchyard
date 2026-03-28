@@ -537,15 +537,7 @@ class AgentExecutor:
                         raise e
 
             # Extract output from result for event emission
-            output_text = None
-            if isinstance(result, dict):
-                # Try to get markdown output or raw analysis result
-                output_text = result.get('markdown_analysis') or result.get('raw_analysis_result')
-                
-                # If not found at top level, try nested in context
-                if not output_text and 'context' in result:
-                    ctx = result['context']
-                    output_text = ctx.get('markdown_analysis') or ctx.get('raw_analysis_result')
+            output_text = self._extract_markdown_output(agent_name, result) if isinstance(result, dict) else None
 
             duration_ms = (time.time() - start_time) * 1000
             self.obs.emit_agent_completed(

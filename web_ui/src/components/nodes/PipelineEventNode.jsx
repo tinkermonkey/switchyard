@@ -65,7 +65,9 @@ export default function PipelineEventNode({ data, nodeStyle, icon }) {
           />
         )}
 
-        <Handle type="target" position={Position.Top} style={{ opacity: 0 }} />
+        <Handle type="target" position={Position.Top}  style={{ opacity: 0 }} />
+        <Handle id="left"  type="target" position={Position.Left}  style={{ opacity: 0 }} />
+        <Handle id="right" type="source" position={Position.Right} style={{ opacity: 0 }} />
 
         <div className="flex items-start gap-2">
           {icon && <div className="mt-0.5 shrink-0">{icon}</div>}

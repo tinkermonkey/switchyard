@@ -25,6 +25,11 @@ function formatDuration(ms) {
   return s > 0 ? `${m}m ${s}s` : `${m}m`
 }
 
+function formatDurationSeconds(sec) {
+  if (sec == null || sec < 0) return null
+  return formatDuration(sec * 1000)
+}
+
 function extractMdFiles(promptText) {
   if (!promptText) return []
   const regex = /`([^`]+\.md)`/g
@@ -58,36 +63,56 @@ export function buildPromptsGraph({ events, selectedPipelineRun, filters = {} })
   const completedMap = new Map()      // task_id → agent_completed event (normalized)
   const failedMap    = new Map()      // task_id → agent_failed event (normalized)
 
+  const commentEvents = []            // github_comment_posted events (normalized)
+  let pipelineCompletedEvent = null   // first pipeline_run_completed event
+
   for (const event of events) {
     const taskId = event.task_id
-    if (!taskId) continue
 
     switch (event.event_type) {
       case 'agent_initialized':
-        agentInitMap.set(taskId, {
+        if (taskId) agentInitMap.set(taskId, {
           ...event,
           agent_execution_id: event.agent_execution_id ?? event.data?.agent_execution_id,
         })
         break
       case 'prompt_constructed':
-        promptMap.set(taskId, {
+        if (taskId) promptMap.set(taskId, {
           ...event,
           prompt: event.prompt ?? event.data?.prompt ?? '',
           prompt_components: event.prompt_components ?? event.data?.prompt_components ?? null,
         })
         break
       case 'agent_completed':
-        completedMap.set(taskId, {
+        if (taskId) completedMap.set(taskId, {
           ...event,
           output: event.output ?? event.data?.output ?? null,
           duration_ms: event.duration_ms ?? event.data?.duration_ms ?? null,
         })
         break
       case 'agent_failed':
-        failedMap.set(taskId, {
+        if (taskId) failedMap.set(taskId, {
           ...event,
           error: event.error ?? event.data?.error ?? null,
         })
+        break
+      case 'github_comment_posted':
+        commentEvents.push({
+          ...event,
+          body:          event.data?.body          ?? event.body          ?? '',
+          title:         event.data?.title         ?? event.title         ?? '',
+          object_type:   event.data?.object_type   ?? event.object_type   ?? '',
+          object_number: event.data?.object_number ?? event.object_number ?? 0,
+        })
+        break
+      case 'pipeline_run_completed':
+        if (!pipelineCompletedEvent) {
+          pipelineCompletedEvent = {
+            ...event,
+            duration_seconds: event.data?.duration_seconds ?? event.duration_seconds ?? null,
+            reason:           event.data?.reason           ?? event.reason           ?? 'completed',
+          }
+        }
         break
     }
   }
@@ -96,20 +121,28 @@ export function buildPromptsGraph({ events, selectedPipelineRun, filters = {} })
   let agentEntries = []
   for (const [taskId, initEvent] of agentInitMap) {
     if (!promptMap.has(taskId)) continue
-    agentEntries.push({ taskId, initEvent })
+    agentEntries.push({ kind: 'agent', taskId, initEvent, timestamp: new Date(initEvent.timestamp).getTime() })
   }
 
   // Sort ascending by start time
-  agentEntries.sort((a, b) =>
-    new Date(a.initEvent.timestamp).getTime() - new Date(b.initEvent.timestamp).getTime()
-  )
+  agentEntries.sort((a, b) => a.timestamp - b.timestamp)
 
-  // Apply agent name filter
+  // Apply agent name filter (only to agent entries; comments always shown)
   if (filterAgent) {
     agentEntries = agentEntries.filter(e => e.initEvent.agent === filterAgent)
   }
 
-  if (!agentEntries.length) {
+  // Normalise comment timestamps for sorting
+  const normalizedComments = commentEvents.map(e => ({
+    kind: 'comment',
+    event: e,
+    timestamp: new Date(e.timestamp).getTime(),
+  }))
+
+  // Build combined backbone timeline: agents + comments, sorted by timestamp
+  const timeline = [...agentEntries, ...normalizedComments].sort((a, b) => a.timestamp - b.timestamp)
+
+  if (timeline.length === 0 && !pipelineCompletedEvent) {
     return { nodes: [], edges: [] }
   }
 
@@ -136,114 +169,224 @@ export function buildPromptsGraph({ events, selectedPipelineRun, filters = {} })
     style: { minWidth: START_NODE_WIDTH },
   })
 
-  // ── Agent + prompt node triples ───────────────────────────────────────────
-  agentEntries.forEach(({ taskId, initEvent }, idx) => {
-    const agentCenterX = FIRST_AGENT_CENTER_X + idx * AGENT_SPACING
-    const agentName    = initEvent.agent ?? 'unknown'
-    const promptEvent  = promptMap.get(taskId)
-    const completedEvent = completedMap.get(taskId)
-    const failedEvent    = failedMap.get(taskId)
+  // ── Timeline entries (agents + comments) ─────────────────────────────────
+  let prevBackboneId = 'prompts-start'
 
-    const status = completedEvent ? 'completed'
-                 : failedEvent    ? 'failed'
-                 : 'running'
-    const isActive = status === 'running'
-    const durationMs = completedEvent?.duration_ms ?? null
+  timeline.forEach((entry, idx) => {
+    const spineX = FIRST_AGENT_CENTER_X + idx * AGENT_SPACING
 
-    const agentNodeId  = `prompts-agent-${taskId}`
-    const inputNodeId  = `prompts-input-${taskId}`
-    const outputNodeId = `prompts-output-${taskId}`
+    if (entry.kind === 'agent') {
+      const { taskId, initEvent } = entry
+      const agentName      = initEvent.agent ?? 'unknown'
+      const promptEvent    = promptMap.get(taskId)
+      const completedEvent = completedMap.get(taskId)
+      const failedEvent    = failedMap.get(taskId)
 
-    // Agent execution node (reuses AgentExecutionNode)
+      const status = completedEvent ? 'completed'
+                   : failedEvent    ? 'failed'
+                   : 'running'
+      const isActive   = status === 'running'
+      const durationMs = completedEvent?.duration_ms ?? null
+
+      const agentNodeId  = `prompts-agent-${taskId}`
+      const inputNodeId  = `prompts-input-${taskId}`
+      const outputNodeId = `prompts-output-${taskId}`
+
+      // Agent execution node
+      nodes.push({
+        id: agentNodeId,
+        type: 'agentExecution',
+        position: { x: spineX - AGENT_NODE_WIDTH / 2, y: AGENT_ROW_Y },
+        data: {
+          label: formatAgentLabel(agentName),
+          status,
+          isActive,
+          durationMs,
+          inputTokens: null,
+          outputTokens: null,
+          tools: null,
+          event: initEvent,
+        },
+        draggable: false,
+      })
+
+      // Input prompt node
+      if (showInput) {
+        const promptText       = promptEvent.prompt
+        const promptComponents = promptEvent.prompt_components
+        const mdFiles          = extractMdFiles(promptText)
+
+        nodes.push({
+          id: inputNodeId,
+          type: 'promptInput',
+          position: { x: spineX - PROMPT_NODE_WIDTH - HALF_GAP, y: PROMPT_ROW_Y },
+          data: {
+            taskId,
+            agentName,
+            promptText,
+            promptComponents,
+            mdFiles,
+            timestamp: promptEvent.timestamp,
+          },
+          draggable: false,
+        })
+
+        edges.push({
+          id: `edge-agent-input-${taskId}`,
+          source: agentNodeId,
+          target: inputNodeId,
+          type: 'default',
+          style: { stroke: '#4b5563', strokeWidth: 1, strokeDasharray: '4 3', opacity: 0.6 },
+        })
+      }
+
+      // Output node
+      if (showOutput) {
+        const outputText = completedEvent?.output ?? null
+        const errorText  = failedEvent?.error ?? null
+
+        nodes.push({
+          id: outputNodeId,
+          type: 'promptOutput',
+          position: { x: spineX + HALF_GAP, y: PROMPT_ROW_Y },
+          data: {
+            taskId,
+            agentName,
+            outputText,
+            errorText,
+            status,
+            durationMs,
+            durationStr: formatDuration(durationMs),
+            timestamp: (completedEvent ?? failedEvent)?.timestamp ?? null,
+          },
+          draggable: false,
+        })
+
+        edges.push({
+          id: `edge-agent-output-${taskId}`,
+          source: agentNodeId,
+          target: outputNodeId,
+          type: 'default',
+          style: { stroke: '#4b5563', strokeWidth: 1, strokeDasharray: '4 3', opacity: 0.6 },
+        })
+      }
+
+      // Backbone edge: prevNode → this agent (left/right handles)
+      edges.push({
+        id: `edge-backbone-${idx}`,
+        source: prevBackboneId,
+        sourceHandle: 'right',
+        target: agentNodeId,
+        targetHandle: 'left',
+        type: 'default',
+        markerEnd: { type: MarkerType.ArrowClosed },
+        style: { stroke: '#30363d', strokeWidth: 1.5 },
+      })
+      prevBackboneId = agentNodeId
+
+    } else {
+      // GitHub comment entry
+      const { event: commentEvent } = entry
+      const commentId    = `prompts-comment-${idx}`
+      const commentBodyId = `prompts-comment-body-${idx}`
+
+      const objectLabel  = commentEvent.object_type && commentEvent.object_number
+        ? `${commentEvent.object_type} #${commentEvent.object_number}`
+        : 'GitHub'
+      const commentLabel = commentEvent.title || objectLabel
+
+      const timestampStr = commentEvent.timestamp
+        ? new Date(commentEvent.timestamp).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+        : null
+
+      // Comment backbone node (compact)
+      nodes.push({
+        id: commentId,
+        type: 'pipelineEvent',
+        position: { x: spineX - AGENT_NODE_WIDTH / 2, y: AGENT_ROW_Y },
+        data: {
+          label: commentLabel,
+          metadata: timestampStr ? `Posted ${timestampStr}` : objectLabel,
+          event: commentEvent,
+          isActive: false,
+        },
+        draggable: false,
+        style: { minWidth: AGENT_NODE_WIDTH },
+      })
+
+      // Comment body node (full content, centered below backbone)
+      if (showOutput) {
+        nodes.push({
+          id: commentBodyId,
+          type: 'promptOutput',
+          position: { x: spineX - PROMPT_NODE_WIDTH / 2, y: PROMPT_ROW_Y },
+          data: {
+            taskId: null,
+            agentName: objectLabel,
+            outputText: commentEvent.body || null,
+            errorText: null,
+            status: 'completed',
+            durationMs: null,
+            durationStr: null,
+            timestamp: commentEvent.timestamp ?? null,
+          },
+          draggable: false,
+        })
+
+        edges.push({
+          id: `edge-comment-body-${idx}`,
+          source: commentId,
+          target: commentBodyId,
+          type: 'default',
+          style: { stroke: '#4b5563', strokeWidth: 1, strokeDasharray: '4 3', opacity: 0.6 },
+        })
+      }
+
+      // Backbone edge: prevNode → this comment (left/right handles)
+      edges.push({
+        id: `edge-backbone-${idx}`,
+        source: prevBackboneId,
+        sourceHandle: 'right',
+        target: commentId,
+        targetHandle: 'left',
+        type: 'default',
+        markerEnd: { type: MarkerType.ArrowClosed },
+        style: { stroke: '#30363d', strokeWidth: 1.5 },
+      })
+      prevBackboneId = commentId
+    }
+  })
+
+  // ── Pipeline completed terminal node ──────────────────────────────────────
+  if (pipelineCompletedEvent) {
+    const completedX = FIRST_AGENT_CENTER_X + timeline.length * AGENT_SPACING
+    const durationStr = formatDurationSeconds(pipelineCompletedEvent.duration_seconds)
+
     nodes.push({
-      id: agentNodeId,
-      type: 'agentExecution',
-      position: { x: agentCenterX - AGENT_NODE_WIDTH / 2, y: AGENT_ROW_Y },
+      id: 'prompts-pipeline-completed',
+      type: 'pipelineCompleted',
+      position: { x: completedX - START_NODE_WIDTH / 2, y: AGENT_ROW_Y },
       data: {
-        label: formatAgentLabel(agentName),
-        status,
-        isActive,
-        durationMs,
-        inputTokens: null,
-        outputTokens: null,
-        tools: null,
-        event: initEvent,
+        label: 'Pipeline Completed',
+        metadata: durationStr ? `Duration: ${durationStr}` : (pipelineCompletedEvent.reason ?? 'completed'),
+        event: pipelineCompletedEvent,
+        isActive: false,
       },
       draggable: false,
+      style: { minWidth: START_NODE_WIDTH },
     })
 
-    // Input prompt node
-    if (showInput) {
-      const promptText       = promptEvent.prompt
-      const promptComponents = promptEvent.prompt_components
-      const mdFiles          = extractMdFiles(promptText)
-
-      nodes.push({
-        id: inputNodeId,
-        type: 'promptInput',
-        position: { x: agentCenterX - PROMPT_NODE_WIDTH - HALF_GAP, y: PROMPT_ROW_Y },
-        data: {
-          taskId,
-          agentName,
-          promptText,
-          promptComponents,
-          mdFiles,
-          timestamp: promptEvent.timestamp,
-        },
-        draggable: false,
-      })
-
-      edges.push({
-        id: `edge-agent-input-${taskId}`,
-        source: agentNodeId,
-        target: inputNodeId,
-        type: 'default',
-        style: { stroke: '#4b5563', strokeWidth: 1, strokeDasharray: '4 3', opacity: 0.6 },
-      })
-    }
-
-    // Output node
-    if (showOutput) {
-      const outputText = completedEvent?.output ?? null
-      const errorText  = failedEvent?.error ?? null
-
-      nodes.push({
-        id: outputNodeId,
-        type: 'promptOutput',
-        position: { x: agentCenterX + HALF_GAP, y: PROMPT_ROW_Y },
-        data: {
-          taskId,
-          agentName,
-          outputText,
-          errorText,
-          status,
-          durationMs,
-          durationStr: formatDuration(durationMs),
-          timestamp: (completedEvent ?? failedEvent)?.timestamp ?? null,
-        },
-        draggable: false,
-      })
-
-      edges.push({
-        id: `edge-agent-output-${taskId}`,
-        source: agentNodeId,
-        target: outputNodeId,
-        type: 'default',
-        style: { stroke: '#4b5563', strokeWidth: 1, strokeDasharray: '4 3', opacity: 0.6 },
-      })
-    }
-
-    // Backbone edge: start → first agent, or agent[i-1] → agent[i]
-    const backboneSource = idx === 0 ? 'prompts-start' : `prompts-agent-${agentEntries[idx - 1].taskId}`
     edges.push({
-      id: `edge-backbone-${idx}`,
-      source: backboneSource,
-      target: agentNodeId,
+      id: 'edge-backbone-completed',
+      source: prevBackboneId,
+      sourceHandle: 'right',
+      target: 'prompts-pipeline-completed',
+      targetHandle: 'left',
       type: 'default',
       markerEnd: { type: MarkerType.ArrowClosed },
       style: { stroke: '#30363d', strokeWidth: 1.5 },
     })
-  })
+  }
 
   return { nodes, edges }
 }

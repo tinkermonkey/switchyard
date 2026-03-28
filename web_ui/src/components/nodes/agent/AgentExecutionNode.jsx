@@ -99,7 +99,9 @@ export default function AgentExecutionNode({ data }) {
       }}
       onClick={executionId ? (e) => { e.stopPropagation(); setModalOpen(true) } : undefined}
     >
-      <Handle type="target" position={Position.Top} style={{ opacity: 0 }} />
+      <Handle type="target" position={Position.Top}  style={{ opacity: 0 }} />
+      <Handle id="left"  type="target" position={Position.Left}  style={{ opacity: 0 }} />
+      <Handle id="right" type="source" position={Position.Right} style={{ opacity: 0 }} />
 
       {/* Running stripe animation */}
       {effectiveStatus === 'running' && (

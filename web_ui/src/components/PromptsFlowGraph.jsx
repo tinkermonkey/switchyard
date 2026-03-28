@@ -7,10 +7,12 @@ import PromptOutputNode from './nodes/prompts/PromptOutputNode.jsx'
 import { buildPromptsGraph } from '../utils/buildPromptsGraph.js'
 
 const nodeTypes = {
-  pipelineStarted: eventNodeTypes.pipelineStarted,
-  agentExecution:  eventNodeTypes.agentExecution,
-  promptInput:     PromptInputNode,
-  promptOutput:    PromptOutputNode,
+  pipelineStarted:   eventNodeTypes.pipelineStarted,
+  pipelineCompleted: eventNodeTypes.pipelineCompleted,
+  pipelineEvent:     eventNodeTypes.pipelineEvent,
+  agentExecution:    eventNodeTypes.agentExecution,
+  promptInput:       PromptInputNode,
+  promptOutput:      PromptOutputNode,
 }
 
 export default function PromptsFlowGraph({ events, selectedPipelineRun, loading }) {
