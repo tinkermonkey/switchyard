@@ -768,9 +768,10 @@ class ReviewCycleExecutor:
                         await github.post_issue_comment(
                             issue_number,
                             escalation_message,
-                            repository
+                            repository,
+                            pipeline_run_id=existing_cycle.pipeline_run_id,
                         )
-                    
+
                     # Return current column, cycle not complete
                     return column.name, False
                 
@@ -853,7 +854,8 @@ class ReviewCycleExecutor:
                         await github.post_issue_comment(
                             issue_number,
                             error_message,
-                            repository
+                            repository,
+                            pipeline_run_id=existing_cycle.pipeline_run_id,
                         )
 
                     raise
@@ -1014,7 +1016,8 @@ class ReviewCycleExecutor:
                 await github.post_issue_comment(
                     issue_number,
                     error_message,
-                    repository
+                    repository,
+                    pipeline_run_id=pipeline_run_id,
                 )
 
             raise
@@ -2829,7 +2832,8 @@ _Automated review cycle by Claude Code Orchestrator_
             await github.post_issue_comment(
                 cycle_state.issue_number,
                 summary,
-                cycle_state.repository
+                cycle_state.repository,
+                pipeline_run_id=cycle_state.pipeline_run_id,
             )
 
     async def _escalate_blocked(self, cycle_state: ReviewCycleState, review_result):
@@ -2911,7 +2915,8 @@ _Escalated by Claude Code Orchestrator - Monitoring for your response..._
             await github.post_issue_comment(
                 cycle_state.issue_number,
                 escalation_comment,
-                cycle_state.repository
+                cycle_state.repository,
+                pipeline_run_id=cycle_state.pipeline_run_id,
             )
 
         logger.warning(
@@ -2985,7 +2990,8 @@ _Escalated by Claude Code Orchestrator_
             await github.post_issue_comment(
                 cycle_state.issue_number,
                 escalation_comment,
-                cycle_state.repository
+                cycle_state.repository,
+                pipeline_run_id=cycle_state.pipeline_run_id,
             )
 
         logger.warning(

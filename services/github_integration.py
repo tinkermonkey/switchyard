@@ -752,12 +752,13 @@ class GitHubIntegration:
         try:
             issue_number = context.get('issue_number')
             repository = context.get('repository')
+            pipeline_run_id = context.get('pipeline_run_id')
 
             if not issue_number:
                 logger.error("No issue_number in context for issue post")
                 return {'success': False, 'error': 'No issue_number'}
 
-            return await self.post_issue_comment(issue_number, comment, repository)
+            return await self.post_issue_comment(issue_number, comment, repository, pipeline_run_id=pipeline_run_id)
 
         except Exception as e:
             logger.error(f"Error posting issue comment: {e}")
