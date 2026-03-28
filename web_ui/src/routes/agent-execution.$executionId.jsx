@@ -406,13 +406,18 @@ function AgentExecutionView() {
       }
     }
 
-    // Use prompt_event from API response instead of searching events
+    // Use prompt_event from API response instead of searching events.
+    // agent-events-* documents are indexed in two ways:
+    //   1. Directly by observability.py (**data flattened) → prompt is at promptEvent.prompt
+    //   2. Via log_collector (raw_event wrapper)           → prompt is at promptEvent.raw_event.data.prompt
+    // Support both paths so either document format works.
     let inputPrompt = null
-    if (promptEvent && promptEvent.raw_event?.data?.prompt) {
+    if (promptEvent) {
+      const promptText = promptEvent.prompt || promptEvent.raw_event?.data?.prompt
       const eventTimestamp = normalizeTimestamp(promptEvent.timestamp)
-      if (eventTimestamp) {
+      if (promptText && eventTimestamp) {
         inputPrompt = {
-          text: promptEvent.raw_event.data.prompt,
+          text: promptText,
           timestamp: eventTimestamp,
           agent: promptEvent.agent_name || promptEvent.agent
         }

@@ -156,11 +156,15 @@ export default function AgentExecutionDetailModal({ executionId, onClose }) {
     }
 
     let inputPrompt = null
-    if (promptEvent?.raw_event?.data?.prompt) {
+    if (promptEvent) {
+      // agent-events-* has two document formats depending on indexing path:
+      //   - Directly indexed by observability.py: prompt at top level (promptEvent.prompt)
+      //   - Indexed via log_collector raw_event wrapper: promptEvent.raw_event.data.prompt
+      const promptText = promptEvent.prompt || promptEvent.raw_event?.data?.prompt
       const ts = normalizeTimestamp(promptEvent.timestamp)
-      if (ts) {
+      if (promptText && ts) {
         inputPrompt = {
-          text: promptEvent.raw_event.data.prompt,
+          text: promptText,
           timestamp: ts,
           agent: promptEvent.agent_name || promptEvent.agent,
         }

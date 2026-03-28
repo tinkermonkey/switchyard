@@ -9,6 +9,11 @@ from pathlib import Path
 from claude.docker_runner import docker_runner
 from services.project_workspace import workspace_manager
 
+try:
+    import redis as redis_lib
+except ImportError:
+    redis_lib = None
+
 logger = logging.getLogger(__name__)
 
 async def run_claude_code(prompt: str, context: Dict[str, Any]) -> str:
@@ -209,12 +214,36 @@ Files: {context.get('files', [])}
                 agent_name=agent,
                 task_id=task_id,
                 project=project,
+                issue_number=context.get('issue_number'),
+                pipeline_run_id=(
+                    context.get('pipeline_run_id')
+                    or context.get('context', {}).get('pipeline_run_id')
+                ),
             )
             env_builder = ClaudeEnvironmentBuilder(
                 otel_host=os.environ.get('OTEL_COLLECTOR_HOST', 'otel-collector')
             )
             # Inherit the full orchestrator environment then overlay Claude-specific vars
             env = {**os.environ.copy(), **env_builder.build(run_ctx)}
+
+            # Connect to Redis for claude-streams-* persistence (fire-and-forget)
+            _redis_client = None
+            if redis_lib is not None:
+                try:
+                    _redis_client = redis_lib.Redis(
+                        host=env.get('REDIS_HOST', 'redis'),
+                        port=int(env.get('REDIS_PORT', 6379)),
+                        socket_timeout=1.0,
+                        socket_connect_timeout=2.0,
+                        decode_responses=False,
+                    )
+                    _redis_client.ping()
+                except Exception:
+                    _redis_client = None
+
+            # Resolve pipeline_run_id once for use in Redis stream writes below
+            _local_pipeline_run_id = run_ctx.pipeline_run_id or ''
+            _local_issue_number = run_ctx.issue_number or ''
 
             logger.debug(f"Executing Claude CLI in {work_dir}")
             logger.debug(f"Command: {' '.join(cmd[:3])}...")  # Don't log full prompt
@@ -311,6 +340,30 @@ Files: {context.get('files', [])}
                         # Stream event to websocket if callback provided
                         if stream_callback:
                             stream_callback(event)
+
+                        # Persist event to claude-streams-* via Redis Stream (same path as
+                        # docker-claude-wrapper.py for containerized agents)
+                        if _redis_client is not None:
+                            try:
+                                event_envelope = {
+                                    'agent': agent,
+                                    'task_id': task_id,
+                                    'project': project,
+                                    'issue_number': _local_issue_number,
+                                    'pipeline_run_id': _local_pipeline_run_id,
+                                    'timestamp': event.get('timestamp', time.time()),
+                                    'event': event,
+                                }
+                                serialized = json.dumps(event_envelope).encode()
+                                _redis_client.xadd(
+                                    'orchestrator:claude_logs_stream',
+                                    {'log': serialized},
+                                    maxlen=50000,
+                                    approximate=True,
+                                )
+                                _redis_client.publish('orchestrator:claude_stream', serialized)
+                            except Exception:
+                                pass  # Non-blocking — output collection must not block execution
 
                         # Track token usage from stream events
                         if 'usage' in event:
