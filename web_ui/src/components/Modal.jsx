@@ -16,10 +16,10 @@ export default function Modal({ title, children, onClose }) {
       onClick={onClose}
     >
       <div
-        className="bg-gh-canvas-subtle border border-gh-border rounded-md w-full max-w-6xl h-[90vh] flex flex-col"
+        className="bg-gh-canvas-subtle border border-gh-border rounded-md w-full max-w-6xl h-[95vh] md:h-[90vh] flex flex-col"
         onClick={(e) => e.stopPropagation()}
       >
-        <div className="flex justify-between items-center p-5 border-b border-gh-border flex-shrink-0">
+        <div className="flex justify-between items-center p-3 md:p-5 border-b border-gh-border flex-shrink-0">
           <h3 className="text-gh-accent-primary text-lg font-semibold">{title}</h3>
           <button
             onClick={onClose}
@@ -28,7 +28,7 @@ export default function Modal({ title, children, onClose }) {
             <X className="w-6 h-6" />
           </button>
         </div>
-        <div className="overflow-auto p-5 flex-1">{children}</div>
+        <div className="overflow-auto p-3 md:p-5 flex-1">{children}</div>
       </div>
     </div>
   )

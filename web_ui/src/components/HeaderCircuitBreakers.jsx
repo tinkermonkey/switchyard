@@ -13,7 +13,7 @@ export default function HeaderCircuitBreakers() {
 
   if (loading) {
     return (
-      <HeaderBox title="Circuit Breakers" minWidth="min-w-[180px]">
+      <HeaderBox title="Circuit Breakers" minWidth="md:min-w-[180px]">
         <p className="text-xs text-gh-fg-muted">Loading...</p>
       </HeaderBox>
     )
@@ -80,7 +80,7 @@ export default function HeaderCircuitBreakers() {
   }
 
   return (
-    <HeaderBox title="Circuit Breakers" minWidth="min-w-[180px]">
+    <HeaderBox title="Circuit Breakers" minWidth="md:min-w-[180px]">
       <div className="space-y-1">
         {circuitBreakers.length === 0 ? (
           <p className="text-xs text-gh-fg-muted">No breakers</p>

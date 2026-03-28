@@ -29,7 +29,7 @@ export default function HeaderClaudeUsage() {
   const sessionPercent = usage.session_usage_percent || 0
 
   return (
-    <HeaderBox title="Claude Usage" minWidth="min-w-[180px]">
+    <HeaderBox title="Claude Usage" minWidth="md:min-w-[180px]">
       <div className="space-y-2">
         {usage.weekly_quota && (
           <div>

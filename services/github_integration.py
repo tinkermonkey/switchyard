@@ -125,7 +125,7 @@ class GitHubIntegration:
 
         return result
 
-    async def post_issue_comment(self, issue_number: int, comment: str, repo: Optional[str] = None) -> Dict[str, Any]:
+    async def post_issue_comment(self, issue_number: int, comment: str, repo: Optional[str] = None, pipeline_run_id: Optional[str] = None) -> Dict[str, Any]:
         """Post a comment to a GitHub issue using REST API with rate limiting.
 
         If the comment exceeds GitHub's character limit, it is automatically
@@ -177,7 +177,8 @@ class GitHubIntegration:
                     body=comment,
                     project=repo_name,
                     repo=f"{self.github_org}/{repo_name}",
-                    comment_id=str(first_result.get('id', ''))
+                    comment_id=str(first_result.get('id', '')),
+                    pipeline_run_id=pipeline_run_id,
                 )
             except Exception:
                 pass
@@ -188,7 +189,7 @@ class GitHubIntegration:
             logger.error(f"Failed to post GitHub comment: {e}", exc_info=True)
             return {'success': False, 'error': str(e)}
 
-    async def post_pr_comment(self, pr_number: int, comment: str, repo: Optional[str] = None) -> Dict[str, Any]:
+    async def post_pr_comment(self, pr_number: int, comment: str, repo: Optional[str] = None, pipeline_run_id: Optional[str] = None) -> Dict[str, Any]:
         """Post a comment to a GitHub pull request using REST API with rate limiting.
 
         If the comment exceeds GitHub's character limit, it is automatically
@@ -239,7 +240,8 @@ class GitHubIntegration:
                     body=comment,
                     project=repo_name,
                     repo=f"{self.github_org}/{repo_name}",
-                    comment_id=str(first_result.get('id', ''))
+                    comment_id=str(first_result.get('id', '')),
+                    pipeline_run_id=pipeline_run_id,
                 )
             except Exception:
                 pass
@@ -255,7 +257,8 @@ class GitHubIntegration:
         pr_number: int,
         review_type: str,  # "approve", "request-changes", "comment"
         body: str,
-        repo: Optional[str] = None
+        repo: Optional[str] = None,
+        pipeline_run_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Create a formal PR review using REST API with rate limiting"""
         try:
@@ -292,7 +295,8 @@ class GitHubIntegration:
                     body=body,
                     project=repo_name,
                     repo=f"{self.github_org}/{repo_name}",
-                    comment_id=str(response.get('id', ''))
+                    comment_id=str(response.get('id', '')),
+                    pipeline_run_id=pipeline_run_id,
                 )
             except Exception:
                 pass
@@ -779,9 +783,9 @@ class GitHubIntegration:
         """Get issue details (simplified wrapper)"""
         return await self.get_issue_details(issue_number, self.repo_name)
 
-    async def post_comment(self, issue_number: int, comment: str) -> Dict[str, Any]:
+    async def post_comment(self, issue_number: int, comment: str, pipeline_run_id: Optional[str] = None) -> Dict[str, Any]:
         """Post comment to issue (simplified wrapper)"""
-        return await self.post_issue_comment(issue_number, comment, self.repo_name)
+        return await self.post_issue_comment(issue_number, comment, self.repo_name, pipeline_run_id=pipeline_run_id)
 
     async def create_pr(
         self,

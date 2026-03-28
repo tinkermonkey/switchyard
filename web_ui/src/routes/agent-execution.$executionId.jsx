@@ -441,7 +441,7 @@ function AgentExecutionView() {
 
   if (loading) {
     return (
-      <div className="min-h-screen p-5 bg-gh-canvas text-gh-fg">
+      <div className="min-h-screen p-2 md:p-5 bg-gh-canvas text-gh-fg">
         <div className="flex items-center justify-center h-96">
           <RefreshCw className="w-8 h-8 animate-spin text-gh-accent-primary" />
         </div>
@@ -451,7 +451,7 @@ function AgentExecutionView() {
 
   if (error || !executionData) {
     return (
-      <div className="min-h-screen p-5 bg-gh-canvas text-gh-fg">
+      <div className="min-h-screen p-2 md:p-5 bg-gh-canvas text-gh-fg">
         <div className="flex items-center justify-center h-96">
           <div className="text-center">
             <p className="text-gh-danger text-lg mb-2">Error</p>
@@ -463,7 +463,7 @@ function AgentExecutionView() {
   }
 
   return (
-    <div className="min-h-screen p-5 bg-gh-canvas text-gh-fg">
+    <div className="min-h-screen p-2 md:p-5 bg-gh-canvas text-gh-fg">
 
       <Header />
 

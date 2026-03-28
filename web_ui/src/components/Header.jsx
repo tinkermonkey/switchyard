@@ -239,9 +239,9 @@ export default function Header() {
       )}
 
       {/* Main Header */}
-      <div className="bg-gh-canvas-subtle p-5 rounded-md border border-gh-border relative">
+      <div className="bg-gh-canvas-subtle p-3 md:p-5 rounded-md border border-gh-border relative">
         {/* Theme toggle + WebSocket indicator - upper right corner */}
-        <div className="absolute top-5 right-5 flex flex-col items-center gap-1.5">
+        <div className="absolute top-2 right-2 md:top-5 md:right-5 flex flex-col items-center gap-1.5">
           <button
             onClick={toggleTheme}
             className="p-2 bg-gh-canvas border border-gh-border rounded-md hover:bg-gh-border-muted transition-colors"
@@ -265,15 +265,15 @@ export default function Header() {
 
         {/* Main content — logo and cards are siblings in the same flex row so the
             logo can stretch to match card height via align-items:stretch (default) */}
-        <div className="flex justify-between items-center gap-4 mr-12">
+        <div className="flex flex-col md:flex-row justify-between items-center gap-4 mr-0 md:mr-12">
           <div className="flex-shrink-0">
             <img
               src={switchyardLogo}
               alt="Switchyard"
-              className="h-32 w-auto"
+              className="h-16 md:h-32 w-auto"
             />
           </div>
-          <div className="flex gap-4 flex-wrap justify-end">
+          <div className="grid grid-cols-2 gap-2 w-full md:w-auto md:flex md:gap-4 md:flex-wrap md:justify-end">
             {connected && (
               <>
                 <HeaderActiveAgents />

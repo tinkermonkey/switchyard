@@ -163,8 +163,8 @@ export default function PipelineRunHeader({
     <div className="mb-2 flex-shrink-0">
       <div className="flex items-start justify-between gap-4">
         <div className="flex-1 min-w-0">
-          <div className="flex items-center gap-3 mb-2">
-            <h2 className="text-xl font-semibold">{pipelineRun.issue_title}</h2>
+          <div className="flex flex-wrap items-center gap-2 md:gap-3 mb-2">
+            <h2 className="text-lg md:text-xl font-semibold break-words min-w-0">{pipelineRun.issue_title}</h2>
             {pipelineRun.lock_status && (
               <LockStatusBadge
                 lockStatus={pipelineRun.lock_status}
@@ -207,7 +207,7 @@ export default function PipelineRunHeader({
               )}
               <button
                 onClick={onDownloadDebugData}
-                className="inline-flex items-center gap-2 px-3 py-1.5 text-sm bg-gh-canvas hover:bg-gh-border-muted transition-colors whitespace-nowrap"
+                className="hidden md:inline-flex items-center gap-2 px-3 py-1.5 text-sm bg-gh-canvas hover:bg-gh-border-muted transition-colors whitespace-nowrap"
                 title="Download debug data as JSON"
               >
                 📥 Download
@@ -215,7 +215,8 @@ export default function PipelineRunHeader({
             </div>
           </div>
 
-          <div className="overflow-x-auto">
+          {/* Desktop: horizontal table */}
+          <div className="hidden md:block overflow-x-auto">
             <table className="text-xs border-collapse">
               <thead>
                 <tr>
@@ -232,6 +233,16 @@ export default function PipelineRunHeader({
                 </tr>
               </tbody>
             </table>
+          </div>
+
+          {/* Mobile: grid layout */}
+          <div className="md:hidden grid grid-cols-2 gap-x-4 gap-y-1 text-xs">
+            {metaCols.map(col => (
+              <div key={col.label}>
+                <span className="text-gh-fg-muted opacity-70 font-medium">{col.label}: </span>
+                <span className="text-gh-fg-muted">{col.value}</span>
+              </div>
+            ))}
           </div>
         </div>
 

@@ -611,7 +611,7 @@ class PRReviewStage(PipelineStage):
                     summary_comment = self._build_cycle_limit_comment(
                         current_cycle, all_created_issues
                     )
-                    self._post_comment_on_issue(repo, parent_issue_number, summary_comment)
+                    self._post_comment_on_issue(repo, parent_issue_number, summary_comment, pipeline_run_id=pipeline_run_id)
 
             else:
                 # Clean pass - advance to Done
@@ -1706,7 +1706,7 @@ Rules:
 
         return issues
 
-    def _post_comment_on_issue(self, repo: str, issue_number: int, comment: str):
+    def _post_comment_on_issue(self, repo: str, issue_number: int, comment: str, pipeline_run_id: Optional[str] = None):
         """Post a comment on a GitHub issue."""
         try:
             subprocess.run(
@@ -1724,6 +1724,7 @@ Rules:
                     body=comment,
                     repo=repo,
                     project=repo.split('/')[-1] if '/' in repo else repo,
+                    pipeline_run_id=pipeline_run_id,
                 )
             except Exception:
                 pass

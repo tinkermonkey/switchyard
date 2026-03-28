@@ -2974,6 +2974,15 @@ class ProjectMonitor:
                 repo_name=project_config.github['repo']
             )
 
+            # Look up the active pipeline run for this issue so comment events are attributed
+            pr_ready_pipeline_run_id = None
+            try:
+                active_run = self.pipeline_run_manager.get_active_pipeline_run(project_name, issue_number)
+                if active_run:
+                    pr_ready_pipeline_run_id = active_run.id
+            except Exception:
+                pass
+
             # Step 2: Check if this issue has a parent (is it a sub-issue?)
             # FIX: Use correct async method get_parent_issue instead of non-existent _get_parent_issue_number
             parent_issue_number = await feature_branch_manager.get_parent_issue(
@@ -3095,7 +3104,8 @@ class ProjectMonitor:
                     await feature_branch_manager.post_feature_completion_comment(
                         github,
                         parent_issue_number,
-                        pr_url
+                        pr_url,
+                        pipeline_run_id=pr_ready_pipeline_run_id,
                     )
 
                     logger.info(f"✓ Posted completion comment to parent issue #{parent_issue_number}")
@@ -3109,7 +3119,8 @@ class ProjectMonitor:
                         parent_issue_number,
                         f"⚠️ **Warning**: All sub-issues have been completed, but the system failed to mark "
                         f"PR #{pr_number} as ready for review. Please manually mark it ready:\n\n"
-                        f"```\ngh pr ready {pr_number}\n```"
+                        f"```\ngh pr ready {pr_number}\n```",
+                        pipeline_run_id=pr_ready_pipeline_run_id,
                     )
             else:
                 logger.info(f"PR #{pr_number} already marked ready, skipping draft→ready transition")
@@ -3148,6 +3159,15 @@ class ProjectMonitor:
         try:
             from config.state_manager import state_manager
             from state_management.pr_review_state_manager import pr_review_state_manager
+
+            # Look up the active pipeline run for comment event attribution
+            advance_pipeline_run_id = None
+            try:
+                active_run = self.pipeline_run_manager.get_active_pipeline_run(project_name, parent_issue_number)
+                if active_run:
+                    advance_pipeline_run_id = active_run.id
+            except Exception:
+                pass
 
             # Find Planning board
             project_state = state_manager.load_project_state(project_name)
@@ -3330,7 +3350,8 @@ class ProjectMonitor:
                             parent_issue_number,
                             f"All sub-issues have been completed, but the maximum automated PR review "
                             f"cycle limit ({MAX_REVIEW_CYCLES}) has been reached. "
-                            f"Further review should be performed manually."
+                            f"Further review should be performed manually.",
+                            pipeline_run_id=advance_pipeline_run_id,
                         )
                         pr_review_state_manager.mark_cycle_limit_notified(
                             project_name, parent_issue_number
@@ -3401,7 +3422,8 @@ class ProjectMonitor:
                         await github.post_comment(
                             parent_issue_number,
                             f"All sub-issues completed again, but the maximum PR review cycle limit ({MAX_REVIEW_CYCLES}) "
-                            f"has been reached. Further review should be performed manually."
+                            f"has been reached. Further review should be performed manually.",
+                            pipeline_run_id=advance_pipeline_run_id,
                         )
                         pr_review_state_manager.mark_cycle_limit_notified(
                             project_name, parent_issue_number
@@ -5188,7 +5210,7 @@ The automated test-fix-validate cycle has failed and requires manual interventio
                         asyncio.set_event_loop(loop2)
                         try:
                             loop2.run_until_complete(
-                                github.post_comment(issue_number, error_comment)
+                                github.post_comment(issue_number, error_comment, pipeline_run_id=pipeline_run.id)
                             )
                         finally:
                             loop2.close()

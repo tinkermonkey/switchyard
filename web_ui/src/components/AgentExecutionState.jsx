@@ -126,7 +126,7 @@ export default function AgentExecutionState({
           <div className="space-y-4">
             {/* First row: Input Prompt and Latest Message side-by-side */}
             {inputPrompt && lastTextMessage && (
-              <div className="flex gap-4">
+              <div className="flex flex-col md:flex-row gap-4">
                 {/* Input Prompt - 50% width */}
                 <div className="flex-1 min-w-0 bg-gh-canvas rounded-md border border-gh-border p-3">
                   <div className="flex items-center justify-between mb-2">
@@ -204,9 +204,9 @@ export default function AgentExecutionState({
             )}
 
             {/* Second row: Tool calls/results (left 70%) and Current Tasks (right 30%) */}
-            <div className="flex gap-4">
+            <div className="flex flex-col md:flex-row gap-4">
               {/* Left side - Tool calls and results */}
-              <div className="flex-[7] min-w-0 space-y-4">
+              <div className="md:flex-[7] min-w-0 space-y-4">
                 {lastToolCall && (
                   <div className="bg-gh-canvas rounded-md border border-gh-border p-3">
                     <div className="flex items-center gap-2 mb-2">
@@ -289,7 +289,7 @@ export default function AgentExecutionState({
               </div>
 
               {/* Right side - Current Tasks */}
-              <div className="flex-[3] min-w-0">
+              <div className="md:flex-[3] min-w-0 order-first md:order-last">
                 {executionData.trigger_source?.startsWith('repair_cycle') && (
                   <RepairCycleStatus events={mergedPipelineEvents} />
                 )}
@@ -299,9 +299,9 @@ export default function AgentExecutionState({
           </div>
         ) : (
           /* When not completed, use original layout */
-          <div className="flex gap-4">
-            {/* Left column - 70% width */}
-            <div className="flex-[7] min-w-0 space-y-4">
+          <div className="flex flex-col md:flex-row gap-4">
+            {/* Left column - 70% width on desktop */}
+            <div className="md:flex-[7] min-w-0 space-y-4">
               {inputPrompt && (
                 <div className="bg-gh-canvas rounded-md border border-gh-border p-3">
                   <div className="flex items-center justify-between mb-2">
@@ -459,8 +459,8 @@ export default function AgentExecutionState({
               )}
             </div>
 
-            {/* Right column - 30% width */}
-            <div className="flex-[3] min-w-0">
+            {/* Right column - 30% width on desktop, shown first on mobile */}
+            <div className="md:flex-[3] min-w-0 order-first md:order-last">
               {executionData.trigger_source?.startsWith('repair_cycle') && (
                 <RepairCycleStatus events={mergedPipelineEvents} />
               )}

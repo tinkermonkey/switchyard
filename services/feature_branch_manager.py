@@ -1010,7 +1010,8 @@ class FeatureBranchManager:
         github_integration,
         issue_number: int,
         branch_name: str,
-        conflict_files: List[str]
+        conflict_files: List[str],
+        pipeline_run_id: Optional[str] = None,
     ):
         """Escalate merge conflict to human intervention"""
         file_list = "\n".join(f"- `{f}`" for f in conflict_files)
@@ -1040,7 +1041,7 @@ git push
 ```
 """
 
-        await github_integration.post_comment(issue_number, message)
+        await github_integration.post_comment(issue_number, message, pipeline_run_id=pipeline_run_id)
         logger.warning(f"Escalated merge conflict for issue #{issue_number}")
 
     async def escalate_stale_branch(
@@ -1048,7 +1049,8 @@ git push
         github_integration,
         parent_issue: int,
         branch_name: str,
-        commits_behind: int
+        commits_behind: int,
+        pipeline_run_id: Optional[str] = None,
     ):
         """Notify about stale branch requiring rebase"""
         message = f"""## 📅 Branch Maintenance Required
@@ -1074,7 +1076,7 @@ git push --force-with-lease
 **Note:** This is a potentially risky operation. Review changes carefully.
 """
 
-        await github_integration.post_comment(parent_issue, message)
+        await github_integration.post_comment(parent_issue, message, pipeline_run_id=pipeline_run_id)
         logger.warning(f"Escalated stale branch for parent #{parent_issue}: {commits_behind} commits behind")
 
     async def prepare_feature_branch(
@@ -1218,7 +1220,8 @@ git push --force-with-lease
                         github_integration,
                         issue_number,
                         branch_name,
-                        e.files
+                        e.files,
+                        pipeline_run_id=pipeline_run_id,
                     )
                     raise
 
@@ -1294,7 +1297,8 @@ Found potentially related branches, but confidence is not high enough for automa
 3. The orchestrator will create a new standalone branch if no action is taken
 
 Waiting for human decision...
-"""
+""",
+                    pipeline_run_id=pipeline_run_id,
                 )
                 logger.warning(
                     f"Medium confidence branch match for issue #{issue_number}. "
@@ -1509,7 +1513,8 @@ Waiting for human decision...
                 github_integration,
                 issue_number,
                 feature_branch.branch_name,
-                e.files
+                e.files,
+                pipeline_run_id=pipeline_run_id,
             )
             raise
 
@@ -1751,10 +1756,19 @@ Waiting for human decision...
 
                         # Post completion comment to parent issue
                         # Only post once - check if we already posted by looking for existing comment
+                        finalize_pipeline_run_id = None
+                        try:
+                            from services.pipeline_run import get_pipeline_run_manager
+                            active_run = get_pipeline_run_manager().get_active_pipeline_run(project, issue_number)
+                            if active_run:
+                                finalize_pipeline_run_id = active_run.id
+                        except Exception:
+                            pass
                         await self.post_feature_completion_comment(
                             github_integration,
                             feature_branch.parent_issue,
-                            pr_result.get("pr_url")
+                            pr_result.get("pr_url"),
+                            pipeline_run_id=finalize_pipeline_run_id,
                         )
                     else:
                         # Log prominent error and post warning to parent issue
@@ -1898,7 +1912,8 @@ Waiting for human decision...
         self,
         github_integration,
         parent_issue: int,
-        pr_url: Optional[str]
+        pr_url: Optional[str],
+        pipeline_run_id: Optional[str] = None,
     ):
         """Post completion comment to parent issue"""
         message = f"""## ✅ Feature Complete
@@ -1910,7 +1925,7 @@ All sub-issues have been completed and changes have been committed.
 The PR is now ready for review and can be merged when approved.
 """
 
-        await github_integration.post_comment(parent_issue, message)
+        await github_integration.post_comment(parent_issue, message, pipeline_run_id=pipeline_run_id)
         logger.info(f"Posted completion comment to parent issue #{parent_issue}")
 
     async def cleanup_orphaned_branches(self, project: str, github_integration):

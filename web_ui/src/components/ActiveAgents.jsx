@@ -81,7 +81,7 @@ const ActiveAgents = ({
     const readableName = formatAgentName(agent.agent)
     const containerProps = typeof ContainerComponent === 'string' 
       ? { className: containerClassName }
-      : { title: readableName, minWidth: 'min-w-[200px]' }
+      : { title: readableName, minWidth: 'md:min-w-[200px]' }
     
     const statusColor = getAgentStatusColor(agent.started_at)
 
@@ -190,7 +190,7 @@ const ActiveAgents = ({
             </div>
           </div>
         ) : (
-          <ContainerComponent title="Active Agents" minWidth="min-w-[180px]">
+          <ContainerComponent title="Active Agents" minWidth="md:min-w-[180px]">
             <div className="text-center text-gh-fg-muted text-sm py-2">
               <Activity className="w-6 h-6 mx-auto mb-1 opacity-50" />
               <p>No active agents</p>

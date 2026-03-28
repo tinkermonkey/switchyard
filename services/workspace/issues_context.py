@@ -126,7 +126,8 @@ class IssuesWorkspaceContext(WorkspaceContext):
 
         await self.github.post_comment(
             self.issue_number,
-            markdown_output
+            markdown_output,
+            pipeline_run_id=self.task_context.get('pipeline_run_id'),
         )
 
         return {

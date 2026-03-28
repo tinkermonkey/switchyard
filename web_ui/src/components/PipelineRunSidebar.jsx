@@ -54,6 +54,8 @@ export default function PipelineRunSidebar({
   activeFilters,
   onFiltersChange,
   filterOptions,
+  isOpen = false,
+  onToggle,
 }) {
   const completedListScrollRef = useRef(null)
   const savedCompletedScrollPos = useRef(0)
@@ -106,8 +108,8 @@ export default function PipelineRunSidebar({
 
   const hasActiveFilters = projectFilter || boardFilter || outcomeFilter
 
-  return (
-    <div className="w-64 flex-shrink-0 bg-gh-canvas-subtle rounded-md border border-gh-border p-4 flex flex-col min-h-0">
+  const sidebarContent = (
+    <>
       <div className="flex items-center gap-2 mb-3 flex-shrink-0">
         <h3 className="text-lg font-semibold">Pipeline Runs</h3>
       </div>
@@ -156,7 +158,7 @@ export default function PipelineRunSidebar({
               <select
                 value={projectFilter}
                 onChange={e => onFiltersChange({ ...activeFilters, project: e.target.value })}
-                className="w-full text-xs bg-gh-canvas border border-gh-border rounded px-2 py-1 text-gh-fg"
+                className="w-full text-xs bg-gh-canvas border border-gh-border rounded px-2 py-2 md:py-1 text-gh-fg"
               >
                 <option value="">Project</option>
                 {projectOptions.map(p => (
@@ -168,7 +170,7 @@ export default function PipelineRunSidebar({
               <select
                 value={boardFilter}
                 onChange={e => onFiltersChange({ ...activeFilters, board: e.target.value })}
-                className="w-full text-xs bg-gh-canvas border border-gh-border rounded px-2 py-1 text-gh-fg"
+                className="w-full text-xs bg-gh-canvas border border-gh-border rounded px-2 py-2 md:py-1 text-gh-fg"
               >
                 <option value="">Board</option>
                 {boardOptions.map(b => (
@@ -180,7 +182,7 @@ export default function PipelineRunSidebar({
               <select
                 value={outcomeFilter}
                 onChange={e => onFiltersChange({ ...activeFilters, outcome: e.target.value })}
-                className="w-full text-xs bg-gh-canvas border border-gh-border rounded px-2 py-1 text-gh-fg"
+                className="w-full text-xs bg-gh-canvas border border-gh-border rounded px-2 py-2 md:py-1 text-gh-fg"
               >
                 <option value="">Outcome</option>
                 {outcomeOptions.map(o => (
@@ -226,6 +228,39 @@ export default function PipelineRunSidebar({
           </>
         )}
       </div>
-    </div>
+    </>
+  )
+
+  return (
+    <>
+      {/* Desktop: static sidebar */}
+      <div className="hidden md:flex w-64 flex-shrink-0 bg-gh-canvas-subtle rounded-md border border-gh-border p-4 flex-col min-h-0">
+        {sidebarContent}
+      </div>
+
+      {/* Mobile: bottom sheet */}
+      <div className="md:hidden">
+        {/* Backdrop */}
+        {isOpen && (
+          <div
+            className="fixed inset-0 bg-black/50 z-30"
+            onClick={onToggle}
+          />
+        )}
+
+        {/* Sheet */}
+        <div
+          className={`fixed inset-x-0 bottom-0 z-40 bg-gh-canvas-subtle border-t border-gh-border rounded-t-xl max-h-[70vh] flex flex-col p-4 transform transition-transform duration-200 ease-out ${
+            isOpen ? 'translate-y-0' : 'translate-y-full'
+          }`}
+        >
+          {/* Drag handle */}
+          <div className="flex justify-center mb-3 flex-shrink-0">
+            <div className="w-10 h-1 bg-gh-border-muted rounded-full" />
+          </div>
+          {sidebarContent}
+        </div>
+      </div>
+    </>
   )
 }

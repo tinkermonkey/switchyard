@@ -343,6 +343,7 @@ class WorkBreakdownAgent(AnalysisAgent):
                         body=body,
                         project=project_name,
                         repo=repo,
+                        pipeline_run_id=task_context.get('pipeline_run_id'),
                     )
                 except Exception:
                     pass

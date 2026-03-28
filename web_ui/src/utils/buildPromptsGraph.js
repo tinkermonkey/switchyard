@@ -234,6 +234,7 @@ export function buildPromptsGraph({ events, selectedPipelineRun, filters = {} })
         edges.push({
           id: `edge-agent-input-${taskId}`,
           source: agentNodeId,
+          sourceHandle: 'bottom',
           target: inputNodeId,
           type: 'default',
           style: { stroke: '#4b5563', strokeWidth: 1, strokeDasharray: '4 3', opacity: 0.6 },
@@ -265,6 +266,7 @@ export function buildPromptsGraph({ events, selectedPipelineRun, filters = {} })
         edges.push({
           id: `edge-agent-output-${taskId}`,
           source: agentNodeId,
+          sourceHandle: 'bottom',
           target: outputNodeId,
           type: 'default',
           style: { stroke: '#4b5563', strokeWidth: 1, strokeDasharray: '4 3', opacity: 0.6 },

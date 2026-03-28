@@ -286,11 +286,20 @@ class ScheduledTasksService:
 
                         # Warn if very stale
                         if commits_behind > 50:
+                            stale_pipeline_run_id = None
+                            try:
+                                from services.pipeline_run import get_pipeline_run_manager
+                                active_run = get_pipeline_run_manager().get_active_pipeline_run(project_name, fb.parent_issue)
+                                if active_run:
+                                    stale_pipeline_run_id = active_run.id
+                            except Exception:
+                                pass
                             await feature_branch_manager.escalate_stale_branch(
                                 gh_integration,
                                 fb.parent_issue,
                                 fb.branch_name,
-                                commits_behind
+                                commits_behind,
+                                pipeline_run_id=stale_pipeline_run_id,
                             )
                             warning_count += 1
                             logger.warning(

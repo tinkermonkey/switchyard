@@ -10,7 +10,7 @@ export default function HeaderSystemHealth() {
 
   if (loading || !checks) {
     return (
-      <HeaderBox title="API Usage" minWidth="min-w-[240px]">
+      <HeaderBox title="API Usage" minWidth="md:min-w-[240px]">
         <p className="text-xs text-gh-fg-muted">Loading...</p>
       </HeaderBox>
     )
@@ -33,7 +33,7 @@ export default function HeaderSystemHealth() {
   }
 
   return (
-    <HeaderBox title="API Usage" minWidth="min-w-[180px]">
+    <HeaderBox title="API Usage" minWidth="md:min-w-[180px]">
       <div className="space-y-2.5">
         {/* GitHub API Usage */}
         {githubCheck?.api_usage && (

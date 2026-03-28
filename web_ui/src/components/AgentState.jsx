@@ -371,9 +371,9 @@ export default function AgentState() {
           Waiting for agent activity...
         </div>
       ) : (
-        <div className="p-4 flex gap-4">
-          {/* Left column - 70% width */}
-          <div className="flex-[7] space-y-4">
+        <div className="p-4 flex flex-col md:flex-row gap-4">
+          {/* Left column - 70% width on desktop */}
+          <div className="md:flex-[7] space-y-4">
             {inputPrompt && (
               <div className="bg-gh-canvas rounded-md border border-gh-border p-3">
                 <div className="flex items-center justify-between mb-2">
@@ -534,8 +534,8 @@ export default function AgentState() {
             )}
           </div>
 
-          {/* Right column - 30% width */}
-          <div className="flex-[3]">
+          {/* Right column - 30% width on desktop, shown first on mobile */}
+          <div className="md:flex-[3] order-first md:order-last">
             <div className="bg-gh-canvas rounded-md border border-gh-border p-3">
               <div className="mb-3">
                 <div className="flex items-center justify-between mb-1">
