@@ -501,47 +501,86 @@ class ScheduledTasksService:
 
                 for container_name in orphaned_tracking:
                     try:
-                        # Extract project and issue from container name
-                        # Format: claude-agent-{project}-{agent}_{project}_{board}_issue_{issue}_{task_id}_{agent}_{timestamp}
-                        parts = container_name.split('_')
+                        # Read structured data from Redis BEFORE deleting the key.
+                        # The hash stores project, issue_number, agent, task_id reliably.
+                        container_info = redis_client.hgetall(f'agent:container:{container_name}')
 
-                        # Try to find issue number
                         issue_number = None
                         project_name = None
-                        for i, part in enumerate(parts):
-                            if part.isdigit() and i > 0:
-                                # Likely an issue number or timestamp
-                                # Issue numbers are typically in the first half of the name
-                                if i < len(parts) // 2 and int(part) < 10000:
-                                    issue_number = int(part)
-                                    # Project name is usually before the issue number
-                                    if i >= 3:
-                                        project_name = parts[i-3]
-                                    break
+                        if container_info:
+                            try:
+                                issue_number = int(container_info['issue_number']) if container_info.get('issue_number') else None
+                            except (ValueError, TypeError):
+                                pass
+                            project_name = container_info.get('project')
+
+                        if not issue_number or not project_name:
+                            # Fallback: extract from container name (less reliable)
+                            parts = container_name.split('_')
+                            for i, part in enumerate(parts):
+                                if part.isdigit() and i > 0:
+                                    if i < len(parts) // 2 and int(part) < 10000:
+                                        issue_number = int(part)
+                                        if i >= 3:
+                                            project_name = parts[i-3]
+                                        break
 
                         logger.info(
                             f"Cleaning up orphaned tracking for {container_name} "
                             f"(project={project_name}, issue=#{issue_number})"
                         )
 
-                        # Clean up Redis tracking
-                        redis_client.delete(f'agent:container:{container_name}')
-
                         # If we can identify the issue, mark execution as failed and release locks
                         if issue_number and project_name:
-                            # Mark execution as failed (if still in_progress)
-                            # NEW: Use work_execution_tracker API for proper state management
+                            # Coordination guard: prevent double-processing with other mechanisms
                             try:
-                                # Check if there's an active execution for this issue
+                                from services.cleanup_guard import try_claim_cleanup
+                                if not try_claim_cleanup(project_name, issue_number, "docker_reconciliation"):
+                                    # Still clean up the orphaned tracking key even if another
+                                    # mechanism owns the cleanup for this issue's execution state.
+                                    redis_client.delete(f'agent:container:{container_name}')
+                                    continue
+                            except Exception as e:
+                                logger.warning(f"Cleanup guard unavailable, proceeding without coordination: {e}")
+
+                            # Skip if issue has an active review cycle or feedback loop
+                            # — these legitimately have no container running.
+                            try:
+                                from services.review_cycle import review_cycle_executor
+                                from services.human_feedback_loop import human_feedback_loop_executor
+                                rc = review_cycle_executor.active_cycles.get(issue_number)
+                                fl = human_feedback_loop_executor.active_loops.get(issue_number)
+                                if ((rc and rc.project_name == project_name and rc.status == 'awaiting_human_feedback') or
+                                        (fl and fl.project_name == project_name)):
+                                    logger.info(
+                                        f"Skipping orphaned tracking cleanup for {project_name}/#{issue_number} "
+                                        f"- awaiting feedback"
+                                    )
+                                    redis_client.delete(f'agent:container:{container_name}')
+                                    continue
+                            except Exception as e:
+                                logger.warning(
+                                    f"Could not check review/feedback state for {project_name}/#{issue_number} "
+                                    f"during Docker reconciliation: {e}"
+                                )
+                                # Fail-safe: don't clean up execution state for a run we can't verify,
+                                # but still remove the orphaned tracking key (container is gone regardless).
+                                redis_client.delete(f'agent:container:{container_name}')
+                                continue
+
+                        # Clean up Redis tracking (after guard checks pass)
+                        redis_client.delete(f'agent:container:{container_name}')
+
+                        if issue_number and project_name:
+                            # Mark execution as failed (if still in_progress)
+                            try:
                                 if work_execution_tracker.has_active_execution(project_name, issue_number):
-                                    # Get the active execution to determine agent and column
                                     state = work_execution_tracker.load_state(project_name, issue_number)
                                     for execution in state.get('execution_history', []):
                                         if execution.get('outcome') == 'in_progress':
                                             agent = execution.get('agent', 'unknown')
                                             column = execution.get('column', 'unknown')
 
-                                            # Mark as failed using proper API
                                             work_execution_tracker.record_execution_outcome(
                                                 issue_number=issue_number,
                                                 column=column,
@@ -555,41 +594,32 @@ class ScheduledTasksService:
                                             )
 
                                             logger.info(
-                                                f"✓ Docker reconciliation marked execution as failed: "
+                                                f"Docker reconciliation marked execution as failed: "
                                                 f"{project_name}/#{issue_number} {agent}"
                                             )
                                             break  # Only mark the first in_progress execution
                             except Exception as e:
                                 logger.warning(f"Could not update execution state: {e}")
 
-                            # Release any pipeline locks held by this container
+                            # Release any pipeline locks held by this issue via the lock manager API.
+                            # Using the API (instead of deleting lock files directly) ensures proper
+                            # state management and allows the next queued issue to be dispatched.
                             try:
-                                lock_manager = PipelineLockManager()
-                                # Scan for locks held by this issue
-                                import os
-                                locks_dir = lock_manager.state_dir
-                                if locks_dir.exists():
-                                    for lock_file in locks_dir.glob("*.yaml"):
-                                        try:
-                                            from utils.file_lock import file_lock
-                                            import yaml
-
-                                            fl = lock_file.with_suffix(lock_file.suffix + '.lock')
-                                            with file_lock(fl):
-                                                if lock_file.exists():
-                                                    with open(lock_file, 'r') as f:
-                                                        lock_data = yaml.safe_load(f)
-
-                                                    if (lock_data and
-                                                        lock_data.get('lock_status') == 'locked' and
-                                                        lock_data.get('locked_by_issue') == issue_number):
-                                                        logger.info(
-                                                            f"Releasing lock for {project_name}/{lock_data.get('board')} "
-                                                            f"(held by orphaned issue #{issue_number})"
-                                                        )
-                                                        lock_file.unlink()
-                                        except Exception as e:
-                                            logger.warning(f"Error checking lock file {lock_file}: {e}")
+                                from services.pipeline_lock_manager import get_pipeline_lock_manager
+                                lm = get_pipeline_lock_manager()
+                                from config.manager import config_manager
+                                project_config = config_manager.get_project_config(project_name)
+                                for pipeline in project_config.pipelines:
+                                    board = pipeline.board_name
+                                    current_lock = lm.get_lock(project_name, board)
+                                    if (current_lock and
+                                            current_lock.lock_status == 'locked' and
+                                            current_lock.locked_by_issue == issue_number):
+                                        logger.info(
+                                            f"Releasing lock for {project_name}/{board} "
+                                            f"(held by orphaned issue #{issue_number})"
+                                        )
+                                        lm.release_lock(project_name, board, issue_number)
                             except Exception as e:
                                 logger.warning(f"Could not release locks: {e}")
 

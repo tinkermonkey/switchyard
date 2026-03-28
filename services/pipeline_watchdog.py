@@ -173,7 +173,31 @@ class PipelineWatchdog:
                     logger.warning(f"Could not check feedback loop state for issue #{issue_number}: {e}")
                     continue  # Fail-safe: don't kill a run we can't verify
 
+                # Never clean up a run that has an active review cycle awaiting human feedback.
+                # Like feedback loops, these legitimately have no Docker container running —
+                # the review cycle escalated to a human and is waiting for a reply.
+                try:
+                    from services.review_cycle import review_cycle_executor
+                    cycle_state = review_cycle_executor.active_cycles.get(issue_number)
+                    if cycle_state and cycle_state.status == 'awaiting_human_feedback':
+                        logger.info(
+                            f"Pipeline run {pipeline_run_id[:8]}... for {project} issue #{issue_number} "
+                            f"has a review cycle awaiting human feedback - skipping zombie cleanup"
+                        )
+                        continue
+                except Exception as e:
+                    logger.warning(f"Could not check review cycle state for issue #{issue_number}: {e}")
+                    continue  # Fail-safe: don't kill a run we can't verify
+
                 # No container, old enough, no lock held, and no feedback loop = ZOMBIE
+                # Coordination guard: prevent double-processing with other cleanup mechanisms
+                try:
+                    from services.cleanup_guard import try_claim_cleanup
+                    if not try_claim_cleanup(project, issue_number, "zombie_watchdog"):
+                        continue
+                except Exception as e:
+                    logger.warning(f"Cleanup guard unavailable, proceeding without coordination: {e}")
+
                 results['zombies_found'] += 1
 
                 age_minutes = (datetime.now(timezone.utc) - started_at).total_seconds() / 60

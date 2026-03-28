@@ -1299,6 +1299,15 @@ class ReviewCycleExecutor:
             cycle_state.status = 'reviewer_working'
             self._save_cycle_state(cycle_state)
 
+            # Restore pipeline run to "active" now that we're resuming work
+            try:
+                from services.pipeline_run import get_pipeline_run_manager
+                get_pipeline_run_manager().update_run_status(
+                    cycle_state.project_name, cycle_state.issue_number, "active"
+                )
+            except Exception as e:
+                logger.warning(f"Failed to restore active status for pipeline run on review cycle resume: {e}")
+
             # Get current iteration from stored outputs
             iteration = cycle_state.current_iteration
 
@@ -1462,6 +1471,15 @@ class ReviewCycleExecutor:
             if cycle_state.issue_number in self.active_cycles:
                 cycle_state.status = 'awaiting_human_feedback'
                 self._save_cycle_state(cycle_state)
+                # Restore feedback_listening so the zombie watchdog doesn't kill
+                # the run while we wait for the next retry/poll.
+                try:
+                    from services.pipeline_run import get_pipeline_run_manager
+                    get_pipeline_run_manager().update_run_status(
+                        cycle_state.project_name, cycle_state.issue_number, "feedback_listening"
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to restore feedback_listening status on review cycle error recovery: {e}")
             raise
 
         finally:
@@ -1855,6 +1873,16 @@ class ReviewCycleExecutor:
                 self.active_cycles[issue_number] = cycle_state
                 self._save_cycle_state(cycle_state)
 
+                # Mark the pipeline run as "feedback_listening" so the zombie watchdog
+                # does not kill it while we wait for human input.
+                try:
+                    from services.pipeline_run import get_pipeline_run_manager
+                    get_pipeline_run_manager().update_run_status(
+                        cycle_state.project_name, cycle_state.issue_number, "feedback_listening"
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to set feedback_listening status for pipeline run during review recovery: {e}")
+
                 logger.info(
                     f"Review cycle state restored for issue #{issue_number}. "
                     f"Status: awaiting_human_feedback. "
@@ -2095,6 +2123,17 @@ class ReviewCycleExecutor:
                     cycle_state.status = 'awaiting_human_feedback'
                     cycle_state.escalation_time = datetime.now().isoformat()
                     self._save_cycle_state(cycle_state)
+
+                    # Mark the pipeline run as "feedback_listening" so the zombie watchdog
+                    # (which only queries status="active") does not kill it while we wait
+                    # for human input — which can legitimately take many hours.
+                    try:
+                        from services.pipeline_run import get_pipeline_run_manager
+                        get_pipeline_run_manager().update_run_status(
+                            cycle_state.project_name, cycle_state.issue_number, "feedback_listening"
+                        )
+                    except Exception as e:
+                        logger.warning(f"Failed to set feedback_listening status for pipeline run during review escalation: {e}")
 
                     logger.info(
                         f"Review cycle escalated for issue #{cycle_state.issue_number}. "

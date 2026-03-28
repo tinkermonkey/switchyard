@@ -1677,6 +1677,14 @@ class WorkExecutionStateTracker:
                                 f"{agent} in {column} from {timestamp}"
                             )
 
+                            # Coordination guard: prevent double-processing with other mechanisms
+                            try:
+                                from services.cleanup_guard import try_claim_cleanup
+                                if not try_claim_cleanup(project_name, issue_number, "stuck_state_cleanup"):
+                                    continue
+                            except Exception as e:
+                                logger.warning(f"Cleanup guard unavailable, proceeding without coordination: {e}")
+
                             # Check if agent/repair cycle container still exists using two methods:
                             # 1. Docker ps (checks if container actually exists)
                             # 2. Redis tracking keys (checks orchestrator's view of active agents)
@@ -1792,6 +1800,36 @@ class WorkExecutionStateTracker:
                                         logger.info(f"Cleaned up orphaned repair cycle Redis key: {repair_cycle_key}")
                                 except Exception as e:
                                     logger.warning(f"Failed to clean up orphaned Redis keys: {e}")
+
+                            # Check if this issue has an active review cycle awaiting human
+                            # feedback.  These legitimately have no container running — the
+                            # review cycle escalated and is waiting for a human reply.
+                            try:
+                                from services.review_cycle import review_cycle_executor
+                                rc = review_cycle_executor.active_cycles.get(issue_number)
+                                if rc and rc.project_name == project_name and rc.status == 'awaiting_human_feedback':
+                                    logger.info(
+                                        f"Issue {project_name}/#{issue_number} has review cycle "
+                                        f"awaiting human feedback - skipping stuck state cleanup"
+                                    )
+                                    continue
+                            except Exception as e:
+                                logger.warning(f"Failed to check review cycle state for {project_name}/#{issue_number}: {e}")
+                                continue  # Fail-safe: don't clean up a run we can't verify
+
+                            # Check if this issue has an active human feedback loop.
+                            try:
+                                from services.human_feedback_loop import human_feedback_loop_executor
+                                fl = human_feedback_loop_executor.active_loops.get(issue_number)
+                                if fl and fl.project_name == project_name:
+                                    logger.info(
+                                        f"Issue {project_name}/#{issue_number} has active feedback "
+                                        f"loop - skipping stuck state cleanup"
+                                    )
+                                    continue
+                            except Exception as e:
+                                logger.warning(f"Failed to check feedback loop state for {project_name}/#{issue_number}: {e}")
+                                continue  # Fail-safe: don't clean up a run we can't verify
 
                             if not has_running_container:
                                 # Before marking as failure, check if the container completed
