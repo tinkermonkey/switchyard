@@ -516,14 +516,14 @@ class WorkExecutionStateTracker:
         # Check 2: Active review cycles
         try:
             from services.review_cycle import review_cycle_executor
-            if issue_number in review_cycle_executor.active_cycles:
-                cycle = review_cycle_executor.active_cycles[issue_number]
-                if cycle.project_name == project_name:
-                    logger.debug(
-                        f"Active review cycle found for {project_name}/#{issue_number}: "
-                        f"iteration {cycle.current_iteration}, status={cycle.status}"
-                    )
-                    return True
+            ck = review_cycle_executor._cycle_key(project_name, issue_number)
+            if ck in review_cycle_executor.active_cycles:
+                cycle = review_cycle_executor.active_cycles[ck]
+                logger.debug(
+                    f"Active review cycle found for {project_name}/#{issue_number}: "
+                    f"iteration {cycle.current_iteration}, status={cycle.status}"
+                )
+                return True
         except (ImportError, AttributeError) as e:
             # Review cycle module may not be available or initialized
             logger.warning(
@@ -1801,16 +1801,41 @@ class WorkExecutionStateTracker:
                                 except Exception as e:
                                     logger.warning(f"Failed to clean up orphaned Redis keys: {e}")
 
-                            # Check if this issue has an active review cycle awaiting human
-                            # feedback.  These legitimately have no container running — the
-                            # review cycle escalated and is waiting for a human reply.
+                            # If this issue holds the pipeline lock on any board,
+                            # work is in progress or pending (review cycle iterating,
+                            # repair cycle, status progression, etc.). Do not touch it.
+                            try:
+                                from services.pipeline_lock_manager import get_pipeline_lock_manager
+                                from config.manager import config_manager as _cfg_mgr
+                                _lm = get_pipeline_lock_manager()
+                                _pcfg = _cfg_mgr.get_project_config(project_name)
+                                _holds_lock = any(
+                                    (_lk := _lm.get_lock(project_name, p.board_name))
+                                    and _lk.lock_status == 'locked'
+                                    and _lk.locked_by_issue == issue_number
+                                    for p in _pcfg.pipelines
+                                )
+                                if _holds_lock:
+                                    logger.info(
+                                        f"Issue {project_name}/#{issue_number} holds pipeline lock "
+                                        f"- skipping stuck state cleanup"
+                                    )
+                                    continue
+                            except Exception as e:
+                                logger.warning(f"Failed to check pipeline lock for {project_name}/#{issue_number}: {e}")
+                                continue  # Fail-safe: don't clean up a run we can't verify
+
+                            # Check if this issue has an active review cycle (any non-completed
+                            # status). Between iterations the container exits normally but the
+                            # cycle is still orchestrating the next iteration.
                             try:
                                 from services.review_cycle import review_cycle_executor
-                                rc = review_cycle_executor.active_cycles.get(issue_number)
-                                if rc and rc.project_name == project_name and rc.status == 'awaiting_human_feedback':
+                                ck = review_cycle_executor._cycle_key(project_name, issue_number)
+                                rc = review_cycle_executor.active_cycles.get(ck)
+                                if rc and rc.status != 'completed':
                                     logger.info(
-                                        f"Issue {project_name}/#{issue_number} has review cycle "
-                                        f"awaiting human feedback - skipping stuck state cleanup"
+                                        f"Issue {project_name}/#{issue_number} has active review cycle "
+                                        f"(status: {rc.status}) - skipping stuck state cleanup"
                                     )
                                     continue
                             except Exception as e:

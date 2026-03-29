@@ -145,17 +145,12 @@ class PipelineWatchdog:
                     )
                     continue
 
-                # Never clean up a run that still holds the pipeline lock.
-                # The lock gates all important flows (review cycles, repair cycles, escalations
-                # awaiting human feedback, etc.) — if it's held, work is in progress or pending.
-                if self.lock_manager:
-                    current_lock = self.lock_manager.get_lock(project, board)
-                    if current_lock and current_lock.lock_status == 'locked' and current_lock.locked_by_issue == issue_number:
-                        logger.info(
-                            f"Pipeline run {pipeline_run_id[:8]}... for {project} issue #{issue_number} "
-                            f"holds the pipeline lock - skipping zombie cleanup"
-                        )
-                        continue
+                # NOTE: We intentionally do NOT skip cleanup just because the lock is held.
+                # The lock alone is not proof of life — a crashed container leaves the lock
+                # held with nobody to release it. The review cycle and feedback loop checks
+                # below (plus the 30-minute age threshold) cover every legitimate
+                # non-containerized state. If none of those fire, the lock is stale and
+                # _cleanup_zombie_run will release it.
 
                 # Never clean up a run that has an active human feedback loop.
                 # Feedback-listening phases legitimately have no Docker container running —
@@ -173,23 +168,24 @@ class PipelineWatchdog:
                     logger.warning(f"Could not check feedback loop state for issue #{issue_number}: {e}")
                     continue  # Fail-safe: don't kill a run we can't verify
 
-                # Never clean up a run that has an active review cycle awaiting human feedback.
-                # Like feedback loops, these legitimately have no Docker container running —
-                # the review cycle escalated to a human and is waiting for a reply.
+                # Never clean up a run that has an active review cycle (any non-completed
+                # status). Between iterations the container exits normally but the cycle
+                # is still orchestrating the next iteration.
                 try:
                     from services.review_cycle import review_cycle_executor
-                    cycle_state = review_cycle_executor.active_cycles.get(issue_number)
-                    if cycle_state and cycle_state.status == 'awaiting_human_feedback':
+                    ck = review_cycle_executor._cycle_key(project, issue_number)
+                    cycle_state = review_cycle_executor.active_cycles.get(ck)
+                    if cycle_state and cycle_state.status != 'completed':
                         logger.info(
                             f"Pipeline run {pipeline_run_id[:8]}... for {project} issue #{issue_number} "
-                            f"has a review cycle awaiting human feedback - skipping zombie cleanup"
+                            f"has active review cycle (status: {cycle_state.status}) - skipping zombie cleanup"
                         )
                         continue
                 except Exception as e:
                     logger.warning(f"Could not check review cycle state for issue #{issue_number}: {e}")
                     continue  # Fail-safe: don't kill a run we can't verify
 
-                # No container, old enough, no lock held, and no feedback loop = ZOMBIE
+                # No container, old enough, no active review cycle or feedback loop = ZOMBIE
                 # Coordination guard: prevent double-processing with other cleanup mechanisms
                 try:
                     from services.cleanup_guard import try_claim_cleanup
@@ -358,15 +354,16 @@ class PipelineWatchdog:
         # Remove any stale review cycle state so it doesn't block future runs
         try:
             from services.review_cycle import review_cycle_executor
-            cycle_state = review_cycle_executor.active_cycles.get(issue_number)
+            ck = review_cycle_executor._cycle_key(project, issue_number)
+            cycle_state = review_cycle_executor.active_cycles.get(ck)
             if cycle_state is None:
                 # Also check disk (cycle may not be in-memory after a restart)
                 all_cycles = review_cycle_executor._load_active_cycles(project)
                 cycle_state = next((c for c in all_cycles if c.issue_number == issue_number), None)
             if cycle_state:
                 review_cycle_executor._remove_cycle_state(cycle_state)
-                if issue_number in review_cycle_executor.active_cycles:
-                    del review_cycle_executor.active_cycles[issue_number]
+                if ck in review_cycle_executor.active_cycles:
+                    del review_cycle_executor.active_cycles[ck]
                 logger.info(f"Removed stale review cycle state for {project} issue #{issue_number} during zombie cleanup")
         except Exception as e:
             logger.warning(f"Failed to clean up review cycle state during zombie cleanup for {project} issue #{issue_number}: {e}")

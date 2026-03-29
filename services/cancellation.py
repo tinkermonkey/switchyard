@@ -246,9 +246,10 @@ def cancel_issue_work(project: str, issue_number: int, reason: str) -> None:
     # 3. Remove active review cycle (if any)
     try:
         from services.review_cycle import review_cycle_executor
-        if issue_number in review_cycle_executor.active_cycles:
-            del review_cycle_executor.active_cycles[issue_number]
-            logger.info(f"Removed active review cycle for issue #{issue_number}")
+        ck = review_cycle_executor._cycle_key(project, issue_number)
+        if ck in review_cycle_executor.active_cycles:
+            del review_cycle_executor.active_cycles[ck]
+            logger.info(f"Removed active review cycle for {project} issue #{issue_number}")
     except Exception as e:
         steps_failed.append(f"review_cycle_cleanup: {e}")
         logger.warning(f"Failed to remove active review cycle: {e}")

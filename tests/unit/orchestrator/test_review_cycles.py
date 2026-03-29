@@ -464,7 +464,7 @@ class TestReviewCycleStateManagement:
                 )
                 
                 # Verify cycle completed and was removed from active cycles
-                assert 1000 not in executor.active_cycles
+                assert ('test-project', 1000) not in executor.active_cycles
     
     @pytest.mark.asyncio
     async def test_review_state_loaded_on_resume(
@@ -503,7 +503,7 @@ class TestReviewCycleStateManagement:
             # Set state manually after construction
             existing_cycle.current_iteration = 2
             existing_cycle.status = 'in_progress'
-            executor.active_cycles[1001] = existing_cycle
+            executor.active_cycles[('test-project', 1001)] = existing_cycle
             
             # Try to start another cycle for same issue
             column = WorkflowColumn(
@@ -642,4 +642,4 @@ class TestReviewCycleCompletion:
                 )
                 
                 # After completion, issue should not be in active cycles
-                assert 1101 not in executor.active_cycles
+                assert ('test-project', 1101) not in executor.active_cycles

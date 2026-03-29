@@ -2829,8 +2829,9 @@ class ProjectMonitor:
 
             try:
                 from services.review_cycle import review_cycle_executor
-                if issue_number in review_cycle_executor.active_cycles:
-                    del review_cycle_executor.active_cycles[issue_number]
+                ck = review_cycle_executor._cycle_key(project_name, issue_number)
+                if ck in review_cycle_executor.active_cycles:
+                    del review_cycle_executor.active_cycles[ck]
             except Exception as e:
                 logger.warning(f"Failed to clean up review cycle for issue #{issue_number} during exit-column handling: {e}")
 
@@ -7984,10 +7985,11 @@ Moving to implementation phase.
             from datetime import datetime
 
             # Check if there's an escalated cycle for this issue (in-memory)
-            if issue_number not in review_cycle_executor.active_cycles:
+            ck = review_cycle_executor._cycle_key(project_name, issue_number)
+            if ck not in review_cycle_executor.active_cycles:
                 return
 
-            cycle_state = review_cycle_executor.active_cycles[issue_number]
+            cycle_state = review_cycle_executor.active_cycles[ck]
             if cycle_state.status != 'awaiting_human_feedback':
                 return
 

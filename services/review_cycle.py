@@ -130,26 +130,32 @@ class ReviewCycleExecutor:
     def __init__(self):
         self.review_parser = ReviewParser()
         # Don't initialize GitHubIntegration here - create it per-call with proper repo context
-        self.active_cycles = {}  # Track active review cycles by issue number
+        self.active_cycles = {}  # Track active review cycles by (project_name, issue_number) tuple
         self.state_dir = None  # Will be set per project
         self.outcome_correlator = get_review_outcome_correlator()
         # Per-issue locks that prevent concurrent _execute_review_loop / _continue_cycle_from_review
         # calls for the same issue (e.g. resume_active_cycles racing with the project monitor poll)
-        self._cycle_execution_locks: Dict[int, threading.Lock] = {}
+        self._cycle_execution_locks: Dict[Tuple, threading.Lock] = {}
         self._cycle_locks_lock = threading.Lock()  # guards the dict above
-        
+
         # Initialize decision observability
         from monitoring.observability import get_observability_manager
         from monitoring.decision_events import DecisionEventEmitter
         self.obs = get_observability_manager()
         self.decision_events = DecisionEventEmitter(self.obs)
 
-    def _get_cycle_lock(self, issue_number: int) -> threading.Lock:
-        """Return the execution lock for an issue, creating it on first use."""
+    @staticmethod
+    def _cycle_key(project_name: str, issue_number: int) -> Tuple[str, int]:
+        """Return the key used to index active_cycles and per-issue locks."""
+        return (project_name, issue_number)
+
+    def _get_cycle_lock(self, project_name: str, issue_number: int) -> threading.Lock:
+        """Return the execution lock for a project/issue, creating it on first use."""
+        key = self._cycle_key(project_name, issue_number)
         with self._cycle_locks_lock:
-            if issue_number not in self._cycle_execution_locks:
-                self._cycle_execution_locks[issue_number] = threading.Lock()
-            return self._cycle_execution_locks[issue_number]
+            if key not in self._cycle_execution_locks:
+                self._cycle_execution_locks[key] = threading.Lock()
+            return self._cycle_execution_locks[key]
 
     def _get_github_integration(self, cycle_state: ReviewCycleState) -> GitHubIntegration:
         """Get properly initialized GitHubIntegration for this cycle"""
@@ -366,7 +372,8 @@ class ReviewCycleExecutor:
 
         # Populate in-memory cache
         for cycle_state in active_cycles:
-            self.active_cycles[cycle_state.issue_number] = cycle_state
+            key = self._cycle_key(cycle_state.project_name, cycle_state.issue_number)
+            self.active_cycles[key] = cycle_state
 
         # Resume each cycle based on its state
         for cycle_state in active_cycles:
@@ -414,8 +421,9 @@ class ReviewCycleExecutor:
                                 f"Removing stale review cycle state (was for {cycle_state.reviewer_agent}/{cycle_state.maker_agent})."
                             )
                             self._remove_cycle_state(cycle_state)
-                            if cycle_state.issue_number in self.active_cycles:
-                                del self.active_cycles[cycle_state.issue_number]
+                            ck = self._cycle_key(cycle_state.project_name, cycle_state.issue_number)
+                            if ck in self.active_cycles:
+                                del self.active_cycles[ck]
                             continue
 
                         # Check if the agents match (column config may have changed)
@@ -427,8 +435,9 @@ class ReviewCycleExecutor:
                                 f"now: {current_column_config.agent}/{current_column_config.maker_agent})."
                             )
                             self._remove_cycle_state(cycle_state)
-                            if cycle_state.issue_number in self.active_cycles:
-                                del self.active_cycles[cycle_state.issue_number]
+                            ck = self._cycle_key(cycle_state.project_name, cycle_state.issue_number)
+                            if ck in self.active_cycles:
+                                del self.active_cycles[ck]
                             continue
                 else:
                     # Issue not found on board, remove stale state
@@ -437,8 +446,9 @@ class ReviewCycleExecutor:
                         f"Removing stale review cycle state."
                     )
                     self._remove_cycle_state(cycle_state)
-                    if cycle_state.issue_number in self.active_cycles:
-                        del self.active_cycles[cycle_state.issue_number]
+                    ck = self._cycle_key(cycle_state.project_name, cycle_state.issue_number)
+                    if ck in self.active_cycles:
+                        del self.active_cycles[ck]
                     continue
 
             except Exception as e:
@@ -470,8 +480,9 @@ class ReviewCycleExecutor:
                 
                 # Remove the corrupted state
                 self._remove_cycle_state(cycle_state)
-                if cycle_state.issue_number in self.active_cycles:
-                    del self.active_cycles[cycle_state.issue_number]
+                ck = self._cycle_key(cycle_state.project_name, cycle_state.issue_number)
+                if ck in self.active_cycles:
+                    del self.active_cycles[ck]
                 continue
 
             try:
@@ -524,7 +535,7 @@ class ReviewCycleExecutor:
                             continue
 
                         # Guard against concurrent execution from the project monitor poll
-                        lock = self._get_cycle_lock(cycle_state.issue_number)
+                        lock = self._get_cycle_lock(cycle_state.project_name, cycle_state.issue_number)
                         if not lock.acquire(blocking=False):
                             logger.info(
                                 f"Review cycle execution already in progress for issue "
@@ -572,7 +583,7 @@ class ReviewCycleExecutor:
                     if cycle_state.review_outputs and len(cycle_state.review_outputs) > 0:
                         # Reviewer has completed at least one iteration
                         logger.info(f"Cycle in initialized state with pending review - continuing")
-                        lock = self._get_cycle_lock(cycle_state.issue_number)
+                        lock = self._get_cycle_lock(cycle_state.project_name, cycle_state.issue_number)
                         if not lock.acquire(blocking=False):
                             logger.info(
                                 f"Review cycle execution already in progress for issue "
@@ -626,7 +637,7 @@ class ReviewCycleExecutor:
                         self._save_cycle_state(cycle_state)
 
                         # Resume the cycle from the review point
-                        lock = self._get_cycle_lock(cycle_state.issue_number)
+                        lock = self._get_cycle_lock(cycle_state.project_name, cycle_state.issue_number)
                         if not lock.acquire(blocking=False):
                             logger.info(
                                 f"Review cycle execution already in progress for issue "
@@ -648,7 +659,7 @@ class ReviewCycleExecutor:
                         self._save_cycle_state(cycle_state)
 
                         # Resume the cycle from the maker point
-                        lock = self._get_cycle_lock(cycle_state.issue_number)
+                        lock = self._get_cycle_lock(cycle_state.project_name, cycle_state.issue_number)
                         if not lock.acquire(blocking=False):
                             logger.info(
                                 f"Review cycle execution already in progress for issue "
@@ -710,8 +721,9 @@ class ReviewCycleExecutor:
             Tuple of (next_column_name, cycle_complete)
         """
         # Check if there's already an active cycle for this issue
-        if issue_number in self.active_cycles:
-            existing_cycle = self.active_cycles[issue_number]
+        key = self._cycle_key(project_name, issue_number)
+        if key in self.active_cycles:
+            existing_cycle = self.active_cycles[key]
             # Check if the existing cycle is for the same agents
             if (existing_cycle.maker_agent == column.maker_agent and
                 existing_cycle.reviewer_agent == column.agent):
@@ -731,8 +743,8 @@ class ReviewCycleExecutor:
                     
                     # Remove corrupted cycle
                     self._remove_cycle_state(existing_cycle)
-                    del self.active_cycles[issue_number]
-                    
+                    del self.active_cycles[key]
+
                     # End the pipeline run if it exists
                     if existing_cycle.pipeline_run_id:
                         try:
@@ -781,7 +793,7 @@ class ReviewCycleExecutor:
                 # Guard against concurrent execution (e.g. resume_active_cycles racing with the
                 # project monitor poll).  Non-blocking: if another thread already holds the lock
                 # for this issue there is nothing new to dispatch.
-                lock = self._get_cycle_lock(issue_number)
+                lock = self._get_cycle_lock(project_name, issue_number)
                 if not lock.acquire(blocking=False):
                     logger.info(
                         f"Review cycle execution already in progress for issue #{issue_number}, "
@@ -804,7 +816,7 @@ class ReviewCycleExecutor:
                     # Escalated cycles must remain in active_cycles so that
                     # check_escalated_review_cycles() can detect human feedback.
                     if cycle_state.status != 'awaiting_human_feedback':
-                        del self.active_cycles[issue_number]
+                        del self.active_cycles[key]
 
                     return next_column, True
 
@@ -812,8 +824,8 @@ class ReviewCycleExecutor:
                     logger.error(f"Review cycle failed for issue #{issue_number}: {e}")
 
                     # EMIT ERROR EVENT for UI visibility
-                    if issue_number in self.active_cycles:
-                        existing_cycle = self.active_cycles[issue_number]
+                    if key in self.active_cycles:
+                        existing_cycle = self.active_cycles[key]
                         self._emit_review_cycle_error(
                             cycle_state=existing_cycle,
                             error=e,
@@ -822,9 +834,9 @@ class ReviewCycleExecutor:
                         )
 
                     # Clean up on error (both in-memory and on-disk)
-                    if issue_number in self.active_cycles:
-                        self._remove_cycle_state(self.active_cycles[issue_number])
-                        del self.active_cycles[issue_number]
+                    if key in self.active_cycles:
+                        self._remove_cycle_state(self.active_cycles[key])
+                        del self.active_cycles[key]
 
                     # End the pipeline run if it exists
                     if hasattr(existing_cycle, 'pipeline_run_id') and existing_cycle.pipeline_run_id:
@@ -869,7 +881,7 @@ class ReviewCycleExecutor:
                     f"now: {column.agent}/{column.maker_agent})"
                 )
                 self._remove_cycle_state(existing_cycle)
-                del self.active_cycles[issue_number]
+                del self.active_cycles[key]
                 # Create new review cycle state
                 cycle_state = ReviewCycleState(
                     issue_number=issue_number,
@@ -926,7 +938,7 @@ class ReviewCycleExecutor:
                 logger.warning(f"Failed to write initial maker output to context dir: {e}")
 
         # Track active cycle
-        self.active_cycles[issue_number] = cycle_state
+        self.active_cycles[key] = cycle_state
         # Save initial state to disk
         cycle_state.status = 'maker_working'
         self._save_cycle_state(cycle_state)
@@ -952,7 +964,7 @@ class ReviewCycleExecutor:
         # Guard against concurrent execution (e.g. resume_active_cycles racing with the project
         # monitor poll).  Non-blocking: if another thread is already executing the loop for this
         # issue (having just added the cycle to active_cycles above), skip rather than duplicate.
-        lock = self._get_cycle_lock(issue_number)
+        lock = self._get_cycle_lock(project_name, issue_number)
         if not lock.acquire(blocking=False):
             logger.info(
                 f"Review cycle execution already in progress for issue #{issue_number}, "
@@ -973,7 +985,7 @@ class ReviewCycleExecutor:
             # Escalated cycles must remain in active_cycles so that
             # check_escalated_review_cycles() can detect human feedback.
             if cycle_state.status != 'awaiting_human_feedback':
-                del self.active_cycles[issue_number]
+                del self.active_cycles[key]
 
             return next_column, True
 
@@ -982,16 +994,16 @@ class ReviewCycleExecutor:
             from services.cancellation import CancellationError
             if isinstance(e, CancellationError):
                 logger.info(f"Review cycle cancelled for issue #{issue_number}: {e}")
-                if issue_number in self.active_cycles:
-                    self._remove_cycle_state(self.active_cycles[issue_number])
-                    del self.active_cycles[issue_number]
+                if key in self.active_cycles:
+                    self._remove_cycle_state(self.active_cycles[key])
+                    del self.active_cycles[key]
                 raise
 
             logger.error(f"Review cycle failed for issue #{issue_number}: {e}")
 
             # EMIT ERROR EVENT for UI visibility
-            if issue_number in self.active_cycles:
-                cycle = self.active_cycles[issue_number]
+            if key in self.active_cycles:
+                cycle = self.active_cycles[key]
                 self._emit_review_cycle_error(
                     cycle_state=cycle,
                     error=e,
@@ -1000,9 +1012,9 @@ class ReviewCycleExecutor:
                 )
 
             # Clean up on error (both in-memory and on-disk)
-            if issue_number in self.active_cycles:
-                self._remove_cycle_state(self.active_cycles[issue_number])
-                del self.active_cycles[issue_number]
+            if key in self.active_cycles:
+                self._remove_cycle_state(self.active_cycles[key])
+                del self.active_cycles[key]
 
             # Post error comment (workspace-aware)
             error_message = f"⚠️ **Review Cycle Error**\n\nThe automated review cycle encountered an error:\n```\n{str(e)}\n```\n\nPlease review manually."
@@ -1089,7 +1101,8 @@ class ReviewCycleExecutor:
                 await self._analyze_review_cycle_outcomes(cycle_state)
 
                 self._remove_cycle_state(cycle_state)
-                del self.active_cycles[cycle_state.issue_number]
+                ck = self._cycle_key(cycle_state.project_name, cycle_state.issue_number)
+                del self.active_cycles[ck]
 
                 # NOTE: Do NOT update PR status here!
                 # PR status is managed by feature_branch_manager.finalize_workspace()
@@ -1216,8 +1229,9 @@ class ReviewCycleExecutor:
                 # and _execute_review_loop does not acquire it, so this is safe.
                 if cycle_state.current_iteration < cycle_state.max_iterations:
                     result = await self._execute_review_loop(cycle_state, column, issue_data, org)
-                    if cycle_state.issue_number in self.active_cycles:
-                        del self.active_cycles[cycle_state.issue_number]
+                    ck = self._cycle_key(cycle_state.project_name, cycle_state.issue_number)
+                    if ck in self.active_cycles:
+                        del self.active_cycles[ck]
                     if result:
                         final_status, next_col_name = result
                         if final_status == ReviewStatus.APPROVED and next_col_name and next_col_name != column.name:
@@ -1271,7 +1285,7 @@ class ReviewCycleExecutor:
         logger.info(f"Resuming escalated review cycle for issue #{cycle_state.issue_number} with human feedback")
 
         # Guard against concurrent calls from successive polling iterations
-        lock = self._get_cycle_lock(cycle_state.issue_number)
+        lock = self._get_cycle_lock(cycle_state.project_name, cycle_state.issue_number)
         if not lock.acquire(blocking=False):
             logger.info(
                 f"Resume already in progress for issue #{cycle_state.issue_number}, "
@@ -1371,8 +1385,9 @@ class ReviewCycleExecutor:
                 cycle_state.status = 'completed'  # Mark as done, needs manual intervention
                 self._save_cycle_state(cycle_state)
                 self._remove_cycle_state(cycle_state)
-                if cycle_state.issue_number in self.active_cycles:
-                    del self.active_cycles[cycle_state.issue_number]
+                ck = self._cycle_key(cycle_state.project_name, cycle_state.issue_number)
+                if ck in self.active_cycles:
+                    del self.active_cycles[ck]
                 return
 
             # If approved, we're done!
@@ -1385,8 +1400,9 @@ class ReviewCycleExecutor:
                 cycle_state.status = 'completed'
                 self._save_cycle_state(cycle_state)
                 self._remove_cycle_state(cycle_state)
-                if cycle_state.issue_number in self.active_cycles:
-                    del self.active_cycles[cycle_state.issue_number]
+                ck = self._cycle_key(cycle_state.project_name, cycle_state.issue_number)
+                if ck in self.active_cycles:
+                    del self.active_cycles[ck]
 
                 # Analyze review cycle outcomes for learning (async, non-blocking)
                 await self._analyze_review_cycle_outcomes(cycle_state)
@@ -1468,7 +1484,8 @@ class ReviewCycleExecutor:
             import traceback
             logger.error(traceback.format_exc())
             # Restore awaiting_human_feedback so the next poll can retry
-            if cycle_state.issue_number in self.active_cycles:
+            ck = self._cycle_key(cycle_state.project_name, cycle_state.issue_number)
+            if ck in self.active_cycles:
                 cycle_state.status = 'awaiting_human_feedback'
                 self._save_cycle_state(cycle_state)
                 # Restore feedback_listening so the zombie watchdog doesn't kill
@@ -1681,13 +1698,14 @@ class ReviewCycleExecutor:
                             })
 
                     # Register in active cycles
-                    self.active_cycles[issue_number] = cycle_state
+                    rk = self._cycle_key(project_name, issue_number)
+                    self.active_cycles[rk] = cycle_state
                     self._save_cycle_state(cycle_state)
 
                     logger.info(f"Resuming review cycle - iteration {iteration + 1}/{cycle_state.max_iterations}")
 
                     # Guard against concurrent execution
-                    lock = self._get_cycle_lock(issue_number)
+                    lock = self._get_cycle_lock(project_name, issue_number)
                     if not lock.acquire(blocking=False):
                         logger.info(
                             f"Review cycle execution already in progress for issue #{issue_number}, "
@@ -1798,10 +1816,11 @@ class ReviewCycleExecutor:
                     })
 
                     # Register in active cycles
-                    self.active_cycles[issue_number] = cycle_state
+                    rk = self._cycle_key(project_name, issue_number)
+                    self.active_cycles[rk] = cycle_state
 
                     # Guard against concurrent execution
-                    lock = self._get_cycle_lock(issue_number)
+                    lock = self._get_cycle_lock(project_name, issue_number)
                     if not lock.acquire(blocking=False):
                         logger.info(
                             f"Review cycle execution already in progress for issue #{issue_number}, "
@@ -1870,7 +1889,8 @@ class ReviewCycleExecutor:
                 )
 
                 # Register in active cycles and save state
-                self.active_cycles[issue_number] = cycle_state
+                rk = self._cycle_key(project_name, issue_number)
+                self.active_cycles[rk] = cycle_state
                 self._save_cycle_state(cycle_state)
 
                 # Mark the pipeline run as "feedback_listening" so the zombie watchdog
@@ -3130,14 +3150,15 @@ _Escalated by Claude Code Orchestrator_
         )
 
         # 1. Resolve active cycle (in-memory first, then disk fallback)
-        cycle_state = self.active_cycles.get(issue_number)
-        if cycle_state is None or cycle_state.project_name != project_name:
+        rk = self._cycle_key(project_name, issue_number)
+        cycle_state = self.active_cycles.get(rk)
+        if cycle_state is None:
             loaded = self._load_active_cycles(project_name)
             cycle_state = next(
                 (c for c in loaded if c.issue_number == issue_number), None
             )
             if cycle_state:
-                self.active_cycles[issue_number] = cycle_state
+                self.active_cycles[rk] = cycle_state
 
         if not cycle_state:
             logger.warning(
@@ -3147,7 +3168,7 @@ _Escalated by Claude Code Orchestrator_
             return
 
         # 2. Acquire per-issue execution lock (prevents race with project monitor poll)
-        lock = self._get_cycle_lock(issue_number)
+        lock = self._get_cycle_lock(project_name, issue_number)
         if not lock.acquire(blocking=False):
             logger.warning(
                 f"Review cycle lock already held for {project_name} issue "

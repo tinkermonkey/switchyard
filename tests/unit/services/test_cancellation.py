@@ -178,7 +178,8 @@ class TestCancelIssueWork:
         mock_kill.return_value = 0
 
         mock_rce = MagicMock()
-        mock_rce.active_cycles = {42: MagicMock()}
+        mock_rce._cycle_key.return_value = ("proj", 42)
+        mock_rce.active_cycles = {("proj", 42): MagicMock()}
         mock_wet = MagicMock()
         mock_wet.get_execution_history.return_value = []
 
@@ -191,7 +192,7 @@ class TestCancelIssueWork:
         }):
             cancel_issue_work("proj", 42, "test reason")
 
-        assert 42 not in mock_rce.active_cycles
+        assert ("proj", 42) not in mock_rce.active_cycles
 
     @patch('services.cancellation.kill_containers_for_issue')
     @patch('services.cancellation.get_cancellation_signal')
