@@ -137,10 +137,6 @@ class TestObservabilityElasticsearchIndexing:
         """Test that non-indexed events are not identified as decision or lifecycle"""
         # Events that are neither decision events nor agent lifecycle events
         non_indexed_events = [
-            EventType.TASK_RECEIVED,
-            EventType.CLAUDE_API_CALL_STARTED,
-            EventType.CLAUDE_API_CALL_COMPLETED,
-            EventType.CLAUDE_API_CALL_FAILED,
             EventType.RESPONSE_CHUNK_RECEIVED,
             EventType.RESPONSE_PROCESSING_STARTED,
             EventType.RESPONSE_PROCESSING_COMPLETED,
@@ -153,6 +149,19 @@ class TestObservabilityElasticsearchIndexing:
                 f"{event_type.value} should not be a decision event"
             assert not obs_manager._is_agent_lifecycle_event(event_type), \
                 f"{event_type.value} should not be an agent lifecycle event"
+
+    def test_task_received_and_claude_api_are_lifecycle_events(self, obs_manager):
+        """Test that task_received and claude_api events are indexed as agent lifecycle"""
+        lifecycle_events = [
+            EventType.TASK_RECEIVED,
+            EventType.CLAUDE_API_CALL_STARTED,
+            EventType.CLAUDE_API_CALL_COMPLETED,
+            EventType.CLAUDE_API_CALL_FAILED,
+        ]
+
+        for event_type in lifecycle_events:
+            assert obs_manager._is_agent_lifecycle_event(event_type), \
+                f"{event_type.value} should be an agent lifecycle event"
 
     def test_all_event_types_are_categorized(self, obs_manager):
         """Test that every EventType is either indexed or explicitly not indexed"""
@@ -333,13 +342,13 @@ class TestObservabilityElasticsearchIndexing:
         """Test that transient events are not indexed to Elasticsearch"""
         # Emit a non-indexed event
         obs_manager.emit(
-            EventType.TASK_RECEIVED,
+            EventType.RESPONSE_CHUNK_RECEIVED,
             agent="test_agent",
             task_id="test_task",
             project="test-project",
-            data={'context_keys': ['issue', 'board']}
+            data={'chunk_size': 100}
         )
-        
+
         # Should NOT call Elasticsearch (only Redis)
         assert not mock_elasticsearch.index.called
     
@@ -481,7 +490,7 @@ class TestObservabilityElasticsearchIndexing:
             data={'model': 'claude-sonnet-4.5'}
         )
         
-        # Non-indexed event
+        # Another lifecycle event (task_received is now indexed as lifecycle)
         obs_manager.emit(
             EventType.TASK_RECEIVED,
             agent="test_agent",
@@ -489,19 +498,19 @@ class TestObservabilityElasticsearchIndexing:
             project="test-project",
             data={'context_keys': []}
         )
-        
-        # Should have 2 index calls (decision + lifecycle, not task_received)
-        assert mock_elasticsearch.index.call_count == 2
-        
+
+        # Should have 3 index calls (1 decision + 2 lifecycle)
+        assert mock_elasticsearch.index.call_count == 3
+
         # Get the indices
         indices = [call_item[1]['index'] for call_item in mock_elasticsearch.index.call_args_list]
-        
-        # Should have one decision-events and one agent-events
+
+        # Should have one decision-events and two agent-events
         decision_indices = [idx for idx in indices if idx.startswith('decision-events-')]
         agent_indices = [idx for idx in indices if idx.startswith('agent-events-')]
-        
+
         assert len(decision_indices) == 1
-        assert len(agent_indices) == 1
+        assert len(agent_indices) == 2
     
     # ========== HELPER METHOD TESTS ==========
     

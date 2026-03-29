@@ -1048,7 +1048,8 @@ class DockerAgentRunner:
         agent = context.get('agent', 'unknown')
         task_id = context.get('task_id', 'unknown')
         project = context.get('project', 'unknown')
-        pipeline_run_id = context.get('pipeline_run_id')
+        task_context = context.get('context', {})
+        pipeline_run_id = task_context.get('pipeline_run_id') or context.get('pipeline_run_id')
 
         # Initialize timing (always needed, even if obs is None)
         import time

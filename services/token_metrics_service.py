@@ -1072,7 +1072,7 @@ class TokenMetricsService:
                         }
                     },
                     '_source': [
-                        'task_id', 'agent', 'agent_name', 'project', 'timestamp', 'raw_event',
+                        'task_id', 'agent', 'agent_name', 'project', 'timestamp',
                         'cycle_type', 'cycle_iteration', 'cycle_stack',
                         'agent_execution_id', 'pipeline_run_id', 'execution_type'
                     ]
@@ -1086,7 +1086,7 @@ class TokenMetricsService:
         if not init_hits:
             return []
 
-        # Build map: task_id → init metadata (extract nested fields from raw_event).
+        # Build map: task_id → init metadata from flat ES document fields.
         # A task may have two agent_initialized events (one older-format without
         # agent_execution_id). Prefer the entry that has agent_execution_id.
         init_map: Dict[str, Dict] = {}
@@ -1095,16 +1095,14 @@ class TokenMetricsService:
             tid = src.get('task_id')
             if not tid:
                 continue
-            raw = src.get('raw_event') or {}
-            raw_data = raw.get('data') or {}
             entry = {
                 'task_id': tid,
-                'agent_name': src.get('agent_name') or src.get('agent') or raw.get('agent') or '',
-                'project': src.get('project') or raw.get('project') or '',
-                'timestamp': src.get('timestamp') or raw.get('timestamp'),
-                'agent_execution_id': src.get('agent_execution_id') or raw_data.get('agent_execution_id'),
-                'pipeline_run_id': src.get('pipeline_run_id') or raw_data.get('pipeline_run_id'),
-                'execution_type': src.get('execution_type') or raw.get('execution_type') or '',
+                'agent_name': src.get('agent_name') or src.get('agent', ''),
+                'project': src.get('project', ''),
+                'timestamp': src.get('timestamp'),
+                'agent_execution_id': src.get('agent_execution_id'),
+                'pipeline_run_id': src.get('pipeline_run_id'),
+                'execution_type': src.get('execution_type', ''),
                 'cycle_type': src.get('cycle_type', ''),
                 'cycle_iteration': src.get('cycle_iteration', 0),
                 'cycle_stack': src.get('cycle_stack', []),

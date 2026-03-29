@@ -527,12 +527,27 @@ def get_history():
                 result = es_client.search(index="agent-events-*", body=query)
                 hits = result['hits']['hits']
 
-                # Convert ES logs to event format (reconstruct from raw_event)
+                # Reconstruct event format from flat ES documents
+                skip_keys = {'event_category'}
                 for hit in hits:
                     source = hit['_source']
-                    # Use raw_event which has the original lifecycle event structure
-                    if 'raw_event' in source and source['raw_event']:
-                        history.append(source['raw_event'])
+                    # Rebuild the ObservabilityEvent shape from flat fields
+                    event = {
+                        'timestamp': source.get('timestamp'),
+                        'event_id': hit['_id'],
+                        'event_type': source.get('event_type'),
+                        'agent': source.get('agent'),
+                        'task_id': source.get('task_id'),
+                        'project': source.get('project'),
+                        'execution_type': source.get('execution_type', ''),
+                        'data': {k: v for k, v in source.items()
+                                 if k not in ('timestamp', 'event_type', 'agent',
+                                              'task_id', 'project', 'execution_type',
+                                              'pipeline_run_id') and k not in skip_keys},
+                    }
+                    if source.get('pipeline_run_id'):
+                        event['data']['pipeline_run_id'] = source['pipeline_run_id']
+                    history.append(event)
 
                 # Reverse to get chronological order (oldest first)
                 history.reverse()

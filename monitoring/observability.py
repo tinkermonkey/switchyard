@@ -553,6 +553,7 @@ class ObservabilityManager:
     def _is_agent_lifecycle_event(self, event_type: EventType) -> bool:
         """Check if an event type is an agent lifecycle event that should be indexed in Elasticsearch"""
         lifecycle_events = {
+            EventType.TASK_RECEIVED,
             EventType.AGENT_INITIALIZED,
             EventType.AGENT_STARTED,
             EventType.AGENT_COMPLETED,
@@ -566,6 +567,10 @@ class ObservabilityManager:
             EventType.CONTAINER_EXECUTION_FAILED,
             # Prompt construction
             EventType.PROMPT_CONSTRUCTED,
+            # Claude API calls
+            EventType.CLAUDE_API_CALL_STARTED,
+            EventType.CLAUDE_API_CALL_COMPLETED,
+            EventType.CLAUDE_API_CALL_FAILED,
         }
         return event_type in lifecycle_events
 
@@ -576,100 +581,71 @@ class ObservabilityManager:
         if not self.enabled:
             return
 
+        # Add pipeline_run_id to data if provided
+        if pipeline_run_id:
+            data['pipeline_run_id'] = pipeline_run_id
+
+        event = ObservabilityEvent(
+            timestamp=utc_isoformat(),
+            event_id=str(uuid.uuid4()),
+            event_type=event_type.value,
+            agent=agent,
+            task_id=task_id,
+            project=project,
+            data=data,
+            execution_type=execution_type
+        )
+
+        event_json = event.to_json()
+
+        # Redis pub/sub + stream (independent of ES)
         try:
-            # Add pipeline_run_id to data if provided
-            if pipeline_run_id:
-                data['pipeline_run_id'] = pipeline_run_id
-
-            event = ObservabilityEvent(
-                timestamp=utc_isoformat(),
-                event_id=str(uuid.uuid4()),
-                event_type=event_type.value,
-                agent=agent,
-                task_id=task_id,
-                project=project,
-                data=data,
-                execution_type=execution_type
-            )
-
-            event_json = event.to_json()
-
-            # Publish to Redis pub/sub for real-time delivery
             self.redis.publish(self.channel, event_json)
-
-            # Also add to Redis Stream for history (with automatic trimming)
             self.redis.xadd(
                 self.stream_key,
                 {'event': event_json},
                 maxlen=self.stream_maxlen,
-                approximate=True  # More efficient trimming
+                approximate=True
             )
-
-            # Set TTL on the stream key (refreshes on each write)
             self.redis.expire(self.stream_key, self.stream_ttl)
-            
-            # Index decision events in Elasticsearch
-            if self.es and self._is_decision_event(event_type):
-                try:
-                    # Create index name based on current date
-                    index_name = f"decision-events-{utc_now().strftime('%Y-%m-%d')}"
-
-                    # Prepare document for Elasticsearch
-                    doc = {
-                        'timestamp': event.timestamp,
-                        'event_type': event.event_type,
-                        'event_category': 'decision',  # Category for filtering
-                        'agent': agent,
-                        'task_id': task_id,
-                        'project': project,
-                        'pipeline_run_id': pipeline_run_id,
-                        'execution_type': execution_type,
-                        **data  # Flatten data into document
-                    }
-
-                    # Diagnostic logging for error events
-                    if event_type == EventType.ERROR_ENCOUNTERED or event_type == EventType.ERROR_RECOVERED:
-                        logger.info(f"[DIAGNOSTIC] Writing {event.event_type} to ES with pipeline_run_id: {pipeline_run_id} (is None: {pipeline_run_id is None}), project: {project}")
-                    
-                    # Index the document (use event_id as doc_id for idempotent upserts)
-                    self._es_write(index_name, doc, doc_id=event.event_id)
-                    logger.info(f"Indexed decision event {event_type.value} to {index_name}")
-                except Exception as e:
-                    logger.error(f"Failed to index decision event to Elasticsearch: {e}")
-            elif self._is_decision_event(event_type):
-                logger.warning(f"Decision event {event_type.value} not indexed - ES client is None")
-            
-            # Index agent lifecycle events in Elasticsearch
-            if self.es and self._is_agent_lifecycle_event(event_type):
-                try:
-                    # Create index name based on current date
-                    index_name = f"agent-events-{utc_now().strftime('%Y-%m-%d')}"
-
-                    # Prepare document for Elasticsearch
-                    doc = {
-                        'timestamp': event.timestamp,
-                        'event_type': event.event_type,
-                        'event_category': 'agent_lifecycle',  # Category for filtering
-                        'agent': agent,
-                        'task_id': task_id,
-                        'project': project,
-                        'pipeline_run_id': pipeline_run_id,
-                        'execution_type': execution_type,
-                        **data  # Flatten data into document
-                    }
-                    
-                    # Index the document (use event_id as doc_id for idempotent upserts)
-                    self._es_write(index_name, doc, doc_id=event.event_id)
-                    logger.info(f"Indexed agent lifecycle event {event_type.value} to {index_name}")
-                except Exception as e:
-                    logger.error(f"Failed to index agent lifecycle event to Elasticsearch: {e}")
-            elif self._is_agent_lifecycle_event(event_type):
-                logger.warning(f"Agent lifecycle event {event_type.value} not indexed - ES client is None")
-
-            logger.debug(f"Emitted {event_type.value} event for {agent}/{task_id}")
-
         except Exception as e:
-            logger.error(f"Failed to emit observability event: {e}")
+            logger.error(f"Failed to publish event to Redis: {e}")
+
+        # ES indexing (independent of Redis)
+        es_doc_base = {
+            'timestamp': event.timestamp,
+            'event_type': event.event_type,
+            'agent': agent,
+            'task_id': task_id,
+            'project': project,
+            'pipeline_run_id': pipeline_run_id,
+            'execution_type': execution_type,
+            **data
+        }
+
+        if self.es and self._is_decision_event(event_type):
+            try:
+                index_name = f"decision-events-{utc_now().strftime('%Y-%m-%d')}"
+                doc = {**es_doc_base, 'event_category': 'decision'}
+                self._es_write(index_name, doc, doc_id=event.event_id)
+                logger.info(f"Indexed decision event {event_type.value} to {index_name}")
+            except Exception as e:
+                logger.error(f"Failed to index decision event to Elasticsearch: {e}")
+        elif self._is_decision_event(event_type):
+            logger.warning(f"Decision event {event_type.value} not indexed - ES client is None")
+
+        if self.es and self._is_agent_lifecycle_event(event_type):
+            try:
+                index_name = f"agent-events-{utc_now().strftime('%Y-%m-%d')}"
+                doc = {**es_doc_base, 'event_category': 'agent_lifecycle'}
+                self._es_write(index_name, doc, doc_id=event.event_id)
+                logger.info(f"Indexed agent lifecycle event {event_type.value} to {index_name}")
+            except Exception as e:
+                logger.error(f"Failed to index agent lifecycle event to Elasticsearch: {e}")
+        elif self._is_agent_lifecycle_event(event_type):
+            logger.warning(f"Agent lifecycle event {event_type.value} not indexed - ES client is None")
+
+        logger.debug(f"Emitted {event_type.value} event for {agent}/{task_id}")
 
     def emit_task_received(self, agent: str, task_id: str, project: str,
                           context: Dict[str, Any], pipeline_run_id: Optional[str] = None,

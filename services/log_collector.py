@@ -24,7 +24,6 @@ from services.pattern_detection_schema import (
     CLAUDE_OTEL_LOGS_TEMPLATE,
     CLAUDE_OTEL_METRICS_TEMPLATE,
     get_index_name,
-    enrich_event,
     enrich_claude_log,
 )
 from services.circuit_breaker import CircuitBreaker, CircuitBreakerOpen
@@ -74,7 +73,6 @@ class LogCollector:
         self.es = Elasticsearch(elasticsearch_hosts)
 
         # Stream keys and consumer group info
-        self.event_stream = "orchestrator:event_stream"
         self.claude_stream = "orchestrator:claude_logs_stream"
         self.consumer_group = "log_collector"
         self.consumer_name = f"log_collector_{int(time.time())}"
@@ -181,37 +179,32 @@ class LogCollector:
 
     def setup_consumer_groups(self):
         """Setup Redis consumer groups for reliable consumption"""
-        for stream_key in [self.event_stream, self.claude_stream]:
-            try:
-                # Try to create consumer group
-                self.redis.xgroup_create(
-                    name=stream_key,
-                    groupname=self.consumer_group,
-                    id="0",  # Start from beginning
-                    mkstream=True
-                )
-                logger.info(f"Created consumer group '{self.consumer_group}' for stream '{stream_key}'")
-            except redis.ResponseError as e:
-                if "BUSYGROUP" in str(e):
-                    # Group already exists
-                    logger.info(f"Consumer group '{self.consumer_group}' already exists for '{stream_key}'")
-                else:
-                    logger.error(f"Error creating consumer group: {e}")
+        try:
+            self.redis.xgroup_create(
+                name=self.claude_stream,
+                groupname=self.consumer_group,
+                id="0",
+                mkstream=True
+            )
+            logger.info(f"Created consumer group '{self.consumer_group}' for stream '{self.claude_stream}'")
+        except redis.ResponseError as e:
+            if "BUSYGROUP" in str(e):
+                logger.info(f"Consumer group '{self.consumer_group}' already exists for '{self.claude_stream}'")
+            else:
+                logger.error(f"Error creating consumer group: {e}")
 
     async def consume_events(self):
         """
-        Main consumption loop for both event streams
+        Main consumption loop for Claude log streams.
+
+        Note: agent events (decision-events, agent-events indices) are written
+        directly by ObservabilityManager.emit() — the log_collector only handles
+        claude-streams which observability.py does not cover.
         """
-        logger.info("Starting event consumption...")
+        logger.info("Starting event consumption (claude-streams only)...")
 
         while True:
             try:
-                # Read from both streams with circuit breaker protection
-                try:
-                    await self.redis_breaker.call(self._consume_agent_events)
-                except CircuitBreakerOpen as e:
-                    logger.debug(f"Redis circuit open for agent events: {e}")
-
                 try:
                     await self.redis_breaker.call(self._consume_claude_logs)
                 except CircuitBreakerOpen as e:
@@ -228,69 +221,6 @@ class LogCollector:
                 logger.error(f"Error in consumption loop: {e}")
                 self.errors += 1
                 await asyncio.sleep(1)  # Back off on errors
-
-    async def _consume_agent_events(self):
-        """Consume from agent event stream"""
-        try:
-            # Read from stream using consumer group
-            messages = self.redis.xreadgroup(
-                groupname=self.consumer_group,
-                consumername=self.consumer_name,
-                streams={self.event_stream: ">"},
-                count=10,
-                block=100  # Block for 100ms
-            )
-
-            if not messages:
-                return
-
-            for stream_name, events in messages:
-                for event_id, event_data in events:
-                    try:
-                        # Parse event JSON
-                        event_json = event_data.get("event")
-                        if not event_json:
-                            continue
-
-                        event = json.loads(event_json)
-
-                        # Enrich event
-                        enriched = enrich_event(event)
-                        enriched["_id"] = event_id  # Use Redis ID as Elasticsearch doc ID
-
-                        # Add to batch
-                        self.batch.append(enriched)
-                        self.events_processed += 1
-
-                        # Acknowledge message
-                        self.redis.xack(self.event_stream, self.consumer_group, event_id)
-
-                        # Flush batch if full
-                        if len(self.batch) >= self.batch_size:
-                            await self._flush_batch()
-
-                    except Exception as e:
-                        logger.error(f"Error processing event {event_id}: {e}")
-                        self.errors += 1
-
-        except redis.ResponseError as e:
-            if "NOGROUP" in str(e):
-                # Consumer group doesn't exist yet, recreate it
-                try:
-                    self.redis.xgroup_create(
-                        name=self.event_stream,
-                        groupname=self.consumer_group,
-                        id="0",
-                        mkstream=True
-                    )
-                    logger.debug(f"Created consumer group for {self.event_stream}")
-                except redis.ResponseError as create_error:
-                    if "BUSYGROUP" not in str(create_error):
-                        logger.error(f"Failed to create consumer group: {create_error}")
-            else:
-                logger.error(f"Redis error consuming agent events: {e}")
-        except Exception as e:
-            logger.error(f"Error consuming agent events: {e}")
 
     async def _consume_claude_logs(self):
         """Consume from Claude logs stream"""
