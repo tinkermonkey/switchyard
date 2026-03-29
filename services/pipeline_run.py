@@ -1252,7 +1252,8 @@ class PipelineRunManager:
                     try:
                         from services.human_feedback_loop import human_feedback_loop_executor
 
-                        if issue_number in human_feedback_loop_executor.active_loops:
+                        lk = human_feedback_loop_executor._loop_key(project, issue_number)
+                        if lk in human_feedback_loop_executor.active_loops:
                             logger.info(
                                 f"Skipping cleanup for pipeline run {pipeline_run_id[:8]}... - "
                                 f"active feedback loop exists for {project} issue #{issue_number}"

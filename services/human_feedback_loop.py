@@ -70,9 +70,14 @@ class HumanFeedbackLoopExecutor:
     def __init__(self):
         self.review_parser = ReviewParser()
         # Don't initialize GitHubIntegration here - create it per-loop with proper repo context
-        self.active_loops = {}  # Track active loops by issue number
+        self.active_loops = {}  # Track active loops by (project_name, issue_number) tuple
         self._initialized = False
         self._stop_events: Dict[str, threading.Event] = {}  # Active stop signals keyed by "project:issue"
+
+    @staticmethod
+    def _loop_key(project_name: str, issue_number: int) -> tuple:
+        """Return the key used to index active_loops."""
+        return (project_name, issue_number)
 
     def _update_loop_heartbeat(self, project_name: str, issue_number: int) -> None:
         """
@@ -239,10 +244,11 @@ class HumanFeedbackLoopExecutor:
             self.request_stop(project_name, issue_number)
 
             # Clean up in-memory state
-            if issue_number in self.active_loops:
-                state = self.active_loops[issue_number]
+            lk = self._loop_key(project_name, issue_number)
+            if lk in self.active_loops:
+                state = self.active_loops[lk]
                 agent = state.agent
-                del self.active_loops[issue_number]
+                del self.active_loops[lk]
                 logger.info(
                     f"🧹 Cleaned up conversational loop for {project_name}#{issue_number} "
                     f"(agent={agent}, reason={reason})"
@@ -338,8 +344,9 @@ class HumanFeedbackLoopExecutor:
         )
 
         # FIX #1: Check if loop already active (in-memory duplicate prevention)
-        if issue_number in self.active_loops:
-            existing_agent = self.active_loops[issue_number].agent
+        lk = self._loop_key(project_name, issue_number)
+        if lk in self.active_loops:
+            existing_agent = self.active_loops[lk].agent
 
             # If same agent, it's a duplicate - reject immediately
             if existing_agent == column.agent:
@@ -414,7 +421,7 @@ class HumanFeedbackLoopExecutor:
         )
 
         # Register active loop
-        self.active_loops[issue_number] = state
+        self.active_loops[self._loop_key(project_name, issue_number)] = state
         self.workflow_columns = workflow_columns
 
         try:
@@ -463,8 +470,9 @@ class HumanFeedbackLoopExecutor:
             raise
         finally:
             # Clean up in-memory state
-            if issue_number in self.active_loops:
-                del self.active_loops[issue_number]
+            lk = self._loop_key(project_name, issue_number)
+            if lk in self.active_loops:
+                del self.active_loops[lk]
 
             # Release Redis distributed lock
             try:
@@ -815,9 +823,10 @@ class HumanFeedbackLoopExecutor:
         finally:
             self._stop_events.pop(stop_key, None)
             # Also remove from active_loops so has_active_execution returns False after loop exits
-            if state.issue_number in self.active_loops:
-                del self.active_loops[state.issue_number]
-                logger.debug(f"Removed issue #{state.issue_number} from active_loops in _conversational_loop finally block")
+            lk = self._loop_key(state.project_name, state.issue_number)
+            if lk in self.active_loops:
+                del self.active_loops[lk]
+                logger.debug(f"Removed {state.project_name}#{state.issue_number} from active_loops in _conversational_loop finally block")
             # Only end the pipeline run when the workflow is truly done — not on column
             # transitions, where the next column's loop should inherit the same run.
             # Column changes (e.g., Requirements → Design) are healthy progressions;

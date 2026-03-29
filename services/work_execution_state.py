@@ -548,13 +548,12 @@ class WorkExecutionStateTracker:
         # Check 4: Conversational feedback loops
         try:
             from services.human_feedback_loop import human_feedback_loop_executor
-            if issue_number in human_feedback_loop_executor.active_loops:
-                loop = human_feedback_loop_executor.active_loops[issue_number]
-                if loop.project_name == project_name:
-                    logger.debug(
-                        f"Active feedback loop found for {project_name}/#{issue_number}"
-                    )
-                    return True
+            lk = human_feedback_loop_executor._loop_key(project_name, issue_number)
+            if lk in human_feedback_loop_executor.active_loops:
+                logger.debug(
+                    f"Active feedback loop found for {project_name}/#{issue_number}"
+                )
+                return True
         except (ImportError, AttributeError) as e:
             # Feedback loop module may not be available or initialized
             logger.warning(
@@ -1845,8 +1844,8 @@ class WorkExecutionStateTracker:
                             # Check if this issue has an active human feedback loop.
                             try:
                                 from services.human_feedback_loop import human_feedback_loop_executor
-                                fl = human_feedback_loop_executor.active_loops.get(issue_number)
-                                if fl and fl.project_name == project_name:
+                                lk = human_feedback_loop_executor._loop_key(project_name, issue_number)
+                                if lk in human_feedback_loop_executor.active_loops:
                                     logger.info(
                                         f"Issue {project_name}/#{issue_number} has active feedback "
                                         f"loop - skipping stuck state cleanup"

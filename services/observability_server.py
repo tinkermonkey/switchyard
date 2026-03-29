@@ -1478,9 +1478,9 @@ def get_active_feedback_loops():
         active_loops = []
 
         # Get all active loops from in-memory state
-        for issue_number, loop_state in human_feedback_loop_executor.active_loops.items():
+        for (project_name, issue_number), loop_state in human_feedback_loop_executor.active_loops.items():
             # Get heartbeat timestamp from Redis
-            heartbeat_key = f"orchestrator:feedback_loop:heartbeat:{loop_state.project_name}:{issue_number}"
+            heartbeat_key = f"orchestrator:feedback_loop:heartbeat:{project_name}:{issue_number}"
             last_heartbeat_str = redis_client.get(heartbeat_key)
 
             # Calculate health status based on heartbeat age

@@ -81,7 +81,7 @@ class TestCleanupLoopStopIntegration:
             project_name="myproject",
             board_name="dev",
         )
-        executor.active_loops[42] = state
+        executor.active_loops[executor._loop_key("myproject", 42)] = state
 
         executor.cleanup_loop("myproject", 42, reason="test")
 

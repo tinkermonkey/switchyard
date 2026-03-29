@@ -2220,7 +2220,7 @@ class DockerAgentRunner:
                     # Track comment timestamp for feedback loop polling
                     from services.feedback_manager import FeedbackManager
                     FeedbackManager().set_last_agent_comment_time(
-                        issue_number, agent, utc_isoformat()
+                        issue_number, agent, utc_isoformat(), project=project
                     )
                 else:
                     logger.error(

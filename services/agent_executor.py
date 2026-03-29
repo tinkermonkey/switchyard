@@ -988,7 +988,8 @@ class AgentExecutor:
                 feedback_manager.set_last_agent_comment_time(
                     issue_number,
                     agent_name,
-                    utc_isoformat()
+                    utc_isoformat(),
+                    project=project_name
                 )
             else:
                 logger.error(f"Failed to post {agent_name} output to GitHub: {post_result.get('error')}")

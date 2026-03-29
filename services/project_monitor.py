@@ -2338,7 +2338,8 @@ class ProjectMonitor:
                                             )
 
                                             # Register and start monitoring
-                                            human_feedback_loop_executor.active_loops[issue_number] = state
+                                            lk = human_feedback_loop_executor._loop_key(project_name, issue_number)
+                                            human_feedback_loop_executor.active_loops[lk] = state
                                             human_feedback_loop_executor.workflow_columns = workflow_template.columns
 
                                             issue_data = self.get_issue_details(repository, issue_number, project_config.github['org'])
@@ -2449,7 +2450,8 @@ class ProjectMonitor:
                                                 )
 
                                             # Register and start monitoring
-                                            human_feedback_loop_executor.active_loops[issue_number] = state
+                                            lk = human_feedback_loop_executor._loop_key(project_name, issue_number)
+                                            human_feedback_loop_executor.active_loops[lk] = state
                                             human_feedback_loop_executor.workflow_columns = workflow_template.columns
 
                                             issue_data = self.get_issue_details(repository, issue_number, project_config.github['org'])
@@ -7008,7 +7010,7 @@ _Repair cycle initiated by Claude Code Orchestrator_
             # Filter to unprocessed comments only
             new_feedback = []
             for comment in all_feedback_comments:
-                if not self.feedback_manager.is_comment_processed(issue_number, comment['id']):
+                if not self.feedback_manager.is_comment_processed(issue_number, comment['id'], project_name):
                     new_feedback.append(comment)
 
             if not new_feedback:
@@ -8173,7 +8175,7 @@ Moving to implementation phase.
                     # Check if this comment mentions the bot
                     if '@orchestrator-bot' in body:
                         # Check if we've already processed this comment
-                        if not self.feedback_manager.is_comment_processed(issue_number, comment_id):
+                        if not self.feedback_manager.is_comment_processed(issue_number, comment_id, project_name):
                             new_feedback.append({
                                 'id': comment_id,
                                 'body': body,
@@ -8199,7 +8201,7 @@ Moving to implementation phase.
                         continue
 
                     # Check if we've already processed this reply
-                    if self.feedback_manager.is_comment_processed(issue_number, reply_id):
+                    if self.feedback_manager.is_comment_processed(issue_number, reply_id, project_name):
                         continue
 
                     new_feedback.append({
