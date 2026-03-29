@@ -85,7 +85,8 @@ class ScheduledTasksService:
             replace_existing=True
         )
 
-        # Schedule token metrics computation
+        # Token metrics: frequent short-lookback job keeps recent data fresh,
+        # full job with longer lookback fills in historical gaps.
         token_metrics_hours = int(os.environ.get('TOKEN_METRICS_INTERVAL_HOURS', '3'))
         self.scheduler.add_job(
             self._run_token_metrics,
@@ -94,11 +95,18 @@ class ScheduledTasksService:
             name=f'Compute token usage metrics (every {token_metrics_hours}h)',
             replace_existing=True
         )
+        self.scheduler.add_job(
+            self._run_token_metrics_recent,
+            trigger=IntervalTrigger(minutes=15),
+            id='token_metrics_recent',
+            name='Compute recent token metrics (every 15m)',
+            replace_existing=True
+        )
 
         # Run token metrics shortly after startup so restarts don't create gaps
         token_startup_jitter = random.uniform(30, 120)
         self.scheduler.add_job(
-            self._run_token_metrics,
+            self._run_token_metrics_recent,
             trigger=DateTrigger(run_date=datetime.now(timezone.utc) + timedelta(seconds=token_startup_jitter)),
             id='token_metrics_startup',
             name='Token metrics catchup (startup)',
@@ -165,7 +173,8 @@ class ScheduledTasksService:
         logger.info("- Docker state reconciliation: Every 5 minutes")
         logger.info("- Queue state reconciliation: Every 10 minutes")
         logger.info("- Empty output detection: Every 15 minutes")
-        logger.info(f"- Token metrics computation: Once at startup in ~{token_startup_jitter:.0f}s, then every {token_metrics_hours}h")
+        logger.info(f"- Token metrics (recent): Once at startup in ~{token_startup_jitter:.0f}s, then every 15m (1h lookback)")
+        logger.info(f"- Token metrics (full): Every {token_metrics_hours}h")
         logger.info("- Project metrics rollup: Daily at 3:30 AM")
         logger.info(f"- Project metrics backfill: Once at startup in ~{jitter_seconds:.0f}s")
         logger.info(f"- Pipeline analysis catchup: Once at startup in ~{analysis_startup_jitter:.0f}s, then every 10 min")
@@ -549,13 +558,22 @@ class ScheduledTasksService:
             logger.error(f"Error in empty output detection: {e}", exc_info=True)
 
     def _run_token_metrics(self):
-        """Run token metrics computation job"""
+        """Run full token metrics computation job (long lookback)."""
         logger.info("Starting token metrics computation job")
         try:
             from services.token_metrics_service import get_token_metrics_service
             get_token_metrics_service().run_metrics_job()
         except Exception as e:
             logger.error(f"Fatal error in token metrics job: {e}", exc_info=True)
+
+    def _run_token_metrics_recent(self):
+        """Run token metrics with a short lookback to keep recent data fresh."""
+        logger.info("Starting recent token metrics computation (1h lookback)")
+        try:
+            from services.token_metrics_service import get_token_metrics_service
+            get_token_metrics_service().run_metrics_job(lookback_hours=1)
+        except Exception as e:
+            logger.error(f"Fatal error in recent token metrics job: {e}", exc_info=True)
 
     def _run_project_metrics(self):
         """Run daily project metrics rollup job (1-day lookback)."""
