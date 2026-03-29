@@ -3445,11 +3445,12 @@ def reconcile_state():
             'queue_reconciliation': None
         }
 
-        # Trigger Docker state reconciliation
+        # Docker state reconciliation removed — tracking key cleanup is handled
+        # by the orphaned container cleanup job; lock/run lifecycle by the watchdog.
         if reconcile_docker:
-            logger.info("Manual trigger: Docker state reconciliation")
-            scheduler.run_docker_reconciliation_now()
-            results['docker_reconciliation'] = 'triggered'
+            logger.info("Manual trigger: orphaned container cleanup (replaces Docker reconciliation)")
+            scheduler.run_orphaned_container_cleanup_now()
+            results['docker_reconciliation'] = 'triggered (orphaned container cleanup)'
 
         # Trigger queue state reconciliation
         if reconcile_queues:
