@@ -2,6 +2,6 @@ import { createFileRoute, redirect } from '@tanstack/react-router'
 
 export const Route = createFileRoute('/')({
   beforeLoad: () => {
-    throw redirect({ to: '/pipeline-run' })
+    throw redirect({ to: '/dashboard' })
   },
 })

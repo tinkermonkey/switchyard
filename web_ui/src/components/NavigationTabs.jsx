@@ -1,9 +1,21 @@
 import { Link } from '@tanstack/react-router'
-import { FolderGit2, Workflow, BarChart2, TrendingUp, FileBarChart2, ClipboardList } from 'lucide-react'
+import { FolderGit2, Workflow, BarChart2, TrendingUp, FileBarChart2, ClipboardList, LayoutDashboard } from 'lucide-react'
 
 export default function NavigationTabs() {
   return (
     <div className="flex gap-2 md:gap-3 my-3 overflow-x-auto scrollbar-hide">
+      <Link
+        to="/dashboard"
+        activeProps={{
+          className: "px-3 py-1.5 text-xs md:px-4 md:py-2 md:text-sm whitespace-nowrap bg-gh-accent-emphasis border border-gh-accent-primary rounded-md hover:bg-gh-accent-primary transition-colors text-white"
+        }}
+        inactiveProps={{
+          className: "px-3 py-1.5 text-xs md:px-4 md:py-2 md:text-sm whitespace-nowrap bg-gh-canvas-subtle border border-gh-border rounded-md hover:bg-gh-border-muted transition-colors"
+        }}
+      >
+        <LayoutDashboard className="inline w-4 h-4 mr-2" />
+        Dashboard
+      </Link>
       <Link
         to="/pipeline-run"
         activeProps={{
