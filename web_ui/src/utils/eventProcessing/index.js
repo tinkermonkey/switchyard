@@ -64,6 +64,27 @@ function buildAgentExecutionMap(sortedEvents) {
 }
 
 /**
+ * Test whether an event matches the given event_type(s) and definition filters
+ * (eventCategory, matchFields, excludeFields).
+ */
+function matchEventForDef(event, types, def) {
+  const eventCategory = def.eventCategory ?? 'decision'
+  if (event.event_category !== eventCategory) return false
+  if (!types.includes(event.event_type)) return false
+  if (def.matchFields) {
+    for (const [k, v] of Object.entries(def.matchFields)) {
+      if (event[k] !== v) return false
+    }
+  }
+  if (def.excludeFields) {
+    for (const [k, v] of Object.entries(def.excludeFields)) {
+      if (event[k] === v) return false
+    }
+  }
+  return true
+}
+
+/**
  * Match start events to end events using sequential-window pairing.
  * For each start S_i, the end must come after S_i AND before the next start S_{i+1}.
  * An end that only arrives after S_{i+1} has begun belongs to a later cycle, not this one.
@@ -89,19 +110,41 @@ function pairCycleEvents(starts, ends) {
 }
 
 /**
- * Find cycle boundaries for any event-driven cycle defined in CYCLE_TERMINAL_EVENTS.
- * Supports both single startEvent (string) and multiple startEvents (array).
+ * Match start events to end events by a shared field value (e.g. task_id).
+ * Used for cycle types where multiple instances can run concurrently, so
+ * sequential-window pairing would give incorrect results.
+ * Returns [{startEvent, endEvent}] — endEvent is null for open starts.
+ */
+function pairCycleEventsByField(starts, ends, field) {
+  const usedEnds = new Set()
+  return starts.map(start => {
+    const fieldValue = start[field]
+    const startMs = new Date(start.timestamp).getTime()
+    const matchedEnd = ends.find(
+      e => !usedEnds.has(e) &&
+           e[field] === fieldValue &&
+           new Date(e.timestamp).getTime() > startMs
+    )
+    if (matchedEnd) usedEnds.add(matchedEnd)
+    return { startEvent: start, endEvent: matchedEnd ?? null }
+  })
+}
+
+/**
+ * Find cycle boundaries for any cycle type defined in CYCLE_TERMINAL_EVENTS.
+ * Supports both single startEvent (string) and multiple startEvents (array),
+ * eventCategory filtering, matchFields/excludeFields, and pairByField for
+ * concurrent cycle types.
  * Returns [{startEvent, endEvent}] — endEvent is null for abandoned/open starts.
  */
 function findCycleBoundaries(def, sortedEvents) {
   const startTypes = def.startEvents ?? [def.startEvent]
   const terminalTypes = Object.keys(def.terminalEvents)
-  const starts = sortedEvents.filter(
-    e => e.event_category === 'decision' && startTypes.includes(e.event_type)
-  )
-  const ends = sortedEvents.filter(
-    e => e.event_category === 'decision' && terminalTypes.includes(e.event_type)
-  )
+  const starts = sortedEvents.filter(e => matchEventForDef(e, startTypes, def))
+  const ends = sortedEvents.filter(e => matchEventForDef(e, terminalTypes, def))
+  if (def.pairByField) {
+    return pairCycleEventsByField(starts, ends, def.pairByField)
+  }
   return pairCycleEvents(starts, ends)
 }
 
@@ -137,30 +180,7 @@ function groupPRReviewPhases(cycleEvents, boundary) {
 }
 
 
-/**
- * Find all repair cycle boundaries.
- * Repair cycles are bounded by agent_initialized / agent_completed (or agent_failed) events for agent='repair_cycle'.
- * Returns [{startEvent, endEvent}] — one entry per repair cycle. endEvent is null if in-progress.
- */
-function findRepairCycles(sortedEvents) {
-  const startEvents = sortedEvents.filter(
-    e =>
-      e.event_category === 'agent_lifecycle' &&
-      e.event_type === 'agent_initialized' &&
-      e.agent === 'repair_cycle'
-  )
-  return startEvents.map(startEvent => {
-    const startMs = new Date(startEvent.timestamp).getTime()
-    const endEvent = sortedEvents.find(
-      e =>
-        e.event_category === 'agent_lifecycle' &&
-        (e.event_type === 'agent_completed' || e.event_type === 'agent_failed') &&
-        e.agent === 'repair_cycle' &&
-        new Date(e.timestamp).getTime() > startMs
-    )
-    return { startEvent, endEvent }
-  })
-}
+
 
 /**
  * Group events within a review cycle into iterations.
@@ -413,8 +433,9 @@ function groupRepairTestCycles(cycleEvents, boundary, agentExecutions) {
 /**
  * Infer synthetic close events for any open cycles, working deepest-first.
  *
- * Nesting order (deepest → outermost):
- *   Sub-cycles (test_execution, fix_cycle) → Test cycles → Repair cycles → Review cycles
+ * Phase 1 handles all cycle types defined in CYCLE_TERMINAL_EVENTS (including
+ * repair_cycle and agent_execution). Phases 2-3b handle repair-cycle-specific
+ * internal sub-structure (test cycles → sub-cycles → nested sub-cycles).
  *
  * For each unclosed cycle a synthetic close event is created with:
  *   - timestamp = earliest valid upper bound (next sibling's start, parent's end, last event + 1 ms)
@@ -447,65 +468,53 @@ function inferMissingCloseEvents(sortedEvents) {
     )
   }
 
-  // ── Phase 1: All event-driven cycles (decision events) ───────────────────
-  // Generic: each definition in CYCLE_TERMINAL_EVENTS drives its own open/close pairing.
-  // Supports both single startEvent (string) and multiple startEvents (array).
+  // ── Phase 1: All cycle types defined in CYCLE_TERMINAL_EVENTS ────────────
+  // Generic: each definition drives its own open/close pairing via matchEventForDef.
+  // Handles decision events, agent_lifecycle events, matchFields, excludeFields, and
+  // pairByField for concurrent cycle types (e.g. agent_execution).
   for (const def of Object.values(CYCLE_TERMINAL_EVENTS)) {
-    const startTypes   = def.startEvents ?? [def.startEvent]
+    const startTypes    = def.startEvents ?? [def.startEvent]
     const terminalTypes = Object.keys(def.terminalEvents)
-    const opens = sortedEvents.filter(
-      e => e.event_category === 'decision' && startTypes.includes(e.event_type)
-    )
-    const closes = sortedEvents.filter(
-      e => e.event_category === 'decision' && terminalTypes.includes(e.event_type)
-    )
+    const opens  = sortedEvents.filter(e => matchEventForDef(e, startTypes, def))
+    const closes = sortedEvents.filter(e => matchEventForDef(e, terminalTypes, def))
     const usedCloses = new Set()
     opens.forEach((open, idx) => {
       const openMs   = new Date(open.timestamp).getTime()
       const nextOpen = opens[idx + 1]
       const nextOpenMs = nextOpen ? new Date(nextOpen.timestamp).getTime() : Infinity
-      const matched = closes.find(
-        e => !usedCloses.has(e) &&
-             new Date(e.timestamp).getTime() > openMs &&
-             new Date(e.timestamp).getTime() <= nextOpenMs
-      )
+
+      let matched
+      if (def.pairByField) {
+        const fieldVal = open[def.pairByField]
+        matched = closes.find(
+          e => !usedCloses.has(e) &&
+               e[def.pairByField] === fieldVal &&
+               new Date(e.timestamp).getTime() > openMs
+        )
+      } else {
+        matched = closes.find(
+          e => !usedCloses.has(e) &&
+               new Date(e.timestamp).getTime() > openMs &&
+               new Date(e.timestamp).getTime() <= nextOpenMs
+        )
+      }
       if (matched) { usedCloses.add(matched); return }
       synthetic.push(makeSyntheticClose(
         open,
         def.syntheticCloseType,
-        closestUpperBound(openMs, nextOpen ? nextOpenMs : null)
+        closestUpperBound(openMs, nextOpen ? nextOpenMs : null),
+        def.syntheticCloseOverrides ?? {}
       ))
     })
   }
 
-  // ── Phase 2: Repair cycles ────────────────────────────────────────────────
+  // Pre-compute repair cycle starts (needed for Phases 2-4 sub-cycle inference).
   const repairStarts = sortedEvents.filter(
-    e => e.event_category === 'agent_lifecycle' &&
-         e.event_type === 'agent_initialized' &&
-         e.agent === 'repair_cycle'
+    e => matchEventForDef(e, ['agent_initialized'], CYCLE_TERMINAL_EVENTS.repair_cycle)
   )
-  {
-    repairStarts.forEach((startEvent, idx) => {
-      const startMs = new Date(startEvent.timestamp).getTime()
-      const hasEnd = sortedEvents.some(
-        e => e.event_category === 'agent_lifecycle' &&
-             (e.event_type === 'agent_completed' || e.event_type === 'agent_failed') &&
-             e.agent === 'repair_cycle' &&
-             new Date(e.timestamp).getTime() > startMs
-      )
-      if (hasEnd) return
-      const nextRepairStart = repairStarts[idx + 1]
-      synthetic.push(makeSyntheticClose(
-        startEvent,
-        'agent_completed',
-        closestUpperBound(startMs, nextRepairStart ? new Date(nextRepairStart.timestamp).getTime() : null),
-        { event_category: 'agent_lifecycle', agent: 'repair_cycle', success: null, error: null, duration_ms: null }
-      ))
-    })
-  }
 
-  // ── Phase 3: Test cycles within repair cycles ─────────────────────────────
-  // (uses Phase 2 synthetic repair-cycle ends; snapshot includes any Phase 2 additions)
+  // ── Phase 2: Test cycles within repair cycles ─────────────────────────────
+  // (uses Phase 1 synthetic repair-cycle ends; snapshot includes any Phase 1 additions)
   {
     const stream = synthetic.length > 0 ? snapshot() : sortedEvents
     repairStarts.forEach(repairStart => {
@@ -540,7 +549,7 @@ function inferMissingCloseEvents(sortedEvents) {
     })
   }
 
-  // ── Phase 4: Sub-cycles within test cycles ────────────────────────────────
+  // ── Phase 3: Sub-cycles within test cycles ────────────────────────────────
   // (uses Phase 2 + 3 synthetic ends via snapshot)
   {
     const stream = snapshot()
@@ -593,8 +602,8 @@ function inferMissingCloseEvents(sortedEvents) {
     })
   }
 
-  // ── Phase 4b: Nested sub-cycles within outer sub-cycles ─────────────────
-  // Phase 4 inferred close events for outer sub-cycles. Now use those (via snapshot)
+  // ── Phase 3b: Nested sub-cycles within outer sub-cycles ─────────────────
+  // Phase 3 inferred close events for outer sub-cycles. Now use those (via snapshot)
   // to determine outer-SC windows and infer closes for any unclosed nested sub-cycles
   // (e.g. a test_execution running inside a systemic_fix with no completed event).
   {
@@ -717,46 +726,48 @@ export function processEvents(events, workflowConfig = null) {
   const _t2 = performance.now()
 
   // Detect cycle boundaries
-  const reviewCycleBoundaries       = findCycleBoundaries(CYCLE_TERMINAL_EVENTS.review_cycle, sorted)
-  const repairCycleBoundaries       = findRepairCycles(sorted)
-  const prReviewCycleBoundaries     = findCycleBoundaries(CYCLE_TERMINAL_EVENTS.pr_review_cycle, sorted)
+  const reviewCycleBoundaries        = findCycleBoundaries(CYCLE_TERMINAL_EVENTS.review_cycle, sorted)
+  const repairCycleBoundaries        = findCycleBoundaries(CYCLE_TERMINAL_EVENTS.repair_cycle, sorted)
+  const prReviewCycleBoundaries      = findCycleBoundaries(CYCLE_TERMINAL_EVENTS.pr_review_cycle, sorted)
   const conversationalLoopBoundaries = findCycleBoundaries(CYCLE_TERMINAL_EVENTS.conversational_loop, sorted)
   const statusProgressionBoundaries  = findCycleBoundaries(CYCLE_TERMINAL_EVENTS.status_progression, sorted)
+  const agentExecutionBoundaries     = findCycleBoundaries(CYCLE_TERMINAL_EVENTS.agent_execution, sorted)
   const _t3 = performance.now()
 
   // Compute the earliest/latest cycle timestamps for prelude/postlude splitting
   let firstCycleStartMs = Infinity
   let lastCycleEndMs = -Infinity
 
-  reviewCycleBoundaries.forEach(({ startEvent, endEvent }) => {
+  // Collect time windows from all non-agent-execution cycle types first, so we can
+  // filter agent_execution boundaries to only those outside other cycles' windows.
+  const otherCycleBoundaries = [
+    ...reviewCycleBoundaries,
+    ...repairCycleBoundaries,
+    ...prReviewCycleBoundaries,
+    ...conversationalLoopBoundaries,
+    ...statusProgressionBoundaries,
+  ]
+  const otherCycleWindows = otherCycleBoundaries.map(({ startEvent, endEvent }) => ({
+    startMs: getMs(startEvent.timestamp),
+    endMs: endEvent ? getMs(endEvent.timestamp) : Date.now(),
+  }))
+
+  otherCycleBoundaries.forEach(({ startEvent, endEvent }) => {
     const sMs = getMs(startEvent.timestamp)
     const eMs = endEvent ? getMs(endEvent.timestamp) : Date.now()
     firstCycleStartMs = Math.min(firstCycleStartMs, sMs)
     lastCycleEndMs = Math.max(lastCycleEndMs, eMs)
   })
 
-  repairCycleBoundaries.forEach(({ startEvent, endEvent }) => {
-    const sMs = getMs(startEvent.timestamp)
-    const eMs = endEvent ? getMs(endEvent.timestamp) : Date.now()
-    firstCycleStartMs = Math.min(firstCycleStartMs, sMs)
-    lastCycleEndMs = Math.max(lastCycleEndMs, eMs)
+  // Agent execution boundaries that fall inside another cycle's window are already
+  // represented by that cycle's internal structure — only standalone ones become
+  // top-level cycle entries.
+  const standaloneAgentExecBoundaries = agentExecutionBoundaries.filter(({ startEvent }) => {
+    const t = getMs(startEvent.timestamp)
+    return !otherCycleWindows.some(w => t >= w.startMs && t <= w.endMs)
   })
 
-  prReviewCycleBoundaries.forEach(({ startEvent, endEvent }) => {
-    const sMs = getMs(startEvent.timestamp)
-    const eMs = endEvent ? getMs(endEvent.timestamp) : Date.now()
-    firstCycleStartMs = Math.min(firstCycleStartMs, sMs)
-    lastCycleEndMs = Math.max(lastCycleEndMs, eMs)
-  })
-
-  conversationalLoopBoundaries.forEach(({ startEvent, endEvent }) => {
-    const sMs = getMs(startEvent.timestamp)
-    const eMs = endEvent ? getMs(endEvent.timestamp) : Date.now()
-    firstCycleStartMs = Math.min(firstCycleStartMs, sMs)
-    lastCycleEndMs = Math.max(lastCycleEndMs, eMs)
-  })
-
-  statusProgressionBoundaries.forEach(({ startEvent, endEvent }) => {
+  standaloneAgentExecBoundaries.forEach(({ startEvent, endEvent }) => {
     const sMs = getMs(startEvent.timestamp)
     const eMs = endEvent ? getMs(endEvent.timestamp) : Date.now()
     firstCycleStartMs = Math.min(firstCycleStartMs, sMs)
@@ -946,6 +957,32 @@ export function processEvents(events, workflowConfig = null) {
       endEvent,
       events: childEvents,
       isCollapsed: true,  // default collapsed — quick operation, primary info is the summary
+    })
+  })
+
+  // ── Agent execution cycles (standalone — outside other cycle windows) ─────
+  standaloneAgentExecBoundaries.forEach((boundary) => {
+    const { startEvent, endEvent } = boundary
+    const cycleStartMs = getMs(startEvent.timestamp)
+    const cycleEndMs = endEvent ? getMs(endEvent.timestamp) : Date.now()
+
+    const cycleEvents = sorted.filter(e => {
+      const t = getMs(e.timestamp)
+      return t > cycleStartMs && t <= cycleEndMs
+    })
+
+    // Child events: everything inside the window except the boundary markers
+    const childEvents = cycleEvents.filter(e => e !== startEvent && e !== endEvent)
+
+    cycles.push({
+      id: `agent_execution_${startEvent.agent}_${startEvent.task_id}`,
+      type: 'agent_execution',
+      startEvent,
+      endEvent,
+      agent: startEvent.agent,
+      taskId: startEvent.task_id,
+      events: childEvents,
+      isCollapsed: true,
     })
   })
 

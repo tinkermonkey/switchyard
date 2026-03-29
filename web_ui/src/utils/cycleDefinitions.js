@@ -1,18 +1,27 @@
 /**
- * Terminal event definitions for each event-driven cycle type.
+ * Terminal event definitions for every cycle type recognised by the UI.
  *
- * terminalEvents: maps event_type → { status?: string, isFailure: bool }
- *   - status: fixed status string to assign when this event closes the cycle.
- *             Omitted when status must be derived from the event's outcome field.
- *   - isFailure: true for abnormal/failure terminal events.
+ * Each entry describes how to detect cycle boundaries:
+ *
+ *   startEvent / startEvents  - event_type(s) that open a cycle
+ *   terminalEvents            - map of event_type → { status?: string, isFailure: bool }
+ *     - status: fixed status string to assign when this event closes the cycle.
+ *               Omitted when status must be derived from the event's outcome field.
+ *     - isFailure: true for abnormal/failure terminal events.
+ *   syntheticCloseType        - event_type used when inferring a close for an open cycle
+ *
+ * Optional fields for non-decision cycle types:
+ *
+ *   eventCategory             - event_category to match (default: 'decision')
+ *   matchFields               - { field: value } pairs that must ALL match on the event
+ *   excludeFields             - { field: value } pairs where ANY match excludes the event
+ *   syntheticCloseOverrides   - extra fields merged into synthetic close events
+ *   pairByField               - when set, pairs start/end by matching this field value
+ *                                instead of sequential-window pairing (for concurrent cycles)
  *
  * Drives two concerns:
- *   1. Boundary detection (eventProcessing/index.js) — which events close a cycle.
+ *   1. Boundary detection (eventProcessing/index.js) — which events open/close a cycle.
  *   2. Status extraction (cycleSummaries.js) — what status to assign the closed cycle.
- *
- * Note: repair_cycle uses agent_lifecycle events (agent_initialized/agent_completed/
- * agent_failed), not decision events, so it follows a different pattern and is
- * not listed here.
  */
 export const CYCLE_TERMINAL_EVENTS = {
   review_cycle: {
@@ -44,5 +53,28 @@ export const CYCLE_TERMINAL_EVENTS = {
       'conversational_loop_paused': { isFailure: false },
     },
     syntheticCloseType: 'conversational_loop_paused',
+  },
+  repair_cycle: {
+    eventCategory: 'agent_lifecycle',
+    startEvent: 'agent_initialized',
+    matchFields: { agent: 'repair_cycle' },
+    terminalEvents: {
+      'agent_completed': { isFailure: false },
+      'agent_failed':    { isFailure: true, status: 'failed' },
+    },
+    syntheticCloseType: 'agent_completed',
+    syntheticCloseOverrides: { event_category: 'agent_lifecycle', agent: 'repair_cycle', success: null, error: null, duration_ms: null },
+  },
+  agent_execution: {
+    eventCategory: 'agent_lifecycle',
+    startEvent: 'agent_initialized',
+    excludeFields: { agent: 'repair_cycle' },
+    terminalEvents: {
+      'agent_completed': { isFailure: false },
+      'agent_failed':    { isFailure: true, status: 'failed' },
+    },
+    syntheticCloseType: 'agent_completed',
+    syntheticCloseOverrides: { event_category: 'agent_lifecycle', success: null, error: null, duration_ms: null },
+    pairByField: 'task_id',
   },
 }

@@ -279,137 +279,12 @@ export function buildFlowchart({
   }
 
   /**
-   * Process a section (prelude or postlude) with agent execution grouping.
-   *
-   * Agent_initialized events create expandable agentExecutionContainer nodes.
-   * All events within each execution's time window become children of that container
-   * (shown when expanded, hidden when collapsed). Events outside any execution window
-   * are processed as top-level nodes.
+   * Process a section (prelude or postlude) — renders each event as a top-level node.
+   * Standalone agent executions are now handled as cycle entries by processEvents(),
+   * so this function no longer needs to detect or group agent execution boundaries.
    */
   function processSection(sectionEvents, idPrefix) {
-    // Build taskId → { agent, exec, startMs, endMs } for all agent executions
-    const windowByTask = new Map()
-    agentExecutions.forEach((execs, agent) => {
-      execs.forEach(exec => {
-        const startMs = new Date(exec.startTime).getTime()
-        const endMs = exec.endTime ? new Date(exec.endTime).getTime() : Infinity
-        windowByTask.set(exec.taskId, { agent, exec, startMs, endMs })
-      })
-    })
-
-    // Identify which task IDs have their agent_initialized in this section
-    const containerTaskIds = new Set()
-    sectionEvents.forEach(event => {
-      if (event.event_category === 'agent_lifecycle' && event.event_type === 'agent_initialized') {
-        containerTaskIds.add(event.task_id)
-      }
-    })
-
-    if (containerTaskIds.size === 0) {
-      sectionEvents.forEach(event => processEventToNode(event, idPrefix, null))
-      return
-    }
-
-    // For a given event, find the task ID of the agent execution container it belongs to.
-    // agent_initialized → owns itself; other agent_lifecycle → matched by task_id;
-    // decision events → matched by timestamp window (latest-started window wins for overlaps).
-    const getOwnerTaskId = (event) => {
-      if (event.event_category === 'agent_lifecycle') {
-        return containerTaskIds.has(event.task_id) ? event.task_id : null
-      }
-      const eventMs = new Date(event.timestamp).getTime()
-      let match = null
-      let matchStartMs = -1
-      containerTaskIds.forEach(taskId => {
-        const w = windowByTask.get(taskId)
-        if (!w) return
-        if (eventMs > w.startMs && eventMs <= w.endMs) {
-          if (w.startMs > matchStartMs) {
-            match = taskId
-            matchStartMs = w.startMs
-          }
-        }
-      })
-      return match
-    }
-
-    sectionEvents.forEach(event => {
-      const ownerTaskId = getOwnerTaskId(event)
-
-      if (ownerTaskId && event.event_category === 'agent_lifecycle' && event.event_type === 'agent_initialized') {
-        // ── Create agent execution container ────────────────────────────────
-        const { agent, task_id: taskId } = event
-        const w = windowByTask.get(taskId)
-        const exec = w?.exec
-        const containerId = `${idPrefix}-agent-${agent}-${taskId}`
-
-        const existingState = existingCycles.get(containerId)
-        const isCollapsed = existingState?.isCollapsed ?? true
-        updatedCycles.set(containerId, { isCollapsed })
-
-        const isActive = activeTaskIds.has(taskId)
-        const durationMs = (exec?.startTime && exec?.endTime)
-          ? new Date(exec.endTime) - new Date(exec.startTime)
-          : null
-        const claudeData = claudeSummaries.get(taskId) ?? null
-
-        // Count visible child events for the header badge
-        const startMs = w?.startMs ?? 0
-        const endMs = w?.endMs ?? Infinity
-        const childCount = sectionEvents.filter(e => {
-          if (e === event) return false
-          if (e.event_category === 'agent_lifecycle' && e.task_id === taskId) {
-            return e.event_type !== 'agent_initialized'
-          }
-          const t = new Date(e.timestamp).getTime()
-          return t > startMs && t <= endMs && !SKIP_EVENT_TYPES.has(e.event_type)
-        }).length
-
-        newNodes.push({
-          id: containerId,
-          type: 'agentExecutionContainer',
-          position: { x: 0, y: 0 },
-          data: {
-            cycleId: containerId,
-            cycleType: 'agent_execution',
-            label: agent.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase()),
-            iterationCount: childCount,
-            isCollapsed,
-            containsActiveAgent: isActive,
-            onToggleCollapse: null,
-            startTime: event.timestamp,
-            endTime: exec?.endTime ?? null,
-            status: exec?.status ?? 'running',
-            isActive,
-            durationMs,
-            inputTokens: claudeData?.inputTokens ?? null,
-            outputTokens: claudeData?.outputTokens ?? null,
-            tools: claudeData?.tools ?? null,
-            event,
-          },
-          style: isCollapsed ? {} : { width: 0, height: 0 },
-          ...(isCollapsed ? {} : { measured: { width: 1, height: 1 } }),
-          draggable: false,
-        })
-        leafChain.push({ id: containerId, timestamp: event.timestamp })
-
-      } else if (ownerTaskId) {
-        // ── Child event inside an agent execution container ──────────────────
-        const { agent } = windowByTask.get(ownerTaskId) ?? {}
-        const containerId = `${idPrefix}-agent-${agent}-${ownerTaskId}`
-        const containerState = updatedCycles.get(containerId)
-        const isCollapsed = containerState?.isCollapsed ?? true
-
-        if (!isCollapsed) {
-          processEventToNode(event, containerId, containerId)
-        }
-        // When collapsed, child events are not rendered
-
-      } else {
-        // ── Top-level event (outside any agent execution window) ─────────────
-        processEventToNode(event, idPrefix, null)
-      }
-    })
+    sectionEvents.forEach(event => processEventToNode(event, idPrefix, null))
   }
 
   /**
@@ -996,6 +871,52 @@ export function buildFlowchart({
           processEventToNode(event, cycle.id, cycle.id)
         })
       }
+
+    } else if (cycle.type === 'agent_execution') {
+      // ── Agent execution container ──────────────────────────────────────
+      const { agent, taskId } = cycle
+      const exec = agentExecutions.get(agent)?.find(e => e.taskId === taskId)
+      const isActive = activeTaskIds.has(taskId)
+      const durationMs = (exec?.startTime && exec?.endTime)
+        ? new Date(exec.endTime) - new Date(exec.startTime)
+        : null
+      const claudeData = claudeSummaries.get(taskId) ?? null
+      const childCount = (cycle.events ?? []).filter(e => !SKIP_EVENT_TYPES.has(e.event_type)).length
+
+      newNodes.push({
+        id: cycle.id,
+        type: 'agentExecutionContainer',
+        position: { x: 0, y: 0 },
+        data: {
+          cycleId: cycle.id,
+          cycleType: 'agent_execution',
+          label: agent.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase()),
+          iterationCount: childCount,
+          isCollapsed,
+          containsActiveAgent: activeContainerIds.has(cycle.id) || isActive,
+          onToggleCollapse: null,
+          startTime: cycle.startEvent?.timestamp,
+          endTime: cycle.endEvent?.timestamp ?? null,
+          status: exec?.status ?? 'running',
+          isActive,
+          durationMs,
+          inputTokens: claudeData?.inputTokens ?? null,
+          outputTokens: claudeData?.outputTokens ?? null,
+          tools: claudeData?.tools ?? null,
+          event: cycle.startEvent,
+        },
+        style: isCollapsed ? {} : { width: 0, height: 0 },
+        ...(isCollapsed ? {} : { measured: { width: 1, height: 1 } }),
+        draggable: false,
+      })
+
+      if (isCollapsed) {
+        leafChain.push({ id: cycle.id, timestamp: cycle.startEvent?.timestamp })
+      } else {
+        ;(cycle.events ?? [])
+          .sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp))
+          .forEach(event => processEventToNode(event, cycle.id, cycle.id))
+      }
     }
   })
 
@@ -1137,6 +1058,10 @@ export function findActiveContainerPath(model, activeTaskIds) {
       // Standalone orphaned iteration — no parent container, just check the iteration itself
       const iterEvents = [cycle.startEvent, ...(cycle.events ?? [])].filter(Boolean)
       if (hasActive(iterEvents)) {
+        result.add(cycle.id)
+      }
+    } else if (cycle.type === 'agent_execution') {
+      if (activeTaskIds.has(cycle.taskId)) {
         result.add(cycle.id)
       }
     }
