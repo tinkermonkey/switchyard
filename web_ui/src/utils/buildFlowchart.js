@@ -279,12 +279,92 @@ export function buildFlowchart({
   }
 
   /**
-   * Process a section (prelude or postlude) — renders each event as a top-level node.
-   * Standalone agent executions are now handled as cycle entries by processEvents(),
-   * so this function no longer needs to detect or group agent execution boundaries.
+   * Render agent execution containers from a model node's agentExecutions array.
+   * Creates agentExecutionContainer nodes with their children, following the same
+   * pattern as other cycle containers (collapse state, active highlighting, etc.).
+   *
+   * Returns an array of { id, timestamp } entries for interleaving into the caller's
+   * chronological sort (so agent containers appear in the correct position relative
+   * to sibling events).
    */
-  function processSection(sectionEvents, idPrefix) {
-    sectionEvents.forEach(event => processEventToNode(event, idPrefix, null))
+  function renderAgentExecutionContainers(agentExecs, idPrefix, parentId) {
+    if (!agentExecs || agentExecs.length === 0) return []
+
+    const entries = []
+    agentExecs.forEach(ae => {
+      const containerId = `${idPrefix}-agent-${ae.agent}-${ae.taskId}`
+
+      const existingState = existingCycles.get(containerId) ?? updatedCycles.get(containerId)
+      const isCollapsed = existingState?.isCollapsed ?? true
+      updatedCycles.set(containerId, { isCollapsed })
+
+      const isActive = activeTaskIds.has(ae.taskId)
+      const exec = agentExecutions.get(ae.agent)?.find(e => e.taskId === ae.taskId)
+      const durationMs = (exec?.startTime && exec?.endTime)
+        ? new Date(exec.endTime) - new Date(exec.startTime)
+        : null
+      const claudeData = claudeSummaries.get(ae.taskId) ?? null
+      const childCount = (ae.events ?? []).filter(e => !SKIP_EVENT_TYPES.has(e.event_type)).length
+
+      const containerNode = {
+        id: containerId,
+        type: 'agentExecutionContainer',
+        position: { x: 0, y: 0 },
+        data: {
+          cycleId: containerId,
+          cycleType: 'agent_execution',
+          label: ae.agent.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase()),
+          iterationCount: childCount,
+          isCollapsed,
+          containsActiveAgent: activeContainerIds.has(containerId) || isActive,
+          onToggleCollapse: null,
+          startTime: ae.startEvent?.timestamp,
+          endTime: ae.endEvent?.timestamp ?? null,
+          status: ae.status ?? exec?.status ?? 'running',
+          isActive,
+          durationMs,
+          inputTokens: claudeData?.inputTokens ?? null,
+          outputTokens: claudeData?.outputTokens ?? null,
+          tools: claudeData?.tools ?? null,
+          event: ae.startEvent,
+        },
+        style: isCollapsed ? {} : { width: 0, height: 0 },
+        ...(isCollapsed ? {} : { measured: { width: 1, height: 1 } }),
+        draggable: false,
+      }
+      if (parentId) containerNode.parentId = parentId
+      newNodes.push(containerNode)
+
+      if (isCollapsed) {
+        entries.push({ id: containerId, timestamp: ae.startEvent?.timestamp })
+      } else {
+        // First entry: the container itself (for edge routing)
+        entries.push({ id: containerId, timestamp: ae.startEvent?.timestamp, isContainer: true })
+        // Then render children
+        ;(ae.events ?? [])
+          .sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp))
+          .forEach(event => processEventToNode(event, containerId, containerId))
+      }
+    })
+    return entries
+  }
+
+  /**
+   * Process a section (prelude or postlude) — renders events and agent execution
+   * containers, sorted chronologically.
+   */
+  function processSection(section, idPrefix) {
+    const aeEntries = renderAgentExecutionContainers(section.agentExecutions, idPrefix, null)
+    const eventEntries = []
+    section.events.forEach(event => {
+      const nodeId = processEventToNode(event, idPrefix, null)
+      if (nodeId) eventEntries.push({ id: nodeId, timestamp: event.timestamp })
+    })
+    // leafChain entries are already added by processEventToNode, but agent container
+    // entries need to be added manually (processEventToNode doesn't handle containers)
+    aeEntries.forEach(entry => {
+      if (!entry.isContainer) leafChain.push(entry)
+    })
   }
 
   /**
@@ -370,7 +450,7 @@ export function buildFlowchart({
   leafChain.push({ id: 'created', timestamp: selectedPipelineRun.started_at })
 
   // ── 3. Prelude events ─────────────────────────────────────────────────────
-  processSection(prelude.events, 'pre')
+  processSection(prelude, 'pre')
 
   // ── 4. Cycles ─────────────────────────────────────────────────────────────
   cycles.forEach(cycle => {
@@ -424,6 +504,11 @@ export function buildFlowchart({
         ;(cycle.events ?? []).forEach(event => {
           allReviewEntries.push({ event, parentId: cycle.id, timestamp: event.timestamp })
         })
+        // Agent execution containers at cycle level (outside iterations)
+        const cycleAeEntries = renderAgentExecutionContainers(cycle.agentExecutions, cycle.id, cycle.id)
+        cycleAeEntries.forEach(entry => {
+          allReviewEntries.push({ containerId: entry.id, timestamp: entry.timestamp })
+        })
 
         // Iteration containers
         const lastIterIdx = cycle.iterations.length - 1
@@ -467,6 +552,11 @@ export function buildFlowchart({
               .sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp))
             allIterEvents.forEach(event => {
               allReviewEntries.push({ event, parentId: iterId, timestamp: event.timestamp })
+            })
+            // Agent execution containers within this iteration
+            const aeEntries = renderAgentExecutionContainers(iteration.agentExecutions, iterId, iterId)
+            aeEntries.forEach(entry => {
+              allReviewEntries.push({ containerId: entry.id, timestamp: entry.timestamp })
             })
           }
         })
@@ -534,6 +624,9 @@ export function buildFlowchart({
           .forEach(event => {
             allRepairEntries.push({ event, parentId: cycle.id, timestamp: event.timestamp })
           })
+        // Agent execution containers at repair cycle level
+        renderAgentExecutionContainers(cycle.agentExecutions, cycle.id, cycle.id)
+          .forEach(entry => allRepairEntries.push({ containerId: entry.id, timestamp: entry.timestamp }))
 
         // Test cycle containers + their sub-cycles + events
         cycle.testCycles.forEach(tc => {
@@ -610,6 +703,9 @@ export function buildFlowchart({
                 ;[sc.startEvent, ...sc.events, sc.endEvent].filter(Boolean).forEach(event => {
                   allRepairEntries.push({ event, parentId: scId, timestamp: event.timestamp })
                 })
+                // Agent execution containers within this sub-cycle
+                renderAgentExecutionContainers(sc.agentExecutions, scId, scId)
+                  .forEach(entry => allRepairEntries.push({ containerId: entry.id, timestamp: entry.timestamp }))
               }
             }
 
@@ -619,6 +715,9 @@ export function buildFlowchart({
             ;[tc.startEvent, ...tc.events, tc.endEvent].filter(Boolean).forEach(event => {
               allRepairEntries.push({ event, parentId: tcId, timestamp: event.timestamp })
             })
+            // Agent execution containers within this test cycle
+            renderAgentExecutionContainers(tc.agentExecutions, tcId, tcId)
+              .forEach(entry => allRepairEntries.push({ containerId: entry.id, timestamp: entry.timestamp }))
           }
         })
 
@@ -675,6 +774,9 @@ export function buildFlowchart({
         ;(cycle.events ?? []).forEach(event => {
           allPREntries.push({ event, parentId: cycle.id, timestamp: event.timestamp })
         })
+        // Agent execution containers at PR review cycle level
+        renderAgentExecutionContainers(cycle.agentExecutions, cycle.id, cycle.id)
+          .forEach(entry => allPREntries.push({ containerId: entry.id, timestamp: entry.timestamp }))
 
         // Phase containers
         ;(cycle.phases ?? []).forEach(phase => {
@@ -715,6 +817,9 @@ export function buildFlowchart({
             allPhaseEvents.forEach(event => {
               allPREntries.push({ event, parentId: phaseId, timestamp: event.timestamp })
             })
+            // Agent execution containers within this phase
+            renderAgentExecutionContainers(phase.agentExecutions, phaseId, phaseId)
+              .forEach(entry => allPREntries.push({ containerId: entry.id, timestamp: entry.timestamp }))
           }
         })
 
@@ -773,10 +878,22 @@ export function buildFlowchart({
           leafChain.push({ id: startId, timestamp: cycle.startEvent.timestamp })
         }
 
-        // Child events (flat — no iteration containers)
-        ;(cycle.events ?? [])
+        // Child events + agent execution containers, sorted chronologically
+        const loopEntries = []
+        ;(cycle.events ?? []).forEach(event => {
+          loopEntries.push({ event, timestamp: event.timestamp })
+        })
+        renderAgentExecutionContainers(cycle.agentExecutions, cycle.id, cycle.id)
+          .forEach(entry => loopEntries.push({ containerId: entry.id, timestamp: entry.timestamp }))
+        loopEntries
           .sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp))
-          .forEach(event => processEventToNode(event, cycle.id, cycle.id))
+          .forEach(entry => {
+            if (entry.containerId) {
+              leafChain.push({ id: entry.containerId, timestamp: entry.timestamp })
+            } else {
+              processEventToNode(entry.event, cycle.id, cycle.id)
+            }
+          })
 
         // Loop close event → direct child, rightmost
         if (cycle.endEvent && !cycle.endEvent._inferred) {
@@ -820,10 +937,22 @@ export function buildFlowchart({
           leafChain.push({ id: startId, timestamp: cycle.startEvent.timestamp })
         }
 
-        // Child events (flat)
-        ;(cycle.events ?? [])
+        // Child events + agent execution containers, sorted chronologically
+        const spEntries = []
+        ;(cycle.events ?? []).forEach(event => {
+          spEntries.push({ event, timestamp: event.timestamp })
+        })
+        renderAgentExecutionContainers(cycle.agentExecutions, cycle.id, cycle.id)
+          .forEach(entry => spEntries.push({ containerId: entry.id, timestamp: entry.timestamp }))
+        spEntries
           .sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp))
-          .forEach(event => processEventToNode(event, cycle.id, cycle.id))
+          .forEach(entry => {
+            if (entry.containerId) {
+              leafChain.push({ id: entry.containerId, timestamp: entry.timestamp })
+            } else {
+              processEventToNode(entry.event, cycle.id, cycle.id)
+            }
+          })
 
         // End event → direct child, rightmost (skip if inferred)
         if (cycle.endEvent && !cycle.endEvent._inferred) {
@@ -864,64 +993,28 @@ export function buildFlowchart({
       if (iterCollapsed) {
         leafChain.push({ id: cycle.id, timestamp: cycle.startEvent?.timestamp })
       } else {
-        const allIterEvents = [cycle.startEvent, ...cycle.events]
+        const orphanEntries = []
+        ;[cycle.startEvent, ...cycle.events]
           .filter(Boolean)
+          .forEach(event => orphanEntries.push({ event, timestamp: event.timestamp }))
+        renderAgentExecutionContainers(cycle.agentExecutions, cycle.id, cycle.id)
+          .forEach(entry => orphanEntries.push({ containerId: entry.id, timestamp: entry.timestamp }))
+        orphanEntries
           .sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp))
-        allIterEvents.forEach(event => {
-          processEventToNode(event, cycle.id, cycle.id)
-        })
+          .forEach(entry => {
+            if (entry.containerId) {
+              leafChain.push({ id: entry.containerId, timestamp: entry.timestamp })
+            } else {
+              processEventToNode(entry.event, cycle.id, cycle.id)
+            }
+          })
       }
 
-    } else if (cycle.type === 'agent_execution') {
-      // ── Agent execution container ──────────────────────────────────────
-      const { agent, taskId } = cycle
-      const exec = agentExecutions.get(agent)?.find(e => e.taskId === taskId)
-      const isActive = activeTaskIds.has(taskId)
-      const durationMs = (exec?.startTime && exec?.endTime)
-        ? new Date(exec.endTime) - new Date(exec.startTime)
-        : null
-      const claudeData = claudeSummaries.get(taskId) ?? null
-      const childCount = (cycle.events ?? []).filter(e => !SKIP_EVENT_TYPES.has(e.event_type)).length
-
-      newNodes.push({
-        id: cycle.id,
-        type: 'agentExecutionContainer',
-        position: { x: 0, y: 0 },
-        data: {
-          cycleId: cycle.id,
-          cycleType: 'agent_execution',
-          label: agent.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase()),
-          iterationCount: childCount,
-          isCollapsed,
-          containsActiveAgent: activeContainerIds.has(cycle.id) || isActive,
-          onToggleCollapse: null,
-          startTime: cycle.startEvent?.timestamp,
-          endTime: cycle.endEvent?.timestamp ?? null,
-          status: exec?.status ?? 'running',
-          isActive,
-          durationMs,
-          inputTokens: claudeData?.inputTokens ?? null,
-          outputTokens: claudeData?.outputTokens ?? null,
-          tools: claudeData?.tools ?? null,
-          event: cycle.startEvent,
-        },
-        style: isCollapsed ? {} : { width: 0, height: 0 },
-        ...(isCollapsed ? {} : { measured: { width: 1, height: 1 } }),
-        draggable: false,
-      })
-
-      if (isCollapsed) {
-        leafChain.push({ id: cycle.id, timestamp: cycle.startEvent?.timestamp })
-      } else {
-        ;(cycle.events ?? [])
-          .sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp))
-          .forEach(event => processEventToNode(event, cycle.id, cycle.id))
-      }
     }
   })
 
   // ── 5. Postlude events ────────────────────────────────────────────────────
-  processSection(postlude.events, 'post')
+  processSection(postlude, 'post')
 
   // ── 6. Pipeline completed node ────────────────────────────────────────────
   if (selectedPipelineRun.status === 'completed') {
@@ -988,15 +1081,20 @@ export function findActiveContainerPath(model, activeTaskIds) {
   const hasActive = (events) =>
     events.some(e => e.event_type === 'agent_initialized' && activeTaskIds.has(e.task_id))
 
+  // After nestAgentExecutions, agent_initialized events are moved from node.events
+  // to node.agentExecutions[].startEvent. Check both locations.
+  const hasActiveExec = (node) =>
+    (node.agentExecutions ?? []).some(ae => activeTaskIds.has(ae.taskId))
+
   model.cycles.forEach(cycle => {
     if (cycle.type === 'review_cycle') {
       // Check residual cycle-level events (not inside any iteration)
       const cycleResiduals = [cycle.startEvent, ...(cycle.events ?? []), cycle.endEvent].filter(Boolean)
-      if (hasActive(cycleResiduals)) result.add(cycle.id)
+      if (hasActive(cycleResiduals) || hasActiveExec(cycle)) result.add(cycle.id)
       cycle.iterations?.forEach(iter => {
         const iterId = `${cycle.id}-iter-${iter.number}`
         const iterEvents = [iter.startEvent, ...iter.events].filter(Boolean)
-        if (hasActive(iterEvents)) {
+        if (hasActive(iterEvents) || hasActiveExec(iter)) {
           result.add(cycle.id)
           result.add(iterId)
         }
@@ -1011,7 +1109,7 @@ export function findActiveContainerPath(model, activeTaskIds) {
         function checkSubCycle(sc, parentId, ancestorIds) {
           const scId = `${parentId}-${sc.cycleType}-${sc.number}`
           const scEvents = [sc.startEvent, ...sc.events, sc.endEvent].filter(Boolean)
-          if (hasActive(scEvents)) {
+          if (hasActive(scEvents) || hasActiveExec(sc)) {
             ancestorIds.forEach(id => result.add(id))
             result.add(scId)
           }
@@ -1023,45 +1121,41 @@ export function findActiveContainerPath(model, activeTaskIds) {
         tc.subCycles?.forEach(sc => checkSubCycle(sc, tcId, [cycle.id, tcId]))
 
         const tcEvents = [tc.startEvent, ...(tc.events ?? []), tc.endEvent].filter(Boolean)
-        if (hasActive(tcEvents)) {
+        if (hasActive(tcEvents) || hasActiveExec(tc)) {
           result.add(cycle.id)
           result.add(tcId)
         }
       })
       const cycleEvents = [cycle.startEvent, ...(cycle.events ?? []), cycle.endEvent].filter(Boolean)
-      if (hasActive(cycleEvents)) {
+      if (hasActive(cycleEvents) || hasActiveExec(cycle)) {
         result.add(cycle.id)
       }
     } else if (cycle.type === 'pr_review_cycle') {
       // Check residual cycle-level events (not inside any phase)
       const prResiduals = [cycle.startEvent, ...(cycle.events ?? []), cycle.endEvent].filter(Boolean)
-      if (hasActive(prResiduals)) result.add(cycle.id)
+      if (hasActive(prResiduals) || hasActiveExec(cycle)) result.add(cycle.id)
       cycle.phases?.forEach(phase => {
         const phaseId = `${cycle.id}-phase-${phase.number}`
         const phaseEvents = [phase.startEvent, ...(phase.events ?? [])].filter(Boolean)
-        if (hasActive(phaseEvents)) {
+        if (hasActive(phaseEvents) || hasActiveExec(phase)) {
           result.add(cycle.id)
           result.add(phaseId)
         }
       })
     } else if (cycle.type === 'conversational_loop') {
       const loopEvents = [cycle.startEvent, ...(cycle.events ?? []), cycle.endEvent].filter(Boolean)
-      if (hasActive(loopEvents)) {
+      if (hasActive(loopEvents) || hasActiveExec(cycle)) {
         result.add(cycle.id)
       }
     } else if (cycle.type === 'status_progression') {
       const spEvents = [cycle.startEvent, ...(cycle.events ?? []), cycle.endEvent].filter(Boolean)
-      if (hasActive(spEvents)) {
+      if (hasActive(spEvents) || hasActiveExec(cycle)) {
         result.add(cycle.id)
       }
     } else if (cycle.type === 'review_iteration') {
       // Standalone orphaned iteration — no parent container, just check the iteration itself
       const iterEvents = [cycle.startEvent, ...(cycle.events ?? [])].filter(Boolean)
-      if (hasActive(iterEvents)) {
-        result.add(cycle.id)
-      }
-    } else if (cycle.type === 'agent_execution') {
-      if (activeTaskIds.has(cycle.taskId)) {
+      if (hasActive(iterEvents) || hasActiveExec(cycle)) {
         result.add(cycle.id)
       }
     }

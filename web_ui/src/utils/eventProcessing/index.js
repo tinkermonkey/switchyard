@@ -690,6 +690,130 @@ function inferMissingCloseEvents(sortedEvents) {
 }
 
 /**
+ * Group events by agent execution boundaries.
+ *
+ * Given a flat list of events at any level of the model, finds agent_initialized
+ * events (excluding repair_cycle agents), looks up their execution windows from the
+ * global agentExecutionMap, claims child events within each window, and returns the
+ * agent execution containers alongside the residual (unclaimed) events.
+ *
+ * This is the same pattern used for iterations within review cycles, sub-cycles within
+ * test cycles, etc. — start event, end event, child events within the time window.
+ *
+ * @param {Array}    events             - Events to group
+ * @param {Map}      agentExecutionMap  - Global agent → [execution] map
+ * @param {Function} getMs             - Timestamp → ms converter (cached)
+ * @returns {{ agentExecutions: Array, events: Array }}
+ */
+function groupAgentExecutions(events, agentExecutionMap, getMs) {
+  const initEvents = events.filter(e =>
+    e.event_category === 'agent_lifecycle' &&
+    e.event_type === 'agent_initialized' &&
+    e.agent !== 'repair_cycle'
+  )
+
+  if (initEvents.length === 0) return { agentExecutions: [], events }
+
+  // Build execution windows from the global map for each agent_initialized in this list
+  const windows = []
+  initEvents.forEach(initEvent => {
+    const execList = agentExecutionMap.get(initEvent.agent) || []
+    const exec = execList.find(e => e.taskId === initEvent.task_id)
+    if (!exec) return
+    windows.push({
+      agent: initEvent.agent,
+      taskId: initEvent.task_id,
+      startEvent: initEvent,
+      endEvent: exec.endEvent,
+      startMs: getMs(exec.startTime),
+      endMs: exec.endTime ? getMs(exec.endTime) : Infinity,
+      status: exec.status,
+    })
+  })
+
+  if (windows.length === 0) return { agentExecutions: [], events }
+
+  // Claim events within each execution window
+  const claimed = new Set()
+  const agentExecs = windows.map(w => {
+    const children = []
+    events.forEach(e => {
+      if (claimed.has(e)) return
+      if (e === w.startEvent) { claimed.add(e); return }
+
+      // agent_lifecycle events for the same task belong to this container
+      if (e.event_category === 'agent_lifecycle' && e.task_id === w.taskId) {
+        claimed.add(e)
+        // agent_completed/agent_failed are boundary markers — claim but don't add as children
+        if (e.event_type !== 'agent_completed' && e.event_type !== 'agent_failed') {
+          children.push(e)
+        }
+        return
+      }
+
+      // Decision events within the time window belong to this container
+      const t = getMs(e.timestamp)
+      if (t > w.startMs && t <= w.endMs) {
+        claimed.add(e)
+        children.push(e)
+      }
+    })
+
+    return {
+      type: 'agent_execution',
+      agent: w.agent,
+      taskId: w.taskId,
+      startEvent: w.startEvent,
+      endEvent: w.endEvent,
+      events: children,
+      status: w.status,
+      isCollapsed: true,
+    }
+  })
+
+  const residual = events.filter(e => !claimed.has(e))
+  return { agentExecutions: agentExecs, events: residual }
+}
+
+/**
+ * Walk the entire PipelineGraph model and nest agent executions at every level.
+ * At each node that has an `events` array, groups events by agent execution
+ * boundaries and adds an `agentExecutions` array alongside the residual events.
+ */
+function nestAgentExecutions(model, getMs) {
+  const aeMap = model.agentExecutions
+
+  function apply(node) {
+    if (!node || !node.events || node.events.length === 0) return
+    const result = groupAgentExecutions(node.events, aeMap, getMs)
+    node.events = result.events
+    node.agentExecutions = result.agentExecutions
+  }
+
+  // Prelude / postlude
+  apply(model.prelude)
+  apply(model.postlude)
+
+  // Walk cycles and their sub-structures
+  model.cycles.forEach(cycle => {
+    apply(cycle)
+
+    // Review cycle → iterations
+    cycle.iterations?.forEach(iter => apply(iter))
+
+    // Repair cycle → test cycles → sub-cycles (recursive)
+    function walkSubCycles(subCycles) {
+      if (!subCycles) return
+      subCycles.forEach(sc => { apply(sc); walkSubCycles(sc.subCycles) })
+    }
+    cycle.testCycles?.forEach(tc => { apply(tc); walkSubCycles(tc.subCycles) })
+
+    // PR review cycle → phases
+    cycle.phases?.forEach(phase => apply(phase))
+  })
+}
+
+/**
  * Process all pipeline run events into a structured PipelineGraph model.
  *
  * @param {Array} events          - All pipeline run events (unsorted)
@@ -731,43 +855,27 @@ export function processEvents(events, workflowConfig = null) {
   const prReviewCycleBoundaries      = findCycleBoundaries(CYCLE_TERMINAL_EVENTS.pr_review_cycle, sorted)
   const conversationalLoopBoundaries = findCycleBoundaries(CYCLE_TERMINAL_EVENTS.conversational_loop, sorted)
   const statusProgressionBoundaries  = findCycleBoundaries(CYCLE_TERMINAL_EVENTS.status_progression, sorted)
-  const agentExecutionBoundaries     = findCycleBoundaries(CYCLE_TERMINAL_EVENTS.agent_execution, sorted)
+  // agent_execution boundaries are NOT detected here — they nest within other cycles
+  // (and prelude/postlude) via nestAgentExecutions() post-processing, using the
+  // agentExecutionMap built above. The definition in cycleDefinitions.js is still
+  // used by inferMissingCloseEvents for synthetic close inference.
   const _t3 = performance.now()
 
   // Compute the earliest/latest cycle timestamps for prelude/postlude splitting
   let firstCycleStartMs = Infinity
   let lastCycleEndMs = -Infinity
 
-  // Collect time windows from all non-agent-execution cycle types first, so we can
-  // filter agent_execution boundaries to only those outside other cycles' windows.
-  const otherCycleBoundaries = [
+  // Agent execution boundaries are NOT used for prelude/postlude splitting — they
+  // nest within other cycles (or prelude/postlude) rather than defining top-level structure.
+  const structuralBoundaries = [
     ...reviewCycleBoundaries,
     ...repairCycleBoundaries,
     ...prReviewCycleBoundaries,
     ...conversationalLoopBoundaries,
     ...statusProgressionBoundaries,
   ]
-  const otherCycleWindows = otherCycleBoundaries.map(({ startEvent, endEvent }) => ({
-    startMs: getMs(startEvent.timestamp),
-    endMs: endEvent ? getMs(endEvent.timestamp) : Date.now(),
-  }))
 
-  otherCycleBoundaries.forEach(({ startEvent, endEvent }) => {
-    const sMs = getMs(startEvent.timestamp)
-    const eMs = endEvent ? getMs(endEvent.timestamp) : Date.now()
-    firstCycleStartMs = Math.min(firstCycleStartMs, sMs)
-    lastCycleEndMs = Math.max(lastCycleEndMs, eMs)
-  })
-
-  // Agent execution boundaries that fall inside another cycle's window are already
-  // represented by that cycle's internal structure — only standalone ones become
-  // top-level cycle entries.
-  const standaloneAgentExecBoundaries = agentExecutionBoundaries.filter(({ startEvent }) => {
-    const t = getMs(startEvent.timestamp)
-    return !otherCycleWindows.some(w => t >= w.startMs && t <= w.endMs)
-  })
-
-  standaloneAgentExecBoundaries.forEach(({ startEvent, endEvent }) => {
+  structuralBoundaries.forEach(({ startEvent, endEvent }) => {
     const sMs = getMs(startEvent.timestamp)
     const eMs = endEvent ? getMs(endEvent.timestamp) : Date.now()
     firstCycleStartMs = Math.min(firstCycleStartMs, sMs)
@@ -960,32 +1068,6 @@ export function processEvents(events, workflowConfig = null) {
     })
   })
 
-  // ── Agent execution cycles (standalone — outside other cycle windows) ─────
-  standaloneAgentExecBoundaries.forEach((boundary) => {
-    const { startEvent, endEvent } = boundary
-    const cycleStartMs = getMs(startEvent.timestamp)
-    const cycleEndMs = endEvent ? getMs(endEvent.timestamp) : Date.now()
-
-    const cycleEvents = sorted.filter(e => {
-      const t = getMs(e.timestamp)
-      return t > cycleStartMs && t <= cycleEndMs
-    })
-
-    // Child events: everything inside the window except the boundary markers
-    const childEvents = cycleEvents.filter(e => e !== startEvent && e !== endEvent)
-
-    cycles.push({
-      id: `agent_execution_${startEvent.agent}_${startEvent.task_id}`,
-      type: 'agent_execution',
-      startEvent,
-      endEvent,
-      agent: startEvent.agent,
-      taskId: startEvent.task_id,
-      events: childEvents,
-      isCollapsed: true,
-    })
-  })
-
   // ── Orphaned review iterations ────────────────────────────────────────────
   // review_cycle_iteration events that fall outside every known review cycle window are
   // "orphaned" — they still need containers. This happens when an orchestrator restart
@@ -1039,6 +1121,17 @@ export function processEvents(events, workflowConfig = null) {
     getMs(a.startEvent.timestamp) - getMs(b.startEvent.timestamp)
   )
 
+  const result = {
+    prelude: { events: preludeEvents },
+    cycles,
+    postlude: { events: postludeEvents },
+    agentExecutions,
+  }
+
+  // Nest agent executions at every level of the model — same pattern as iterations
+  // within review cycles or sub-cycles within test cycles.
+  nestAgentExecutions(result, getMs)
+
   const _tEnd = performance.now()
   console.log(
     `[PerfGraph] processEvents: ${(_tEnd - _t0).toFixed(1)}ms` +
@@ -1049,10 +1142,5 @@ export function processEvents(events, workflowConfig = null) {
     ` | cycleBuild:${(_tEnd - _t3).toFixed(1)}ms`
   )
 
-  return {
-    prelude: { events: preludeEvents },
-    cycles,
-    postlude: { events: postludeEvents },
-    agentExecutions,
-  }
+  return result
 }
