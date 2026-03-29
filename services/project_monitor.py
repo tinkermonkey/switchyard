@@ -4070,7 +4070,8 @@ class ProjectMonitor:
                         'issue_number': issue_number,
                         'repository': repository,
                         'workspace_type': workspace_type,
-                        'discussion_id': discussion_id
+                        'discussion_id': discussion_id,
+                        'pipeline_run_id': pipeline_run.id,
                     }
 
                     loop.run_until_complete(
@@ -4183,15 +4184,10 @@ _Review cycle initiated by Claude Code Orchestrator_
                                 'board': pipeline_config.board_name if 'pipeline_config' in locals() and pipeline_config else None
                             }
 
-                            # Try to get pipeline_run_id if we have issue_number and project_name
-                            pipeline_run_id = None
-                            if 'issue_number' in locals() and issue_number and 'project_name' in locals() and project_name:
-                                try:
-                                    from services.pipeline_run import get_pipeline_run_manager
-                                    prm = get_pipeline_run_manager()
-                                    pipeline_run_id = prm.get_active_run_id(project_name, issue_number)
-                                except Exception:
-                                    pass  # pipeline_run_id will remain None
+                            try:
+                                err_pipeline_run_id = pipeline_run.id
+                            except NameError:
+                                err_pipeline_run_id = None
 
                             decision_emitter.emit_error_decision(
                                 error_type="review_cycle_thread_failure",
@@ -4200,7 +4196,7 @@ _Review cycle initiated by Claude Code Orchestrator_
                                 recovery_action="Review cycle thread terminated, pipeline lock retained",
                                 success=False,
                                 project=context.get('project', 'unknown'),
-                                pipeline_run_id=pipeline_run_id
+                                pipeline_run_id=err_pipeline_run_id
                             )
                         except Exception as emit_error:
                             logger.error(f"Failed to emit thread error event: {emit_error}", exc_info=True)
@@ -4673,9 +4669,10 @@ The automated test-fix-validate cycle has failed and requires manual interventio
                     'issue_number': issue_number,
                     'repository': repository,
                     'workspace_type': workspace_type,
-                    'discussion_id': discussion_id
+                    'discussion_id': discussion_id,
+                    'pipeline_run_id': pipeline_run_id,
                 }
-                
+
                 # Build summary
                 if repair_result:
                     test_results = repair_result.get('test_results', [])
@@ -5521,7 +5518,8 @@ The automated test-fix-validate cycle has failed and requires manual interventio
                     'issue_number': issue_number,
                     'repository': repository,
                     'workspace_type': workspace_type,
-                    'discussion_id': discussion_id
+                    'discussion_id': discussion_id,
+                    'pipeline_run_id': pipeline_run_id,
                 }
 
                 # Build comment with optional branch info
