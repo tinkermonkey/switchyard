@@ -95,6 +95,16 @@ class ScheduledTasksService:
             replace_existing=True
         )
 
+        # Run token metrics shortly after startup so restarts don't create gaps
+        token_startup_jitter = random.uniform(30, 120)
+        self.scheduler.add_job(
+            self._run_token_metrics,
+            trigger=DateTrigger(run_date=datetime.now(timezone.utc) + timedelta(seconds=token_startup_jitter)),
+            id='token_metrics_startup',
+            name='Token metrics catchup (startup)',
+            replace_existing=True
+        )
+
         # Schedule project metrics computation - daily at 3 AM
         self.scheduler.add_job(
             self._run_project_metrics,
@@ -155,7 +165,7 @@ class ScheduledTasksService:
         logger.info("- Docker state reconciliation: Every 5 minutes")
         logger.info("- Queue state reconciliation: Every 10 minutes")
         logger.info("- Empty output detection: Every 15 minutes")
-        logger.info(f"- Token metrics computation: Every {token_metrics_hours} hours")
+        logger.info(f"- Token metrics computation: Once at startup in ~{token_startup_jitter:.0f}s, then every {token_metrics_hours}h")
         logger.info("- Project metrics rollup: Daily at 3:30 AM")
         logger.info(f"- Project metrics backfill: Once at startup in ~{jitter_seconds:.0f}s")
         logger.info(f"- Pipeline analysis catchup: Once at startup in ~{analysis_startup_jitter:.0f}s, then every 10 min")
