@@ -5527,7 +5527,7 @@ The automated test-fix-validate cycle has failed and requires manual interventio
                     'repository': repository,
                     'workspace_type': workspace_type,
                     'discussion_id': discussion_id,
-                    'pipeline_run_id': pipeline_run_id,
+                    'pipeline_run_id': pipeline_run.id,
                 }
 
                 # Build comment with optional branch info
