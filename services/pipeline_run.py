@@ -294,6 +294,57 @@ class PipelineRunManager:
             f"Updated context_dir for pipeline run {pipeline_run.id}: {pipeline_run.context_dir}"
         )
 
+    def get_recent_pipeline_run_id(
+        self,
+        project: str,
+        issue_number: int
+    ) -> Optional[str]:
+        """
+        Get the most recent pipeline_run_id for an issue, regardless of status.
+
+        Read-only: does NOT restore Redis state or modify any mappings.
+        Use for event attribution when the run may already be completed
+        (e.g. post-completion PR-ready checks, parent issue advancement).
+
+        Args:
+            project: Project name
+            issue_number: Issue number
+
+        Returns:
+            pipeline_run_id string if any run exists for this issue, None otherwise
+        """
+        # 1. Check the issue→run mapping (covers active runs)
+        issue_key = self._get_issue_key(project, issue_number)
+        run_id = self.redis.hget(self.redis_issue_mapping, issue_key)
+        if run_id:
+            return run_id
+
+        # 2. Check ES for the most recent run (any status)
+        if self.es:
+            try:
+                result = self.es.search(
+                    index=f"{self.es_index_pattern}-*",
+                    body={
+                        "query": {
+                            "bool": {
+                                "must": [
+                                    {"term": {"project": project}},
+                                    {"term": {"issue_number": issue_number}}
+                                ]
+                            }
+                        },
+                        "size": 1,
+                        "sort": [{"started_at": {"order": "desc"}}],
+                        "_source": ["id"]
+                    }
+                )
+                if result['hits']['total']['value'] > 0:
+                    return result['hits']['hits'][0]['_source']['id']
+            except Exception as e:
+                logger.debug(f"Error searching ES for recent pipeline run: {e}")
+
+        return None
+
     def get_active_pipeline_run(
         self,
         project: str,
@@ -301,11 +352,11 @@ class PipelineRunManager:
     ) -> Optional[PipelineRun]:
         """
         Get active pipeline run for an issue
-        
+
         Args:
             project: Project name
             issue_number: Issue number
-            
+
         Returns:
             PipelineRun if active run exists, None otherwise
         """
@@ -340,16 +391,36 @@ class PipelineRunManager:
                     if result['hits']['total']['value'] > 0:
                         pipeline_run = PipelineRun.from_dict(result['hits']['hits'][0]['_source'])
                         logger.debug(f"Found active pipeline run {pipeline_run.id} in Elasticsearch (not in Redis)")
-                        
-                        # Restore to Redis for future lookups
+
+                        # Guard against ES near-real-time stale reads.
+                        # end_pipeline_run() stores completed data in Redis (setex) and deletes
+                        # the issue mapping (hdel) BEFORE persisting to ES.  If the ES search
+                        # index hasn't refreshed yet, this query can return a stale "active"
+                        # document for a run that was just completed.  Restoring that stale
+                        # data would overwrite the correct completed state in Redis and cause
+                        # subsequent callers to reuse the old pipeline_run_id.
                         redis_key = self._get_redis_key(pipeline_run.id)
+                        existing_data = self.redis.get(redis_key)
+                        if existing_data:
+                            try:
+                                existing = json.loads(existing_data)
+                                if existing.get('status') == 'completed':
+                                    logger.info(
+                                        f"Skipping ES fallback restore for {pipeline_run.id} — "
+                                        f"already completed in Redis (stale ES read)"
+                                    )
+                                    return None
+                            except (json.JSONDecodeError, TypeError):
+                                pass
+
+                        # Restore to Redis for future lookups
                         self.redis.setex(
                             redis_key,
                             3600,  # 1 hour TTL
                             json.dumps(pipeline_run.to_dict())
                         )
                         self.redis.hset(self.redis_issue_mapping, issue_key, pipeline_run.id)
-                        
+
                         return pipeline_run
                 except Exception as e:
                     logger.debug(f"Error searching Elasticsearch for active pipeline run: {e}")

@@ -2975,12 +2975,15 @@ class ProjectMonitor:
                 repo_name=project_config.github['repo']
             )
 
-            # Look up the active pipeline run for this issue so comment events are attributed
+            # Look up the most recent pipeline run for this issue so comment events are attributed.
+            # Use get_recent_pipeline_run_id (read-only) instead of get_active_pipeline_run
+            # because the run has just been ended — calling get_active_pipeline_run here
+            # could hit a stale ES search result and restore the completed run as "active".
             pr_ready_pipeline_run_id = None
             try:
-                active_run = self.pipeline_run_manager.get_active_pipeline_run(project_name, issue_number)
-                if active_run:
-                    pr_ready_pipeline_run_id = active_run.id
+                pr_ready_pipeline_run_id = self.pipeline_run_manager.get_recent_pipeline_run_id(
+                    project_name, issue_number
+                )
             except Exception:
                 pass
 
@@ -3161,12 +3164,14 @@ class ProjectMonitor:
             from config.state_manager import state_manager
             from state_management.pr_review_state_manager import pr_review_state_manager
 
-            # Look up the active pipeline run for comment event attribution
+            # Look up the most recent pipeline run for comment event attribution.
+            # Use get_recent_pipeline_run_id (read-only) — the parent's run may already
+            # be completed, but post-completion actions still belong to that run.
             advance_pipeline_run_id = None
             try:
-                active_run = self.pipeline_run_manager.get_active_pipeline_run(project_name, parent_issue_number)
-                if active_run:
-                    advance_pipeline_run_id = active_run.id
+                advance_pipeline_run_id = self.pipeline_run_manager.get_recent_pipeline_run_id(
+                    project_name, parent_issue_number
+                )
             except Exception:
                 pass
 

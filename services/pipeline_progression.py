@@ -160,14 +160,16 @@ class PipelineProgression:
             except Exception as e:
                 logger.debug(f"Could not determine current status: {e}")
 
-            # Get pipeline_run_id for event tracking
+            # Get pipeline_run_id for event tracking.
+            # Use get_recent_pipeline_run_id (read-only) — the run may already be
+            # completed but status progression events still belong to it.
             pipeline_run_id = None
             try:
                 from services.pipeline_run import get_pipeline_run_manager
                 pipeline_run_manager = get_pipeline_run_manager()
-                active_run = pipeline_run_manager.get_active_pipeline_run(project_name, issue_number)
-                if active_run:
-                    pipeline_run_id = active_run.id
+                pipeline_run_id = pipeline_run_manager.get_recent_pipeline_run_id(
+                    project_name, issue_number
+                )
             except Exception as e:
                 logger.debug(f"Could not get pipeline_run_id: {e}")
 
