@@ -2,7 +2,8 @@ import React, { useState } from 'react'
 import { AlertTriangle, XCircle, Activity } from 'lucide-react'
 import { useActiveAgents } from '../hooks/useActiveAgents'
 import { useAgentActions } from '../hooks/useAgentActions'
-import { formatDuration, getRuntimeMs } from '../utils/stateHelpers'
+import { getRuntimeMs } from '../utils/stateHelpers'
+import RunDuration from './RunDuration'
 
 /**
  * Format agent name to human-readable format
@@ -128,7 +129,7 @@ const ActiveAgents = ({
           <div className="text-xs text-gh-fg-muted space-y-1">
             <div className="flex items-center justify-between">
               <span>Running:</span>
-              <span className="font-medium text-gh-fg-default">{formatDuration(agent.started_at)}</span>
+              <RunDuration startedAt={agent.started_at} className="font-medium text-gh-fg-default" />
             </div>
             
             {agent.container_name && (

@@ -1,8 +1,8 @@
 import { useState } from 'react'
 import { createPortal } from 'react-dom'
-import { Handle, Position } from '@xyflow/react'
 import { PlusCircle } from 'lucide-react'
 import EventJsonModal from '../../EventJsonModal'
+import NodeHandles from '../NodeHandles'
 
 const NODE_STYLE = {
   padding: '12px 16px',
@@ -58,7 +58,7 @@ export default function SubIssueCreatedNode({ data }) {
           />
         )}
 
-        <Handle type="target" position={Position.Top} style={{ opacity: 0 }} />
+        <NodeHandles />
 
         <div className="flex items-start gap-2">
           <div className="mt-0.5 shrink-0">
@@ -84,7 +84,6 @@ export default function SubIssueCreatedNode({ data }) {
           </div>
         </div>
 
-        <Handle type="source" position={Position.Bottom} style={{ opacity: 0 }} />
       </div>
 
       {modalOpen && createPortal(

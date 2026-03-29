@@ -25,6 +25,7 @@ const CONTAINER_TYPES = new Set([
   'prReviewCycleContainer',
   'conversationalLoopContainer',
   'statusProgressionContainer',
+  'agentExecutionContainer',
   'iterationContainer',
   'subCycleContainer',
   'cycleBounding',
@@ -185,7 +186,8 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
       n.type === 'repairCycleContainer' ||
       n.type === 'prReviewCycleContainer' ||
       n.type === 'conversationalLoopContainer' ||
-      n.type === 'statusProgressionContainer'
+      n.type === 'statusProgressionContainer' ||
+      n.type === 'agentExecutionContainer'
     ) && !n.parentId
   )
   const iterContainers = nodes.filter(n => n.type === 'iterationContainer')
@@ -402,7 +404,11 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
       const width = cyclePadding * 2 + directColW + iterTotalWidth + iterSpacingTotal
       const height = containerHeaderHeight + cyclePadding * 2 + Math.max(maxIterHeight, directTotalH)
       cycleSizes.set(cc.id, { width: Math.max(width, 400), height: Math.max(height, 180) })
-    } else if (cc.type === 'conversationalLoopContainer' || cc.type === 'statusProgressionContainer') {
+    } else if (
+      cc.type === 'conversationalLoopContainer' ||
+      cc.type === 'statusProgressionContainer' ||
+      cc.type === 'agentExecutionContainer'
+    ) {
       // Layout: vertical stack of direct event children (start + child events + end)
       const numDirect = direct.length
       const directTotalH = numDirect > 0
@@ -432,7 +438,8 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
     type === 'repairCycleContainer' ||
     type === 'prReviewCycleContainer' ||
     type === 'conversationalLoopContainer' ||
-    type === 'statusProgressionContainer'
+    type === 'statusProgressionContainer' ||
+    type === 'agentExecutionContainer'
   const isRootContainerType = (type) =>
     isRootCycleType(type) || type === 'iterationContainer'
 
@@ -566,7 +573,11 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
         })
         relX += iterSize.width + horizontalSpacing
       })
-    } else if (cc.type === 'conversationalLoopContainer' || cc.type === 'statusProgressionContainer') {
+    } else if (
+      cc.type === 'conversationalLoopContainer' ||
+      cc.type === 'statusProgressionContainer' ||
+      cc.type === 'agentExecutionContainer'
+    ) {
       // Vertical stack of all direct event children (start + child events + end)
       const ccSize = cycleSizes.get(cc.id) || { width: 300 }
       let childY = contentY
@@ -794,7 +805,7 @@ export function updateEdgesForCycles(edges, cycles, nodesByCycle) {
             source: `cycle-${agent}`,
           }
         }
-        
+
         if (edge.target.startsWith(cyclePrefix)) {
           // Redirect to cycle bounding node
           newEdge = {

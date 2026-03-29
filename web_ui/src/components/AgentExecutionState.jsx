@@ -6,6 +6,7 @@ import remarkGfm from 'remark-gfm'
 import { formatTimestamp } from '../utils/eventMerging'
 import RepairCycleStatus from './RepairCycleStatus'
 import AgentExecutionCurrentTasks from './AgentExecutionCurrentTasks'
+import RunDuration from './RunDuration'
 
 const formatAgentName = (agentName) => {
   if (!agentName || typeof agentName !== 'string' || agentName.trim() === '') return 'Unknown Agent'
@@ -76,7 +77,7 @@ export default function AgentExecutionState({
     { label: 'Agent', value: formatAgentName(executionData.agent) },
     { label: 'Started', value: new Date(executionData.started_at).toLocaleString() },
     ...(executionData.ended_at ? [{ label: 'Ended', value: new Date(executionData.ended_at).toLocaleString() }] : []),
-    ...(executionData.duration ? [{ label: 'Duration', value: `${Math.floor(executionData.duration / 60)}m ${Math.floor(executionData.duration % 60)}s` }] : []),
+    { label: 'Duration', value: <RunDuration startedAt={executionData.started_at} endedAt={executionData.ended_at} /> },
   ]
 
   return (

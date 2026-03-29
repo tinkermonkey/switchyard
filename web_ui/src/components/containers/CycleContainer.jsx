@@ -81,11 +81,13 @@ export function CycleContainer({ data, theme, isDark = true }) {
         }}
       >
         <Handle
+          id="top"
           type="target"
           position={Position.Top}
           style={{ background: borderColor, width: 10, height: 10, border: '2px solid white', zIndex: 10 }}
         />
         <Handle
+          id="bottom"
           type="source"
           position={Position.Bottom}
           style={{ background: borderColor, width: 10, height: 10, border: '2px solid white', zIndex: 10 }}
@@ -147,11 +149,13 @@ export function CycleContainer({ data, theme, isDark = true }) {
       />
 
       <Handle
+        id="top"
         type="target"
         position={Position.Top}
         style={{ background: borderColor, width: 10, height: 10, border: '2px solid white', opacity: 0 }}
       />
       <Handle
+        id="bottom"
         type="source"
         position={Position.Bottom}
         style={{ background: borderColor, width: 10, height: 10, border: '2px solid white', opacity: 0 }}

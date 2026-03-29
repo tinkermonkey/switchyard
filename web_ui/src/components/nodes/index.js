@@ -14,7 +14,9 @@ import PipelineStartedNode   from './pipeline/PipelineStartedNode'
 import PipelineCompletedNode from './pipeline/PipelineCompletedNode'
 
 // ── Agent execution ───────────────────────────────────────────────────────────
-import AgentExecutionNode from './agent/AgentExecutionNode'
+import AgentExecutionNode  from './agent/AgentExecutionNode'
+import AgentCompletedNode  from './agent/AgentCompletedNode'
+import AgentFailedNode     from './agent/AgentFailedNode'
 
 // ── Review cycle ──────────────────────────────────────────────────────────────
 import ReviewCycleStartedNode            from './cycles/review/ReviewCycleStartedNode'
@@ -146,6 +148,8 @@ export const eventNodeTypes = {
 
   // Agent execution
   agentExecution: AgentExecutionNode,
+  agentCompleted: AgentCompletedNode,
+  agentFailed:    AgentFailedNode,
 
   // Review cycle
   reviewCycleStarted:           ReviewCycleStartedNode,

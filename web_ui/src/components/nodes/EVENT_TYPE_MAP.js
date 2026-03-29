@@ -17,6 +17,9 @@
  *   │   ├── PipelineStartedNode                pipeline_created (static)
  *   │   └── PipelineCompletedNode              pipeline_completed (static)
  *   ├── agent/AgentExecutionNode               agent_initialized
+ *   ├── agent/AgentLifecycleNode
+ *   │   ├── AgentCompletedNode                 agent_completed
+ *   │   └── AgentFailedNode                    agent_failed
  *   ├── cycles/CycleEventNode
  *   │   ├── cycles/review/ReviewCycleEventNode (purple family)
  *   │   │   ├── ReviewCycleStartedNode         review_cycle_started
@@ -117,19 +120,87 @@
  *       └── ContainerResultRecoveredNode  container_result_recovered
  */
 /**
+ * Infrastructure and telemetry event types that are excluded from both the
+ * pipeline flow graph and the event log. These events carry no user-facing
+ * signal and would produce noise if shown.
+ *
+ * Used by:
+ *   - buildFlowchart.js  — never builds nodes for these types
+ *   - pipeline-run.jsx   — strips them from pipelineEvents before rendering
+ */
+export const EXCLUDED_EVENT_TYPES = new Set([
+  // Agent lifecycle infrastructure
+  'task_received',
+  'agent_started',
+
+  // Prompt / API internals
+  'prompt_constructed',
+  'claude_api_call_started',
+  'claude_api_call_completed',
+  'claude_api_call_failed',
+
+  // Container lifecycle internals
+  'container_launch_started',
+  'container_launch_succeeded',
+  'container_launch_failed',
+  'container_execution_started',
+  'container_execution_completed',
+  'container_execution_failed',
+
+  // Streaming / processing internals
+  'response_chunk_received',
+  'response_processing_started',
+  'response_processing_completed',
+  'tool_execution_started',
+  'tool_execution_completed',
+
+  // Raw telemetry
+  'performance_metric',
+  'token_usage',
+
+  // Raw Anthropic API streaming event types
+  'claude_stream',
+  'claude_stream_event',
+  'text_output',
+  'text_delta',
+  'tool_call',
+  'tool_use',
+  'tool_result',
+  'input_json_delta',
+  'message_start',
+  'message_delta',
+  'message_stop',
+  'content_block_start',
+  'content_block_delta',
+  'content_block_stop',
+])
+
+/**
+ * Returns true if the event should be included in any pipeline view
+ * (flow graph, event log, prompts graph). Single source of truth for
+ * what events are worth showing — all three views share this filter.
+ *
+ * Excludes:
+ *   - claude_log category  (raw Claude CLI streaming output)
+ *   - claude_api category  (raw Anthropic API calls)
+ *   - EXCLUDED_EVENT_TYPES (infrastructure, telemetry, API stream types)
+ *   - Events wrapping raw Anthropic stream events in their raw_event field
+ */
+export function shouldIncludePipelineEvent(event) {
+  if (event.event_category === 'claude_log') return false
+  if (event.event_category === 'claude_api')  return false
+  if (EXCLUDED_EVENT_TYPES.has(event.event_type)) return false
+  if (event.raw_event) {
+    const rawType = event.raw_event?.event?.type ?? event.raw_event?.type
+    if (rawType && EXCLUDED_EVENT_TYPES.has(rawType)) return false
+  }
+  return true
+}
+
+/**
  * Backend event types intentionally NOT mapped here because buildFlowchart.js
- * filters them out before reaching getNodeType() — they never render as graph nodes:
- *
- *   agent_lifecycle (except agent_initialized):
- *     task_received, agent_started, agent_completed, agent_failed
- *
- *   Infrastructure / telemetry:
- *     prompt_constructed, claude_api_call_started, claude_api_call_completed,
- *     claude_api_call_failed, container_launch_started, container_launch_succeeded,
- *     container_launch_failed, container_execution_started, container_execution_completed,
- *     container_execution_failed, response_chunk_received, response_processing_started,
- *     response_processing_completed, tool_execution_started, tool_execution_completed,
- *     performance_metric, token_usage
+ * filters them out before reaching getNodeType() — they never render as graph nodes.
+ * The full list is in EXCLUDED_EVENT_TYPES above.
  *
  * Note: pipeline_created and pipeline_completed are NOT emitted as backend events.
  * Those boundary nodes are constructed statically in buildFlowchart.js from
@@ -139,6 +210,8 @@
 export const EVENT_TYPE_MAP = {
   // ── Agent execution ──────────────────────────────────────────────────────────────
   agent_initialized: 'agentExecution',
+  agent_completed:   'agentCompleted',
+  agent_failed:      'agentFailed',
 
   // ── Review cycle ─────────────────────────────────────────────────────────────────
   review_cycle_started:            'reviewCycleStarted',
@@ -264,68 +337,3 @@ export function getNodeType(eventType) {
   return EVENT_TYPE_MAP[eventType] ?? 'pipelineEvent'
 }
 
-/**
- * Node types that are hidden by default (cycle boundary events).
- * These nodes exist in the graph for edge routing but are not rendered unless
- * the user explicitly enables full visibility (e.g. "Show all nodes" toggle).
- */
-export const HIDDEN_BY_DEFAULT_TYPES = new Set([
-  // Review cycle boundaries
-  'reviewCycleStarted',
-  'reviewCycleCompleted',
-
-  // Review cycle — iteration / selection events
-  'reviewCycleIteration',
-  'reviewCycleReviewerSelected',
-  'reviewCycleMakerSelected',
-
-  // Repair cycle boundaries
-  'repairCycleStarted',
-  'repairCycleIteration',
-  'repairCycleCompleted',
-  'repairCycleFailed',
-
-  // Repair cycle — test sub-family boundaries
-  'repairCycleTestCycleStarted',
-  'repairCycleTestCycleCompleted',
-  'repairCycleTestExecutionStarted',
-  'repairCycleTestExecutionCompleted',
-
-  // Repair cycle — fix sub-family boundaries
-  'repairCycleFixCycleStarted',
-  'repairCycleFixCycleCompleted',
-
-  // Repair cycle — warning review boundaries
-  'repairCycleWarningReviewStarted',
-  'repairCycleWarningReviewCompleted',
-  'repairCycleWarningReviewFailed',
-
-  // Repair cycle — systemic boundaries
-  'repairCycleSystemicAnalysisStarted',
-  'repairCycleSystemicAnalysisCompleted',
-  'repairCycleSystemicFixStarted',
-  'repairCycleSystemicFixCompleted',
-
-  // Repair cycle — container lifecycle boundaries
-  'repairCycleContainerStarted',
-  'repairCycleContainerCompleted',
-  'repairCycleContainerKilled',
-
-  // PR review boundaries
-  'prReviewStageStarted',
-  'prReviewStageCompleted',
-  'prReviewPhaseStarted',
-  'prReviewPhaseCompleted',
-  'prReviewPhaseFailed',
-
-  // Branch management
-  'branchReused',
-
-  // Conversational loop boundaries
-  'conversationalLoopStarted',
-
-  // Status progression boundaries
-  'statusProgressionStarted',
-  'statusProgressionCompleted',
-  'statusProgressionFailed',
-])

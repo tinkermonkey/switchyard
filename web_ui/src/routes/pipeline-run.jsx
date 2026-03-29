@@ -12,6 +12,7 @@ import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import { useNavigate } from '@tanstack/react-router'
 import { useSocket } from '../contexts/SocketContext'
 import { mergePipelineRunEvents, mergeArrayByIdStable } from '../utils/eventMerging'
+import { shouldIncludePipelineEvent } from '../components/nodes/EVENT_TYPE_MAP.js'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 
@@ -368,47 +369,29 @@ function PipelineRunView() {
     return mergePipelineRunEvents(pipelineRunEvents, socketEvents, selectedPipelineRun)
   }, [pipelineRunEvents, socketEvents, selectedPipelineRun])
 
-  // Graph events: exclude claude_log streaming events — never used for cycle detection
-  // or node building. Large runs have 80%+ claude_log events; filtering here prevents
-  // processEvents / buildFlowchart from sorting and scanning thousands of irrelevant events.
-  const graphEvents = useMemo(() =>
-    mergedEvents.filter(e => e.event_category !== 'claude_log'),
+  // Single filtered event array shared by all views — flow graph, event log, prompts.
+  // Excludes claude_log/claude_api categories, infrastructure/telemetry types, and raw
+  // Anthropic API streaming events. See shouldIncludePipelineEvent in EVENT_TYPE_MAP.js.
+  // allEvents (unfiltered mergedEvents) is kept separately for token/tool enrichment.
+  const pipelineEvents = useMemo(() =>
+    mergedEvents.filter(shouldIncludePipelineEvent),
     [mergedEvents]
   )
 
-  // Filtered events for event log tab (exclude Claude streaming)
-  const eventLogEvents = useMemo(() => {
-    const claudeStreamEventTypes = new Set([
-      'claude_stream', 'claude_stream_event', 'text_output', 'text_delta',
-      'tool_call', 'tool_use', 'tool_result', 'input_json_delta',
-      'message_start', 'message_delta', 'message_stop',
-      'content_block_start', 'content_block_delta', 'content_block_stop',
-    ])
-    return mergedEvents.filter(event => {
-      if (event.event_category === 'claude_api') return false
-      if (claudeStreamEventTypes.has(event.event_type)) return false
-      if (event.raw_event) {
-        const rawEventType = event.raw_event?.event?.type || event.raw_event?.type
-        if (claudeStreamEventTypes.has(rawEventType)) return false
-      }
-      return true
-    })
-  }, [mergedEvents])
-
-  // Find latest agent execution ID — graphEvents is sorted ascending, so the last
+  // Find latest agent execution ID — pipelineEvents is sorted ascending, so the last
   // agent_initialized event is the most recently started agent execution.
   const latestAgentExecutionId = useMemo(() => {
-    if (!graphEvents || graphEvents.length === 0) return null
-    const agentInitEvents = graphEvents.filter(event => event.event_type === 'agent_initialized')
+    if (!pipelineEvents || pipelineEvents.length === 0) return null
+    const agentInitEvents = pipelineEvents.filter(event => event.event_type === 'agent_initialized')
     if (agentInitEvents.length === 0) return null
     const ev = agentInitEvents.at(-1)
     return ev.agent_execution_id || ev.data?.agent_execution_id || null
-  }, [graphEvents])
+  }, [pipelineEvents])
 
   // Determine if currently in conversational loop
   const isConversational = useMemo(() => {
-    if (!graphEvents || graphEvents.length === 0) return false
-    const sortedEvents = [...graphEvents].sort((a, b) =>
+    if (!pipelineEvents || pipelineEvents.length === 0) return false
+    const sortedEvents = [...pipelineEvents].sort((a, b) =>
       new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
     )
     for (const event of sortedEvents) {
@@ -420,7 +403,7 @@ function PipelineRunView() {
       }
     }
     return false
-  }, [graphEvents])
+  }, [pipelineEvents])
 
   const handleDownloadDebugData = useCallback(() => {
     if (!selectedPipelineRun) return
@@ -668,13 +651,13 @@ function PipelineRunView() {
               </div>
 
               {/* Content Area */}
-              <div className="flex-1 min-h-[800px] md:min-h-0 flex">
+              <div className="flex-1 min-h-[300px] md:min-h-0 flex">
                 {contentTab === 'report' && analysis ? (
                   <PipelineAnalysisReport analysis={analysis} />
                 ) : contentTab === 'prompts' ? (
                   <div className="flex-1 min-h-0">
                     <PromptsFlowGraph
-                      events={graphEvents}
+                      events={pipelineEvents}
                       selectedPipelineRun={selectedPipelineRun}
                       loading={loadingEvents}
                     />
@@ -688,15 +671,14 @@ function PipelineRunView() {
                     ) : (
                       <PipelineRunEventLog
                         pipelineRun={selectedPipelineRun}
-                        events={eventLogEvents}
-                        isActive={selectedPipelineRun?.status === 'active'}
+                        events={pipelineEvents}
                       />
                     )}
                   </div>
                 ) : (
                   <div className="flex-1 min-h-0">
                     <PipelineFlowGraph
-                      graphEvents={graphEvents}
+                      graphEvents={pipelineEvents}
                       allEvents={mergedEvents}
                       workflowConfig={workflowConfig}
                       selectedPipelineRun={selectedPipelineRun}
@@ -706,7 +688,6 @@ function PipelineRunView() {
                       loading={loadingEvents}
                       emptyMessage="No events found for this pipeline run"
                       fitViewAlign={selectedPipelineRun.status === 'active' ? 'active-node' : 'top'}
-                      showAllNodes={false}
                     />
                   </div>
                 )}

@@ -11,6 +11,7 @@ export const containerNodeTypes = {
   prReviewCycleContainer:      CycleContainerNode,
   conversationalLoopContainer: CycleContainerNode,
   statusProgressionContainer:  CycleContainerNode,
+  agentExecutionContainer:     CycleContainerNode,
 
   // Level 2 — iteration/phase containers (theme driven by data.cycleType)
   iterationContainer:          CycleContainerNode,

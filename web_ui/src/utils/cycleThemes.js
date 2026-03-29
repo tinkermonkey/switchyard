@@ -1,4 +1,4 @@
-import { RotateCcw, Wrench, GitPullRequest, MessageSquare, FlaskConical, AlertTriangle, Search, ArrowRight } from 'lucide-react'
+import { RotateCcw, Wrench, GitPullRequest, MessageSquare, FlaskConical, AlertTriangle, Search, ArrowRight, Activity } from 'lucide-react'
 import {
   renderReviewCycleSummary,
   renderRepairCycleSummary,
@@ -13,6 +13,7 @@ import {
   renderSystemicAnalysisSummary,
   renderSystemicFixSummary,
   renderStatusProgressionSummary,
+  renderAgentExecutionSummary,
 } from './cycleCollapsedSummaries.jsx'
 
 /**
@@ -92,6 +93,21 @@ export const CYCLE_THEME_MAP = {
     collapsedCountColorLight: '#166534',
     collapsedWidth:           320,
     renderCollapsedSummary:   renderStatusProgressionSummary,
+  },
+
+  agent_execution: {
+    borderColor:              '#58a6ff',
+    borderStyle:              'solid',
+    bgColor:                  'rgba(88,166,255,0.10)',
+    cornerColor:              'rgba(88,166,255,0.4)',
+    icon:                     Activity,
+    countSuffix:              'event',
+    collapsedLabel:           'Agent Execution',
+    collapsedTextColor:       '#cae8ff',
+    collapsedCountColor:      '#cae8ff',
+    collapsedCountColorLight: '#0550ae',
+    collapsedWidth:           280,
+    renderCollapsedSummary:   renderAgentExecutionSummary,
   },
 
   // ── Level 2 ───────────────────────────────────────────────────────────────

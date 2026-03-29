@@ -1,6 +1,7 @@
 import { memo, useRef, useLayoutEffect, useEffect, useMemo } from 'react'
 import { RefreshCw, Activity, CheckCircle } from 'lucide-react'
-import { formatDuration, formatRunDuration } from '../utils/stateHelpers'
+import { formatDuration } from '../utils/stateHelpers'
+import RunDuration from './RunDuration'
 
 // Memoized run list item — only re-renders when run object or selection changes
 const PipelineRunItem = memo(({ run, isSelected, onClick }) => {
@@ -29,11 +30,9 @@ const PipelineRunItem = memo(({ run, isSelected, onClick }) => {
           <>Started {formatDuration(run.started_at)} ago</>
         )}
       </div>
-      {run.duration && (
-        <div className="text-xs mt-1 opacity-75">
-          Duration: {formatRunDuration(run.duration)}
-        </div>
-      )}
+      <div className="text-xs mt-1 opacity-75">
+        Duration: <RunDuration startedAt={run.started_at} endedAt={run.ended_at} />
+      </div>
     </button>
   )
 }, (prevProps, nextProps) => {

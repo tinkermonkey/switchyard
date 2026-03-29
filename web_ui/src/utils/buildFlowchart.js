@@ -1,22 +1,7 @@
 import { MarkerType } from '@xyflow/react'
 import { processEvents } from './eventProcessing/index.js'
-import { getNodeType, HIDDEN_BY_DEFAULT_TYPES } from '../components/nodes/EVENT_TYPE_MAP.js'
+import { getNodeType, EXCLUDED_EVENT_TYPES } from '../components/nodes/EVENT_TYPE_MAP.js'
 import { extractClaudeLogSummaries } from './extractClaudeLogSummaries.js'
-
-// Infrastructure and telemetry event types that are intentionally not rendered as graph nodes.
-// See EVENT_TYPE_MAP.js for full documentation. Any event type NOT in this list and NOT
-// handled by processEventToNode will trigger a console.warn to surface new/unhandled types.
-const SKIP_EVENT_TYPES = new Set([
-  'task_received', 'agent_started', 'agent_completed', 'agent_failed',
-  'prompt_constructed',
-  'claude_api_call_started', 'claude_api_call_completed', 'claude_api_call_failed',
-  'container_launch_started', 'container_launch_succeeded', 'container_launch_failed',
-  'container_execution_started', 'container_execution_completed', 'container_execution_failed',
-  'response_chunk_received',
-  'response_processing_started', 'response_processing_completed',
-  'tool_execution_started', 'tool_execution_completed',
-  'performance_metric', 'token_usage',
-])
 import {
   extractRepairCycleSummary,
   extractTestCycleSummary,
@@ -28,6 +13,96 @@ import {
   extractConversationalLoopSummary,
   extractStatusProgressionSummary,
 } from './cycleSummaries.js'
+
+// Alias for the shared exclusion set (see EVENT_TYPE_MAP.js for full documentation).
+// Any event type NOT in this set and NOT handled by processEventToNode will trigger
+// a console.warn to surface new/unhandled types.
+const SKIP_EVENT_TYPES = EXCLUDED_EVENT_TYPES
+
+/**
+ * Node types visible in the default ("Simplify") view of PipelineFlowGraph.
+ * Any node type NOT in this set gets defaultHidden: true and is hidden when showAllNodes
+ * is false. Nodes in this set are always shown.
+ *
+ * Add new event node types here when they should appear in the simplified view.
+ * The fallback 'pipelineEvent' type is included so unknown/unmapped event types are
+ * always visible rather than silently hidden.
+ */
+const DEFAULT_SHOWN_NODE_TYPES = new Set([
+  // Fallback — always show unknown event types
+  'pipelineEvent',
+
+  // Agent execution
+  'agentExecution',
+  'agentCompleted',
+  'agentFailed',
+
+  // Review cycle — signal events only
+  'reviewCycleEscalated',
+
+  // Repair cycle — signal events only
+  'repairCycleEnvRebuildStarted',
+  'repairCycleEnvRebuildCompleted',
+  'repairCycleFileFixStarted',
+  'repairCycleFileFixCompleted',
+  'repairCycleFileFixFailed',
+  'repairCycleContainerCheckpointUpdated',
+  'repairCycleContainerRecovered',
+
+  // Agent routing & selection
+  'agentRoutingDecision',
+  'agentSelected',
+  'workspaceRoutingDecision',
+
+  // Pipeline & stage progression
+  'pipelineStageTransition',
+  'pipelineRunStarted',
+  'pipelineRunCompleted',
+  'pipelineRunFailed',
+
+  // Feedback monitoring
+  'feedbackDetected',
+  'feedbackListeningStarted',
+  'feedbackListeningStopped',
+  'feedbackIgnored',
+
+  // Conversational loop — signal events only
+  'conversationalQuestionRouted',
+  'conversationalLoopPaused',
+  'conversationalLoopResumed',
+
+  // Error handling & circuit breakers
+  'errorEncountered',
+  'errorRecovered',
+  'circuitBreakerOpened',
+  'circuitBreakerClosed',
+  'retryAttempted',
+
+  // Task queue management
+  'taskQueued',
+  'taskDequeued',
+  'taskPriorityChanged',
+  'taskCancelled',
+
+  // Branch management — signal events only
+  'branchCreated',
+  'branchConflictDetected',
+  'branchStaleDetected',
+  'branchSelectionEscalated',
+
+  // Issue management
+  'subIssueCreated',
+  'subIssueCreationFailed',
+
+  // System operations
+  'executionStateReconciled',
+  'statusValidationFailure',
+  'resultPersistenceFailed',
+  'fallbackStorageUsed',
+  'outputValidationFailed',
+  'emptyOutputDetected',
+  'containerResultRecovered',
+])
 
 /**
  * Builds React Flow nodes and edges from pipeline run events.
@@ -153,7 +228,7 @@ export function buildFlowchart({
         decision_category: event.decision_category,
         timestamp: event.timestamp,
         event,
-        ...(HIDDEN_BY_DEFAULT_TYPES.has(nodeType) && { defaultHidden: true }),
+        ...(!DEFAULT_SHOWN_NODE_TYPES.has(nodeType) && { defaultHidden: true }),
       },
       draggable: false,
     }
@@ -204,8 +279,141 @@ export function buildFlowchart({
   }
 
   /**
+   * Process a section (prelude or postlude) with agent execution grouping.
+   *
+   * Agent_initialized events create expandable agentExecutionContainer nodes.
+   * All events within each execution's time window become children of that container
+   * (shown when expanded, hidden when collapsed). Events outside any execution window
+   * are processed as top-level nodes.
+   */
+  function processSection(sectionEvents, idPrefix) {
+    // Build taskId → { agent, exec, startMs, endMs } for all agent executions
+    const windowByTask = new Map()
+    agentExecutions.forEach((execs, agent) => {
+      execs.forEach(exec => {
+        const startMs = new Date(exec.startTime).getTime()
+        const endMs = exec.endTime ? new Date(exec.endTime).getTime() : Infinity
+        windowByTask.set(exec.taskId, { agent, exec, startMs, endMs })
+      })
+    })
+
+    // Identify which task IDs have their agent_initialized in this section
+    const containerTaskIds = new Set()
+    sectionEvents.forEach(event => {
+      if (event.event_category === 'agent_lifecycle' && event.event_type === 'agent_initialized') {
+        containerTaskIds.add(event.task_id)
+      }
+    })
+
+    if (containerTaskIds.size === 0) {
+      sectionEvents.forEach(event => processEventToNode(event, idPrefix, null))
+      return
+    }
+
+    // For a given event, find the task ID of the agent execution container it belongs to.
+    // agent_initialized → owns itself; other agent_lifecycle → matched by task_id;
+    // decision events → matched by timestamp window (latest-started window wins for overlaps).
+    const getOwnerTaskId = (event) => {
+      if (event.event_category === 'agent_lifecycle') {
+        return containerTaskIds.has(event.task_id) ? event.task_id : null
+      }
+      const eventMs = new Date(event.timestamp).getTime()
+      let match = null
+      let matchStartMs = -1
+      containerTaskIds.forEach(taskId => {
+        const w = windowByTask.get(taskId)
+        if (!w) return
+        if (eventMs > w.startMs && eventMs <= w.endMs) {
+          if (w.startMs > matchStartMs) {
+            match = taskId
+            matchStartMs = w.startMs
+          }
+        }
+      })
+      return match
+    }
+
+    sectionEvents.forEach(event => {
+      const ownerTaskId = getOwnerTaskId(event)
+
+      if (ownerTaskId && event.event_category === 'agent_lifecycle' && event.event_type === 'agent_initialized') {
+        // ── Create agent execution container ────────────────────────────────
+        const { agent, task_id: taskId } = event
+        const w = windowByTask.get(taskId)
+        const exec = w?.exec
+        const containerId = `${idPrefix}-agent-${agent}-${taskId}`
+
+        const existingState = existingCycles.get(containerId)
+        const isCollapsed = existingState?.isCollapsed ?? true
+        updatedCycles.set(containerId, { isCollapsed })
+
+        const isActive = activeTaskIds.has(taskId)
+        const durationMs = (exec?.startTime && exec?.endTime)
+          ? new Date(exec.endTime) - new Date(exec.startTime)
+          : null
+        const claudeData = claudeSummaries.get(taskId) ?? null
+
+        // Count visible child events for the header badge
+        const startMs = w?.startMs ?? 0
+        const endMs = w?.endMs ?? Infinity
+        const childCount = sectionEvents.filter(e => {
+          if (e === event) return false
+          if (e.event_category === 'agent_lifecycle' && e.task_id === taskId) {
+            return e.event_type !== 'agent_initialized'
+          }
+          const t = new Date(e.timestamp).getTime()
+          return t > startMs && t <= endMs && !SKIP_EVENT_TYPES.has(e.event_type)
+        }).length
+
+        newNodes.push({
+          id: containerId,
+          type: 'agentExecutionContainer',
+          position: { x: 0, y: 0 },
+          data: {
+            cycleId: containerId,
+            cycleType: 'agent_execution',
+            label: agent.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase()),
+            iterationCount: childCount,
+            isCollapsed,
+            containsActiveAgent: isActive,
+            onToggleCollapse: null,
+            startTime: event.timestamp,
+            endTime: exec?.endTime ?? null,
+            status: exec?.status ?? 'running',
+            isActive,
+            durationMs,
+            inputTokens: claudeData?.inputTokens ?? null,
+            outputTokens: claudeData?.outputTokens ?? null,
+            tools: claudeData?.tools ?? null,
+            event,
+          },
+          style: isCollapsed ? {} : { width: 0, height: 0 },
+          ...(isCollapsed ? {} : { measured: { width: 1, height: 1 } }),
+          draggable: false,
+        })
+        leafChain.push({ id: containerId, timestamp: event.timestamp })
+
+      } else if (ownerTaskId) {
+        // ── Child event inside an agent execution container ──────────────────
+        const { agent } = windowByTask.get(ownerTaskId) ?? {}
+        const containerId = `${idPrefix}-agent-${agent}-${ownerTaskId}`
+        const containerState = updatedCycles.get(containerId)
+        const isCollapsed = containerState?.isCollapsed ?? true
+
+        if (!isCollapsed) {
+          processEventToNode(event, containerId, containerId)
+        }
+        // When collapsed, child events are not rendered
+
+      } else {
+        // ── Top-level event (outside any agent execution window) ─────────────
+        processEventToNode(event, idPrefix, null)
+      }
+    })
+  }
+
+  /**
    * Process a raw event into a node, push to newNodes, and add to leafChain.
-   * Skips agent_completed / agent_failed events (status is reflected on the agent node).
    * Returns the node id if a node was created, or null.
    */
   function processEventToNode(event, idPrefix, parentId = null) {
@@ -223,6 +431,38 @@ export function buildFlowchart({
     ) {
       const id = `${idPrefix}-agent-${event.agent}-${event.task_id}`
       node = makeAgentNode(event, id, parentId)
+    } else if (
+      event.event_category === 'agent_lifecycle' &&
+      (event.event_type === 'agent_completed' || event.event_type === 'agent_failed')
+    ) {
+      const id = `${idPrefix}-agentlc-${event.event_type}-${event.timestamp}`
+      const nodeType = getNodeType(event.event_type)
+      const metadataParts = []
+      if (event.agent) metadataParts.push(event.agent.replace(/_/g, ' '))
+      const dMs = event.data?.duration_ms
+      if (dMs != null) {
+        const dSec = Math.round(dMs / 1000)
+        metadataParts.push(dSec < 60 ? `${dSec}s` : `${Math.floor(dSec / 60)}m ${dSec % 60}s`)
+      }
+      if (event.data?.error) {
+        const err = String(event.data.error)
+        metadataParts.push(err.length > 50 ? err.substring(0, 50) + '…' : err)
+      }
+      node = {
+        id,
+        type: nodeType,
+        position: { x: 0, y: 0 },
+        data: {
+          label: event.event_type.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase()),
+          type: event.event_type,
+          metadata: metadataParts.join(' • '),
+          timestamp: event.timestamp,
+          event,
+          ...(!DEFAULT_SHOWN_NODE_TYPES.has(nodeType) && { defaultHidden: true }),
+        },
+        draggable: false,
+      }
+      if (parentId) node.parentId = parentId
     } else if (!SKIP_EVENT_TYPES.has(event.event_type)) {
       // Not a known infrastructure/telemetry type and not a handled category.
       // This indicates a new backend event type with no frontend handler — add it to
@@ -255,9 +495,7 @@ export function buildFlowchart({
   leafChain.push({ id: 'created', timestamp: selectedPipelineRun.started_at })
 
   // ── 3. Prelude events ─────────────────────────────────────────────────────
-  prelude.events.forEach(event => {
-    processEventToNode(event, 'pre', null)
-  })
+  processSection(prelude.events, 'pre')
 
   // ── 4. Cycles ─────────────────────────────────────────────────────────────
   cycles.forEach(cycle => {
@@ -762,9 +1000,7 @@ export function buildFlowchart({
   })
 
   // ── 5. Postlude events ────────────────────────────────────────────────────
-  postlude.events.forEach(event => {
-    processEventToNode(event, 'post', null)
-  })
+  processSection(postlude.events, 'post')
 
   // ── 6. Pipeline completed node ────────────────────────────────────────────
   if (selectedPipelineRun.status === 'completed') {
@@ -792,7 +1028,9 @@ export function buildFlowchart({
       newEdges.push({
         id: `edge-${source}-${target}`,
         source,
+        sourceHandle: 'bottom',
         target,
+        targetHandle: 'top',
         type: 'smart',
         markerEnd: { type: MarkerType.ArrowClosed, color: '#6e7681' },
         style: { stroke: '#6e7681' },

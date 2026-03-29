@@ -1,7 +1,6 @@
-import { useState, useEffect, useMemo, memo } from 'react'
+import { useState, useMemo, memo } from 'react'
 import EventJsonModal from './EventJsonModal'
 import { Link } from '@tanstack/react-router'
-import { useSocket } from '../contexts/SocketContext'
 import {
   Activity, AlertCircle, CheckCircle, XCircle, GitBranch, MessageSquare,
   PlayCircle, RotateCcw, AlertTriangle, Users, FileCode, Clock, ExternalLink
@@ -424,103 +423,140 @@ const GenericEvent = memo(({ event, onIconClick }) => (
   </PipelineRunEventLogEvent>
 ))
 
-// Event renderer mapping
-const getEventComponent = (event, onIconClick) => {
-  const eventTypeMap = {
-    // Lifecycle
-    'agent_initialized': AgentInitializedEvent,
-    'agent_completed': AgentCompletedEvent,
-    'agent_failed': AgentFailedEvent,
+/**
+ * Maps every backend event_type string to its log row component.
+ * Mirrors EVENT_TYPE_MAP.js — when a new event type is added there,
+ * add it here too (use GenericEvent if no rich component is needed).
+ */
+const EVENT_LOG_COMPONENT_MAP = {
+  // ── Agent lifecycle ───────────────────────────────────────────────────────
+  agent_initialized: AgentInitializedEvent,
+  agent_completed:   AgentCompletedEvent,
+  agent_failed:      AgentFailedEvent,
 
-    // Routing
-    'agent_routing_decision': AgentRoutingDecisionEvent,
-    'agent_selected': AgentSelectedEvent,
+  // ── Agent routing & selection ─────────────────────────────────────────────
+  agent_routing_decision:     AgentRoutingDecisionEvent,
+  agent_selected:             AgentSelectedEvent,
+  workspace_routing_decision: GenericEvent,
 
-    // Feedback
-    'feedback_detected': FeedbackDetectedEvent,
-    'feedback_listening_started': FeedbackListeningStartedEvent,
-    'feedback_listening_stopped': FeedbackListeningStoppedEvent,
+  // ── Review cycle ──────────────────────────────────────────────────────────
+  review_cycle_started:           ReviewCycleStartedEvent,
+  review_cycle_iteration:         ReviewCycleIterationEvent,
+  review_cycle_maker_selected:    ReviewCycleMakerSelectedEvent,
+  review_cycle_reviewer_selected: ReviewCycleReviewerSelectedEvent,
+  review_cycle_escalated:         ReviewCycleEscalatedEvent,
+  review_cycle_completed:         ReviewCycleCompletedEvent,
 
-    // Status Progression
-    'status_progression_started': StatusProgressionStartedEvent,
-    'status_progression_completed': StatusProgressionCompletedEvent,
-    'status_progression_failed': StatusProgressionFailedEvent,
+  // ── Repair cycle ──────────────────────────────────────────────────────────
+  repair_cycle_started:   GenericEvent,
+  repair_cycle_iteration: GenericEvent,
+  repair_cycle_completed: GenericEvent,
+  repair_cycle_failed:    GenericEvent,
 
-    // Review Cycles
-    'review_cycle_started': ReviewCycleStartedEvent,
-    'review_cycle_iteration': ReviewCycleIterationEvent,
-    'review_cycle_maker_selected': ReviewCycleMakerSelectedEvent,
-    'review_cycle_reviewer_selected': ReviewCycleReviewerSelectedEvent,
-    'review_cycle_escalated': ReviewCycleEscalatedEvent,
-    'review_cycle_completed': ReviewCycleCompletedEvent,
+  repair_cycle_env_rebuild_started:   GenericEvent,
+  repair_cycle_env_rebuild_completed: GenericEvent,
 
-    // Error Handling
-    'error_encountered': ErrorEncounteredEvent,
-    'error_recovered': ErrorRecoveredEvent,
+  repair_cycle_test_cycle_started:       GenericEvent,
+  repair_cycle_test_cycle_completed:     GenericEvent,
+  repair_cycle_test_execution_started:   GenericEvent,
+  repair_cycle_test_execution_completed: GenericEvent,
 
-    // State Reconciliation
-    'execution_state_reconciled': ExecutionStateReconciledEvent,
+  repair_cycle_fix_cycle_started:   GenericEvent,
+  repair_cycle_fix_cycle_completed: GenericEvent,
+  repair_cycle_file_fix_started:    GenericEvent,
+  repair_cycle_file_fix_completed:  GenericEvent,
+  repair_cycle_file_fix_failed:     GenericEvent,
 
-    // Task Queue
-    'task_queued': TaskQueuedEvent,
-    'task_dequeued': TaskDequeuedEvent,
+  repair_cycle_warning_review_started:   GenericEvent,
+  repair_cycle_warning_review_completed: GenericEvent,
+  repair_cycle_warning_review_failed:    GenericEvent,
 
-    // Branch Management
-    'branch_created': BranchCreatedEvent,
-    'branch_reused': BranchReusedEvent,
+  repair_cycle_systemic_analysis_started:   GenericEvent,
+  repair_cycle_systemic_analysis_completed: GenericEvent,
+  repair_cycle_systemic_fix_started:        GenericEvent,
+  repair_cycle_systemic_fix_completed:      GenericEvent,
 
-    // Conversational
-    'conversational_loop_started': ConversationalLoopStartedEvent,
-    'conversational_question_routed': ConversationalQuestionRoutedEvent,
-  }
+  repair_cycle_container_started:            GenericEvent,
+  repair_cycle_container_checkpoint_updated: GenericEvent,
+  repair_cycle_container_recovered:          GenericEvent,
+  repair_cycle_container_killed:             GenericEvent,
+  repair_cycle_container_completed:          GenericEvent,
 
-  const Component = eventTypeMap[event.event_type] || GenericEvent
-  return <Component key={event.event_id} event={event} onIconClick={onIconClick} />
+  // ── PR review ─────────────────────────────────────────────────────────────
+  pr_review_stage_started:   GenericEvent,
+  pr_review_phase_started:   GenericEvent,
+  pr_review_phase_completed: GenericEvent,
+  pr_review_phase_failed:    GenericEvent,
+  pr_review_stage_completed: GenericEvent,
+
+  // ── Pipeline & stage progression ──────────────────────────────────────────
+  status_progression_started:   StatusProgressionStartedEvent,
+  status_progression_completed: StatusProgressionCompletedEvent,
+  status_progression_failed:    StatusProgressionFailedEvent,
+  pipeline_stage_transition:    GenericEvent,
+  pipeline_run_started:         GenericEvent,
+  pipeline_run_completed:       GenericEvent,
+  pipeline_run_failed:          GenericEvent,
+
+  // ── Feedback monitoring ───────────────────────────────────────────────────
+  feedback_detected:          FeedbackDetectedEvent,
+  feedback_listening_started: FeedbackListeningStartedEvent,
+  feedback_listening_stopped: FeedbackListeningStoppedEvent,
+  feedback_ignored:           GenericEvent,
+
+  // ── Conversational loop ───────────────────────────────────────────────────
+  conversational_loop_started:    ConversationalLoopStartedEvent,
+  conversational_question_routed: ConversationalQuestionRoutedEvent,
+  conversational_loop_paused:     GenericEvent,
+  conversational_loop_resumed:    GenericEvent,
+
+  // ── Error handling & circuit breakers ─────────────────────────────────────
+  error_encountered:      ErrorEncounteredEvent,
+  error_recovered:        ErrorRecoveredEvent,
+  circuit_breaker_opened: GenericEvent,
+  circuit_breaker_closed: GenericEvent,
+  retry_attempted:        GenericEvent,
+
+  // ── Task queue management ─────────────────────────────────────────────────
+  task_queued:           TaskQueuedEvent,
+  task_dequeued:         TaskDequeuedEvent,
+  task_priority_changed: GenericEvent,
+  task_cancelled:        GenericEvent,
+
+  // ── Branch management ─────────────────────────────────────────────────────
+  branch_selected:            GenericEvent,
+  branch_created:             BranchCreatedEvent,
+  branch_reused:              BranchReusedEvent,
+  branch_conflict_detected:   GenericEvent,
+  branch_stale_detected:      GenericEvent,
+  branch_selection_escalated: GenericEvent,
+
+  // ── Issue management ──────────────────────────────────────────────────────
+  sub_issue_created:         GenericEvent,
+  sub_issue_creation_failed: GenericEvent,
+
+  // ── System operations ─────────────────────────────────────────────────────
+  execution_state_reconciled: ExecutionStateReconciledEvent,
+  status_validation_failure:  GenericEvent,
+  result_persistence_failed:  GenericEvent,
+  fallback_storage_used:      GenericEvent,
+  output_validation_failed:   GenericEvent,
+  empty_output_detected:      GenericEvent,
+  container_result_recovered: GenericEvent,
 }
 
-// Main PipelineRunEventLog component
-function PipelineRunEventLog({ pipelineRun, events: initialEvents = [], isActive = false }) {
-  const [events, setEvents] = useState(initialEvents)
+// Main PipelineRunEventLog component.
+// Receives pre-filtered pipelineEvents from the parent — no internal socket
+// merging needed since the parent's mergedEvents already handles live updates.
+function PipelineRunEventLog({ pipelineRun, events = [] }) {
   const [selectedEventForModal, setSelectedEventForModal] = useState(null)
-  const { events: socketEvents } = useSocket()
 
-  const handleIconClick = (event) => {
-    setSelectedEventForModal(event)
-  }
-
-  const closeModal = () => {
-    setSelectedEventForModal(null)
-  }
-
-  // Update events when new socket events arrive for this pipeline run
-  // Note: This is NOT redundant with parent's mergedEvents - parent provides initial state,
-  // but this component independently subscribes to live updates for active runs
-  useEffect(() => {
-    if (!isActive || !pipelineRun) return
-
-    // Filter socket events for this pipeline run
-    const newEvents = socketEvents.filter(e =>
-      e.pipeline_run_id === pipelineRun.id &&
-      !events.find(existing => existing.event_id === e.event_id)
-    )
-
-    if (newEvents.length > 0) {
-      setEvents(prev => [...prev, ...newEvents].sort((a, b) =>
-        new Date(a.timestamp) - new Date(b.timestamp)
-      ))
-    }
-  }, [socketEvents, isActive, pipelineRun, events])
-  
-  // Update events when initialEvents prop changes
-  useEffect(() => {
-    setEvents(initialEvents)
-  }, [initialEvents])
-  
   // Sort events oldest to newest
-  const sortedEvents = useMemo(() => {
-    return [...events].sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp))
-  }, [events])
-  
+  const sortedEvents = useMemo(() =>
+    [...events].sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp)),
+    [events]
+  )
+
   if (!pipelineRun) return null
 
   return (
@@ -531,27 +567,25 @@ function PipelineRunEventLog({ pipelineRun, events: initialEvents = [], isActive
         </div>
       ) : (
         <div className="relative">
-          {sortedEvents.map(event => getEventComponent(event, handleIconClick))}
+          {sortedEvents.map(event => {
+            const Component = EVENT_LOG_COMPONENT_MAP[event.event_type] ?? GenericEvent
+            return <Component key={event.event_id} event={event} onIconClick={setSelectedEventForModal} />
+          })}
         </div>
       )}
 
-      {/* Event JSON Modal */}
       {selectedEventForModal && (
-        <EventJsonModal event={selectedEventForModal} onClose={closeModal} />
+        <EventJsonModal event={selectedEventForModal} onClose={() => setSelectedEventForModal(null)} />
       )}
     </div>
   )
 }
 
-// Memoized wrapper to prevent unnecessary re-renders
-const PipelineRunEventLogMemoized = memo(PipelineRunEventLog, (prevProps, nextProps) => {
-  // Only re-render if pipeline run ID, events array identity, or isActive changed
-  // Use array identity (===) not length, since parent computes events via useMemo
-  return (
-    prevProps.pipelineRun?.id === nextProps.pipelineRun?.id &&
-    prevProps.events === nextProps.events &&
-    prevProps.isActive === nextProps.isActive
-  )
-})
+// Memoized wrapper — re-renders only when run ID or events array identity changes.
+// Uses array identity (===) not length; parent computes events via useMemo.
+const PipelineRunEventLogMemoized = memo(PipelineRunEventLog, (prevProps, nextProps) =>
+  prevProps.pipelineRun?.id === nextProps.pipelineRun?.id &&
+  prevProps.events === nextProps.events
+)
 
 export default PipelineRunEventLogMemoized

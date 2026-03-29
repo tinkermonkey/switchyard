@@ -49,9 +49,19 @@ export default function PromptsFlowGraph({ events, selectedPipelineRun, loading 
     [events, selectedPipelineRun, filterAgentName, showInput, showOutput]
   )
 
+  // Stable serialization key so we only push new nodes/edges into React Flow
+  // when the graph data actually changes, not just when object references change.
+  const prevGraphKey = useRef('')
+
   useEffect(() => {
-    setNodes(rawNodes)
-    setEdges(rawEdges)
+    const graphKey = JSON.stringify(rawNodes.map(n => n.id).concat(rawEdges.map(e => e.id)))
+    const dataChanged = graphKey !== prevGraphKey.current
+    prevGraphKey.current = graphKey
+
+    if (dataChanged) {
+      setNodes(rawNodes)
+      setEdges(rawEdges)
+    }
 
     const pipelineRunChanged = prevPipelineRun.current !== selectedPipelineRun
     prevPipelineRun.current = selectedPipelineRun
@@ -140,7 +150,7 @@ export default function PromptsFlowGraph({ events, selectedPipelineRun, loading 
           panOnScroll={true}
         >
           <Background />
-          <Controls />
+          <Controls position="top-left" />
         </ReactFlow>
       </div>
     </div>

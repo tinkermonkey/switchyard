@@ -2,7 +2,7 @@ import { useState, useEffect } from 'react'
 import { Lock, Unlock, Clock, XCircle, ArrowRight, MessageSquare, Copy, Maximize2, Minimize2, CheckCircle2, AlertCircle } from 'lucide-react'
 import { useNavigate } from '@tanstack/react-router'
 import TokenUsagePanel from './TokenUsagePanel'
-import { formatDuration, formatRunDuration } from '../utils/stateHelpers'
+import RunDuration from './RunDuration'
 
 const LockStatusBadge = ({ lockStatus, lockHolderIssue }) => {
   if (lockStatus === 'holding_lock') {
@@ -62,13 +62,6 @@ export default function PipelineRunHeader({
   const navigate = useNavigate()
   const [pipelineRunLogs, setPipelineRunLogs] = useState([])
   const [copied, setCopied] = useState(false)
-  const [, setTick] = useState(0)
-
-  useEffect(() => {
-    if (pipelineRun?.duration || pipelineRun?.status !== 'active') return
-    const id = setInterval(() => setTick(t => t + 1), 1000)
-    return () => clearInterval(id)
-  }, [pipelineRun?.duration, pipelineRun?.status])
 
   useEffect(() => {
     if (!pipelineRun?.id) return
@@ -83,11 +76,6 @@ export default function PipelineRunHeader({
   if (!pipelineRun) return null
 
   const repoUrl = pipelineRun.repo_url || null
-
-  const getDuration = () => {
-    if (pipelineRun.duration) return formatRunDuration(pipelineRun.duration)
-    return formatDuration(pipelineRun.started_at)
-  }
 
   const handleCopyId = async () => {
     try {
@@ -155,7 +143,7 @@ export default function PipelineRunHeader({
     },
     {
       label: 'Duration',
-      value: getDuration(),
+      value: <RunDuration startedAt={pipelineRun.started_at} endedAt={pipelineRun.ended_at} />,
     },
   ]
 

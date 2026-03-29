@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { createPortal } from 'react-dom'
-import { Handle, Position } from '@xyflow/react'
 import EventJsonModal from '../EventJsonModal'
+import NodeHandles from './NodeHandles'
 
 /**
  * Root base component for all pipeline event nodes.
@@ -65,9 +65,7 @@ export default function PipelineEventNode({ data, nodeStyle, icon }) {
           />
         )}
 
-        <Handle type="target" position={Position.Top}  style={{ opacity: 0 }} />
-        <Handle id="left"  type="target" position={Position.Left}  style={{ opacity: 0 }} />
-        <Handle id="right" type="source" position={Position.Right} style={{ opacity: 0 }} />
+        <NodeHandles />
 
         <div className="flex items-start gap-2">
           {icon && <div className="mt-0.5 shrink-0">{icon}</div>}
@@ -76,8 +74,6 @@ export default function PipelineEventNode({ data, nodeStyle, icon }) {
             {metadata && <div className="text-xs mt-1 opacity-90">{metadata}</div>}
           </div>
         </div>
-
-        <Handle type="source" position={Position.Bottom} style={{ opacity: 0 }} />
       </div>
 
       {modalOpen && createPortal(

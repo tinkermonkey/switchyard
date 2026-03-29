@@ -638,3 +638,72 @@ export function renderSystemicFixSummary(data, isDark) {
     </div>
   )
 }
+
+// ── Agent execution renderer ──────────────────────────────────────────────────
+
+export function renderAgentExecutionSummary(data, isDark) {
+  const { status, isActive, durationMs, inputTokens, outputTokens, tools, iterationCount } = data
+
+  const effectiveStatus = isActive || status === 'running' ? 'running' : (status ?? 'completed')
+
+  const statusColor =
+    effectiveStatus === 'running'     ? (isDark ? '#58a6ff' : '#0969da') :
+    effectiveStatus === 'completed'   ? (isDark ? '#3fb950' : '#2da44e') :
+    effectiveStatus === 'failed'      ? (isDark ? '#f85149' : '#cf222e') :
+    effectiveStatus === 'interrupted' ? (isDark ? '#d29055' : '#bc4c00') :
+    (isDark ? '#6e7681' : '#57606a')
+
+  const statusLabel = {
+    running: 'RUNNING',
+    completed: 'DONE',
+    failed: 'FAILED',
+    interrupted: 'KILLED',
+  }[effectiveStatus] ?? 'DONE'
+
+  const durationStr = durationMs != null ? fmtDur(Math.round(durationMs / 1000)) : null
+  const totalTokens = (inputTokens ?? 0) + (outputTokens ?? 0)
+  const tokensStr = totalTokens > 0
+    ? totalTokens >= 1_000_000 ? `${(totalTokens / 1_000_000).toFixed(1)}M`
+      : totalTokens >= 1_000 ? `${(totalTokens / 1_000).toFixed(1)}k`
+      : String(totalTokens)
+    : null
+
+  const muted = isDark ? '#7d8590' : '#57606a'
+
+  return (
+    <div style={{ padding: '6px 12px 8px', display: 'flex', flexDirection: 'column', gap: 4 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+        <StatusDot color={statusColor} />
+        <span style={{ fontSize: 10, fontWeight: 700, color: statusColor }}>{statusLabel}</span>
+        {durationStr && (
+          <span style={{ fontSize: 10, color: muted, marginLeft: 'auto' }}>{durationStr}</span>
+        )}
+        {tokensStr && (
+          <span style={{ fontSize: 10, color: muted }}>{tokensStr}</span>
+        )}
+      </div>
+      {tools?.length > 0 && (
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 3, marginTop: 2 }}>
+          {tools.slice(0, 5).map(tool => (
+            <span key={tool} style={{
+              fontSize: 9, padding: '1px 5px', borderRadius: 3,
+              background: isDark ? '#1a3050' : '#cfe2f8',
+              color: isDark ? '#8bb8e8' : '#0550ae',
+              fontFamily: 'monospace',
+            }}>
+              {tool}
+            </span>
+          ))}
+          {tools.length > 5 && (
+            <span style={{ fontSize: 9, color: muted }}>+{tools.length - 5}</span>
+          )}
+        </div>
+      )}
+      {iterationCount > 0 && (
+        <div style={{ fontSize: 9, color: muted, marginTop: 1 }}>
+          {iterationCount} event{iterationCount !== 1 ? 's' : ''} · click to expand
+        </div>
+      )}
+    </div>
+  )
+}

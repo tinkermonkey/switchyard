@@ -2,12 +2,13 @@ import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import {
   ReactFlow,
   Controls,
+  ControlButton,
   Background,
   useNodesState,
   useEdgesState,
 } from '@xyflow/react'
 import '@xyflow/react/dist/style.css'
-import { RefreshCw } from 'lucide-react'
+import { RefreshCw, Eye, EyeOff } from 'lucide-react'
 import LayoutController from './LayoutController'
 import SmartPipelineEdge from './SmartPipelineEdge'
 import { containerNodeTypes } from './containers/index.js'
@@ -85,7 +86,8 @@ const CYCLE_CONTAINER_TYPES = Object.keys(containerNodeTypes)
  *                        'top' shows the first events; 'bottom' shows the most recent events;
  *                        'active-node' centres on the in-progress node (falls back to 'bottom');
  *                        both 'top'/'bottom' fit to graph width for zoom. Defaults to 'center'.
- *   showAllNodes        - Show all nodes including defaultHidden ones (default: true)
+ *   showAllNodes        - When true (default), all events are shown. When false, only nodes in
+ *                        DEFAULT_SHOWN_NODE_TYPES are visible (simplify view).
  */
 export default function PipelineFlowGraph({
   graphEvents,
@@ -103,8 +105,9 @@ export default function PipelineFlowGraph({
   emptyMessage = 'No events found',
   onLayoutDone,
   fitViewAlign = 'center',
-  showAllNodes = true,
+  showAllNodes: showAllNodesProp = true,
 }) {
+  const [showAllNodes, setShowAllNodes] = useState(showAllNodesProp)
   const [nodes, setNodes, onNodesChange] = useNodesState([])
   const [edges, setEdges, onEdgesChange] = useEdgesState([])
   const [layoutReady, setLayoutReady] = useState(false)
@@ -291,10 +294,10 @@ export default function PipelineFlowGraph({
     }
   }, [])
 
-  // Remove nodes marked defaultHidden (boundary/housekeeping events) and reroute edges
+  // Hide nodes not in DEFAULT_SHOWN_NODE_TYPES and reroute edges
   // around them so the sequential chain stays intact. Nodes are fully removed (not just
-  // marked hidden) so the layout engine never allocates space for them. Skipped when
-  // showAllNodes is true.
+  // hidden) so the layout engine never allocates space for them. Skipped when
+  // showAllNodes is true (the default).
   const filteredRawBuild = useMemo(() => {
     if (!rawBuild || showAllNodes) return rawBuild
 
@@ -520,7 +523,14 @@ export default function PipelineFlowGraph({
               userExpandedContainersRef={userOpenedCyclesRef}
             />
             <Background />
-            <Controls />
+            <Controls position="top-left">
+              <ControlButton
+                onClick={() => setShowAllNodes(v => !v)}
+                title={showAllNodes ? 'Simplify view' : 'Show all events'}
+              >
+                {showAllNodes ? <EyeOff size={12} /> : <Eye size={12} />}
+              </ControlButton>
+            </Controls>
           </ReactFlow>
 
         </div>

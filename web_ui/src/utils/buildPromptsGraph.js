@@ -338,6 +338,7 @@ export function buildPromptsGraph({ events, selectedPipelineRun, filters = {} })
         edges.push({
           id: `edge-comment-body-${idx}`,
           source: commentId,
+          sourceHandle: 'bottom',
           target: commentBodyId,
           type: 'default',
           style: { stroke: '#4b5563', strokeWidth: 1, strokeDasharray: '4 3', opacity: 0.6 },
