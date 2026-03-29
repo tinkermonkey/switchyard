@@ -251,7 +251,8 @@ Files: {context.get('files', [])}
             # Emit Claude API call started event
             api_start_time = time.time()
             if obs:
-                obs.emit_claude_call_started(agent, task_id, project, claude_model)
+                obs.emit_claude_call_started(agent, task_id, project, claude_model,
+                                             pipeline_run_id=_local_pipeline_run_id or None)
 
             # Get stream callback if websocket is connected
             stream_callback = context.get('stream_callback')
@@ -409,7 +410,8 @@ Files: {context.get('files', [])}
                                                    input_tokens, output_tokens,
                                                    cache_read_tokens=cache_read_tokens,
                                                    cache_creation_tokens=cache_creation_tokens,
-                                                   success=success)
+                                                   success=success,
+                                                   pipeline_run_id=_local_pipeline_run_id or None)
 
                 if process.returncode == 0:
                     result_text = ''.join(result_parts)

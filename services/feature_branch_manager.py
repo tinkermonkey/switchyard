@@ -1261,7 +1261,8 @@ git push --force-with-lease
                     issue_number=issue_number,
                     parent_issue=parent_issue,
                     is_new=False,
-                    confidence=best_match['confidence']
+                    confidence=best_match['confidence'],
+                    pipeline_run_id=pipeline_run_id
                 )
 
                 return branch_name
@@ -1343,7 +1344,8 @@ Waiting for human decision...
                 reason="Created new standalone branch (no parent issue, no related branches found)",
                 issue_number=issue_number,
                 parent_issue=None,
-                is_new=True
+                is_new=True,
+                pipeline_run_id=pipeline_run_id
             )
 
             return branch_name
@@ -1556,7 +1558,8 @@ Waiting for human decision...
             reason=f"Using parent feature branch for issue #{issue_number} ({reason_suffix})",
             issue_number=issue_number,
             parent_issue=parent_issue,
-            is_new=is_new_branch
+            is_new=is_new_branch,
+            pipeline_run_id=pipeline_run_id
         )
 
         return feature_branch.branch_name

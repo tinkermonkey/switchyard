@@ -1793,6 +1793,7 @@ For each warning:
 
         project = context.get("project", "unknown")
         task_id = context.get("task_id", "unknown")
+        pipeline_run_id = context.get("pipeline_run_id")
 
         # Emit performance metrics using the standard emit_performance_metric method
         try:
@@ -1803,6 +1804,7 @@ For each warning:
                 metric_name="repair_cycle_iterations",
                 value=float(cycle_result.iterations),
                 unit="iterations",
+                pipeline_run_id=pipeline_run_id,
             )
 
             obs.emit_performance_metric(
@@ -1812,6 +1814,7 @@ For each warning:
                 metric_name="repair_cycle_duration",
                 value=cycle_result.duration_seconds,
                 unit="seconds",
+                pipeline_run_id=pipeline_run_id,
             )
 
             obs.emit_performance_metric(
@@ -1821,6 +1824,7 @@ For each warning:
                 metric_name="repair_cycle_files_fixed",
                 value=float(cycle_result.files_fixed),
                 unit="files",
+                pipeline_run_id=pipeline_run_id,
             )
 
             obs.emit_performance_metric(
@@ -1830,6 +1834,7 @@ For each warning:
                 metric_name="repair_cycle_warnings_reviewed",
                 value=float(cycle_result.warnings_reviewed),
                 unit="warnings",
+                pipeline_run_id=pipeline_run_id,
             )
 
             # Emit success rate as binary metric (1.0 or 0.0)
@@ -1840,6 +1845,7 @@ For each warning:
                 metric_name="repair_cycle_success",
                 value=1.0 if cycle_result.passed else 0.0,
                 unit="success",
+                pipeline_run_id=pipeline_run_id,
             )
 
         except Exception as e:

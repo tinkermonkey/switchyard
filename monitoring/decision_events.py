@@ -99,11 +99,12 @@ class DecisionEventEmitter:
         board: str,
         selected_agent: str,
         reason: str,
-        selection_criteria: Optional[Dict[str, Any]] = None
+        selection_criteria: Optional[Dict[str, Any]] = None,
+        pipeline_run_id: Optional[str] = None
     ):
         """
         Emit simplified agent selection event
-        
+
         Args:
             issue_number: GitHub issue number
             project: Project name
@@ -111,9 +112,10 @@ class DecisionEventEmitter:
             selected_agent: Selected agent
             reason: Selection reason
             selection_criteria: Criteria used for selection
+            pipeline_run_id: Pipeline run ID for traceability
         """
         task_id = f"agent_selected_{project}_{issue_number}"
-        
+
         self.obs.emit(
             EventType.AGENT_SELECTED,
             agent="orchestrator",
@@ -128,7 +130,8 @@ class DecisionEventEmitter:
                 },
                 'reason': reason,
                 'selection_criteria': selection_criteria or {}
-            }
+            },
+            pipeline_run_id=pipeline_run_id
         )
     
     def emit_feedback_detected(
@@ -278,20 +281,22 @@ class DecisionEventEmitter:
         project: str,
         board: str,
         feedback_source: str,
-        reason: str
+        reason: str,
+        pipeline_run_id: Optional[str] = None
     ):
         """
         Emit event when feedback is detected but ignored
-        
+
         Args:
             issue_number: Issue number
             project: Project name
             board: Board name
             feedback_source: Source of feedback
             reason: Why it was ignored
+            pipeline_run_id: Pipeline run ID for traceability
         """
         task_id = f"feedback_ignored_{project}_{issue_number}"
-        
+
         self.obs.emit(
             EventType.FEEDBACK_IGNORED,
             agent="orchestrator",
@@ -303,7 +308,8 @@ class DecisionEventEmitter:
                 'board': board,
                 'feedback_source': feedback_source,
                 'reason': reason
-            }
+            },
+            pipeline_run_id=pipeline_run_id
         )
     
     def emit_status_progression(
@@ -371,11 +377,12 @@ class DecisionEventEmitter:
         board: str,
         from_stage: str,
         to_stage: str,
-        reason: str
+        reason: str,
+        pipeline_run_id: Optional[str] = None
     ):
         """
         Emit event when issue transitions between pipeline stages
-        
+
         Args:
             issue_number: Issue number
             project: Project name
@@ -383,9 +390,10 @@ class DecisionEventEmitter:
             from_stage: Previous stage
             to_stage: New stage
             reason: Why transition occurred
+            pipeline_run_id: Pipeline run ID for traceability
         """
         task_id = f"stage_transition_{project}_{issue_number}"
-        
+
         self.obs.emit(
             EventType.PIPELINE_STAGE_TRANSITION,
             agent="orchestrator",
@@ -398,7 +406,8 @@ class DecisionEventEmitter:
                 'from_stage': from_stage,
                 'to_stage': to_stage,
                 'reason': reason
-            }
+            },
+            pipeline_run_id=pipeline_run_id
         )
     
     def emit_review_cycle_decision(
@@ -736,19 +745,21 @@ class DecisionEventEmitter:
         circuit_name: str,
         failure_count: int,
         threshold: int,
-        last_error: Optional[str] = None
+        last_error: Optional[str] = None,
+        pipeline_run_id: Optional[str] = None
     ):
         """
         Emit event when circuit breaker opens
-        
+
         Args:
             circuit_name: Name of circuit breaker
             failure_count: Number of failures
             threshold: Threshold that triggered opening
             last_error: Last error that triggered opening
+            pipeline_run_id: Pipeline run ID for traceability
         """
         task_id = f"circuit_breaker_{circuit_name}"
-        
+
         self.obs.emit(
             EventType.CIRCUIT_BREAKER_OPENED,
             agent="orchestrator",
@@ -761,23 +772,26 @@ class DecisionEventEmitter:
                 'threshold': threshold,
                 'last_error': last_error,
                 'reason': f"Circuit breaker '{circuit_name}' opened after {failure_count} failures (threshold: {threshold})"
-            }
+            },
+            pipeline_run_id=pipeline_run_id
         )
-    
+
     def emit_circuit_breaker_closed(
         self,
         circuit_name: str,
-        reason: str
+        reason: str,
+        pipeline_run_id: Optional[str] = None
     ):
         """
         Emit event when circuit breaker closes
-        
+
         Args:
             circuit_name: Name of circuit breaker
             reason: Why it was closed
+            pipeline_run_id: Pipeline run ID for traceability
         """
         task_id = f"circuit_breaker_{circuit_name}"
-        
+
         self.obs.emit(
             EventType.CIRCUIT_BREAKER_CLOSED,
             agent="orchestrator",
@@ -787,7 +801,8 @@ class DecisionEventEmitter:
                 'decision_category': 'error_handling',
                 'circuit_name': circuit_name,
                 'reason': reason
-            }
+            },
+            pipeline_run_id=pipeline_run_id
         )
     
     def emit_retry_attempted(
@@ -797,11 +812,12 @@ class DecisionEventEmitter:
         max_attempts: int,
         project: str,
         issue_number: Optional[int] = None,
-        last_error: Optional[str] = None
+        last_error: Optional[str] = None,
+        pipeline_run_id: Optional[str] = None
     ):
         """
         Emit event when a retry is attempted
-        
+
         Args:
             operation_name: Name of operation being retried
             attempt_number: Current attempt number (1-indexed)
@@ -809,9 +825,10 @@ class DecisionEventEmitter:
             project: Project name
             issue_number: Optional issue number if retry is issue-specific
             last_error: Error that triggered the retry
+            pipeline_run_id: Pipeline run ID for traceability
         """
         task_id = f"retry_{project}_{issue_number or operation_name}"
-        
+
         self.obs.emit(
             EventType.RETRY_ATTEMPTED,
             agent="orchestrator",
@@ -825,7 +842,8 @@ class DecisionEventEmitter:
                 'max_attempts': max_attempts,
                 'last_error': last_error,
                 'reason': f"Retry attempt {attempt_number}/{max_attempts} for {operation_name}"
-            }
+            },
+            pipeline_run_id=pipeline_run_id
         )
     
     def emit_workspace_routing(
@@ -921,11 +939,12 @@ class DecisionEventEmitter:
         issue_number: int,
         board: str,
         reason: Optional[str] = None,
-        workspace_type: str = "issues"
+        workspace_type: str = "issues",
+        pipeline_run_id: Optional[str] = None
     ):
         """
         Emit event when task is taken from queue for execution
-        
+
         Args:
             agent: Agent name
             project: Project name
@@ -933,9 +952,10 @@ class DecisionEventEmitter:
             board: Board name
             reason: Optional reason why task was dequeued
             workspace_type: Type of workspace ("issues" or "discussions")
+            pipeline_run_id: Pipeline run ID for traceability
         """
         task_id = f"task_queue_{project}_{issue_number}"
-        
+
         self.obs.emit(
             EventType.TASK_DEQUEUED,
             agent="orchestrator",
@@ -948,7 +968,8 @@ class DecisionEventEmitter:
                 'board': board,
                 'workspace_type': workspace_type,
                 'reason': reason or f"Task dequeued for execution by agent '{agent}'"
-            }
+            },
+            pipeline_run_id=pipeline_run_id
         )
     
     def emit_task_priority_changed(
@@ -959,11 +980,12 @@ class DecisionEventEmitter:
         old_priority: str,
         new_priority: str,
         reason: str,
-        workspace_type: str = "issues"
+        workspace_type: str = "issues",
+        pipeline_run_id: Optional[str] = None
     ):
         """
         Emit event when a task's priority is changed
-        
+
         Args:
             project: Project name
             issue_number: Issue number
@@ -972,9 +994,10 @@ class DecisionEventEmitter:
             new_priority: New priority
             reason: Why priority was changed
             workspace_type: Type of workspace ("issues" or "discussions")
+            pipeline_run_id: Pipeline run ID for traceability
         """
         task_id = f"task_queue_{project}_{issue_number}"
-        
+
         self.obs.emit(
             EventType.TASK_PRIORITY_CHANGED,
             agent="orchestrator",
@@ -992,7 +1015,8 @@ class DecisionEventEmitter:
                     'new_priority': new_priority
                 },
                 'reason': reason
-            }
+            },
+            pipeline_run_id=pipeline_run_id
         )
     
     def emit_task_cancelled(
@@ -1002,11 +1026,12 @@ class DecisionEventEmitter:
         board: str,
         agent: str,
         reason: str,
-        workspace_type: str = "issues"
+        workspace_type: str = "issues",
+        pipeline_run_id: Optional[str] = None
     ):
         """
         Emit event when a task is cancelled
-        
+
         Args:
             project: Project name
             issue_number: Issue number
@@ -1014,9 +1039,10 @@ class DecisionEventEmitter:
             agent: Agent the task was assigned to
             reason: Why the task was cancelled
             workspace_type: Type of workspace ("issues" or "discussions")
+            pipeline_run_id: Pipeline run ID for traceability
         """
         task_id = f"task_queue_{project}_{issue_number}"
-        
+
         self.obs.emit(
             EventType.TASK_CANCELLED,
             agent="orchestrator",
@@ -1032,7 +1058,8 @@ class DecisionEventEmitter:
                     'action': 'cancel_task'
                 },
                 'reason': reason
-            }
+            },
+            pipeline_run_id=pipeline_run_id
         )
 
     def emit_branch_reused(
@@ -1299,7 +1326,8 @@ class DecisionEventEmitter:
         project_number: int,
         invalid_count: int,
         invalid_statuses: list,
-        affected_issues: list
+        affected_issues: list,
+        pipeline_run_id: Optional[str] = None
     ):
         """Emit event when status validation fails after retries."""
         self.obs.emit(
@@ -1315,7 +1343,8 @@ class DecisionEventEmitter:
                 'invalid_statuses': invalid_statuses,
                 'affected_issues': affected_issues,
                 'attempts': 3
-            }
+            },
+            pipeline_run_id=pipeline_run_id
         )
 
     def emit_sub_issue_created(

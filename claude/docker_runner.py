@@ -1058,7 +1058,8 @@ class DockerAgentRunner:
         if obs:
             obs.emit_claude_call_started(agent, task_id, project, claude_model,
                                          pipeline_run_id=pipeline_run_id)
-            obs.emit_container_launch_started(agent, task_id, project, container_name, image_name)
+            obs.emit_container_launch_started(agent, task_id, project, container_name, image_name,
+                                              pipeline_run_id=pipeline_run_id)
 
         try:
             # Launch detached container
@@ -1072,7 +1073,8 @@ class DockerAgentRunner:
                 error_msg = f"Failed to launch container: {launch_result.stderr}"
                 logger.error(error_msg)
                 if obs:
-                    obs.emit_container_launch_failed(agent, task_id, project, container_name, error_msg)
+                    obs.emit_container_launch_failed(agent, task_id, project, container_name, error_msg,
+                                                     pipeline_run_id=pipeline_run_id)
                 raise Exception(error_msg)
 
             container_id = launch_result.stdout.strip()
@@ -1080,7 +1082,8 @@ class DockerAgentRunner:
 
             # Emit container launch success
             if obs:
-                obs.emit_container_launch_succeeded(agent, task_id, project, container_name, container_id)
+                obs.emit_container_launch_succeeded(agent, task_id, project, container_name, container_id,
+                                                    pipeline_run_id=pipeline_run_id)
 
             # Track active container in Redis for kill switch
             # Registration happens AFTER docker run succeeds so we have the real container_id
@@ -1289,7 +1292,8 @@ class DockerAgentRunner:
                     duration_ms = (time.time() - api_start_time) * 1000
                     # Extract first error line for event
                     error_preview = stderr_text[:200] if stderr_text else "No error output"
-                    obs.emit_container_execution_failed(agent, task_id, project, container_name, exit_code, error_preview, duration_ms)
+                    obs.emit_container_execution_failed(agent, task_id, project, container_name, exit_code, error_preview, duration_ms,
+                                                        pipeline_run_id=pipeline_run_id)
 
             # Cleanup ALL prompt files in project directory
             # This handles accumulation from multiple runs and prevents workspace contamination
@@ -1312,13 +1316,15 @@ class DockerAgentRunner:
                 import time
                 api_duration_ms = (time.time() - api_start_time) * 1000
                 # Emit container execution completed (with exit code)
-                obs.emit_container_execution_completed(agent, task_id, project, container_name, exit_code, api_duration_ms)
+                obs.emit_container_execution_completed(agent, task_id, project, container_name, exit_code, api_duration_ms,
+                                                       pipeline_run_id=pipeline_run_id)
                 # Emit Claude call completed (success determined by exit_code)
                 obs.emit_claude_call_completed(agent, task_id, project, api_duration_ms,
                                                input_tokens, output_tokens,
                                                cache_read_tokens=cache_read_tokens,
                                                cache_creation_tokens=cache_creation_tokens,
-                                               success=(exit_code == 0))
+                                               success=(exit_code == 0),
+                                               pipeline_run_id=pipeline_run_id)
 
             if exit_code == 0:
                 result_text = ''.join(result_parts)
@@ -1544,7 +1550,8 @@ class DockerAgentRunner:
                     obs.emit_claude_call_failed(agent, task_id, project, api_duration_ms, stderr_excerpt, exit_code,
                                                 input_tokens=input_tokens, output_tokens=output_tokens,
                                                 cache_read_tokens=cache_read_tokens,
-                                                cache_creation_tokens=cache_creation_tokens)
+                                                cache_creation_tokens=cache_creation_tokens,
+                                                pipeline_run_id=pipeline_run_id)
 
                 # CRITICAL: Record failure outcome immediately before raising exception
                 # This ensures outcome is recorded even if exception handling fails

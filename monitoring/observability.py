@@ -755,7 +755,8 @@ class ObservabilityManager:
     def emit_claude_call_completed(self, agent: str, task_id: str, project: str,
                                    duration_ms: float, input_tokens: int,
                                    output_tokens: int, cache_read_tokens: int = 0,
-                                   cache_creation_tokens: int = 0, success: bool = True):
+                                   cache_creation_tokens: int = 0, success: bool = True,
+                                   pipeline_run_id: Optional[str] = None):
         """Emit Claude API call completed event"""
         self.emit(EventType.CLAUDE_API_CALL_COMPLETED, agent, task_id, project, {
             'duration_ms': duration_ms,
@@ -765,12 +766,13 @@ class ObservabilityManager:
             'cache_creation_tokens': cache_creation_tokens,
             'total_tokens': input_tokens + output_tokens + cache_read_tokens + cache_creation_tokens,
             'success': success
-        })
+        }, pipeline_run_id=pipeline_run_id)
 
     def emit_claude_call_failed(self, agent: str, task_id: str, project: str,
                                 duration_ms: float, error: str, exit_code: Optional[int] = None,
                                 input_tokens: int = 0, output_tokens: int = 0,
-                                cache_read_tokens: int = 0, cache_creation_tokens: int = 0):
+                                cache_read_tokens: int = 0, cache_creation_tokens: int = 0,
+                                pipeline_run_id: Optional[str] = None):
         """Emit Claude API call failed event"""
         self.emit(EventType.CLAUDE_API_CALL_FAILED, agent, task_id, project, {
             'duration_ms': duration_ms,
@@ -781,51 +783,56 @@ class ObservabilityManager:
             'cache_read_tokens': cache_read_tokens,
             'cache_creation_tokens': cache_creation_tokens,
             'success': False
-        })
+        }, pipeline_run_id=pipeline_run_id)
 
     def emit_container_launch_started(self, agent: str, task_id: str, project: str,
-                                      container_name: str, image: str):
+                                      container_name: str, image: str,
+                                      pipeline_run_id: Optional[str] = None):
         """Emit container launch started event"""
         self.emit(EventType.CONTAINER_LAUNCH_STARTED, agent, task_id, project, {
             'container_name': container_name,
             'image': image
-        })
+        }, pipeline_run_id)
 
     def emit_container_launch_succeeded(self, agent: str, task_id: str, project: str,
-                                       container_name: str, container_id: str):
+                                       container_name: str, container_id: str,
+                                       pipeline_run_id: Optional[str] = None):
         """Emit container launch succeeded event"""
         self.emit(EventType.CONTAINER_LAUNCH_SUCCEEDED, agent, task_id, project, {
             'container_name': container_name,
             'container_id': container_id
-        })
+        }, pipeline_run_id)
 
     def emit_container_launch_failed(self, agent: str, task_id: str, project: str,
-                                     container_name: str, error: str):
+                                     container_name: str, error: str,
+                                     pipeline_run_id: Optional[str] = None):
         """Emit container launch failed event"""
         self.emit(EventType.CONTAINER_LAUNCH_FAILED, agent, task_id, project, {
             'container_name': container_name,
             'error': error
-        })
+        }, pipeline_run_id)
 
     def emit_container_execution_completed(self, agent: str, task_id: str, project: str,
-                                          container_name: str, exit_code: int, duration_ms: float):
+                                          container_name: str, exit_code: int, duration_ms: float,
+                                          pipeline_run_id: Optional[str] = None):
         """Emit container execution completed event"""
         self.emit(EventType.CONTAINER_EXECUTION_COMPLETED, agent, task_id, project, {
             'container_name': container_name,
             'exit_code': exit_code,
             'duration_ms': duration_ms,
             'success': exit_code == 0
-        })
+        }, pipeline_run_id)
 
     def emit_container_execution_failed(self, agent: str, task_id: str, project: str,
-                                       container_name: str, exit_code: int, error: str, duration_ms: float):
+                                       container_name: str, exit_code: int, error: str, duration_ms: float,
+                                       pipeline_run_id: Optional[str] = None):
         """Emit container execution failed event"""
         self.emit(EventType.CONTAINER_EXECUTION_FAILED, agent, task_id, project, {
             'container_name': container_name,
             'exit_code': exit_code,
             'error': error,
             'duration_ms': duration_ms
-        })
+        }, pipeline_run_id)
 
     def emit_response_chunk(self, agent: str, task_id: str, project: str,
                            chunk: str, chunk_index: int):
@@ -854,13 +861,14 @@ class ObservabilityManager:
         self.emit(event_type, agent, task_id, project, data)
 
     def emit_performance_metric(self, agent: str, task_id: str, project: str,
-                               metric_name: str, value: float, unit: str):
+                               metric_name: str, value: float, unit: str,
+                               pipeline_run_id: Optional[str] = None):
         """Emit performance metric"""
         self.emit(EventType.PERFORMANCE_METRIC, agent, task_id, project, {
             'metric_name': metric_name,
             'value': value,
             'unit': unit
-        })
+        }, pipeline_run_id)
 
     def emit_agent_completed(self, agent: str, task_id: str, project: str,
                             duration_ms: float, success: bool,

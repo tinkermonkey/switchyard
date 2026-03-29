@@ -852,7 +852,8 @@ class TestEventTypeCompleteness:
             'pr_review_phase_completed', 'pr_review_phase_failed', 'pr_review_stage_completed',
             'execution_state_reconciled',
             'sub_issue_created', 'sub_issue_creation_failed',
-            'prompt_size_warning',
+            'prompt_size_warning', 'agent_output_format_unexpected',
+            'github_comment_posted',
         }
 
         expected_lifecycle_events = {
