@@ -11,20 +11,15 @@
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as RecommendationReportsRouteImport } from './routes/recommendation-reports'
 import { Route as ProjectsRouteImport } from './routes/projects'
-import { Route as DashboardRouteImport } from './routes/dashboard'
 import { Route as ProjectMetricsRouteImport } from './routes/project-metrics'
 import { Route as PipelineRunRouteImport } from './routes/pipeline-run'
 import { Route as PipelineReportsRouteImport } from './routes/pipeline-reports'
+import { Route as DashboardRouteImport } from './routes/dashboard'
 import { Route as CycleMetricsRouteImport } from './routes/cycle-metrics'
 import { Route as AgentMetricsRouteImport } from './routes/agent-metrics'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as AgentExecutionExecutionIdRouteImport } from './routes/agent-execution.$executionId'
 
-const DashboardRoute = DashboardRouteImport.update({
-  id: '/dashboard',
-  path: '/dashboard',
-  getParentRoute: () => rootRouteImport,
-} as any)
 const RecommendationReportsRoute = RecommendationReportsRouteImport.update({
   id: '/recommendation-reports',
   path: '/recommendation-reports',
@@ -48,6 +43,11 @@ const PipelineRunRoute = PipelineRunRouteImport.update({
 const PipelineReportsRoute = PipelineReportsRouteImport.update({
   id: '/pipeline-reports',
   path: '/pipeline-reports',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const DashboardRoute = DashboardRouteImport.update({
+  id: '/dashboard',
+  path: '/dashboard',
   getParentRoute: () => rootRouteImport,
 } as any)
 const CycleMetricsRoute = CycleMetricsRouteImport.update({
@@ -198,18 +198,18 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof PipelineReportsRouteImport
       parentRoute: typeof rootRouteImport
     }
-    '/cycle-metrics': {
-      id: '/cycle-metrics'
-      path: '/cycle-metrics'
-      fullPath: '/cycle-metrics'
-      preLoaderRoute: typeof CycleMetricsRouteImport
-      parentRoute: typeof rootRouteImport
-    }
     '/dashboard': {
       id: '/dashboard'
       path: '/dashboard'
       fullPath: '/dashboard'
       preLoaderRoute: typeof DashboardRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/cycle-metrics': {
+      id: '/cycle-metrics'
+      path: '/cycle-metrics'
+      fullPath: '/cycle-metrics'
+      preLoaderRoute: typeof CycleMetricsRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/agent-metrics': {

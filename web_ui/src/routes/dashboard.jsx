@@ -52,17 +52,7 @@ function DashboardView() {
     <div className="h-screen flex flex-col p-2 md:p-5 bg-gh-canvas text-gh-fg">
       <Header />
 
-      <div className="flex items-center justify-between my-3 flex-shrink-0">
-        <NavigationTabs />
-        <button
-          onClick={() => fetchActiveRuns(true)}
-          disabled={loading}
-          className="px-4 py-2 bg-gh-canvas-subtle border border-gh-border rounded-md hover:bg-gh-border-muted transition-colors text-sm"
-        >
-          <RefreshCw className={`inline w-4 h-4 mr-2 ${loading ? 'animate-spin' : ''}`} />
-          <span className="hidden md:inline">Refresh</span>
-        </button>
-      </div>
+      <NavigationTabs />
 
       <div className="flex-1 min-h-0">
         {loading && activeRuns.length === 0 ? (

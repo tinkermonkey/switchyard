@@ -1,5 +1,5 @@
 import { createFileRoute } from '@tanstack/react-router'
-import { RefreshCw, List } from 'lucide-react'
+import { List } from 'lucide-react'
 import Header from '../components/Header'
 import NavigationTabs from '../components/NavigationTabs'
 import PipelineFlowGraph from '../components/PipelineFlowGraph'
@@ -552,23 +552,13 @@ function PipelineRunView() {
       {!isFullscreen && (
         <div className="flex items-center justify-between my-3 flex-shrink-0">
           <NavigationTabs />
-          <div className="flex items-center gap-2">
-            <button
-              onClick={() => setSidebarOpen(true)}
-              className="md:hidden px-3 py-2 bg-gh-canvas-subtle border border-gh-border rounded-md hover:bg-gh-border-muted transition-colors text-sm"
-            >
-              <List className="inline w-4 h-4 mr-1" />
-              Runs
-            </button>
-            <button
-              onClick={() => fetchActivePipelineRuns(true)}
-              disabled={loading}
-              className="px-4 py-2 bg-gh-canvas-subtle border border-gh-border rounded-md hover:bg-gh-border-muted transition-colors text-sm"
-            >
-              <RefreshCw className={`inline w-4 h-4 mr-2 ${loading ? 'animate-spin' : ''}`} />
-              <span className="hidden md:inline">Refresh</span>
-            </button>
-          </div>
+          <button
+            onClick={() => setSidebarOpen(true)}
+            className="md:hidden px-3 py-2 bg-gh-canvas-subtle border border-gh-border rounded-md hover:bg-gh-border-muted transition-colors text-sm"
+          >
+            <List className="inline w-4 h-4 mr-1" />
+            Runs
+          </button>
         </div>
       )}
 
