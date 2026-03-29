@@ -6,7 +6,6 @@ import { Sun, Moon, AlertTriangle, AlertCircle, Plug, Unplug, CircleHelp } from 
 import HeaderActiveAgents from './HeaderActiveAgents'
 import HeaderSystemHealth from './HeaderSystemHealth'
 import HeaderCircuitBreakers from './HeaderCircuitBreakers'
-import HeaderClaudeUsage from './HeaderClaudeUsage'
 import HeaderStatsCard from './HeaderStatsCard'
 import switchyardLogo from '../assets/switchyard_logo.svg'
 
@@ -63,8 +62,7 @@ export default function Header() {
       'github': 'GitHub API',
       'claude': 'Claude Code CLI',
       'disk': 'Disk Space',
-      'memory': 'Memory',
-      'claude_usage': 'Claude Code Usage'
+      'memory': 'Memory'
     }
     return names[key] || key
   }
@@ -91,44 +89,6 @@ export default function Header() {
 
       case 'claude':
         return check.healthy ? 'Available' : 'Not accessible'
-
-      case 'claude_usage': {
-        if (!check.available) {
-          return check.error || 'Usage data unavailable'
-        }
-
-        const formatTokens = (tokens) => {
-          if (!tokens) return '0'
-          const millions = tokens / 1000000
-          return millions >= 1000 ? `${(millions / 1000).toFixed(2)}B` : `${millions.toFixed(1)}M`
-        }
-
-        // Build quota information sections
-        const sections = []
-
-        if (check.weekly_quota) {
-          const weeklyUsed = formatTokens(check.weekly_usage)
-          const weeklyQuota = formatTokens(check.weekly_quota)
-          const weeklyPercent = check.weekly_usage_percent || 0
-          sections.push(`Weekly: ${weeklyUsed}/${weeklyQuota} (${weeklyPercent.toFixed(1)}%)`)
-        }
-
-        if (check.session_quota) {
-          const sessionUsed = formatTokens(check.session_usage)
-          const sessionQuota = formatTokens(check.session_quota)
-          const sessionPercent = check.session_usage_percent || 0
-          const remainingMins = check.session_remaining_minutes || 0
-          sections.push(`Session: ${sessionUsed}/${sessionQuota} (${sessionPercent.toFixed(1)}%, ${remainingMins}m left)`)
-        }
-
-        if (sections.length === 0) {
-          const todayTokens = formatTokens(check.last_day_tokens)
-          const todayCost = check.last_day_cost ? `$${check.last_day_cost.toFixed(2)}` : '$0.00'
-          return `Today: ${todayCost} (${todayTokens} tokens)`
-        }
-
-        return sections.join(' • ')
-      }
 
       default:
         return check.healthy ? 'OK' : (check.error || 'Failed')
@@ -277,7 +237,6 @@ export default function Header() {
             {connected && (
               <>
                 <HeaderActiveAgents />
-                <HeaderClaudeUsage />
                 <HeaderSystemHealth />
                 <HeaderCircuitBreakers />
               </>

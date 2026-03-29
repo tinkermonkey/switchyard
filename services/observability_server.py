@@ -247,16 +247,24 @@ def get_claude_token_usage():
     Query Elasticsearch for Claude Code token usage metrics.
 
     Uses pre-computed hourly bucket indices (token-metrics-agents-hourly-*)
-    which are populated from OTEL data by TokenMetricsService. The old approach
-    queried agent-events-* for a 'context_tokens' field that is no longer written
-    since the migration from claude-streams-* to OTEL.
+    which are populated from OTEL data by TokenMetricsService.
 
-    Returns token breakdowns for the last 4 hours and 7 days.
+    Returns token breakdowns for the last 4 hours and 7 days, plus a
+    'status' field to distinguish genuine zeros from missing data:
+      "ok"       — index exists and has matching documents
+      "empty"    — index exists but no documents matched the time range
+      "no_index" — the hourly index does not exist yet
+      "error"    — query failed
     """
     try:
         from datetime import datetime
 
         def _sum_hourly_tokens(time_filter: str) -> dict:
+            zeros = {
+                'sum_direct_input': 0, 'sum_cache_read': 0,
+                'sum_cache_creation': 0, 'sum_output': 0,
+                'task_count': 0, '_hits': 0, '_index_missing': False,
+            }
             try:
                 result = es_client.search(
                     index='token-metrics-agents-hourly-*',
@@ -273,17 +281,21 @@ def get_claude_token_usage():
                     }
                 )
                 aggs = result.get('aggregations', {})
+                total = result.get('hits', {}).get('total', {})
+                hits = total.get('value', 0) if isinstance(total, dict) else total
                 return {
                     'sum_direct_input':   int(aggs.get('sum_direct', {}).get('value', 0) or 0),
                     'sum_cache_read':     int(aggs.get('sum_cr',     {}).get('value', 0) or 0),
                     'sum_cache_creation': int(aggs.get('sum_cc',     {}).get('value', 0) or 0),
                     'sum_output':         int(aggs.get('sum_out',    {}).get('value', 0) or 0),
                     'task_count':         int(aggs.get('task_count', {}).get('value', 0) or 0),
+                    '_hits':              int(hits),
+                    '_index_missing':     False,
                 }
             except Exception as e:
                 if 'index_not_found' in str(e).lower() or 'no such index' in str(e).lower():
-                    return {'sum_direct_input': 0, 'sum_cache_read': 0,
-                            'sum_cache_creation': 0, 'sum_output': 0, 'task_count': 0}
+                    zeros['_index_missing'] = True
+                    return zeros
                 raise
 
         now = datetime.utcnow()
@@ -292,6 +304,14 @@ def get_claude_token_usage():
 
         def _total_input(s):
             return s['sum_direct_input'] + s['sum_cache_read'] + s['sum_cache_creation']
+
+        # Determine overall status
+        if s4h['_index_missing'] and s7d['_index_missing']:
+            status = 'no_index'
+        elif s4h['_hits'] > 0 or s7d['_hits'] > 0:
+            status = 'ok'
+        else:
+            status = 'empty'
 
         return {
             # Backward-compatible totals (input + output combined)
@@ -304,6 +324,10 @@ def get_claude_token_usage():
             'input_tokens_7d':  _total_input(s7d),
             'output_tokens_7d': s7d['sum_output'],
             'task_count_7d':    s7d['task_count'],
+            # Diagnostic fields
+            'hits_4h':          s4h['_hits'],
+            'hits_7d':          s7d['_hits'],
+            'status':           status,
             'collected_at': now.isoformat() + 'Z',
         }
 
@@ -318,6 +342,9 @@ def get_claude_token_usage():
             'input_tokens_7d': 0,
             'output_tokens_7d': 0,
             'task_count_7d': 0,
+            'hits_4h': 0,
+            'hits_7d': 0,
+            'status': 'error',
             'error': str(e),
             'collected_at': datetime.utcnow().isoformat() + 'Z',
         }
