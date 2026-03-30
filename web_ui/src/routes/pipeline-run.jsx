@@ -647,7 +647,7 @@ function PipelineRunView() {
                 ) : contentTab === 'prompts' ? (
                   <div className="flex-1 min-h-0">
                     <PromptsFlowGraph
-                      events={pipelineEvents}
+                      events={mergedEvents}
                       selectedPipelineRun={selectedPipelineRun}
                       loading={loadingEvents}
                     />
