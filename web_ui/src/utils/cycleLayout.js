@@ -13,6 +13,8 @@
  *   updateEdgesForCycles  — redirects edges when cycles are collapsed
  */
 
+import { CYCLE_THEME_MAP } from './cycleThemes.js'
+
 /**
  * Node types that are structural containers, not renderable pipeline events.
  * Any node whose type is NOT in this set is treated as a leaf event node by the layout engine.
@@ -24,6 +26,126 @@ const CONTAINER_TYPES = new Set([
   'subCycleContainer',
   'cycleBounding',
 ])
+
+/**
+ * Resolve layout direction for a cycle container from its theme config.
+ * Returns 'horizontal' or 'vertical' (default).
+ */
+function getLayoutDirection(cycleType) {
+  return CYCLE_THEME_MAP[cycleType]?.layoutDirection ?? 'vertical'
+}
+
+/**
+ * Gather all children of a cycle container (direct events, iterations, sub-cycle containers)
+ * into a single chronologically-sorted array. Each item carries `{ node, kind, w, h }` so
+ * the sizing/positioning functions can handle all child types uniformly.
+ */
+function gatherCycleChildren(ccId, { directChildrenByCycle, itersByParent, subCyclesByCycle, iterSizes, subCycleSizes, nodeWidth, nodeHeight }) {
+  const direct = directChildrenByCycle.get(ccId) || []
+  const iters = itersByParent.get(ccId) || []
+  const scs = subCyclesByCycle.get(ccId) || []
+
+  return [
+    ...direct.map(d => ({
+      node: d,
+      ts: d.data?.timestamp || d.data?.startTime || '',
+      kind: 'direct',
+      w: d.measured?.width ?? nodeWidth,
+      h: d.measured?.height ?? nodeHeight,
+    })),
+    ...iters.map(it => ({
+      node: it,
+      ts: it.data?.startTime || '',
+      kind: 'iter',
+      w: iterSizes.get(it.id)?.width ?? nodeWidth,
+      h: iterSizes.get(it.id)?.height ?? nodeHeight,
+    })),
+    ...scs.map(sc => ({
+      node: sc,
+      ts: sc.data?.startTime || sc.data?.startEvent?.timestamp || '',
+      kind: 'subCycle',
+      w: subCycleSizes.get(sc.id)?.width ?? nodeWidth,
+      h: subCycleSizes.get(sc.id)?.height ?? nodeHeight,
+    })),
+  ].sort((a, b) => new Date(a.ts) - new Date(b.ts))
+}
+
+/**
+ * Compute the bounding size of a cycle container whose children are laid out horizontally.
+ */
+function sizeCycleHorizontal(items, { containerHeaderHeight, cyclePadding, horizontalSpacing }) {
+  if (items.length === 0) return { width: 300, height: 180 }
+  const totalWidth = items.reduce((sum, it) => sum + it.w, 0)
+  const spacingTotal = items.length > 1 ? horizontalSpacing * (items.length - 1) : 0
+  const maxHeight = Math.max(...items.map(it => it.h))
+  const width = cyclePadding * 2 + totalWidth + spacingTotal
+  const height = containerHeaderHeight + cyclePadding * 2 + maxHeight
+  return { width: Math.max(width, 300), height: Math.max(height, 180) }
+}
+
+/**
+ * Compute the bounding size of a cycle container whose children are laid out vertically.
+ */
+function sizeCycleVertical(items, { containerHeaderHeight, cyclePadding, innerVertSpacing, nodeWidth }) {
+  if (items.length === 0) return { width: 300, height: 180 }
+  const totalH = items.reduce((sum, it) => sum + it.h, 0) + Math.max(0, items.length - 1) * innerVertSpacing
+  const maxW = Math.max(...items.map(it => it.w), nodeWidth)
+  const width = cyclePadding * 2 + maxW
+  const height = containerHeaderHeight + cyclePadding * 2 + totalH
+  return { width: Math.max(width, 300), height: Math.max(height, 180) }
+}
+
+/**
+ * Position children of a cycle container horizontally (left-to-right), vertically centered.
+ */
+function positionCycleHorizontal(items, { cyclePadding, containerHeaderHeight, horizontalSpacing }, positionedNodes) {
+  const contentY = containerHeaderHeight + cyclePadding
+  const maxH = items.length > 0 ? Math.max(...items.map(it => it.h)) : 0
+  let relX = cyclePadding
+  items.forEach(({ node, kind, w, h }) => {
+    const y = contentY + Math.round((maxH - h) / 2)
+    if (kind === 'iter' || kind === 'subCycle') {
+      positionedNodes.set(node.id, {
+        ...node,
+        position: { x: relX, y },
+        style: node.data?.isCollapsed
+          ? { ...node.style, width: w }
+          : { ...node.style, width: w, height: h },
+      })
+    } else {
+      positionedNodes.set(node.id, {
+        ...node,
+        position: { x: relX, y },
+      })
+    }
+    relX += w + horizontalSpacing
+  })
+}
+
+/**
+ * Position children of a cycle container vertically (top-to-bottom), horizontally centered.
+ */
+function positionCycleVertical(items, ccWidth, { cyclePadding, containerHeaderHeight, innerVertSpacing }, positionedNodes) {
+  let childY = containerHeaderHeight + cyclePadding
+  items.forEach(({ node, kind, w, h }) => {
+    const x = (ccWidth - w) / 2
+    if (kind === 'iter' || kind === 'subCycle') {
+      positionedNodes.set(node.id, {
+        ...node,
+        position: { x, y: childY },
+        style: node.data?.isCollapsed
+          ? { ...node.style, width: w }
+          : { ...node.style, width: w, height: h },
+      })
+    } else {
+      positionedNodes.set(node.id, {
+        ...node,
+        position: { x, y: childY },
+      })
+    }
+    childY += h + innerVertSpacing
+  })
+}
 
 // Debug logging control - set to true to enable verbose console logging
 const DEBUG_CYCLE_LAYOUT = false
@@ -361,63 +483,14 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
       return
     }
 
-    const iters = itersByParent.get(cc.id) || []
-    const direct = directChildrenByCycle.get(cc.id) || []
-    const maxIterHeight = iters.reduce(
-      (max, it) => Math.max(max, iterSizes.get(it.id)?.height ?? 0), nodeHeight
-    )
+    const gatherOpts = { directChildrenByCycle, itersByParent, subCyclesByCycle, iterSizes, subCycleSizes, nodeWidth, nodeHeight }
+    const items = gatherCycleChildren(cc.id, gatherOpts)
+    const direction = getLayoutDirection(cc.data?.cycleType)
 
-    if (cc.data?.cycleType === 'review_cycle' || cc.data?.cycleType === 'pr_review_cycle') {
-      // All items lay out horizontally: direct event children (boundary + residuals) + iterations + sub-cycle containers.
-      const directWidths = direct.map(d => d.measured?.width ?? nodeWidth)
-      const iterWidths = iters.map(it => iterSizes.get(it.id)?.width ?? nodeWidth)
-      // Include sub-cycle containers that are direct children of this cycle container
-      const cycleSCs = subCyclesByCycle.get(cc.id) || []
-      const scWidths = cycleSCs.map(sc => subCycleSizes.get(sc.id)?.width ?? nodeWidth)
-      const allWidths = [...directWidths, ...iterWidths, ...scWidths]
-      const totalWidth = allWidths.reduce((sum, w) => sum + w, 0)
-      const spacingTotal = allWidths.length > 1 ? horizontalSpacing * (allWidths.length - 1) : 0
-      const width = cyclePadding * 2 + totalWidth + spacingTotal
-      const height = containerHeaderHeight + cyclePadding * 2 + maxIterHeight
-      cycleSizes.set(cc.id, { width: Math.max(width, 300), height: Math.max(height, 180) })
-    } else if (cc.data?.cycleType === 'repair_cycle') {
-      // Layout: [residual-col?] [tc1] [tc2] [tc3]  — horizontal
-      const numIters = iters.length
-      const iterTotalWidth = iters.reduce(
-        (sum, it) => sum + (iterSizes.get(it.id)?.width ?? 0), 0
-      )
-      const iterSpacingTotal = numIters > 1 ? horizontalSpacing * (numIters - 1) : 0
-
-      // Residual event column (direct event children outside any test cycle)
-      const directMaxW = direct.length > 0
-        ? Math.max(...direct.map(c => c.measured?.width ?? nodeWidth))
-        : 0
-      const directTotalH = direct.length > 0
-        ? direct.reduce((sum, c) => sum + (c.measured?.height ?? nodeHeight), 0) +
-          Math.max(0, direct.length - 1) * innerVertSpacing
-        : 0
-      const directColW = directMaxW > 0 ? directMaxW + horizontalSpacing : 0
-
-      const width = cyclePadding * 2 + directColW + iterTotalWidth + iterSpacingTotal
-      const height = containerHeaderHeight + cyclePadding * 2 + Math.max(maxIterHeight, directTotalH)
-      cycleSizes.set(cc.id, { width: Math.max(width, 400), height: Math.max(height, 180) })
-    } else if (
-      cc.data?.cycleType === 'conversational_loop' ||
-      cc.data?.cycleType === 'status_progression' ||
-      cc.data?.cycleType === 'agent_execution'
-    ) {
-      // Layout: vertical stack of direct event children (start + child events + end)
-      const numDirect = direct.length
-      const directTotalH = numDirect > 0
-        ? direct.reduce((sum, c) => sum + (c.measured?.height ?? nodeHeight), 0) +
-          Math.max(0, numDirect - 1) * innerVertSpacing
-        : 0
-      const directMaxW = numDirect > 0
-        ? Math.max(...direct.map(c => c.measured?.width ?? nodeWidth))
-        : nodeWidth
-      const width = cyclePadding * 2 + directMaxW
-      const height = containerHeaderHeight + cyclePadding * 2 + directTotalH
-      cycleSizes.set(cc.id, { width: Math.max(width, 300), height: Math.max(height, 180) })
+    if (direction === 'horizontal') {
+      cycleSizes.set(cc.id, sizeCycleHorizontal(items, { containerHeaderHeight, cyclePadding, horizontalSpacing }))
+    } else {
+      cycleSizes.set(cc.id, sizeCycleVertical(items, { containerHeaderHeight, cyclePadding, innerVertSpacing, nodeWidth }))
     }
   })
 
@@ -479,124 +552,17 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
   const _clT5 = performance.now() // pass 3 done
 
   // ── Pass 4: Position cycle container children ─────────────────────────────
+  // Uses the same gatherCycleChildren + direction-based dispatch as Pass 2.
   cycleContainers.forEach(cc => {
-    const iters = (itersByParent.get(cc.id) || []).sort(
-      (a, b) => (a.data?.iterationNumber ?? 0) - (b.data?.iterationNumber ?? 0)
-    )
-    const direct = (directChildrenByCycle.get(cc.id) || []).sort((a, b) => {
-      // Decision nodes store time as data.timestamp; container nodes as data.startTime.
-      const aTs = a.data?.timestamp ?? a.data?.startTime ?? 0
-      const bTs = b.data?.timestamp ?? b.data?.startTime ?? 0
-      return new Date(aTs) - new Date(bTs)
-    })
+    const gatherOpts = { directChildrenByCycle, itersByParent, subCyclesByCycle, iterSizes, subCycleSizes, nodeWidth, nodeHeight }
+    const items = gatherCycleChildren(cc.id, gatherOpts)
+    const direction = getLayoutDirection(cc.data?.cycleType)
 
-    const contentY = containerHeaderHeight + cyclePadding  // y offset inside container
-
-    if (cc.data?.cycleType === 'review_cycle' || cc.data?.cycleType === 'pr_review_cycle') {
-      const cycleSCs = subCyclesByCycle.get(cc.id) || []
-      const maxIterH = iters.reduce((max, it) => Math.max(max, iterSizes.get(it.id)?.height ?? 0), 0)
-
-      // Sort all horizontal items (direct event children + iteration containers + sub-cycle containers)
-      // chronologically.
-      const allItems = [
-        ...direct.map(d => ({
-          node: d,
-          ts: d.data?.timestamp || d.data?.startTime || '',
-          containerType: null,
-        })),
-        ...iters.map(it => ({
-          node: it,
-          ts: it.data?.startTime || '',
-          containerType: 'iter',
-        })),
-        ...cycleSCs.map(sc => ({
-          node: sc,
-          ts: sc.data?.startTime || '',
-          containerType: 'subCycle',
-        })),
-      ].sort((a, b) => new Date(a.ts) - new Date(b.ts))
-
-      let relX = cyclePadding
-      allItems.forEach(({ node, containerType }) => {
-        if (containerType === 'iter') {
-          const iterSize = iterSizes.get(node.id) || { width: nodeWidth + iterPadding * 2, height: 200 }
-          const iterY = contentY + Math.round((maxIterH - iterSize.height) / 2)
-          positionedNodes.set(node.id, {
-            ...node,
-            position: { x: relX, y: iterY },
-            style: node.data?.isCollapsed
-              ? { ...node.style, width: iterSize.width }
-              : { ...node.style, width: iterSize.width, height: iterSize.height },
-          })
-          relX += iterSize.width + horizontalSpacing
-        } else if (containerType === 'subCycle') {
-          const scSize = subCycleSizes.get(node.id) || { width: nodeWidth, height: nodeHeight }
-          positionedNodes.set(node.id, {
-            ...node,
-            position: { x: relX, y: contentY },
-            style: node.data?.isCollapsed
-              ? { ...node.style, width: scSize.width }
-              : { ...node.style, width: scSize.width, height: scSize.height },
-          })
-          relX += scSize.width + horizontalSpacing
-        } else {
-          positionedNodes.set(node.id, {
-            ...node,
-            position: { x: relX, y: contentY },
-          })
-          relX += (node.measured?.width ?? nodeWidth) + horizontalSpacing
-        }
-      })
-    } else if (cc.data?.cycleType === 'repair_cycle') {
-      let relX = cyclePadding
-      const maxIterH = iters.reduce((max, it) => Math.max(max, iterSizes.get(it.id)?.height ?? 0), 0)
-
-      // Residual event column (direct event children outside any test cycle)
-      if (direct.length > 0) {
-        const maxW = Math.max(...direct.map(c => c.measured?.width ?? nodeWidth))
-        let childY = contentY
-        direct.forEach(child => {
-          const childW = child.measured?.width ?? nodeWidth
-          const childH = child.measured?.height ?? nodeHeight
-          positionedNodes.set(child.id, {
-            ...child,
-            position: { x: relX + (maxW - childW) / 2, y: childY },
-          })
-          childY += childH + innerVertSpacing
-        })
-        relX += maxW + horizontalSpacing
-      }
-
-      // Iteration containers — vertically centered within the tallest iteration's space
-      iters.forEach(iter => {
-        const iterSize = iterSizes.get(iter.id) || { width: nodeWidth + iterPadding * 2, height: 200 }
-        const iterY = contentY + Math.round((maxIterH - iterSize.height) / 2)
-        positionedNodes.set(iter.id, {
-          ...iter,
-          position: { x: relX, y: iterY },
-          style: iter.data?.isCollapsed
-            ? { ...iter.style, width: iterSize.width }
-            : { ...iter.style, width: iterSize.width, height: iterSize.height },
-        })
-        relX += iterSize.width + horizontalSpacing
-      })
-    } else if (
-      cc.data?.cycleType === 'conversational_loop' ||
-      cc.data?.cycleType === 'status_progression' ||
-      cc.data?.cycleType === 'agent_execution'
-    ) {
-      // Vertical stack of all direct event children (start + child events + end)
+    if (direction === 'horizontal') {
+      positionCycleHorizontal(items, { cyclePadding, containerHeaderHeight, horizontalSpacing }, positionedNodes)
+    } else {
       const ccSize = cycleSizes.get(cc.id) || { width: 300 }
-      let childY = contentY
-      direct.forEach(child => {
-        const childW = child.measured?.width ?? nodeWidth
-        const childH = child.measured?.height ?? nodeHeight
-        positionedNodes.set(child.id, {
-          ...child,
-          position: { x: (ccSize.width - childW) / 2, y: childY },
-        })
-        childY += childH + innerVertSpacing
-      })
+      positionCycleVertical(items, ccSize.width, { cyclePadding, containerHeaderHeight, innerVertSpacing }, positionedNodes)
     }
   })
 

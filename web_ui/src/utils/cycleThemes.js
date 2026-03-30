@@ -24,6 +24,7 @@ import {
 export const CYCLE_THEME_MAP = {
   // ── Level 1 ───────────────────────────────────────────────────────────────
   review_cycle: {
+    layoutDirection:          'horizontal',
     borderColor:              '#9333ea',
     borderStyle:              'solid',
     bgColor:                  'rgba(147, 51, 234, 0.14)',
@@ -38,6 +39,7 @@ export const CYCLE_THEME_MAP = {
     renderCollapsedSummary:   renderReviewCycleSummary,
   },
   repair_cycle: {
+    layoutDirection:          'horizontal',
     borderColor:              '#d97706',
     borderStyle:              'solid',
     bgColor:                  'rgba(217, 119, 6, 0.14)',
@@ -52,6 +54,7 @@ export const CYCLE_THEME_MAP = {
     renderCollapsedSummary:   renderRepairCycleSummary,
   },
   pr_review_cycle: {
+    layoutDirection:          'horizontal',
     borderColor:              '#0ea5e9',
     borderStyle:              'solid',
     bgColor:                  'rgba(14,165,233,0.12)',
@@ -66,6 +69,7 @@ export const CYCLE_THEME_MAP = {
     renderCollapsedSummary:   renderPRReviewCycleSummary,
   },
   conversational_loop: {
+    layoutDirection:          'vertical',
     borderColor:              '#ec4899',
     borderStyle:              'solid',
     bgColor:                  'rgba(236,72,153,0.12)',
@@ -81,6 +85,7 @@ export const CYCLE_THEME_MAP = {
   },
 
   status_progression: {
+    layoutDirection:          'vertical',
     borderColor:              '#22c55e',
     borderStyle:              'solid',
     bgColor:                  'rgba(34,197,94,0.10)',
@@ -96,6 +101,7 @@ export const CYCLE_THEME_MAP = {
   },
 
   agent_execution: {
+    layoutDirection:          'vertical',
     borderColor:              '#58a6ff',
     borderStyle:              'solid',
     bgColor:                  'rgba(88,166,255,0.10)',
@@ -112,6 +118,7 @@ export const CYCLE_THEME_MAP = {
 
   // ── Level 2 ───────────────────────────────────────────────────────────────
   review_iteration: {
+    layoutDirection:          'vertical',
     borderColor:              '#9333ea',
     borderStyle:              'solid',
     bgColor:                  'rgba(147,51,234,0.06)',
@@ -126,6 +133,7 @@ export const CYCLE_THEME_MAP = {
     renderCollapsedSummary:   renderReviewIterationSummary,
   },
   repair_test_cycle: {
+    layoutDirection:          'vertical',
     borderColor:              '#d97706',
     borderStyle:              'solid',
     bgColor:                  'rgba(217,119,6,0.06)',
@@ -140,6 +148,7 @@ export const CYCLE_THEME_MAP = {
     renderCollapsedSummary:   renderRepairTestCycleSummary,
   },
   pr_review_phase: {
+    layoutDirection:          'vertical',
     borderColor:              '#0ea5e9',
     borderStyle:              'solid',
     bgColor:                  'rgba(14,165,233,0.06)',
@@ -156,6 +165,7 @@ export const CYCLE_THEME_MAP = {
 
   // ── Level 3 ───────────────────────────────────────────────────────────────
   test_execution: {
+    layoutDirection:          'vertical',
     borderColor:              '#10b981',
     borderStyle:              'solid',
     bgColor:                  'rgba(16,185,129,0.06)',
@@ -170,6 +180,7 @@ export const CYCLE_THEME_MAP = {
     renderCollapsedSummary:   renderTestExecutionSummary,
   },
   fix_cycle: {
+    layoutDirection:          'vertical',
     borderColor:              '#d97706',
     borderStyle:              'solid',
     bgColor:                  'rgba(217,119,6,0.06)',
@@ -184,6 +195,7 @@ export const CYCLE_THEME_MAP = {
     renderCollapsedSummary:   renderFixCycleSummary,
   },
   warning_review: {
+    layoutDirection:          'vertical',
     borderColor:              '#f59e0b',
     borderStyle:              'solid',
     bgColor:                  'rgba(245,158,11,0.06)',
@@ -198,6 +210,7 @@ export const CYCLE_THEME_MAP = {
     renderCollapsedSummary:   renderWarningReviewSummary,
   },
   systemic_analysis: {
+    layoutDirection:          'vertical',
     borderColor:              '#8b5cf6',
     borderStyle:              'solid',
     bgColor:                  'rgba(139,92,246,0.06)',
@@ -212,6 +225,7 @@ export const CYCLE_THEME_MAP = {
     renderCollapsedSummary:   renderSystemicAnalysisSummary,
   },
   systemic_fix: {
+    layoutDirection:          'vertical',
     borderColor:              '#a78bfa',
     borderStyle:              'solid',
     bgColor:                  'rgba(167,139,250,0.06)',
