@@ -73,6 +73,7 @@ class HumanFeedbackLoopExecutor:
         self.active_loops = {}  # Track active loops by (project_name, issue_number) tuple
         self._initialized = False
         self._stop_events: Dict[str, threading.Event] = {}  # Active stop signals keyed by "project:issue"
+        self._stop_reasons: Dict[str, str] = {}  # Why each stop was requested — "column_changed" preserves the pipeline run
 
     @staticmethod
     def _loop_key(project_name: str, issue_number: int) -> tuple:
@@ -283,13 +284,20 @@ class HumanFeedbackLoopExecutor:
             )
             return False
 
-    def request_stop(self, project_name: str, issue_number: int) -> bool:
-        """Signal an active feedback loop to stop. Thread-safe."""
+    def request_stop(self, project_name: str, issue_number: int, reason: str = "stop_requested") -> bool:
+        """Signal an active feedback loop to stop. Thread-safe.
+
+        Args:
+            reason: Why the loop is being stopped. Use "column_changed" when the issue has
+                    moved to another column so the pipeline run is preserved for the next
+                    column's loop. Any other value (default "stop_requested") will end the run.
+        """
         stop_key = f"{project_name}:{issue_number}"
         event = self._stop_events.get(stop_key)
         if event:
+            self._stop_reasons[stop_key] = reason
             event.set()
-            logger.info(f"Sent stop signal to feedback loop for {project_name}#{issue_number}")
+            logger.info(f"Sent stop signal to feedback loop for {project_name}#{issue_number} (reason={reason})")
             return True
         logger.debug(
             f"No active stop event for {project_name}#{issue_number} "
@@ -635,9 +643,10 @@ class HumanFeedbackLoopExecutor:
 
         # Check if stop was requested during initial feedback processing
         if stop_event.is_set():
+            _exit_reason = self._stop_reasons.pop(stop_key, "stop_requested")
             logger.info(
-                f"Stop signal received for issue #{state.issue_number} during initial processing. "
-                f"Exiting feedback loop."
+                f"Stop signal received for issue #{state.issue_number} during initial processing "
+                f"(reason={_exit_reason}). Exiting feedback loop."
             )
             try:
                 decision_events.emit_feedback_listening_stopped(
@@ -652,7 +661,6 @@ class HumanFeedbackLoopExecutor:
             except Exception as e:
                 logger.warning(f"Failed to emit feedback_listening_stopped event: {e}")
             _loop_exited_normally = True
-            _exit_reason = "stop_requested"
             return (None, True)
 
         try:
@@ -660,9 +668,10 @@ class HumanFeedbackLoopExecutor:
                 # Sleep with 1-second granularity so stop signals are detected quickly
                 for _ in range(poll_interval):
                     if stop_event.is_set():
+                        _exit_reason = self._stop_reasons.pop(stop_key, "stop_requested")
                         logger.info(
-                            f"Stop signal received for issue #{state.issue_number}. "
-                            f"Exiting feedback loop."
+                            f"Stop signal received for issue #{state.issue_number} "
+                            f"(reason={_exit_reason}). Exiting feedback loop."
                         )
                         try:
                             decision_events.emit_feedback_listening_stopped(
@@ -677,7 +686,6 @@ class HumanFeedbackLoopExecutor:
                         except Exception as e:
                             logger.warning(f"Failed to emit feedback_listening_stopped event: {e}")
                         _loop_exited_normally = True
-                        _exit_reason = "stop_requested"
                         return (None, True)
                     await asyncio.sleep(1)
 
@@ -822,6 +830,7 @@ class HumanFeedbackLoopExecutor:
                     logger.warning(f"Could not check current column for issue #{state.issue_number}: {e}")
         finally:
             self._stop_events.pop(stop_key, None)
+            self._stop_reasons.pop(stop_key, None)
             # Also remove from active_loops so has_active_execution returns False after loop exits
             lk = self._loop_key(state.project_name, state.issue_number)
             if lk in self.active_loops:
