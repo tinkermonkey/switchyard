@@ -642,9 +642,11 @@ export function renderSystemicFixSummary(data, isDark) {
 // ── Agent execution renderer ──────────────────────────────────────────────────
 
 export function renderAgentExecutionSummary(data, isDark) {
-  const { status, isActive, durationMs, inputTokens, outputTokens, tools, iterationCount } = data
+  const summary = data.summary ?? {}
+  const { status, durationMs, inputTokens, outputTokens, tools } = summary
+  const { containsActiveAgent, iterationCount } = data
 
-  const effectiveStatus = isActive || status === 'running' ? 'running' : (status ?? 'completed')
+  const effectiveStatus = containsActiveAgent || status === 'running' ? 'running' : (status ?? 'completed')
 
   const statusColor =
     effectiveStatus === 'running'     ? (isDark ? '#58a6ff' : '#0969da') :

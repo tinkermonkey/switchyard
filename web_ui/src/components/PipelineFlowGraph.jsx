@@ -175,15 +175,15 @@ export default function PipelineFlowGraph({
   const buildRawFlowchart = useCallback(() => {
     if (!graphEvents || !graphEvents.length || !selectedPipelineRun) return null
 
-    // Derive activeTaskIds from the zombie-aware agentExecutions map so that
-    // interrupted (zombie) agents are excluded. The raw scan of agent_initialized
-    // without agent_completed would incorrectly include zombies from orchestrator restarts.
-    const { agentExecutions: execMap } = processEvents(graphEvents)
+    // Derive activeTaskIds from agentExecutionBoundaries — boundaries without
+    // an endEvent (or with an inferred endEvent) indicate a still-running agent.
+    const { agentExecutionBoundaries } = processEvents(graphEvents)
     const activeTaskIds = new Set()
-    execMap.forEach(executions => {
-      executions.forEach(exec => {
-        if (exec.status === 'running') activeTaskIds.add(exec.taskId)
-      })
+    agentExecutionBoundaries.forEach(b => {
+      if (!b.endEvent || b.endEvent._inferred) {
+        const taskId = b.startEvent?.task_id
+        if (taskId) activeTaskIds.add(taskId)
+      }
     })
 
     return buildFlowchartUtil({
@@ -223,10 +223,11 @@ export default function PipelineFlowGraph({
 
     // Determine which containers are on the active-agent path.
     const activeTaskIds = new Set()
-    model.agentExecutions.forEach(executions => {
-      executions.forEach(exec => {
-        if (exec.status === 'running') activeTaskIds.add(exec.taskId)
-      })
+    model.agentExecutionBoundaries.forEach(b => {
+      if (!b.endEvent || b.endEvent._inferred) {
+        const taskId = b.startEvent?.task_id
+        if (taskId) activeTaskIds.add(taskId)
+      }
     })
     const activeContainerIds = findActiveContainerPath(model, activeTaskIds)
     const prevAutoOpened = prevAutoOpenedRef.current

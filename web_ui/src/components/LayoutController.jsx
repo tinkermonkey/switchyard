@@ -10,7 +10,7 @@ import { applyCycleLayout, updateEdgesForCycles } from '../utils/cycleLayout'
  *   Phase 2 (here):   reads node.measured dimensions → runs applyCycleLayout → sets final nodes
  *
  * Props:
- *   rawBuild        { nodes, edges, agentExecutions, updatedCycles } from buildFlowchart
+ *   rawBuild        { nodes, edges, updatedCycles } from buildFlowchart
  *   layoutOptions   params object passed to applyCycleLayout
  *   finalizeNodes   (layoutedNodes) => finalNodes  — caller injects draggable/callbacks
  *   setNodes        from useNodesState
@@ -80,7 +80,7 @@ export default function LayoutController({
     // Active-node tracking is never suppressed — we always want to follow the running
     // agent even when the user has manually opened other containers.
     if (align === 'active-node') {
-      const activeNode = nodes.find(n => n.data?.isActive)
+      const activeNode = nodes.find(n => n.data?.isActive || n.data?.containsActiveAgent)
       if (activeNode) {
         fitView({ nodes: [{ id: activeNode.id }], padding: 0.5, maxZoom: 1, duration })
         return
@@ -188,7 +188,7 @@ export default function LayoutController({
     const _rlT2 = performance.now()
     const finalNodes = finalizeNodesRef.current(layoutedNodes)
     const _rlT3 = performance.now()
-    const finalEdges = updateEdgesForCycles(rb.edges, rb.updatedCycles, rb.agentExecutions)
+    const finalEdges = updateEdgesForCycles(rb.edges, rb.updatedCycles)
     const _rlT4 = performance.now()
 
     setNodes(finalNodes)
@@ -232,7 +232,7 @@ export default function LayoutController({
   // [structuralVersion] effect above having already set it to false for structural changes.
   useEffect(() => {
     if (!rawBuild || !layoutDone.current) return
-    const finalEdges = updateEdgesForCycles(rawBuild.edges, rawBuild.updatedCycles, rawBuild.agentExecutions)
+    const finalEdges = updateEdgesForCycles(rawBuild.edges, rawBuild.updatedCycles)
     setEdges(finalEdges)
   }, [rawBuild, setEdges])
 

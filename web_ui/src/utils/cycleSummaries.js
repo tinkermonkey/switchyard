@@ -296,3 +296,31 @@ export function extractConversationalLoopSummary(cycle) {
     return { status: 'running', exchangeCount: 0, durationSeconds: null, agentName: null, pausedReason: null }
   }
 }
+
+export function extractAgentExecutionSummary(boundary, claudeSummaries = null) {
+  try {
+    const { startEvent, endEvent } = boundary
+    const taskId = startEvent?.task_id
+    const claudeData = claudeSummaries?.get(taskId) ?? null
+
+    const status = endEvent && !endEvent._inferred
+      ? (endEvent.event_type === 'agent_completed' ? 'completed' : 'failed')
+      : 'running'
+
+    let durationMs = null
+    if (startEvent?.timestamp && endEvent?.timestamp && !endEvent._inferred) {
+      const diff = new Date(endEvent.timestamp) - new Date(startEvent.timestamp)
+      if (!isNaN(diff) && diff > 0) durationMs = diff
+    }
+
+    return {
+      status,
+      durationMs,
+      inputTokens: claudeData?.inputTokens ?? null,
+      outputTokens: claudeData?.outputTokens ?? null,
+      tools: claudeData?.tools ?? null,
+    }
+  } catch {
+    return { status: 'running', durationMs: null, inputTokens: null, outputTokens: null, tools: null }
+  }
+}

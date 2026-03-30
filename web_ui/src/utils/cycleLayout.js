@@ -2,7 +2,7 @@
  * Custom layout algorithm for pipeline runs.
  *
  * Positions nodes using a 3–4 level hierarchy:
- *   Root level  → reviewCycleContainer / repairCycleContainer / standalone event nodes
+ *   Root level  → subCycleContainer (all cycle types) / standalone event nodes
  *   Level 2     → iterationContainer nodes (children of cycle containers)
  *   Level 3     → event grandchildren inside iteration containers; subCycleContainer (repair cycles)
  *   Level 4     → event leaves inside subCycleContainers (repair cycles only)
@@ -20,12 +20,6 @@
  * when the event nodes were given granular per-event-type strings.
  */
 const CONTAINER_TYPES = new Set([
-  'reviewCycleContainer',
-  'repairCycleContainer',
-  'prReviewCycleContainer',
-  'conversationalLoopContainer',
-  'statusProgressionContainer',
-  'agentExecutionContainer',
   'iterationContainer',
   'subCycleContainer',
   'cycleBounding',
@@ -148,7 +142,7 @@ function groupIterationColumns(subCycles, directChildren, subCycleSizes, opts) {
 
 /**
  * Positions pipeline nodes using a 3–4 level layout hierarchy:
- *   Root level  → reviewCycleContainer / repairCycleContainer / standalone event nodes
+ *   Root level  → subCycleContainer (all cycle types) / standalone event nodes
  *   Level 2     → iterationContainer nodes (children of cycle containers)
  *   Level 3     → event grandchildren inside iteration containers; subCycleContainer (repair cycles)
  *   Level 4     → event leaves inside subCycleContainers (repair cycles only)
@@ -180,29 +174,18 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
   const _clT0 = performance.now()
 
   // Categorise nodes by type and parent relationship
+  // All cycle types use subCycleContainer — root-level ones (no parentId) are top-level cycle containers.
   const cycleContainers = nodes.filter(
-    n => (
-      n.type === 'reviewCycleContainer' ||
-      n.type === 'repairCycleContainer' ||
-      n.type === 'prReviewCycleContainer' ||
-      n.type === 'conversationalLoopContainer' ||
-      n.type === 'statusProgressionContainer' ||
-      n.type === 'agentExecutionContainer'
-    ) && !n.parentId
+    n => n.type === 'subCycleContainer' && !n.parentId
   )
   const iterContainers = nodes.filter(n => n.type === 'iterationContainer')
-  const subCycleContainers = nodes.filter(n => n.type === 'subCycleContainer')
-  // Nested agent execution containers (with parentId) — treated like subCycleContainers
-  // for layout purposes. Root-level ones (no parentId) are already in cycleContainers.
-  const nestedAgentExecContainers = nodes.filter(
-    n => n.type === 'agentExecutionContainer' && n.parentId
-  )
+  // Nested sub-cycle containers (with parentId) — excludes root-level ones already in cycleContainers
+  const subCycleContainers = nodes.filter(n => n.type === 'subCycleContainer' && n.parentId)
 
   // Build ID sets for O(1) parent lookups instead of O(n) .some() scans
   const iterContainerIds = new Set(iterContainers.map(n => n.id))
   const cycleContainerIds = new Set(cycleContainers.map(n => n.id))
   const subCycleContainerIds = new Set(subCycleContainers.map(n => n.id))
-  const nestedAgentExecIds = new Set(nestedAgentExecContainers.map(n => n.id))
 
   // All leaf event children (used in the final output collection)
   const allGrandchildren = nodes.filter(n => n.parentId && !CONTAINER_TYPES.has(n.type) &&
@@ -211,15 +194,12 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
     cycleContainerIds.has(n.parentId))
   const allSubCycleLeaves = nodes.filter(n => n.parentId && !CONTAINER_TYPES.has(n.type) &&
     subCycleContainerIds.has(n.parentId))
-  const allAgentExecLeaves = nodes.filter(n => n.parentId && !CONTAINER_TYPES.has(n.type) &&
-    nestedAgentExecIds.has(n.parentId))
 
   // Visible-only subsets — hidden nodes are excluded from sizing and positioning
   // so containers are correctly sized around what is actually rendered.
   const grandchildren = allGrandchildren.filter(n => !n.hidden)
   const directCycleChildren = allDirectCycleChildren.filter(n => !n.hidden)
   const subCycleLeaves = allSubCycleLeaves.filter(n => !n.hidden)
-  const agentExecLeaves = allAgentExecLeaves.filter(n => !n.hidden)
 
   // Build lookup maps
   const itersByParent = new Map()   // cycleId → [iterationContainer]
@@ -237,6 +217,7 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
   })
 
   const subCyclesByIter = new Map()  // iterId → [outer subCycleContainer]
+  const subCyclesByCycle = new Map()  // cycleId → [subCycleContainer] (direct children of cycle containers)
   const nestedSubCyclesByParentSc = new Map()  // outerScId → [inner subCycleContainer]
   subCycleContainers.forEach(sc => {
     const pid = sc.parentId
@@ -248,6 +229,10 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
       // Inner SC: parent is another subCycleContainer
       if (!nestedSubCyclesByParentSc.has(pid)) nestedSubCyclesByParentSc.set(pid, [])
       nestedSubCyclesByParentSc.get(pid).push(sc)
+    } else if (cycleContainerIds.has(pid)) {
+      // SC directly inside a cycle container (e.g., agent execution inside review cycle)
+      if (!subCyclesByCycle.has(pid)) subCyclesByCycle.set(pid, [])
+      subCyclesByCycle.get(pid).push(sc)
     }
   })
 
@@ -258,21 +243,6 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
     leavesBySubCycle.get(pid).push(leaf)
   })
 
-  // Nested agent execution containers: group by parent (iteration, cycle, or sub-cycle)
-  const agentExecByParent = new Map()  // parentId → [agentExecutionContainer]
-  nestedAgentExecContainers.forEach(ae => {
-    const pid = ae.parentId
-    if (!agentExecByParent.has(pid)) agentExecByParent.set(pid, [])
-    agentExecByParent.get(pid).push(ae)
-  })
-
-  const leavesByAgentExec = new Map()  // agentExecId → [pipelineEvent]
-  agentExecLeaves.forEach(leaf => {
-    const pid = leaf.parentId
-    if (!leavesByAgentExec.has(pid)) leavesByAgentExec.set(pid, [])
-    leavesByAgentExec.get(pid).push(leaf)
-  })
-
   const directChildrenByCycle = new Map()  // cycleId → [pipelineEvent]
   directCycleChildren.forEach(child => {
     const pid = child.parentId
@@ -280,10 +250,10 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
     directChildrenByCycle.get(pid).push(child)
   })
 
-  // Identify iterationContainers that are children of repairCycleContainers
+  // Identify iterationContainers that are children of repair cycle containers
   // (these are test-cycle containers whose sub-cycles should use column layout)
   const repairCycleIds = new Set(
-    cycleContainers.filter(cc => cc.type === 'repairCycleContainer').map(cc => cc.id)
+    cycleContainers.filter(cc => cc.data?.cycleType === 'repair_cycle').map(cc => cc.id)
   )
   const repairTestCycleIds = new Set(
     iterContainers.filter(ic => repairCycleIds.has(ic.parentId)).map(ic => ic.id)
@@ -291,30 +261,10 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
 
   const _clT1 = performance.now() // categorise + lookup maps done
 
-  // ── Pass 0a: Size nested agent execution containers ──────────────────────
-  // Sized BEFORE sub-cycle containers because AE containers can be children of
-  // sub-cycles, and sub-cycle sizing needs AE dimensions.
   const COLLAPSED_WIDTH = COLLAPSED_CYCLE_WIDTH
   const COLLAPSED_HEIGHT = COLLAPSED_CYCLE_HEIGHT
-  const agentExecSizes = new Map()
-  nestedAgentExecContainers.forEach(ae => {
-    if (ae.data?.isCollapsed) {
-      agentExecSizes.set(ae.id, {
-        width: ae.measured?.width > 1 ? ae.measured.width : COLLAPSED_WIDTH,
-        height: ae.measured?.height > 1 ? ae.measured.height : COLLAPSED_HEIGHT,
-      })
-      return
-    }
-    const leaves = leavesByAgentExec.get(ae.id) || []
-    const n = leaves.length
-    const totalH = leaves.reduce((sum, l) => sum + (l.measured?.height ?? nodeHeight), 0)
-    const maxW = n > 0 ? Math.max(...leaves.map(l => l.measured?.width ?? nodeWidth)) : nodeWidth
-    const height = containerHeaderHeight + cyclePadding * 2 + totalH + Math.max(0, n - 1) * innerVertSpacing
-    const width = maxW + cyclePadding * 2
-    agentExecSizes.set(ae.id, { width: Math.max(width, 280), height: Math.max(height, 100) })
-  })
 
-  // ── Pass 0b: Size subCycleContainers (bottom-up: inner SCs before outer) ──
+  // ── Pass 0: Size subCycleContainers (bottom-up: inner SCs before outer) ──
   // Inner SCs (parentId is another SC) are sized first so outer SCs can include
   // their dimensions when computing their own height/width.
   const subCycleSizes = new Map()
@@ -333,15 +283,10 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
     }
     const leaves = leavesBySubCycle.get(sc.id) || []
     const nestedSCs = nestedSubCyclesByParentSc.get(sc.id) || []
-    const scAgentExecs = agentExecByParent.get(sc.id) || []
     const allItems = [
       ...leaves.map(l => ({ h: l.measured?.height ?? nodeHeight, w: l.measured?.width ?? nodeWidth })),
       ...nestedSCs.map(nsc => {
         const sz = subCycleSizes.get(nsc.id) || { width: nodeWidth, height: nodeHeight }
-        return { h: sz.height, w: sz.width }
-      }),
-      ...scAgentExecs.map(ae => {
-        const sz = agentExecSizes.get(ae.id) || { width: 280, height: 100 }
         return { h: sz.height, w: sz.width }
       }),
     ]
@@ -386,16 +331,11 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
       }
     }
 
-    // Default: vertical stack sizing — includes direct children, sub-cycles, and agent exec containers
-    const agentExecs = agentExecByParent.get(iter.id) || []
+    // Default: vertical stack sizing — includes direct children and sub-cycles
     const allChildren = [
       ...directChildren.map(c => ({ w: c.measured?.width ?? nodeWidth, h: c.measured?.height ?? nodeHeight })),
       ...subCycles.map(sc => {
         const sz = subCycleSizes.get(sc.id) || { width: nodeWidth, height: nodeHeight }
-        return { w: sz.width, h: sz.height }
-      }),
-      ...agentExecs.map(ae => {
-        const sz = agentExecSizes.get(ae.id) || { width: 280, height: 100 }
         return { w: sz.width, h: sz.height }
       }),
     ]
@@ -423,24 +363,24 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
 
     const iters = itersByParent.get(cc.id) || []
     const direct = directChildrenByCycle.get(cc.id) || []
-    const cycleAgentExecs = agentExecByParent.get(cc.id) || []
     const maxIterHeight = iters.reduce(
       (max, it) => Math.max(max, iterSizes.get(it.id)?.height ?? 0), nodeHeight
     )
 
-    if (cc.type === 'reviewCycleContainer' || cc.type === 'prReviewCycleContainer') {
-      // All items lay out horizontally: direct event children (boundary + residuals) + iterations.
-      // Sum all widths regardless of order (total width doesn't depend on arrangement).
+    if (cc.data?.cycleType === 'review_cycle' || cc.data?.cycleType === 'pr_review_cycle') {
+      // All items lay out horizontally: direct event children (boundary + residuals) + iterations + sub-cycle containers.
       const directWidths = direct.map(d => d.measured?.width ?? nodeWidth)
       const iterWidths = iters.map(it => iterSizes.get(it.id)?.width ?? nodeWidth)
-      const aeWidths = cycleAgentExecs.map(ae => agentExecSizes.get(ae.id)?.width ?? 280)
-      const allWidths = [...directWidths, ...iterWidths, ...aeWidths]
+      // Include sub-cycle containers that are direct children of this cycle container
+      const cycleSCs = subCyclesByCycle.get(cc.id) || []
+      const scWidths = cycleSCs.map(sc => subCycleSizes.get(sc.id)?.width ?? nodeWidth)
+      const allWidths = [...directWidths, ...iterWidths, ...scWidths]
       const totalWidth = allWidths.reduce((sum, w) => sum + w, 0)
       const spacingTotal = allWidths.length > 1 ? horizontalSpacing * (allWidths.length - 1) : 0
       const width = cyclePadding * 2 + totalWidth + spacingTotal
       const height = containerHeaderHeight + cyclePadding * 2 + maxIterHeight
       cycleSizes.set(cc.id, { width: Math.max(width, 300), height: Math.max(height, 180) })
-    } else if (cc.type === 'repairCycleContainer') {
+    } else if (cc.data?.cycleType === 'repair_cycle') {
       // Layout: [residual-col?] [tc1] [tc2] [tc3]  — horizontal
       const numIters = iters.length
       const iterTotalWidth = iters.reduce(
@@ -462,9 +402,9 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
       const height = containerHeaderHeight + cyclePadding * 2 + Math.max(maxIterHeight, directTotalH)
       cycleSizes.set(cc.id, { width: Math.max(width, 400), height: Math.max(height, 180) })
     } else if (
-      cc.type === 'conversationalLoopContainer' ||
-      cc.type === 'statusProgressionContainer' ||
-      cc.type === 'agentExecutionContainer'
+      cc.data?.cycleType === 'conversational_loop' ||
+      cc.data?.cycleType === 'status_progression' ||
+      cc.data?.cycleType === 'agent_execution'
     ) {
       // Layout: vertical stack of direct event children (start + child events + end)
       const numDirect = direct.length
@@ -491,12 +431,7 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
   // Process all root-level nodes (no parentId) in array order, which is chronological
   const rootLayoutNodes = nodes.filter(n => !n.parentId)
   const isRootCycleType = (type) =>
-    type === 'reviewCycleContainer' ||
-    type === 'repairCycleContainer' ||
-    type === 'prReviewCycleContainer' ||
-    type === 'conversationalLoopContainer' ||
-    type === 'statusProgressionContainer' ||
-    type === 'agentExecutionContainer'
+    type === 'subCycleContainer'
   const isRootContainerType = (type) =>
     isRootCycleType(type) || type === 'iterationContainer'
 
@@ -549,7 +484,7 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
       (a, b) => (a.data?.iterationNumber ?? 0) - (b.data?.iterationNumber ?? 0)
     )
     const direct = (directChildrenByCycle.get(cc.id) || []).sort((a, b) => {
-      // Decision nodes store time as data.timestamp; agentExecution nodes as data.startTime.
+      // Decision nodes store time as data.timestamp; container nodes as data.startTime.
       const aTs = a.data?.timestamp ?? a.data?.startTime ?? 0
       const bTs = b.data?.timestamp ?? b.data?.startTime ?? 0
       return new Date(aTs) - new Date(bTs)
@@ -557,13 +492,12 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
 
     const contentY = containerHeaderHeight + cyclePadding  // y offset inside container
 
-    if (cc.type === 'reviewCycleContainer' || cc.type === 'prReviewCycleContainer') {
-      const ccAgentExecs = agentExecByParent.get(cc.id) || []
+    if (cc.data?.cycleType === 'review_cycle' || cc.data?.cycleType === 'pr_review_cycle') {
+      const cycleSCs = subCyclesByCycle.get(cc.id) || []
       const maxIterH = iters.reduce((max, it) => Math.max(max, iterSizes.get(it.id)?.height ?? 0), 0)
 
-      // Sort all horizontal items (direct event children + iteration containers + agent exec containers)
-      // chronologically. This handles residual events (which may appear between the start event
-      // and the first iteration, or between iterations) without hardcoding start/end positions.
+      // Sort all horizontal items (direct event children + iteration containers + sub-cycle containers)
+      // chronologically.
       const allItems = [
         ...direct.map(d => ({
           node: d,
@@ -575,10 +509,10 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
           ts: it.data?.startTime || '',
           containerType: 'iter',
         })),
-        ...ccAgentExecs.map(ae => ({
-          node: ae,
-          ts: ae.data?.startTime || '',
-          containerType: 'agentExec',
+        ...cycleSCs.map(sc => ({
+          node: sc,
+          ts: sc.data?.startTime || '',
+          containerType: 'subCycle',
         })),
       ].sort((a, b) => new Date(a.ts) - new Date(b.ts))
 
@@ -595,17 +529,16 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
               : { ...node.style, width: iterSize.width, height: iterSize.height },
           })
           relX += iterSize.width + horizontalSpacing
-        } else if (containerType === 'agentExec') {
-          const aeSize = agentExecSizes.get(node.id) || { width: 280, height: 100 }
-          const aeStyle = node.data?.isCollapsed
-            ? { ...node.style, width: aeSize.width }
-            : { ...node.style, width: aeSize.width, height: aeSize.height }
+        } else if (containerType === 'subCycle') {
+          const scSize = subCycleSizes.get(node.id) || { width: nodeWidth, height: nodeHeight }
           positionedNodes.set(node.id, {
             ...node,
             position: { x: relX, y: contentY },
-            style: aeStyle,
+            style: node.data?.isCollapsed
+              ? { ...node.style, width: scSize.width }
+              : { ...node.style, width: scSize.width, height: scSize.height },
           })
-          relX += aeSize.width + horizontalSpacing
+          relX += scSize.width + horizontalSpacing
         } else {
           positionedNodes.set(node.id, {
             ...node,
@@ -614,7 +547,7 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
           relX += (node.measured?.width ?? nodeWidth) + horizontalSpacing
         }
       })
-    } else if (cc.type === 'repairCycleContainer') {
+    } else if (cc.data?.cycleType === 'repair_cycle') {
       let relX = cyclePadding
       const maxIterH = iters.reduce((max, it) => Math.max(max, iterSizes.get(it.id)?.height ?? 0), 0)
 
@@ -648,9 +581,9 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
         relX += iterSize.width + horizontalSpacing
       })
     } else if (
-      cc.type === 'conversationalLoopContainer' ||
-      cc.type === 'statusProgressionContainer' ||
-      cc.type === 'agentExecutionContainer'
+      cc.data?.cycleType === 'conversational_loop' ||
+      cc.data?.cycleType === 'status_progression' ||
+      cc.data?.cycleType === 'agent_execution'
     ) {
       // Vertical stack of all direct event children (start + child events + end)
       const ccSize = cycleSizes.get(cc.id) || { width: 300 }
@@ -711,22 +644,17 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
     // Default: vertical stack layout
     const directChildren = childrenByIter.get(iter.id) || []
     const subCycles = subCyclesByIter.get(iter.id) || []
-    const iterAgentExecs = agentExecByParent.get(iter.id) || []
 
-    // Sort all children chronologically (events, sub-cycles, and agent exec containers)
+    // Sort all children chronologically (events and sub-cycles)
     const allChildren = [
       ...directChildren.map(c => ({ node: c, ts: c.data?.timestamp || c.data?.startTime || '' })),
-      ...subCycles.map(sc => ({ node: sc, ts: sc.data?.startEvent?.timestamp || '' })),
-      ...iterAgentExecs.map(ae => ({ node: ae, ts: ae.data?.startTime || '' })),
+      ...subCycles.map(sc => ({ node: sc, ts: sc.data?.startEvent?.timestamp || sc.data?.startTime || '' })),
     ].sort((a, b) => new Date(a.ts) - new Date(b.ts))
 
     let childY = iterHeaderHeight + iterPadding
     allChildren.forEach(({ node }) => {
-      if (node.type === 'subCycleContainer' || node.type === 'agentExecutionContainer') {
-        const sz = (node.type === 'subCycleContainer'
-          ? subCycleSizes.get(node.id)
-          : agentExecSizes.get(node.id)
-        ) || { width: nodeWidth, height: nodeHeight }
+      if (node.type === 'subCycleContainer') {
+        const sz = subCycleSizes.get(node.id) || { width: nodeWidth, height: nodeHeight }
         const centeredX = (iterSize.width - sz.width) / 2
         positionedNodes.set(node.id, {
           ...node,
@@ -757,7 +685,6 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
   subCycleContainers.forEach(sc => {
     const leaves = leavesBySubCycle.get(sc.id) || []
     const nestedSCs = nestedSubCyclesByParentSc.get(sc.id) || []
-    const scAgentExecs = agentExecByParent.get(sc.id) || []
     const scSize = subCycleSizes.get(sc.id) || { width: nodeWidth + cyclePadding * 2 }
 
     const allItems = [
@@ -768,13 +695,8 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
       })),
       ...nestedSCs.map(nsc => ({
         node: nsc,
-        ts: nsc.data?.startEvent?.timestamp || '',
+        ts: nsc.data?.startEvent?.timestamp || nsc.data?.startTime || '',
         containerType: 'subCycle',
-      })),
-      ...scAgentExecs.map(ae => ({
-        node: ae,
-        ts: ae.data?.startTime || '',
-        containerType: 'agentExec',
       })),
     ].sort((a, b) => new Date(a.ts) - new Date(b.ts))
 
@@ -782,16 +704,6 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
     allItems.forEach(({ node, containerType }) => {
       if (containerType === 'subCycle') {
         const sz = subCycleSizes.get(node.id) || { width: nodeWidth, height: nodeHeight }
-        positionedNodes.set(node.id, {
-          ...node,
-          position: { x: (scSize.width - sz.width) / 2, y: childY },
-          style: node.data?.isCollapsed
-            ? { ...node.style, width: sz.width }
-            : { ...node.style, width: sz.width, height: sz.height },
-        })
-        childY += sz.height + innerVertSpacing
-      } else if (containerType === 'agentExec') {
-        const sz = agentExecSizes.get(node.id) || { width: 280, height: 100 }
         positionedNodes.set(node.id, {
           ...node,
           position: { x: (scSize.width - sz.width) / 2, y: childY },
@@ -813,29 +725,6 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
 
   const _clT8 = performance.now() // pass 6 done
 
-  // ── Pass 7: Position leaves within nested agent execution containers ─────
-  nestedAgentExecContainers.forEach(ae => {
-    const leaves = leavesByAgentExec.get(ae.id) || []
-    const aeSize = agentExecSizes.get(ae.id) || { width: 280 }
-
-    const sortedLeaves = [...leaves].sort((a, b) => {
-      const aTs = a.data?.timestamp || a.data?.startTime || ''
-      const bTs = b.data?.timestamp || b.data?.startTime || ''
-      return new Date(aTs) - new Date(bTs)
-    })
-
-    let childY = containerHeaderHeight + cyclePadding
-    sortedLeaves.forEach(leaf => {
-      const childW = leaf.measured?.width ?? nodeWidth
-      const childH = leaf.measured?.height ?? nodeHeight
-      positionedNodes.set(leaf.id, {
-        ...leaf,
-        position: { x: (aeSize.width - childW) / 2, y: childY },
-      })
-      childY += childH + innerVertSpacing
-    })
-  })
-
   // ── Collect and order final nodes (parents before children) ──────────────
   // Order: root → cycleContainers → iterContainers → direct children → subCycleContainers → subCycleLeaves
   const parentNodes = nodes.filter(n => !n.parentId).map(n => positionedNodes.get(n.id) ?? n)
@@ -854,16 +743,8 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
   const directChildrenNodes = [...allDirectCycleChildren, ...allGrandchildren].map(resolveNode)
   const subCycleContainerNodes = subCycleContainers.map(n => positionedNodes.get(n.id) ?? n)
   const subCycleLeafNodes = allSubCycleLeaves.map(resolveNode)
-  const nestedAgentExecNodes = nestedAgentExecContainers.map(n => positionedNodes.get(n.id) ?? n)
-  const agentExecLeafNodes = allAgentExecLeaves.map(resolveNode)
 
-  const cycleNodes = nodes.filter(
-    n => n.type === 'reviewCycleContainer' ||
-         n.type === 'repairCycleContainer' ||
-         n.type === 'prReviewCycleContainer' ||
-         n.type === 'conversationalLoopContainer' ||
-         n.type === 'statusProgressionContainer'
-  ).map(n => positionedNodes.get(n.id) ?? n)
+  const cycleNodes = cycleContainers.map(n => positionedNodes.get(n.id) ?? n)
 
   const _clTEnd = performance.now()
   const _fmt = (a, b) => `${(b - a).toFixed(1)}ms`
@@ -882,7 +763,7 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
   )
 
   return {
-    nodes: [...parentNodes, ...iterContainerNodes, ...directChildrenNodes, ...subCycleContainerNodes, ...subCycleLeafNodes, ...nestedAgentExecNodes, ...agentExecLeafNodes],
+    nodes: [...parentNodes, ...iterContainerNodes, ...directChildrenNodes, ...subCycleContainerNodes, ...subCycleLeafNodes],
     cycleNodes,
     edges,
   }

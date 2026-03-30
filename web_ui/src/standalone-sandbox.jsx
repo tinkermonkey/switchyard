@@ -62,15 +62,13 @@ export default function StandaloneSandbox() {
 
   const handleDownloadProcessed = useCallback(() => {
     if (!processedModel || !debugData) return
-    const { prelude, cycles, postlude, agentExecutions } = processedModel
+    const { prelude, cycles, postlude, agentExecutionBoundaries } = processedModel
     const serializable = {
       pipelineRun: debugData.pipelineRun,
       prelude,
       cycles: [...(cycles?.values?.() ?? cycles ?? [])],
       postlude,
-      agentExecutions: agentExecutions instanceof Map
-        ? Object.fromEntries(agentExecutions)
-        : agentExecutions,
+      agentExecutionBoundaries,
     }
     const blob = new Blob([JSON.stringify(serializable, null, 2)], { type: 'application/json' })
     const url = URL.createObjectURL(blob)

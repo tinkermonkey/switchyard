@@ -16,8 +16,6 @@
  *   matchFields               - { field: value } pairs that must ALL match on the event
  *   excludeFields             - { field: value } pairs where ANY match excludes the event
  *   syntheticCloseOverrides   - extra fields merged into synthetic close events
- *   pairByField               - when set, pairs start/end by matching this field value
- *                                instead of sequential-window pairing (for concurrent cycles)
  *
  * Drives two concerns:
  *   1. Boundary detection (eventProcessing/index.js) — which events open/close a cycle.
@@ -75,6 +73,5 @@ export const CYCLE_TERMINAL_EVENTS = {
     },
     syntheticCloseType: 'agent_completed',
     syntheticCloseOverrides: { event_category: 'agent_lifecycle', success: null, error: null, duration_ms: null },
-    pairByField: 'task_id',
   },
 }

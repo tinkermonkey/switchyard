@@ -9,9 +9,8 @@ import { useTheme } from '../../contexts/ThemeContext.jsx'
  * Dispatches on data.cycleType → looks up theme from CYCLE_THEME_MAP →
  * renders CycleContainer with that theme.
  *
- * Registered in index.js for every container node type string:
- *   reviewCycleContainer, repairCycleContainer, prReviewCycleContainer,
- *   conversationalLoopContainer, iterationContainer, subCycleContainer
+ * Registered in index.js as:
+ *   subCycleContainer (universal), iterationContainer
  */
 
 const DEFAULT_THEME = {
