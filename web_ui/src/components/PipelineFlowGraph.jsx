@@ -450,6 +450,11 @@ export default function PipelineFlowGraph({
     })
   }, [nodesDraggable, allowResizing, handleToggleWithTracking])
 
+  // Re-apply finalizeNodes when draggable/resizable toggles without a full re-layout.
+  useEffect(() => {
+    setNodes(curr => curr.length > 0 ? finalizeNodes(curr) : curr)
+  }, [nodesDraggable, allowResizing]) // eslint-disable-line react-hooks/exhaustive-deps
+
   const handleLayoutDone = useCallback((finalNodes) => {
     hasLayoutedOnceRef.current = true
     setLayoutReady(true)

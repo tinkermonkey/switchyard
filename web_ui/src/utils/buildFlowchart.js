@@ -190,9 +190,6 @@ export function buildFlowchart({
 
   // ── Helpers ──────────────────────────────────────────────────────────────
 
-  /** The ordered leaf-node chain: we build this list, then connect sequentially. */
-  const leafChain = [] // [{ id, timestamp }]
-
   const newNodes = []
   const newEdges = []
 
@@ -265,6 +262,7 @@ export function buildFlowchart({
         status: execution.status,
         metadata: isActive ? 'Running' : execution.status,
         isActive,
+        timestamp: event.timestamp,
         startTime: event.timestamp,
         durationMs,
         inputTokens: claudeData?.inputTokens ?? null,
@@ -304,7 +302,15 @@ export function buildFlowchart({
         ? new Date(exec.endTime) - new Date(exec.startTime)
         : null
       const claudeData = claudeSummaries.get(ae.taskId) ?? null
-      const childCount = (ae.events ?? []).filter(e => !SKIP_EVENT_TYPES.has(e.event_type)).length
+      // Build the full list of renderable events: startEvent + intermediate events + endEvent.
+      // groupAgentExecutions excludes startEvent/endEvent from ae.events, but they should
+      // always appear as the first/last children when the container is expanded.
+      const allChildEvents = [
+        ae.startEvent,
+        ...(ae.events ?? []),
+        ae.endEvent,
+      ].filter(Boolean)
+      const childCount = allChildEvents.filter(e => !SKIP_EVENT_TYPES.has(e.event_type)).length
 
       const containerNode = {
         id: containerId,
@@ -335,18 +341,13 @@ export function buildFlowchart({
       if (parentId) containerNode.parentId = parentId
       newNodes.push(containerNode)
 
-      if (isCollapsed) {
-        entries.push({ id: containerId, timestamp: ae.startEvent?.timestamp })
-      } else {
-        // First entry: the container itself (for edge routing)
-        entries.push({ id: containerId, timestamp: ae.startEvent?.timestamp, isContainer: true })
-        // Then render children
-        ;(ae.events ?? [])
+      if (!isCollapsed) {
+        // Expanded: render child event nodes inside the container
+        allChildEvents
           .sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp))
           .forEach(event => processEventToNode(event, containerId, containerId))
       }
     })
-    return entries
   }
 
   /**
@@ -354,21 +355,12 @@ export function buildFlowchart({
    * containers, sorted chronologically.
    */
   function processSection(section, idPrefix) {
-    const aeEntries = renderAgentExecutionContainers(section.agentExecutions, idPrefix, null)
-    const eventEntries = []
-    section.events.forEach(event => {
-      const nodeId = processEventToNode(event, idPrefix, null)
-      if (nodeId) eventEntries.push({ id: nodeId, timestamp: event.timestamp })
-    })
-    // leafChain entries are already added by processEventToNode, but agent container
-    // entries need to be added manually (processEventToNode doesn't handle containers)
-    aeEntries.forEach(entry => {
-      if (!entry.isContainer) leafChain.push(entry)
-    })
+    renderAgentExecutionContainers(section.agentExecutions, idPrefix, null)
+    section.events.forEach(event => processEventToNode(event, idPrefix, null))
   }
 
   /**
-   * Process a raw event into a node, push to newNodes, and add to leafChain.
+   * Process a raw event into a node and push to newNodes.
    * Returns the node id if a node was created, or null.
    */
   function processEventToNode(event, idPrefix, parentId = null) {
@@ -429,7 +421,6 @@ export function buildFlowchart({
 
     if (node) {
       newNodes.push(node)
-      leafChain.push({ id: node.id, timestamp: event.timestamp })
       return node.id
     }
     return null
@@ -444,10 +435,10 @@ export function buildFlowchart({
       label: 'Pipeline Started',
       type: 'pipeline_created',
       metadata: new Date(selectedPipelineRun.started_at).toLocaleString(),
+      timestamp: selectedPipelineRun.started_at,
     },
     draggable: false,
   })
-  leafChain.push({ id: 'created', timestamp: selectedPipelineRun.started_at })
 
   // ── 3. Prelude events ─────────────────────────────────────────────────────
   processSection(prelude, 'pre')
@@ -485,37 +476,22 @@ export function buildFlowchart({
       }
       newNodes.push(rcNode)
 
-      if (isCollapsed) {
-        // Collapsed: the container is the only leaf in the chain
-        leafChain.push({ id: cycle.id, timestamp: cycle.startEvent?.timestamp })
-      } else {
-        // Expanded: collect all leaf-chain entries, then sort chronologically so residual
-        // events (in the cycle window but outside any iteration) are interleaved correctly.
-        const allReviewEntries = []
-
-        // review_cycle_started → direct child (pre-created node, goes straight to leafChain)
+      if (!isCollapsed) {
+        // review_cycle_started → direct child
         if (cycle.startEvent) {
-          const startId = `${cycle.id}-start`
-          newNodes.push(makeDecisionNode(cycle.startEvent, startId, cycle.id))
-          allReviewEntries.push({ leafId: startId, timestamp: cycle.startEvent.timestamp })
+          newNodes.push(makeDecisionNode(cycle.startEvent, `${cycle.id}-start`, cycle.id))
         }
 
-        // Residual events: in the cycle window but not claimed by any iteration
-        ;(cycle.events ?? []).forEach(event => {
-          allReviewEntries.push({ event, parentId: cycle.id, timestamp: event.timestamp })
-        })
-        // Agent execution containers at cycle level (outside iterations)
-        const cycleAeEntries = renderAgentExecutionContainers(cycle.agentExecutions, cycle.id, cycle.id)
-        cycleAeEntries.forEach(entry => {
-          allReviewEntries.push({ containerId: entry.id, timestamp: entry.timestamp })
-        })
+        // Residual events at cycle level
+        ;(cycle.events ?? []).forEach(event => processEventToNode(event, cycle.id, cycle.id))
+        renderAgentExecutionContainers(cycle.agentExecutions, cycle.id, cycle.id)
 
         // Iteration containers
         const lastIterIdx = cycle.iterations.length - 1
         cycle.iterations.forEach((iteration, iterIdx) => {
           const iterId = `${cycle.id}-iter-${iteration.number}`
           const iterState = existingCycles.get(iterId)
-          const iterCollapsed = iterState?.isCollapsed ?? true  // default: collapsed
+          const iterCollapsed = iterState?.isCollapsed ?? true
           updatedCycles.set(iterId, { isCollapsed: iterCollapsed })
 
           const isLastFailed = rcSummary.isFailure && iterIdx === lastIterIdx
@@ -534,8 +510,8 @@ export function buildFlowchart({
               iterationCount: iteration.events.length + 1,
               isCollapsed: iterCollapsed,
               containsActiveAgent: activeContainerIds.has(iterId),
-              onToggleCollapse: null, // injected by caller
-              startTime: iteration.startEvent?.timestamp,  // used by cycleLayout for ordering
+              onToggleCollapse: null,
+              startTime: iteration.startEvent?.timestamp,
               summary: extractReviewIterationSummary(iteration, cycle.startEvent, isLastFailed),
               isFailure: isLastFailed,
             },
@@ -544,42 +520,18 @@ export function buildFlowchart({
             draggable: false,
           })
 
-          if (iterCollapsed) {
-            allReviewEntries.push({ containerId: iterId, timestamp: iteration.startEvent?.timestamp })
-          } else {
-            const allIterEvents = [iteration.startEvent, ...iteration.events]
+          if (!iterCollapsed) {
+            ;[iteration.startEvent, ...iteration.events]
               .filter(Boolean)
-              .sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp))
-            allIterEvents.forEach(event => {
-              allReviewEntries.push({ event, parentId: iterId, timestamp: event.timestamp })
-            })
-            // Agent execution containers within this iteration
-            const aeEntries = renderAgentExecutionContainers(iteration.agentExecutions, iterId, iterId)
-            aeEntries.forEach(entry => {
-              allReviewEntries.push({ containerId: entry.id, timestamp: entry.timestamp })
-            })
+              .forEach(event => processEventToNode(event, iterId, iterId))
+            renderAgentExecutionContainers(iteration.agentExecutions, iterId, iterId)
           }
         })
 
         // review_cycle_completed → direct child (skip if inferred)
         if (cycle.endEvent && !cycle.endEvent._inferred) {
-          const endId = `${cycle.id}-end`
-          newNodes.push(makeDecisionNode(cycle.endEvent, endId, cycle.id))
-          allReviewEntries.push({ leafId: endId, timestamp: cycle.endEvent.timestamp })
+          newNodes.push(makeDecisionNode(cycle.endEvent, `${cycle.id}-end`, cycle.id))
         }
-
-        // Process all entries in chronological order for correct leafChain sequencing
-        allReviewEntries
-          .sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp))
-          .forEach(entry => {
-            if (entry.leafId) {
-              leafChain.push({ id: entry.leafId, timestamp: entry.timestamp })
-            } else if (entry.containerId) {
-              leafChain.push({ id: entry.containerId, timestamp: entry.timestamp })
-            } else {
-              processEventToNode(entry.event, entry.parentId, entry.parentId)
-            }
-          })
       }
     } else if (cycle.type === 'repair_cycle') {
       // ── Repair cycle container ──────────────────────────────────────────
@@ -605,37 +557,24 @@ export function buildFlowchart({
       }
       newNodes.push(rpcNode)
 
-      if (isCollapsed) {
-        leafChain.push({ id: cycle.id, timestamp: cycle.startEvent?.timestamp })
-      } else if (cycle.testCycles) {
-        // Collect ALL entries (repair-level residuals + tc-level events) for one
-        // chronological sort so leafChain sequencing is correct across the whole cycle.
-        // Entries are either { event, parentId, timestamp } or { containerId, timestamp }
-        // for collapsed containers that go directly into the leafChain.
-        const allRepairEntries = []
-
-        // Repair-level residual events → direct children of the repair cycle container.
-        // Exclude startEvent (repair_cycle agent_initialized) — it is the container
-        // boundary marker and is already represented by the repairCycleContainer node
-        // itself. Rendering it as a child produces a misleading "Repair Cycle / failed"
-        // node (the agent execution's final status) in the first slot of the container.
+      if (!isCollapsed && cycle.testCycles) {
+        // Repair-level residual events (exclude boundary markers)
+        const REPAIR_BOUNDARY_TYPES = new Set([
+          'repair_cycle_started', 'repair_cycle_completed', 'repair_cycle_container_completed',
+        ])
         ;(cycle.events ?? [])
-          .filter(e => e !== cycle.startEvent)
-          .forEach(event => {
-            allRepairEntries.push({ event, parentId: cycle.id, timestamp: event.timestamp })
-          })
-        // Agent execution containers at repair cycle level
+          .filter(e => e !== cycle.startEvent && e !== cycle.endEvent && !REPAIR_BOUNDARY_TYPES.has(e.event_type))
+          .forEach(event => processEventToNode(event, cycle.id, cycle.id))
         renderAgentExecutionContainers(cycle.agentExecutions, cycle.id, cycle.id)
-          .forEach(entry => allRepairEntries.push({ containerId: entry.id, timestamp: entry.timestamp }))
 
         // Test cycle containers + their sub-cycles + events
         cycle.testCycles.forEach(tc => {
           const tcId = `${cycle.id}-tc-${tc.number}`
           const tcState = existingCycles.get(tcId)
-          const tcCollapsed = tcState?.isCollapsed ?? true  // default: collapsed
+          const tcCollapsed = tcState?.isCollapsed ?? true
           updatedCycles.set(tcId, { isCollapsed: tcCollapsed })
 
-          const tcNode = {
+          newNodes.push({
             id: tcId,
             type: 'iterationContainer',
             parentId: cycle.id,
@@ -649,25 +588,21 @@ export function buildFlowchart({
               iterationCount: tc.subCycles.length,
               isCollapsed: tcCollapsed,
               containsActiveAgent: activeContainerIds.has(tcId),
-              onToggleCollapse: null, // injected by caller
+              onToggleCollapse: null,
+              startTime: tc.startEvent?.timestamp,
               summary: extractTestCycleSummary(tc),
             },
             style: tcCollapsed ? {} : { width: 0, height: 0 },
             ...(tcCollapsed ? {} : { measured: { width: 1, height: 1 } }),
             draggable: false,
-          }
-          newNodes.push(tcNode)
+          })
 
-          if (tcCollapsed) {
-            allRepairEntries.push({ containerId: tcId, timestamp: tc.startEvent?.timestamp ?? 0 })
-          } else {
-            // Recursively create sub-cycle containers and collect their events/nested containers.
-            // Called with the outer tc container as the initial parentId; nested sub-cycles
-            // use their parent SC's id as parentId so React Flow renders them correctly.
-            const addSubCycleEntries = (sc, parentId) => {
+          if (!tcCollapsed) {
+            // Recursively create sub-cycle containers
+            const createSubCycles = (sc, parentId) => {
               const scId = `${parentId}-${sc.cycleType}-${sc.number}`
               const scState = existingCycles.get(scId)
-              const scCollapsed = scState?.isCollapsed ?? true  // default: collapsed
+              const scCollapsed = scState?.isCollapsed ?? true
               updatedCycles.set(scId, { isCollapsed: scCollapsed })
 
               newNodes.push({
@@ -684,9 +619,10 @@ export function buildFlowchart({
                   iterationCount: sc.events.length + (sc.subCycles?.length ?? 0),
                   startEvent: sc.startEvent,
                   endEvent: sc.endEvent,
+                  startTime: sc.startEvent?.timestamp,
                   isCollapsed: scCollapsed,
                   containsActiveAgent: activeContainerIds.has(scId),
-                  onToggleCollapse: null, // injected by caller
+                  onToggleCollapse: null,
                   summary: extractSubCycleSummary(sc),
                 },
                 style: scCollapsed ? {} : { width: 0, height: 0 },
@@ -694,43 +630,20 @@ export function buildFlowchart({
                 draggable: false,
               })
 
-              if (scCollapsed) {
-                allRepairEntries.push({ containerId: scId, timestamp: sc.startEvent?.timestamp ?? 0 })
-              } else {
-                // Recurse into nested sub-cycles first (parent node already pushed above)
-                sc.subCycles?.forEach(nsc => addSubCycleEntries(nsc, scId))
-                // Then add residual events (outside any nested sub-cycle windows)
-                ;[sc.startEvent, ...sc.events, sc.endEvent].filter(Boolean).forEach(event => {
-                  allRepairEntries.push({ event, parentId: scId, timestamp: event.timestamp })
-                })
-                // Agent execution containers within this sub-cycle
+              if (!scCollapsed) {
+                sc.subCycles?.forEach(nsc => createSubCycles(nsc, scId))
+                ;[sc.startEvent, ...sc.events, sc.endEvent].filter(Boolean)
+                  .forEach(event => processEventToNode(event, scId, scId))
                 renderAgentExecutionContainers(sc.agentExecutions, scId, scId)
-                  .forEach(entry => allRepairEntries.push({ containerId: entry.id, timestamp: entry.timestamp }))
               }
             }
 
-            tc.subCycles.forEach(sc => addSubCycleEntries(sc, tcId))
-
-            // Residual events within the test cycle go directly under the tc container
-            ;[tc.startEvent, ...tc.events, tc.endEvent].filter(Boolean).forEach(event => {
-              allRepairEntries.push({ event, parentId: tcId, timestamp: event.timestamp })
-            })
-            // Agent execution containers within this test cycle
+            tc.subCycles.forEach(sc => createSubCycles(sc, tcId))
+            ;[tc.startEvent, ...(tc.events ?? []), tc.endEvent].filter(Boolean)
+              .forEach(event => processEventToNode(event, tcId, tcId))
             renderAgentExecutionContainers(tc.agentExecutions, tcId, tcId)
-              .forEach(entry => allRepairEntries.push({ containerId: entry.id, timestamp: entry.timestamp }))
           }
         })
-
-        // Process all entries in chronological order for correct leafChain sequencing
-        allRepairEntries
-          .sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp))
-          .forEach(entry => {
-            if (entry.containerId) {
-              leafChain.push({ id: entry.containerId, timestamp: entry.timestamp })
-            } else {
-              processEventToNode(entry.event, entry.parentId, entry.parentId)
-            }
-          })
       }
     } else if (cycle.type === 'pr_review_cycle') {
       // ── PR review cycle container ───────────────────────────────────────
@@ -756,33 +669,18 @@ export function buildFlowchart({
       }
       newNodes.push(prNode)
 
-      if (isCollapsed) {
-        leafChain.push({ id: cycle.id, timestamp: cycle.startEvent?.timestamp })
-      } else {
-        // Expanded: collect all leaf-chain entries, then sort chronologically so residual
-        // events (between stage_started and first phase, or between phases) are interleaved.
-        const allPREntries = []
-
-        // pr_review_stage_started → direct child (pre-created node)
+      if (!isCollapsed) {
         if (cycle.startEvent) {
-          const startId = `${cycle.id}-start`
-          newNodes.push(makeDecisionNode(cycle.startEvent, startId, cycle.id))
-          allPREntries.push({ leafId: startId, timestamp: cycle.startEvent.timestamp })
+          newNodes.push(makeDecisionNode(cycle.startEvent, `${cycle.id}-start`, cycle.id))
         }
 
-        // Residual events: in the cycle window but not claimed by any phase
-        ;(cycle.events ?? []).forEach(event => {
-          allPREntries.push({ event, parentId: cycle.id, timestamp: event.timestamp })
-        })
-        // Agent execution containers at PR review cycle level
+        ;(cycle.events ?? []).forEach(event => processEventToNode(event, cycle.id, cycle.id))
         renderAgentExecutionContainers(cycle.agentExecutions, cycle.id, cycle.id)
-          .forEach(entry => allPREntries.push({ containerId: entry.id, timestamp: entry.timestamp }))
 
-        // Phase containers
         ;(cycle.phases ?? []).forEach(phase => {
           const phaseId = `${cycle.id}-phase-${phase.number}`
           const phaseState = existingCycles.get(phaseId)
-          const phaseCollapsed = phaseState?.isCollapsed ?? true  // default: collapsed
+          const phaseCollapsed = phaseState?.isCollapsed ?? true
           updatedCycles.set(phaseId, { isCollapsed: phaseCollapsed })
 
           newNodes.push({
@@ -799,8 +697,8 @@ export function buildFlowchart({
               iterationCount: phase.events.length + 1,
               isCollapsed: phaseCollapsed,
               containsActiveAgent: activeContainerIds.has(phaseId),
-              onToggleCollapse: null, // injected by caller
-              startTime: phase.startEvent?.timestamp,  // used by cycleLayout for ordering
+              onToggleCollapse: null,
+              startTime: phase.startEvent?.timestamp,
               summary: extractPRReviewPhaseSummary(phase),
             },
             style: phaseCollapsed ? {} : { width: 0, height: 0 },
@@ -808,40 +706,17 @@ export function buildFlowchart({
             draggable: false,
           })
 
-          if (phaseCollapsed) {
-            allPREntries.push({ containerId: phaseId, timestamp: phase.startEvent?.timestamp })
-          } else {
-            const allPhaseEvents = [phase.startEvent, ...phase.events]
+          if (!phaseCollapsed) {
+            ;[phase.startEvent, ...phase.events]
               .filter(Boolean)
-              .sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp))
-            allPhaseEvents.forEach(event => {
-              allPREntries.push({ event, parentId: phaseId, timestamp: event.timestamp })
-            })
-            // Agent execution containers within this phase
+              .forEach(event => processEventToNode(event, phaseId, phaseId))
             renderAgentExecutionContainers(phase.agentExecutions, phaseId, phaseId)
-              .forEach(entry => allPREntries.push({ containerId: entry.id, timestamp: entry.timestamp }))
           }
         })
 
-        // pr_review_stage_completed → direct child (skip if inferred)
         if (cycle.endEvent && !cycle.endEvent._inferred) {
-          const endId = `${cycle.id}-end`
-          newNodes.push(makeDecisionNode(cycle.endEvent, endId, cycle.id))
-          allPREntries.push({ leafId: endId, timestamp: cycle.endEvent.timestamp })
+          newNodes.push(makeDecisionNode(cycle.endEvent, `${cycle.id}-end`, cycle.id))
         }
-
-        // Process all entries in chronological order for correct leafChain sequencing
-        allPREntries
-          .sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp))
-          .forEach(entry => {
-            if (entry.leafId) {
-              leafChain.push({ id: entry.leafId, timestamp: entry.timestamp })
-            } else if (entry.containerId) {
-              leafChain.push({ id: entry.containerId, timestamp: entry.timestamp })
-            } else {
-              processEventToNode(entry.event, entry.parentId, entry.parentId)
-            }
-          })
       }
     } else if (cycle.type === 'conversational_loop') {
       // ── Conversational loop container ───────────────────────────────────
@@ -867,40 +742,14 @@ export function buildFlowchart({
       }
       newNodes.push(clNode)
 
-      if (isCollapsed) {
-        leafChain.push({ id: cycle.id, timestamp: cycle.startEvent?.timestamp })
-      } else {
-        // Loop open event → direct child, leftmost
+      if (!isCollapsed) {
         if (cycle.startEvent) {
-          const startId = `${cycle.id}-start`
-          const startNode = makeDecisionNode(cycle.startEvent, startId, cycle.id)
-          newNodes.push(startNode)
-          leafChain.push({ id: startId, timestamp: cycle.startEvent.timestamp })
+          newNodes.push(makeDecisionNode(cycle.startEvent, `${cycle.id}-start`, cycle.id))
         }
-
-        // Child events + agent execution containers, sorted chronologically
-        const loopEntries = []
-        ;(cycle.events ?? []).forEach(event => {
-          loopEntries.push({ event, timestamp: event.timestamp })
-        })
+        ;(cycle.events ?? []).forEach(event => processEventToNode(event, cycle.id, cycle.id))
         renderAgentExecutionContainers(cycle.agentExecutions, cycle.id, cycle.id)
-          .forEach(entry => loopEntries.push({ containerId: entry.id, timestamp: entry.timestamp }))
-        loopEntries
-          .sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp))
-          .forEach(entry => {
-            if (entry.containerId) {
-              leafChain.push({ id: entry.containerId, timestamp: entry.timestamp })
-            } else {
-              processEventToNode(entry.event, cycle.id, cycle.id)
-            }
-          })
-
-        // Loop close event → direct child, rightmost
         if (cycle.endEvent && !cycle.endEvent._inferred) {
-          const endId = `${cycle.id}-end`
-          const endNode = makeDecisionNode(cycle.endEvent, endId, cycle.id)
-          newNodes.push(endNode)
-          leafChain.push({ id: endId, timestamp: cycle.endEvent.timestamp })
+          newNodes.push(makeDecisionNode(cycle.endEvent, `${cycle.id}-end`, cycle.id))
         }
       }
     } else if (cycle.type === 'status_progression') {
@@ -927,38 +776,14 @@ export function buildFlowchart({
       }
       newNodes.push(spNode)
 
-      if (isCollapsed) {
-        leafChain.push({ id: cycle.id, timestamp: cycle.startEvent?.timestamp })
-      } else {
-        // Start event → direct child, leftmost
+      if (!isCollapsed) {
         if (cycle.startEvent) {
-          const startId = `${cycle.id}-start`
-          newNodes.push(makeDecisionNode(cycle.startEvent, startId, cycle.id))
-          leafChain.push({ id: startId, timestamp: cycle.startEvent.timestamp })
+          newNodes.push(makeDecisionNode(cycle.startEvent, `${cycle.id}-start`, cycle.id))
         }
-
-        // Child events + agent execution containers, sorted chronologically
-        const spEntries = []
-        ;(cycle.events ?? []).forEach(event => {
-          spEntries.push({ event, timestamp: event.timestamp })
-        })
+        ;(cycle.events ?? []).forEach(event => processEventToNode(event, cycle.id, cycle.id))
         renderAgentExecutionContainers(cycle.agentExecutions, cycle.id, cycle.id)
-          .forEach(entry => spEntries.push({ containerId: entry.id, timestamp: entry.timestamp }))
-        spEntries
-          .sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp))
-          .forEach(entry => {
-            if (entry.containerId) {
-              leafChain.push({ id: entry.containerId, timestamp: entry.timestamp })
-            } else {
-              processEventToNode(entry.event, cycle.id, cycle.id)
-            }
-          })
-
-        // End event → direct child, rightmost (skip if inferred)
         if (cycle.endEvent && !cycle.endEvent._inferred) {
-          const endId = `${cycle.id}-end`
-          newNodes.push(makeDecisionNode(cycle.endEvent, endId, cycle.id))
-          leafChain.push({ id: endId, timestamp: cycle.endEvent.timestamp })
+          newNodes.push(makeDecisionNode(cycle.endEvent, `${cycle.id}-end`, cycle.id))
         }
       }
     } else if (cycle.type === 'review_iteration') {
@@ -990,24 +815,11 @@ export function buildFlowchart({
         draggable: false,
       })
 
-      if (iterCollapsed) {
-        leafChain.push({ id: cycle.id, timestamp: cycle.startEvent?.timestamp })
-      } else {
-        const orphanEntries = []
+      if (!iterCollapsed) {
         ;[cycle.startEvent, ...cycle.events]
           .filter(Boolean)
-          .forEach(event => orphanEntries.push({ event, timestamp: event.timestamp }))
+          .forEach(event => processEventToNode(event, cycle.id, cycle.id))
         renderAgentExecutionContainers(cycle.agentExecutions, cycle.id, cycle.id)
-          .forEach(entry => orphanEntries.push({ containerId: entry.id, timestamp: entry.timestamp }))
-        orphanEntries
-          .sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp))
-          .forEach(entry => {
-            if (entry.containerId) {
-              leafChain.push({ id: entry.containerId, timestamp: entry.timestamp })
-            } else {
-              processEventToNode(entry.event, cycle.id, cycle.id)
-            }
-          })
       }
 
     }
@@ -1028,37 +840,60 @@ export function buildFlowchart({
         metadata: selectedPipelineRun.ended_at
           ? new Date(selectedPipelineRun.ended_at).toLocaleString()
           : '',
+        timestamp: selectedPipelineRun.ended_at,
       },
       draggable: false,
     })
-    leafChain.push({ id: 'completed', timestamp: selectedPipelineRun.ended_at })
   }
 
-  // ── 7. Build sequential edges through leaf chain ──────────────────────────
-  for (let i = 1; i < leafChain.length; i++) {
-    const source = leafChain[i - 1].id
-    const target = leafChain[i].id
-    if (source && target && source !== target) {
-      newEdges.push({
-        id: `edge-${source}-${target}`,
-        source,
-        sourceHandle: 'bottom',
-        target,
-        targetHandle: 'top',
-        type: 'smart',
-        markerEnd: { type: MarkerType.ArrowClosed, color: '#6e7681' },
-        style: { stroke: '#6e7681' },
-      })
-    }
-  }
+  // ── 7. Build edges: sequence leaves + collapsed containers chronologically ──
+  const CONTAINER_TYPES = new Set([
+    'reviewCycleContainer', 'repairCycleContainer', 'prReviewCycleContainer',
+    'conversationalLoopContainer', 'statusProgressionContainer',
+    'iterationContainer', 'subCycleContainer', 'agentExecutionContainer',
+  ])
 
-  // ── 8. Ensure correct React Flow node ordering (parents before children) ──
-  // newNodes is already built parents-first (containers added before their children above).
+  // Robust timestamp extraction — nodes use different field names
+  const getTs = n => n.data?.timestamp ?? n.data?.startTime ?? n.data?.event?.timestamp ?? 0
+
+  // The edge sequence includes:
+  //   - All leaf (non-container) nodes
+  //   - Collapsed containers (they stand in for their hidden children)
+  // Expanded containers are excluded — their children participate directly.
+  const sequenceNodes = newNodes
+    .filter(n => {
+      if (!CONTAINER_TYPES.has(n.type)) return true          // leaf node
+      if (n.data?.isCollapsed) return true                   // collapsed container
+      return false                                           // expanded container (children are in sequence)
+    })
+    .sort((a, b) => new Date(getTs(a)) - new Date(getTs(b)))
+
+  // Build sequential edges, deduplicating (collapsed containers may appear
+  // adjacent to each other or to their own parent chain — skip self-edges).
+  const seenEdges = new Set()
+  for (let i = 1; i < sequenceNodes.length; i++) {
+    const source = sequenceNodes[i - 1].id
+    const target = sequenceNodes[i].id
+    if (source === target) continue
+    const key = `${source}->${target}`
+    if (seenEdges.has(key)) continue
+    seenEdges.add(key)
+    newEdges.push({
+      id: `edge-${source}-${target}`,
+      source,
+      sourceHandle: 'bottom',
+      target,
+      targetHandle: 'top',
+      type: 'smart',
+      markerEnd: { type: MarkerType.ArrowClosed, color: '#6e7681' },
+      style: { stroke: '#6e7681' },
+    })
+  }
 
   const _bfTEnd = performance.now()
   console.log(
     `[PerfGraph] buildFlowchart: ${(_bfTEnd - _bfT0).toFixed(1)}ms` +
-    ` | nodes:${newNodes.length} edges:${newEdges.length} leafChain:${leafChain.length}` +
+    ` | nodes:${newNodes.length} edges:${newEdges.length} sequence:${sequenceNodes.length}` +
     ` | processEvents:${(_bfT1 - _bfT0).toFixed(1)}ms` +
     ` | nodeBuild:${(_bfTEnd - _bfT1).toFixed(1)}ms`
   )

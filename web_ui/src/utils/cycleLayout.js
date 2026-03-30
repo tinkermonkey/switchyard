@@ -291,43 +291,11 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
 
   const _clT1 = performance.now() // categorise + lookup maps done
 
-  // ── Pass 0: Size subCycleContainers (bottom-up: inner SCs before outer) ───
-  // Inner SCs (parentId is another SC) are sized first so outer SCs can include
-  // their dimensions when computing their own height/width.
+  // ── Pass 0a: Size nested agent execution containers ──────────────────────
+  // Sized BEFORE sub-cycle containers because AE containers can be children of
+  // sub-cycles, and sub-cycle sizing needs AE dimensions.
   const COLLAPSED_WIDTH = COLLAPSED_CYCLE_WIDTH
   const COLLAPSED_HEIGHT = COLLAPSED_CYCLE_HEIGHT
-  const subCycleSizes = new Map()
-  const sortedSubCycleContainers = [...subCycleContainers].sort((a, b) => {
-    const aIsInner = subCycleContainerIds.has(a.parentId) ? 1 : 0
-    const bIsInner = subCycleContainerIds.has(b.parentId) ? 1 : 0
-    return bIsInner - aIsInner  // descending: inner (1) before outer (0)
-  })
-  sortedSubCycleContainers.forEach(sc => {
-    if (sc.data?.isCollapsed) {
-      subCycleSizes.set(sc.id, {
-        width: sc.measured?.width > 1 ? sc.measured.width : COLLAPSED_WIDTH,
-        height: sc.measured?.height > 1 ? sc.measured.height : COLLAPSED_HEIGHT,
-      })
-      return
-    }
-    const leaves = leavesBySubCycle.get(sc.id) || []
-    const nestedSCs = nestedSubCyclesByParentSc.get(sc.id) || []
-    const allItems = [
-      ...leaves.map(l => ({ h: l.measured?.height ?? nodeHeight, w: l.measured?.width ?? nodeWidth })),
-      ...nestedSCs.map(nsc => {
-        const sz = subCycleSizes.get(nsc.id) || { width: nodeWidth, height: nodeHeight }
-        return { h: sz.height, w: sz.width }
-      }),
-    ]
-    const n = allItems.length
-    const totalH = allItems.reduce((sum, item) => sum + item.h, 0)
-    const maxW = n > 0 ? Math.max(...allItems.map(item => item.w)) : nodeWidth
-    const height = iterHeaderHeight + cyclePadding * 2 + totalH + Math.max(0, n - 1) * innerVertSpacing
-    const width = maxW + cyclePadding * 2
-    subCycleSizes.set(sc.id, { width, height })
-  })
-
-  // Size nested agent execution containers (vertical stack, same as simple cycle containers)
   const agentExecSizes = new Map()
   nestedAgentExecContainers.forEach(ae => {
     if (ae.data?.isCollapsed) {
@@ -344,6 +312,45 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
     const height = containerHeaderHeight + cyclePadding * 2 + totalH + Math.max(0, n - 1) * innerVertSpacing
     const width = maxW + cyclePadding * 2
     agentExecSizes.set(ae.id, { width: Math.max(width, 280), height: Math.max(height, 100) })
+  })
+
+  // ── Pass 0b: Size subCycleContainers (bottom-up: inner SCs before outer) ──
+  // Inner SCs (parentId is another SC) are sized first so outer SCs can include
+  // their dimensions when computing their own height/width.
+  const subCycleSizes = new Map()
+  const sortedSubCycleContainers = [...subCycleContainers].sort((a, b) => {
+    const aIsInner = subCycleContainerIds.has(a.parentId) ? 1 : 0
+    const bIsInner = subCycleContainerIds.has(b.parentId) ? 1 : 0
+    return bIsInner - aIsInner  // descending: inner (1) before outer (0)
+  })
+  sortedSubCycleContainers.forEach(sc => {
+    if (sc.data?.isCollapsed) {
+      subCycleSizes.set(sc.id, {
+        width: sc.measured?.width > 1 ? sc.measured.width : COLLAPSED_WIDTH,
+        height: sc.measured?.height > 1 ? sc.measured.height : COLLAPSED_HEIGHT,
+      })
+      return
+    }
+    const leaves = leavesBySubCycle.get(sc.id) || []
+    const nestedSCs = nestedSubCyclesByParentSc.get(sc.id) || []
+    const scAgentExecs = agentExecByParent.get(sc.id) || []
+    const allItems = [
+      ...leaves.map(l => ({ h: l.measured?.height ?? nodeHeight, w: l.measured?.width ?? nodeWidth })),
+      ...nestedSCs.map(nsc => {
+        const sz = subCycleSizes.get(nsc.id) || { width: nodeWidth, height: nodeHeight }
+        return { h: sz.height, w: sz.width }
+      }),
+      ...scAgentExecs.map(ae => {
+        const sz = agentExecSizes.get(ae.id) || { width: 280, height: 100 }
+        return { h: sz.height, w: sz.width }
+      }),
+    ]
+    const n = allItems.length
+    const totalH = allItems.reduce((sum, item) => sum + item.h, 0)
+    const maxW = n > 0 ? Math.max(...allItems.map(item => item.w)) : nodeWidth
+    const height = iterHeaderHeight + cyclePadding * 2 + totalH + Math.max(0, n - 1) * innerVertSpacing
+    const width = maxW + cyclePadding * 2
+    subCycleSizes.set(sc.id, { width, height })
   })
 
   const _clT2 = performance.now() // pass 0 done
@@ -743,31 +750,48 @@ export function applyCycleLayout(nodes, edges, cycles, options = {}) {
 
   const _clT7 = performance.now() // pass 5 done
 
-  // ── Pass 6: Position leaves and nested SC containers within subCycleContainers ─
-  // Outer SCs may contain nested SC containers in addition to leaf event nodes;
-  // inner SCs contain only leaf events. All items are interleaved chronologically.
+  // ── Pass 6: Position leaves, nested SC containers, and agent exec containers within subCycleContainers ─
+  // Outer SCs may contain nested SC containers and agent execution containers in
+  // addition to leaf event nodes; inner SCs contain only leaf events.
+  // All items are interleaved chronologically.
   subCycleContainers.forEach(sc => {
     const leaves = leavesBySubCycle.get(sc.id) || []
     const nestedSCs = nestedSubCyclesByParentSc.get(sc.id) || []
+    const scAgentExecs = agentExecByParent.get(sc.id) || []
     const scSize = subCycleSizes.get(sc.id) || { width: nodeWidth + cyclePadding * 2 }
 
     const allItems = [
       ...leaves.map(l => ({
         node: l,
         ts: l.data?.timestamp || l.data?.startTime || '',
-        isContainer: false,
+        containerType: null,
       })),
       ...nestedSCs.map(nsc => ({
         node: nsc,
         ts: nsc.data?.startEvent?.timestamp || '',
-        isContainer: true,
+        containerType: 'subCycle',
+      })),
+      ...scAgentExecs.map(ae => ({
+        node: ae,
+        ts: ae.data?.startTime || '',
+        containerType: 'agentExec',
       })),
     ].sort((a, b) => new Date(a.ts) - new Date(b.ts))
 
     let childY = iterHeaderHeight + cyclePadding
-    allItems.forEach(({ node, isContainer }) => {
-      if (isContainer) {
+    allItems.forEach(({ node, containerType }) => {
+      if (containerType === 'subCycle') {
         const sz = subCycleSizes.get(node.id) || { width: nodeWidth, height: nodeHeight }
+        positionedNodes.set(node.id, {
+          ...node,
+          position: { x: (scSize.width - sz.width) / 2, y: childY },
+          style: node.data?.isCollapsed
+            ? { ...node.style, width: sz.width }
+            : { ...node.style, width: sz.width, height: sz.height },
+        })
+        childY += sz.height + innerVertSpacing
+      } else if (containerType === 'agentExec') {
+        const sz = agentExecSizes.get(node.id) || { width: 280, height: 100 }
         positionedNodes.set(node.id, {
           ...node,
           position: { x: (scSize.width - sz.width) / 2, y: childY },
