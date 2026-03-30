@@ -562,7 +562,7 @@ class PipelineRunManager:
                                 pipeline_run = PipelineRun.from_dict(run_data)
                                 redis_key = self._get_redis_key(pipeline_run.id)
                                 self.redis.setex(redis_key, 3600, json.dumps(pipeline_run.to_dict()))
-                                self.redis.hset(self.redis_issue_mapping, issue_key, pipeline_run.id)
+                                self.redis.hset(self.redis_issue_mapping, self._get_issue_key(project, issue_number), pipeline_run.id)
                                 return pipeline_run, False
                     except Exception as e:
                         logger.error(f"Error checking/ending old pipeline runs in Elasticsearch: {e}")
