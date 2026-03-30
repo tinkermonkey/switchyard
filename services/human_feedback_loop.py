@@ -448,6 +448,23 @@ class HumanFeedbackLoopExecutor:
                 # CRITICAL FIX: When replying to existing feedback, set is_initial=False
                 # This ensures the agent uses question/revision mode instead of initial mode
                 logger.info(f"Found initial user request from {initial_feedback['author']}, replying to it as feedback")
+
+                # Emit feedback_detected so this interaction is visible in the event log
+                has_parent_comment = initial_feedback.get('parent_comment') is not None
+                predicted_mode = 'question' if has_parent_comment else 'revision'
+                decision_events.emit_feedback_detected(
+                    issue_number=state.issue_number,
+                    project=state.project_name,
+                    board=state.board_name,
+                    feedback_source='discussion_reply' if state.workspace_type == 'discussions' else 'issue_comment',
+                    feedback_content=initial_feedback.get('body', ''),
+                    target_agent=state.agent,
+                    action_taken=f"route_to_agent_{state.agent}_in_{predicted_mode}_mode",
+                    workspace_type=state.workspace_type,
+                    discussion_id=state.discussion_id,
+                    pipeline_run_id=state.pipeline_run_id
+                )
+
                 await self._execute_agent(
                     state,
                     column,

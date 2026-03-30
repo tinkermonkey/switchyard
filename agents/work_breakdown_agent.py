@@ -17,7 +17,7 @@ from agents.base_analysis_agent import AnalysisAgent
 from agents.utils import parse_json_block
 from config.manager import ConfigManager
 from config.state_manager import GitHubStateManager
-from monitoring.decision_events import DecisionEventEmitter
+from monitoring.decision_events import get_decision_event_emitter
 import logging
 import json
 import re
@@ -320,7 +320,10 @@ class WorkBreakdownAgent(AnalysisAgent):
                 discussion_id = task_context.get('discussion_id')
                 if discussion_id:
                     from services.github_discussions import GitHubDiscussions
-                    GitHubDiscussions().add_discussion_comment(discussion_id, body)
+                    GitHubDiscussions().add_discussion_comment(
+                        discussion_id, body,
+                        pipeline_run_id=task_context.get('pipeline_run_id'),
+                    )
                 else:
                     logger.warning("No discussion_id in task_context — cannot post comment")
             else:
@@ -1100,10 +1103,8 @@ Do not add any other text before or after the JSON.
                     logger.info(f"Linked issue #{issue_number} as sub-issue of #{parent_issue_number}")
 
                     # Emit SUCCESS event
-                    obs = task_context.get('observability')
-                    if obs:
-                        decision_emitter = DecisionEventEmitter(obs)
-                        decision_emitter.emit_sub_issue_created(
+                    try:
+                        get_decision_event_emitter().emit_sub_issue_created(
                             project=project_name,
                             parent_issue=int(parent_issue_number),
                             issue_number=int(issue_number),
@@ -1119,6 +1120,8 @@ Do not add any other text before or after the JSON.
                             },
                             pipeline_run_id=pipeline_run_id
                         )
+                    except Exception:
+                        pass
 
                 created_issues.append({
                     'number': issue_number,
@@ -1133,22 +1136,19 @@ Do not add any other text before or after the JSON.
                 logger.error(f"Failed to create sub-issue '{sub_issue['title']}': {e}", exc_info=True)
 
                 # Emit FAILURE event
-                obs = task_context.get('observability')
-                if obs:
-                    decision_emitter = DecisionEventEmitter(obs)
-                    decision_emitter.emit_sub_issue_creation_failed(
-                        project=project_name,
-                        parent_issue=int(parent_issue_number),
-                        title=sub_issue['title'],
-                        board="SDLC Execution",
-                        error=e,
-                        source="work_breakdown",
-                        context_data={
-                            'phase': sub_issue['phase'],
-                            'order_in_phase': idx,
-                        },
-                        pipeline_run_id=pipeline_run_id
-                    )
+                get_decision_event_emitter().emit_sub_issue_creation_failed(
+                    project=project_name,
+                    parent_issue=int(parent_issue_number),
+                    title=sub_issue['title'],
+                    board="SDLC Execution",
+                    error=e,
+                    source="work_breakdown",
+                    context_data={
+                        'phase': sub_issue['phase'],
+                        'order_in_phase': idx,
+                    },
+                    pipeline_run_id=pipeline_run_id
+                )
                 # Continue with other issues
 
         return created_issues

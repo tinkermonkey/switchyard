@@ -723,7 +723,9 @@ class GitHubIntegration:
                 comment_id = discussions.add_discussion_comment(
                     discussion_id=discussion_id,
                     body=chunk,
-                    reply_to_id=current_reply_to
+                    reply_to_id=current_reply_to,
+                    pipeline_run_id=context.get('pipeline_run_id'),
+                    repo=context.get('repository', 'unknown'),
                 )
 
                 if comment_id:

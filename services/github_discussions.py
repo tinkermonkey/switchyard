@@ -105,7 +105,8 @@ class GitHubDiscussions:
         return None
 
     def create_discussion(self, owner: str, repo: str, category_id: str,
-                         title: str, body: str, repository_id: Optional[str] = None) -> Optional[Dict]:
+                         title: str, body: str, repository_id: Optional[str] = None,
+                         pipeline_run_id: Optional[str] = None) -> Optional[Dict]:
         """
         Create a new discussion
 
@@ -169,6 +170,7 @@ class GitHubDiscussions:
                     repo=f"{owner}/{repo}",
                     project=repo,
                     comment_id=discussion_id,
+                    pipeline_run_id=pipeline_run_id,
                 )
             except Exception:
                 pass
@@ -183,7 +185,9 @@ class GitHubDiscussions:
         return None
 
     def add_discussion_comment(self, discussion_id: str, body: str,
-                              reply_to_id: Optional[str] = None) -> Optional[str]:
+                              reply_to_id: Optional[str] = None,
+                              pipeline_run_id: Optional[str] = None,
+                              repo: str = "unknown") -> Optional[str]:
         """
         Add a comment to a discussion
 
@@ -228,8 +232,9 @@ class GitHubDiscussions:
                     object_number=0,
                     title=_extract_comment_title(body),
                     body=body,
-                    repo="unknown",
+                    repo=repo,
                     comment_id=comment_id,
+                    pipeline_run_id=pipeline_run_id,
                 )
             except Exception:
                 pass

@@ -774,7 +774,8 @@ class ReviewCycleExecutor:
                     if workspace_type == 'discussions' and discussion_id:
                         from services.github_discussions import GitHubDiscussions
                         discussions = GitHubDiscussions()
-                        discussions.add_discussion_comment(discussion_id, escalation_message)
+                        discussions.add_discussion_comment(discussion_id, escalation_message,
+                                                          pipeline_run_id=existing_cycle.pipeline_run_id)
                     else:
                         github = self._get_github_for_project(project_name, repository)
                         await github.post_issue_comment(
@@ -860,7 +861,8 @@ class ReviewCycleExecutor:
                     if workspace_type == 'discussions' and discussion_id:
                         from services.github_discussions import GitHubDiscussions
                         discussions = GitHubDiscussions()
-                        discussions.add_discussion_comment(discussion_id, error_message)
+                        discussions.add_discussion_comment(discussion_id, error_message,
+                                                          pipeline_run_id=existing_cycle.pipeline_run_id)
                     else:
                         github = self._get_github_for_project(project_name, repository)
                         await github.post_issue_comment(
@@ -1022,7 +1024,8 @@ class ReviewCycleExecutor:
             if workspace_type == 'discussions' and discussion_id:
                 from services.github_discussions import GitHubDiscussions
                 discussions = GitHubDiscussions()
-                discussions.add_discussion_comment(discussion_id, error_message)
+                discussions.add_discussion_comment(discussion_id, error_message,
+                                                  pipeline_run_id=pipeline_run_id)
             else:
                 github = self._get_github_for_project(project_name, repository)
                 await github.post_issue_comment(
@@ -2884,7 +2887,8 @@ _Automated review cycle by Claude Code Orchestrator_
             # Post to discussion
             from services.github_discussions import GitHubDiscussions
             discussions = GitHubDiscussions()
-            discussions.add_discussion_comment(cycle_state.discussion_id, summary)
+            discussions.add_discussion_comment(cycle_state.discussion_id, summary,
+                                              pipeline_run_id=cycle_state.pipeline_run_id)
         else:
             # Post to issue
             github = self._get_github_integration(cycle_state)
@@ -2967,7 +2971,8 @@ _Escalated by Claude Code Orchestrator - Monitoring for your response..._
             # Post to discussion
             from services.github_discussions import GitHubDiscussions
             discussions = GitHubDiscussions()
-            discussions.add_discussion_comment(cycle_state.discussion_id, escalation_comment)
+            discussions.add_discussion_comment(cycle_state.discussion_id, escalation_comment,
+                                              pipeline_run_id=cycle_state.pipeline_run_id)
         else:
             # Post to issue
             github = self._get_github_integration(cycle_state)
@@ -3042,7 +3047,8 @@ _Escalated by Claude Code Orchestrator_
             # Post to discussion
             from services.github_discussions import GitHubDiscussions
             discussions = GitHubDiscussions()
-            discussions.add_discussion_comment(cycle_state.discussion_id, escalation_comment)
+            discussions.add_discussion_comment(cycle_state.discussion_id, escalation_comment,
+                                              pipeline_run_id=cycle_state.pipeline_run_id)
         else:
             # Post to issue
             github = self._get_github_integration(cycle_state)
