@@ -341,16 +341,9 @@ class PromptBuilder:
                 iteration=rc.iteration,
                 max_iterations=rc.max_iterations,
                 reviewer=rc.reviewer_agent.replace("_", " ").title(),
-            ) if template else (
-                f"\n## Review Cycle — Revision {rc.iteration} of {rc.max_iterations}\n\n"
-                f"The {rc.reviewer_agent.replace('_', ' ').title()} has reviewed your work "
-                f"and identified issues to address.\n\n"
-                f"**Your Task**: REVISE your previous output to address the feedback. Don't start from scratch.\n\n"
-                f"After {rc.max_iterations} iterations, unresolved work escalates for human review.\n"
-            )
+            ) if template else ""
 
-        template = loader.workflow_template("revision/feedback_context")
-        return template if template else "\n## Feedback Context\n\nUser feedback has been provided on your previous work. Incorporate their suggestions.\n"
+        return loader.workflow_template("revision/feedback_context")
 
     # ── Reviewer-specific section builders ────────────────────────────────
 
