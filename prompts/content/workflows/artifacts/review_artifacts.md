@@ -29,13 +29,13 @@ Review ALL generated artifacts and fix any issues found. Focus on quality, accur
 For each artifact:
 
 1. **Placeholder Removal** (Critical):
-   - Find and fix unfilled placeholders like `{e}`, `{trace_id}`, `{store_error}`, etc.
+   - Find and fix unfilled placeholders like `{{e}}`, `{{trace_id}}`, `{{store_error}}`, etc.
    - Replace with realistic variable names or complete the code examples
    - Common placeholders to fix:
-     - Exception variables: `{e}` → `e` or specific name
-     - IDs: `{trace_id}` → `trace_id` or example value
-     - Errors: `{store_error}` → `store_error`
-     - Lists: `{invalid_services}` → `invalid_services`
+     - Exception variables: `{{e}}` → `e` or specific name
+     - IDs: `{{trace_id}}` → `trace_id` or example value
+     - Errors: `{{store_error}}` → `store_error`
+     - Lists: `{{invalid_services}}` → `invalid_services`
 
 2. **Code Example Quality**:
    - Ensure all code examples are complete and runnable

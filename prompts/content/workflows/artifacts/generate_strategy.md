@@ -63,9 +63,9 @@ Return ONLY a JSON object (no markdown, no explanations outside JSON) with this 
     {{
       "name": "{project}-<capability>",
       "purpose": "One-line description of what this agent does",
-      "model": "sonnet",
+      "model": "sonnet" | "opus",
       "tools": ["Bash", "Read", "Grep", "Glob", "Edit", "Write"],
-      "color": "blue",
+      "color": "blue" | "green" | "purple" | "orange",
       "rationale": "Why this agent is needed for this project"
     }}
   ],
@@ -73,7 +73,7 @@ Return ONLY a JSON object (no markdown, no explanations outside JSON) with this 
     {{
       "name": "{project}-<skill>",
       "purpose": "One-line description",
-      "args": "<arg-spec>",
+      "args": "<arg-spec>" | "",
       "rationale": "Why this skill is useful"
     }}
   ],
