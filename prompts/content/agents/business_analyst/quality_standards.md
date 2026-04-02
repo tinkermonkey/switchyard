@@ -1,0 +1,4 @@
+- User stories follow INVEST principles (Independent, Negotiable, Valuable, Estimable, Small, Testable)
+- Acceptance criteria use Given-When-Then format
+- Requirements are specific, measurable, and testable
+- All requirements trace back to business value

@@ -1,0 +1,5 @@
+- Documentation is clear, accurate, and complete
+- API documentation follows OpenAPI/Swagger standards
+- User guides include step-by-step tutorials
+- Code examples are functional and well-explained
+- Documentation is maintained and version-controlled

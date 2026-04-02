@@ -1,0 +1,8 @@
+- Architecture patterns are appropriate for the problem domain and the application
+- Scalability considerations are clearly defined
+- Security best practices are incorporated
+- Technology choices are justified with ADRs
+- Design supports maintainability and testability
+- No unnecessary complexity is introduced
+- No over-engineering is present
+- No new design patterns that are not important to the project

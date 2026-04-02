@@ -1,18 +1,21 @@
 """
 Base Maker Agent Class
 
-Provides a unified pattern for all maker agents (create/produce output) with three execution modes:
-1. Initial - First-time analysis/creation
-2. Question - Answer human questions about previous output (conversational)
-3. Revision - Update previous output based on feedback
+Provides a unified execution pattern for all maker agents (agents that create
+or produce output).  Prompt assembly is fully delegated to PromptBuilder;
+agent subclasses declare only their identity and optional capability flags.
 
-All maker agents inherit from this base class and implement agent-specific properties.
+Three execution modes are selected automatically from task context:
+  initial   — first-time creation from requirements
+  question  — conversational reply to a thread question
+  revision  — update based on reviewer or human feedback
 """
 
 from typing import Dict, Any, List
 from abc import ABC, abstractmethod
 from pipeline.base import PipelineStage
 from claude.claude_integration import run_claude_code
+from prompts import PromptBuilder, PromptContext
 import logging
 
 logger = logging.getLogger(__name__)
@@ -20,602 +23,137 @@ logger = logging.getLogger(__name__)
 
 class MakerAgent(PipelineStage, ABC):
     """
-    Base class for all maker agents (agents that create/produce output).
+    Base class for all maker agents.
 
-    Maker agents operate in three modes:
-    - Initial: Create output from requirements
-    - Question: Answer human questions about previous output (conversational)
-    - Revision: Update output based on feedback (from reviewer or human)
+    Subclasses implement the four abstract properties and nothing else —
+    all prompt logic lives in PromptBuilder.
     """
 
     def __init__(self, agent_name: str, agent_config: Dict[str, Any] = None):
         super().__init__(agent_name, agent_config=agent_config)
+        self._prompt_builder = PromptBuilder()
 
-    # ==================================================================================
-    # ABSTRACT PROPERTIES - Each agent must implement these
-    # ==================================================================================
+    # ── Abstract properties — each subclass must provide these ───────────────
 
     @property
     @abstractmethod
     def agent_display_name(self) -> str:
-        """Human-readable agent name (e.g., 'Business Analyst')"""
-        pass
+        """Human-readable label, e.g. 'Business Analyst'."""
 
     @property
     @abstractmethod
     def agent_role_description(self) -> str:
-        """Brief description of agent's role and expertise"""
-        pass
+        """One-sentence role description injected at the top of every prompt."""
 
     @property
     @abstractmethod
     def output_sections(self) -> List[str]:
-        """List of section names in agent's output (for revision prompts)"""
-        pass
+        """Ordered section names used in initial and revision prompts."""
 
-    # ==================================================================================
-    # OPTIONAL PROPERTIES - Agents can override for customization
-    # ==================================================================================
+    # ── Optional overrides ───────────────────────────────────────────────────
 
-    def get_initial_guidelines(self) -> str:
+    @property
+    def prompt_variant(self) -> str:
         """
-        Agent-specific guidelines for initial analysis mode.
-        Override to add domain-specific instructions.
+        Template variant key.
+          'standard'       — analysis/planning framing (default)
+          'implementation' — code implementation framing
         """
-        return ""
+        return "standard"
 
-    def get_quality_standards(self) -> str:
-        """
-        Quality standards and best practices for this agent type.
-        Override to add domain-specific standards.
-        """
-        return ""
+    @property
+    def include_sub_issue_format(self) -> bool:
+        """Set to True to append the sub-issue JSON format block (WorkBreakdownAgent)."""
+        return False
 
-    # ==================================================================================
-    # MODE DETECTION - Determines which execution mode to use
-    # ==================================================================================
+    # ── Capability flags — override or set via agent_config ──────────────────
 
-    def _determine_execution_mode(self, task_context: Dict[str, Any]) -> str:
-        """
-        Determine execution mode from task context.
-
-        Returns:
-            'question' - Conversational mode (threaded Q&A)
-            'revision' - Revision mode (review cycle or feedback)
-            'initial' - Initial analysis mode
-        """
-        # Check for conversational mode (threaded Q&A)
-        is_conversational = (
-            task_context.get('trigger') == 'feedback_loop' and
-            task_context.get('conversation_mode') == 'threaded' and
-            len(task_context.get('thread_history', [])) > 0
-        )
-
-        if is_conversational:
-            logger.info("Using QUESTION mode (threaded conversational)")
-            return 'question'
-
-        # Check for revision mode (review cycle or feedback)
-        is_revision = (
-            task_context.get('trigger') in ['review_cycle_revision', 'feedback_loop'] or
-            'revision' in task_context or
-            'feedback' in task_context
-        )
-
-        if is_revision:
-            logger.info("Using REVISION mode (update based on feedback)")
-            return 'revision'
-
-        # Default to initial mode
-        logger.info("Using INITIAL mode (first-time analysis)")
-        return 'initial'
-
-    # ==================================================================================
-    # OUTPUT INSTRUCTION BUILDER - Conditional based on agent capabilities
-    # ==================================================================================
-
-    def _get_output_instructions(self, mode: str = 'initial') -> str:
-        """
-        Build output instructions based on agent configuration.
-
-        Agents that make code changes get different instructions than
-        agents that only produce analysis/reviews.
-        """
-        from config.manager import config_manager
-
-        # Check if agent makes code changes
+    def _capability_flags(self) -> Dict[str, bool]:
+        """Return makes_code_changes and filesystem_write_allowed from config."""
         makes_code_changes = False
         filesystem_write_allowed = True
-
         if self.agent_config:
-            # Try to get from agent_config dict
             if isinstance(self.agent_config, dict):
-                makes_code_changes = self.agent_config.get('makes_code_changes', False)
-                filesystem_write_allowed = self.agent_config.get('filesystem_write_allowed', True)
-            # Try to get from agent_config object attributes
-            elif hasattr(self.agent_config, 'get'):
-                agent_cfg = self.agent_config.get('agent_config', {})
-                makes_code_changes = agent_cfg.get('makes_code_changes', False)
-                filesystem_write_allowed = agent_cfg.get('filesystem_write_allowed', True)
-
-        # QUESTION MODE: Lighter instructions for conversational replies
-        if mode == 'question':
-            base_instructions = """
-**IMPORTANT - OUTPUT FORMAT**:
-- **PROJECT-SPECIFIC CONVENTIONS OVERRIDE**: Read `/workspace/CLAUDE.md` first.
-- Use proper markdown formatting (headers, lists, code blocks)
-- **NO INTERNAL DIALOG**: Do not include planning statements like "Let me research...", "I'll examine...". Just provide the answer.
-"""
-            if makes_code_changes or filesystem_write_allowed:
-                return base_instructions + """
-- You may create, edit, or modify files if requested
-- Your changes will be auto-committed to git
-- Provide a summary of your work/answer as the GitHub comment
-"""
-            else:
-                return base_instructions + """
-- Output your answer as markdown text directly
-- DO NOT create any files
-"""
-
-        # Agents that modify files get permissive instructions
-        if makes_code_changes or filesystem_write_allowed:
-            return """
-
-**IMPORTANT**:
-- **PROJECT-SPECIFIC CONVENTIONS OVERRIDE**: Read `/workspace/CLAUDE.md` first. The project's CLAUDE.md file defines project-specific conventions, file organization, and documentation requirements that take precedence over these general instructions.
-- You may create, edit, or modify files as needed to complete your task
-- Use the Write, Edit, and other file manipulation tools
-- Your changes will be auto-committed to git
-- Also provide a summary of your work as markdown for the GitHub comment
-- Use proper markdown formatting (headers, lists, code blocks)
-- **DO NOT include internal planning dialog**: Do not include statements like "Let me research...", "I'll examine...", "Now let me check...", etc. in your GitHub comment summary. Only include the final summary of what you did.
-"""
-
-        # Agents that only analyze/review get restrictive instructions
-        else:
-            return """
-
-**IMPORTANT - OUTPUT FORMAT**:
-- **PROJECT-SPECIFIC CONVENTIONS OVERRIDE**: Read `/workspace/CLAUDE.md` first. The project's CLAUDE.md file defines project-specific conventions and documentation requirements that take precedence over these general instructions.
-- Output your analysis as markdown text directly in your response
-- DO NOT create any files - this will be posted to GitHub as a comment
-- DO NOT include project name, feature name, or date headers (this info is already in the discussion)
-- **START IMMEDIATELY** with your first section heading (e.g., "## Executive Summary" or "## Problem Abstraction")
-- **NO CONVERSATIONAL PREAMBLES**: Do NOT include statements like "Ok, I'll build...", "I'll analyze...", "Let me create...", etc.
-- **NO SUMMARY SECTIONS**: Do NOT create a "Summary for GitHub Comment" section at the end - your entire output IS the comment
-- **NO INTERNAL DIALOG**: Do NOT include planning statements like "Let me research...", "I'll examine...", "Now let me check..."
-- Focus on WHAT needs to be done, not HOW or WHEN
-- Be specific and factual, avoid hypotheticals and hyperbole
-- Use proper markdown formatting (headers, lists, code blocks)
-"""
-
-    # ==================================================================================
-    # PROMPT BUILDERS - One for each mode
-    # ==================================================================================
-
-    def _build_initial_prompt(self, task_context: Dict[str, Any]) -> str:
-        """Build prompt for initial analysis/creation"""
-        issue = task_context.get('issue', {})
-        project = task_context.get('project', 'unknown')
-        previous_stage = task_context.get('previous_stage_output', '')
-        pipeline_context_dir = task_context.get('pipeline_context_dir')
-        inputs_from = task_context.get('inputs_from', [])
-
-        previous_stage_prompt = ""
-        if pipeline_context_dir:
-            try:
-                from services.pipeline_context_writer import PipelineContextWriter
-                writer = PipelineContextWriter.from_existing(pipeline_context_dir)
-                if writer.exists():
-                    section = writer.stage_prompt_section(inputs_from)
-                    if section:
-                        previous_stage_prompt = section
-            except Exception:
-                pass
-
-        if not previous_stage_prompt and previous_stage:
-            previous_stage_prompt = f"""
-## Previous Stage Output
-{previous_stage}
-
-Build upon this previous analysis in your work.
-"""
-
-        guidelines = self.get_initial_guidelines()
-        guidelines_section = f"\n{guidelines}" if guidelines else ""
-
-        quality_standards = self.get_quality_standards()
-        quality_section = f"""
-## Quality Standards
-{quality_standards}
-""" if quality_standards else ""
-
-        # Build output instructions based on agent capabilities
-        output_instructions = self._get_output_instructions(mode='initial')
-
-        prompt = f"""
-You are a {self.agent_display_name}.
-
-{self.agent_role_description}
-
-## Task: Initial Analysis
-
-Analyze the following requirement for project {project}:
-
-**Title**: {issue.get('title', 'No title')}
-**Description**: {issue.get('body', 'No description')}
-**Labels**: {issue.get('labels', [])}
-{previous_stage_prompt}{quality_section}
-## Output Format
-
-Provide a comprehensive analysis with the following sections:
-{chr(10).join(f'- {section}' for section in self.output_sections)}
-{guidelines_section}
-{output_instructions}
-"""
-        return prompt
-
-    def _build_question_prompt(self, task_context: Dict[str, Any]) -> str:
-        """Build prompt for answering questions (conversational mode)"""
-        thread_history = task_context.get('thread_history', [])
-        current_question = task_context.get('feedback', {}).get('formatted_text', '')
-        issue = task_context.get('issue', {})
-        pipeline_context_dir = task_context.get('pipeline_context_dir')
-
-        # Include initial guidelines so agent knows its capabilities
-        guidelines = self.get_initial_guidelines()
-        guidelines_section = f"\n{guidelines}" if guidelines else ""
-
-        # Include output instructions so agent knows it can take action
-        output_instructions = self._get_output_instructions(mode='question')
-
-        # Use file-based context when pipeline context dir is available —
-        # avoids embedding potentially large thread_history in the prompt
-        if pipeline_context_dir:
-            try:
-                from services.pipeline_context_writer import PipelineContextWriter
-                writer = PipelineContextWriter.from_existing(pipeline_context_dir)
-                if writer.exists():
-                    context_section = writer.question_prompt_section()
-                    prompt = f"""
-You are the {self.agent_display_name} continuing a conversation.
-
-{self.agent_role_description}
-
-## Original Context
-**Title**: {issue.get('title', 'No title')}
-{guidelines_section}
-{context_section}
-## Latest Question
-{current_question}
-
-## Response Guidelines
-
-You are in **conversational mode** (replying to a comment thread):
-
-1. **REPLY ONLY TO THE LATEST QUESTION**: Do NOT regenerate your entire previous report.
-2. **Take Action When Requested**: If the user is asking you to proceed, DO IT - don't ask for permission again
-3. **Be Direct & Concise**: 200-500 words unless the question needs more
-4. **Reference Prior Discussion**: Build on what's been said
-5. **Natural Tone**: Professional but approachable ("I", "you")
-6. **Stay Focused**: Answer the specific question
-7. **Clarify if Needed**: Ask follow-up questions if unclear
-8. **NO Internal Planning Dialog**: Do not include statements like "Let me research...", "I'll examine...", "Now let me check...". Just provide the findings directly.
-
-**Response Format**:
-- Use markdown for clarity (bold, lists, code blocks)
-- Start directly with your answer (no formal headers)
-- End naturally (no signatures)
-- **DO NOT** include a "Summary" section or "Report" section unless explicitly asked. Just answer the question.
-
-**Common Scenarios**:
-- "Expand on X?" → 2-3 focused paragraphs on X
-- "What about Y?" → Explain Y, connect to previous points
-- "Compare X and Y?" → Direct comparison with key differences
-- "Confused about Z" → Clarify with simpler explanation/examples
-- "Yes, do it" / "Please proceed" → TAKE ACTION immediately without asking again
-{output_instructions}
-
-Your response will be posted as a threaded reply.
-"""
-                    return prompt
-            except Exception:
-                pass
-
-        # Fallback: embed conversation history in the prompt
-        formatted_history = self._format_thread_history(thread_history)
-
-        prompt = f"""
-You are the {self.agent_display_name} continuing a conversation.
-
-{self.agent_role_description}
-
-## Original Context
-**Title**: {issue.get('title', 'No title')}
-**Description**: {issue.get('body', 'No description')}
-{guidelines_section}
-## Conversation History
-{formatted_history}
-
-## Latest Question
-{current_question}
-
-## Response Guidelines
-
-You are in **conversational mode** (replying to a comment thread):
-
-1. **REPLY ONLY TO THE LATEST QUESTION**: Do NOT regenerate your entire previous report.
-2. **Take Action When Requested**: If the user is asking you to proceed, DO IT - don't ask for permission again
-3. **Be Direct & Concise**: 200-500 words unless the question needs more
-4. **Reference Prior Discussion**: Build on what's been said
-5. **Natural Tone**: Professional but approachable ("I", "you")
-6. **Stay Focused**: Answer the specific question
-7. **Clarify if Needed**: Ask follow-up questions if unclear
-8. **NO Internal Planning Dialog**: Do not include statements like "Let me research...", "I'll examine...", "Now let me check...". Just provide the findings directly.
-
-**Response Format**:
-- Use markdown for clarity (bold, lists, code blocks)
-- Start directly with your answer (no formal headers)
-- End naturally (no signatures)
-- **DO NOT** include a "Summary" section or "Report" section unless explicitly asked. Just answer the question.
-
-**Common Scenarios**:
-- "Expand on X?" → 2-3 focused paragraphs on X
-- "What about Y?" → Explain Y, connect to previous points
-- "Compare X and Y?" → Direct comparison with key differences
-- "Confused about Z" → Clarify with simpler explanation/examples
-- "Yes, do it" / "Please proceed" → TAKE ACTION immediately without asking again
-{output_instructions}
-
-Your response will be posted as a threaded reply.
-"""
-        return prompt
-
-    def _build_revision_prompt(self, task_context: Dict[str, Any]) -> str:
-        """Build prompt for revision based on feedback"""
-        # Get revision context
-        revision_data = task_context.get('revision', {})
-        previous_output = revision_data.get('previous_output', task_context.get('previous_output', ''))
-        feedback = revision_data.get('feedback', task_context.get('feedback', {}).get('formatted_text', ''))
-
-        # Check if this is a review cycle
-        review_cycle = task_context.get('review_cycle', {})
-        iteration = review_cycle.get('iteration', 0)
-        max_iterations = review_cycle.get('max_iterations', 3)
-        reviewer = review_cycle.get('reviewer_agent', 'reviewer')
-        is_review_cycle = task_context.get('trigger') == 'review_cycle_revision'
-
-        issue = task_context.get('issue', {})
-
-        # Build cycle context section
-        if is_review_cycle:
-            cycle_context = f"""
-## Review Cycle - Revision {iteration} of {max_iterations}
-
-The {reviewer.replace('_', ' ').title()} has reviewed your work and identified issues to address.
-
-**Your Task**: REVISE your previous output to address the feedback. Don't start from scratch.
-
-After {max_iterations} iterations, unresolved work escalates for human review.
-"""
-        else:
-            cycle_context = """
-## Feedback Context
-
-User feedback has been provided on your previous work. Incorporate their suggestions.
-"""
-
-        # Use file-based context when available (reduces prompt size, full history accessible)
-        context_dir = task_context.get('review_cycle_context_dir')
-        if context_dir and is_review_cycle:
-            feedback_file = f'review_feedback_{iteration}.md'
-            maker_file = f'maker_output_{iteration}.md'
-            prompt = f"""
-You are the {self.agent_display_name} revising your work based on feedback.
-
-{self.agent_role_description}
-{cycle_context}
-**Title**: {issue.get('title', 'No title')}
-
-## Review Cycle Context Files
-
-All context for this review cycle is at `/review_cycle_context/`:
-- **`{feedback_file}`** — the feedback you MUST address ← read this first
-- `{maker_file}` — the implementation that was reviewed (your previous version)
-- `initial_request.md` — original requirements
-- Earlier numbered files show the full iteration history if needed
-
-## Revision Guidelines
-
-**CRITICAL - How to Revise**:
-1. **Read `{feedback_file}` thoroughly** — list each distinct issue raised
-2. **Address EVERY feedback point** — don't leave any issues unresolved
-3. **Make TARGETED changes** — modify only what was criticized
-4. **Keep working content** — don't rewrite sections that weren't criticized
-5. **Stay focused** — don't add new content unless specifically requested
-
-**Required Output Structure**:
-
-**MUST START WITH**:
-```
-## Revision Notes
-- ✅ [Issue 1 Title]: [Brief description of what you changed]
-- ✅ [Issue 2 Title]: [Brief description of what you changed]
-- ✅ [Issue 3 Title]: [Brief description of what you changed]
-...
-```
-
-This checklist is **CRITICAL** - it helps the reviewer see you addressed each point.
-
-**Then provide your COMPLETE, REVISED document**:
-- All sections: {', '.join(self.output_sections)}
-- Full content (not just changes)
-- DO NOT include project name, feature name, or date headers (already in discussion)
-
-**Important Don'ts**:
-- ❌ Start from scratch (this is a REVISION, not complete rewrite)
-- ❌ Skip any feedback point without addressing it
-- ❌ Remove content that wasn't criticized
-- ❌ Add new sections unless specifically requested
-- ❌ Make changes to sections that weren't mentioned in feedback
-- ❌ Ignore subtle feedback ("clarify X" means "add more detail about X")
-
-**Format**: Markdown text for GitHub posting.
-"""
-            return prompt
-
-        # Fallback: embed context directly (legacy state or non-review-cycle revisions)
-        prompt = f"""
-You are the {self.agent_display_name} revising your work based on feedback.
-
-{self.agent_role_description}
-{cycle_context}
-## Original Context
-**Title**: {issue.get('title', 'No title')}
-**Description**: {issue.get('body', 'No description')}
-
-## Your Previous Output (to be revised)
-{previous_output}
-
-## Feedback to Address
-{feedback}
-
-## Revision Guidelines
-
-**CRITICAL - How to Revise**:
-1. **Read feedback systematically**: List each distinct issue raised
-2. **Address EVERY feedback point**: Don't leave any issues unresolved
-3. **Make TARGETED changes**: Modify only what was criticized
-4. **Keep working content**: Don't rewrite sections that weren't criticized
-5. **Stay focused**: Don't add new content unless specifically requested
-
-**Required Output Structure**:
-
-**MUST START WITH**:
-```
-## Revision Notes
-- ✅ [Issue 1 Title]: [Brief description of what you changed]
-- ✅ [Issue 2 Title]: [Brief description of what you changed]
-- ✅ [Issue 3 Title]: [Brief description of what you changed]
-...
-```
-
-This checklist is **CRITICAL** - it helps the reviewer see you addressed each point.
-
-**Then provide your COMPLETE, REVISED document**:
-- All sections: {', '.join(self.output_sections)}
-- Full content (not just changes)
-- DO NOT include project name, feature name, or date headers (already in discussion)
-
-**Important Don'ts**:
-- ❌ Start from scratch (this is a REVISION, not complete rewrite)
-- ❌ Skip any feedback point without addressing it
-- ❌ Remove content that wasn't criticized
-- ❌ Add new sections unless specifically requested
-- ❌ Make changes to sections that weren't mentioned in feedback
-- ❌ Ignore subtle feedback ("clarify X" means "add more detail about X")
-
-**Format**: Markdown text for GitHub posting.
-"""
-        return prompt
-
-    # ==================================================================================
-    # HELPER METHODS
-    # ==================================================================================
-
-    def _format_thread_history(self, history: List[Dict]) -> str:
-        """Format thread history for conversational prompts"""
-        if not history:
-            return ""
-
-        formatted = []
-        for msg in history:
-            role = msg.get('role', 'user')
-            author = msg.get('author', 'unknown')
-
-            # Handle body being either string or dict (e.g., {'formatted_text': '...'})
-            body_raw = msg.get('body', '')
-            if isinstance(body_raw, dict):
-                # Extract text from dict (common patterns)
-                body = body_raw.get('formatted_text', '') or body_raw.get('text', '') or str(body_raw)
-            else:
-                body = str(body_raw)
-
-            body = body.strip()
-
-            if role == 'agent':
-                formatted.append(f"**You** ({author}):\n{body}\n")
-            else:
-                formatted.append(f"**@{author}**:\n{body}\n")
-
-        return "\n".join(formatted)
-
-    # ==================================================================================
-    # MAIN EXECUTION - Delegates to mode-specific prompt builder
-    # ==================================================================================
+                makes_code_changes = self.agent_config.get("makes_code_changes", False)
+                filesystem_write_allowed = self.agent_config.get("filesystem_write_allowed", True)
+            elif hasattr(self.agent_config, "get"):
+                cfg = self.agent_config.get("agent_config", {})
+                makes_code_changes = cfg.get("makes_code_changes", False)
+                filesystem_write_allowed = cfg.get("filesystem_write_allowed", True)
+        return {
+            "makes_code_changes": makes_code_changes,
+            "filesystem_write_allowed": filesystem_write_allowed,
+        }
+
+    # ── Prompt context construction ───────────────────────────────────────────
+
+    def _build_prompt_context(self, task_context: Dict[str, Any]) -> PromptContext:
+        """
+        Build the PromptContext for this invocation.
+
+        Subclasses may override to add agent-specific fields (e.g.
+        WorkBreakdownAgent sets sub-issue extras).
+        """
+        flags = self._capability_flags()
+        return PromptContext.from_task_context(
+            task_context,
+            agent_name=self.agent_name,
+            agent_display_name=self.agent_display_name,
+            agent_role_description=self.agent_role_description,
+            output_sections=self.output_sections,
+            makes_code_changes=flags["makes_code_changes"],
+            filesystem_write_allowed=flags["filesystem_write_allowed"],
+            prompt_variant=self.prompt_variant,
+            include_sub_issue_format=self.include_sub_issue_format,
+        )
+
+    # ── Main execution ────────────────────────────────────────────────────────
 
     async def execute(self, context: Dict[str, Any]) -> Dict[str, Any]:
         """
         Execute agent with automatic mode detection.
 
-        This is the main entry point called by the orchestrator.
-        Mode is detected automatically and delegated to appropriate prompt builder.
+        Called by the orchestrator.  Builds a PromptContext, delegates prompt
+        assembly to PromptBuilder, and runs the prompt via Claude Code SDK.
         """
-        # Extract task context
-        task_context = context.get('context', {})
+        task_context = context.get("context", {})
+        prompt_ctx = self._build_prompt_context(task_context)
 
-        # Determine execution mode
-        mode = self._determine_execution_mode(task_context)
+        logger.info(
+            "Agent %s executing in %s mode (variant=%s)",
+            self.agent_name, prompt_ctx.mode, prompt_ctx.prompt_variant,
+        )
 
-        # Build prompt based on mode
-        if mode == 'question':
-            prompt = self._build_question_prompt(task_context)
-        elif mode == 'revision':
-            prompt = self._build_revision_prompt(task_context)
-        else:  # initial
-            prompt = self._build_initial_prompt(task_context)
+        prompt = self._prompt_builder.build(prompt_ctx)
 
         try:
-            # Enhance context with agent config
             enhanced_context = context.copy()
+            if self.agent_config and "agent_config" in self.agent_config:
+                enhanced_context["agent_config"] = self.agent_config["agent_config"]
+            if self.agent_config and "mcp_servers" in self.agent_config:
+                enhanced_context["mcp_servers"] = self.agent_config["mcp_servers"]
+                logger.info(
+                    "Added %d MCP servers to context", len(enhanced_context["mcp_servers"])
+                )
 
-            if self.agent_config and 'agent_config' in self.agent_config:
-                enhanced_context['agent_config'] = self.agent_config['agent_config']
-            if self.agent_config and 'mcp_servers' in self.agent_config:
-                enhanced_context['mcp_servers'] = self.agent_config['mcp_servers']
-                logger.info(f"Added {len(enhanced_context['mcp_servers'])} MCP servers to context")
-
-            # Execute with Claude Code SDK
             result = await run_claude_code(prompt, enhanced_context)
 
-            # Process result (handle both old string format and new dict format)
             if isinstance(result, dict):
-                analysis_text = result.get('result', '')
-                session_id = result.get('session_id')
-
-                # Propagate output_posted flag so agent_executor skips double-posting.
-                # docker_runner._complete_agent_execution sets this when it has already
-                # posted the output to GitHub (routing via durable YAML state).
-                if result.get('output_posted'):
-                    context['output_posted'] = True
-
-                # Store session_id in context for session continuity
+                analysis_text = result.get("result", "")
+                if result.get("output_posted"):
+                    context["output_posted"] = True
+                session_id = result.get("session_id")
                 if session_id:
-                    context['claude_session_id'] = session_id
-                    logger.info(f"Stored Claude Code session_id: {session_id}")
+                    context["claude_session_id"] = session_id
+                    logger.info("Stored Claude Code session_id: %s", session_id)
             else:
-                # Backward compatibility: old string format
                 analysis_text = result if isinstance(result, str) else str(result)
 
-            # Store output for GitHub comment and downstream consumers
-            context['agent_output'] = analysis_text
-
-            context['completed_work'] = context.get('completed_work', []) + [
+            context["agent_output"] = analysis_text
+            context["completed_work"] = context.get("completed_work", []) + [
                 f"{self.agent_display_name} analysis completed"
             ]
-
             return context
 
-        except Exception as e:
-            raise Exception(f"{self.agent_display_name} execution failed: {str(e)}")
+        except Exception as exc:
+            raise Exception(f"{self.agent_display_name} execution failed: {exc}") from exc

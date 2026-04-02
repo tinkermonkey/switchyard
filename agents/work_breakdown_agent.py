@@ -18,6 +18,7 @@ from agents.utils import parse_json_block
 from config.manager import ConfigManager
 from config.state_manager import GitHubStateManager
 from monitoring.decision_events import get_decision_event_emitter
+from prompts import PromptContext
 import logging
 import json
 import re
@@ -53,39 +54,81 @@ class WorkBreakdownAgent(AnalysisAgent):
 
     @property
     def output_sections(self) -> List[str]:
-        # Output format is fully controlled by sub_issue_instructions in
-        # _build_initial_prompt — no generic sections needed here.
+        # Output format is fully controlled by the sub_issue_format.md content file.
         return []
 
-    # ==================================================================================
-    # OPTIONAL CUSTOMIZATIONS - Agent-specific guidelines
-    # ==================================================================================
+    @property
+    def include_sub_issue_format(self) -> bool:
+        return True
 
-    def get_initial_guidelines(self) -> str:
-        return """
-## Important Guidelines
+    # ── Prompt context override ───────────────────────────────────────────────
 
-- Break work into logical phases based on the architecture design
-- Each sub-issue should be a cohesive unit of work for a developer
-- **CRITICAL**: Include DETAILED technical design in each sub-issue. The developer should not need to look up the original architecture document.
-- Copy relevant API signatures, data models, and component interactions directly into the sub-issue.
-- Include all specific requirements, design guidance, and acceptance criteria in each sub-issue
-- Order sub-issues by dependencies (earlier phases first)
-- Keep phase titles concise: "Phase 1: Infrastructure setup"
-- Do NOT include effort estimates or timeline predictions
-- Focus on WHAT needs to be done in each phase, not HOW long it will take
+    def _build_prompt_context(self, task_context: Dict[str, Any]) -> PromptContext:
+        """
+        Override to resolve discussion/parent-issue numbers before building the
+        PromptContext, so the sub-issue format block can be rendered with the
+        correct GitHub links.
+        """
+        ctx = super()._build_prompt_context(task_context)
 
-**IMPORTANT**: The engineer won't be given the full requirements/design again, so ensure each sub-issue is self-contained including all necessary details.
+        project = task_context.get("project", "unknown")
+        workspace_type = task_context.get("workspace_type", "issues")
+        issue_number = task_context.get("issue_number", "unknown")
+        discussion_id = task_context.get("discussion_id")
 
-"""
+        # Resolve repo URL
+        try:
+            project_config = self.config_manager.get_project_config(project)
+            github_config = project_config.github
+            repo_url = f"https://github.com/{github_config['org']}/{github_config['repo']}"
+        except Exception as exc:
+            logger.warning("Could not get project config: %s", exc)
+            repo_url = "https://github.com/unknown/unknown"
 
-    def get_quality_standards(self) -> str:
-        return """
-- Each sub-issue has clear, testable acceptance criteria
-- Dependencies between sub-issues are explicitly stated
-- Requirements trace back to the original business requirements
-- Design guidance captures relevant sections of the architecture with full architectural context
-"""
+        parent_issue_number = "unknown"
+        discussion_number = "unknown"
+        discussion_url = "[discussion link]"
+
+        if workspace_type == "discussions":
+            try:
+                if discussion_id:
+                    github_state = self.state_manager.load_project_state(project)
+                    if github_state and github_state.discussion_issue_links:
+                        parent_issue_number = github_state.discussion_issue_links.get(discussion_id, "unknown")
+                        if parent_issue_number != "unknown":
+                            logger.info("Found parent issue #%s for discussion %s", parent_issue_number, discussion_id)
+
+                    from services.github_discussions import GitHubDiscussions
+                    details = GitHubDiscussions().get_discussion(discussion_id)
+                    if details:
+                        discussion_number = details.get("number", "unknown")
+                        discussion_url = f"{repo_url}/discussions/{discussion_number}"
+            except Exception as exc:
+                logger.error("Error looking up discussion/issue: %s", exc, exc_info=True)
+        else:
+            parent_issue_number = str(issue_number)
+            try:
+                github_state = self.state_manager.load_project_state(project)
+                if github_state and github_state.issue_discussion_links:
+                    disc_id = github_state.issue_discussion_links.get(str(issue_number))
+                    if disc_id:
+                        from services.github_discussions import GitHubDiscussions
+                        details = GitHubDiscussions().get_discussion(disc_id)
+                        if details:
+                            discussion_number = details.get("number", "unknown")
+                            discussion_url = f"{repo_url}/discussions/{discussion_number}"
+            except Exception as exc:
+                logger.debug("Could not look up discussion for issue #%s: %s", issue_number, exc)
+
+        discussion_reference_json = (
+            f"This work is detailed in discussion [{discussion_number}]({discussion_url})"
+            if discussion_number != "unknown"
+            else ""
+        )
+
+        ctx.sub_issue_parent_issue_number = str(parent_issue_number)
+        ctx.sub_issue_discussion_reference_json = discussion_reference_json
+        return ctx
 
     # ==================================================================================
     # ENHANCED EXECUTION - Create sub-issues in addition to discussion post
@@ -362,149 +405,6 @@ class WorkBreakdownAgent(AnalysisAgent):
                        'change phase', 'split', 'merge']
             return any(keyword in feedback_text for keyword in keywords)
         return False
-
-    # ==================================================================================
-    # OVERRIDE: Enhanced prompts with sub-issue formatting instructions
-    # ==================================================================================
-
-    def _build_initial_prompt(self, task_context: Dict[str, Any]) -> str:
-        """Build prompt for initial work breakdown with sub-issue creation instructions"""
-        base_prompt = super()._build_initial_prompt(task_context)
-
-        # Get workspace info
-        project = task_context.get('project', 'unknown')
-        workspace_type = task_context.get('workspace_type', 'issues')
-        issue_number = task_context.get('issue_number', 'unknown')
-        discussion_id = task_context.get('discussion_id')  # Internal GitHub discussion ID
-
-        # Get project config to find repo URL
-        try:
-            project_config = self.config_manager.get_project_config(project)
-            github_config = project_config.github
-            repo_url = f"https://github.com/{github_config['org']}/{github_config['repo']}"
-        except Exception as e:
-            logger.warning(f"Could not get project config: {e}")
-            repo_url = "https://github.com/unknown/unknown"
-
-        # Determine discussion number and parent issue number
-        discussion_number = 'unknown'
-        parent_issue_number = 'unknown'
-        discussion_url = "[discussion link]"
-        parent_issue_url = "[parent issue link]"
-
-        if workspace_type == 'discussions':
-            # We're working on a discussion
-            # IMPORTANT: issue_number is actually the PARENT ISSUE number, not the discussion number
-            # We need to look up both the parent issue and get the discussion number
-            try:
-                if discussion_id:
-                    # discussion_id is the internal GitHub node ID for the discussion
-                    github_state = self.state_manager.load_project_state(project)
-                    if github_state and github_state.discussion_issue_links:
-                        parent_issue_number = github_state.discussion_issue_links.get(discussion_id)
-                        if parent_issue_number:
-                            parent_issue_url = f"{repo_url}/issues/{parent_issue_number}"
-                            logger.info(f"Found parent issue #{parent_issue_number} for discussion (node_id: {discussion_id})")
-                        else:
-                            logger.warning(f"No parent issue found for discussion node_id {discussion_id}")
-                    else:
-                        logger.warning(f"No discussion_issue_links in GitHub state for project {project}")
-
-                    # Get discussion number from GitHub using the discussion_id
-                    from services.github_discussions import GitHubDiscussions
-                    discussions = GitHubDiscussions()
-                    discussion_details = discussions.get_discussion(discussion_id)
-                    if discussion_details:
-                        discussion_number = discussion_details.get('number', 'unknown')
-                        discussion_url = f"{repo_url}/discussions/{discussion_number}"
-                        logger.info(f"Discussion #{discussion_number} (node_id: {discussion_id})")
-                    else:
-                        logger.warning(f"Could not fetch discussion details for {discussion_id}")
-                else:
-                    logger.error(f"No discussion_id provided in task_context")
-            except Exception as e:
-                logger.error(f"Error looking up discussion/issue: {e}", exc_info=True)
-        else:
-            # We're working on an issue directly
-            parent_issue_number = issue_number
-            parent_issue_url = f"{repo_url}/issues/{issue_number}"
-
-            # If working on an issue, there might still be an associated discussion
-            # Look it up for the sub-issue body
-            try:
-                github_state = self.state_manager.load_project_state(project)
-                if github_state and github_state.issue_discussion_links:
-                    # Convert to string - YAML keys are strings even for numeric values
-                    disc_id = github_state.issue_discussion_links.get(str(issue_number))
-                    if disc_id:
-                        # Get discussion number for this issue
-                        from services.github_discussions import GitHubDiscussions
-                        discussions = GitHubDiscussions()
-                        discussion_details = discussions.get_discussion(disc_id)
-                        if discussion_details:
-                            discussion_number = discussion_details.get('number', 'unknown')
-                            discussion_url = f"{repo_url}/discussions/{discussion_number}"
-                            logger.info(f"Issue #{issue_number} has associated discussion #{discussion_number}")
-            except Exception as e:
-                logger.debug(f"Could not look up discussion for issue #{issue_number}: {e}")
-
-        # Add sub-issue formatting instructions
-        # Build discussion reference based on what we have
-        discussion_reference = ""
-        discussion_reference_json = ""
-        if discussion_number != 'unknown':
-            discussion_reference = f"**Discussion**: This work is detailed in discussion [{discussion_number}]({discussion_url})"
-            discussion_reference_json = f"This work is detailed in discussion [{discussion_number}]({discussion_url})"
-
-        sub_issue_instructions = f"""
-
-## Output Format
-
-Output ONLY a ```json code block containing an array of sub-issue objects.
-Do not add any other text before or after the JSON.
-
-```json
-[
-  {{
-    "title": "Phase 1: [Concise description]",
-    "description": "Brief overview of this phase's goals.",
-    "requirements": "- Specific requirement 1\\n- Specific requirement 2",
-    "design_guidance": "- Technical detail 1\\n- API signature or data model",
-    "acceptance_criteria": "- [ ] Testable criterion\\n- [ ] Code is reviewed and approved",
-    "dependencies": "None",
-    "parent_issue": "#{parent_issue_number}",
-    "discussion": "{discussion_reference_json}",
-    "phase": "Phase 1: [Concise description]"
-  }},
-  {{
-    "title": "Phase 2: [Concise description]",
-    "description": "...",
-    "requirements": "...",
-    "design_guidance": "...",
-    "acceptance_criteria": "...",
-    "dependencies": "Phase 1",
-    "parent_issue": "#{parent_issue_number}",
-    "discussion": "{discussion_reference_json}",
-    "phase": "Phase 2: [Concise description]"
-  }}
-]
-```
-
-**Rules**:
-- One object per phase, ordered by dependency (foundational work first)
-- `requirements`, `design_guidance`, and `acceptance_criteria` are multi-line markdown strings — use `\\n` for newlines within each JSON string value
-- `dependencies`: `"None"` or phase titles like `"Phase 1"` or `"Phase 1, Phase 2"`
-- The JSON array must be syntactically valid
-
-**Content requirements**:
-1. Extract phases from the software architect's design (or create logical phases if not explicit)
-2. Break work into smaller chunks if phases are too large
-3. **CRITICAL**: Pull specific requirements from the business analyst's work and specific design guidance from the software architect
-4. **CRITICAL**: Include detailed technical specifications (API signatures, data models, component interactions) in `design_guidance` — the sub-issue must be self-contained
-5. Keep titles concise and descriptive
-"""
-
-        return base_prompt + sub_issue_instructions
 
     # ==================================================================================
     # SUB-ISSUE PARSING AND CREATION

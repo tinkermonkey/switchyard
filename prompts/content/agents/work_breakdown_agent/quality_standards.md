@@ -1,0 +1,4 @@
+- Each sub-issue has clear, testable acceptance criteria
+- Dependencies between sub-issues are explicitly stated
+- Requirements trace back to the original business requirements
+- Design guidance captures relevant sections of the architecture with full architectural context

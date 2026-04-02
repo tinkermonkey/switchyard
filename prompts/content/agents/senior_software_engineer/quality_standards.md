@@ -1,0 +1,2 @@
+- Proper error handling and logging
+- Clear variable/function naming
