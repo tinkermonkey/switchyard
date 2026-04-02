@@ -47,33 +47,11 @@ from monitoring.timestamp_utils import utc_now, utc_isoformat, to_utc_isoformat
 from monitoring.observability import EventType
 from monitoring.cycle_stack import push_frame, CycleFrame
 from services.cancellation import CancellationError
+from prompts.loader import default_loader
 
 
 logger = logging.getLogger(__name__)
 
-# Shared output format appended to every test-runner prompt.
-# Using a plain string (not an f-string) so the literal {} in the JSON examples
-# are safe to concatenate with both plain and f-string prompt bodies.
-_TEST_OUTPUT_FORMAT = """
-CRITICAL: You MUST return ONLY valid JSON in this EXACT format (no markdown, no explanation):
-{
-    "passed": <number of passing checks or tests>,
-    "failed": <number of failing checks or tests>,
-    "warnings": <number of items in warning_list (must equal len(warning_list), 0 if empty)>,
-    "failures": [
-        {"file": "<file path>", "test": "<check or test name>", "message": "<failure message>"},
-        ...
-    ],
-    "warning_list": [
-        {"file": "<file path>", "message": "<warning message>"},
-        ...
-    ]
-}
-
-If everything passes cleanly, return:
-{"passed": 1, "failed": 0, "warnings": 0, "failures": [], "warning_list": []}
-
-DO NOT include any explanation, markdown formatting, or other text - ONLY the JSON object."""
 
 MAX_SYSTEMIC_SUB_CYCLES = 3   # max attempts per special-case sub-cycle
 
@@ -945,175 +923,24 @@ class RepairCycleStage(PipelineStage):
         pipeline_run_id = context.get("pipeline_run_id")
 
         # Build the appropriate prompt for this test type
-        if config.test_type == "compilation":
-            direct_prompt = """Ensure all code in this project passes compilation and linting checks.
-
-Your goal is to identify and report compilation errors and linting violations so they can be fixed before running tests.
-
-1. Identify the project's tech stack by inspecting config files (package.json, pyproject.toml, tsconfig.json, setup.py, etc.)
-
-2. Run the appropriate compilation and linting tools:
-   - **TypeScript/JavaScript**: `npx tsc --noEmit` (or the configured tsconfig) and ESLint if configured
-   - **Python**:
-     a. First auto-fix: `ruff check --fix --unsafe-fixes .` (removes unused variables, fixes comparison style, etc.)
-     b. Then check remaining: `ruff check .` — report only violations that require manual fixes
-     c. Type check: `mypy src/` (or `mypy .` if no src/ layout)
-   - **Other languages**: use the project's configured build/lint toolchain
-
-3. Save the full output to /tmp/compilation_results.txt for reference.
-
-4. Return structured results. Each distinct error is a separate failure entry. Use the source file as "file", the error code or rule as "test", and the error message as "message".""" + _TEST_OUTPUT_FORMAT
-
-        elif config.test_type == "pre-commit":
-            direct_prompt = """Run the pre-commit scripts for this project and report any failures.
-
-1. Identify how pre-commit is configured by inspecting the project root (e.g. .pre-commit-config.yaml, package.json scripts, Makefile targets named "pre-commit").
-
-2. Run the pre-commit scripts against all files:
-   - If using the `pre-commit` tool: `pre-commit run --all-files`
-   - If using a npm/package.json script: `npm run pre-commit` (or the configured script name)
-   - If using a Makefile target: `make pre-commit`
-
-3. Save the full output to /tmp/pre_commit_results.txt for reference.
-
-4. Return structured results. Each distinct hook failure is a separate entry. Use the hook name as "test" and the file it failed on (if reported) as "file"; use the hook name as "file" if no specific file is identified.""" + _TEST_OUTPUT_FORMAT
-
-        elif config.test_type == "ci":
-            # Allow ~25 minutes for CI polling before timing out gracefully.
-            poll_deadline_minutes = 25
-            direct_prompt = f"""Check whether CI (continuous integration) is passing for this project's current branch.
-
-You have approximately {poll_deadline_minutes} minutes to complete this check before your session times out.
-If CI has not completed within that window, return a failure result indicating CI is still running.
-
-Follow these steps exactly:
-
-0. Check whether CI is configured for this project:
-   Look for CI configuration files (e.g. `.github/workflows/`, `.circleci/`, `.travis.yml`, `Jenkinsfile`, `azure-pipelines.yml`).
-   If none exist, CI is not set up for this project — return success immediately:
-   {{"passed": 1, "failed": 0, "warnings": 0, "failures": [], "warning_list": []}}
-
-1. Verify the current branch is a feature branch (not main/master/develop):
-   `git rev-parse --abbrev-ref HEAD`
-   If the branch is main, master, or develop — stop immediately and return:
-   {{"passed": 0, "failed": 1, "warnings": 0, "failures": [{{"file": "git", "test": "branch-check", "message": "CI test type should not run on default branch"}}], "warning_list": []}}
-
-2. Check whether there are local commits not yet pushed to origin:
-   `git status -sb`
-   If there are unpushed commits, attempt to push:
-   `git push origin HEAD`
-   If the push succeeds, proceed to step 3.
-   If the push fails due to authentication/network issues, do NOT treat this as a CI failure.
-   Instead, check if any CI run exists for the current commit SHA that was already pushed earlier:
-   `git rev-parse origin/$(git rev-parse --abbrev-ref HEAD)` to get the last pushed SHA
-   Then query for CI runs on that commit. If the most recent run for the pushed commit is a success, return success.
-   If there is no successful run and push failed, return:
-   {{"passed": 0, "failed": 1, "warnings": 0, "failures": [{{"file": "git", "test": "push", "message": "Cannot push unpushed commits — authentication failed. CI cannot be verified against latest code."}}], "warning_list": []}}
-
-3. Wait for the most recent CI run to complete:
-   `gh run list --limit 1 --branch $(git rev-parse --abbrev-ref HEAD) --json databaseId,status,conclusion,workflowName`
-   Poll every 30 seconds until `status` is `completed`.
-   **IMPORTANT**: Only check the CI run that was triggered by the push in step 2 (or the most recent one if already up-to-date).
-   Do NOT report a stale CI run that predates the current commit as the result.
-   Verify the run's head SHA matches the current commit: `gh run view <run_id> --json headSha`
-
-   **JSON parsing**: Do NOT use `jq` — it may not be installed. Use python3 instead:
-   ```
-   gh run list --limit 1 --branch BRANCH --json databaseId,status,conclusion,workflowName \
-     | python3 -c "import sys,json; runs=json.load(sys.stdin); r=runs[0] if runs else {{}}; print(r.get('databaseId',''), r.get('status',''), r.get('conclusion',''))"
-   ```
-   Or to get a single field from `gh run view`:
-   ```
-   gh run view RUN_ID --json headSha | python3 -c "import sys,json; print(json.load(sys.stdin).get('headSha',''))"
-   ```
-
-   If no CI run appears within 3 minutes of pushing, return:
-   {{"passed": 0, "failed": 1, "warnings": 0, "failures": [{{"file": "ci", "test": "trigger", "message": "No CI run triggered within 3 minutes of push — CI may not be configured for this branch"}}], "warning_list": []}}
-   If CI has still not completed when you are within 2 minutes of your deadline, stop polling and return:
-   {{"passed": 0, "failed": 1, "warnings": 0, "failures": [{{"file": "ci", "test": "timeout", "message": "CI run did not complete within the allotted time ({poll_deadline_minutes} minutes)"}}], "warning_list": []}}
-
-4. Once completed, check the conclusion. If `conclusion` is `success`, CI passed — return the passing result.
-
-5. If CI failed, retrieve failure details:
-   `gh run view <run_id> --log-failed`
-   Save the full output to /tmp/ci_failures.txt for reference.
-
-6. Parse the failures into the structured format below. Each CI job failure is a separate entry.
-   Use the source file path from the log as "file" (or the job/workflow name if no file is identifiable).
-   Use the job name and step name as "test".""" + _TEST_OUTPUT_FORMAT
-
-        elif config.test_type == "storybook":
-            direct_prompt = """Run the Storybook story tests for this project.
-
-1. Check if Storybook is configured by looking for storybook-related scripts in package.json.
-   If Storybook is not configured, return success immediately:
-   {"passed": 1, "failed": 0, "warnings": 0, "failures": [], "warning_list": []}
-
-2. Run the full Storybook test suite using the all-in-one script:
-   `npm run test:storybook:full`
-   This script builds Storybook, serves it locally on port 61001, waits for the server to be ready,
-   and runs all story tests (including accessibility checks via axe-core).
-
-3. Save the full output to /tmp/storybook_results.txt for reference.
-
-4. Return structured results. Each failing story test is a separate failure entry.
-   Use the story file path as "file", the story/test name as "test", and the error message as "message".""" + _TEST_OUTPUT_FORMAT
-
-        elif config.test_type == "unit":
-            direct_prompt = """Run ONLY unit tests for this project. Do NOT run integration, e2e, or performance tests.
-
-1. Identify the test framework and unit test location by inspecting the project structure and config files
-   (pytest.ini, pyproject.toml, package.json, etc.)
-
-2. Determine the correct scope — prefer directory-based scoping over marker-based:
-   - **Python (pytest)**:
-     a. Check whether a dedicated unit test directory exists (e.g. tests/unit_tests/, tests/unit/, src/tests/).
-        If it exists, run: `pytest <unit_test_dir>/`
-        This is the most reliable way to avoid accidentally running integration or performance tests.
-     b. If tests are NOT separated by directory, check pytest.ini/pyproject.toml markers and run:
-        `pytest -m "not integration and not e2e and not performance and not slow"`
-     Always run from the project root so pytest.ini is picked up.
-   - **TypeScript/JavaScript**: `npm test` or `npx vitest run` or `npx jest --testPathPattern=unit`
-     (use the configured test script; if a unit/ directory exists, target it directly)
-   - **Other**: use the project's configured unit test command
-
-3. Save the full output to /tmp/unit_test_results.txt for reference.
-
-4. Count only ACTUAL test failures in "failures" — not log lines that contain the word ERROR or FAILED.
-   Count only ACTIONABLE warnings in "warning_list" (e.g. deprecation warnings in test code that
-   should be fixed) — not expected log-level WARNING messages from the application under test.
-   Set "warnings" to exactly len(warning_list).""" + _TEST_OUTPUT_FORMAT
-
-        elif config.test_type == "integration":
-            direct_prompt = """Run ONLY integration tests for this project. Do NOT run unit, e2e, or performance tests.
-
-1. Identify the test framework and integration test location by inspecting the project structure and
-   config files.
-
-2. Determine the correct scope — prefer directory-based scoping:
-   - **Python (pytest)**:
-     a. Check whether a dedicated integration test directory exists (e.g. tests/integration_tests/,
-        tests/integration/). If it exists, run: `pytest <integration_test_dir>/`
-     b. If tests are NOT separated by directory, use the marker: `pytest -m integration`
-     Always run from the project root so pytest.ini is picked up.
-   - **TypeScript/JavaScript**: use the configured integration test script or directory.
-
-3. Save the full output to /tmp/integration_test_results.txt for reference.
-
-4. Count only ACTUAL test failures. Set "warnings" to exactly len(warning_list).""" + _TEST_OUTPUT_FORMAT
-
+        _test_output_format = default_loader.workflow_template("repair/test_output_format")
+        _runner_key = {
+            "compilation": "runner_compilation",
+            "pre-commit": "runner_pre_commit",
+            "ci": "runner_ci",
+            "storybook": "runner_storybook",
+            "unit": "runner_unit",
+            "integration": "runner_integration",
+        }.get(config.test_type)
+        if _runner_key:
+            direct_prompt = default_loader.workflow_template(f"repair/{_runner_key}") + _test_output_format
         else:
-            direct_prompt = f"""Run all {config.test_type} tests for this project.
-
-Please identify the appropriate test framework and location for {config.test_type} tests.
-
-**IMPORTANT**: When running tests, save the test results to a file in /tmp so that you can refer back to them and so they're not made part of the codebase.
-
-These tests runs can take some time to complete, please be patient and don't put time limits on the test execution. Make sure you're capturing the information you need to identify failures without having to re-run the tests multiple times.
-
-Also, make sure you are capturing the **full** output of the test runs, including any warnings and errors, to disk to avoid having to re-run the tests multiple times.
-
-Be mindful of environment setup steps like installing dependencies and activating virtual environments.""" + _TEST_OUTPUT_FORMAT
+            direct_prompt = (
+                default_loader.workflow_template("repair/runner_generic").format(
+                    test_type=config.test_type,
+                )
+                + _test_output_format
+            )
 
         # Build task context for this agent execution
         _iter_stack = push_frame(
@@ -1595,14 +1422,10 @@ Be mindful of environment setup steps like installing dependencies and activatin
                 "review_cycle": None,
                 "cycle_stack": _warn_stack,
                 # Provide the review instructions as a 'direct_prompt' so the agent can use it
-                "direct_prompt": f"""Review these warnings from a run of {source_file}:
-
-{warning_text}
-
-For each warning:
-- Determine if it's expected in this context
-- If not expected, fix the underlying issue
-""",
+                "direct_prompt": default_loader.workflow_template("repair/warning_review").format(
+                    source_file=source_file,
+                    warning_text=warning_text,
+                ),
             }
 
             # Increment agent call counter
@@ -1899,30 +1722,13 @@ For each warning:
                 failure_lines.append(f"  ... and {len(failures) - 5} more")
         failure_summary = "\n".join(failure_lines)
 
-        direct_prompt = f"""Analyze these test failures for systemic root causes.
-
-Project: {project}
-Test type: {config.test_type}
-Total failures: {test_result.failed}
-Files with failures: {len(grouped_failures)}
-
-Failure summary:
-{failure_summary}
-
-Classify the failures into:
-1. Environmental issues: version mismatches, missing packages, stale node_modules, outdated Docker image, or any issue requiring Dockerfile.agent changes
-2. Systemic code issues: the same code pattern or bug repeated across many files that can be fixed with a single global change
-
-You MUST return ONLY valid JSON in this EXACT format (no markdown, no explanation):
-{{
-    "has_env_issues": true,
-    "env_issue_description": "describe what Dockerfile.agent or environment changes are needed, or empty string if none",
-    "has_systemic_code_issues": false,
-    "systemic_issue_description": "describe the global code fix needed and how to apply it, or empty string if none",
-    "affected_files": ["list of files involved in the systemic code fix, or empty array"]
-}}
-
-If the failures appear to be isolated per-file issues with different root causes, return has_env_issues: false and has_systemic_code_issues: false."""
+        direct_prompt = default_loader.workflow_template("repair/systemic_analysis").format(
+            project=project,
+            test_type=config.test_type,
+            total_failures=test_result.failed,
+            files_with_failures=len(grouped_failures),
+            failure_summary=failure_summary,
+        )
 
         _analysis_stack = push_frame(
             context.get('cycle_stack', []),
@@ -2449,16 +2255,12 @@ If the failures appear to be isolated per-file issues with different root causes
                 f"{current_test_result.failed} {config.test_type} failures remaining"
             )
 
-            direct_prompt = f"""Your goal is to fix ALL failing {config.test_type} tests in this project. Every failure listed below must pass before you are done.{known_pattern}
-
-## Current failure state
-{failure_digest}{attempt_note}
-
-## How to approach this
-1. Examine representative failing files to understand the root cause. The failure state above shows a sample — the full set of affected files may be larger.
-2. Use grep or glob to discover every file in the project that exhibits the same pattern, not just the ones listed above.
-3. Apply fixes comprehensively across all affected files. Prefer bulk approaches (scripted edits, sed, ast-based transforms) over editing files one at a time.
-4. After fixing, run the {config.test_type} checks to measure progress. Repeat until all failures are resolved."""
+            direct_prompt = default_loader.workflow_template("repair/systemic_fix").format(
+                test_type=config.test_type,
+                known_pattern=known_pattern,
+                failure_digest=failure_digest,
+                attempt_note=attempt_note,
+            )
 
             task_description = (
                 f"Fix {current_test_result.failed} {config.test_type} failures"
