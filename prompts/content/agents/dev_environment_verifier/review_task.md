@@ -1,3 +1,12 @@
+---
+invoked_by: prompts/builder.py — PromptBuilder.build_verifier_prompt() via loader.agent_review_task("dev_environment_verifier")
+  Injected as {verification_task} in the verifier mode template; all {project_name} occurrences
+  are pre-expanded via .replace("{project_name}", project_name) before injection
+variables:
+  project_name: Project name string; expanded by build_verifier_prompt() before template injection
+    (not a standard str.format() variable — replaced via str.replace() to avoid conflicts with
+    shell command braces like ${VAR} in the file content)
+---
 ## Your Verification Tasks
 
 **CRITICAL**: You must verify the Docker image was built successfully and mark the container state appropriately.

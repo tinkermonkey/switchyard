@@ -1,3 +1,8 @@
+---
+invoked_by: prompts/builder.py — PromptBuilder._reviewer_format_instructions() via loader.agent_format_rereviewing("code_reviewer")
+  Called when is_rereviewing=True; injected as {format_instructions} in the reviewer mode template
+variables: none
+---
 **Review Format**:
 ```
 ### Status

@@ -1,3 +1,11 @@
+---
+invoked_by: prompts/builder.py — PromptBuilder.build_from_template() via loader.workflow_template("pr_review/requirements")
+  Used when ctx.agent_name == "requirements_verifier"; check_content is truncated to 15000 chars if needed
+variables:
+  pr_url: URL of the pull request to verify (ctx.pr_url)
+  check_name: Name/label of the context source being verified (ctx.check_name)
+  check_content: Full content of the context to verify against (ctx.check_content, max 15000 chars)
+---
 You are a Requirements Verification Specialist.
 
 ## PR to Verify

@@ -1,3 +1,9 @@
+---
+invoked_by: prompts/builder.py — PromptBuilder.build_from_template() via loader.workflow_template("pr_review/code_review")
+  Used when ctx.agent_name == "pr_code_reviewer"; check_content is truncated to 15000 chars if needed
+variables:
+  pr_url: URL of the pull request to review (ctx.pr_url)
+---
 You are a PR Code Reviewer. Review this pull request for code quality issues.
 
 **CRITICAL**: Use the /pr-review-toolkit:review-pr skill for this task.

@@ -1,3 +1,10 @@
+---
+invoked_by: prompts/builder.py — PromptBuilder._build_initial() via loader.agent_sub_issue_format("work_breakdown_agent")
+  Appended to the assembled initial prompt when ctx.include_sub_issue_format=True (WorkBreakdownAgent only)
+variables:
+  parent_issue_number: GitHub issue number of the parent epic (ctx.sub_issue_parent_issue_number)
+  discussion_reference_json: JSON-serialised discussion reference object (ctx.sub_issue_discussion_reference_json)
+---
 
 ## Output Format
 

@@ -1,3 +1,8 @@
+---
+invoked_by: prompts/builder.py — PromptBuilder._build_initial() via loader.agent_guidelines("technical_writer")
+  Injected as {guidelines_section} in the initial_standard or initial_implementation mode template
+variables: none
+---
 **Documentation Creation Guidelines**:
 
 **Scope & Focus**:

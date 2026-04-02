@@ -1,3 +1,8 @@
+---
+invoked_by: prompts/builder.py — PromptBuilder._build_initial() via loader.agent_guidelines("senior_software_engineer")
+  Injected as {guidelines_section} in the initial_implementation mode template (prompt_variant == "implementation")
+variables: none
+---
 Implement the code changes to meet the requirements specified.
 
 **Project-Specific Expert Agents**:

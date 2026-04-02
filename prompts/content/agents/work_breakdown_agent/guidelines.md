@@ -1,3 +1,8 @@
+---
+invoked_by: prompts/builder.py — PromptBuilder._build_initial() via loader.agent_guidelines("work_breakdown_agent")
+  Injected as {guidelines_section} in the initial_standard or initial_implementation mode template
+variables: none
+---
 ## Important Guidelines
 
 - Break work into logical phases based on the architecture design

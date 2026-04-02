@@ -1,3 +1,8 @@
+---
+invoked_by: prompts/builder.py — PromptBuilder.build_reviewer_prompt() via loader.agent_review_task("code_reviewer")
+  Injected as {review_task} in the reviewer mode template
+variables: none
+---
 **Code Quality Assessment**:
 - Clean code practices (DRY, KISS, YAGNI)
 - Code readability and maintainability

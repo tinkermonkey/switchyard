@@ -1,3 +1,8 @@
+---
+invoked_by: prompts/builder.py — PromptBuilder._build_initial() via loader.agent_guidelines("business_analyst")
+  Injected as {guidelines_section} in the initial_standard or initial_implementation mode template
+variables: none
+---
 ## Important Guidelines
 
 **Content Guidelines**:

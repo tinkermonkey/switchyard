@@ -1,3 +1,8 @@
+---
+invoked_by: prompts/builder.py — PromptBuilder.build_reviewer_prompt() via loader.agent_review_task("documentation_editor")
+  Injected as {review_task} in the reviewer mode template
+variables: none
+---
 **Content Quality Assessment**:
 - Factual accuracy and technical correctness
 - Clarity and readability for target audience

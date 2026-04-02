@@ -1,3 +1,8 @@
+---
+invoked_by: prompts/builder.py — PromptBuilder._output_instructions() via loader.workflow_template("output/code_writing")
+  Used when mode != "question" and is_file_writer=True (ctx.makes_code_changes or ctx.filesystem_write_allowed)
+variables: none
+---
 
 **IMPORTANT**:
 - **PROJECT-SPECIFIC CONVENTIONS OVERRIDE**: Read `/workspace/CLAUDE.md` first. The project's CLAUDE.md file defines project-specific conventions, file organisation, and documentation requirements that take precedence over these general instructions.

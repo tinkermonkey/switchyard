@@ -1,3 +1,8 @@
+---
+invoked_by: prompts/builder.py — PromptBuilder._build_initial() via loader.agent_guidelines("dev_environment_setup")
+  Injected as {guidelines_section} in the initial_standard or initial_implementation mode template
+variables: none
+---
 ### Your Task:
 
 1. **Analyse the Codebase and any problem descriptions**:

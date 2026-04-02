@@ -9,7 +9,7 @@ review cycle blocks, and placeholder expansion.
 import pytest
 from prompts import PromptBuilder, PromptContext
 from prompts.context import IssueContext, ReviewCycleContext
-from prompts.loader import ContentLoader
+from prompts.loader import ContentLoader, _strip_frontmatter
 
 
 # ---------------------------------------------------------------------------
@@ -81,28 +81,37 @@ class TestContentLoader:
         assert self.LOADER.agent_format_rereviewing(agent_name), \
             f"format_rereviewing.md missing for {agent_name}"
 
-    @pytest.mark.parametrize("agent_name", ["pr_code_reviewer", "requirements_verifier"])
-    def test_main_prompt_non_empty(self, agent_name):
-        assert self.LOADER.agent_main_prompt(agent_name), \
-            f"main_prompt.md missing for {agent_name}"
+    @pytest.mark.parametrize("workflow_path,label", [
+        ("pr_review/code_review", "pr_code_reviewer"),
+        ("pr_review/requirements", "requirements_verifier"),
+    ])
+    def test_pr_review_workflow_templates_non_empty(self, workflow_path, label):
+        assert self.LOADER.workflow_template(workflow_path), \
+            f"workflows/{workflow_path}.md missing for {label}"
 
     def test_sub_issue_format_non_empty(self):
         assert self.LOADER.agent_sub_issue_format("work_breakdown_agent")
 
-    def test_output_instructions_all_non_empty(self):
-        assert self.LOADER.output_instructions_code_writing()
-        assert self.LOADER.output_instructions_analysis()
-        assert self.LOADER.output_instructions_code_writing_question()
-        assert self.LOADER.output_instructions_analysis_question()
+    @pytest.mark.parametrize("path", [
+        "output/code_writing",
+        "output/analysis",
+        "question/output_code",
+        "question/output_analysis",
+    ])
+    def test_output_workflow_templates_non_empty(self, path):
+        assert self.LOADER.workflow_template(path), f"workflows/{path}.md is empty or missing"
 
-    def test_review_cycle_all_non_empty(self):
-        assert self.LOADER.review_cycle_maker_revision_cycle()
-        assert self.LOADER.review_cycle_maker_feedback()
-        assert self.LOADER.review_cycle_reviewer_initial()
-        assert self.LOADER.review_cycle_reviewer_rereviewing()
-        assert self.LOADER.review_cycle_reviewer_post_human()
-        assert self.LOADER.review_cycle_verifier_initial()
-        assert self.LOADER.review_cycle_verifier_rereviewing()
+    @pytest.mark.parametrize("path", [
+        "revision/cycle_context",
+        "revision/feedback_context",
+        "review/iteration_initial",
+        "review/iteration_rereviewing",
+        "review/iteration_post_human",
+        "verification/iteration_initial",
+        "verification/iteration_rereviewing",
+    ])
+    def test_cycle_workflow_templates_non_empty(self, path):
+        assert self.LOADER.workflow_template(path), f"workflows/{path}.md is empty or missing"
 
     def test_documentation_editor_rereviewing_context_non_empty(self):
         assert self.LOADER.agent_rereviewing_context("documentation_editor"), \
@@ -114,6 +123,51 @@ class TestContentLoader:
     def test_missing_file_returns_empty_string(self):
         assert self.LOADER.agent_guidelines("nonexistent_agent") == ""
         assert self.LOADER.agent_quality_standards("nonexistent_agent") == ""
+
+    @pytest.mark.parametrize("path", [
+        "initial/standard", "initial/implementation",
+        "question/file_context", "question/embedded",
+        "revision/file_based", "revision/embedded",
+        "review/prompt", "verification/prompt",
+    ])
+    def test_structural_workflow_templates_non_empty(self, path):
+        assert self.LOADER.workflow_template(path), f"workflows/{path}.md is empty or missing"
+
+    def test_workflow_template_missing_returns_empty(self):
+        assert self.LOADER.workflow_template("nonexistent/path") == ""
+
+    def test_workflow_templates_have_no_frontmatter(self):
+        """Frontmatter must be stripped before content is returned."""
+        for path in ("initial/standard", "initial/implementation",
+                     "question/file_context", "question/embedded",
+                     "revision/file_based", "revision/embedded",
+                     "review/prompt", "verification/prompt"):
+            content = self.LOADER.workflow_template(path)
+            assert not content.startswith("---"), \
+                f"workflows/{path}.md still contains frontmatter after loading"
+
+    def test_strip_frontmatter_removes_yaml_block(self):
+        raw = "---\nkey: value\nanother: thing\n---\nActual content here."
+        assert _strip_frontmatter(raw) == "Actual content here."
+
+    def test_strip_frontmatter_no_frontmatter_unchanged(self):
+        raw = "No frontmatter here.\nJust content."
+        assert _strip_frontmatter(raw) == raw
+
+    def test_strip_frontmatter_unclosed_returns_unchanged(self):
+        raw = "---\nkey: value\nno closing delimiter"
+        assert _strip_frontmatter(raw) == raw
+
+    def test_content_files_have_no_frontmatter_after_load(self):
+        """All loaded content should be free of frontmatter delimiters at the start."""
+        loader = self.LOADER
+        # Sample a cross-section of file types
+        assert not loader.agent_guidelines("business_analyst").startswith("---")
+        assert not loader.agent_quality_standards("software_architect").startswith("---")
+        assert not loader.workflow_template("review/iteration_initial").startswith("---")
+        assert not loader.workflow_template("revision/cycle_context").startswith("---")
+        assert not loader.workflow_template("output/code_writing").startswith("---")
+        assert not loader.agent_review_task("code_reviewer").startswith("---")
 
 
 # ---------------------------------------------------------------------------

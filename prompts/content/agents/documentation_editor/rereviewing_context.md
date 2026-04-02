@@ -1,3 +1,15 @@
+---
+invoked_by: prompts/builder.py — PromptBuilder._reviewer_iteration_context() via loader.agent_rereviewing_context("documentation_editor")
+  Agent-specific override for re-review mode; takes precedence over reviewer_rereviewing.md
+  Falls back to review_cycle/reviewer_rereviewing.md if this file is absent
+variables:
+  iteration: Current review cycle iteration number (rc.iteration)
+  max_iterations: Maximum allowed iterations before human escalation (rc.max_iterations)
+  maker_agent_title: Maker agent name formatted as title case (rc.maker_agent.replace("_", " ").title())
+  prior_feedback_section: Pre-formatted block referencing or embedding previous review feedback;
+    either "read /review_cycle_context/review_feedback_{n-1}.md" instruction (file-based) or
+    embedded <previous_feedback> block, or empty string if no prior feedback available
+---
 
 ## Review Cycle Context — Re-Review Mode
 

@@ -2,33 +2,54 @@
 Content file loader for prompt assembly.
 
 All prose content (guidelines, quality standards, review criteria, output
-instructions, review cycle blocks) lives in prompts/content/ as markdown
-files.  Files may contain {variable} placeholders that are filled in by
-PromptBuilder after loading.
+instructions, and structural prompt templates) lives in prompts/content/ as
+markdown files.  Files may contain {variable} placeholders that are filled in
+by PromptBuilder after loading.
+
+Files may optionally include YAML frontmatter (--- ... ---) which documents
+the invocation path and available variables.  Frontmatter is stripped
+automatically before content is returned — it is for human reference only.
 
 Directory layout:
     prompts/content/
-        output_instructions/
-            code_writing.md
-            analysis.md
-            code_writing_question.md
-            analysis_question.md
-        review_cycle/
-            maker_revision_cycle.md
-            maker_feedback.md
-            reviewer_initial.md
-            reviewer_rereviewing.md
-            reviewer_post_human.md
-            verifier_initial.md
-            verifier_rereviewing.md
+        workflows/
+            initial/
+                standard.md        structural template — analysis agents, initial mode
+                implementation.md  structural template — code agents, initial mode
+            question/
+                file_context.md    structural template — question mode, file-based context
+                embedded.md        structural template — question mode, embedded history
+                output_code.md     output instructions — question mode, file-writing agents
+                output_analysis.md output instructions — question mode, analysis agents
+            revision/
+                file_based.md      structural template — revision mode, file-based context
+                embedded.md        structural template — revision mode, embedded feedback
+                cycle_context.md   iteration context block — maker during review cycle
+                feedback_context.md iteration context block — maker during feedback loop
+            review/
+                prompt.md          structural template — reviewer agents
+                iteration_initial.md       iteration context — initial review pass
+                iteration_rereviewing.md   iteration context — re-review pass
+                iteration_post_human.md    iteration context — post-human-escalation pass
+            verification/
+                prompt.md          structural template — verifier agents
+                iteration_initial.md       iteration context — initial verification
+                iteration_rereviewing.md   iteration context — re-verification
+            pr_review/
+                code_review.md     fully custom template — PRCodeReviewerAgent
+                requirements.md    fully custom template — RequirementsVerifierAgent
+            output/
+                code_writing.md    output instructions — initial/revision, file-writing agents
+                analysis.md        output instructions — initial/revision, analysis agents
         agents/
             {agent_name}/
-                guidelines.md          (optional)
-                quality_standards.md   (optional)
-                review_task.md         (standalone reviewer agents)
-                format_initial.md      (reviewer format block, initial pass)
-                format_rereviewing.md  (reviewer format block, re-review)
-                main_prompt.md         (fully custom prompt template)
+                guidelines.md              (optional)
+                quality_standards.md       (optional)
+                review_task.md             (standalone reviewer agents)
+                format_initial.md          (reviewer format block, initial pass)
+                format_rereviewing.md      (reviewer format block, re-review)
+                rereviewing_context.md     (agent-specific re-review context override, optional)
+                sub_issue_format.md        (JSON sub-issue output format, WorkBreakdownAgent)
 """
 
 from __future__ import annotations
@@ -42,16 +63,34 @@ logger = logging.getLogger(__name__)
 _CONTENT_ROOT = Path(__file__).parent / "content"
 
 
+def _strip_frontmatter(content: str) -> str:
+    """Remove YAML frontmatter delimited by opening and closing --- lines.
+
+    Frontmatter is for human reference only (documents invocation path and
+    available variables).  It is stripped here so callers receive clean
+    template content without risk of {variable} references in YAML
+    descriptions interfering with str.format() calls.
+    """
+    if not content.startswith("---"):
+        return content
+    end = content.find("\n---", 3)
+    if end == -1:
+        return content  # no closing ---, return as-is
+    return content[end + 4:].lstrip("\n")
+
+
 @lru_cache(maxsize=256)
 def _load_file(path: Path) -> str:
     """Load a content file, returning empty string if not found.
+
+    Frontmatter (--- ... ---) is stripped before returning.
 
     Results are cached permanently for the process lifetime — intentional for
     production use where content files change only via deployments (which restart
     the container).  In development, restart the process to pick up file edits.
     """
     try:
-        return path.read_text(encoding="utf-8").strip()
+        return _strip_frontmatter(path.read_text(encoding="utf-8")).strip()
     except FileNotFoundError:
         return ""
     except Exception as exc:
@@ -69,6 +108,23 @@ class ContentLoader:
 
     def __init__(self, content_root: Path = _CONTENT_ROOT):
         self._root = content_root
+
+    # ── Workflow templates ─────────────────────────────────────────────────
+
+    def workflow_template(self, path: str) -> str:
+        """Load any content file from prompts/content/workflows/.
+
+        path is relative to the workflows/ directory, without the .md extension.
+
+        Examples:
+            "initial/standard"        — standard initial mode template
+            "question/file_context"   — question mode with file-based context
+            "revision/cycle_context"  — maker revision cycle context block
+            "review/prompt"           — reviewer agent structural template
+            "pr_review/code_review"   — PR code reviewer custom template
+            "output/code_writing"     — output instructions for file-writing agents
+        """
+        return _load_file(self._root / "workflows" / f"{path}.md")
 
     # ── Agent content ──────────────────────────────────────────────────────
 
@@ -90,10 +146,6 @@ class ContentLoader:
         """Output format block for a re-review pass."""
         return _load_file(self._root / "agents" / agent_name / "format_rereviewing.md")
 
-    def agent_main_prompt(self, agent_name: str) -> str:
-        """Fully custom prompt template (for PR reviewer / requirements verifier)."""
-        return _load_file(self._root / "agents" / agent_name / "main_prompt.md")
-
     def agent_sub_issue_format(self, agent_name: str) -> str:
         """JSON sub-issue output format block (WorkBreakdownAgent)."""
         return _load_file(self._root / "agents" / agent_name / "sub_issue_format.md")
@@ -102,48 +154,9 @@ class ContentLoader:
         """Agent-specific re-review iteration context block (overrides the shared template).
 
         Optional — returns empty string if the agent has no agent-specific override,
-        in which case the caller should fall back to review_cycle_reviewer_rereviewing().
+        in which case the caller should fall back to workflow_template("review/iteration_rereviewing").
         """
         return _load_file(self._root / "agents" / agent_name / "rereviewing_context.md")
-
-    # ── Output instructions ────────────────────────────────────────────────
-
-    def output_instructions_code_writing(self) -> str:
-        return _load_file(self._root / "output_instructions" / "code_writing.md")
-
-    def output_instructions_analysis(self) -> str:
-        return _load_file(self._root / "output_instructions" / "analysis.md")
-
-    def output_instructions_code_writing_question(self) -> str:
-        return _load_file(self._root / "output_instructions" / "code_writing_question.md")
-
-    def output_instructions_analysis_question(self) -> str:
-        return _load_file(self._root / "output_instructions" / "analysis_question.md")
-
-    # ── Review cycle blocks ────────────────────────────────────────────────
-
-    def review_cycle_maker_revision_cycle(self) -> str:
-        """Revision context block when trigger == 'review_cycle_revision'."""
-        return _load_file(self._root / "review_cycle" / "maker_revision_cycle.md")
-
-    def review_cycle_maker_feedback(self) -> str:
-        """Revision context block for generic feedback loop."""
-        return _load_file(self._root / "review_cycle" / "maker_feedback.md")
-
-    def review_cycle_reviewer_initial(self) -> str:
-        return _load_file(self._root / "review_cycle" / "reviewer_initial.md")
-
-    def review_cycle_reviewer_rereviewing(self) -> str:
-        return _load_file(self._root / "review_cycle" / "reviewer_rereviewing.md")
-
-    def review_cycle_reviewer_post_human(self) -> str:
-        return _load_file(self._root / "review_cycle" / "reviewer_post_human.md")
-
-    def review_cycle_verifier_initial(self) -> str:
-        return _load_file(self._root / "review_cycle" / "verifier_initial.md")
-
-    def review_cycle_verifier_rereviewing(self) -> str:
-        return _load_file(self._root / "review_cycle" / "verifier_rereviewing.md")
 
 
 # Module-level singleton — agents share one loader instance.
