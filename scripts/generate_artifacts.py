@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from claude.claude_integration import run_claude_code
 from monitoring.timestamp_utils import utc_isoformat
+from scripts._prompt_loader import load_prompt
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -130,114 +131,22 @@ async def generate_agent(
     patterns_summary = (summaries_dir / 'PatternsSummary.md').read_text()
 
     # Build prompt for Claude Code CLI
-    prompt = f"""# Agent Definition Generation
-
-You are creating an agent definition for the **{project}** project.
-
-## Agent to Create
-
-**Name:** {agent_spec['name']}
-**Purpose:** {agent_spec.get('purpose', 'Not specified')}
-**Rationale:** {agent_spec.get('rationale', 'Not specified')}
-
-**Capabilities:**
-{chr(10).join('- ' + cap for cap in agent_spec.get('capabilities', []))}
-
-**Tools:** {', '.join(agent_spec.get('tools', []))}
-**Model:** {agent_spec.get('model', 'sonnet')}
-
-## Project Context
-
-**Architecture Summary:**
-```markdown
-{arch_summary[:3000]}
-```
-
-**Tech Stack Summary:**
-```markdown
-{tech_summary[:3000]}
-```
-
-**Patterns & Conventions:**
-```markdown
-{patterns_summary[:3000]}
-```
-
-## Your Mission
-
-Create a complete agent definition markdown file with YAML frontmatter.
-
-**Output Path:** `.claude/agents/switchyard/{agent_spec['name']}.md`
-
-Use this structure:
-
-```markdown
----
-name: {agent_spec['name']}
-description: {agent_spec.get('purpose', 'Agent description')}
-tools: {agent_spec.get('tools', ['Read', 'Grep', 'Glob'])}
-model: {agent_spec.get('model', 'sonnet')}
-color: {agent_spec.get('color', 'blue')}
-generated: true
-generation_timestamp: {utc_isoformat()}
-generation_version: "2.0"
-source_project: {project}
-source_codebase_hash: {codebase_hash}
----
-
-# {{Agent Display Name}}
-
-You are a specialized agent for the **{project}** project.
-
-## Role
-
-{{Detailed role description - BE SPECIFIC with architectural context from summaries}}
-
-## Project Context
-
-**Architecture:** {{From ArchitectureSummary - actual architecture style}}
-**Key Technologies:** {{From TechStackSummary - actual frameworks}}
-**Conventions:** {{From PatternsSummary - actual coding patterns}}
-
-## Knowledge Base
-
-### Architecture Understanding
-{{Paste relevant sections from ArchitectureSummary that this agent needs}}
-
-### Tech Stack Knowledge
-{{Paste relevant sections from TechStackSummary that this agent needs}}
-
-### Coding Patterns
-{{Paste relevant patterns from PatternsSummary that this agent should enforce}}
-
-## Capabilities
-
-{{List specific capabilities from agent_spec - WITH FILE EXAMPLES from the project}}
-
-## Guidelines
-
-{{List specific guidelines from CLAUDE.md and PatternsSummary}}
-
-## Common Tasks
-
-{{Concrete examples - USE ACTUAL FILES that exist in the project}}
-
-## Antipatterns to Watch For
-
-{{Specific antipatterns from PatternsSummary}}
-
----
-
-*This agent was automatically generated from codebase analysis.*
-```
-
-**Important:**
-- Pull content directly from the summaries - don't make things up
-- Every "example task" should reference actual files that exist (use Read tool to verify)
-- Patterns and conventions should come from PatternsSummary.md
-- Ground everything in the actual project analysis
-- Use the Write tool to create the file at the specified path
-"""
+    prompt = load_prompt(
+        "artifacts/generate_agent",
+        project=project,
+        agent_name=agent_spec['name'],
+        agent_purpose=agent_spec.get('purpose', 'Not specified'),
+        agent_rationale=agent_spec.get('rationale', 'Not specified'),
+        agent_capabilities="\n".join('- ' + cap for cap in agent_spec.get('capabilities', [])),
+        agent_tools=', '.join(agent_spec.get('tools', [])),
+        agent_model=agent_spec.get('model', 'sonnet'),
+        agent_color=agent_spec.get('color', 'blue'),
+        arch_summary=arch_summary[:3000],
+        tech_summary=tech_summary[:3000],
+        patterns_summary=patterns_summary[:3000],
+        generation_timestamp=utc_isoformat(),
+        codebase_hash=codebase_hash,
+    )
 
     # Run Claude Code CLI to generate agent
     context = {
@@ -307,93 +216,19 @@ async def generate_skill(
     patterns_summary = (summaries_dir / 'PatternsSummary.md').read_text()
 
     # Build prompt for Claude Code CLI
-    prompt = f"""# Skill Definition Generation
-
-You are creating a skill definition for the **{project}** project.
-
-## Skill to Create
-
-**Name:** {skill_spec['name']}
-**Purpose:** {skill_spec.get('purpose', 'Not specified')}
-**Implementation:** {skill_spec.get('implementation', 'Not specified')}
-**Args:** {skill_spec.get('args', [])}
-
-## Project Context
-
-**Architecture Summary:**
-```markdown
-{arch_summary[:2000]}
-```
-
-**Tech Stack Summary:**
-```markdown
-{tech_summary[:2000]}
-```
-
-**Patterns & Conventions:**
-```markdown
-{patterns_summary[:2000]}
-```
-
-## Your Mission
-
-Create a complete skill definition markdown file with YAML frontmatter.
-
-**Output Path:** `.claude/skills/{skill_spec['name']}/SKILL.md`
-
-Use this structure:
-
-```markdown
----
-name: {skill_spec['name']}
-description: {skill_spec.get('purpose', 'Skill description')}
-user_invocable: true
-args: {skill_spec.get('args', [])}
-generated: true
-generation_timestamp: {utc_isoformat()}
-generation_version: "2.0"
-source_project: {project}
-source_codebase_hash: {codebase_hash}
----
-
-# {{Skill Display Name}}
-
-Quick-reference skill for **{project}**.
-
-## Usage
-
-```bash
-/{skill_spec['name']} {{args}}
-```
-
-## Purpose
-
-{{Detailed purpose - BE SPECIFIC with project context}}
-
-## Implementation
-
-{{Actual commands/operations to perform - USE ACTUAL PROJECT FILES AND COMMANDS}}
-
-For example:
-- If this is a test skill, use the actual test framework command from TechStackSummary
-- If this is an architecture skill, reference actual directories from ArchitectureSummary
-- If this is a patterns skill, cite actual files from PatternsSummary
-
-## Examples
-
-{{Concrete usage examples with actual project context}}
-
----
-
-*This skill was automatically generated.*
-```
-
-**Important:**
-- Use actual commands from the project (from TechStackSummary - test framework, build tools, etc.)
-- Reference actual files and directories from ArchitectureSummary
-- Don't use generic placeholders - be specific to THIS project
-- Use the Write tool to create the file at the specified path
-"""
+    prompt = load_prompt(
+        "artifacts/generate_skill",
+        project=project,
+        skill_name=skill_spec['name'],
+        skill_purpose=skill_spec.get('purpose', 'Not specified'),
+        skill_implementation=skill_spec.get('implementation', 'Not specified'),
+        skill_args=str(skill_spec.get('args', [])),
+        arch_summary=arch_summary[:2000],
+        tech_summary=tech_summary[:2000],
+        patterns_summary=patterns_summary[:2000],
+        generation_timestamp=utc_isoformat(),
+        codebase_hash=codebase_hash,
+    )
 
     # Run Claude Code CLI to generate skill
     context = {
@@ -582,105 +417,16 @@ async def review_artifacts_quality(
     logger.info(f"  Reviewing {len(agent_files)} agent(s) and {len(skill_files)} skill(s)...")
 
     # Build comprehensive review prompt
-    prompt = f"""# Agent Team Quality Review
-
-You are reviewing the generated agent and skill definitions for **{project}**.
-
-## Artifacts to Review
-
-**Agents ({len(agent_files)}):**
-{chr(10).join(f'- .claude/agents/switchyard/{name}' for name in agent_files)}
-
-**Skills ({len(skill_files)}):**
-{chr(10).join(f'- .claude/skills/{name}' for name in skill_files)}
-
-## Your Mission
-
-Review ALL generated artifacts and fix any issues found. Focus on quality, accuracy, and polish.
-
-### Review Criteria
-
-For each artifact:
-
-1. **Placeholder Removal** (Critical):
-   - Find and fix unfilled placeholders like `{{e}}`, `{{trace_id}}`, `{{store_error}}`, etc.
-   - Replace with realistic variable names or complete the code examples
-   - Common placeholders to fix:
-     - Exception variables: `{{e}}` → `e` or specific name
-     - IDs: `{{trace_id}}` → `trace_id` or example value
-     - Errors: `{{store_error}}` → `store_error`
-     - Lists: `{{invalid_services}}` → `invalid_services`
-
-2. **Code Example Quality**:
-   - Ensure all code examples are complete and runnable
-   - Use actual file paths from the project
-   - Follow project conventions (async/await, type hints, etc.)
-   - Remove any template artifacts or incomplete snippets
-
-3. **Consistency**:
-   - Verify YAML frontmatter is complete and valid
-   - Check that tone and formatting are consistent across all artifacts
-   - Ensure descriptions are clear and actionable
-
-4. **Accuracy**:
-   - Verify file paths and line numbers are correct (use Read/Grep to check)
-   - Confirm port interfaces and method signatures match actual code
-   - Test that example commands will actually work
-
-5. **Optimization**:
-   - Remove redundancy and verbosity
-   - Clarify ambiguous instructions
-   - Add missing context where needed
-   - Improve examples to be more practical
-
-6. **Formatting**:
-   - Ensure proper markdown formatting
-   - Code blocks have correct language tags
-   - Lists and sections are well-structured
-
-## Process
-
-1. Read each artifact file using the Read tool
-2. Identify issues based on criteria above
-3. Use the Edit tool to fix issues (preserve existing content structure)
-4. Focus on surgical edits - don't rewrite unnecessarily
-5. After reviewing all files, provide a summary of changes made
-
-## Important Guidelines
-
-- Make targeted fixes, not wholesale rewrites
-- Preserve the core content and knowledge base
-- Use Edit tool for changes (not Write - we want to preserve content)
-- If you find a file path reference, verify it exists before keeping it
-- If unsure about something, leave it rather than guessing
-
-## Expected Output
-
-After reviewing and fixing all artifacts, provide a summary:
-
-```markdown
-# Quality Review Summary
-
-## Changes Made
-
-### Agents
-- agent-name.md: Fixed X placeholders, improved Y examples
-- ...
-
-### Skills
-- skill-name/SKILL.md: Fixed X issues, clarified Y
-- ...
-
-## Statistics
-- Total artifacts reviewed: X
-- Issues found: Y
-- Issues fixed: Z
-- Artifacts modified: N
-
-## Validation Ready
-All artifacts should now pass validation without warnings.
-```
-"""
+    agent_files_list = "\n".join(f'- .claude/agents/switchyard/{name}' for name in agent_files)
+    skill_files_list = "\n".join(f'- .claude/skills/{name}' for name in skill_files)
+    prompt = load_prompt(
+        "artifacts/review_artifacts",
+        project=project,
+        agent_count=str(len(agent_files)),
+        agent_files=agent_files_list,
+        skill_count=str(len(skill_files)),
+        skill_files=skill_files_list,
+    )
 
     if dry_run:
         logger.info(f"[DRY RUN] Would review {len(agent_files) + len(skill_files)} artifacts")
