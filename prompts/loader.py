@@ -38,9 +38,38 @@ Directory layout:
             pr_review/
                 code_review.md     fully custom template — PRCodeReviewerAgent
                 requirements.md    fully custom template — RequirementsVerifierAgent
+                main_review.md     PR review prompt body (pr_url, prior_cycle_section, checkout_instruction)
+                prior_cycles.md    prior-cycle context block (prior_cycle_context)
+                authority_*.md     static authority-framing blocks for RequirementsVerifierAgent
+                verification_main.md  verification prompt (pr_url, authority_framing, context_name, context_content)
+                consolidation.md   consolidation prompt (phase_blocks); uses {{ }} for JSON schema
             output/
                 code_writing.md    output instructions — initial/revision, file-writing agents
                 analysis.md        output instructions — initial/revision, analysis agents
+            repair/
+                test_output_format.md   static JSON response schema; concatenated, not formatted
+                runner_compilation.md   runner prompt — compilation failures; concatenated
+                runner_pre_commit.md    runner prompt — pre-commit hook failures; concatenated
+                runner_ci.md            runner prompt — CI pipeline failures; concatenated
+                runner_storybook.md     runner prompt — Storybook build failures; concatenated
+                runner_unit.md          runner prompt — unit test failures; concatenated
+                runner_integration.md   runner prompt — integration test failures; concatenated
+                runner_generic.md       runner prompt — unknown test type ({test_type}); formatted then concatenated
+                warning_review.md       inline warning review prompt ({source_file}, {warning_text})
+                systemic_analysis.md    systemic failure analysis prompt (5 variables); uses {{ }} for JSON schema
+                systemic_fix.md         systemic fix prompt ({test_type}, {known_pattern}, {failure_digest}, {attempt_note})
+            analysis/
+                pattern_improvement.md      pattern analysis prompt (10 variables); uses {{ }} for JSON schema
+                pipeline_run.md             pipeline run analysis prompt (5 variables incl. sentinel strings); uses {{ }} for JSON
+                ignored_review_pattern.md   ignored review pattern detection prompt (6 variables); uses {{ }} for JSON schema
+                architecture_discovery.md   codebase architecture analysis prompt ({project})
+                techstack_discovery.md      tech stack discovery prompt ({project})
+                conventions_discovery.md    coding conventions discovery prompt ({project})
+            artifacts/
+                generate_agent.md    agent definition generation prompt (13 variables); uses {{ }} for AI-facing placeholders
+                generate_skill.md    skill definition generation prompt (10 variables); uses {{ }} for AI-facing placeholders
+                review_artifacts.md  artifact quality review prompt (5 variables)
+                generate_strategy.md agent team strategy generation prompt (4 variables); uses {{ }} for JSON schema
         agents/
             {agent_name}/
                 guidelines.md              (optional)
