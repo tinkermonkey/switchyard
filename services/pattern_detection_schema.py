@@ -213,6 +213,9 @@ CLAUDE_STREAMS_MAPPING = {
             "tool_name":             {"type": "keyword"},
             "tool_params":           {"type": "object", "enabled": False},
             "tool_params_text":      {"type": "text", "analyzer": "standard"},
+            "output_text":           {"type": "text", "analyzer": "standard"},
+            "result_text":           {"type": "text", "analyzer": "standard"},
+            "parent_tool_use_id":    {"type": "keyword"},
             "success":               {"type": "boolean"},
             "error_message":         {"type": "text", "fields": {"keyword": {"type": "keyword", "ignore_above": 512}}},
             "raw_event":             {"type": "object", "enabled": False},
@@ -502,6 +505,11 @@ def enrich_claude_log(log_data: dict) -> dict:
     event = log_data.get("event", {})
     event_type = event.get("type")
 
+    # parent_tool_use_id links sub-agent events back to the Agent tool call that spawned them
+    parent_tool_use_id = event.get("parent_tool_use_id")
+    if parent_tool_use_id:
+        enriched["parent_tool_use_id"] = parent_tool_use_id
+
     # Determine event type from Claude event structure
     # New format: event.type = "assistant"/"user" with event.message.content[]
     if event_type == "assistant":
@@ -528,6 +536,7 @@ def enrich_claude_log(log_data: dict) -> dict:
                     break
                 elif item.get("type") == "text":
                     enriched["event_type"] = "text_output"
+                    enriched["output_text"] = item.get("text", "")
                     break
 
         # Extract token usage as indexed top-level fields
@@ -561,6 +570,15 @@ def enrich_claude_log(log_data: dict) -> dict:
                     enriched["event_type"] = "tool_result"
                     enriched["tool_name"] = item.get("tool_use_id")
                     enriched["success"] = not item.get("is_error", False)
+                    result_content = item.get("content")
+                    if isinstance(result_content, str) and result_content:
+                        enriched["result_text"] = result_content
+                    elif isinstance(result_content, list):
+                        # content can be a list of content blocks
+                        texts = [c.get("text", "") for c in result_content if c.get("type") == "text"]
+                        combined = "\n".join(texts)
+                        if combined:
+                            enriched["result_text"] = combined
                     break
 
     # Old format: direct keys in event object (fallback for compatibility)

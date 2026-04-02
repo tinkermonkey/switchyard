@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react'
+import { parseTimestamp } from '../utils/stateHelpers'
 
 function formatSeconds(totalSecs) {
   if (totalSecs <= 0) return '0s'
@@ -35,10 +36,12 @@ export default function RunDuration({ startedAt, endedAt, className }) {
 
   if (!startedAt) return null
 
-  const start = new Date(startedAt).getTime()
-  if (isNaN(start)) return null
+  const startDate = parseTimestamp(startedAt)
+  if (!startDate) return null
+  const start = startDate.getTime()
 
-  const end  = endedAt ? new Date(endedAt).getTime() : Date.now()
+  const endDate = endedAt ? parseTimestamp(endedAt) : null
+  const end = endDate ? endDate.getTime() : Date.now()
   const secs = Math.max(0, Math.floor((end - start) / 1000))
 
   return <span className={className}>{formatSeconds(secs)}</span>
