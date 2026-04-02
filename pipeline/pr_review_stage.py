@@ -15,6 +15,7 @@ import json
 import re
 from typing import Dict, Any, List, Optional, Tuple
 from pipeline.base import PipelineStage
+from prompts.loader import default_loader
 from services.agent_executor import get_agent_executor
 from config.manager import ConfigManager
 from config.state_manager import GitHubStateManager
@@ -907,87 +908,27 @@ class PRReviewStage(PipelineStage):
         - STEP 1 (PRIMARY): Do the work (use the skill)
         - STEP 2 (SECONDARY): Format the output (for automation)
         """
-        # Extract PR number for checkout command
         match = re.search(r'/pull/(\d+)$', pr_url)
         pr_number = match.group(1) if match else None
 
         checkout_instruction = ""
         if pr_number:
-            checkout_instruction = f"""
-First, checkout the PR branch so review tools can analyze the changes:
-
-```bash
-gh pr checkout {pr_number}
-```
-"""
+            checkout_instruction = (
+                f"\nFirst, checkout the PR branch so review tools can analyze the changes:\n\n"
+                f"```bash\ngh pr checkout {pr_number}\n```\n"
+            )
 
         prior_cycle_section = ""
         if prior_cycle_context:
-            prior_cycle_section = f"""
-## Prior Review Cycles
+            prior_cycle_section = default_loader.workflow_template("pr_review/prior_cycles").format(
+                prior_cycle_context=prior_cycle_context,
+            )
 
-The following issues were found and closed in previous automated review cycles for this PR.
-Do NOT re-report issues that were fixed in prior cycles unless you have concrete evidence
-the fix was reverted or the issue exists at a different location.
-
-For each issue you report, explicitly note in the description whether it is:
-- **NEW**: First time this issue has been identified
-- **REGRESSION**: Was previously fixed but has reappeared
-
-{prior_cycle_context}
-
----
-"""
-
-        return f"""You are a PR Review Specialist reviewing PR: {pr_url}
-{prior_cycle_section}
-## STEP 1: Run Comprehensive Review
-
-**REQUIRED**: Use the pr-review-toolkit skill to run specialized review agents.
-{checkout_instruction}
-Then run the comprehensive review:
-
-/pr-review-toolkit:review-pr all
-
-**IMPORTANT**: Do NOT use parallel mode or set `run_in_background: true` when invoking review agents.
-Run the review agents sequentially, waiting for each to complete before proceeding.
-This ensures you collect ALL review findings before compiling the final output.
-
-The skill will launch specialized agents (code-reviewer, test-analyzer, silent-failure-hunter, comment-analyzer, type-design-analyzer) and provide detailed findings.
-
-## STEP 2: Structure Results for Issue Creation
-
-After the review skill completes, you MUST format the findings in this EXACT structure so they can be parsed and converted to GitHub issues:
-
-```
-## PR Review Findings
-
-### Critical Issues
-- **[Finding Title]**: [Description with file:line references] (NEW / REGRESSION)
-
-### High Priority Issues
-- **[Finding Title]**: [Description with file:line references] (NEW / REGRESSION)
-
-### Medium Priority Issues
-- **[Finding Title]**: [Description with file:line references] (NEW / REGRESSION)
-
-### Low Priority / Nice-to-Have
-- **[Finding Title]**: [Description with file:line references] (NEW / REGRESSION)
-
-### Clean Areas
-- [Areas that passed review with no issues]
-```
-
-**IMPORTANT FORMATTING RULES**:
-1. Section must start with `## PR Review Findings`
-2. Use exact heading names: "Critical Issues", "High Priority Issues", "Medium Priority Issues", "Low Priority / Nice-to-Have"
-3. Each finding must use format: `- **[Title]**: [Description]`
-4. If no issues at a severity level, write ONLY "None found" - no additional text
-5. Include file:line references where applicable (e.g., `/workspace/file.ts:123`)
-6. Tag each finding as (NEW) or (REGRESSION) if prior cycle history was provided above
-
-This structured format enables automatic GitHub issue creation from your findings.
-"""
+        return default_loader.workflow_template("pr_review/main_review").format(
+            pr_url=pr_url,
+            prior_cycle_section=prior_cycle_section,
+            checkout_instruction=checkout_instruction,
+        )
 
     def _build_verification_prompt(
         self, pr_url: str, context_name: str, authority_key: str, context_content: str
@@ -999,80 +940,20 @@ This structured format enables automatic GitHub issue creation from your finding
         # Dispatch on the explicit authority_key (not the display name) so the framing
         # is robust against future renames of the human-readable context_name.
         _authority_framings = {
-            "business_analyst": (
-                "## Context Authority: Functional Requirements\n\n"
-                "This context source represents **functional business requirements**. "
-                "Flag gaps for items explicitly described as required, must-have, or core functionality. "
-                "Skip items described as nice-to-have, future enhancements, or optional."
-            ),
-            "software_architect": (
-                "## Context Authority: Committed Technical Specifications\n\n"
-                "This context source represents **committed architectural decisions and technical specifications** — "
-                "the agreed-upon technical contracts that must be implemented.\n\n"
-                "Flag ALL gaps, deviations from specified patterns, and missing components. "
-                "These specifications carry the highest authority."
-            ),
+            "business_analyst": default_loader.workflow_template("pr_review/authority_business_analyst"),
+            "software_architect": default_loader.workflow_template("pr_review/authority_software_architect"),
         }
-        authority_framing = _authority_framings.get(
-            authority_key,
-            # Default (parent_issue or unknown): treat as acceptance criteria
-            "## Context Authority: Acceptance Criteria\n\n"
-            "This context source is the **source of truth for acceptance criteria**. "
-            "Every explicit requirement listed here must be implemented. "
-            "Flag any missing or partially implemented requirements."
+        authority_framing = (
+            _authority_framings.get(authority_key)
+            or default_loader.workflow_template("pr_review/authority_default")
         )
 
-        return f"""
-You are a Requirements Verification Specialist. Your job is to verify that a PR's implementation
-fully addresses the requirements from a specific context source.
-
-## PR to Verify
-{pr_url}
-
-Review the PR diff to understand what was implemented.
-
-{authority_framing}
-
-## Context Source: {context_name}
-
-The following is the original context that should be fully addressed by the PR:
-
----
-{context_content}
----
-
-## Your Task
-
-1. Read the PR diff carefully
-2. Compare against the context source above
-3. Identify any requirements, specifications, or design decisions from the context that are:
-   - NOT implemented in the PR (gap)
-   - Partially implemented — missing aspects (gap)
-   - Implemented differently than specified (deviation)
-
-Apply the authority framing above when deciding what qualifies as a gap. Research suggestions
-and aspirational ideas from the Idea Researcher are NOT gaps unless explicitly committed to.
-
-## Output Format
-
-Structure your findings EXACTLY like this:
-
-```
-## {context_name} Verification
-
-### Gaps Found
-- **[Gap Title]**: [What was specified vs what was implemented or missing]
-
-### Deviations
-- **[Deviation Title]**: [What was specified vs what was actually done]
-
-### Verified
-- [Requirements that were correctly implemented]
-```
-
-Under "### Gaps Found" and "### Deviations", write ONLY "None found" if there are none — no additional text.
-If all requirements are met, write "All requirements verified - no gaps found" and list what was verified.
-"""
+        return default_loader.workflow_template("pr_review/verification_main").format(
+            pr_url=pr_url,
+            authority_framing=authority_framing,
+            context_name=context_name,
+            context_content=context_content,
+        )
 
     def _parse_review_findings(self, output: str, source: str) -> List[Dict[str, Any]]:
         """Parse review output into structured findings grouped by severity."""
@@ -1617,54 +1498,9 @@ If all requirements are met, write "All requirements verified - no gaps found" a
         for source_name, markdown_text in phase_outputs:
             phase_blocks += f"### Source: {source_name}\n\n{markdown_text}\n\n---\n\n"
 
-        return f"""You are a PR Review Consolidator. Your job is to review findings from multiple
-review phases and produce a single, consolidated list of actionable issues grouped by
-affected component or area — not by severity or source phase.
-
-## Filtering Criteria
-
-Only include a finding if ALL of the following are true:
-1. It references a specific file and line number (e.g., `src/auth/login.py:42`) OR describes a
-   concretely missing implementation (not a research suggestion or aspirational idea).
-2. It represents a real gap or bug in the committed code — not a style preference, future
-   enhancement, or speculative improvement.
-3. It is explicitly required by the requirements/specifications (for gaps found in Phase 2
-   verification) — not a nice-to-have or research suggestion from an idea researcher.
-
-Deduplicate ruthlessly: if the same underlying problem appears in multiple phases, merge them
-into a single finding. Keep the most descriptive version.
-
-## Phase Findings
-
-{phase_blocks}
-## Required Output
-
-Output a single JSON object. Do NOT wrap it in a code fence or add any other text before or after.
-
-The JSON must have this exact structure:
-{{
-  "groups": [
-    {{
-      "name": "Functional Area Name",
-      "severity": "critical|high|medium|low",
-      "findings": "- **Finding Title**: Description with file:line ref\\n- **Finding 2**: ..."
-    }}
-  ],
-  "filtered_out": [
-    "One-line note about what was removed and why"
-  ]
-}}
-
-Rules:
-- "name": Component or area (e.g. "Authentication Module", "API Layer", "Test Coverage",
-  "Error Handling") — NOT a severity level or source phase name.
-- "severity": The highest severity present among findings in this group
-  (critical > high > medium > low).
-- "findings": Markdown bullet list; each item formatted as `- **Title**: description`.
-  Include file:line references where available.
-- "filtered_out": Brief list of removed or merged findings with a one-line explanation each.
-- If nothing survives filtering, return "groups": [] and explain everything in "filtered_out".
-"""
+        return default_loader.workflow_template("pr_review/consolidation").format(
+            phase_blocks=phase_blocks,
+        )
 
     def _parse_consolidated_findings(self, text: str) -> List[Dict[str, Any]]:
         """Parse JSON-encoded consolidation output into issue specs (one per functional group)."""
