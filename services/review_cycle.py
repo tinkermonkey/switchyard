@@ -1247,10 +1247,30 @@ class ReviewCycleExecutor:
                         f"maker run for issue #{cycle_state.issue_number}. Escalating."
                     )
                     await self._escalate_max_iterations(cycle_state, self.review_parser.parse_review(review_output))
+                    cycle_state.status = 'awaiting_human_feedback'
+                    cycle_state.escalation_time = datetime.now().isoformat()
+                    self._save_cycle_state(cycle_state)
+                    try:
+                        from services.pipeline_run import get_pipeline_run_manager
+                        get_pipeline_run_manager().update_run_status(
+                            cycle_state.project_name, cycle_state.issue_number, "feedback_listening"
+                        )
+                    except Exception as _e:
+                        logger.warning(f"Failed to set feedback_listening status after max_iterations escalation: {_e}")
 
             elif review_result.status == ReviewStatus.BLOCKED:
                 logger.info(f"Review blocked, escalating")
                 await self._escalate_blocked(cycle_state, review_result)
+                cycle_state.status = 'awaiting_human_feedback'
+                cycle_state.escalation_time = datetime.now().isoformat()
+                self._save_cycle_state(cycle_state)
+                try:
+                    from services.pipeline_run import get_pipeline_run_manager
+                    get_pipeline_run_manager().update_run_status(
+                        cycle_state.project_name, cycle_state.issue_number, "feedback_listening"
+                    )
+                except Exception as _e:
+                    logger.warning(f"Failed to set feedback_listening status after blocked escalation in recovery path: {_e}")
 
         except Exception as e:
             if isinstance(e, CancellationError):
@@ -2181,6 +2201,16 @@ class ReviewCycleExecutor:
                         f"issue #{cycle_state.issue_number}"
                     )
                     await self._escalate_max_iterations(cycle_state, review_result_parsed)
+                    cycle_state.status = 'awaiting_human_feedback'
+                    cycle_state.escalation_time = datetime.now().isoformat()
+                    self._save_cycle_state(cycle_state)
+                    try:
+                        from services.pipeline_run import get_pipeline_run_manager
+                        get_pipeline_run_manager().update_run_status(
+                            cycle_state.project_name, cycle_state.issue_number, "feedback_listening"
+                        )
+                    except Exception as _e:
+                        logger.warning(f"Failed to set feedback_listening status after max_iterations escalation: {_e}")
                     return ReviewStatus.CHANGES_REQUESTED, column.name
                 # Continue to Step 4 to invoke maker with feedback
 
@@ -2354,6 +2384,16 @@ class ReviewCycleExecutor:
             if not maker_comment:
                 logger.error(f"Maker {cycle_state.maker_agent} did not post a response on iteration {iteration}")
                 await self._escalate_max_iterations(cycle_state, review_result_parsed)
+                cycle_state.status = 'awaiting_human_feedback'
+                cycle_state.escalation_time = datetime.now().isoformat()
+                self._save_cycle_state(cycle_state)
+                try:
+                    from services.pipeline_run import get_pipeline_run_manager
+                    get_pipeline_run_manager().update_run_status(
+                        cycle_state.project_name, cycle_state.issue_number, "feedback_listening"
+                    )
+                except Exception as _e:
+                    logger.warning(f"Failed to set feedback_listening status after max_iterations escalation: {_e}")
                 return ReviewStatus.CHANGES_REQUESTED, column.name
 
             # Store maker output and persist immediately so a restart mid-loop
