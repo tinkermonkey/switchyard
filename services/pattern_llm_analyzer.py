@@ -17,6 +17,7 @@ from apscheduler.triggers.cron import CronTrigger
 import anthropic
 import os
 import random
+from prompts.loader import default_loader
 
 logger = logging.getLogger(__name__)
 
@@ -291,51 +292,18 @@ class PatternLLMAnalyzer:
             for ex in pattern['examples'][:3]
         ])
 
-        prompt = f"""You are analyzing agent behavior logs to improve CLAUDE.md instructions that guide AI agents.
-
-## Pattern Summary
-**Type:** {pattern['pattern_name']}
-**Frequency:** {pattern['occurrence_count']} occurrences across {len(pattern.get('affected_projects', []))} projects
-**Projects affected:** {', '.join(pattern.get('affected_projects', [])[:5])}
-**Agents affected:** {', '.join(pattern.get('affected_agents', [])[:3])}
-**Severity:** {pattern.get('severity', 'medium')}
-**Category:** {pattern.get('category', 'general')}
-**Average impact:** ~{avg_impact} seconds per occurrence
-**Total time wasted:** ~{total_time_wasted} seconds
-
-## Example Instances
-{examples_text}
-
-## Task
-Propose a specific, concise addition or modification to CLAUDE.md that would prevent this pattern. Follow these constraints:
-
-1. **Be specific and actionable** - Not philosophical or general advice
-2. **Use concrete examples** - Show exact commands or patterns to use/avoid
-3. **Keep it concise** - Under 150 words
-4. **Format as a git diff** - Show exactly what to add/change
-5. **Specify the section** - Which part of CLAUDE.md (e.g., "Git Operations", "File System Safety", "Best Practices")
-
-## Output Format
-
-Return your response in this exact format:
-
-### SECTION
-<section_name>
-
-### PROPOSED_CHANGE
-```diff
-<git diff format showing addition or change>
-```
-
-### EXPECTED_IMPACT
-<1-2 sentences on how this prevents the pattern>
-
-### REASONING
-<2-3 sentences explaining why this pattern occurs and why your fix helps>
-
-Be direct and technical. Focus on preventing the specific error pattern."""
-
-        return prompt
+        return default_loader.workflow_template("analysis/pattern_improvement").format(
+            pattern_name=pattern['pattern_name'],
+            occurrence_count=pattern['occurrence_count'],
+            project_count=len(pattern.get('affected_projects', [])),
+            projects_affected=', '.join(pattern.get('affected_projects', [])[:5]),
+            agents_affected=', '.join(pattern.get('affected_agents', [])[:3]),
+            severity=pattern.get('severity', 'medium'),
+            category=pattern.get('category', 'general'),
+            avg_impact=avg_impact,
+            total_time_wasted=total_time_wasted,
+            examples_text=examples_text,
+        )
 
     def _parse_llm_response(self, response_text: str, pattern: Dict[str, Any]) -> Dict[str, Any]:
         """Parse LLM response into structured format"""

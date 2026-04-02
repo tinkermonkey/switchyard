@@ -15,6 +15,7 @@ import uuid
 from typing import Optional
 
 from elasticsearch import Elasticsearch
+from prompts.loader import default_loader
 
 logger = logging.getLogger(__name__)
 
@@ -174,52 +175,13 @@ class PipelineRunAnalysisService:
         except Exception as e:
             logger.warning(f"pipeline_run_analysis: could not read skill file: {e}")
 
-        return f"""You are performing an automated post-completion analysis of a pipeline run.
-
-Pipeline Run ID to investigate: {run_id}
-
-{skill_content}
-
-## Your Task
-
-Follow the investigation steps above (Steps 1–7) for pipeline run `{run_id}`.
-
-Note: This analysis runs after pipeline completion. Agent containers are already removed (--rm),
-so Step 2 (docker-compose exec timeline script) and Step 5 (docker logs) will not be available.
-Focus on the Elasticsearch queries in Steps 1, 3, 4, and 6, then synthesize in Step 7.
-
-After completing the investigation, output your findings in the following exact format.
-Do not include any text before {_SUMMARY_START} — that delimiter must be the very first thing you output in your final answer.
-
-{_SUMMARY_START}
-[Human-readable markdown summary — include a timeline table and root cause analysis]
-
-{_ANALYSIS_JSON_START}
-{{
-  "success": true,
-  "successExplanation": "one-sentence explanation of the overall outcome",
-  "orchestratorRecommendations": [
-    {{
-      "priority": "high|medium|low",
-      "category": "bug|improvement|performance|configuration",
-      "description": "...",
-      "filePath": "optional/path.py"
-    }}
-  ],
-  "projectRecommendations": [
-    {{
-      "priority": "high|medium|low",
-      "category": "bug|improvement|performance|configuration",
-      "description": "..."
-    }}
-  ]
-}}
-{_ANALYSIS_JSON_END}
-
-Set "success" to false if the pipeline run failed or produced no useful output.
-Omit "filePath" from projectRecommendations entries (it is optional on orchestrator entries only).
-If there is nothing to recommend, use empty arrays.
-"""
+        return default_loader.workflow_template("analysis/pipeline_run").format(
+            run_id=run_id,
+            skill_content=skill_content,
+            summary_start=_SUMMARY_START,
+            analysis_json_start=_ANALYSIS_JSON_START,
+            analysis_json_end=_ANALYSIS_JSON_END,
+        )
 
     def _parse_response(self, text: str):
         """

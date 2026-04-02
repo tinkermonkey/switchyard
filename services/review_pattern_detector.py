@@ -13,6 +13,7 @@ from elasticsearch import Elasticsearch
 
 from services.pattern_llm_analyzer import PatternLLMAnalyzer
 from services.review_learning_schema import AGG_LOW_VALUE_PATTERNS
+from prompts.loader import default_loader
 
 logger = logging.getLogger(__name__)
 
@@ -211,31 +212,17 @@ class ReviewPatternDetector:
         Returns:
             Dict with pattern_description, reason_ignored, suggested_action
         """
-        prompt = f"""
-Analyze these review comments that were frequently IGNORED by developers:
-
-Agent: {agent}
-Category: {category}
-Severity: {severity}
-Ignore Rate: {ignore_rate:.1%}
-Sample Size: {len(sample_findings)}
-
-Examples of ignored feedback:
-{chr(10).join(f"{i+1}. {msg}" for i, msg in enumerate(sample_findings[:10]))}
-
-Tasks:
-1. Identify the common pattern across these ignored review comments
-2. Explain why developers might be ignoring this type of feedback
-3. Suggest what action should be taken (suppress, adjust_severity, or context_filter)
-
-Return ONLY valid JSON in this exact format:
-{{
-  "pattern_description": "Brief description of the common pattern (1-2 sentences)",
-  "reason_ignored": "Why developers ignore this feedback (1-2 sentences)",
-  "suggested_action": "suppress|adjust_severity|context_filter",
-  "confidence": 0.0-1.0
-}}
-"""
+        examples_text = "\n".join(
+            f"{i+1}. {msg}" for i, msg in enumerate(sample_findings[:10])
+        )
+        prompt = default_loader.workflow_template("analysis/ignored_review_pattern").format(
+            agent=agent,
+            category=category,
+            severity=severity,
+            ignore_rate=f"{ignore_rate:.1%}",
+            sample_size=len(sample_findings),
+            examples_text=examples_text,
+        )
 
         try:
             result = await self.llm_analyzer.analyze_pattern(prompt)
