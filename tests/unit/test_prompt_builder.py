@@ -177,11 +177,20 @@ class TestContentLoader:
 # ---------------------------------------------------------------------------
 
 class TestWorkflowTemplateFormatCorrectness:
-    """Verify every .format()-ed workflow template accepts its documented variables.
+    """Verify every .format()-ed workflow template accepts its documented variables
+    AND that the substituted values actually appear in the output.
 
-    A KeyError here means a bare {var} exists in a file that is loaded via
-    .format(**kwargs) without that var being supplied — the same class of bug
-    that caused review_artifacts.md to crash at runtime.
+    Two distinct failure modes are guarded against:
+    - KeyError: a bare {var} in the file is not supplied as a kwarg
+    - Silent drop: a variable is renamed in the template (e.g. {pr_url} → {prurl});
+      Python's str.format() ignores extra kwargs, so no KeyError is raised but
+      the value is never inserted. The per-kwarg presence check catches this.
+
+    Note on the presence check: `check_vars` lists kwarg keys whose values must
+    appear verbatim in the output.  Variables are omitted from check_vars when
+    their test value is empty string (legitimately absent from output) or when the
+    value is a sentinel/structural string that may be reformatted by the template
+    (e.g. numeric counts embedded in a sentence).
     """
 
     LOADER = ContentLoader()
@@ -191,30 +200,39 @@ class TestWorkflowTemplateFormatCorrectness:
     _ANALYSIS_JSON_START = "---ANALYSIS_JSON_START---"
     _ANALYSIS_JSON_END = "---ANALYSIS_JSON_END---"
 
-    @pytest.mark.parametrize("path,kwargs", [
+    @pytest.mark.parametrize("path,kwargs,check_vars", [
         # repair/ — formatted templates
         ("repair/runner_generic",
-         {"test_type": "e2e"}),
+         {"test_type": "e2e"},
+         ["test_type"]),
         ("repair/warning_review",
-         {"source_file": "src/foo.py", "warning_text": "unused import on line 3"}),
+         {"source_file": "src/foo.py", "warning_text": "unused import on line 3"},
+         ["source_file", "warning_text"]),
         ("repair/systemic_analysis",
          {"project": "myapp", "test_type": "unit", "total_failures": "12",
-          "files_with_failures": "4", "failure_summary": "- foo.py: 3 failures"}),
+          "files_with_failures": "4", "failure_summary": "- foo.py: 3 failures"},
+         ["project", "test_type", "failure_summary"]),
         ("repair/systemic_fix",
-         {"test_type": "unit", "known_pattern": "import error", "failure_digest": "digest",
-          "attempt_note": ""}),
+         {"test_type": "unit", "known_pattern": "import error", "failure_digest": "digest-text",
+          "attempt_note": ""},
+         ["test_type", "known_pattern", "failure_digest"]),
         # pr_review/ — formatted templates
         ("pr_review/prior_cycles",
-         {"prior_cycle_context": "Cycle 1: reviewer said fix X"}),
+         {"prior_cycle_context": "Cycle 1: reviewer said fix X"},
+         ["prior_cycle_context"]),
         ("pr_review/main_review",
          {"pr_url": "https://github.com/org/repo/pull/42",
-          "prior_cycle_section": "", "checkout_instruction": ""}),
+          "prior_cycle_section": "", "checkout_instruction": ""},
+         ["pr_url"]),
         ("pr_review/verification_main",
          {"pr_url": "https://github.com/org/repo/pull/42",
-          "authority_framing": "You are a Business Analyst.",
-          "context_name": "Business Requirements", "context_content": "## Requirements\n..."}),
+          "authority_framing": "UNIQUE_AUTHORITY_FRAMING_SENTINEL",
+          "context_name": "Business Requirements",
+          "context_content": "UNIQUE_CONTEXT_CONTENT_SENTINEL"},
+         ["pr_url", "authority_framing", "context_name", "context_content"]),
         ("pr_review/consolidation",
-         {"phase_blocks": "## Code Review\nfindings here"}),
+         {"phase_blocks": "UNIQUE_PHASE_BLOCKS_SENTINEL"},
+         ["phase_blocks"]),
         # analysis/ — formatted templates
         ("analysis/pattern_improvement",
          {"pattern_name": "missing_error_handling", "occurrence_count": "8",
@@ -222,63 +240,79 @@ class TestWorkflowTemplateFormatCorrectness:
           "agents_affected": "senior_software_engineer",
           "severity": "high", "category": "error_handling",
           "avg_impact": "4.5", "total_time_wasted": "36.0",
-          "examples_text": "Example 1: agent failed on line 42"}),
+          "examples_text": "Example 1: agent failed on line 42"},
+         ["pattern_name", "projects_affected", "agents_affected", "examples_text"]),
         ("analysis/pipeline_run",
-         {"run_id": "run-abc123", "skill_content": "## Skill\ndo stuff",
+         {"run_id": "run-abc123", "skill_content": "UNIQUE_SKILL_CONTENT_SENTINEL",
           "summary_start": _SUMMARY_START,
           "analysis_json_start": _ANALYSIS_JSON_START,
-          "analysis_json_end": _ANALYSIS_JSON_END}),
+          "analysis_json_end": _ANALYSIS_JSON_END},
+         ["run_id", "skill_content", "summary_start", "analysis_json_start", "analysis_json_end"]),
         ("analysis/ignored_review_pattern",
          {"agent": "code_reviewer", "category": "style", "severity": "low",
           "ignore_rate": "62.5%", "sample_size": "16",
-          "examples_text": "- Finding: unused variable"}),
-        ("analysis/architecture_discovery", {"project": "myapp"}),
-        ("analysis/techstack_discovery",    {"project": "myapp"}),
-        ("analysis/conventions_discovery",  {"project": "myapp"}),
+          "examples_text": "UNIQUE_EXAMPLES_TEXT_SENTINEL"},
+         ["agent", "category", "ignore_rate", "examples_text"]),
+        ("analysis/architecture_discovery", {"project": "myapp"}, ["project"]),
+        ("analysis/techstack_discovery",    {"project": "myapp"}, ["project"]),
+        ("analysis/conventions_discovery",  {"project": "myapp"}, ["project"]),
         # artifacts/ — formatted templates
         ("artifacts/generate_agent",
          {"project": "myapp", "agent_name": "myapp-reviewer",
-          "agent_purpose": "Reviews PRs for correctness",
-          "agent_rationale": "Needed for quality gates",
+          "agent_purpose": "UNIQUE_AGENT_PURPOSE_SENTINEL",
+          "agent_rationale": "UNIQUE_AGENT_RATIONALE_SENTINEL",
           "agent_capabilities": "- Review pull requests\n- Check test coverage",
           "agent_tools": "Bash, Read, Grep",
           "agent_model": "sonnet", "agent_color": "blue",
-          "arch_summary": "Monolith with FastAPI backend",
-          "tech_summary": "Python 3.11, FastAPI, React",
-          "patterns_summary": "async/await throughout",
+          "arch_summary": "UNIQUE_ARCH_SUMMARY_SENTINEL",
+          "tech_summary": "UNIQUE_TECH_SUMMARY_SENTINEL",
+          "patterns_summary": "UNIQUE_PATTERNS_SUMMARY_SENTINEL",
           "generation_timestamp": "2026-04-03T00:00:00Z",
-          "codebase_hash": "abc123def456"}),
+          "codebase_hash": "abc123def456"},
+         ["agent_name", "agent_purpose", "agent_rationale", "arch_summary",
+          "tech_summary", "patterns_summary", "generation_timestamp", "codebase_hash"]),
         ("artifacts/generate_skill",
          {"project": "myapp", "skill_name": "myapp-deploy",
-          "skill_purpose": "Deploys the application",
-          "skill_implementation": "Run make deploy",
+          "skill_purpose": "UNIQUE_SKILL_PURPOSE_SENTINEL",
+          "skill_implementation": "UNIQUE_SKILL_IMPL_SENTINEL",
           "skill_args": "['--env', '--dry-run']",
-          "arch_summary": "Monolith with FastAPI backend",
-          "tech_summary": "Python 3.11, FastAPI",
-          "patterns_summary": "async/await throughout",
+          "arch_summary": "UNIQUE_ARCH_SUMMARY_SENTINEL",
+          "tech_summary": "UNIQUE_TECH_SUMMARY_SENTINEL",
+          "patterns_summary": "UNIQUE_PATTERNS_SUMMARY_SENTINEL",
           "generation_timestamp": "2026-04-03T00:00:00Z",
-          "codebase_hash": "abc123def456"}),
+          "codebase_hash": "abc123def456"},
+         ["skill_name", "skill_purpose", "skill_implementation", "arch_summary",
+          "tech_summary", "patterns_summary", "generation_timestamp", "codebase_hash"]),
         ("artifacts/review_artifacts",
          {"project": "myapp", "agent_count": "3",
-          "agent_files": "- .claude/agents/myapp-reviewer.md",
+          "agent_files": "UNIQUE_AGENT_FILES_SENTINEL",
           "skill_count": "1",
-          "skill_files": "- .claude/skills/myapp-deploy.md"}),
+          "skill_files": "UNIQUE_SKILL_FILES_SENTINEL"},
+         ["project", "agent_files", "skill_files"]),
         ("artifacts/generate_strategy",
          {"project": "myapp",
-          "arch_summary": "Monolith with FastAPI backend",
-          "tech_summary": "Python 3.11, FastAPI, React",
-          "patterns_summary": "async/await, type hints throughout"}),
+          "arch_summary": "UNIQUE_ARCH_SUMMARY_SENTINEL",
+          "tech_summary": "UNIQUE_TECH_SUMMARY_SENTINEL",
+          "patterns_summary": "UNIQUE_PATTERNS_SUMMARY_SENTINEL"},
+         ["project", "arch_summary", "tech_summary", "patterns_summary"]),
         # Previously-covered templates that use .format() — regression guard
         ("revision/cycle_context",
-         {"iteration": "2", "max_iterations": "3", "reviewer": "Code Reviewer"}),
-        ("revision/feedback_context", {}),
+         {"iteration": "2", "max_iterations": "3", "reviewer": "Code Reviewer"},
+         ["iteration", "max_iterations", "reviewer"]),
+        ("revision/feedback_context", {}, []),
     ])
-    def test_format_call_succeeds(self, path, kwargs):
-        """No KeyError when .format() is called with documented variables."""
+    def test_format_call_succeeds_and_values_substituted(self, path, kwargs, check_vars):
+        """No KeyError; each check_var value appears verbatim in the output."""
         template = self.LOADER.workflow_template(path)
         assert template, f"workflows/{path}.md is missing or empty"
         result = template.format(**kwargs)
         assert result
+        for key in check_vars:
+            value = kwargs[key]
+            assert value in result, (
+                f"workflows/{path}.md: value for '{key}' ({value!r}) not found in output — "
+                f"variable may have been renamed or removed from the template"
+            )
 
 
 # ---------------------------------------------------------------------------

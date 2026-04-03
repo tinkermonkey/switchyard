@@ -11,6 +11,7 @@ Covers:
   - _build_consolidation_prompt()
 """
 
+import re
 import pytest
 from unittest.mock import MagicMock, patch
 
@@ -27,13 +28,19 @@ def stage():
     PRReviewStage triggers services.dev_container_state which creates
     /app/state/dev_containers.  We mock that module in sys.modules before the
     import so the path is never touched.
+
+    Uses yield (not return) so that patch.dict stays active for the entire
+    module scope.  This prevents any test that accidentally calls a method
+    relying on pr_review_state_manager or ConfigManager from hitting the real
+    singleton.  Only the three prompt-builder methods under test are safe to
+    call on this instance — they use only default_loader and re.
     """
     with patch.dict("sys.modules", {"services.dev_container_state": MagicMock()}):
         with patch("pipeline.pr_review_stage.ConfigManager"), \
              patch("pipeline.pr_review_stage.GitHubStateManager"), \
              patch("pipeline.pr_review_stage.pr_review_state_manager"):
             from pipeline.pr_review_stage import PRReviewStage
-            return PRReviewStage()
+            yield PRReviewStage()
 
 
 # ---------------------------------------------------------------------------
@@ -77,8 +84,14 @@ class TestBuildPrReviewPrompt:
             "https://github.com/org/repo/pull/7",
             prior_cycle_context="some context",
         )
-        # No bare {word} placeholders should remain in the output
-        import re
+        # Checks for bare {lowercase_word} that survived .format() substitution.
+        # This regex does NOT flag JSON keys like {"groups": ...} (quotes inside)
+        # or escaped {{ }} literal braces (converted to { } by .format() only
+        # when surrounding non-alphabetic content).  If a future template edit
+        # adds an AI-facing {{example_var}} placeholder, it will appear as
+        # {example_var} in the output and trigger this check — that is the
+        # intended behaviour, as it signals a template convention change that
+        # needs explicit review.
         unresolved = re.findall(r'\{[a-z_]+\}', result)
         assert unresolved == [], f"Unresolved placeholders: {unresolved}"
 
@@ -115,20 +128,31 @@ class TestBuildVerificationPrompt:
         result = self._call(stage, authority_key="business_analyst")
         # authority_business_analyst.md: "functional business requirements"
         assert "functional business requirements" in result
+        # Negative: must NOT contain phrases unique to the other two authority files
+        assert "architectural decisions" not in result
+        assert "Acceptance Criteria" not in result
 
     def test_software_architect_authority_framing(self, stage):
         result = self._call(stage, authority_key="software_architect")
         # authority_software_architect.md: "architectural decisions"
         assert "architectural decisions" in result
+        # Negative: must NOT contain phrases unique to the other two authority files
+        assert "functional business requirements" not in result
+        assert "Acceptance Criteria" not in result
 
     def test_unknown_authority_key_uses_default_framing(self, stage):
         result = self._call(stage, authority_key="idea_researcher")
         # authority_default.md: "Acceptance Criteria"
         assert "Acceptance Criteria" in result
+        # Negative: must NOT contain phrases unique to the named authority files
+        assert "functional business requirements" not in result
+        assert "architectural decisions" not in result
 
     def test_empty_authority_key_uses_default_framing(self, stage):
         result = self._call(stage, authority_key="")
         assert "Acceptance Criteria" in result
+        assert "functional business requirements" not in result
+        assert "architectural decisions" not in result
 
     def test_context_truncated_at_15000_chars(self, stage):
         long_content = "x" * 20000
@@ -149,7 +173,8 @@ class TestBuildVerificationPrompt:
 
     def test_no_unresolved_format_placeholders(self, stage):
         result = self._call(stage)
-        import re
+        # See note in TestBuildPrReviewPrompt.test_no_unresolved_format_placeholders
+        # for the documented limitations of this regex.
         unresolved = re.findall(r'\{[a-z_]+\}', result)
         assert unresolved == [], f"Unresolved placeholders: {unresolved}"
 
@@ -202,9 +227,10 @@ class TestBuildConsolidationPrompt:
 
     def test_no_unresolved_format_placeholders(self, stage):
         result = stage._build_consolidation_prompt([("Source A", "text")])
-        import re
-        # Exclude JSON schema placeholders that are intentionally in the template
-        # (e.g. {"groups": ...}) — only check for bare lowercase word placeholders
+        # consolidation.md uses {{ }} around its JSON schema keys (e.g. {{"groups": ...}})
+        # which become literal { } after .format().  Those JSON keys contain quotes, colons,
+        # or uppercase — not matched by \{[a-z_]+\}.  See the note in
+        # TestBuildPrReviewPrompt.test_no_unresolved_format_placeholders for full caveat.
         unresolved = re.findall(r'\{[a-z_]+\}', result)
         assert unresolved == [], f"Unresolved placeholders: {unresolved}"
 
