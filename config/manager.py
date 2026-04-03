@@ -1,5 +1,5 @@
 """
-Configuration Manager for the Claude Code Orchestrator
+Configuration Manager for the Switchyard
 
 This module provides the core configuration management functionality, handling:
 - Loading foundational configurations (agents, pipelines, workflows)

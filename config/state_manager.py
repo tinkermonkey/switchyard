@@ -1,5 +1,5 @@
 """
-GitHub State Manager for the Claude Code Orchestrator
+GitHub State Manager for the Switchyard
 
 This module manages the runtime state of GitHub projects, including:
 - GitHub project IDs, board IDs, column IDs

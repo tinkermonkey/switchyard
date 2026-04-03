@@ -2887,17 +2887,20 @@ class ReviewCycleExecutor:
         message: str
     ):
         """Post a summary comment about the review cycle (workspace-aware)"""
-        summary = f"""## 🔄 Review Cycle Complete
+        summary = f"""## Review Cycle Complete
 
 **Status**: {final_status}
+
 **Iterations**: {cycle_state.current_iteration}/{cycle_state.max_iterations}
+
 **Maker**: {cycle_state.maker_agent.replace('_', ' ').title()}
+
 **Reviewer**: {cycle_state.reviewer_agent.replace('_', ' ').title()}
 
 {message}
 
 ---
-_Automated review cycle by Claude Code Orchestrator_
+_Automated review cycle by Switchyard_
 """
 
         if cycle_state.workspace_type == 'discussions' and cycle_state.discussion_id:
@@ -2981,7 +2984,7 @@ The review cycle is **paused and waiting for your feedback**. Please:
 **Iteration**: {cycle_state.current_iteration}/{cycle_state.max_iterations}
 
 ---
-_Escalated by Claude Code Orchestrator - Monitoring for your response..._
+_Escalated by Switchyard - Monitoring for your response..._
 """
 
         if cycle_state.workspace_type == 'discussions' and cycle_state.discussion_id:

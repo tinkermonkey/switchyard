@@ -247,7 +247,7 @@ Columns: Backlog, In Progress, Verification, Done.
 
 **`github_project_settings`**:
 - `visibility: private`
-- `description_template: "Automated project board managed by Claude Code Orchestrator"`
+- `description_template: "Automated project board managed by Switchyard"`
 
 ---
 

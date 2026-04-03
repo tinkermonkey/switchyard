@@ -1,8 +1,9 @@
 import { useState, useEffect } from 'react'
-import { Lock, Unlock, Clock, XCircle, ArrowRight, MessageSquare, Copy, Maximize2, Minimize2, CheckCircle2, AlertCircle } from 'lucide-react'
+import { Lock, Unlock, Clock, XCircle, ArrowRight, MessageSquare, Maximize2, Minimize2, CheckCircle2, AlertCircle } from 'lucide-react'
 import { useNavigate } from '@tanstack/react-router'
 import TokenUsagePanel from './TokenUsagePanel'
 import RunDuration from './RunDuration'
+import CopyableId from './CopyableId'
 
 const LockStatusBadge = ({ lockStatus, lockHolderIssue }) => {
   if (lockStatus === 'holding_lock') {
@@ -61,7 +62,6 @@ export default function PipelineRunHeader({
 }) {
   const navigate = useNavigate()
   const [pipelineRunLogs, setPipelineRunLogs] = useState([])
-  const [copied, setCopied] = useState(false)
 
   useEffect(() => {
     if (!pipelineRun?.id) return
@@ -76,16 +76,6 @@ export default function PipelineRunHeader({
   if (!pipelineRun) return null
 
   const repoUrl = pipelineRun.repo_url || null
-
-  const handleCopyId = async () => {
-    try {
-      await navigator.clipboard.writeText(pipelineRun.id)
-      setCopied(true)
-      setTimeout(() => setCopied(false), 1500)
-    } catch {
-      // Clipboard API unavailable or not in secure context
-    }
-  }
 
   const isActive = pipelineRun.status === 'active'
   const statusLabel = isActive
@@ -124,18 +114,7 @@ export default function PipelineRunHeader({
     },
     {
       label: 'ID',
-      value: (
-        <span className="flex items-center gap-1 font-mono">
-          <span>{pipelineRun.id}</span>
-          <button
-            onClick={handleCopyId}
-            className="text-gh-fg-muted hover:text-gh-fg transition-colors"
-            title={copied ? 'Copied!' : 'Copy ID'}
-          >
-            <Copy className="w-3 h-3" />
-          </button>
-        </span>
-      ),
+      value: <CopyableId id={pipelineRun.id} />,
     },
     {
       label: 'Started',

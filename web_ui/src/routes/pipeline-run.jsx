@@ -552,18 +552,7 @@ function PipelineRunView() {
     <div className="min-h-screen flex flex-col p-2 md:p-5 bg-gh-canvas text-gh-fg">
       {!isFullscreen && <Header />}
 
-      {!isFullscreen && (
-        <div className="flex items-center justify-between my-3 flex-shrink-0">
-          <NavigationTabs />
-          <button
-            onClick={() => setSidebarOpen(true)}
-            className="md:hidden px-3 py-2 bg-gh-canvas-subtle border border-gh-border rounded-md hover:bg-gh-border-muted transition-colors text-sm"
-          >
-            <List className="inline w-4 h-4 mr-1" />
-            Runs
-          </button>
-        </div>
-      )}
+      {!isFullscreen && <NavigationTabs />}
 
       <div className={`flex gap-0 md:gap-4 ${isFullscreen ? 'fixed inset-0 z-50 p-5 bg-gh-canvas' : 'flex-1 min-h-0'}`}>
         <PipelineRunSidebar
@@ -601,42 +590,38 @@ function PipelineRunView() {
               <div className="flex border-b border-gh-border mb-4 flex-shrink-0">
                 <button
                   onClick={() => updateUrlParams({ contentTab: 'graph' }, true)}
-                  className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors ${
-                    contentTab === 'graph' || (contentTab === 'report' && !analysis)
-                      ? 'border-gh-accent-emphasis text-gh-accent-fg'
-                      : 'border-transparent text-gh-fg-muted hover:text-gh-fg hover:border-gh-border-muted'
-                  }`}
+                  className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors ${contentTab === 'graph' || (contentTab === 'report' && !analysis)
+                    ? 'border-gh-accent-emphasis text-gh-accent-fg'
+                    : 'border-transparent text-gh-fg-muted hover:text-gh-fg hover:border-gh-border-muted'
+                    }`}
                 >
                   Graph
                 </button>
                 <button
                   onClick={() => updateUrlParams({ contentTab: 'log' }, true)}
-                  className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors ${
-                    contentTab === 'log'
-                      ? 'border-gh-accent-emphasis text-gh-accent-fg'
-                      : 'border-transparent text-gh-fg-muted hover:text-gh-fg hover:border-gh-border-muted'
-                  }`}
+                  className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors ${contentTab === 'log'
+                    ? 'border-gh-accent-emphasis text-gh-accent-fg'
+                    : 'border-transparent text-gh-fg-muted hover:text-gh-fg hover:border-gh-border-muted'
+                    }`}
                 >
                   Event Log
                 </button>
                 <button
                   onClick={() => updateUrlParams({ contentTab: 'prompts' }, true)}
-                  className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors ${
-                    contentTab === 'prompts'
-                      ? 'border-gh-accent-emphasis text-gh-accent-fg'
-                      : 'border-transparent text-gh-fg-muted hover:text-gh-fg hover:border-gh-border-muted'
-                  }`}
+                  className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors ${contentTab === 'prompts'
+                    ? 'border-gh-accent-emphasis text-gh-accent-fg'
+                    : 'border-transparent text-gh-fg-muted hover:text-gh-fg hover:border-gh-border-muted'
+                    }`}
                 >
                   Prompts
                 </button>
                 {analysis && (
                   <button
                     onClick={() => updateUrlParams({ contentTab: 'report' }, true)}
-                    className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors ${
-                      contentTab === 'report'
-                        ? 'border-gh-accent-emphasis text-gh-accent-fg'
-                        : 'border-transparent text-gh-fg-muted hover:text-gh-fg hover:border-gh-border-muted'
-                    }`}
+                    className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors ${contentTab === 'report'
+                      ? 'border-gh-accent-emphasis text-gh-accent-fg'
+                      : 'border-transparent text-gh-fg-muted hover:text-gh-fg hover:border-gh-border-muted'
+                      }`}
                   >
                     Report
                   </button>
@@ -712,10 +697,10 @@ export const Route = createFileRoute('/pipeline-run')({
   validateSearch: (search) => {
     return {
       runId: typeof search.runId === 'string' ? search.runId : undefined,
-      contentTab: search.contentTab === 'log'     ? 'log'
-              : search.contentTab === 'report'  ? 'report'
-              : search.contentTab === 'prompts' ? 'prompts'
-              : 'graph',
+      contentTab: search.contentTab === 'log' ? 'log'
+        : search.contentTab === 'report' ? 'report'
+          : search.contentTab === 'prompts' ? 'prompts'
+            : 'graph',
     }
   },
 })

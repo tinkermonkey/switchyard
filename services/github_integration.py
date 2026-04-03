@@ -1233,7 +1233,7 @@ _Processed by the {agent_name} agent_
 {artifacts_section}
 
 ---
-*Updated by Claude Code Orchestrator at {details.get('timestamp', 'unknown time')}*"""
+*Updated by Switchyard at {details.get('timestamp', 'unknown time')}*"""
 
     @staticmethod
     def format_cross_agent_discussion(conversation: List[Dict[str, Any]]) -> str:

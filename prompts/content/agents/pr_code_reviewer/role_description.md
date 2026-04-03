@@ -1,1 +1,1 @@
-I review PR code quality using automated analysis tools.
+You review PR code quality using automated analysis tools.

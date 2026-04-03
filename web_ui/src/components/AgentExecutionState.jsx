@@ -7,6 +7,7 @@ import { formatTimestamp } from '../utils/eventMerging'
 import RepairCycleStatus from './RepairCycleStatus'
 import AgentExecutionCurrentTasks from './AgentExecutionCurrentTasks'
 import RunDuration from './RunDuration'
+import CopyableId from './CopyableId'
 
 const formatAgentName = (agentName) => {
   if (!agentName || typeof agentName !== 'string' || agentName.trim() === '') return 'Unknown Agent'
@@ -60,19 +61,10 @@ export default function AgentExecutionState({
   const metaCols = [
     ...(pipelineRunId ? [{
       label: 'Pipeline Run',
-      value: (
-        <Link
-          to="/pipeline-run"
-          search={{ runId: pipelineRunId }}
-          className="font-mono text-xs text-gh-accent-fg hover:underline"
-          title="View pipeline run"
-        >
-          {pipelineRunId}
-        </Link>
-      ),
+      value: <CopyableId id={pipelineRunId} />
     }] : []),
-    { label: 'Execution ID', value: <span className="font-mono">{executionId}</span> },
-    { label: 'Task ID', value: <span className="font-mono">{executionData.task_id}</span> },
+    { label: 'Execution ID', value: <CopyableId id={executionId} /> },
+    { label: 'Task ID', value: <CopyableId id={executionData.task_id} /> },
     { label: 'Project', value: executionData.project },
     { label: 'Agent', value: formatAgentName(executionData.agent) },
     { label: 'Started', value: new Date(executionData.started_at).toLocaleString() },

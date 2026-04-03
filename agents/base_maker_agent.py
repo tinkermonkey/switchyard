@@ -31,6 +31,7 @@ class MakerAgent(PipelineStage, ABC):
 
     def __init__(self, agent_name: str, agent_config: Dict[str, Any] = None):
         super().__init__(agent_name, agent_config=agent_config)
+        self.agent_name = agent_name
         self._prompt_builder = PromptBuilder()
 
     # ── Abstract properties — each subclass must provide these ───────────────

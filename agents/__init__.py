@@ -1,5 +1,5 @@
 """
-Agent implementations for the Claude Code Orchestrator.
+Agent implementations for the Switchyard.
 
 This module provides all the specialized agents that handle different phases
 of the Software Development Lifecycle (SDLC) based on the vision document.

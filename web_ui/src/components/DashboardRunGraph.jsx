@@ -2,6 +2,7 @@ import { useCallback } from 'react'
 import { useNavigate } from '@tanstack/react-router'
 import PipelineFlowGraph from './PipelineFlowGraph'
 import RunDuration from './RunDuration'
+import CopyableId from './CopyableId'
 import { useDashboardRunData } from '../hooks/useDashboardRunData'
 
 export default function DashboardRunGraph({ run }) {
@@ -14,7 +15,7 @@ export default function DashboardRunGraph({ run }) {
 
   return (
     <div
-      className="bg-gh-canvas-subtle border border-gh-border rounded-md overflow-hidden cursor-pointer hover:border-gh-accent-primary transition-colors flex flex-col"
+      className="bg-gh-canvas-subtle border border-gh-border rounded-md overflow-hidden hover:border-gh-accent-primary transition-colors flex flex-col"
     >
       {/* Compact header */}
       <div className="flex items-center gap-3 px-3 py-2 border-b border-gh-border min-w-0 flex-shrink-0">
@@ -34,7 +35,7 @@ export default function DashboardRunGraph({ run }) {
         ) : (
           <span className="text-xs text-gh-fg-muted flex-shrink-0">#{run.issue_number}</span>
         )}
-        <span className="text-xs text-gh-fg-muted font-mono flex-shrink-0">{run.id}</span>
+        <CopyableId id={run.id} className="text-xs text-gh-fg-muted flex-shrink-0" />
         <RunDuration
           startedAt={run.started_at}
           endedAt={run.ended_at}

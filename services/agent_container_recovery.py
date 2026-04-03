@@ -1476,9 +1476,9 @@ class AgentContainerRecovery:
         summary_lines = [
             f"## ✅ Repair Cycle Complete" if overall_success else "## ❌ Repair Cycle Failed",
             "",
-            f"**Container**: `{container_name}`",
-            f"**Total Agent Calls**: {result.get('total_agent_calls', 0)}",
-            f"**Duration**: {result.get('duration_seconds', 0):.1f}s",
+            f"**Container**: `{container_name}`\n",
+            f"**Total Agent Calls**: {result.get('total_agent_calls', 0)}\n",
+            f"**Duration**: {result.get('duration_seconds', 0):.1f}s\n",
             ""
         ]
 

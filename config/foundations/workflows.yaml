@@ -275,7 +275,7 @@ workflow_templates:
 # GitHub Project Board settings
 github_project_settings:
   visibility: "private"
-  description_template: "Automated project board managed by Claude Code Orchestrator"
+  description_template: "Automated project board managed by Switchyard"
 
 # Label definitions for pipeline routing
 pipeline_labels:
