@@ -194,6 +194,8 @@ class TokenMetricsService:
                     "tool_call_count":      {"type": "integer"},
                     "prompt_length":        {"type": "long"},
                     "tool_breakdown":       {"type": "object", "enabled": False},
+                    "models_used":          {"type": "keyword"},
+                    "total_cost_usd":       {"type": "float"},
                 }
             ),
         ]
@@ -943,9 +945,11 @@ class TokenMetricsService:
             sum_cache_read = 0
             sum_cache_creation = 0
             sum_output = 0
+            sum_cost_usd = 0.0
             first_input: Optional[int] = None
             peak_input = 0
             task_tool_breakdown: Dict[str, Dict] = {}
+            task_models: set = set()
 
             pending_attrs: Optional[Dict] = None
             pending_effective_input: int = 0
@@ -988,6 +992,14 @@ class TokenMetricsService:
                                 td = task_tool_breakdown.setdefault(tool_name, _empty_tool_entry())
                                 td['sum_context_growth'] += delta / k
 
+                        if pending_attrs.get('model'):
+                            task_models.add(pending_attrs['model'])
+
+                        try:
+                            sum_cost_usd += float(pending_attrs.get('cost_usd') or 0)
+                        except (ValueError, TypeError):
+                            pass
+
                     new_direct = _parse_otel_int(attrs.get('input_tokens'))
                     new_cr = _parse_otel_int(attrs.get('cache_read_tokens'))
                     new_cc = _parse_otel_int(attrs.get('cache_creation_tokens'))
@@ -1017,6 +1029,14 @@ class TokenMetricsService:
                 if pending_effective_input > peak_input:
                     peak_input = pending_effective_input
 
+                if pending_attrs.get('model'):
+                    task_models.add(pending_attrs['model'])
+
+                try:
+                    sum_cost_usd += float(pending_attrs.get('cost_usd') or 0)
+                except (ValueError, TypeError):
+                    pass
+
             if first_input is not None:
                 context_growth = max(0, peak_input - first_input)
                 tool_breakdown = {
@@ -1037,6 +1057,8 @@ class TokenMetricsService:
                     'total_cache_creation': sum_cache_creation,
                     'tool_call_count': sum(td['invocation_count'] for td in task_tool_breakdown.values()),
                     'tool_breakdown': tool_breakdown,
+                    'models_used': sorted(task_models),
+                    'total_cost_usd': round(sum_cost_usd, 6),
                 }
 
         return results
@@ -1205,6 +1227,8 @@ class TokenMetricsService:
             doc['total_cache_creation'] = tokens.get('total_cache_creation')
             doc['tool_call_count'] = tokens.get('tool_call_count')
             doc['tool_breakdown'] = tokens.get('tool_breakdown', {})
+            doc['models_used'] = tokens.get('models_used', [])
+            doc['total_cost_usd'] = tokens.get('total_cost_usd', 0.0)
 
             doc['prompt_length'] = prompt_length_map.get(tid)
 

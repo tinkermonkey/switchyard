@@ -14,7 +14,7 @@ const getToolResultLength = (content) => {
   return 0
 }
 
-export default function TokenUsagePanel({ logs, promptText }) {
+export default function TokenUsagePanel({ logs, summary, promptText }) {
   const [isUsageExpanded, setIsUsageExpanded] = useState(false)
 
   const tokenUsage = useMemo(() => {
@@ -61,11 +61,13 @@ export default function TokenUsagePanel({ logs, promptText }) {
         const outputTokens = usage.output_tokens || 0
 
         if (firstInput === null) firstInput = effectiveInput
-        peakEffectiveInput = effectiveInput
         totalOutputTokens += outputTokens
-        peakCacheRead = cacheRead
-        peakCacheCreation = cacheCreation
-        peakDirectInput = inputDirect
+        if (effectiveInput >= peakEffectiveInput) {
+          peakEffectiveInput = effectiveInput
+          peakCacheRead = cacheRead
+          peakCacheCreation = cacheCreation
+          peakDirectInput = inputDirect
+        }
 
         if (prevEffectiveInput !== null && prevTurnTools.length > 0) {
           const delta = Math.max(0, effectiveInput - prevEffectiveInput)
@@ -142,6 +144,233 @@ export default function TokenUsagePanel({ logs, promptText }) {
     return String(n)
   }
 
+  const formatCost = (usd) => {
+    if (!usd || usd === 0) return null
+    if (usd < 0.01) return `$${usd.toFixed(4)}`
+    return `$${usd.toFixed(2)}`
+  }
+
+  // Context window limits by model family. All current Claude models are 200k.
+  const MODEL_CONTEXT_LIMITS = { default: 200_000 }
+  const getContextLimit = (models) => {
+    return MODEL_CONTEXT_LIMITS.default
+  }
+
+  // Pipeline-run-wide view: use pre-aggregated summary when available.
+  // This is accurate across multiple agent executions (context resets properly,
+  // tool counts are summed per execution rather than tracked as a single session).
+  if (summary) {
+    const totalInput = summary.total_input_tokens || 0
+    const totalOutput = summary.total_output_tokens || 0
+    const totalCost = summary.total_cost_usd || 0
+    const cacheHitRate = totalInput > 0 ? Math.round((summary.total_cache_read || 0) / totalInput * 100) : 0
+    const contextLimit = getContextLimit(summary.models_used)
+    const peakUtilPct = contextLimit > 0 ? Math.round((summary.peak_context || 0) / contextLimit * 100) : null
+    const agentBreakdown = summary.agent_breakdown || {}
+    const agentRows = Object.entries(agentBreakdown)
+      .map(([name, b]) => ({
+        name,
+        taskCount: b.task_count || 0,
+        input: (b.sum_direct_input || 0) + (b.sum_cache_read || 0) + (b.sum_cache_creation || 0),
+        cacheRead: b.sum_cache_read || 0,
+        cacheCreation: b.sum_cache_creation || 0,
+        output: b.sum_output || 0,
+        toolCalls: b.tool_call_count || 0,
+        cost: b.sum_cost_usd || 0,
+      }))
+      .sort((a, b) => b.input - a.input)
+
+    const toolBreakdown = summary.tool_breakdown || {}
+    const toolRows = Object.entries(toolBreakdown)
+      .map(([name, td]) => ({
+        name,
+        calls: td.call_count || 0,
+        contextGrowth: Math.round(td.sum_context_growth || 0),
+      }))
+      .sort((a, b) => (b.contextGrowth - a.contextGrowth) || (b.calls - a.calls))
+
+    const modelsUsed = summary.models_used || []
+
+    return (
+      <div className="my-2 bg-gh-canvas-subtle rounded-md border border-gh-border">
+        <button
+          onClick={() => setIsUsageExpanded(!isUsageExpanded)}
+          className="w-full flex items-center justify-between p-3 hover:bg-gh-border-muted transition-colors rounded-md"
+        >
+          <div className="flex items-center gap-2">
+            <span className="text-sm font-semibold text-gh-fg">Token Usage</span>
+            <span className="text-gh-fg-muted text-sm">·</span>
+            <span className="text-sm text-gh-fg-muted">{formatTokenCount(totalInput + totalOutput)} total</span>
+            <span className="text-gh-fg-muted text-sm">·</span>
+            <span className="text-sm text-gh-fg-muted">{summary.task_count} execution{summary.task_count !== 1 ? 's' : ''}</span>
+            {formatCost(totalCost) && (
+              <>
+                <span className="text-gh-fg-muted text-sm">·</span>
+                <span className="text-sm text-gh-fg-muted">{formatCost(totalCost)}</span>
+              </>
+            )}
+            {cacheHitRate > 0 && (
+              <>
+                <span className="text-gh-fg-muted text-sm">·</span>
+                <span className="text-sm text-gh-fg-muted">{cacheHitRate}% cached</span>
+              </>
+            )}
+          </div>
+          {isUsageExpanded ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
+        </button>
+
+        {isUsageExpanded && (
+          <div className="border-t border-gh-border p-3 grid grid-cols-3 gap-4">
+            {/* Col 1: Totals */}
+            <div>
+              <h4 className="text-xs font-semibold text-gh-fg-muted uppercase mb-2">Pipeline Totals</h4>
+              <table className="w-full text-sm">
+                <thead>
+                  <tr>
+                    <th className="text-left text-gh-fg-muted font-normal text-xs pb-1"></th>
+                    <th className="text-right text-gh-fg-muted font-normal text-xs pb-1">tokens</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td className="text-gh-fg-muted py-0.5">Total input</td>
+                    <td className="text-right font-mono">{formatTokenCount(totalInput)}</td>
+                  </tr>
+                  <tr>
+                    <td className="text-gh-fg-muted py-0.5 pl-3 text-xs">↳ direct</td>
+                    <td className="text-right font-mono text-xs">{formatTokenCount(summary.total_direct_input || 0)}</td>
+                  </tr>
+                  <tr>
+                    <td className="text-gh-fg-muted py-0.5 pl-3 text-xs">↳ cache reads</td>
+                    <td className="text-right font-mono text-xs">{formatTokenCount(summary.total_cache_read || 0)}</td>
+                  </tr>
+                  <tr>
+                    <td className="text-gh-fg-muted py-0.5 pl-3 text-xs">↳ cache writes</td>
+                    <td className="text-right font-mono text-xs">{formatTokenCount(summary.total_cache_creation || 0)}</td>
+                  </tr>
+                  <tr className="border-t border-gh-border">
+                    <td className="text-gh-fg-muted py-0.5">Total output</td>
+                    <td className="text-right font-mono">{formatTokenCount(totalOutput)}</td>
+                  </tr>
+                  <tr className="border-t border-gh-border">
+                    <td className="text-gh-fg font-semibold py-0.5">Grand total</td>
+                    <td className="text-right font-mono font-semibold">{formatTokenCount(totalInput + totalOutput)}</td>
+                  </tr>
+                  {summary.total_context_growth > 0 && (
+                    <tr className="border-t border-gh-border">
+                      <td className="text-gh-fg-muted py-0.5 pt-1.5">Cumulative ctx growth</td>
+                      <td className="text-right font-mono pt-1.5">{formatTokenCount(summary.total_context_growth)}</td>
+                    </tr>
+                  )}
+                  {summary.peak_context > 0 && (
+                    <tr>
+                      <td className="text-gh-fg-muted py-0.5">Peak context (single exec)</td>
+                      <td className="text-right font-mono text-gh-fg-muted">
+                        {formatTokenCount(summary.peak_context)}
+                        {peakUtilPct !== null && <span className="ml-1 opacity-60">({peakUtilPct}%)</span>}
+                      </td>
+                    </tr>
+                  )}
+                  {totalInput > 0 && (
+                    <tr>
+                      <td className="text-gh-fg-muted py-0.5">Cache hit rate</td>
+                      <td className="text-right font-mono">{cacheHitRate}%</td>
+                    </tr>
+                  )}
+                  {summary.total_tool_calls > 0 && (
+                    <tr>
+                      <td className="text-gh-fg-muted py-0.5">Total tool calls</td>
+                      <td className="text-right font-mono">{summary.total_tool_calls}</td>
+                    </tr>
+                  )}
+                  {formatCost(totalCost) && (
+                    <tr className="border-t border-gh-border">
+                      <td className="text-gh-fg font-semibold py-0.5 pt-1.5">Est. cost</td>
+                      <td className="text-right font-mono font-semibold pt-1.5">{formatCost(totalCost)}</td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+
+              {modelsUsed.length > 0 && (
+                <div className="mt-3">
+                  <h4 className="text-xs font-semibold text-gh-fg-muted uppercase mb-1.5">Models</h4>
+                  <div className="flex flex-wrap gap-1">
+                    {modelsUsed.map(m => (
+                      <span key={m} className="px-2 py-0.5 bg-gh-accent-subtle border border-gh-accent-muted rounded text-xs font-mono">
+                        {m}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Col 2: Tool breakdown */}
+            <div>
+              <h4 className="text-xs font-semibold text-gh-fg-muted uppercase mb-2">Tools Used</h4>
+              {toolRows.length > 0 ? (
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr>
+                      <th className="text-left text-gh-fg-muted font-normal text-xs pb-1">Tool</th>
+                      <th className="text-right text-gh-fg-muted font-normal text-xs pb-1">Calls</th>
+                      <th className="text-right text-gh-fg-muted font-normal text-xs pb-1">Ctx growth (tok)</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {toolRows.map(({ name, calls, contextGrowth }) => (
+                      <tr key={name}>
+                        <td className="text-gh-fg font-mono py-0.5 text-xs">{name}</td>
+                        <td className="text-right text-gh-fg py-0.5">{calls}</td>
+                        <td className="text-right text-gh-fg py-0.5">{contextGrowth > 0 ? formatTokenCount(contextGrowth) : '—'}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              ) : (
+                <p className="text-gh-fg-muted text-xs">No tool breakdown available</p>
+              )}
+            </div>
+
+            {/* Col 3: Per-agent breakdown */}
+            <div>
+              <h4 className="text-xs font-semibold text-gh-fg-muted uppercase mb-2">By Agent</h4>
+              {agentRows.length > 0 ? (
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr>
+                      <th className="text-left text-gh-fg-muted font-normal text-xs pb-1">Agent</th>
+                      <th className="text-right text-gh-fg-muted font-normal text-xs pb-1">Runs</th>
+                      <th className="text-right text-gh-fg-muted font-normal text-xs pb-1">Input</th>
+                      <th className="text-right text-gh-fg-muted font-normal text-xs pb-1">Output</th>
+                      <th className="text-right text-gh-fg-muted font-normal text-xs pb-1">Tools</th>
+                      {totalCost > 0 && <th className="text-right text-gh-fg-muted font-normal text-xs pb-1">Cost</th>}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {agentRows.map(({ name, taskCount, input, output, toolCalls, cost }) => (
+                      <tr key={name}>
+                        <td className="text-gh-fg font-mono py-0.5 text-xs">{name}</td>
+                        <td className="text-right text-gh-fg py-0.5">{taskCount}</td>
+                        <td className="text-right text-gh-fg py-0.5">{formatTokenCount(input)}</td>
+                        <td className="text-right text-gh-fg py-0.5">{formatTokenCount(output)}</td>
+                        <td className="text-right text-gh-fg py-0.5">{toolCalls > 0 ? toolCalls : '—'}</td>
+                        {totalCost > 0 && <td className="text-right text-gh-fg py-0.5">{formatCost(cost) || '—'}</td>}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              ) : (
+                <p className="text-gh-fg-muted text-xs">No agent breakdown available</p>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+    )
+  }
+
   if (!tokenUsage.hasData) return null
 
   return (
@@ -195,7 +424,14 @@ export default function TokenUsagePanel({ logs, promptText }) {
                 </tr>
                 <tr className="border-t border-gh-border">
                   <td className="text-gh-fg-muted py-0.5">Peak context</td>
-                  <td className="text-right font-mono">{formatTokenCount(tokenUsage.peakContext)}</td>
+                  <td className="text-right font-mono">
+                    {formatTokenCount(tokenUsage.peakContext)}
+                    {(() => {
+                      const limit = getContextLimit(tokenUsage.modelsUsed)
+                      const pct = limit > 0 ? Math.round(tokenUsage.peakContext / limit * 100) : null
+                      return pct !== null ? <span className="ml-1 opacity-60 text-xs">({pct}%)</span> : null
+                    })()}
+                  </td>
                 </tr>
                 <tr>
                   <td className="text-gh-fg-muted py-0.5 pl-3 text-xs">↳ direct input</td>
@@ -209,6 +445,14 @@ export default function TokenUsagePanel({ logs, promptText }) {
                   <td className="text-gh-fg-muted py-0.5 pl-3 text-xs">↳ cache writes</td>
                   <td className="text-right font-mono text-xs">{formatTokenCount(tokenUsage.peakCacheCreation)}</td>
                 </tr>
+                {tokenUsage.peakContext > 0 && (
+                  <tr>
+                    <td className="text-gh-fg-muted py-0.5 pl-3 text-xs">↳ cache hit rate</td>
+                    <td className="text-right font-mono text-xs">
+                      {Math.round(tokenUsage.peakCacheRead / tokenUsage.peakContext * 100)}%
+                    </td>
+                  </tr>
+                )}
                 <tr className="border-t border-gh-border">
                   <td className="text-gh-fg-muted py-0.5">Output</td>
                   <td className="text-right font-mono">{formatTokenCount(tokenUsage.totalOutput)}</td>

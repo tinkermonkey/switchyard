@@ -61,14 +61,17 @@ export default function PipelineRunHeader({
   onToggleFullscreen,
 }) {
   const navigate = useNavigate()
-  const [pipelineRunLogs, setPipelineRunLogs] = useState([])
+  const [pipelineRunSummary, setPipelineRunSummary] = useState(null)
 
   useEffect(() => {
     if (!pipelineRun?.id) return
     let cancelled = false
     fetch(`/api/pipeline-run/${pipelineRun.id}/token-usage`)
       .then(r => r.json())
-      .then(data => { if (!cancelled && data.success) setPipelineRunLogs(data.logs || []) })
+      .then(data => {
+        if (cancelled || !data.success) return
+        setPipelineRunSummary(data.summary || null)
+      })
       .catch(err => console.error('[PipelineRunHeader] token-usage fetch error:', err))
     return () => { cancelled = true }
   }, [pipelineRun?.id])
@@ -216,7 +219,7 @@ export default function PipelineRunHeader({
       </div>
 
       <div className="">
-        <TokenUsagePanel logs={pipelineRunLogs} />
+        <TokenUsagePanel summary={pipelineRunSummary} />
       </div>
 
       {pipelineRun.lock_status === 'waiting_for_lock' && pipelineRun.blocked_by_issue && (

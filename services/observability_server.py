@@ -1083,11 +1083,11 @@ def _get_repo_url(project_name: str) -> Optional[str]:
 def get_active_pipeline_runs():
     """Get all currently active pipeline runs with lock status"""
     try:
-        # Query Elasticsearch for active pipeline runs
+        # Query Elasticsearch for active pipeline runs (includes feedback_listening)
         query = {
             "query": {
-                "term": {
-                    "status": "active"
+                "terms": {
+                    "status": ["active", "feedback_listening"]
                 }
             },
             "sort": [{"started_at": "desc"}],
@@ -1764,26 +1764,10 @@ def get_agent_execution(execution_id):
 @app.route('/api/pipeline-run/<pipeline_run_id>/token-usage')
 def get_pipeline_run_token_usage(pipeline_run_id):
     try:
-        # Fetch raw OTEL logs for this pipeline run
-        logs = []
-        try:
-            logs_result = es_client.search(
-                index='logs-claude.otel-default',
-                body={
-                    'query': {'term': {'resource.attributes.pipeline_run_id.keyword': pipeline_run_id}},
-                    'sort': [{'@timestamp': 'asc'}],
-                    'size': 10000
-                }
-            )
-            for hit in logs_result['hits']['hits']:
-                logs.append(hit['_source'])
-        except Exception as e:
-            if 'index_not_found_exception' in str(e).lower():
-                return jsonify({'success': True, 'logs': [], 'summary': None,
-                                'pipeline_run_id': pipeline_run_id, 'log_count': 0})
-            raise
-
-        # Compute summary from pre-aggregated agent-execution-summaries for accuracy
+        # Compute summary from pre-aggregated agent-execution-summaries.
+        # Raw OTEL logs are not returned — they use a different schema from the
+        # claude-streams logs the agent-execution view consumes, and the frontend
+        # only uses the summary for the pipeline-run panel.
         summary = None
         try:
             exec_result = es_client.search(
@@ -1799,6 +1783,7 @@ def get_pipeline_run_token_usage(pipeline_run_id):
                         'initial_context', 'peak_context', 'context_growth',
                         'total_output', 'total_direct_input', 'total_cache_read',
                         'total_cache_creation', 'tool_call_count',
+                        'tool_breakdown', 'models_used', 'total_cost_usd',
                     ],
                 }
             )
@@ -1806,9 +1791,13 @@ def get_pipeline_run_token_usage(pipeline_run_id):
             if exec_hits:
                 total_direct = total_cr = total_cc = total_out = 0
                 total_tool_calls = 0
+                total_cost_usd = 0.0
+                total_context_growth = 0
                 peak_context = 0
                 per_agent: dict = {}
                 per_task = []
+                all_models: set = set()
+                pipeline_tool_breakdown: dict = {}
 
                 for hit in exec_hits:
                     src = hit['_source']
@@ -1818,14 +1807,30 @@ def get_pipeline_run_token_usage(pipeline_run_id):
                     out    = src.get('total_output') or 0
                     tc     = src.get('tool_call_count') or 0
                     pk     = src.get('peak_context') or 0
+                    cg     = src.get('context_growth') or 0
+                    cost   = src.get('total_cost_usd') or 0.0
+                    task_models = src.get('models_used') or []
+                    task_tool_bd = src.get('tool_breakdown') or {}
 
                     total_direct += direct
                     total_cr     += cr
                     total_cc     += cc
                     total_out    += out
                     total_tool_calls += tc
+                    total_cost_usd   += cost
+                    total_context_growth += cg
                     if pk > peak_context:
                         peak_context = pk
+                    all_models.update(task_models)
+
+                    # Accumulate per-tool counts and context growth across all executions
+                    for tool_name, td in task_tool_bd.items():
+                        ptd = pipeline_tool_breakdown.setdefault(tool_name, {
+                            'call_count': 0, 'sum_context_growth': 0, 'sum_output': 0,
+                        })
+                        ptd['call_count']        += td.get('task_count') or 0
+                        ptd['sum_context_growth'] += td.get('sum_context_growth') or 0
+                        ptd['sum_output']         += td.get('sum_output') or 0
 
                     agent = src.get('agent_name') or 'unknown'
                     if agent not in per_agent:
@@ -1833,6 +1838,7 @@ def get_pipeline_run_token_usage(pipeline_run_id):
                             'task_count': 0, 'sum_direct_input': 0,
                             'sum_cache_read': 0, 'sum_cache_creation': 0,
                             'sum_output': 0, 'tool_call_count': 0,
+                            'sum_cost_usd': 0.0,
                         }
                     ab = per_agent[agent]
                     ab['task_count']          += 1
@@ -1841,6 +1847,7 @@ def get_pipeline_run_token_usage(pipeline_run_id):
                     ab['sum_cache_creation']  += cc
                     ab['sum_output']          += out
                     ab['tool_call_count']     += tc
+                    ab['sum_cost_usd']        += cost
 
                     per_task.append({
                         'task_id':       src.get('task_id'),
@@ -1849,26 +1856,33 @@ def get_pipeline_run_token_usage(pipeline_run_id):
                         'duration_ms':   src.get('duration_ms'),
                         'initial_context': src.get('initial_context'),
                         'peak_context':  pk,
+                        'context_growth': cg,
                         'total_input':   direct + cr + cc,
                         'total_direct_input': direct,
                         'total_cache_read':   cr,
                         'total_cache_creation': cc,
                         'total_output':  out,
                         'tool_call_count': tc,
+                        'total_cost_usd': cost,
+                        'models_used':   task_models,
                     })
 
                 total_input = total_direct + total_cr + total_cc
                 summary = {
-                    'task_count':           len(exec_hits),
-                    'total_input_tokens':   total_input,
-                    'total_direct_input':   total_direct,
-                    'total_cache_read':     total_cr,
-                    'total_cache_creation': total_cc,
-                    'total_output_tokens':  total_out,
-                    'total_tool_calls':     total_tool_calls,
-                    'peak_context':         peak_context,
-                    'agent_breakdown':      per_agent,
-                    'per_task':             per_task,
+                    'task_count':              len(exec_hits),
+                    'total_input_tokens':      total_input,
+                    'total_direct_input':      total_direct,
+                    'total_cache_read':        total_cr,
+                    'total_cache_creation':    total_cc,
+                    'total_output_tokens':     total_out,
+                    'total_tool_calls':        total_tool_calls,
+                    'total_cost_usd':          round(total_cost_usd, 6),
+                    'total_context_growth':    total_context_growth,
+                    'peak_context':            peak_context,
+                    'models_used':             sorted(all_models),
+                    'tool_breakdown':          pipeline_tool_breakdown,
+                    'agent_breakdown':         per_agent,
+                    'per_task':                per_task,
                 }
         except Exception as e:
             err_str = str(e).lower()
@@ -1877,10 +1891,8 @@ def get_pipeline_run_token_usage(pipeline_run_id):
 
         return jsonify({
             'success': True,
-            'logs': logs,
             'summary': summary,
             'pipeline_run_id': pipeline_run_id,
-            'log_count': len(logs)
         })
     except Exception as e:
         logger.error(f"Error fetching pipeline run token usage: {e}")
