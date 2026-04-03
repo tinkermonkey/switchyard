@@ -8,7 +8,7 @@ variables:
   review_domain: Domain being reviewed (e.g. "code", "documentation"); passed from build_reviewer_prompt()
 ---
 
-## Review Cycle
+## Review Cycle — Initial Review
 
 This is **Review Iteration {iteration} of {max_iterations}**.
 

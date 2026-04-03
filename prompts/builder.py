@@ -67,6 +67,7 @@ class PromptBuilder:
         *,
         reviewer_title: str,
         review_domain: str,
+        filter_instructions: str = "",
     ) -> str:
         """Assemble a prompt for reviewer agents (CodeReviewer, DocumentationEditor)."""
         agent = ctx.agent_name
@@ -87,6 +88,7 @@ class PromptBuilder:
             context_section=context_section,
             review_task=review_task,
             format_instructions=format_instructions,
+            filter_instructions=filter_instructions,
         )
 
     def build_verifier_prompt(self, ctx: "PromptContext") -> str:
@@ -313,15 +315,8 @@ class PromptBuilder:
                 pass
 
         if ctx.previous_stage:
-            return (
-                f"\n## Previous Work and Feedback\n\n"
-                f"The following is the complete history of agent outputs and feedback for this issue.\n"
-                f"This includes outputs from ALL previous stages (design, testing, QA, etc.) and any\n"
-                f"user feedback. If this issue was returned from testing or QA, pay special attention\n"
-                f"to their feedback and address all issues they identified.\n\n"
-                f"{ctx.previous_stage}\n\n"
-                f"IMPORTANT: Review all feedback carefully and address every issue that is not already addressed.\n"
-            )
+            template = self._loader.workflow_template("initial/previous_work_fallback")
+            return "\n" + template.format(previous_stage=ctx.previous_stage) + "\n"
 
         return ""
 
@@ -363,10 +358,9 @@ class PromptBuilder:
                 prev_feedback_file = f"review_feedback_{rc.iteration - 1}.md"
                 prior_feedback_section = f"**Your Previous Review Feedback**: read `/pipeline_context/{prev_feedback_file}`\n"
             elif rc.previous_review_feedback:
-                prior_feedback_section = (
-                    f"**Your Previous Review Feedback**:\n"
-                    f"<previous_feedback>\n{rc.previous_review_feedback}\n</previous_feedback>\n"
-                )
+                prior_feedback_section = self._loader.workflow_template("review/prior_feedback_section").format(
+                    previous_review_feedback=rc.previous_review_feedback,
+                ) + "\n"
             else:
                 prior_feedback_section = ""
 
@@ -388,15 +382,12 @@ class PromptBuilder:
     def _reviewer_requirements_section(self, ctx: "PromptContext") -> str:
         rc = ctx.review_cycle
         if rc and ctx.pipeline_context_dir:
-            return (
-                f"## Original Requirements\n\n"
-                f"**Title**: {ctx.issue.title}\n"
-                f"(Full requirements in `/pipeline_context/initial_request.md`)"
+            return self._loader.workflow_template("review/requirements_file_based").format(
+                issue_title=ctx.issue.title,
             )
-        return (
-            f"## Original Requirements\n\n"
-            f"**Title**: {ctx.issue.title}\n"
-            f"**Description**: {ctx.issue.body}"
+        return self._loader.workflow_template("review/requirements_embedded").format(
+            issue_title=ctx.issue.title,
+            issue_body=ctx.issue.body,
         )
 
     def _reviewer_context_section(self, ctx: "PromptContext") -> str:
@@ -411,32 +402,23 @@ class PromptBuilder:
                     f"- **`{prev_feedback_file}`** — your previous feedback; "
                     f"verify those issues are now resolved\n"
                 )
-            return (
-                f"\n## Review Cycle Context Files\n\n"
-                f"All context files are at `/pipeline_context/`:\n"
-                f"- **`current_diff.md`** — git changes to review (stat + commits) ← run `git diff` from those commits\n"
-                f"- **`{maker_file}`** — current implementation to review\n"
-                f"- `initial_request.md` — original requirements to verify against\n"
-                f"{prev_feedback_note}"
-                f"- Earlier numbered files show the full iteration history\n\n"
-                f"**Review focus**: Read `current_diff.md` for the list of changed files, then use\n"
-                f"`git diff <base_commit> HEAD -- <file>` to examine the actual changes. Review ONLY\n"
-                f"additions (`+`) and deletions (`-`). Do not review unchanged code.\n"
-            )
+            return "\n" + self._loader.workflow_template("review/context_file_based").format(
+                maker_file=maker_file,
+                prev_feedback_note=prev_feedback_note,
+            ) + "\n"
 
         # Embedded documentation (DocumentationEditorAgent passes docs via previous_stage)
         if ctx.previous_stage:
-            return f"\n## Documentation to Review\n\n{ctx.previous_stage}\n"
+            return "\n" + self._loader.workflow_template("review/context_embedded_docs").format(
+                previous_stage=ctx.previous_stage,
+            ) + "\n"
 
         # Fallback: embedded change manifest (code reviewer without a context dir)
         change_manifest = ctx.change_manifest
         if change_manifest:
-            return (
-                f"\n## Code Changes\n\n{change_manifest}\n\n"
-                f"**Review focus**: Use the `git diff` commands listed above to fetch and examine the actual\n"
-                f"changes before reviewing. Review ONLY additions (`+`) and deletions (`-`) in the diff output.\n"
-                f"Do not review unchanged code.\n"
-            )
+            return "\n" + self._loader.workflow_template("review/context_embedded_changes").format(
+                change_manifest=change_manifest,
+            ) + "\n"
         return ""
 
     def _reviewer_format_instructions(self, ctx: "PromptContext", is_rereviewing: bool) -> str:
@@ -455,10 +437,9 @@ class PromptBuilder:
         if rc.is_rereviewing:
             prior = ""
             if rc.previous_review_feedback:
-                prior = (
-                    f"**Your Previous Review Feedback**:\n"
-                    f"<previous_feedback>\n{rc.previous_review_feedback}\n</previous_feedback>\n\n"
-                )
+                prior = self._loader.workflow_template("review/prior_feedback_section").format(
+                    previous_review_feedback=rc.previous_review_feedback,
+                ) + "\n\n"
             template = loader.workflow_template("verification/iteration_rereviewing")
             return template.format(
                 iteration=rc.iteration,

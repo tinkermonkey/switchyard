@@ -479,7 +479,7 @@ class TestAgentContentInPrompt:
     def test_idea_researcher_guidelines_in_prompt(self):
         ctx = _make_ctx("idea_researcher", "Idea Researcher", "I research ideas.", [])
         prompt = BUILDER.build(ctx)
-        assert "explore and build out the idea" in prompt
+        assert "Explore and build out the idea" in prompt
 
     def test_software_architect_guidelines_in_prompt(self):
         ctx = _make_ctx("software_architect", "Software Architect", "I design systems.",
@@ -494,7 +494,7 @@ class TestAgentContentInPrompt:
                         makes_code_changes=True, filesystem_write_allowed=True,
                         prompt_variant="implementation")
         prompt = BUILDER.build(ctx)
-        assert "Implement the code changes" in prompt
+        assert "Implement the specified code changes" in prompt
 
     def test_technical_writer_guidelines_in_prompt(self):
         ctx = _make_ctx("technical_writer", "Technical Writer", "I write docs.",

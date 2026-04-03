@@ -14,8 +14,9 @@ Directory layout:
     prompts/content/
         workflows/
             initial/
-                standard.md        structural template — analysis agents, initial mode
-                implementation.md  structural template — code agents, initial mode
+                standard.md              structural template — analysis agents, initial mode
+                implementation.md        structural template — code agents, initial mode
+                previous_work_fallback.md previous work section fallback ({previous_stage})
             question/
                 file_context.md    structural template — question mode, file-based context
                 embedded.md        structural template — question mode, embedded history
@@ -31,6 +32,12 @@ Directory layout:
                 iteration_initial.md       iteration context — initial review pass
                 iteration_rereviewing.md   iteration context — re-review pass
                 iteration_post_human.md    iteration context — post-human-escalation pass
+                requirements_file_based.md requirements section — file-based context ({issue_title})
+                requirements_embedded.md   requirements section — embedded ({issue_title}, {issue_body})
+                context_file_based.md      context section — file-based ({maker_file}, {prev_feedback_note})
+                context_embedded_docs.md   context section — embedded docs ({previous_stage})
+                context_embedded_changes.md context section — embedded changes ({change_manifest})
+                prior_feedback_section.md  prior feedback block ({previous_review_feedback})
             verification/
                 prompt.md          structural template — verifier agents
                 iteration_initial.md       iteration context — initial verification
