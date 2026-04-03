@@ -327,6 +327,18 @@ export const mergeArrayByIdStable = (existingItems, newItems, idKey = 'id') => {
     return newItem
   })
 
+  // If nothing changed (same length, same object references in same order), return
+  // the existing array so React's useState bails out and skips the re-render.
+  // Element-level reference preservation above is not enough — a new array always
+  // triggers a re-render even when every element is identical.
+  if (merged.length === existingItems.length) {
+    let hasChanges = false
+    for (let i = 0; i < merged.length; i++) {
+      if (merged[i] !== existingItems[i]) { hasChanges = true; break }
+    }
+    if (!hasChanges) return existingItems
+  }
+
   return merged
 }
 

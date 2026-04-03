@@ -29,10 +29,6 @@ class RequirementsVerifierAgent(AnalysisAgent):
         return "Requirements Verifier"
 
     @property
-    def agent_role_description(self) -> str:
-        return "I verify PR implementation against requirements and design specifications."
-
-    @property
     def output_sections(self) -> List[str]:
         return ["Gaps Found", "Deviations", "Verified"]
 

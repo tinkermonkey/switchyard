@@ -392,10 +392,24 @@ class AgentExecutor:
         # This returns the agent_execution_id for tracking this specific execution
         agent_config = agent_stage.agent_config or {}
         cycle_stack = task_context.get('cycle_stack')
+
+        # Collect pipeline context files for observability (best-effort)
+        _context_files = None
+        _context_dir = task_context.get('pipeline_context_dir')
+        if _context_dir:
+            try:
+                from services.pipeline_context_writer import PipelineContextWriter as _PCW
+                _writer = _PCW.from_existing(_context_dir)
+                if _writer.exists():
+                    _context_files = _writer.list_files()
+            except Exception:
+                pass
+
         agent_execution_id = self.obs.emit_agent_initialized(
             agent_name, task_id, project_name, agent_config, branch_name, container_name, pipeline_run_id,
             execution_type=execution_type,
-            cycle_stack=cycle_stack
+            cycle_stack=cycle_stack,
+            context_files=_context_files
         )
         
         logger.info(f"Agent execution started with ID: {agent_execution_id}")

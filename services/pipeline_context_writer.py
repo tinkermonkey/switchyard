@@ -31,6 +31,11 @@ class PipelineContextWriter(AgentContextWriter):
         conversation_turn_{N}.md        — numbered user questions in order
         latest_question.md              — always the most recent question (stable path)
 
+    review-cycle files (when used by a maker-checker review cycle):
+        current_diff.md                 — (overwritten) git diff before each reviewer run
+        maker_output_{N}.md             — maker agent output for iteration N
+        review_feedback_{N}.md          — reviewer feedback for iteration N
+
     The directory path is stored in PipelineRun.context_dir so it can be
     re-attached after an orchestrator restart (the files persist on the host volume).
     """
@@ -75,6 +80,60 @@ class PipelineContextWriter(AgentContextWriter):
         """Write (or overwrite) latest_question.md with the current user question."""
         content = f"**@{author}**:\n\n{question or ''}"
         self._write_file('latest_question.md', content)
+
+    def write_maker_output(self, output: str, iteration_number: int):
+        """Write a maker agent output as maker_output_{N}.md."""
+        self._write_file(f'maker_output_{iteration_number}.md', output or '')
+
+    def write_review_feedback(self, feedback: str, iteration_number: int):
+        """Write a reviewer output as review_feedback_{N}.md."""
+        self._write_file(f'review_feedback_{iteration_number}.md', feedback or '')
+
+    def write_current_diff(self, change_manifest: str):
+        """Write (or overwrite) current_diff.md before each reviewer run."""
+        self._write_file('current_diff.md', change_manifest or '')
+
+    def repopulate_review_cycle_from_state(
+        self,
+        issue: dict,
+        maker_outputs: list,
+        review_outputs: list,
+    ):
+        """
+        Re-create any missing review cycle context files from in-memory state.
+
+        Called when the context directory was lost (e.g. volume remount) but
+        the state YAML still has the outputs. Writes are idempotent — existing
+        files are skipped.
+        """
+        if not self.exists():
+            os.makedirs(self._context_dir, exist_ok=True)
+
+        initial_path = os.path.join(self._context_dir, 'initial_request.md')
+        if not os.path.exists(initial_path):
+            self.write_initial_request(
+                issue.get('title', ''),
+                issue.get('body', ''),
+            )
+
+        for entry in maker_outputs:
+            n = entry.get('iteration', 0)
+            filename = f'maker_output_{n + 1}.md'
+            path = os.path.join(self._context_dir, filename)
+            if not os.path.exists(path):
+                self._write_file(filename, entry.get('output', ''))
+
+        for entry in review_outputs:
+            n = entry.get('iteration', 1)
+            filename = f'review_feedback_{n}.md'
+            path = os.path.join(self._context_dir, filename)
+            if not os.path.exists(path):
+                self._write_file(filename, entry.get('output', ''))
+
+        logger.info(
+            f"Repopulated pipeline context dir from review cycle state: {self._context_dir} "
+            f"({len(maker_outputs)} maker, {len(review_outputs)} review outputs)"
+        )
 
     # ------------------------------------------------------------------
     # Turn counting

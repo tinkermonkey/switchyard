@@ -116,7 +116,7 @@ class LogCollector:
                 name="agent-logs-ilm-policy",
                 body=AGENT_LOGS_ILM_POLICY
             )
-            logger.info("Created ILM policy: agent-logs-ilm-policy (7-day retention)")
+            logger.info("Created ILM policy: agent-logs-ilm-policy (14-day retention)")
             
             # Create index templates for both new indices
             self.es.indices.put_index_template(
@@ -143,7 +143,7 @@ class LogCollector:
                 name="claude-otel-ilm-policy",
                 body=CLAUDE_OTEL_ILM_POLICY
             )
-            logger.info("Created ILM policy: claude-otel-ilm-policy (7-day retention)")
+            logger.info("Created ILM policy: claude-otel-ilm-policy (14-day retention)")
 
             self.es.indices.put_index_template(
                 name="claude-otel-logs-ilm",

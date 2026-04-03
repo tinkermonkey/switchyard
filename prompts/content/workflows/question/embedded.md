@@ -17,13 +17,23 @@ You are the {agent_display_name} continuing a conversation.
 {agent_role_description}
 
 ## Original Context
-**Title**: {issue_title}
-**Description**: {issue_body}
+
+**Title**:
+{issue_title}
+
+**Description**:
+{issue_body}
+
+## Guidelines
+
 {guidelines_section}
+
 ## Conversation History
+
 {formatted_history}
 
 ## Latest Question
+
 {current_question}
 
 ## Response Guidelines

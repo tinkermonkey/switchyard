@@ -49,10 +49,6 @@ class WorkBreakdownAgent(AnalysisAgent):
         return "Work Breakdown Specialist"
 
     @property
-    def agent_role_description(self) -> str:
-        return """I decompose approved designs into phase-based sub-issues for implementation, ensuring each issue has clear requirements, design guidance, and acceptance criteria."""
-
-    @property
     def output_sections(self) -> List[str]:
         # Output format is fully controlled by the sub_issue_format.md content file.
         return []

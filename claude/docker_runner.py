@@ -649,37 +649,7 @@ class DockerAgentRunner:
             cmd.extend(['-v', f'{host_mcp_path}:/home/orchestrator/.mcp_config.json:ro'])
             logger.info(f"Mounting MCP config: {host_mcp_path} -> /home/orchestrator/.mcp_config.json")
 
-        # Mount review cycle context directory if provided (file-based context for review cycles)
-        review_cycle_context_dir = (
-            task_context.get('review_cycle_context_dir')
-            or context.get('review_cycle_context_dir')
-        )
-        if review_cycle_context_dir:
-            host_ctx_path = review_cycle_context_dir
-            if review_cycle_context_dir.startswith('/workspace/'):
-                relative = review_cycle_context_dir.replace('/workspace/', '')
-                host_ctx_path = f'{host_workspace}/{relative}'
-            elif review_cycle_context_dir.startswith('/app/'):
-                relative = review_cycle_context_dir.replace('/app/', '')
-                host_ctx_path = f'{host_workspace}/switchyard/{relative}'
-            # Mount to /review_cycle_context (NOT inside /workspace) to avoid Docker
-            # overlay2 nested-mount failure: runc cannot mkdirat inside an
-            # already-mounted /workspace overlay merged layer.
-            # Verify existence using the container-side path (host_ctx_path is a host
-            # path and is not accessible from inside the orchestrator container).
-            if os.path.isdir(review_cycle_context_dir):
-                cmd.extend(['-v', f'{host_ctx_path}:/review_cycle_context:ro'])
-                logger.info(
-                    f"Mounting review cycle context: {host_ctx_path} -> /review_cycle_context"
-                )
-            else:
-                logger.warning(
-                    f"Review cycle context dir declared in task but missing on disk "
-                    f"({review_cycle_context_dir}); agent will run without /review_cycle_context. "
-                    f"This may indicate premature cleanup during circuit breaker recovery."
-                )
-
-        # Mount pipeline context directory if provided (file-based context for planning agents)
+        # Mount pipeline context directory if provided (file-based context for all agents, including review cycles)
         pipeline_context_dir = (
             task_context.get('pipeline_context_dir')
             or context.get('pipeline_context_dir')

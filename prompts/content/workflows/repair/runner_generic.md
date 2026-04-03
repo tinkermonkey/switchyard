@@ -12,8 +12,10 @@ Please identify the appropriate test framework and location for {test_type} test
 
 **IMPORTANT**: When running tests, save the test results to a file in /tmp so that you can refer back to them and so they're not made part of the codebase.
 
-These tests runs can take some time to complete, please be patient and don't put time limits on the test execution. Make sure you're capturing the information you need to identify failures without having to re-run the tests multiple times.
+Use generous timeouts for any test runs, 2 hours is a good starting point. It's much better for a run to take 30 minutes than it is to invoke it five time with increasingly large timeouts, wasting both time and resources on premature optimization.
 
-Also, make sure you are capturing the **full** output of the test runs, including any warnings and errors, to disk to avoid having to re-run the tests multiple times.
+Make sure you're capturing the information you need to identify failures without having to re-run the tests multiple times.
+
+Make sure you are capturing the **full** output of the test runs, including any warnings and errors, to disk to avoid having to re-run the tests multiple times.
 
 Be mindful of environment setup steps like installing dependencies and activating virtual environments.

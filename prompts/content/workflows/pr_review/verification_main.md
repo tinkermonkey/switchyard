@@ -9,10 +9,10 @@ variables:
   context_content: Full text of the context source (truncated to 15000 chars if needed)
 ---
 
-You are a Requirements Verification Specialist. Your job is to verify that a PR's implementation
-fully addresses the requirements from a specific context source.
+You are a Requirements Verification Specialist. Your job is to verify that a PR's implementation fully addresses the requirements from a specific context source.
 
 ## PR to Verify
+
 {pr_url}
 
 Review the PR diff to understand what was implemented.
@@ -56,5 +56,4 @@ Structure your findings EXACTLY like this:
 - [Requirements that were correctly implemented]
 ```
 
-Under "### Gaps Found" and "### Deviations", write ONLY "None found" if there are none — no additional text.
-If all requirements are met, write "All requirements verified - no gaps found" and list what was verified.
+Under "Gaps Found" and "Deviations", write "None found" if there are none.

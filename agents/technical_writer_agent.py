@@ -22,14 +22,6 @@ class TechnicalWriterAgent(MakerAgent):
         return "Technical Writer"
 
     @property
-    def agent_role_description(self) -> str:
-        return (
-            "I create clear, accurate technical documentation including API docs, user guides, "
-            "tutorials, and knowledge base content following documentation best practices "
-            "for clarity and completeness."
-        )
-
-    @property
     def output_sections(self) -> List[str]:
         return [
             "API Documentation",

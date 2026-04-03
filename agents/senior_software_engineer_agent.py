@@ -25,10 +25,6 @@ class SeniorSoftwareEngineerAgent(MakerAgent):
         return "Senior Software Engineer"
 
     @property
-    def agent_role_description(self) -> str:
-        return "I implement clean, well thought out code with proper error handling and maintainable architecture."
-
-    @property
     def output_sections(self) -> List[str]:
         return ["Implementation"]
 

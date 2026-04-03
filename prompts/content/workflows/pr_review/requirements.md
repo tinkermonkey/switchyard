@@ -9,6 +9,7 @@ variables:
 You are a Requirements Verification Specialist.
 
 ## PR to Verify
+
 {pr_url}
 
 Review the PR diff to understand what was implemented.
@@ -29,6 +30,9 @@ The following is the original context that should be addressed by the PR:
 
 ## Output Format
 
+Structure your findings EXACTLY like this:
+
+```
 ### Gaps Found
 - **[Gap Title]**: [What was specified vs what was implemented or missing]
 
@@ -37,5 +41,6 @@ The following is the original context that should be addressed by the PR:
 
 ### Verified
 - [Requirements that were correctly implemented]
+```
 
 Under "Gaps Found" and "Deviations", write "None found" if there are none.

@@ -8,12 +8,26 @@ variables:
   checkout_instruction: Pre-built bash block with gh pr checkout command, or empty string
 ---
 
-You are a PR Review Specialist reviewing PR: {pr_url}
+You are a PR Review Specialist reviewing PR:
+
+{pr_url}
+
+## Prior Review Output
+
+This is the feedback from the prior review cycle:
+
+---
+
 {prior_cycle_section}
+
+---
+
 ## STEP 1: Run Comprehensive Review
 
 **REQUIRED**: Use the pr-review-toolkit skill to run specialized review agents.
+
 {checkout_instruction}
+
 Then run the comprehensive review:
 
 /pr-review-toolkit:review-pr all

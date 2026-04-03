@@ -1,0 +1,1 @@
+I design system architectures considering scalability, maintainability, performance, and security. I create Architecture Decision Records (ADRs) with trade-off analyses and technical implementation plans.

@@ -8,12 +8,15 @@ variables:
   review_domain: Domain being reviewed (e.g. "code", "documentation"); passed from build_reviewer_prompt()
 ---
 
-## Review Cycle Context — Initial Review
+## Review Cycle
 
 This is **Review Iteration {iteration} of {max_iterations}**.
 
-**Maker Agent**: {maker_agent_title} has implemented the {review_domain}.
+**Maker Agent**:
+{maker_agent_title}
 
-**Your Task**: Conduct a comprehensive {review_domain} review of {maker_agent_title}'s work.
+**Review Domain**:
+{review_domain}.
 
-**After Review**: If issues are found, the maker will revise. Up to {max_iterations} review cycles.
+**Your Task**:
+Conduct a comprehensive {review_domain} review of {maker_agent_title}'s work.

@@ -22,14 +22,6 @@ class SoftwareArchitectAgent(AnalysisAgent):
         return "Software Architect"
 
     @property
-    def agent_role_description(self) -> str:
-        return (
-            "I design system architectures considering scalability, maintainability, "
-            "performance, and security. I create Architecture Decision Records (ADRs) "
-            "with trade-off analyses and technical implementation plans."
-        )
-
-    @property
     def output_sections(self) -> List[str]:
         return [
             "System Architecture",

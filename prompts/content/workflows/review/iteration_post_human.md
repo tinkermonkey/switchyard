@@ -23,4 +23,5 @@ You previously escalated this review due to **blocking issues** that required hu
 - Your updated review should be a **complete, standalone review** (not just changes)
 - Set the appropriate status: APPROVED, CHANGES NEEDED, or BLOCKED (if still unresolved)
 
-**Current Iteration**: {iteration}/{max_iterations}
+**Current Iteration**:
+{iteration} of {max_iterations} max

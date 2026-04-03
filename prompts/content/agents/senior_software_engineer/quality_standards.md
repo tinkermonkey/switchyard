@@ -5,3 +5,4 @@ variables: none
 ---
 - Proper error handling and logging
 - Clear variable/function naming
+- Best practices followed for the languages, frameworks, and technologies

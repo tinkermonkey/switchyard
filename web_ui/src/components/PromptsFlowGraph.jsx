@@ -22,7 +22,7 @@ export default function PromptsFlowGraph({ events, selectedPipelineRun, loading 
 
   const rfRef = useRef(null)
   const hasInitialized = useRef(false)
-  const prevPipelineRun = useRef(selectedPipelineRun)
+  const prevPipelineRun = useRef(selectedPipelineRun?.id)
   const [nodes, setNodes, onNodesChange] = useNodesState([])
   const [edges, setEdges, onEdgesChange] = useEdgesState([])
 
@@ -63,8 +63,8 @@ export default function PromptsFlowGraph({ events, selectedPipelineRun, loading 
       setEdges(rawEdges)
     }
 
-    const pipelineRunChanged = prevPipelineRun.current !== selectedPipelineRun
-    prevPipelineRun.current = selectedPipelineRun
+    const pipelineRunChanged = prevPipelineRun.current !== selectedPipelineRun?.id
+    prevPipelineRun.current = selectedPipelineRun?.id
 
     if ((!hasInitialized.current || pipelineRunChanged) && rawNodes.length > 0) {
       hasInitialized.current = true

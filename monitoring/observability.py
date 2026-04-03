@@ -663,7 +663,8 @@ class ObservabilityManager:
                               container_name: Optional[str] = None,
                               pipeline_run_id: Optional[str] = None,
                               execution_type: str = "",
-                              cycle_stack: Optional[list] = None):
+                              cycle_stack: Optional[list] = None,
+                              context_files: Optional[list] = None):
         """Emit agent initialized event"""
         from monitoring.cycle_stack import cycle_type_from_stack, cycle_iteration_from_stack
 
@@ -685,6 +686,8 @@ class ObservabilityManager:
             data['cycle_stack'] = cycle_stack
             data['cycle_type'] = cycle_type_from_stack(cycle_stack)
             data['cycle_iteration'] = cycle_iteration_from_stack(cycle_stack)
+        if context_files is not None:
+            data['context_files'] = context_files
 
         self.emit(EventType.AGENT_INITIALIZED, agent, task_id, project, data, pipeline_run_id,
                   execution_type=execution_type)

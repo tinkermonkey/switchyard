@@ -3,7 +3,8 @@ invoked_by: prompts/builder.py — PromptBuilder.build_reviewer_prompt() via loa
   Injected as {review_task} in the reviewer mode template
 variables: none
 ---
-**Code Quality Assessment**:
+## Code Quality Assessment
+
 - Clean code practices (DRY, KISS, YAGNI)
 - Code readability and maintainability
 - Naming conventions and structure → No "Phase X" or "Enhanced" or "Improved" etc

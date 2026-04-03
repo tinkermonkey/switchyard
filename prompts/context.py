@@ -73,7 +73,6 @@ class PromptContext:
     inputs_from: list = field(default_factory=list)  # upstream agent names
 
     # ── Review cycle (maker revision) ─────────────────────────────────────────
-    review_cycle_context_dir: Optional[str] = None
     review_cycle: Optional[ReviewCycleContext] = None
 
     # ── Question mode ─────────────────────────────────────────────────────────
@@ -108,7 +107,7 @@ class PromptContext:
     check_content: str = ""
 
     # ── Code reviewer (standalone, non-file-based) ───────────────────────────
-    change_manifest: str = ""  # embedded change summary when no review_cycle_context_dir
+    change_manifest: str = ""  # embedded change summary when no pipeline_context_dir
 
     # ── Dev environment verifier ──────────────────────────────────────────────
     project_name: str = ""   # explicit project name (verifier needs it expanded)
@@ -151,7 +150,7 @@ class PromptContext:
                 is_rereviewing=review_cycle_raw.get("is_rereviewing", False),
                 post_human_feedback=review_cycle_raw.get("post_human_feedback", False),
                 previous_review_feedback=review_cycle_raw.get("previous_review_feedback") or "",
-                context_dir=task_context.get("review_cycle_context_dir"),
+                context_dir=task_context.get("pipeline_context_dir"),
             )
 
         # ── Mode detection ────────────────────────────────────────────────
@@ -205,7 +204,6 @@ class PromptContext:
             previous_stage=task_context.get("previous_stage_output", ""),
             pipeline_context_dir=task_context.get("pipeline_context_dir"),
             inputs_from=task_context.get("inputs_from", []),
-            review_cycle_context_dir=task_context.get("review_cycle_context_dir"),
             review_cycle=review_cycle,
             thread_history=task_context.get("thread_history", []),
             current_question=feedback_text if mode == "question" else "",

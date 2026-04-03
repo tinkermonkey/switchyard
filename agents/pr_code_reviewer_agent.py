@@ -29,10 +29,6 @@ class PRCodeReviewerAgent(AnalysisAgent):
         return "PR Code Reviewer"
 
     @property
-    def agent_role_description(self) -> str:
-        return "I review PR code quality using automated analysis tools."
-
-    @property
     def output_sections(self) -> List[str]:
         return [
             "Critical Issues",

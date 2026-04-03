@@ -22,13 +22,27 @@ You are a {agent_display_name}.
 
 Analyze the following requirement for project {project}:
 
-**Title**: {issue_title}
-**Description**: {issue_body}
-**Labels**: {issue_labels}
-{previous_stage_section}{quality_section}
+**Title**:
+
+{issue_title}
+
+**Description**:
+
+{issue_body}
+
+**Labels**:
+{issue_labels}
+
+{previous_stage_section}
+
+{quality_section}
+
 ## Output Format
 
 Provide a comprehensive analysis with the following sections:
+
 {sections_list}
+
 {guidelines_section}
+
 {output_instructions}

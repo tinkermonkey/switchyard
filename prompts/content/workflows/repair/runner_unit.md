@@ -24,6 +24,4 @@ Run ONLY unit tests for this project. Do NOT run integration, e2e, or performanc
 3. Save the full output to /tmp/unit_test_results.txt for reference.
 
 4. Count only ACTUAL test failures in "failures" — not log lines that contain the word ERROR or FAILED.
-   Count only ACTIONABLE warnings in "warning_list" (e.g. deprecation warnings in test code that
-   should be fixed) — not expected log-level WARNING messages from the application under test.
-   Set "warnings" to exactly len(warning_list).
+   - Count only ACTIONABLE warnings in "warning_list" (e.g. deprecation warnings in test code that should be fixed) — not expected log-level WARNING messages from the application under test. Set "warnings" to exactly len(warning_list).

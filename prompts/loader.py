@@ -59,9 +59,7 @@ Directory layout:
                 systemic_analysis.md    systemic failure analysis prompt (5 variables); uses {{ }} for JSON schema
                 systemic_fix.md         systemic fix prompt ({test_type}, {known_pattern}, {failure_digest}, {attempt_note})
             analysis/
-                pattern_improvement.md      pattern analysis prompt (10 variables); uses {{ }} for JSON schema
                 pipeline_run.md             pipeline run analysis prompt (5 variables incl. sentinel strings); uses {{ }} for JSON
-                ignored_review_pattern.md   ignored review pattern detection prompt (6 variables); uses {{ }} for JSON schema
                 architecture_discovery.md   codebase architecture analysis prompt ({project})
                 techstack_discovery.md      tech stack discovery prompt ({project})
                 conventions_discovery.md    coding conventions discovery prompt ({project})
@@ -72,6 +70,7 @@ Directory layout:
                 generate_strategy.md agent team strategy generation prompt (4 variables); uses {{ }} for JSON schema
         agents/
             {agent_name}/
+                role_description.md        (one-sentence role injected at prompt top)
                 guidelines.md              (optional)
                 quality_standards.md       (optional)
                 review_task.md             (standalone reviewer agents)
@@ -178,6 +177,10 @@ class ContentLoader:
     def agent_sub_issue_format(self, agent_name: str) -> str:
         """JSON sub-issue output format block (WorkBreakdownAgent)."""
         return _load_file(self._root / "agents" / agent_name / "sub_issue_format.md")
+
+    def agent_role_description(self, agent_name: str) -> str:
+        """One-sentence role description injected at the top of every prompt."""
+        return _load_file(self._root / "agents" / agent_name / "role_description.md")
 
     def agent_rereviewing_context(self, agent_name: str) -> str:
         """Agent-specific re-review iteration context block (overrides the shared template).

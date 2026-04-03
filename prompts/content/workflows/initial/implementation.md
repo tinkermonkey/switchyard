@@ -16,10 +16,24 @@ You are a {agent_display_name}.
 
 {agent_role_description}
 
-**Issue Title**: {issue_title}
+### Work Item
+
+These are the requirements to implement.
+
+**Title**:
+{issue_title}
 
 **Description**:
 {issue_body}
 
-{previous_work_section}{guidelines_section}
+### Previous Work
+
+{previous_work_section}
+
+### Guidelines
+
+{guidelines_section}
+
+### Output Instructions
+
 {output_instructions}

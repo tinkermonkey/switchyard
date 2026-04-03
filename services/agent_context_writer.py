@@ -1,9 +1,9 @@
 """
 AgentContextWriter - Base class for context directory writers.
 
-Provides shared filesystem primitives used by ReviewCycleContextWriter
-and PipelineContextWriter. Both subclasses write context files into a
-temp directory that gets mounted read-only into agent containers.
+Provides shared filesystem primitives used by PipelineContextWriter.
+Subclasses write context files into a temp directory that gets mounted
+read-only into agent containers.
 """
 
 import logging

@@ -3,4 +3,4 @@ invoked_by: prompts/builder.py — PromptBuilder._build_initial() via loader.age
   Injected as {quality_section} ("## Quality Standards" block) in the initial_standard mode template
 variables: none
 ---
-- The idea is built out and progressed with research
+- The idea presented is explored and progressed via research which takes into account the current codebase and tech stack

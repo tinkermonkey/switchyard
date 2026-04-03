@@ -22,9 +22,5 @@ class BusinessAnalystAgent(AnalysisAgent):
         return "Business Analyst"
 
     @property
-    def agent_role_description(self) -> str:
-        return "I analyse business requirements, create user stories, and ensure requirements are clear, complete, and testable."
-
-    @property
     def output_sections(self) -> List[str]:
         return ["Executive Summary", "Functional Requirements", "User Stories"]

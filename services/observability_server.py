@@ -2006,7 +2006,7 @@ def get_cycle_metrics():
             days = int(request.args.get('days', 7))
         except (ValueError, TypeError):
             return jsonify({'success': False, 'error': 'Invalid days parameter', 'metrics': []}), 400
-        days = max(1, min(days, 7))  # raw data retained for 7 days
+        days = max(1, min(days, 14))  # raw data retained for 14 days
         cycle_type_filter = request.args.get('cycle_type')
 
         must_clauses = [{'range': {'hour_bucket': {'gte': f'now-{days}d'}}}]
@@ -2073,7 +2073,7 @@ def get_project_metrics():
             days = int(request.args.get('days', 7))
         except (ValueError, TypeError):
             return jsonify({'success': False, 'error': 'Invalid days parameter', 'projects': []}), 400
-        days = max(1, min(days, 7))
+        days = max(1, min(days, 14))
 
         try:
             result = es_client.search(

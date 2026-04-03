@@ -328,9 +328,12 @@ function PipelineRunView() {
       if (data.success && urlRunIdRef.current === pipelineRunId) {
         const newEventsWithKeys = data.events.map((event, idx) => ({
           ...event,
-          _key: event.id || `${event.timestamp}_${idx}`
+          _key: event.id || `${event.timestamp}_${event.event_type}_${event.task_id || ''}`
         }))
-        setPipelineRunEvents(newEventsWithKeys)
+        // Preserve the existing array reference when content is unchanged — prevents
+        // mergedEvents from recomputing and both graphs from re-running on every
+        // silent poll even when no new events have arrived.
+        setPipelineRunEvents(prev => mergeArrayByIdStable(prev, newEventsWithKeys, '_key'))
       }
     } catch (error) {
       console.error('Error fetching pipeline run events:', error)

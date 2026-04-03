@@ -22,10 +22,6 @@ class IdeaResearcherAgent(AnalysisAgent):
         return "Idea Researcher"
 
     @property
-    def agent_role_description(self) -> str:
-        return "I conduct business research and concept analysis, exploring solution landscapes, prior art, and architectural implications."
-
-    @property
     def output_sections(self) -> List[str]:
         return [
             "Executive Summary",

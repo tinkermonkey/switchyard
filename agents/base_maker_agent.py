@@ -41,9 +41,12 @@ class MakerAgent(PipelineStage, ABC):
         """Human-readable label, e.g. 'Business Analyst'."""
 
     @property
-    @abstractmethod
     def agent_role_description(self) -> str:
-        """One-sentence role description injected at the top of every prompt."""
+        """One-sentence role description injected at the top of every prompt.
+
+        Loaded from prompts/content/agents/{agent_name}/role_description.md.
+        """
+        return self._prompt_builder._loader.agent_role_description(self.agent_name)
 
     @property
     @abstractmethod

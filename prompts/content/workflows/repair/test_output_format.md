@@ -7,6 +7,7 @@ notes: >
 ---
 
 CRITICAL: You MUST return ONLY valid JSON in this EXACT format (no markdown, no explanation):
+```
 {
     "passed": <number of passing checks or tests>,
     "failed": <number of failing checks or tests>,
@@ -20,6 +21,7 @@ CRITICAL: You MUST return ONLY valid JSON in this EXACT format (no markdown, no 
         ...
     ]
 }
+```
 
 If everything passes cleanly, return:
 {"passed": 1, "failed": 0, "warnings": 0, "failures": [], "warning_list": []}

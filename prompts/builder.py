@@ -67,13 +67,8 @@ class PromptBuilder:
         *,
         reviewer_title: str,
         review_domain: str,
-        filter_instructions: str = "",
     ) -> str:
-        """
-        Assemble a prompt for reviewer agents (CodeReviewer, DocumentationEditor).
-
-        filter_instructions is async-loaded by the agent and injected here.
-        """
+        """Assemble a prompt for reviewer agents (CodeReviewer, DocumentationEditor)."""
         agent = ctx.agent_name
         rc = ctx.review_cycle
         is_rereviewing = rc.is_rereviewing if rc else False
@@ -88,7 +83,6 @@ class PromptBuilder:
             reviewer_title=reviewer_title,
             review_domain=review_domain,
             iteration_context=iteration_context,
-            filter_instructions=filter_instructions,
             requirements_section=requirements_section,
             context_section=context_section,
             review_task=review_task,
@@ -233,7 +227,7 @@ class PromptBuilder:
         # (trigger == 'review_cycle_revision' is captured as review_cycle existing)
         use_file_context = (
             is_review_cycle
-            and ctx.review_cycle_context_dir
+            and ctx.pipeline_context_dir
         )
 
         cycle_context = self._maker_cycle_context(ctx)
@@ -367,7 +361,7 @@ class PromptBuilder:
             # Determine how to surface previous feedback
             if rc.context_dir and rc.iteration and rc.iteration > 1:
                 prev_feedback_file = f"review_feedback_{rc.iteration - 1}.md"
-                prior_feedback_section = f"**Your Previous Review Feedback**: read `/review_cycle_context/{prev_feedback_file}`\n"
+                prior_feedback_section = f"**Your Previous Review Feedback**: read `/pipeline_context/{prev_feedback_file}`\n"
             elif rc.previous_review_feedback:
                 prior_feedback_section = (
                     f"**Your Previous Review Feedback**:\n"
@@ -393,11 +387,11 @@ class PromptBuilder:
 
     def _reviewer_requirements_section(self, ctx: "PromptContext") -> str:
         rc = ctx.review_cycle
-        if rc and ctx.review_cycle_context_dir:
+        if rc and ctx.pipeline_context_dir:
             return (
                 f"## Original Requirements\n\n"
                 f"**Title**: {ctx.issue.title}\n"
-                f"(Full requirements in `/review_cycle_context/initial_request.md`)"
+                f"(Full requirements in `/pipeline_context/initial_request.md`)"
             )
         return (
             f"## Original Requirements\n\n"
@@ -407,7 +401,7 @@ class PromptBuilder:
 
     def _reviewer_context_section(self, ctx: "PromptContext") -> str:
         rc = ctx.review_cycle
-        if rc and ctx.review_cycle_context_dir:
+        if rc and ctx.pipeline_context_dir:
             iteration = rc.iteration
             maker_file = f"maker_output_{iteration}.md" if iteration else "maker_output_1.md"
             prev_feedback_note = ""
@@ -419,7 +413,7 @@ class PromptBuilder:
                 )
             return (
                 f"\n## Review Cycle Context Files\n\n"
-                f"All context files are at `/review_cycle_context/`:\n"
+                f"All context files are at `/pipeline_context/`:\n"
                 f"- **`current_diff.md`** — git changes to review (stat + commits) ← run `git diff` from those commits\n"
                 f"- **`{maker_file}`** — current implementation to review\n"
                 f"- `initial_request.md` — original requirements to verify against\n"

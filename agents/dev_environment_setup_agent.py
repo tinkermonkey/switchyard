@@ -22,14 +22,6 @@ class DevEnvironmentSetupAgent(MakerAgent):
         return "Dev Environment Setup Specialist"
 
     @property
-    def agent_role_description(self) -> str:
-        return (
-            "I fix and configure development environments by modifying Dockerfiles, "
-            "dependency files, and build scripts to resolve environment issues and "
-            "ensure reproducible builds."
-        )
-
-    @property
     def output_sections(self) -> List[str]:
         return [
             "Problem Analysis",

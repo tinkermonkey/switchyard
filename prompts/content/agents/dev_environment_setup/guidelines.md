@@ -3,7 +3,7 @@ invoked_by: prompts/builder.py — PromptBuilder._build_initial() via loader.age
   Injected as {guidelines_section} in the initial_standard or initial_implementation mode template
 variables: none
 ---
-### Your Task:
+### Your Task
 
 1. **Analyse the Codebase and any problem descriptions**:
    - Identify the different types of files involved in the environment setup

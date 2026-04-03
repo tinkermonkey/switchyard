@@ -134,7 +134,7 @@ AGENT_LOGS_TEMPLATE = {
 }
 
 
-# Lifecycle policy for index rotation (daily indices, 7-day retention)
+# Lifecycle policy for index rotation (daily indices, 14-day retention)
 # Note: No rollover action since we use date-based index names
 AGENT_LOGS_ILM_POLICY = {
     "policy": {
@@ -148,7 +148,7 @@ AGENT_LOGS_ILM_POLICY = {
                 }
             },
             "warm": {
-                "min_age": "3d",
+                "min_age": "7d",
                 "actions": {
                     "set_priority": {
                         "priority": 50
@@ -156,7 +156,7 @@ AGENT_LOGS_ILM_POLICY = {
                 }
             },
             "delete": {
-                "min_age": "7d",
+                "min_age": "14d",
                 "actions": {
                     "delete": {}
                 }
@@ -280,7 +280,7 @@ AGENT_EVENTS_TEMPLATE = {
 }
 
 # ILM policy for OTEL data streams (logs-claude.otel-* and metrics-claude.otel-*)
-# Matches the 7-day retention used by agent-logs-ilm-policy.
+# Matches the 14-day retention used by agent-logs-ilm-policy.
 CLAUDE_OTEL_ILM_POLICY = {
     "policy": {
         "phases": {
@@ -291,13 +291,13 @@ CLAUDE_OTEL_ILM_POLICY = {
                 }
             },
             "warm": {
-                "min_age": "3d",
+                "min_age": "7d",
                 "actions": {
                     "set_priority": {"priority": 50}
                 }
             },
             "delete": {
-                "min_age": "7d",
+                "min_age": "14d",
                 "actions": {
                     "delete": {}
                 }

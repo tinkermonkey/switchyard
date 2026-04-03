@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from 'react'
 import { RefreshCw, TrendingUp } from 'lucide-react'
 
-const DAYS_OPTIONS = [1, 3, 7]
+const DAYS_OPTIONS = [1, 3, 7, 14]
 
 const fmt = (n) => {
   if (n == null) return '—'

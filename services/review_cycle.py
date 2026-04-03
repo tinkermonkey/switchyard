@@ -12,10 +12,9 @@ from datetime import datetime
 from config.manager import WorkflowColumn
 from services.review_parser import ReviewParser, ReviewStatus
 from services.github_integration import GitHubIntegration
-from services.review_outcome_correlator import get_review_outcome_correlator
 from monitoring.cycle_stack import push_frame, CycleFrame
 from services.cancellation import CancellationError
-from services.review_cycle_context import ReviewCycleContextWriter
+from services.pipeline_context_writer import PipelineContextWriter
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +61,7 @@ class ReviewCycleState:
         self.last_approved_commit = None  # Git commit hash of last approved review (for scoped diffs)
         self.pre_maker_commit = None  # HEAD snapshot taken just before the maker agent runs each iteration
         self.context_dir: Optional[str] = None  # Container path to review cycle context directory
-        self.context_writer: Optional[ReviewCycleContextWriter] = None  # In-memory handle (not persisted)
+        self.context_writer: Optional[PipelineContextWriter] = None  # In-memory handle (not persisted)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -132,7 +131,6 @@ class ReviewCycleExecutor:
         # Don't initialize GitHubIntegration here - create it per-call with proper repo context
         self.active_cycles = {}  # Track active review cycles by (project_name, issue_number) tuple
         self.state_dir = None  # Will be set per project
-        self.outcome_correlator = get_review_outcome_correlator()
         # Per-issue locks that prevent concurrent _execute_review_loop / _continue_cycle_from_review
         # calls for the same issue (e.g. resume_active_cycles racing with the project monitor poll)
         self._cycle_execution_locks: Dict[Tuple, threading.Lock] = {}
@@ -185,7 +183,7 @@ class ReviewCycleExecutor:
         self,
         cycle_state: ReviewCycleState,
         issue_data: Optional[Dict[str, Any]] = None,
-    ) -> Optional[ReviewCycleContextWriter]:
+    ) -> Optional[PipelineContextWriter]:
         """
         Return the context writer for this cycle, restoring it after a restart if needed.
 
@@ -202,14 +200,14 @@ class ReviewCycleExecutor:
             # Legacy state predating this feature — embedded-prompt fallback
             return None
 
-        writer = ReviewCycleContextWriter.from_existing(cycle_state.context_dir)
+        writer = PipelineContextWriter.from_existing(cycle_state.context_dir)
         if not writer.exists():
             logger.warning(
                 f"Review cycle context dir missing for issue #{cycle_state.issue_number} "
                 f"({cycle_state.context_dir}) — repopulating from state"
             )
             if issue_data:
-                writer.repopulate_from_state(
+                writer.repopulate_review_cycle_from_state(
                     issue=issue_data,
                     maker_outputs=cycle_state.maker_outputs,
                     review_outputs=cycle_state.review_outputs,
@@ -223,21 +221,6 @@ class ReviewCycleExecutor:
 
         cycle_state.context_writer = writer
         return writer
-
-    async def _analyze_review_cycle_outcomes(self, cycle_state: ReviewCycleState):
-        """
-        Analyze completed review cycle for learning.
-
-        Extracts review outcomes to feed into the pattern detection and learning system.
-        This runs asynchronously in the background to not block cycle completion.
-        """
-        try:
-            logger.info(f"Analyzing review cycle outcomes for issue #{cycle_state.issue_number}")
-            outcomes = await self.outcome_correlator.analyze_review_cycle_outcome(cycle_state)
-            logger.info(f"Extracted {len(outcomes)} review outcomes for learning")
-        except Exception as e:
-            logger.warning(f"Failed to analyze review outcomes (non-critical): {e}")
-            # Don't fail the cycle if learning fails
 
     def _get_state_file_path(self, project_name: str) -> str:
         """Get path to active cycles state file for a project"""
@@ -914,7 +897,7 @@ class ReviewCycleExecutor:
 
         # Set up file-based context directory for this new cycle
         try:
-            writer = ReviewCycleContextWriter.setup(issue_number, pipeline_run_id or '')
+            writer = PipelineContextWriter.setup(issue_number, pipeline_run_id or '')
             cycle_state.context_writer = writer
             cycle_state.context_dir = writer.context_dir
             writer.write_initial_request(
@@ -1099,9 +1082,6 @@ class ReviewCycleExecutor:
 
                 cycle_state.status = 'completed'
                 self._save_cycle_state(cycle_state)
-
-                # Analyze review cycle outcomes for learning (async, non-blocking)
-                await self._analyze_review_cycle_outcomes(cycle_state)
 
                 self._remove_cycle_state(cycle_state)
                 ck = self._cycle_key(cycle_state.project_name, cycle_state.issue_number)
@@ -1426,9 +1406,6 @@ class ReviewCycleExecutor:
                 ck = self._cycle_key(cycle_state.project_name, cycle_state.issue_number)
                 if ck in self.active_cycles:
                     del self.active_cycles[ck]
-
-                # Analyze review cycle outcomes for learning (async, non-blocking)
-                await self._analyze_review_cycle_outcomes(cycle_state)
 
                 if column.auto_advance_on_approval:
                     next_column = self._get_next_column_name(column, cycle_state.project_name, cycle_state.board_name)
@@ -2550,7 +2527,7 @@ class ReviewCycleExecutor:
             },
             'previous_stage_output': context_for_review,  # Discussions context only; empty for issues
             'change_manifest': change_manifest,  # Compact manifest; reviewer fetches diffs via bash
-            'review_cycle_context_dir': cycle_state.context_dir,  # File-based context (mounted in container)
+            'pipeline_context_dir': cycle_state.context_dir,  # File-based context (mounted in container)
             'timestamp': datetime.now().isoformat()
         }
         logger.info(f"[DIAGNOSTIC] Created review task_context with pipeline_run_id: {cycle_state.pipeline_run_id} for issue #{cycle_state.issue_number}")
@@ -2610,7 +2587,7 @@ class ReviewCycleExecutor:
                 'feedback': review_feedback,  # Concise feedback to address
                 'formatted_feedback': f"**Review Feedback (Iteration {iteration}):**\n\n{review_feedback}"
             },
-            'review_cycle_context_dir': cycle_state.context_dir,  # File-based context (mounted in container)
+            'pipeline_context_dir': cycle_state.context_dir,  # File-based context (mounted in container)
             'timestamp': datetime.now().isoformat()
         }
         logger.info(f"[DIAGNOSTIC] Created maker revision task_context with pipeline_run_id: {cycle_state.pipeline_run_id} for issue #{cycle_state.issue_number}")

@@ -9,12 +9,13 @@ variables:
 ## Prior Review Cycles
 
 The following issues were found and closed in previous automated review cycles for this PR.
-Do NOT re-report issues that were fixed in prior cycles unless you have concrete evidence
-the fix was reverted or the issue exists at a different location.
+Do NOT re-report issues that were fixed in prior cycles unless you have concrete evidence the fix was reverted or the issue exists at a different location.
 
 For each issue you report, explicitly note in the description whether it is:
 - **NEW**: First time this issue has been identified
 - **REGRESSION**: Was previously fixed but has reappeared
+
+---
 
 {prior_cycle_context}
 

@@ -1,6 +1,6 @@
 ---
 invoked_by: prompts/builder.py — PromptBuilder._build_revision() via loader.workflow_template("revision/file_based")
-  Used when ctx.review_cycle_context_dir is set (feedback and prior output are on disk)
+  Used when ctx.pipeline_context_dir is set (feedback and prior output are on disk)
 variables:
   agent_display_name: Human-readable agent title (e.g. "Senior Software Engineer")
   agent_role_description: One-paragraph description of the agent's role and focus area
@@ -22,7 +22,7 @@ You are the {agent_display_name} revising your work based on feedback.
 
 ## Review Cycle Context Files
 
-All context for this review cycle is at `/review_cycle_context/`:
+All context for this review cycle is at `/pipeline_context/`:
 - **`{feedback_file}`** — the feedback you MUST address ← read this first
 - `{maker_file}` — the implementation that was reviewed (your previous version)
 - `initial_request.md` — original requirements

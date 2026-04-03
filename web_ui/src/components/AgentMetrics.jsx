@@ -3,7 +3,7 @@ import { Link } from '@tanstack/react-router'
 import { RefreshCw, BarChart2, ChevronDown, ChevronRight } from 'lucide-react'
 import TrendChart from './TrendChart'
 
-const DAYS_OPTIONS = [1, 3, 7]
+const DAYS_OPTIONS = [1, 3, 7, 14]
 
 const formatTokenCount = (n) => {
   if (n == null) return '—'

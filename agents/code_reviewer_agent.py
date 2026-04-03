@@ -22,21 +22,6 @@ class CodeReviewerAgent(PipelineStage):
         super().__init__("code_reviewer", agent_config=agent_config)
         self._prompt_builder = PromptBuilder()
 
-    async def _get_filter_instructions(self) -> str:
-        """Load learned review filters (≥75% confidence) to inject into prompt."""
-        try:
-            from services.review_filter_manager import get_review_filter_manager
-            filter_manager = get_review_filter_manager()
-            filters = await filter_manager.get_agent_filters(
-                agent_name="code_reviewer",
-                min_confidence=0.75,
-                active_only=True,
-            )
-            return filter_manager.build_filter_instructions(filters) if filters else ""
-        except Exception as exc:
-            logger.warning("Failed to load review filters (non-critical): %s", exc)
-            return ""
-
     async def execute(self, context: Dict[str, Any]) -> Dict[str, Any]:
         task_context = context.get("context", {})
         issue_raw = task_context.get("issue", {})
@@ -54,7 +39,7 @@ class CodeReviewerAgent(PipelineStage):
                 is_rereviewing=review_cycle_raw.get("is_rereviewing", False),
                 post_human_feedback=review_cycle_raw.get("post_human_feedback", False),
                 previous_review_feedback=review_cycle_raw.get("previous_review_feedback") or "",
-                context_dir=task_context.get("review_cycle_context_dir"),
+                context_dir=task_context.get("pipeline_context_dir"),
             )
 
         ctx = PromptContext(
@@ -68,18 +53,15 @@ class CodeReviewerAgent(PipelineStage):
                 title=issue_raw.get("title", "No title"),
                 body=issue_raw.get("body", "No description"),
             ),
-            review_cycle_context_dir=task_context.get("review_cycle_context_dir"),
+            pipeline_context_dir=task_context.get("pipeline_context_dir"),
             review_cycle=review_cycle,
             change_manifest=change_manifest,
         )
-
-        filter_instructions = await self._get_filter_instructions()
 
         prompt = self._prompt_builder.build_reviewer_prompt(
             ctx,
             reviewer_title="Senior Software Engineer",
             review_domain="code",
-            filter_instructions=filter_instructions,
         )
 
         try:

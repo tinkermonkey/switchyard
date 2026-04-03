@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback } from 'react'
 import { RefreshCw, BarChart2 } from 'lucide-react'
 import TrendChart from './TrendChart'
 
-const DAYS_OPTIONS = [1, 3, 7]  // server clamps cycle metrics to 7 days max
+const DAYS_OPTIONS = [1, 3, 7, 14]  // server clamps cycle metrics to 14 days max
 
 // Strip 'claude-' prefix and trailing 8-digit date from a model ID.
 // e.g. 'claude-haiku-4-5-20251001' → 'haiku-4-5', 'claude-sonnet-4-6' → 'sonnet-4-6'

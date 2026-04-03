@@ -614,7 +614,7 @@ class TestRevisionMode:
                         ["Executive Summary"],
                         task_extras={
                             "trigger": "review_cycle_revision",
-                            "review_cycle_context_dir": "/review_cycle_context",
+                            "pipeline_context_dir": "/pipeline_context",
                             "review_cycle": {
                                 "iteration": 2,
                                 "max_iterations": 3,
@@ -677,7 +677,7 @@ class TestReviewerPrompt:
             project="myapp",
             issue=IssueContext(title="Add search", body="Users need search"),
             review_cycle=rc,
-            review_cycle_context_dir="/review_cycle_context" if with_context_dir else None,
+            pipeline_context_dir="/pipeline_context" if with_context_dir else None,
             previous_stage=with_previous_stage,
         )
         return ctx
@@ -1029,7 +1029,7 @@ class TestDocumentationEditorRereviewing:
             project="myapp",
             issue=IssueContext(title="Add search", body="desc"),
             review_cycle=rc,
-            review_cycle_context_dir="/review_cycle_context",
+            pipeline_context_dir="/pipeline_context",
         )
         prompt = BUILDER.build_reviewer_prompt(ctx,
                                                reviewer_title="Senior Software Engineer",
@@ -1059,7 +1059,7 @@ class TestChangeManifestField:
             project="myapp",
             issue=IssueContext(title="Add feature", body="desc"),
             review_cycle=rc,
-            # No review_cycle_context_dir — falls back to embedded change_manifest
+            # No pipeline_context_dir — falls back to embedded change_manifest
             change_manifest="Changed: src/app.py, tests/test_app.py",
         )
         prompt = BUILDER.build_reviewer_prompt(ctx, reviewer_title="Senior Software Engineer",
