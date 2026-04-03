@@ -1214,7 +1214,7 @@ def get_active_agents_from_pipelines():
                 "query": {
                     "bool": {
                         "must": [
-                            {"term": {"pipeline_run_id.keyword": pipeline_run_id}},
+                            {"term": {"pipeline_run_id": pipeline_run_id}},
                             {"terms": {"event_type": ["agent_initialized", "agent_completed", "agent_failed"]}}
                         ]
                     }

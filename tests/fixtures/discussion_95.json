@@ -126,7 +126,7 @@
           },
           {
             "id": "DC_kwDOPH6wk84A3mOW",
-            "body": "## \ud83d\udeab Review Blocked - Human Review Required\n\nThe automated review identified **6 blocking issue(s)** that require human attention.\n\n### Blocking Issues\n- **The**: revised Business Analysis shows significant improvement and has successfully addressed most critical issues from the previous review. The addition of code references, SQL schemas, and explicit clarifications demonstrates thorough analysis. However, several technical inconsistencies and missing requirements remain that need resolution before implementation.\n- **Problem**: Foreign key enforcement is critical for data integrity (per NFR4.2 \"ReferenceLink foreign keys MUST be enforced\"). This cannot be an assumption that needs verification\u2014it must be a requirement.\n- **Critical Issues Resolved**: All blocking issues from previous review have been addressed\n- **Comprehensive Clarifications**: The \"Critical Clarifications\" section effectively addresses reviewer concerns\n- **The Business Analysis**: has made excellent progress and demonstrates thorough research of the existing codebase. The critical field naming and schema detection issues have been resolved. However, the virtual table schema specification (Issue #1) is a blocking technical concern that could lead to implementation errors. The class/property differentiation issue (#2) is a high-priority functional gap that will impact user experience.\n- **Estimated Revision Effort**: 2-3 hours to address blocking issues and high-priority recommendations.\n\n### Next Steps\nPlease review the blocking issues and either:\n1. Address the issues manually\n2. Provide guidance to the orchestrator\n3. Override the review decision if appropriate\n\n**Iteration**: 2/3\n\n---\n_Escalated by Claude Code Orchestrator_\n",
+            "body": "## \ud83d\udeab Review Blocked - Human Review Required\n\nThe automated review identified **6 blocking issue(s)** that require human attention.\n\n### Blocking Issues\n- **The**: revised Business Analysis shows significant improvement and has successfully addressed most critical issues from the previous review. The addition of code references, SQL schemas, and explicit clarifications demonstrates thorough analysis. However, several technical inconsistencies and missing requirements remain that need resolution before implementation.\n- **Problem**: Foreign key enforcement is critical for data integrity (per NFR4.2 \"ReferenceLink foreign keys MUST be enforced\"). This cannot be an assumption that needs verification\u2014it must be a requirement.\n- **Critical Issues Resolved**: All blocking issues from previous review have been addressed\n- **Comprehensive Clarifications**: The \"Critical Clarifications\" section effectively addresses reviewer concerns\n- **The Business Analysis**: has made excellent progress and demonstrates thorough research of the existing codebase. The critical field naming and schema detection issues have been resolved. However, the virtual table schema specification (Issue #1) is a blocking technical concern that could lead to implementation errors. The class/property differentiation issue (#2) is a high-priority functional gap that will impact user experience.\n- **Estimated Revision Effort**: 2-3 hours to address blocking issues and high-priority recommendations.\n\n### Next Steps\nPlease review the blocking issues and either:\n1. Address the issues manually\n2. Provide guidance to the orchestrator\n3. Override the review decision if appropriate\n\n**Iteration**: 2/3\n\n---\n_Escalated by Switchyard_\n",
             "createdAt": "2025-10-02T14:00:44Z",
             "author": {
               "login": "orchestrator-bot"
@@ -177,7 +177,7 @@
           },
           {
             "id": "DC_kwDOPH6wk84A3nIq",
-            "body": "## \ud83d\udd04 Starting Review Cycle\n\n**Reviewer**: Requirements Reviewer\n**Maker**: Business Analyst\n**Max Iterations**: 3\n\nThe automated maker-checker review cycle is now starting. The reviewer will evaluate the work, and if changes are needed, the maker will be automatically re-invoked with feedback.\n\n---\n_Review cycle initiated by Claude Code Orchestrator_\n",
+            "body": "## \ud83d\udd04 Starting Review Cycle\n\n**Reviewer**: Requirements Reviewer\n**Maker**: Business Analyst\n**Max Iterations**: 3\n\nThe automated maker-checker review cycle is now starting. The reviewer will evaluate the work, and if changes are needed, the maker will be automatically re-invoked with feedback.\n\n---\n_Review cycle initiated by Switchyard_\n",
             "createdAt": "2025-10-02T21:28:03Z",
             "author": {
               "login": "orchestrator-bot"
@@ -241,7 +241,7 @@
           },
           {
             "id": "DC_kwDOPH6wk84A3nJz",
-            "body": "## \ud83d\udd04 Starting Review Cycle\n\n**Reviewer**: Requirements Reviewer\n**Maker**: Business Analyst\n**Max Iterations**: 3\n\nThe automated maker-checker review cycle is now starting. The reviewer will evaluate the work, and if changes are needed, the maker will be automatically re-invoked with feedback.\n\n---\n_Review cycle initiated by Claude Code Orchestrator_\n",
+            "body": "## \ud83d\udd04 Starting Review Cycle\n\n**Reviewer**: Requirements Reviewer\n**Maker**: Business Analyst\n**Max Iterations**: 3\n\nThe automated maker-checker review cycle is now starting. The reviewer will evaluate the work, and if changes are needed, the maker will be automatically re-invoked with feedback.\n\n---\n_Review cycle initiated by Switchyard_\n",
             "createdAt": "2025-10-02T21:43:26Z",
             "author": {
               "login": "orchestrator-bot"
@@ -285,7 +285,7 @@
           },
           {
             "id": "DC_kwDOPH6wk84A3nLI",
-            "body": "## \ud83d\udd04 Starting Review Cycle\n\n**Reviewer**: Requirements Reviewer\n**Maker**: Business Analyst\n**Max Iterations**: 3\n\nThe automated maker-checker review cycle is now starting. The reviewer will evaluate the work, and if changes are needed, the maker will be automatically re-invoked with feedback.\n\n---\n_Review cycle initiated by Claude Code Orchestrator_\n",
+            "body": "## \ud83d\udd04 Starting Review Cycle\n\n**Reviewer**: Requirements Reviewer\n**Maker**: Business Analyst\n**Max Iterations**: 3\n\nThe automated maker-checker review cycle is now starting. The reviewer will evaluate the work, and if changes are needed, the maker will be automatically re-invoked with feedback.\n\n---\n_Review cycle initiated by Switchyard_\n",
             "createdAt": "2025-10-02T22:04:17Z",
             "author": {
               "login": "orchestrator-bot"
@@ -307,7 +307,7 @@
           },
           {
             "id": "DC_kwDOPH6wk84A3nLS",
-            "body": "## \ud83d\udd04 Review Cycle Complete\n\n**Status**: APPROVED\n**Iterations**: 1/3\n**Maker**: Business Analyst\n**Reviewer**: Requirements Reviewer\n\nReview approved after 1 iteration(s)\n\n---\n_Automated review cycle by Claude Code Orchestrator_\n",
+            "body": "## \ud83d\udd04 Review Cycle Complete\n\n**Status**: APPROVED\n**Iterations**: 1/3\n**Maker**: Business Analyst\n**Reviewer**: Requirements Reviewer\n\nReview approved after 1 iteration(s)\n\n---\n_Automated review cycle by Switchyard_\n",
             "createdAt": "2025-10-02T22:05:11Z",
             "author": {
               "login": "orchestrator-bot"

@@ -1,5 +1,5 @@
 import { memo, useRef, useLayoutEffect, useEffect, useMemo } from 'react'
-import { RefreshCw, Activity, CheckCircle } from 'lucide-react'
+import { RefreshCw, Activity, CheckCircle, MessageCircle } from 'lucide-react'
 import { formatDuration } from '../utils/stateHelpers'
 import RunDuration from './RunDuration'
 
@@ -83,8 +83,18 @@ export default function PipelineRunSidebar({
     }
   }, [completedPipelineRuns])
 
-  const activeRunsList = useMemo(() => {
-    return activePipelineRuns.map(run => (
+  const feedbackListeningRuns = useMemo(
+    () => activePipelineRuns.filter(r => r.status === 'feedback_listening'),
+    [activePipelineRuns]
+  )
+
+  const activeRuns = useMemo(
+    () => activePipelineRuns.filter(r => r.status !== 'feedback_listening'),
+    [activePipelineRuns]
+  )
+
+  const feedbackListeningRunsList = useMemo(() => {
+    return feedbackListeningRuns.map(run => (
       <PipelineRunItem
         key={run.id}
         run={run}
@@ -92,7 +102,18 @@ export default function PipelineRunSidebar({
         onClick={() => onSelectRun(run)}
       />
     ))
-  }, [activePipelineRuns, selectedPipelineRun, onSelectRun])
+  }, [feedbackListeningRuns, selectedPipelineRun, onSelectRun])
+
+  const activeRunsList = useMemo(() => {
+    return activeRuns.map(run => (
+      <PipelineRunItem
+        key={run.id}
+        run={run}
+        isSelected={selectedPipelineRun?.id === run.id}
+        onClick={() => onSelectRun(run)}
+      />
+    ))
+  }, [activeRuns, selectedPipelineRun, onSelectRun])
 
   const completedRunsList = useMemo(() => {
     return completedPipelineRuns.map(run => (
@@ -113,21 +134,43 @@ export default function PipelineRunSidebar({
         <h3 className="text-lg font-semibold">Pipeline Runs</h3>
       </div>
 
+      {/* Feedback Listening section */}
+      {(loading || feedbackListeningRuns.length > 0) && (
+        <div className="flex-shrink-0 mb-2">
+          <div className="flex items-center gap-2 mb-2">
+            <MessageCircle className="w-4 h-4 text-gh-fg-muted" />
+            <span className="text-sm font-medium">Feedback Listening</span>
+            {feedbackListeningRuns.length > 0 && (
+              <span className="ml-auto text-xs bg-gh-attention-emphasis text-white rounded-full px-1.5 py-0.5 leading-none">
+                {feedbackListeningRuns.length}
+              </span>
+            )}
+          </div>
+          {loading ? (
+            <p className="text-gh-fg-muted text-xs px-1 mb-2">Loading...</p>
+          ) : (
+            <div className="space-y-2 mb-2">
+              {feedbackListeningRunsList}
+            </div>
+          )}
+        </div>
+      )}
+
       {/* Active section */}
       <div className="flex-shrink-0">
         <div className="flex items-center gap-2 mb-2">
           <Activity className="w-4 h-4 text-gh-fg-muted" />
           <span className="text-sm font-medium">Active</span>
-          {activePipelineRuns.length > 0 && (
+          {activeRuns.length > 0 && (
             <span className="ml-auto text-xs bg-gh-accent-emphasis text-white rounded-full px-1.5 py-0.5 leading-none">
-              {activePipelineRuns.length}
+              {activeRuns.length}
             </span>
           )}
         </div>
 
         {loading ? (
           <p className="text-gh-fg-muted text-xs px-1 mb-2">Loading...</p>
-        ) : activePipelineRuns.length === 0 ? (
+        ) : activeRuns.length === 0 ? (
           <p className="text-gh-fg-muted text-xs px-1 mb-2">No active runs</p>
         ) : (
           <div className="space-y-2 mb-2">

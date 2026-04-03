@@ -72,6 +72,7 @@ class HumanFeedbackLoopExecutor:
         # Don't initialize GitHubIntegration here - create it per-loop with proper repo context
         self.active_loops = {}  # Track active loops by (project_name, issue_number) tuple
         self._initialized = False
+        self._init_lock = threading.Lock()  # Prevents concurrent initialize() calls from multiple background threads
         self._stop_events: Dict[str, threading.Event] = {}  # Active stop signals keyed by "project:issue"
         self._stop_reasons: Dict[str, str] = {}  # Why each stop was requested — "column_changed" preserves the pipeline run
 
@@ -103,8 +104,15 @@ class HumanFeedbackLoopExecutor:
 
     async def initialize(self):
         """Initialize executor and clean up stale locks from previous orchestrator runs"""
-        if self._initialized:
-            return
+        with self._init_lock:
+            if self._initialized:
+                return
+            # Set the flag inside the lock before releasing it.  This ensures a
+            # second thread that enters while we are still doing cleanup below
+            # sees _initialized=True and returns immediately, preventing the
+            # cross-issue lock-deletion bug (issue N's initialize() deleting
+            # issue M's valid Redis lock).
+            self._initialized = True
 
         logger.info("Initializing HumanFeedbackLoopExecutor and cleaning up stale locks...")
 
@@ -118,7 +126,6 @@ class HumanFeedbackLoopExecutor:
         # Clean up stale Redis locks that don't have corresponding running containers
         await self._cleanup_stale_redis_locks()
 
-        self._initialized = True
         logger.info("HumanFeedbackLoopExecutor initialization complete")
 
     async def _cleanup_stale_redis_locks(self):
@@ -197,8 +204,20 @@ class HumanFeedbackLoopExecutor:
                                 )
                                 break
 
-                    # If no active container found, this is a stale lock
+                    # If no active container found, check the heartbeat before deleting.
+                    # A feedback loop in monitoring mode (waiting for human input) has no
+                    # active container — the agent already finished — but it IS alive and
+                    # renews its heartbeat key every 30 s.  Deleting its lock would cause
+                    # the loop to miss replies and deadlock the pipeline.
                     if not has_active_container:
+                        heartbeat_key = f"orchestrator:feedback_loop:heartbeat:{project}:{issue_number}"
+                        if redis_client.exists(heartbeat_key):
+                            logger.info(
+                                f"✅ Lock {lock_key} is VALID: no container but active heartbeat "
+                                f"(feedback loop in monitoring mode for issue #{issue_number})"
+                            )
+                            continue
+
                         redis_client.delete(lock_key)
                         cleaned_count += 1
                         logger.warning(
@@ -760,6 +779,16 @@ class HumanFeedbackLoopExecutor:
                         pipeline_run_id=state.pipeline_run_id
                     )
 
+                    # Restore pipeline run to "active" while the agent is running
+                    # so the zombie watchdog and UX correctly reflect work in progress.
+                    try:
+                        from services.pipeline_run import get_pipeline_run_manager
+                        get_pipeline_run_manager().update_run_status(
+                            state.project_name, state.issue_number, "active"
+                        )
+                    except Exception as e:
+                        logger.warning(f"Failed to restore active status for pipeline run before agent execution: {e}")
+
                     # Execute agent with human feedback (pass full dict with author)
                     await self._execute_agent(
                         state,
@@ -770,6 +799,16 @@ class HumanFeedbackLoopExecutor:
                         is_initial=False,
                         human_feedback=human_feedback
                     )
+
+                    # Return to feedback_listening now that the agent has responded
+                    # so the zombie watchdog does not kill us during the next wait.
+                    try:
+                        from services.pipeline_run import get_pipeline_run_manager
+                        get_pipeline_run_manager().update_run_status(
+                            state.project_name, state.issue_number, "feedback_listening"
+                        )
+                    except Exception as e:
+                        logger.warning(f"Failed to restore feedback_listening status after agent execution: {e}")
 
                     # FIX #3: Mark comment as processed to prevent duplicate responses
                     comment_id = human_feedback.get('comment_id')

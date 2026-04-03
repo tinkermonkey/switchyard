@@ -418,14 +418,14 @@ class ProjectMetricsService:
                     'query': {
                         'bool': {
                             'must': [
-                                {'terms': {'resource.attributes.task_id.keyword': task_ids}},
-                                {'terms': {'event_name.keyword': ['api_request', 'tool_result']}}
+                                {'terms': {'resource.attributes.task_id': task_ids}},
+                                {'terms': {'event_name': ['api_request', 'tool_result']}}
                             ]
                         }
                     },
-                    '_source': ['resource.attributes.task_id', 'event', 'attributes', '@timestamp'],
+                    '_source': ['resource.attributes.task_id', 'event_name', 'attributes', '@timestamp'],
                     'sort': [
-                        {'resource.attributes.task_id.keyword': {'order': 'asc'}},
+                        {'resource.attributes.task_id': {'order': 'asc'}},
                         {'@timestamp': {'order': 'asc'}}
                     ],
                 },

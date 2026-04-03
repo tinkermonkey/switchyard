@@ -3060,7 +3060,7 @@ The review cycle has paused for human intervention. Please:
 4. Manually move the card when ready
 
 ---
-_Escalated by Claude Code Orchestrator_
+_Escalated by Switchyard_
 """
 
         if cycle_state.workspace_type == 'discussions' and cycle_state.discussion_id:

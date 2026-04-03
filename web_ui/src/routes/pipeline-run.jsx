@@ -495,7 +495,7 @@ function PipelineRunView() {
     if (!selectedRunId) return
 
     const intervalId = setInterval(() => {
-      if (selectedPipelineRunRef.current?.status === 'active') {
+      if (['active', 'feedback_listening'].includes(selectedPipelineRunRef.current?.status)) {
         fetchPipelineRunEvents(selectedRunId, { silent: true })
       }
     }, 30000)
@@ -665,7 +665,7 @@ function PipelineRunView() {
                       height="100%"
                       loading={loadingEvents}
                       emptyMessage="No events found for this pipeline run"
-                      fitViewAlign={selectedPipelineRun.status === 'active' ? 'active-node' : 'top'}
+                      fitViewAlign={['active', 'feedback_listening'].includes(selectedPipelineRun.status) ? 'active-node' : 'top'}
                     />
                   </div>
                 )}
