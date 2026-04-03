@@ -20,6 +20,7 @@ pipeline_templates:
         name: "Business Requirements Analysis"
         required_capabilities: ["requirements_analysis"]
         default_agent: "business_analyst"
+        inputs_from: ["idea_researcher"]
         retries: 3
         review_required: false
 
@@ -27,6 +28,7 @@ pipeline_templates:
         name: "System Architecture & Design"
         required_capabilities: ["system_architecture", "technical_design"]
         default_agent: "software_architect"
+        inputs_from: ["idea_researcher", "business_analyst"]
         retries: 3
         review_required: false
 
@@ -78,7 +80,7 @@ pipeline_templates:
         name: "Software Development"
         required_capabilities: ["software_development", "code_implementation"]
         default_agent: "senior_software_engineer"
-        inputs_from: ["software_architect"]  # Pull full design from planning workflow (requirements already in issue body)
+        inputs_from: ["software_architect"]  # Architecture design from parent planning pipeline
         retries: 5
         review_required: true
         reviewer_agent: "code_reviewer"
