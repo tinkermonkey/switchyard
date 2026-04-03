@@ -177,8 +177,8 @@ export default function PromptInputNode({ data }) {
           '[&_h3]:text-xs [&_h3]:font-semibold [&_h3]:mt-1.5 [&_h3]:mb-0.5',
           '[&_p]:text-xs [&_p]:my-1',
           '[&_li]:text-xs [&_li]:my-0.5',
-          '[&_ul]:pl-4 [&_ol]:pl-4',
-          '[&_code]:text-xs [&_code]:font-mono [&_code]:px-1 [&_code]:rounded',
+          '[&_ul]:list-disc [&_ul]:pl-4 [&_ol]:list-decimal [&_ol]:pl-4',
+          '[&_code]:text-xs [&_code]:font-mono [&_code]:px-1 [&_code]:rounded [&_:not(pre)>code]:break-words [&_:not(pre)>code]:whitespace-pre-wrap',
           colorMode === 'light'
             ? '[&_code]:bg-gray-100 [&_pre]:bg-gray-100'
             : '[&_code]:bg-gray-800 [&_pre]:bg-gray-800',
