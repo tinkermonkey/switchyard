@@ -137,14 +137,16 @@ class TestContentLoader:
         assert self.LOADER.workflow_template("nonexistent/path") == ""
 
     def test_workflow_templates_have_no_frontmatter(self):
-        """Frontmatter must be stripped before content is returned."""
-        for path in ("initial/standard", "initial/implementation",
-                     "question/file_context", "question/embedded",
-                     "revision/file_based", "revision/embedded",
-                     "review/prompt", "verification/prompt"):
-            content = self.LOADER.workflow_template(path)
+        """Frontmatter must be stripped before content is returned — covers all workflow files."""
+        from pathlib import Path
+        workflows_dir = Path(__file__).parent.parent.parent / "prompts" / "content" / "workflows"
+        md_files = list(workflows_dir.rglob("*.md"))
+        assert md_files, "No workflow markdown files found — check path"
+        for md_path in md_files:
+            rel = md_path.relative_to(workflows_dir).with_suffix("")
+            content = self.LOADER.workflow_template(str(rel))
             assert not content.startswith("---"), \
-                f"workflows/{path}.md still contains frontmatter after loading"
+                f"workflows/{rel}.md still contains frontmatter after loading"
 
     def test_strip_frontmatter_removes_yaml_block(self):
         raw = "---\nkey: value\nanother: thing\n---\nActual content here."
@@ -168,6 +170,146 @@ class TestContentLoader:
         assert not loader.workflow_template("revision/cycle_context").startswith("---")
         assert not loader.workflow_template("output/code_writing").startswith("---")
         assert not loader.agent_review_task("code_reviewer").startswith("---")
+
+
+# ---------------------------------------------------------------------------
+# Workflow template .format() correctness — no KeyError on documented vars
+# ---------------------------------------------------------------------------
+
+class TestWorkflowTemplateFormatCorrectness:
+    """Verify every .format()-ed workflow template accepts its documented variables.
+
+    A KeyError here means a bare {var} exists in a file that is loaded via
+    .format(**kwargs) without that var being supplied — the same class of bug
+    that caused review_artifacts.md to crash at runtime.
+    """
+
+    LOADER = ContentLoader()
+
+    # Sentinel values used by pipeline_run_analysis.py
+    _SUMMARY_START = "---SUMMARY_START---"
+    _ANALYSIS_JSON_START = "---ANALYSIS_JSON_START---"
+    _ANALYSIS_JSON_END = "---ANALYSIS_JSON_END---"
+
+    @pytest.mark.parametrize("path,kwargs", [
+        # repair/ — formatted templates
+        ("repair/runner_generic",
+         {"test_type": "e2e"}),
+        ("repair/warning_review",
+         {"source_file": "src/foo.py", "warning_text": "unused import on line 3"}),
+        ("repair/systemic_analysis",
+         {"project": "myapp", "test_type": "unit", "total_failures": "12",
+          "files_with_failures": "4", "failure_summary": "- foo.py: 3 failures"}),
+        ("repair/systemic_fix",
+         {"test_type": "unit", "known_pattern": "import error", "failure_digest": "digest",
+          "attempt_note": ""}),
+        # pr_review/ — formatted templates
+        ("pr_review/prior_cycles",
+         {"prior_cycle_context": "Cycle 1: reviewer said fix X"}),
+        ("pr_review/main_review",
+         {"pr_url": "https://github.com/org/repo/pull/42",
+          "prior_cycle_section": "", "checkout_instruction": ""}),
+        ("pr_review/verification_main",
+         {"pr_url": "https://github.com/org/repo/pull/42",
+          "authority_framing": "You are a Business Analyst.",
+          "context_name": "Business Requirements", "context_content": "## Requirements\n..."}),
+        ("pr_review/consolidation",
+         {"phase_blocks": "## Code Review\nfindings here"}),
+        # analysis/ — formatted templates
+        ("analysis/pattern_improvement",
+         {"pattern_name": "missing_error_handling", "occurrence_count": "8",
+          "project_count": "3", "projects_affected": "app-a, app-b, app-c",
+          "agents_affected": "senior_software_engineer",
+          "severity": "high", "category": "error_handling",
+          "avg_impact": "4.5", "total_time_wasted": "36.0",
+          "examples_text": "Example 1: agent failed on line 42"}),
+        ("analysis/pipeline_run",
+         {"run_id": "run-abc123", "skill_content": "## Skill\ndo stuff",
+          "summary_start": _SUMMARY_START,
+          "analysis_json_start": _ANALYSIS_JSON_START,
+          "analysis_json_end": _ANALYSIS_JSON_END}),
+        ("analysis/ignored_review_pattern",
+         {"agent": "code_reviewer", "category": "style", "severity": "low",
+          "ignore_rate": "62.5%", "sample_size": "16",
+          "examples_text": "- Finding: unused variable"}),
+        ("analysis/architecture_discovery", {"project": "myapp"}),
+        ("analysis/techstack_discovery",    {"project": "myapp"}),
+        ("analysis/conventions_discovery",  {"project": "myapp"}),
+        # artifacts/ — formatted templates
+        ("artifacts/generate_agent",
+         {"project": "myapp", "agent_name": "myapp-reviewer",
+          "agent_purpose": "Reviews PRs for correctness",
+          "agent_rationale": "Needed for quality gates",
+          "agent_capabilities": "- Review pull requests\n- Check test coverage",
+          "agent_tools": "Bash, Read, Grep",
+          "agent_model": "sonnet", "agent_color": "blue",
+          "arch_summary": "Monolith with FastAPI backend",
+          "tech_summary": "Python 3.11, FastAPI, React",
+          "patterns_summary": "async/await throughout",
+          "generation_timestamp": "2026-04-03T00:00:00Z",
+          "codebase_hash": "abc123def456"}),
+        ("artifacts/generate_skill",
+         {"project": "myapp", "skill_name": "myapp-deploy",
+          "skill_purpose": "Deploys the application",
+          "skill_implementation": "Run make deploy",
+          "skill_args": "['--env', '--dry-run']",
+          "arch_summary": "Monolith with FastAPI backend",
+          "tech_summary": "Python 3.11, FastAPI",
+          "patterns_summary": "async/await throughout",
+          "generation_timestamp": "2026-04-03T00:00:00Z",
+          "codebase_hash": "abc123def456"}),
+        ("artifacts/review_artifacts",
+         {"project": "myapp", "agent_count": "3",
+          "agent_files": "- .claude/agents/myapp-reviewer.md",
+          "skill_count": "1",
+          "skill_files": "- .claude/skills/myapp-deploy.md"}),
+        ("artifacts/generate_strategy",
+         {"project": "myapp",
+          "arch_summary": "Monolith with FastAPI backend",
+          "tech_summary": "Python 3.11, FastAPI, React",
+          "patterns_summary": "async/await, type hints throughout"}),
+        # Previously-covered templates that use .format() — regression guard
+        ("revision/cycle_context",
+         {"iteration": "2", "max_iterations": "3", "reviewer": "Code Reviewer"}),
+        ("revision/feedback_context", {}),
+    ])
+    def test_format_call_succeeds(self, path, kwargs):
+        """No KeyError when .format() is called with documented variables."""
+        template = self.LOADER.workflow_template(path)
+        assert template, f"workflows/{path}.md is missing or empty"
+        result = template.format(**kwargs)
+        assert result
+
+
+# ---------------------------------------------------------------------------
+# Workflow template content spot-checks — key phrases survive .format()
+# ---------------------------------------------------------------------------
+
+class TestWorkflowTemplateContentSpotChecks:
+    """Verify that high-variable-count templates retain key instructional phrases
+    after .format() substitution, catching content loss during future edits."""
+
+    LOADER = ContentLoader()
+
+    def test_pattern_improvement_retains_actionable_instruction(self):
+        result = self.LOADER.workflow_template("analysis/pattern_improvement").format(
+            pattern_name="p", occurrence_count="1", project_count="1",
+            projects_affected="a", agents_affected="b", severity="high",
+            category="general", avg_impact="1.0", total_time_wasted="1.0",
+            examples_text="ex",
+        )
+        assert "specific and actionable" in result
+
+    def test_generate_agent_retains_ai_facing_placeholder(self):
+        """The {{Agent Display Name}} placeholder must survive as {Agent Display Name} in output."""
+        result = self.LOADER.workflow_template("artifacts/generate_agent").format(
+            project="p", agent_name="p-agent", agent_purpose="does X",
+            agent_rationale="why", agent_capabilities="- cap", agent_tools="Bash",
+            agent_model="sonnet", agent_color="blue",
+            arch_summary="arch", tech_summary="tech", patterns_summary="pats",
+            generation_timestamp="ts", codebase_hash="hash",
+        )
+        assert "{Agent Display Name}" in result
 
 
 # ---------------------------------------------------------------------------
