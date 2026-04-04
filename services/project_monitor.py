@@ -6640,7 +6640,9 @@ _Repair cycle initiated by Switchyard_
                                     try:
                                         self.pipeline_run_manager.end_pipeline_run(
                                             project_name, issue_number,
-                                            reason="feedback_loop_died"
+                                            # "feedback_loop_ended" is the convention that suppresses
+                                            # the cancellation signal so the new loop starts cleanly.
+                                            reason="feedback_loop_ended"
                                         )
                                     except Exception as _end_err:
                                         logger.warning(
@@ -6648,7 +6650,7 @@ _Repair cycle initiated by Switchyard_
                                         )
                                     # Fall through — the column check below will re-trigger the loop
                             except Exception as _e:
-                                logger.debug(f"Could not check pipeline run status for #{issue_number}: {_e}")
+                                logger.warning(f"Could not check pipeline run status for #{issue_number}: {_e}")
 
                             # Check if the column is conversational — if so, release the
                             # just-acquired lock before triggering (conversational loops
