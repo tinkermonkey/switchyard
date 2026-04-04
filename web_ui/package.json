@@ -13,6 +13,10 @@
   "dependencies": {
     "@dagrejs/dagre": "^1.1.5",
     "@jalez/react-flow-smart-edge": "^4.0.0",
+    "d3-array": "^3.2.4",
+    "d3-scale": "^4.0.2",
+    "d3-time": "^3.1.0",
+    "d3-time-format": "^4.1.0",
     "node-fetch": "^3.3.2",
     "react": "^19.1.1",
     "react-dom": "^19.1.1"

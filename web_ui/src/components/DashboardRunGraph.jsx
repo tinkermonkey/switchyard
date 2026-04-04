@@ -3,6 +3,7 @@ import { useNavigate } from '@tanstack/react-router'
 import PipelineFlowGraph from './PipelineFlowGraph'
 import RunDuration from './RunDuration'
 import CopyableId from './CopyableId'
+import ToolUseTimeline from './ToolUseTimeline'
 import { useDashboardRunData } from '../hooks/useDashboardRunData'
 
 export default function DashboardRunGraph({ run }) {
@@ -43,6 +44,11 @@ export default function DashboardRunGraph({ run }) {
           endedAt={run.ended_at}
           className="text-xs text-gh-fg-muted flex-shrink-0"
         />
+      </div>
+
+      {/* Tool use timeline */}
+      <div className="flex-shrink-0 border-b border-gh-border">
+        <ToolUseTimeline run={run} allEvents={mergedEvents} />
       </div>
 
       {/* Graph body */}
