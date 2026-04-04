@@ -133,6 +133,15 @@ class ScheduledTasksService:
             replace_existing=True
         )
 
+        # Schedule Docker disk cleanup - weekly on Sunday at 3 AM
+        self.scheduler.add_job(
+            self._cleanup_docker_disk,
+            trigger=CronTrigger(day_of_week='sun', hour=3, minute=0),
+            id='docker_disk_cleanup',
+            name='Cleanup Docker dangling images, non-latest agent tags, and build cache',
+            replace_existing=True
+        )
+
         self.scheduler.start()
         self.running = True
         logger.info("Scheduled tasks service started")
@@ -147,6 +156,7 @@ class ScheduledTasksService:
         logger.info("- Project metrics rollup: Daily at 3:30 AM")
         logger.info(f"- Project metrics backfill: Once at startup in ~{jitter_seconds:.0f}s")
         logger.info("- Zombie pipeline run cleanup: Every 30 minutes")
+        logger.info("- Docker disk cleanup: Weekly on Sunday at 3 AM")
 
     def stop(self):
         """Stop the scheduler"""
@@ -496,6 +506,50 @@ class ScheduledTasksService:
         except Exception as e:
             logger.error(f"Zombie pipeline run cleanup failed: {e}", exc_info=True)
 
+    async def _cleanup_docker_disk(self):
+        """Remove dangling images, non-latest agent tags, and build cache."""
+        import subprocess
+
+        def run(cmd: list[str]) -> tuple[int, str]:
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            return result.returncode, (result.stdout + result.stderr).strip()
+
+        logger.info("Starting Docker disk cleanup")
+        try:
+            # Dangling images
+            code, out = run(["docker", "image", "prune", "-f"])
+            logger.info(f"Dangling image prune: {out.splitlines()[-1] if out else 'done'}")
+
+            # Non-latest agent image tags
+            code, out = run([
+                "docker", "images",
+                "--format", "{{.Repository}}:{{.Tag}}\t{{.Size}}",
+            ])
+            removed = 0
+            for line in out.splitlines():
+                parts = line.split("\t")
+                if len(parts) != 2:
+                    continue
+                ref, size = parts
+                repo, _, tag = ref.rpartition(":")
+                if repo.endswith("-agent") and tag != "latest":
+                    rc, msg = run(["docker", "rmi", ref])
+                    if rc == 0:
+                        logger.info(f"Removed non-latest agent image: {ref} ({size})")
+                        removed += 1
+                    else:
+                        logger.warning(f"Could not remove {ref}: {msg}")
+            logger.info(f"Non-latest agent image cleanup: {removed} removed")
+
+            # Build cache
+            logger.info("Pruning build cache (may take a moment)")
+            code, out = run(["docker", "builder", "prune", "-f"])
+            logger.info(f"Build cache prune: {out.splitlines()[-1] if out else 'done'}")
+
+            logger.info("Docker disk cleanup complete")
+        except Exception as e:
+            logger.error(f"Error in Docker disk cleanup: {e}", exc_info=True)
+
     def run_cleanup_now(self):
         """Run cleanup task immediately (for testing/manual trigger)"""
         logger.info("Manually triggering orphaned branch cleanup")
@@ -556,6 +610,11 @@ class ScheduledTasksService:
         """Run project metrics 7-day backfill immediately (for testing/manual trigger)."""
         logger.info("Manually triggering project metrics backfill")
         self._run_project_metrics_backfill()
+
+    def run_docker_cleanup_now(self):
+        """Run Docker disk cleanup immediately (for testing/manual trigger)."""
+        logger.info("Manually triggering Docker disk cleanup")
+        asyncio.create_task(self._cleanup_docker_disk())
 
 
 # Global instance
