@@ -372,6 +372,29 @@ async def main():
                                 )
                                 should_retrigger = False
 
+                        # Check if the pipeline run is awaiting human feedback (escalated review
+                        # cycle or feedback loop). The lock stays held — but there is nothing to
+                        # re-trigger; the human feedback loop is already listening for GitHub
+                        # comments and will resume on its own when the human responds.
+                        if should_retrigger:
+                            try:
+                                from services.pipeline_run import get_pipeline_run_manager
+                                active_run = get_pipeline_run_manager().get_active_pipeline_run(
+                                    project_name, lock.locked_by_issue
+                                )
+                                if active_run and active_run.status == 'feedback_listening':
+                                    logger.info(
+                                        f"Skipping re-trigger for issue #{lock.locked_by_issue} - "
+                                        f"pipeline run {active_run.id} is in feedback_listening state "
+                                        f"(awaiting human input)"
+                                    )
+                                    should_retrigger = False
+                            except Exception as e:
+                                logger.warning(
+                                    f"Could not check pipeline run status for issue "
+                                    f"#{lock.locked_by_issue}: {e} — proceeding with re-trigger"
+                                )
+
                         # Re-trigger agent only if no active work is running
                         # (May have been interrupted mid-execution during restart)
                         if should_retrigger:
