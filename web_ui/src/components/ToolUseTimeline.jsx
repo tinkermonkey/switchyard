@@ -14,6 +14,35 @@ const ROW_HEIGHT = 22
 
 const fmtTime = timeFormat('%-M:%S')
 
+// Stable color assignments for well-known tools. Any tool not listed here
+// falls through to a hash-derived color from the overflow palette.
+const TOOL_COLORS = {
+  Read:        '#4493f8', // blue
+  Edit:        '#3fb950', // green
+  Write:       '#56d364', // light green
+  Bash:        '#f0883e', // orange
+  Grep:        '#ffa657', // amber
+  Glob:        '#79c0ff', // sky blue
+  WebSearch:   '#a371f7', // purple
+  WebFetch:    '#d2a8ff', // lavender
+  Agent:       '#ff7b72', // coral
+  Task:        '#ff7b72', // coral (alias for Agent)
+  Skill:       '#58a6ff', // medium blue
+  TodoWrite:   '#e3b341', // yellow
+  TodoRead:    '#e3b341', // yellow
+  NotebookEdit:'#bc8cff', // violet
+}
+
+const OVERFLOW_PALETTE = ['#f778ba', '#39d353', '#db6d28', '#0075ca', '#e4e669', '#c5def5', '#bfd4f2']
+
+function toolColor(name) {
+  if (TOOL_COLORS[name]) return TOOL_COLORS[name]
+  // Stable hash for unknown tools so the color doesn't change across renders
+  let h = 0
+  for (let i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) >>> 0
+  return OVERFLOW_PALETTE[h % OVERFLOW_PALETTE.length]
+}
+
 function parseToolEvents(rawEvent, ts, idPrefix) {
   if (!rawEvent || rawEvent.type !== 'assistant') return []
   const content = rawEvent.message?.content
@@ -238,7 +267,7 @@ export default function ToolUseTimeline({ run, allEvents = [] }) {
               cx={x}
               cy={yBand + yScale.bandwidth() / 2}
               r={rScale(event.outputTokens)}
-              fill="#4493f8"
+              fill={toolColor(event.toolName)}
               opacity="0.75"
               style={{ cursor: 'crosshair' }}
               onMouseEnter={e => handleDotMouseEnter(e, event)}
