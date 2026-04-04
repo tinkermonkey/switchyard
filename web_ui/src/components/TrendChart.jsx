@@ -37,9 +37,9 @@ const segLabel = (ms, days) => {
  *   sum_mc = total peak context tokens for that hour/day bucket
  *   tc     = task count for that bucket
  *
- * Each bar's height = Σ(sum_mc) / Σ(tc) across all names for that segment
- * (true weighted average per execution). Each name's coloured slice = its
- * sum_mc / Σ(tc), so the slices sum exactly to the bar height.
+ * Each name's slice height = sum_mc / tc for that name only (its own avg peak context).
+ * Slices are stacked so the bar height = sum of per-name averages, not a cross-name average.
+ * This keeps each slice's numeric value comparable to the detail table averages.
  */
 export default function TrendChart({ hourlySeries, days }) {
   const [hovered, setHovered] = useState(null)
@@ -71,12 +71,13 @@ export default function TrendChart({ hourlySeries, days }) {
     }
   }
 
-  // Compute display values: each name's slice = sumMc / totalTc so slices sum to weighted avg
+  // Compute display values: each name's slice = its own sumMc / its own tc
+  // so the tooltip value matches the per-name averages in the detail table.
   const processed = segs.map(seg => {
     const totalTc = names.reduce((s, n) => s + (seg.byName[n]?.tc || 0), 0)
     const slices = names.map(name => {
       const d = seg.byName[name]
-      return (d && totalTc > 0) ? d.sumMc / totalTc : 0
+      return (d && d.tc > 0) ? d.sumMc / d.tc : 0
     })
     const total = slices.reduce((a, b) => a + b, 0)
     return { start: seg.start, slices, total, totalTasks: totalTc }
@@ -99,7 +100,7 @@ export default function TrendChart({ hourlySeries, days }) {
   return (
     <div className="bg-gh-canvas-subtle border border-gh-border rounded-md p-3">
       <p className="text-xs text-gh-fg-muted mb-2">
-        Avg peak context / execution — weighted across active series per segment
+        Avg peak context / execution — per series, stacked
       </p>
       <div className="flex gap-3">
         {/* Chart — takes all remaining width */}
@@ -190,10 +191,6 @@ export default function TrendChart({ hourlySeries, days }) {
                   </div>
                 )
               })}
-              <div className="border-t border-gh-border mt-1.5 pt-1 flex justify-between">
-                <span className="text-gh-fg-muted">avg total</span>
-                <span className="font-mono">{fmt(processed[hovered].total)}</span>
-              </div>
             </div>
           )}
         </div>
