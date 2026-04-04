@@ -1898,6 +1898,27 @@ def get_pipeline_run_token_usage(pipeline_run_id):
         logger.error(f"Error fetching pipeline run token usage: {e}")
         return jsonify({'success': False, 'error': str(e)}), 500
 
+@app.route('/api/pipeline-run/<pipeline_run_id>/analyze', methods=['POST'])
+def trigger_pipeline_run_analysis(pipeline_run_id):
+    try:
+        result = es_client.search(
+            index='pipeline-runs-*',
+            body={
+                'query': {'term': {'id': pipeline_run_id}},
+                '_source': ['started_at'],
+                'size': 1,
+            }
+        )
+        hits = result.get('hits', {}).get('hits', [])
+        started_at = hits[0]['_source'].get('started_at') if hits else None
+        from services.pipeline_run_analysis import get_pipeline_run_analysis_service
+        get_pipeline_run_analysis_service().trigger_analysis_async(pipeline_run_id, started_at)
+        return jsonify({'success': True, 'message': 'Analysis triggered'})
+    except Exception as e:
+        logger.error(f"Error triggering pipeline run analysis: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
 @app.route('/api/pipeline-run/<pipeline_run_id>/analysis')
 def get_pipeline_run_analysis(pipeline_run_id):
     try:

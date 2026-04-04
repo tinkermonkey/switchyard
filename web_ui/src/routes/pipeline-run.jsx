@@ -102,6 +102,8 @@ function PipelineRunView() {
   const [completedLoadedCount, setCompletedLoadedCount] = useState(0)
   const [hasMoreCompleted, setHasMoreCompleted] = useState(true)
   const [analysis, setAnalysis] = useState(null)
+  const [triggeringAnalysis, setTriggeringAnalysis] = useState(false)
+  const analysisPollRef = useRef({ interval: null, timeout: null })
   const [showKillModal, setShowKillModal] = useState(false)
   const [isFullscreen, setIsFullscreen] = useState(false)
   const [activeFilters, setActiveFilters] = useState({ project: '', board: '', outcome: '' })
@@ -473,11 +475,49 @@ function PipelineRunView() {
     }
   }, [selectedRunId, fetchWorkflowConfig])
 
+  const triggerAnalysis = useCallback(async () => {
+    if (!selectedRunId || triggeringAnalysis) return
+    setTriggeringAnalysis(true)
+    try {
+      const response = await fetch(`/api/pipeline-run/${selectedRunId}/analyze`, { method: 'POST' })
+      const data = await response.json()
+      if (!data.success) {
+        console.error('Failed to trigger analysis:', data.error)
+        setTriggeringAnalysis(false)
+        return
+      }
+      const poll = setInterval(async () => {
+        try {
+          const r = await fetch(`/api/pipeline-run/${selectedRunId}/analysis`)
+          const d = await r.json()
+          if (d.success && d.analysis) {
+            setAnalysis(d.analysis)
+            setTriggeringAnalysis(false)
+            clearInterval(analysisPollRef.current.interval)
+            clearTimeout(analysisPollRef.current.timeout)
+          }
+        } catch (_) {}
+      }, 5000)
+      const timeout = setTimeout(() => {
+        clearInterval(analysisPollRef.current.interval)
+        setTriggeringAnalysis(false)
+      }, 120000)
+      analysisPollRef.current = { interval: poll, timeout }
+    } catch (err) {
+      console.error('Error triggering analysis:', err)
+      setTriggeringAnalysis(false)
+    }
+  }, [selectedRunId, triggeringAnalysis])
+
   // Fetch pipeline analysis (summary + recommendations) when run changes.
   // Clear immediately on every run switch so stale data from a previous run is
   // never shown while the new fetch is in flight or if the new run has no analysis.
   useEffect(() => {
     setAnalysis(null)
+    setTriggeringAnalysis(false)
+    clearInterval(analysisPollRef.current.interval)
+    clearTimeout(analysisPollRef.current.timeout)
+    analysisPollRef.current = { interval: null, timeout: null }
     if (!selectedRunId) return
     let cancelled = false
     fetch(`/api/pipeline-run/${selectedRunId}/analysis`)
@@ -590,7 +630,7 @@ function PipelineRunView() {
               <div className="flex border-b border-gh-border mb-4 flex-shrink-0">
                 <button
                   onClick={() => updateUrlParams({ contentTab: 'graph' }, true)}
-                  className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors ${contentTab === 'graph' || (contentTab === 'report' && !analysis)
+                  className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors ${contentTab === 'graph'
                     ? 'border-gh-accent-emphasis text-gh-accent-fg'
                     : 'border-transparent text-gh-fg-muted hover:text-gh-fg hover:border-gh-border-muted'
                     }`}
@@ -615,23 +655,32 @@ function PipelineRunView() {
                 >
                   Prompts
                 </button>
-                {analysis && (
-                  <button
-                    onClick={() => updateUrlParams({ contentTab: 'report' }, true)}
-                    className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors ${contentTab === 'report'
-                      ? 'border-gh-accent-emphasis text-gh-accent-fg'
-                      : 'border-transparent text-gh-fg-muted hover:text-gh-fg hover:border-gh-border-muted'
-                      }`}
-                  >
-                    Report
-                  </button>
-                )}
+                <button
+                  onClick={() => updateUrlParams({ contentTab: 'report' }, true)}
+                  className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors ${contentTab === 'report'
+                    ? 'border-gh-accent-emphasis text-gh-accent-fg'
+                    : 'border-transparent text-gh-fg-muted hover:text-gh-fg hover:border-gh-border-muted'
+                    }`}
+                >
+                  Report
+                </button>
               </div>
 
               {/* Content Area */}
               <div className="flex-1 min-h-[300px] md:min-h-0 flex">
                 {contentTab === 'report' && analysis ? (
                   <PipelineAnalysisReport analysis={analysis} />
+                ) : contentTab === 'report' ? (
+                  <div className="flex-1 flex flex-col items-center justify-center gap-3 text-gh-fg-muted">
+                    <p className="text-sm">No report generated yet.</p>
+                    <button
+                      onClick={triggerAnalysis}
+                      disabled={triggeringAnalysis}
+                      className="px-3 py-1.5 text-sm bg-gh-canvas border border-gh-border rounded hover:bg-gh-border-muted transition-colors disabled:opacity-50"
+                    >
+                      {triggeringAnalysis ? 'Generating…' : 'Generate Report'}
+                    </button>
+                  </div>
                 ) : contentTab === 'prompts' ? (
                   <div className="flex-1 min-h-0">
                     <PromptsFlowGraph

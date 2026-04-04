@@ -884,15 +884,6 @@ class PipelineRunManager:
         # Update in Elasticsearch
         self._persist_to_elasticsearch(pipeline_run)
 
-        # Trigger async pipeline run analysis (non-blocking, best-effort)
-        try:
-            from services.pipeline_run_analysis import get_pipeline_run_analysis_service
-            get_pipeline_run_analysis_service().trigger_analysis_async(
-                pipeline_run.id, pipeline_run.started_at
-            )
-        except Exception as e:
-            logger.warning(f"Failed to trigger pipeline run analysis: {e}")
-
         # Release pipeline lock if this issue holds it
         # This prevents stale locks from blocking other issues when runs end due to errors.
         # Skip when retain_lock=True (e.g. repair cycle failure — lock held for manual intervention).
