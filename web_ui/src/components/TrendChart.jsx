@@ -31,15 +31,15 @@ const segLabel = (ms, days) => {
 }
 
 /**
- * Stacked bar chart showing avg output tokens per execution over 24 time segments.
+ * Stacked bar chart showing avg peak context per execution over 24 time segments.
  *
- * hourlySeries: { name: [{h: isoString, sum_out: number, tc: number}] }
- *   sum_out = total output tokens for that hour bucket
- *   tc      = task count for that hour bucket
+ * hourlySeries: { name: [{h: isoString, sum_mc: number, tc: number}] }
+ *   sum_mc = total peak context tokens for that hour/day bucket
+ *   tc     = task count for that bucket
  *
- * Each bar's height = Σ(sum_out) / Σ(tc) across all names for that segment
+ * Each bar's height = Σ(sum_mc) / Σ(tc) across all names for that segment
  * (true weighted average per execution). Each name's coloured slice = its
- * sum_out / Σ(tc), so the slices sum exactly to the bar height.
+ * sum_mc / Σ(tc), so the slices sum exactly to the bar height.
  */
 export default function TrendChart({ hourlySeries, days }) {
   const [hovered, setHovered] = useState(null)
@@ -53,34 +53,33 @@ export default function TrendChart({ hourlySeries, days }) {
   const segMs = winMs / SEGS
   const winStart = now - winMs
 
-  // Accumulate sum_out and tc per segment per name
+  // Accumulate sum_mc and tc per segment per name
   const segs = Array.from({ length: SEGS }, (_, i) => ({
     start: winStart + i * segMs,
     byName: {},
   }))
 
   for (const [name, docs] of Object.entries(hourlySeries)) {
-    for (const { h, sum_out, tc } of docs) {
+    for (const { h, sum_mc, tc } of docs) {
       const idx = Math.floor((new Date(h).getTime() - winStart) / segMs)
       if (idx >= 0 && idx < SEGS) {
         const b = segs[idx].byName
-        if (!b[name]) b[name] = { sumOut: 0, tc: 0 }
-        b[name].sumOut += sum_out
+        if (!b[name]) b[name] = { sumMc: 0, tc: 0 }
+        b[name].sumMc += (sum_mc || 0)
         b[name].tc += tc
       }
     }
   }
 
-  // Compute display values: each name's slice = sumOut / totalTc so slices sum to weighted avg
+  // Compute display values: each name's slice = sumMc / totalTc so slices sum to weighted avg
   const processed = segs.map(seg => {
     const totalTc = names.reduce((s, n) => s + (seg.byName[n]?.tc || 0), 0)
     const slices = names.map(name => {
       const d = seg.byName[name]
-      return (d && totalTc > 0) ? d.sumOut / totalTc : 0
+      return (d && totalTc > 0) ? d.sumMc / totalTc : 0
     })
     const total = slices.reduce((a, b) => a + b, 0)
-    const totalTasks = names.reduce((s, n) => s + (seg.byName[n]?.tc || 0), 0)
-    return { start: seg.start, slices, total, totalTasks }
+    return { start: seg.start, slices, total, totalTasks: totalTc }
   })
 
   const maxTotal = Math.max(...processed.map(s => s.total), 1)
@@ -100,7 +99,7 @@ export default function TrendChart({ hourlySeries, days }) {
   return (
     <div className="bg-gh-canvas-subtle border border-gh-border rounded-md p-3">
       <p className="text-xs text-gh-fg-muted mb-2">
-        Avg output tokens / execution — weighted across active series per segment
+        Avg peak context / execution — weighted across active series per segment
       </p>
       <div className="flex gap-3">
         {/* Chart — takes all remaining width */}

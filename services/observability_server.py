@@ -2015,6 +2015,7 @@ def get_agent_metrics():
                 hourly_series.setdefault(an, []).append({
                     'h': doc.get('hour_bucket'),
                     'sum_out': int(doc.get('sum_output') or 0),
+                    'sum_mc': int(doc.get('sum_max_context') or 0),
                     'tc': tc,
                 })
 
@@ -2083,6 +2084,7 @@ def get_cycle_metrics():
                 hourly_series.setdefault(ct, []).append({
                     'h': doc.get('hour_bucket'),
                     'sum_out': int(doc.get('sum_output') or 0),
+                    'sum_mc': int(doc.get('sum_max_context') or 0),
                     'tc': tc,
                 })
 
@@ -2141,7 +2143,20 @@ def get_project_metrics():
         projects = [_aggregate_project_docs(proj, proj_docs) for proj, proj_docs in by_project.items()]
         projects.sort(key=lambda p: p['pipeline_run_count'], reverse=True)
 
-        return jsonify({'success': True, 'projects': projects})
+        # Build per-project daily series for trend charts (peak context by project over time)
+        hourly_series = {}
+        for doc in docs:
+            proj = doc.get('project')
+            rc = doc.get('pipeline_run_count', 0) or 0
+            if proj and rc:
+                c = doc.get('context') or {}
+                hourly_series.setdefault(proj, []).append({
+                    'h': doc.get('day_bucket'),
+                    'sum_mc': int(c.get('sum_max_context', 0) or 0),
+                    'tc': rc,
+                })
+
+        return jsonify({'success': True, 'projects': projects, 'hourly_series': hourly_series})
 
     except Exception as e:
         logger.error(f"Error fetching project metrics: {e}", exc_info=True)

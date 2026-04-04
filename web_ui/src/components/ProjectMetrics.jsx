@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from 'react'
 import { RefreshCw, TrendingUp } from 'lucide-react'
+import TrendChart from './TrendChart'
 
 const DAYS_OPTIONS = [1, 3, 7, 14]
 
@@ -104,7 +105,7 @@ function ProjectCard({ project: p }) {
             note={`${fmt(tokens.sum_output)} total`}
           />
           <TokenRow
-            label="Avg Max Context"
+            label="Avg Peak Context"
             avg={context.avg_max_context_per_run}
             note={`${fmt(context.peak_max_context)} peak`}
           />
@@ -329,6 +330,7 @@ function ProjectCard({ project: p }) {
 
 export default function ProjectMetrics({ days, onDaysChange }) {
   const [projects, setProjects] = useState([])
+  const [hourlySeries, setHourlySeries] = useState({})
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
 
@@ -340,6 +342,7 @@ export default function ProjectMetrics({ days, onDaysChange }) {
       const data = await res.json()
       if (data.success) {
         setProjects(data.projects || [])
+        setHourlySeries(data.hourly_series || {})
       } else {
         setError(data.error || 'Failed to load project metrics')
       }
@@ -409,6 +412,10 @@ export default function ProjectMetrics({ days, onDaysChange }) {
             Check back after the job has run at least once, or trigger a backfill manually.
           </p>
         </div>
+      )}
+
+      {!loading && Object.keys(hourlySeries).length > 0 && (
+        <TrendChart hourlySeries={hourlySeries} days={days} />
       )}
 
       {!loading && projects.length > 0 && (
