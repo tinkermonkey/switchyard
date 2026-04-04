@@ -1026,7 +1026,6 @@ class HumanFeedbackLoopExecutor:
             logger.info(f"Resuming Claude Code session: {state.claude_session_id}")
 
         # Execute agent via centralized executor (ensures observability)
-        # Mode detection happens in base_maker_agent._determine_execution_mode()
         logger.info(f"Executing {state.agent} (iteration {state.current_iteration}, is_initial={is_initial})")
 
         from services.agent_executor import get_agent_executor

@@ -122,6 +122,7 @@ class MakerAgent(PipelineStage, ABC):
         """
         task_context = context.get("context", {})
         prompt_ctx = self._build_prompt_context(task_context)
+        context["execution_mode"] = prompt_ctx.mode
 
         logger.info(
             "Agent %s executing in %s mode (variant=%s)",

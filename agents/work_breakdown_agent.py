@@ -151,8 +151,8 @@ class WorkBreakdownAgent(AnalysisAgent):
         # Re-fetch task_context after super() (it may have been mutated)
         task_context = context.get('context', {})
 
-        # Determine execution mode
-        mode = self._determine_execution_mode(task_context)
+        # Read the mode computed by MakerAgent.execute() from PromptContext
+        mode = context.get('execution_mode', 'initial')
 
         # Only create/manage sub-issues in initial mode or when explicitly requested
         if mode == 'initial' or self._should_manage_sub_issues(task_context):
