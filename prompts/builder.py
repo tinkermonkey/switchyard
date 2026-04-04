@@ -231,14 +231,16 @@ class PromptBuilder:
             is_review_cycle
             and ctx.pipeline_context_dir
         )
-
         cycle_context = self._maker_cycle_context(ctx)
         sections_joined = ", ".join(ctx.output_sections) if ctx.output_sections else "all sections"
 
         if use_file_context and rc:
             feedback_file = f"review_feedback_{rc.iteration}.md"
             maker_file = f"maker_output_{rc.iteration}.md"
-            return self._loader.workflow_template("revision/file_based").format(
+            # 'implementation' agents execute code/git changes; all others produce document output.
+            # Uses the same prompt_variant check as _build_initial() (line 149).
+            template = "revision/file_based_code" if ctx.prompt_variant == "implementation" else "revision/file_based"
+            return self._loader.workflow_template(template).format(
                 agent_display_name=ctx.agent_display_name,
                 agent_role_description=ctx.agent_role_description,
                 cycle_context=cycle_context,

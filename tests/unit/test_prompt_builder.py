@@ -127,7 +127,7 @@ class TestContentLoader:
     @pytest.mark.parametrize("path", [
         "initial/standard", "initial/implementation",
         "question/file_context", "question/embedded",
-        "revision/file_based", "revision/embedded",
+        "revision/file_based", "revision/file_based_code", "revision/embedded",
         "review/prompt", "verification/prompt",
     ])
     def test_structural_workflow_templates_non_empty(self, path):
@@ -626,6 +626,58 @@ class TestRevisionMode:
         prompt = BUILDER.build(ctx)
         assert "review_feedback_2.md" in prompt
         assert "maker_output_2.md" in prompt
+        # Document agent: must NOT get code execution instructions
+        assert "execute" not in prompt.lower() or "Markdown text for GitHub posting" in prompt
+
+    def test_code_agent_revision_uses_code_template(self):
+        """Agents with prompt_variant='implementation' must get the file_based_code template,
+        which instructs them to execute changes rather than produce a Markdown document."""
+        ctx = _make_ctx("senior_software_engineer", "Senior Software Engineer", "I code.",
+                        [],
+                        prompt_variant="implementation",
+                        task_extras={
+                            "trigger": "review_cycle_revision",
+                            "pipeline_context_dir": "/pipeline_context",
+                            "review_cycle": {
+                                "iteration": 2,
+                                "max_iterations": 3,
+                                "reviewer_agent": "code_reviewer",
+                                "is_rereviewing": False,
+                                "previous_review_feedback": "Fix branch structure",
+                            }
+                        })
+        prompt = BUILDER.build(ctx)
+        assert "review_feedback_2.md" in prompt
+        assert "maker_output_2.md" in prompt
+        # Code template: must instruct execution, not document production
+        assert "execute" in prompt.lower()
+        assert "git" in prompt.lower()
+        # Must NOT contain the document-agent instruction to produce a Markdown document
+        assert "Markdown text for GitHub posting" not in prompt
+        assert "COMPLETE, REVISED document" not in prompt
+
+    def test_document_agent_with_makes_code_changes_gets_document_template(self):
+        """technical_writer has makes_code_changes=True but prompt_variant='standard'.
+        It should still get the document template, not the code execution template."""
+        ctx = _make_ctx("technical_writer", "Technical Writer", "I write docs.",
+                        ["Overview"],
+                        makes_code_changes=True,
+                        prompt_variant="standard",
+                        task_extras={
+                            "trigger": "review_cycle_revision",
+                            "pipeline_context_dir": "/pipeline_context",
+                            "review_cycle": {
+                                "iteration": 1,
+                                "max_iterations": 3,
+                                "reviewer_agent": "documentation_editor",
+                                "is_rereviewing": False,
+                                "previous_review_feedback": "Clarify section 2",
+                            }
+                        })
+        prompt = BUILDER.build(ctx)
+        assert "Markdown text for GitHub posting" in prompt
+        assert "COMPLETE, REVISED document" in prompt
+        assert "execute" not in prompt.lower() or "Markdown text for GitHub posting" in prompt
 
     def test_feedback_loop_trigger_uses_feedback_context(self):
         ctx = _make_ctx("business_analyst", "Business Analyst", "I analyse.", [],
