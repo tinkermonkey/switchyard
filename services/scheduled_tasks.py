@@ -146,7 +146,6 @@ class ScheduledTasksService:
         logger.info(f"- Token metrics (full): Every {token_metrics_hours}h")
         logger.info("- Project metrics rollup: Daily at 3:30 AM")
         logger.info(f"- Project metrics backfill: Once at startup in ~{jitter_seconds:.0f}s")
-        logger.info(f"- Pipeline analysis catchup: Once at startup in ~{analysis_startup_jitter:.0f}s, then every 10 min")
         logger.info("- Zombie pipeline run cleanup: Every 30 minutes")
 
     def stop(self):

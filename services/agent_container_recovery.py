@@ -365,17 +365,45 @@ class AgentContainerRecovery:
                                 f"for container {container_name}"
                             )
 
-                # Skip agent containers that are part of repair cycles
-                # Check execution_type label first, fall back to container name for old-format containers
+                # Detect repair cycle agent containers via label, with name-based fallback
+                # for containers created before labels were introduced.
                 label_execution_type = labels.get('org.switchyard.execution_type', '')
                 is_repair = label_execution_type.startswith('repair_') or (
                     not label_execution_type and ('repair_' in container_name or 'repair-' in container_name)
                 )
                 if is_repair:
-                    logger.debug(
-                        f"Skipping {container_name} - managed by repair cycle container "
-                        f"(execution_type={label_execution_type or 'detected from name'})"
-                    )
+                    # Don't silently skip — enforce the configured agent timeout so stale
+                    # repair containers that slip through repair cycle recovery get cleaned up.
+                    created_str = container.get('created_at', '')
+                    try:
+                        created_dt = datetime.strptime(created_str[:19], '%Y-%m-%d %H:%M:%S')
+                        age = datetime.utcnow() - created_dt
+                        try:
+                            from config.manager import config_manager
+                            repair_agent_timeout = config_manager.get_agent('senior_software_engineer').timeout
+                        except Exception:
+                            repair_agent_timeout = 10800  # fallback: 3 hours
+                        if age.total_seconds() > repair_agent_timeout:
+                            logger.warning(
+                                f"Repair cycle container {container_name} has exceeded the configured "
+                                f"agent timeout ({repair_agent_timeout}s / "
+                                f"{repair_agent_timeout/3600:.1f}h), killing it"
+                            )
+                            self.kill_container(container_name, container_id)
+                            killed += 1
+                        else:
+                            logger.debug(
+                                f"Skipping {container_name} - repair cycle container "
+                                f"(execution_type={label_execution_type or 'detected from name'}), "
+                                f"age {age.total_seconds()/3600:.1f}h within configured limit"
+                            )
+                            # Track the task_id so orphan detection doesn't abandon
+                            # the execution history entry for a still-valid container.
+                            repair_task_id = labels.get('org.switchyard.task_id', '')
+                            if repair_task_id:
+                                recovered_task_ids.add(repair_task_id)
+                    except Exception as e:
+                        logger.warning(f"Could not parse age for repair container {container_name}: {e}")
                     continue
 
                 # Try to get metadata from labels first
@@ -674,41 +702,73 @@ class AgentContainerRecovery:
 
     def get_running_repair_cycle_containers(self) -> List[Dict[str, str]]:
         """
-        Get list of running repair cycle containers from Docker
+        Get list of running repair cycle orchestrating containers from Docker.
+
+        Uses label-based filtering rather than name-prefix matching:
+          - org.switchyard.managed=true  — all orchestrator-launched containers
+          - org.switchyard.execution_type starts with 'repair_'  — repair cycle work
+          - org.switchyard.agent is absent  — orchestrating containers only; individual
+            agent runs (claude-agent-* containers) always carry this label and are owned
+            by the regular agent recovery path.
 
         Returns:
-            List of container info dicts with name, status, created_at
+            List of container info dicts with name, status, created_at, labels,
+            parsed_labels
         """
         try:
-            # List all running containers with name starting with repair-cycle-
             result = subprocess.run(
-                ['docker', 'ps', '--filter', 'name=repair-cycle-', '--format', '{{json .}}'],
+                [
+                    'docker', 'ps',
+                    '--filter', 'label=org.switchyard.managed=true',
+                    '--format', '{{json .}}'
+                ],
                 capture_output=True,
                 text=True,
                 timeout=10
             )
-            
+
             if result.returncode != 0:
                 logger.error(f"Failed to list repair cycle containers: {result.stderr}")
                 return []
-            
+
             containers = []
             for line in result.stdout.strip().split('\n'):
-                if line:
-                    try:
-                        container_data = json.loads(line)
-                        containers.append({
-                            'name': container_data.get('Names', ''),
-                            'id': container_data.get('ID', ''),
-                            'status': container_data.get('Status', ''),
-                            'created_at': container_data.get('CreatedAt', ''),
-                            'image': container_data.get('Image', '')
-                        })
-                    except json.JSONDecodeError as e:
-                        logger.warning(f"Failed to parse container JSON: {e}")
-            
+                if not line:
+                    continue
+                try:
+                    container_data = json.loads(line)
+                    labels_str = container_data.get('Labels', '')
+                    labels = {}
+                    if labels_str:
+                        for part in labels_str.split(','):
+                            if '=' in part:
+                                k, v = part.split('=', 1)
+                                labels[k.strip()] = v.strip()
+
+                    # Only repair-related execution types
+                    execution_type = labels.get('org.switchyard.execution_type', '')
+                    if not execution_type.startswith('repair_'):
+                        continue
+
+                    # Individual agent runs carry org.switchyard.agent; orchestrating
+                    # containers don't.  Agent recovery owns the former.
+                    if labels.get('org.switchyard.agent'):
+                        continue
+
+                    containers.append({
+                        'name': container_data.get('Names', ''),
+                        'id': container_data.get('ID', ''),
+                        'status': container_data.get('Status', ''),
+                        'created_at': container_data.get('CreatedAt', ''),
+                        'image': container_data.get('Image', ''),
+                        'labels': labels_str,
+                        'parsed_labels': labels,
+                    })
+                except json.JSONDecodeError as e:
+                    logger.warning(f"Failed to parse container JSON: {e}")
+
             return containers
-            
+
         except Exception as e:
             logger.error(f"Error getting running repair cycle containers: {e}")
             return []
@@ -1119,6 +1179,14 @@ class AgentContainerRecovery:
         """
         logger.info("Starting repair cycle container recovery process")
 
+        # Resolve the hard timeout from config so we don't hard-code it here.
+        # senior_software_engineer is the agent used for all repair cycle work.
+        try:
+            from config.manager import config_manager
+            _repair_agent_timeout = config_manager.get_agent('senior_software_engineer').timeout
+        except Exception:
+            _repair_agent_timeout = 10800  # fallback: 3 hours
+
         running_containers = self.get_running_repair_cycle_containers()
 
         if not running_containers:
@@ -1181,7 +1249,7 @@ class AgentContainerRecovery:
                         created_dt = datetime.strptime(created_str[:19], '%Y-%m-%d %H:%M:%S')
                         age = datetime.utcnow() - created_dt
 
-                        if age < timedelta(minutes=180):
+                        if age.total_seconds() < _repair_agent_timeout:
                             logger.info(f"Container is young ({age.total_seconds()/60:.1f}min), keeping it and reconnecting")
                             # Re-attach monitoring thread for this young container
                             try:
@@ -1226,13 +1294,14 @@ class AgentContainerRecovery:
                         created_dt = datetime.strptime(created_str[:19], '%Y-%m-%d %H:%M:%S')
                         age = datetime.utcnow() - created_dt
                         
-                        if age > timedelta(hours=2):
+                        if age.total_seconds() > _repair_agent_timeout:
                             logger.warning(
-                                f"Container is over 2 hours old ({age.total_seconds()/3600:.1f}h), killing it"
+                                f"Container is over configured timeout "
+                                f"({_repair_agent_timeout}s / {_repair_agent_timeout/3600:.1f}h), killing it"
                             )
                             self.kill_repair_cycle_container_with_event(
                                 container_name, container_id, project, issue_number,
-                                f"Stale checkpoint ({checkpoint_age/60:.1f}min old) and container over 2 hours old"
+                                f"Stale checkpoint ({checkpoint_age/60:.1f}min old) and container exceeded configured timeout"
                             )
                             killed += 1
                             continue

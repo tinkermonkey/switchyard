@@ -30,7 +30,7 @@ from services.cancellation import get_cancellation_signal
 
 logger = logging.getLogger(__name__)
 
-MAX_REVIEW_CYCLES = 5
+MAX_REVIEW_CYCLES = 3
 
 # Patterns that indicate a section has no actionable findings.
 # Used by _is_none_found() to prevent false-positive issue creation when Claude
