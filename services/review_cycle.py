@@ -705,6 +705,28 @@ class ReviewCycleExecutor:
         """
         # Check if there's already an active cycle for this issue
         key = self._cycle_key(project_name, issue_number)
+
+        # If the in-memory cache doesn't have this cycle, check disk before creating a new one.
+        # This covers the post-restart window where lock recovery calls start_review_cycle before
+        # resume_active_cycles has had a chance to populate the cache.  Without this check, the
+        # new-cycle path runs, overwrites the persisted state with a fresh iteration-0 cycle, and
+        # then calls _execute_review_loop — launching a reviewer while the recovered maker
+        # container is still running.
+        if key not in self.active_cycles:
+            persisted_cycles = self._load_active_cycles(project_name)
+            persisted = next(
+                (c for c in persisted_cycles if c.issue_number == issue_number),
+                None
+            )
+            if persisted:
+                logger.info(
+                    f"Loaded persisted review cycle for issue #{issue_number} from disk "
+                    f"(status: {persisted.status}, iteration: {persisted.current_iteration}/"
+                    f"{persisted.max_iterations}) — in-memory cache was empty "
+                    f"(pre-resume_active_cycles window)"
+                )
+                self.active_cycles[key] = persisted
+
         if key in self.active_cycles:
             existing_cycle = self.active_cycles[key]
             # Check if the existing cycle is for the same agents
@@ -773,6 +795,21 @@ class ReviewCycleExecutor:
                 
                 # Reuse existing cycle - do NOT append maker output or reset state
                 cycle_state = existing_cycle
+
+                # If an agent was mid-execution when the orchestrator restarted the cycle will
+                # be in maker_working or reviewer_working state but the in-process lock no longer
+                # exists.  Calling _execute_review_loop here would start a reviewer alongside the
+                # still-running container.  Defer to resume_active_cycles, which tracks container
+                # completion and will transition the cycle when the agent finishes.
+                if cycle_state.status in ('maker_working', 'reviewer_working'):
+                    from services.work_execution_state import work_execution_tracker
+                    if work_execution_tracker.has_active_execution(project_name, issue_number):
+                        logger.info(
+                            f"Review cycle for issue #{issue_number} is in "
+                            f"{cycle_state.status} state with an active agent execution "
+                            f"— deferring to resume_active_cycles"
+                        )
+                        return column.name, False
 
                 # Guard against concurrent execution (e.g. resume_active_cycles racing with the
                 # project monitor poll).  Non-blocking: if another thread already holds the lock
