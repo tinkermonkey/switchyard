@@ -252,7 +252,14 @@ def _launch_repair_cycle_container(
             '--network', docker_runner.network_name,
             '--detach',  # Run in background
             '--user', '1000',  # Run as orchestrator user (UID only, inherit groups from image)
-            
+
+            # Labels for container recovery after orchestrator restart
+            '--label', f'org.switchyard.managed=true',
+            '--label', f'org.switchyard.project={project_name}',
+            '--label', f'org.switchyard.issue_number={issue_number}',
+            '--label', f'org.switchyard.pipeline_run_id={pipeline_run_id}',
+            '--label', f'org.switchyard.execution_type=repair_cycle',
+
             # Volume mounts
             # Mount orchestrator code (live code for development)
             '-v', f'{host_workspace_path}/switchyard:/app',
