@@ -46,8 +46,9 @@ export function renderReviewCycleSummary(data, isDark) {
   if (!s) return null
 
   const statusColor =
-    s.status === 'approved'  ? '#10b981' :
-    s.isFailure              ? '#ef4444' :
+    s.status === 'approved'   ? '#10b981' :
+    s.status === 'abandoned'  ? '#6b7280' :
+    s.isFailure               ? '#ef4444' :
     '#9333ea'
 
   const iterations = s.iterations ?? []

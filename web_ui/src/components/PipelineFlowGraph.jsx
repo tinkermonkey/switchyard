@@ -222,11 +222,21 @@ export default function PipelineFlowGraph({
     })
 
     // Determine which containers are on the active-agent path.
+    // Exclude agent executions inside abandoned cycles (interrupted by a restart) —
+    // their agents have no end event but are not genuinely active.
+    const abandonedWindows = model.cycles
+      .filter(c => c.isAbandoned)
+      .map(c => ({ startMs: new Date(c.startEvent.timestamp).getTime(), endMs: c.effectiveEndMs }))
+
     const activeTaskIds = new Set()
     model.agentExecutionBoundaries.forEach(b => {
       if (!b.endEvent || b.endEvent._inferred) {
         const taskId = b.startEvent?.task_id
-        if (taskId) activeTaskIds.add(taskId)
+        if (taskId) {
+          const tMs = new Date(b.startEvent.timestamp).getTime()
+          const inAbandoned = abandonedWindows.some(w => tMs >= w.startMs && tMs <= w.endMs)
+          if (!inAbandoned) activeTaskIds.add(taskId)
+        }
       }
     })
     const activeContainerIds = findActiveContainerPath(model, activeTaskIds)

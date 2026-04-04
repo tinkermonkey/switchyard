@@ -123,7 +123,10 @@ export function extractSubCycleSummary(sc) {
 export function extractReviewCycleSummary(cycle) {
   try {
     const endEvent = cycle.endEvent
-    let status = 'running'
+    // A cycle is abandoned when it was interrupted by an orchestrator restart — it has no
+    // close event but a sibling cycle was started immediately after. Show 'abandoned' rather
+    // than 'running' so it doesn't appear perpetually active in the graph.
+    let status = cycle.isAbandoned ? 'abandoned' : 'running'
     let isFailure = false
     if (endEvent && !endEvent._inferred) {
       const termDef = CYCLE_TERMINAL_EVENTS.review_cycle.terminalEvents[endEvent.event_type]

@@ -648,10 +648,22 @@ export function processEvents(events, workflowConfig = null) {
   // Pre-scan for orphaned review_cycle_iteration events to include their time bounds
   // in firstCycleStartMs / lastCycleEndMs before prelude/postlude are computed.
   // (Full orphaned-iteration processing happens after cycles are built below.)
-  const reviewCycleWindowsForOrphans = reviewCycleBoundaries.map(({ startEvent, endEvent }) => ({
-    startMs: getMs(startEvent.timestamp),
-    endMs: endEvent ? getMs(endEvent.timestamp) : Date.now(),
-  }))
+  //
+  // For abandoned cycles (null endEvent with a subsequent restart), cap the window at
+  // the next sibling's start rather than Date.now(). Without this cap, an abandoned
+  // review cycle would claim all subsequent events (including iterations from the
+  // restarted cycle) as its own, causing duplicate iterations and making it appear active.
+  const reviewCycleWindowsForOrphans = reviewCycleBoundaries.map(({ startEvent, endEvent }, idx) => {
+    const nextBoundary = reviewCycleBoundaries[idx + 1]
+    return {
+      startMs: getMs(startEvent.timestamp),
+      endMs: endEvent
+        ? getMs(endEvent.timestamp)
+        : nextBoundary
+          ? getMs(nextBoundary.startEvent.timestamp)
+          : Date.now(),
+    }
+  })
   sorted.forEach(e => {
     if (e.event_type !== 'review_cycle_iteration') return
     const t = getMs(e.timestamp)
@@ -680,7 +692,19 @@ export function processEvents(events, workflowConfig = null) {
   reviewCycleBoundaries.forEach((boundary, idx) => {
     const { startEvent, endEvent } = boundary
     const cycleStartMs = getMs(startEvent.timestamp)
-    const cycleEndMs = endEvent ? getMs(endEvent.timestamp) : Date.now()
+    // An abandoned cycle has a synthetic close event (_inferred: true) injected by
+    // inferMissingCloseEvents at the next sibling's start time, plus a real sibling
+    // cycle that follows. We detect this to mark it as abandoned rather than running.
+    const nextBoundary = reviewCycleBoundaries[idx + 1]
+    const cycleEndMs = endEvent
+      ? getMs(endEvent.timestamp)
+      : nextBoundary
+        ? getMs(nextBoundary.startEvent.timestamp)
+        : Date.now()
+    // inferMissingCloseEvents already caps the synthetic close at the next sibling's start,
+    // so cycleEndMs is already correct whether we hit the endEvent branch or the nextBoundary
+    // branch. The isAbandoned flag is what drives visual treatment.
+    const isAbandoned = !!endEvent?._inferred && !!nextBoundary
 
     const cycleEvents = sorted.filter(e => {
       const t = getMs(e.timestamp)
@@ -710,6 +734,10 @@ export function processEvents(events, workflowConfig = null) {
       iterations,
       events: reviewResiduals,
       isCollapsed: true,
+      isAbandoned,
+      // Effective end time in ms — capped at next sibling's start for abandoned cycles.
+      // Used by PipelineFlowGraph to exclude interrupted agents from the active path.
+      effectiveEndMs: cycleEndMs,
     })
   })
 
