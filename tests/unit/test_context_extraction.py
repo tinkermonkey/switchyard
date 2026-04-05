@@ -192,7 +192,7 @@ class TestContextExtraction:
         from config.manager import ConfigManager
 
         # Create minimal instances
-        monitor = ProjectMonitor(TaskQueue(), ConfigManager())
+        monitor = ProjectMonitor(TaskQueue(use_redis=False), ConfigManager())
 
         # The actual method expects discussion_id and makes a GraphQL call
         # We need to mock this or refactor the method to accept data directly

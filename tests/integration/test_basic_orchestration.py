@@ -10,7 +10,7 @@ logger = logging.getLogger(__name__)
 async def test_basic_orchestration():
     """Test basic orchestration with Business Analyst"""
 
-    task_queue = TaskQueue()
+    task_queue = TaskQueue(use_redis=False)
 
     # Create test task
     test_task = Task(

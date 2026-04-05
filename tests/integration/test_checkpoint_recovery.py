@@ -16,7 +16,7 @@ class CheckpointRecoveryTestSuite:
     def __init__(self):
         self.test_results = {}
         self.state_manager = StateManager()
-        self.task_queue = TaskQueue()
+        self.task_queue = TaskQueue(use_redis=False)
 
     async def test_graceful_shutdown_recovery(self):
         """Test recovery after graceful shutdown"""

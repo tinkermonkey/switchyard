@@ -33,7 +33,7 @@ class Task:
         return cls(**data)
 
 class TaskQueue:
-    def __init__(self, use_redis: bool = False):
+    def __init__(self, use_redis: bool = True):
         self.use_redis = use_redis
         self.redis_client = None
         self.fallback_queues = {

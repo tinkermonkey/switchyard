@@ -13,7 +13,7 @@ import logging
 logger = logging.getLogger(__name__)
 class PerformanceTestSuite:
     def __init__(self):
-        self.task_queue = TaskQueue()
+        self.task_queue = TaskQueue(use_redis=False)
         self.state_manager = StateManager()
         self.logger = OrchestratorLogger("performance_test")
         self.baseline_memory = None

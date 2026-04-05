@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import copy
 import os
 import time
 import json
@@ -6827,13 +6828,9 @@ _Repair cycle initiated by Switchyard_
                             # GitHub column. If the card moved while the orchestrator was offline,
                             # the first poll will see a genuine status_changed diff and route
                             # through trigger_agent_for_status exactly as normal.
-                            from services.pipeline_run import get_pipeline_run_manager
-                            from services.work_execution_state import work_execution_tracker
-                            pipeline_run_manager = get_pipeline_run_manager()
-                            import copy
                             for issue_number, item in list(current_by_issue.items()):
                                 try:
-                                    run = pipeline_run_manager.get_active_pipeline_run(
+                                    run = self.pipeline_run_manager.get_active_pipeline_run(
                                         project_name, issue_number
                                     )
                                     if not run or run.status != 'feedback_listening':
@@ -8543,6 +8540,6 @@ Moving to implementation phase.
 
 if __name__ == "__main__":
     # Initialize task queue and start monitoring
-    task_queue = TaskQueue()
+    task_queue = TaskQueue(use_redis=False)
     monitor = ProjectMonitor(task_queue)
     monitor.monitor_projects()
