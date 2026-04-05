@@ -2476,7 +2476,7 @@ class DockerAgentRunner:
                             from services.pipeline_progression import PipelineProgression
                             from task_queue.task_manager import TaskQueue
 
-                            task_queue = TaskQueue()
+                            task_queue = TaskQueue(use_redis=True)
                             progression_service = PipelineProgression(task_queue)
 
                             repository = project_config.github['repo']

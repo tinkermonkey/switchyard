@@ -1669,7 +1669,7 @@ class AgentContainerRecovery:
                         from services.pipeline_progression import PipelineProgression
                         from task_queue.task_manager import TaskQueue
 
-                        task_queue = TaskQueue()
+                        task_queue = TaskQueue(use_redis=True)
                         progression_service = PipelineProgression(task_queue)
                         progression_service.move_issue_to_column(
                             project_name=project,
