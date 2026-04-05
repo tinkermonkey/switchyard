@@ -53,8 +53,6 @@ export default function PipelineRunSidebar({
   activeFilters,
   onFiltersChange,
   filterOptions,
-  isOpen = false,
-  onToggle,
 }) {
   const completedListScrollRef = useRef(null)
   const savedCompletedScrollPos = useRef(0)
@@ -182,7 +180,7 @@ export default function PipelineRunSidebar({
       <div className="border-t border-gh-border my-2 flex-shrink-0" />
 
       {/* Completed section */}
-      <div className="flex flex-col flex-1 min-h-0">
+      <div className="flex flex-col md:flex-1 md:min-h-0">
         <div className="flex items-center gap-2 mb-2 flex-shrink-0">
           <CheckCircle className="w-4 h-4 text-gh-fg-muted" />
           <span className="text-sm font-medium">Completed</span>
@@ -245,7 +243,7 @@ export default function PipelineRunSidebar({
           <>
             <div
               ref={completedListScrollRef}
-              className="space-y-2 overflow-y-auto overscroll-contain flex-1"
+              className="space-y-2 md:overflow-y-auto overscroll-contain md:flex-1"
               style={{ scrollBehavior: 'auto' }}
             >
               {completedRunsList}
@@ -274,35 +272,8 @@ export default function PipelineRunSidebar({
   )
 
   return (
-    <>
-      {/* Desktop: static sidebar */}
-      <div className="hidden md:flex w-64 flex-shrink-0 bg-gh-canvas-subtle rounded-md border border-gh-border p-4 flex-col min-h-0">
-        {sidebarContent}
-      </div>
-
-      {/* Mobile: bottom sheet */}
-      <div className="md:hidden">
-        {/* Backdrop */}
-        {isOpen && (
-          <div
-            className="fixed inset-0 bg-black/50 z-30"
-            onClick={onToggle}
-          />
-        )}
-
-        {/* Sheet */}
-        <div
-          className={`fixed inset-x-0 bottom-0 z-40 bg-gh-canvas-subtle border-t border-gh-border rounded-t-xl max-h-[70vh] flex flex-col p-4 transform transition-transform duration-200 ease-out ${
-            isOpen ? 'translate-y-0' : 'translate-y-full'
-          }`}
-        >
-          {/* Drag handle */}
-          <div className="flex justify-center mb-3 flex-shrink-0">
-            <div className="w-10 h-1 bg-gh-border-muted rounded-full" />
-          </div>
-          {sidebarContent}
-        </div>
-      </div>
-    </>
+    <div className="w-full max-h-[40vh] overflow-y-auto md:overflow-visible md:max-h-none md:w-64 md:flex-shrink-0 bg-gh-canvas-subtle rounded-md border border-gh-border p-4 flex flex-col md:min-h-0">
+      {sidebarContent}
+    </div>
   )
 }

@@ -1,5 +1,4 @@
 import { createFileRoute } from '@tanstack/react-router'
-import { List } from 'lucide-react'
 import Header from '../components/Header'
 import NavigationTabs from '../components/NavigationTabs'
 import PipelineFlowGraph from '../components/PipelineFlowGraph'
@@ -93,7 +92,6 @@ function PipelineRunView() {
   const [activePipelineRuns, setActivePipelineRuns] = useState([])
   const [completedPipelineRuns, setCompletedPipelineRuns] = useState([])
   const [selectedPipelineRun, setSelectedPipelineRun] = useState(null)
-  const [sidebarOpen, setSidebarOpen] = useState(false)
   const [pipelineRunEvents, setPipelineRunEvents] = useState([])
   const [workflowConfig, setWorkflowConfig] = useState(null)
   const [loading, setLoading] = useState(true)
@@ -594,7 +592,7 @@ function PipelineRunView() {
 
       {!isFullscreen && <NavigationTabs />}
 
-      <div className={`flex gap-0 md:gap-4 ${isFullscreen ? 'fixed inset-0 z-50 p-5 bg-gh-canvas' : 'flex-1 min-h-0'}`}>
+      <div className={`flex flex-col md:flex-row gap-2 md:gap-4 ${isFullscreen ? 'fixed inset-0 z-50 p-5 bg-gh-canvas' : 'flex-1 min-h-0'}`}>
         <PipelineRunSidebar
           activePipelineRuns={activePipelineRuns}
           completedPipelineRuns={completedPipelineRuns}
@@ -607,8 +605,6 @@ function PipelineRunView() {
           activeFilters={activeFilters}
           onFiltersChange={setActiveFilters}
           filterOptions={filterOptions}
-          isOpen={sidebarOpen}
-          onToggle={() => setSidebarOpen(prev => !prev)}
         />
 
         {/* Main Content Area */}

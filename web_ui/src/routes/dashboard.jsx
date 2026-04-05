@@ -57,12 +57,12 @@ function DashboardView() {
   const { cols, rows } = getGridLayout(totalCells)
 
   return (
-    <div className="h-screen flex flex-col p-2 md:p-5 bg-gh-canvas text-gh-fg">
+    <div className="min-h-screen md:h-screen flex flex-col p-2 md:p-5 bg-gh-canvas text-gh-fg">
       <Header />
 
       <NavigationTabs />
 
-      <div className={`flex-1 ${isMobile ? 'overflow-y-auto' : 'min-h-0'}`}>
+      <div className={`flex-1 `}>
         {loading && activeRuns.length === 0 ? (
           <div className="flex items-center justify-center h-full">
             <RefreshCw className="w-8 h-8 animate-spin text-gh-accent-primary" />

@@ -13,6 +13,15 @@ export function ThemeProvider({ children }) {
     root.classList.remove('light', 'dark')
     root.classList.add(theme)
     localStorage.setItem('theme', theme)
+
+    const color = theme === 'dark' ? '#0d1117' : '#ffffff'
+    let meta = document.querySelector('meta[name="theme-color"]')
+    if (!meta) {
+      meta = document.createElement('meta')
+      meta.name = 'theme-color'
+      document.head.appendChild(meta)
+    }
+    meta.content = color
   }, [theme])
 
   const toggleTheme = () => {
