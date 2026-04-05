@@ -334,6 +334,30 @@ class ReviewCycleExecutor:
 
         logger.info(f"Removed completed cycle state for issue {cycle_state.issue_number}")
 
+    def clear_cycle_state(self, project_name: str, issue_number: int) -> None:
+        """Remove any active review cycle state for an issue (both in-memory and on disk).
+
+        Used by the FAILSAFE recovery path when a pipeline run stuck in feedback_listening
+        is ended, so that a subsequent retry for the same issue starts with a clean slate.
+        """
+        key = self._cycle_key(project_name, issue_number)
+        cycle = self.active_cycles.pop(key, None)
+        if cycle:
+            self._remove_cycle_state(cycle)
+        else:
+            # Cycle may only exist on disk (e.g. after an orchestrator restart)
+            import yaml, os
+            state_file = self._get_state_file_path(project_name)
+            if os.path.exists(state_file):
+                with open(state_file, 'r') as f:
+                    data = yaml.safe_load(f) or {}
+                updated = [c for c in data.get('active_cycles', []) if c['issue_number'] != issue_number]
+                if len(updated) != len(data.get('active_cycles', [])):
+                    data['active_cycles'] = updated
+                    with open(state_file, 'w') as f:
+                        yaml.dump(data, f, default_flow_style=False)
+                    logger.info(f"Cleared on-disk review cycle state for issue #{issue_number} in {project_name}")
+
     async def resume_active_cycles(self, project_name: str, org: str):
         """
         Resume all active review cycles for a project after restart
@@ -727,6 +751,11 @@ class ReviewCycleExecutor:
                 )
                 self.active_cycles[key] = persisted
 
+        # When stale state from a prior run is discarded below, we need to skip the reuse path
+        # and create a fresh ReviewCycleState.  This flag signals that need across the nested
+        # if/else structure without requiring a goto or function extraction.
+        _create_new_cycle = False
+
         if key in self.active_cycles:
             existing_cycle = self.active_cycles[key]
             # Check if the existing cycle is for the same agents
@@ -737,164 +766,195 @@ class ReviewCycleExecutor:
                     f"using existing cycle (status: {existing_cycle.status}, "
                     f"iteration: {existing_cycle.current_iteration}/{existing_cycle.max_iterations})"
                 )
-                
-                # Check if the cycle is already beyond max iterations (corrupted state)
+
+                # Check if the cycle is already beyond max iterations.
                 if existing_cycle.current_iteration >= existing_cycle.max_iterations:
-                    logger.warning(
-                        f"Review cycle for issue #{issue_number} is already at or beyond max iterations "
-                        f"({existing_cycle.current_iteration}/{existing_cycle.max_iterations}). "
-                        f"This indicates a corrupted state. Cleaning up and escalating."
+                    # Two distinct situations require different responses:
+                    #
+                    # 1. Same pipeline run (both IDs non-None and equal): genuinely corrupted
+                    #    state — the running pipeline somehow incremented past the limit.
+                    #    Escalate and end the current run.
+                    #
+                    # 2. Any other case (different IDs, or either ID is None): stale state left
+                    #    over from a previous run that hit its limit (e.g. user reset the issue
+                    #    to Backlog and retried).  Discard the old state and start a fresh cycle.
+                    #    Defaulting to "stale" when IDs are absent is the safe choice — creating
+                    #    a fresh cycle is far less destructive than terminating a live pipeline run.
+                    same_run = (
+                        existing_cycle.pipeline_run_id is not None
+                        and pipeline_run_id is not None
+                        and existing_cycle.pipeline_run_id == pipeline_run_id
                     )
-                    
-                    # Remove corrupted cycle
+
+                    # Remove the stale/corrupted cycle state in either case
                     self._remove_cycle_state(existing_cycle)
                     del self.active_cycles[key]
 
-                    # End the pipeline run if it exists
-                    if existing_cycle.pipeline_run_id:
-                        try:
-                            from services.pipeline_run import get_pipeline_run_manager
-                            pipeline_run_manager = get_pipeline_run_manager()
-                            pipeline_run_manager.end_pipeline_run(
-                                project_name,
-                                issue_number,
-                                reason="review_cycle_exceeded_max_iterations",
-                                retain_lock=True
-                            )
-                            logger.info(f"Ended pipeline run {existing_cycle.pipeline_run_id} due to max iterations exceeded")
-                        except Exception as e:
-                            logger.error(f"Failed to end pipeline run {existing_cycle.pipeline_run_id}: {e}", exc_info=True)
-                    
-                    # Post escalation message
-                    escalation_message = (
-                        f"⚠️ **Review Cycle Exceeded Max Iterations**\n\n"
-                        f"The review cycle has already reached or exceeded the maximum iterations "
-                        f"({existing_cycle.current_iteration}/{existing_cycle.max_iterations}). "
-                        f"Manual review is required.\n\n"
-                        f"**Maker Agent:** {existing_cycle.maker_agent}\n"
-                        f"**Reviewer Agent:** {existing_cycle.reviewer_agent}\n\n"
-                        f"Please review the work and provide feedback to continue."
-                    )
-                    
-                    if workspace_type == 'discussions' and discussion_id:
-                        from services.github_discussions import GitHubDiscussions
-                        discussions = GitHubDiscussions()
-                        discussions.add_discussion_comment(discussion_id, escalation_message,
-                                                          pipeline_run_id=existing_cycle.pipeline_run_id)
-                    else:
-                        github = self._get_github_for_project(project_name, repository)
-                        await github.post_issue_comment(
-                            issue_number,
-                            escalation_message,
-                            repository,
-                            pipeline_run_id=existing_cycle.pipeline_run_id,
+                    if same_run:
+                        logger.warning(
+                            f"Review cycle for issue #{issue_number} is already at or beyond max iterations "
+                            f"({existing_cycle.current_iteration}/{existing_cycle.max_iterations}) "
+                            f"within the same pipeline run. This indicates corrupted state. Cleaning up and escalating."
                         )
 
-                    # Return current column, cycle not complete
-                    return column.name, False
-                
-                # Reuse existing cycle - do NOT append maker output or reset state
-                cycle_state = existing_cycle
+                        # End the pipeline run if it exists
+                        if existing_cycle.pipeline_run_id:
+                            try:
+                                from services.pipeline_run import get_pipeline_run_manager
+                                pipeline_run_manager = get_pipeline_run_manager()
+                                pipeline_run_manager.end_pipeline_run(
+                                    project_name,
+                                    issue_number,
+                                    reason="review_cycle_exceeded_max_iterations",
+                                    retain_lock=True
+                                )
+                                logger.info(f"Ended pipeline run {existing_cycle.pipeline_run_id} due to max iterations exceeded")
+                            except Exception as e:
+                                logger.error(f"Failed to end pipeline run {existing_cycle.pipeline_run_id}: {e}", exc_info=True)
 
-                # If an agent was mid-execution when the orchestrator restarted the cycle will
-                # be in maker_working or reviewer_working state but the in-process lock no longer
-                # exists.  Calling _execute_review_loop here would start a reviewer alongside the
-                # still-running container.  Defer to resume_active_cycles, which tracks container
-                # completion and will transition the cycle when the agent finishes.
-                if cycle_state.status in ('maker_working', 'reviewer_working'):
-                    from services.work_execution_state import work_execution_tracker
-                    if work_execution_tracker.has_active_execution(project_name, issue_number):
+                        # Post escalation message
+                        escalation_message = (
+                            f"⚠️ **Review Cycle Exceeded Max Iterations**\n\n"
+                            f"The review cycle has already reached or exceeded the maximum iterations "
+                            f"({existing_cycle.current_iteration}/{existing_cycle.max_iterations}). "
+                            f"Manual review is required.\n\n"
+                            f"**Maker Agent:** {existing_cycle.maker_agent}\n"
+                            f"**Reviewer Agent:** {existing_cycle.reviewer_agent}\n\n"
+                            f"Please review the work and provide feedback to continue."
+                        )
+
+                        if workspace_type == 'discussions' and discussion_id:
+                            from services.github_discussions import GitHubDiscussions
+                            discussions = GitHubDiscussions()
+                            discussions.add_discussion_comment(discussion_id, escalation_message,
+                                                              pipeline_run_id=existing_cycle.pipeline_run_id)
+                        else:
+                            github = self._get_github_for_project(project_name, repository)
+                            await github.post_issue_comment(
+                                issue_number,
+                                escalation_message,
+                                repository,
+                                pipeline_run_id=existing_cycle.pipeline_run_id,
+                            )
+
+                        # Return current column, cycle not complete
+                        return column.name, False
+                    else:
+                        # Stale state from a prior run (or unknown provenance) — discard and
+                        # start a fresh cycle.  The _create_new_cycle flag causes the reuse
+                        # block below to be skipped so a new ReviewCycleState is created instead.
                         logger.info(
-                            f"Review cycle for issue #{issue_number} is in "
-                            f"{cycle_state.status} state with an active agent execution "
-                            f"— deferring to resume_active_cycles"
+                            f"Review cycle for issue #{issue_number} has exhausted state from a "
+                            f"prior pipeline run (old={existing_cycle.pipeline_run_id}, "
+                            f"new={pipeline_run_id}, "
+                            f"iterations={existing_cycle.current_iteration}/{existing_cycle.max_iterations}). "
+                            f"Discarding stale state and starting a fresh cycle."
+                        )
+                        _create_new_cycle = True
+
+                if not _create_new_cycle:
+                    # Reuse existing cycle - do NOT append maker output or reset state
+                    cycle_state = existing_cycle
+
+                    # If an agent was mid-execution when the orchestrator restarted the cycle will
+                    # be in maker_working or reviewer_working state but the in-process lock no longer
+                    # exists.  Calling _execute_review_loop here would start a reviewer alongside the
+                    # still-running container.  Defer to resume_active_cycles, which tracks container
+                    # completion and will transition the cycle when the agent finishes.
+                    if cycle_state.status in ('maker_working', 'reviewer_working'):
+                        from services.work_execution_state import work_execution_tracker
+                        if work_execution_tracker.has_active_execution(project_name, issue_number):
+                            logger.info(
+                                f"Review cycle for issue #{issue_number} is in "
+                                f"{cycle_state.status} state with an active agent execution "
+                                f"— deferring to resume_active_cycles"
+                            )
+                            return column.name, False
+
+                    # Guard against concurrent execution (e.g. resume_active_cycles racing with the
+                    # project monitor poll).  Non-blocking: if another thread already holds the lock
+                    # for this issue there is nothing new to dispatch.
+                    lock = self._get_cycle_lock(project_name, issue_number)
+                    if not lock.acquire(blocking=False):
+                        logger.info(
+                            f"Review cycle execution already in progress for issue #{issue_number}, "
+                            f"skipping concurrent call"
                         )
                         return column.name, False
 
-                # Guard against concurrent execution (e.g. resume_active_cycles racing with the
-                # project monitor poll).  Non-blocking: if another thread already holds the lock
-                # for this issue there is nothing new to dispatch.
-                lock = self._get_cycle_lock(project_name, issue_number)
-                if not lock.acquire(blocking=False):
-                    logger.info(
-                        f"Review cycle execution already in progress for issue #{issue_number}, "
-                        f"skipping concurrent call"
-                    )
-                    return column.name, False
-
-                # Continue directly to executing the review loop
-                # The existing state already has the maker outputs and iteration tracking
-                try:
-                    # Execute the review loop
-                    final_status, next_column = await self._execute_review_loop(
-                        cycle_state,
-                        column,
-                        issue_data,
-                        org
-                    )
-
-                    # Clean up only if not awaiting human feedback.
-                    # Escalated cycles must remain in active_cycles so that
-                    # check_escalated_review_cycles() can detect human feedback.
-                    if cycle_state.status != 'awaiting_human_feedback':
-                        del self.active_cycles[key]
-
-                    return next_column, True
-
-                except Exception as e:
-                    logger.error(f"Review cycle failed for issue #{issue_number}: {e}")
-
-                    # EMIT ERROR EVENT for UI visibility
-                    if key in self.active_cycles:
-                        existing_cycle = self.active_cycles[key]
-                        self._emit_review_cycle_error(
-                            cycle_state=existing_cycle,
-                            error=e,
-                            error_context="execution",
-                            recovery_action="Review cycle terminated, GitHub comment posted"
+                    # Continue directly to executing the review loop
+                    # The existing state already has the maker outputs and iteration tracking
+                    try:
+                        # Execute the review loop
+                        final_status, next_column = await self._execute_review_loop(
+                            cycle_state,
+                            column,
+                            issue_data,
+                            org
                         )
 
-                    # Clean up on error (both in-memory and on-disk)
-                    if key in self.active_cycles:
-                        self._remove_cycle_state(self.active_cycles[key])
-                        del self.active_cycles[key]
+                        # Clean up only if not awaiting human feedback.
+                        # Escalated cycles must remain in active_cycles so that
+                        # check_escalated_review_cycles() can detect human feedback.
+                        if cycle_state.status != 'awaiting_human_feedback':
+                            del self.active_cycles[key]
 
-                    # End the pipeline run if it exists
-                    if hasattr(existing_cycle, 'pipeline_run_id') and existing_cycle.pipeline_run_id:
-                        try:
-                            from services.pipeline_run import get_pipeline_run_manager
-                            pipeline_run_manager = get_pipeline_run_manager()
-                            pipeline_run_manager.end_pipeline_run(
-                                project_name,
-                                issue_number,
-                                reason=f"review_cycle_failed: {str(e)[:100]}",
-                                retain_lock=True,
-                                outcome="failed"
+                        return next_column, True
+
+                    except Exception as e:
+                        logger.error(f"Review cycle failed for issue #{issue_number}: {e}")
+
+                        # EMIT ERROR EVENT for UI visibility
+                        if key in self.active_cycles:
+                            existing_cycle = self.active_cycles[key]
+                            self._emit_review_cycle_error(
+                                cycle_state=existing_cycle,
+                                error=e,
+                                error_context="execution",
+                                recovery_action="Review cycle terminated, GitHub comment posted"
                             )
-                            logger.info(f"Ended pipeline run {existing_cycle.pipeline_run_id} due to review cycle failure")
-                        except Exception as prm_error:
-                            logger.error(f"Failed to end pipeline run {existing_cycle.pipeline_run_id}: {prm_error}", exc_info=True)
 
-                    # Post error comment (workspace-aware)
-                    error_message = f"⚠️ **Review Cycle Error**\n\nThe automated review cycle encountered an error:\n```\n{str(e)}\n```\n\nPlease review manually."
+                        # Clean up on error (both in-memory and on-disk)
+                        if key in self.active_cycles:
+                            self._remove_cycle_state(self.active_cycles[key])
+                            del self.active_cycles[key]
 
-                    if workspace_type == 'discussions' and discussion_id:
-                        from services.github_discussions import GitHubDiscussions
-                        discussions = GitHubDiscussions()
-                        discussions.add_discussion_comment(discussion_id, error_message,
-                                                          pipeline_run_id=existing_cycle.pipeline_run_id)
-                    else:
-                        github = self._get_github_for_project(project_name, repository)
-                        await github.post_issue_comment(
-                            issue_number,
-                            error_message,
-                            repository,
-                            pipeline_run_id=existing_cycle.pipeline_run_id,
-                        )
+                        # End the pipeline run if it exists
+                        if hasattr(existing_cycle, 'pipeline_run_id') and existing_cycle.pipeline_run_id:
+                            try:
+                                from services.pipeline_run import get_pipeline_run_manager
+                                pipeline_run_manager = get_pipeline_run_manager()
+                                pipeline_run_manager.end_pipeline_run(
+                                    project_name,
+                                    issue_number,
+                                    reason=f"review_cycle_failed: {str(e)[:100]}",
+                                    retain_lock=True,
+                                    outcome="failed"
+                                )
+                                logger.info(f"Ended pipeline run {existing_cycle.pipeline_run_id} due to review cycle failure")
+                            except Exception as prm_error:
+                                logger.error(f"Failed to end pipeline run {existing_cycle.pipeline_run_id}: {prm_error}", exc_info=True)
 
-                    raise
-                finally:
-                    lock.release()
+                        # Post error comment (workspace-aware)
+                        error_message = f"⚠️ **Review Cycle Error**\n\nThe automated review cycle encountered an error:\n```\n{str(e)}\n```\n\nPlease review manually."
+
+                        if workspace_type == 'discussions' and discussion_id:
+                            from services.github_discussions import GitHubDiscussions
+                            discussions = GitHubDiscussions()
+                            discussions.add_discussion_comment(discussion_id, error_message,
+                                                              pipeline_run_id=existing_cycle.pipeline_run_id)
+                        else:
+                            github = self._get_github_for_project(project_name, repository)
+                            await github.post_issue_comment(
+                                issue_number,
+                                error_message,
+                                repository,
+                                pipeline_run_id=existing_cycle.pipeline_run_id,
+                            )
+
+                        raise
+                    finally:
+                        lock.release()
             else:
                 # Different review column - remove old cycle and create new one
                 logger.info(
@@ -919,6 +979,23 @@ class ReviewCycleExecutor:
                 )
         else:
             # Create new review cycle state
+            cycle_state = ReviewCycleState(
+                issue_number=issue_number,
+                repository=repository,
+                maker_agent=column.maker_agent,
+                reviewer_agent=column.agent,
+                max_iterations=column.max_iterations,
+                project_name=project_name,
+                board_name=board_name,
+                workspace_type=workspace_type,
+                discussion_id=discussion_id,
+                pipeline_run_id=pipeline_run_id
+            )
+
+        # Stale state from a prior run was discarded above — create a fresh cycle now.
+        # This branch is reached after the outer if/else so the shared initialization below
+        # handles it identically to any other new cycle.
+        if _create_new_cycle:
             cycle_state = ReviewCycleState(
                 issue_number=issue_number,
                 repository=repository,
@@ -3301,3 +3378,7 @@ _Escalated by Switchyard_
 
 # Global executor instance
 review_cycle_executor = ReviewCycleExecutor()
+
+
+def get_review_cycle_executor() -> ReviewCycleExecutor:
+    return review_cycle_executor

@@ -6655,6 +6655,20 @@ _Repair cycle initiated by Switchyard_
                                         logger.warning(
                                             f"Could not end stale pipeline run for #{issue_number}: {_end_err}"
                                         )
+                                    # Clear any stale review cycle state so that if the issue is
+                                    # reset and retried, start_review_cycle won't find an exhausted
+                                    # cycle from this run and incorrectly terminate the new one.
+                                    try:
+                                        from services.review_cycle import get_review_cycle_executor
+                                        get_review_cycle_executor().clear_cycle_state(project_name, issue_number)
+                                        logger.info(
+                                            f"⚡ FAILSAFE: Cleared review cycle state for #{issue_number} "
+                                            f"in {project_name} during feedback_listening recovery"
+                                        )
+                                    except Exception as _cycle_err:
+                                        logger.warning(
+                                            f"Could not clear review cycle state for #{issue_number}: {_cycle_err}"
+                                        )
                                     # Fall through — the column check below will re-trigger the loop
                             except Exception as _e:
                                 logger.warning(f"Could not check pipeline run status for #{issue_number}: {_e}")
