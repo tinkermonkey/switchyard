@@ -115,6 +115,16 @@ class ProjectPipeline:
 
 
 @dataclass
+class ReferenceRepo:
+    """A read-only reference repository mounted into agent containers"""
+    name: str
+    path: str           # Container-side path (e.g. /workspace/context-helpers)
+    description: str    # Human-readable description of the repo's purpose; available for prompt injection
+    branch: str = "main"
+    mount_path: str = None  # Container mount point; defaults to /reference/<name>
+
+
+@dataclass
 class ProjectConfig:
     """Project configuration data"""
     name: str
@@ -128,6 +138,7 @@ class ProjectConfig:
     agent_customizations: Dict[str, Dict[str, Any]] = None
     orchestrator: Dict[str, Any] = None
     hidden: bool = False  # Hide from UI and monitoring
+    reference_repos: List[ReferenceRepo] = None  # Read-only repos mounted at agent launch via git worktrees
 
 
 class ConfigurationError(Exception):
@@ -352,6 +363,16 @@ class ConfigManager:
                 issue_stages=issue_stages
             ))
 
+        reference_repos = []
+        for repo_data in project_data.get('reference_repos', []):
+            reference_repos.append(ReferenceRepo(
+                name=repo_data['name'],
+                path=repo_data['path'],
+                description=repo_data['description'],
+                branch=repo_data.get('branch', 'main'),
+                mount_path=repo_data.get('mount_path'),
+            ))
+
         return ProjectConfig(
             name=project_data['name'],
             description=project_data['description'],
@@ -363,7 +384,8 @@ class ConfigManager:
             ci=project_data.get('ci'),
             agent_customizations=project_data.get('agent_customizations', {}),
             orchestrator=data.get('orchestrator', {}),
-            hidden=project_data.get('hidden', False)
+            hidden=project_data.get('hidden', False),
+            reference_repos=reference_repos,
         )
 
     def get_agents(self) -> Dict[str, AgentConfig]:

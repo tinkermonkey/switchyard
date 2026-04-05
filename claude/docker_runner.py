@@ -29,6 +29,7 @@ class DockerAgentRunner:
         self.network_name = network_name
         self._host_workspace_path = None  # Cache for host workspace path detection
         self._redis = None  # Lazy Redis connection (shared across register/unregister/persist calls)
+        self._active_worktrees: dict = {}  # container_name -> [(repo_path, worktree_path), ...]
 
     def _get_redis(self):
         """Lazy Redis connection (tolerates Redis being unavailable)."""
@@ -177,6 +178,106 @@ class DockerAgentRunner:
                 'success': False,
                 'error': f"Unexpected error: {e}"
             }
+
+    @staticmethod
+    def _create_reference_worktree(container_repo_path: str, task_id: str, repo_name: str, branch: str = "main") -> Optional[str]:
+        """Create a detached worktree at origin/<branch> of the reference repo.
+
+        All paths are container-side (e.g. /workspace/context-helpers). Git subcommands
+        run inside the orchestrator container, so host paths must not be used here.
+        The caller is responsible for translating the returned container path to a host
+        path for the Docker -v mount.
+
+        The worktree is placed at:
+          /workspace/.orchestrator/tmp/ref-worktrees/<repo_name>/<task_id>/
+
+        A scoped fetch of origin/<branch> runs first so the worktree always reflects
+        the latest remote state. The base clone's checked-out branch is never touched,
+        so the base clone and the worktree can be on completely different branches
+        simultaneously.
+
+        Returns the container-side worktree path on success, None on failure (caller
+        falls back to mounting the base clone directly).
+        """
+        if not os.path.isdir(os.path.join(container_repo_path, '.git')):
+            logger.warning(f"Reference repo not found or not a git repo: {container_repo_path}")
+            return None
+
+        worktree_path = f'/workspace/.orchestrator/tmp/ref-worktrees/{repo_name}/{task_id}'
+        os.makedirs(os.path.dirname(worktree_path), exist_ok=True)
+
+        try:
+            subprocess.run(
+                ['git', '-C', container_repo_path, 'fetch', 'origin', branch, '--quiet'],
+                check=True, capture_output=True, timeout=30
+            )
+            subprocess.run(
+                ['git', '-C', container_repo_path, 'worktree', 'add', '--detach', worktree_path, f'origin/{branch}'],
+                check=True, capture_output=True, timeout=30
+            )
+            logger.info(f"Created reference worktree for {repo_name}@origin/{branch} at {worktree_path}")
+            return worktree_path
+        except subprocess.TimeoutExpired:
+            logger.warning(f"Timed out creating worktree for {repo_name}; will mount base clone directly")
+        except subprocess.CalledProcessError as e:
+            logger.warning(
+                f"Failed to create worktree for {repo_name}: {e.stderr.decode().strip()}; "
+                "will mount base clone directly"
+            )
+        return None
+
+    def _cleanup_reference_worktrees(self, container_name: str) -> None:
+        """Remove all worktrees created for a container launch."""
+        for repo_path, worktree_path in self._active_worktrees.pop(container_name, []):
+            try:
+                subprocess.run(
+                    ['git', '-C', repo_path, 'worktree', 'remove', '--force', worktree_path],
+                    check=True, capture_output=True, timeout=15
+                )
+                logger.info(f"Removed reference worktree: {worktree_path}")
+            except Exception as e:
+                logger.warning(f"Failed to remove worktree {worktree_path}: {e}; worktree prune will clean it up on next startup")
+
+    @staticmethod
+    def prune_reference_worktrees(workspace_root: str = '/workspace') -> None:
+        """Remove all staged reference worktrees and prune git metadata.
+
+        Call this at orchestrator startup to clean up any worktrees left behind
+        by a previous crash. Safe to call even if the directory doesn't exist.
+        """
+        staging_root = os.path.join(workspace_root, '.orchestrator', 'tmp', 'ref-worktrees')
+        if not os.path.isdir(staging_root):
+            return
+
+        # Each subdirectory of staging_root is a repo_name; each beneath that is a task worktree
+        for repo_name in os.listdir(staging_root):
+            repo_staging = os.path.join(staging_root, repo_name)
+            if not os.path.isdir(repo_staging):
+                continue
+            repo_path = os.path.join(workspace_root, repo_name)
+            for task_id in os.listdir(repo_staging):
+                worktree_path = os.path.join(repo_staging, task_id)
+                if os.path.isdir(worktree_path):
+                    try:
+                        subprocess.run(
+                            ['git', '-C', repo_path, 'worktree', 'remove', '--force', worktree_path],
+                            capture_output=True, timeout=15
+                        )
+                    except Exception:
+                        import shutil
+                        shutil.rmtree(worktree_path, ignore_errors=True)
+            # Prune any remaining stale metadata entries
+            try:
+                subprocess.run(
+                    ['git', '-C', repo_path, 'worktree', 'prune'],
+                    capture_output=True, timeout=15
+                )
+            except Exception:
+                pass
+            # Remove the now-empty staging directory for this repo
+            if os.path.isdir(repo_staging) and not os.listdir(repo_staging):
+                os.rmdir(repo_staging)
+        logger.info(f"Pruned reference worktrees under {staging_root}")
 
     async def _verify_container_write_access(
         self,
@@ -368,6 +469,8 @@ class DockerAgentRunner:
             # Clean up container and tracking
             self._cleanup_container(container_name)
             self._unregister_active_container(container_name)
+            # Clean up reference repo worktrees created for this launch
+            self._cleanup_reference_worktrees(container_name)
             # Clean up MCP config file
             if mcp_config_path and os.path.exists(mcp_config_path):
                 try:
@@ -674,6 +777,56 @@ class DockerAgentRunner:
                     f"Pipeline context dir not found ({pipeline_context_dir}); "
                     f"skipping mount — agents will use embedded context fallback"
                 )
+
+        # Mount reference repos (read-only, isolated per-launch via git worktrees)
+        try:
+            from config.manager import config_manager
+            ref_project_config = config_manager.get_project_config(context.get('project', 'unknown'))
+            reference_repos = ref_project_config.reference_repos or []
+        except Exception:
+            reference_repos = []
+
+        task_id = context.get('task_id', container_name)
+        worktrees_for_container = []
+
+        for repo in reference_repos:
+            # repo.path is a container-side path (e.g. /workspace/context-helpers)
+            repo_container_path = repo.path
+
+            if not os.path.isdir(repo_container_path):
+                logger.warning(
+                    f"Reference repo '{repo.name}' not found at {repo_container_path}; skipping mount. "
+                    "Clone the repo into the orchestrator workspace to enable it."
+                )
+                continue
+
+            # Try to create an isolated worktree snapshot at origin/<branch>.
+            # _create_reference_worktree takes and returns container-side paths.
+            worktree_container_path = self._create_reference_worktree(
+                repo_container_path, str(task_id), repo.name, repo.branch
+            )
+
+            if worktree_container_path:
+                # Translate container worktree path to host path for the Docker -v mount
+                relative = worktree_container_path.replace('/workspace/', '')
+                mount_source = f'{host_workspace}/{relative}'
+                # Store container-side paths for cleanup (git subcommands run in the container)
+                worktrees_for_container.append((repo_container_path, worktree_container_path))
+            else:
+                # Fallback: mount the base clone directly (read-only)
+                logger.warning(
+                    f"Falling back to base clone for reference repo '{repo.name}'. "
+                    "Concurrent agent launches may see transient git state."
+                )
+                relative = repo_container_path.replace('/workspace/', '')
+                mount_source = f'{host_workspace}/{relative}'
+
+            container_mount_path = repo.mount_path or f'/reference/{repo.name}'
+            cmd.extend(['-v', f'{mount_source}:{container_mount_path}:ro'])
+            logger.info(f"Mounting reference repo {repo.name}: {mount_source} -> {container_mount_path}:ro")
+
+        if worktrees_for_container:
+            self._active_worktrees[container_name] = worktrees_for_container
 
         cmd.extend([
             # Working directory inside container

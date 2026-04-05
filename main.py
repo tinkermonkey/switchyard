@@ -198,6 +198,11 @@ async def main():
     DockerAgentRunner.cleanup_orphaned_redis_keys()
     logger.info("Orphaned Redis key cleanup complete")
 
+    # Prune any reference repo worktrees left behind by a previous crash
+    logger.info("Pruning stale reference repo worktrees")
+    DockerAgentRunner.prune_reference_worktrees()
+    logger.info("Reference repo worktree prune complete")
+
     # Clean up stuck in_progress execution states from interrupted agent runs
     # This now runs AFTER container recovery, so it won't clean up states for recovered containers
     logger.info("Cleaning up stuck in_progress execution states")
