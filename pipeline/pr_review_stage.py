@@ -1114,7 +1114,7 @@ class PRReviewStage(PipelineStage):
                          '--json', 'id,number,url'],
                         capture_output=True, text=True, timeout=30
                     )
-                    if view_result.returncode == 0:
+                    if view_result.returncode == 0 and view_result.stdout.strip():
                         issue_data = json.loads(view_result.stdout)
                         break
                     delay = 2 ** _attempt
