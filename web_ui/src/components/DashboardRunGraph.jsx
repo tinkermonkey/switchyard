@@ -9,6 +9,14 @@ import { TodoList } from './AgentState'
 import { useDashboardRunData } from '../hooks/useDashboardRunData'
 import { useSocket } from '../contexts/SocketContext'
 
+function fmtTok(n) {
+  if (!n) return '0'
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
+  if (n >= 10_000) return `${(n / 1_000).toFixed(0)}K`
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`
+  return String(n)
+}
+
 // Same palette as ToolUseTimeline — keeps badge colors in sync across both components
 const TOOL_COLORS = {
   Read: '#4493f8', Edit: '#3fb950', Write: '#56d364', Bash: '#f0883e',
@@ -69,10 +77,30 @@ export default function DashboardRunGraph({ run }) {
   // Agent identifier of the most recent live execution — resets todos when the active agent changes.
   const [currentLiveAgent, setCurrentLiveAgent] = useState(null)
 
+  // Token summary fetched from /api/pipeline-run/<id>/token-usage (otel-collector rollup).
+  // Lags live streaming slightly but gives accurate per-type totals for the full run.
+  const [tokenSummary, setTokenSummary] = useState(null)
+
   // Reset live state when the run changes
   useEffect(() => {
     setLiveToolEvents([])
     setCurrentLiveAgent(null)
+    setTokenSummary(null)
+  }, [run?.id])
+
+  // Fetch token summary on mount and poll every 30s (mirrors useDashboardRunData poll cadence)
+  useEffect(() => {
+    if (!run?.id) return
+    let cancelled = false
+    const fetchTokens = () => {
+      fetch(`/api/pipeline-run/${run.id}/token-usage`)
+        .then(r => r.json())
+        .then(data => { if (!cancelled && data.success) setTokenSummary(data.summary || null) })
+        .catch(() => {})
+    }
+    fetchTokens()
+    const id = setInterval(fetchTokens, 30000)
+    return () => { cancelled = true; clearInterval(id) }
   }, [run?.id])
 
   // Subscribe directly to claude_stream_event for this run.
@@ -128,6 +156,25 @@ export default function DashboardRunGraph({ run }) {
     }
     return merged
   }, [historicalToolEvents, liveToolEvents])
+
+  // Fallback token totals derived from mergedEvents when the otel summary isn't available yet.
+  // Output tokens are accurate (always additive); input/cache totals overcount within a single
+  // context window (each turn includes prior context) but are a reasonable approximation.
+  const derivedTokens = useMemo(() => {
+    let totalInput = 0, totalOutput = 0, totalCacheRead = 0, totalCacheWrite = 0
+    let hasData = false
+    for (const evt of mergedEvents) {
+      const usage = evt.raw_event?.event?.message?.usage
+      if (!usage) continue
+      totalInput     += usage.input_tokens || 0
+      totalOutput    += usage.output_tokens || 0
+      totalCacheRead += usage.cache_read_input_tokens || 0
+      totalCacheWrite += usage.cache_creation_input_tokens || 0
+      hasData = true
+    }
+    if (!hasData) return null
+    return { total_direct_input: totalInput, total_output_tokens: totalOutput, total_cache_read: totalCacheRead, total_cache_creation: totalCacheWrite }
+  }, [mergedEvents])
 
   // Most recent tool event — drives the overlay badge.
   // Same source as ToolUseTimeline so both always reflect the same event.
@@ -188,9 +235,37 @@ export default function DashboardRunGraph({ run }) {
         />
       </div>
 
-      {/* Tool use timeline */}
-      <div className="flex-shrink-0 border-b border-gh-border">
-        <ToolUseTimeline toolEvents={toolEvents} />
+      {/* Tool use timeline + token counter */}
+      <div className="flex-shrink-0 border-b border-gh-border flex items-stretch min-w-0">
+        <div className="flex-1 min-w-0">
+          <ToolUseTimeline toolEvents={toolEvents} />
+        </div>
+        {(tokenSummary ?? derivedTokens) && (
+          {(() => {
+            const tok = tokenSummary ?? derivedTokens
+            return (
+              <div className="flex-shrink-0 border-l border-gh-border px-3 py-2 flex flex-col justify-center gap-1 min-w-[90px]">
+                <div className="text-xs text-gh-fg-muted font-semibold uppercase tracking-wide leading-none mb-1">Tokens</div>
+                <div className="flex items-baseline justify-between gap-2">
+                  <span className="text-xs text-gh-fg-muted">input</span>
+                  <span className="text-xs font-mono text-gh-fg">{fmtTok(tok.total_direct_input || 0)}</span>
+                </div>
+                <div className="flex items-baseline justify-between gap-2">
+                  <span className="text-xs text-gh-fg-muted">output</span>
+                  <span className="text-xs font-mono text-gh-fg">{fmtTok(tok.total_output_tokens || 0)}</span>
+                </div>
+                <div className="flex items-baseline justify-between gap-2">
+                  <span className="text-xs text-gh-fg-muted">c.read</span>
+                  <span className="text-xs font-mono text-gh-fg">{fmtTok(tok.total_cache_read || 0)}</span>
+                </div>
+                <div className="flex items-baseline justify-between gap-2">
+                  <span className="text-xs text-gh-fg-muted">c.write</span>
+                  <span className="text-xs font-mono text-gh-fg">{fmtTok(tok.total_cache_creation || 0)}</span>
+                </div>
+              </div>
+            )
+          })()}
+        )}
       </div>
 
       {/* Graph body */}
