@@ -7,11 +7,13 @@ variables:
 ## Review Cycle Context Files
 
 All context files are at `/pipeline_context/`:
-- **`current_diff.md`** — git changes to review (stat + commits) ← run `git diff` from those commits
-- **`{maker_file}`** — current implementation to review
+- **`{maker_file}`** — what the maker implemented (primary source of truth)
+- **`current_diff.md`** — git changes since before the maker ran; use this to find the relevant files quickly
 - `initial_request.md` — original requirements to verify against
 {prev_feedback_note}- Earlier numbered files show the full iteration history
 
-**Review focus**: Read `current_diff.md` for the list of changed files, then use
-`git diff <base_commit> HEAD -- <file>` to examine the actual changes. Review ONLY
-additions (`+`) and deletions (`-`). Do not review unchanged code.
+**Review focus**: Read `{maker_file}` to understand what was implemented, then use
+`current_diff.md` to locate the changed files and run `git diff <base_commit> HEAD -- <file>`
+to examine the actual code. If the diff is empty — because the maker recovered without
+making new changes, or the snapshot is stale — locate the relevant code via `{maker_file}`
+and `git log` instead. Review the implementation as it exists, not just the delta.
