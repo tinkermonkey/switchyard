@@ -20,6 +20,14 @@ function getGridLayout(count) {
 function DashboardView() {
   const [activeRuns, setActiveRuns] = useState([])
   const [loading, setLoading] = useState(true)
+  const [isMobile, setIsMobile] = useState(() => window.innerWidth < 768)
+
+  useEffect(() => {
+    const mq = window.matchMedia('(max-width: 767px)')
+    const handler = e => setIsMobile(e.matches)
+    mq.addEventListener('change', handler)
+    return () => mq.removeEventListener('change', handler)
+  }, [])
 
   const fetchActiveRuns = useCallback(async (isInitial = false) => {
     try {
@@ -54,7 +62,7 @@ function DashboardView() {
 
       <NavigationTabs />
 
-      <div className="flex-1 min-h-0">
+      <div className={`flex-1 ${isMobile ? 'overflow-y-auto' : 'min-h-0'}`}>
         {loading && activeRuns.length === 0 ? (
           <div className="flex items-center justify-center h-full">
             <RefreshCw className="w-8 h-8 animate-spin text-gh-accent-primary" />
@@ -65,8 +73,11 @@ function DashboardView() {
           </div>
         ) : (
           <div
-            className="h-full gap-2"
-            style={{
+            className={`gap-2 ${isMobile ? '' : 'h-full'}`}
+            style={isMobile ? {
+              display: 'grid',
+              gridTemplateColumns: '1fr',
+            } : {
               display: 'grid',
               gridTemplateColumns: `repeat(${cols}, 1fr)`,
               gridTemplateRows: `repeat(${rows}, 1fr)`,

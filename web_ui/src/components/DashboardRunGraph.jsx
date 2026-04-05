@@ -154,7 +154,7 @@ export default function DashboardRunGraph({ run }) {
 
   return (
     <div
-      className="bg-gh-canvas-subtle border border-gh-border rounded-md overflow-hidden hover:border-gh-accent-primary transition-colors flex flex-col"
+      className="bg-gh-canvas-subtle border border-gh-border rounded-md overflow-hidden hover:border-gh-accent-primary transition-colors flex flex-col min-h-[400px] md:min-h-0"
     >
       {/* Compact header */}
       <div className="flex items-center gap-3 px-3 py-2 border-b border-gh-border min-w-0 flex-shrink-0">
