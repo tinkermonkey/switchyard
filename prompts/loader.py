@@ -50,6 +50,8 @@ Directory layout:
                 authority_*.md     static authority-framing blocks for RequirementsVerifierAgent
                 verification_main.md  verification prompt (pr_url, authority_framing, context_name, context_content)
                 consolidation.md   consolidation prompt (phase_blocks); uses {{ }} for JSON schema
+            context/
+                reference_repos.md  reference repos section — appended when project has reference_repos ({entries})
             output/
                 code_writing.md    output instructions — initial/revision, file-writing agents
                 analysis.md        output instructions — initial/revision, analysis agents

@@ -54,12 +54,28 @@ class PromptBuilder:
             return ctx.direct_prompt
 
         if ctx.mode == "question":
-            return self._build_question(ctx)
-        if ctx.mode == "revision":
-            return self._build_revision(ctx)
-        return self._build_initial(ctx)
+            prompt = self._build_question(ctx)
+        elif ctx.mode == "revision":
+            prompt = self._build_revision(ctx)
+        else:
+            prompt = self._build_initial(ctx)
+
+        return self._append_reference_repos(prompt, ctx)
 
     # ── Specialised builders used by standalone agents ─────────────────────
+
+    def _append_reference_repos(self, prompt: str, ctx: "PromptContext") -> str:
+        """Append the reference repos section to a prompt if the project has any configured.
+
+        Uses ctx.reference_repos_section when already populated (agents using from_task_context).
+        Falls back to computing it from ctx.project for agents that construct PromptContext directly
+        (code_reviewer, documentation_editor, pr_code_reviewer, requirements_verifier, verifier).
+        """
+        from prompts.context import PromptContext as _PC
+        section = ctx.reference_repos_section or _PC._build_reference_repos_section(ctx.project)
+        if section:
+            return prompt + "\n\n" + section
+        return prompt
 
     def build_reviewer_prompt(
         self,
@@ -80,7 +96,7 @@ class PromptBuilder:
         requirements_section = self._reviewer_requirements_section(ctx)
         context_section = self._reviewer_context_section(ctx)
 
-        return self._loader.workflow_template("review/prompt").format(
+        prompt = self._loader.workflow_template("review/prompt").format(
             reviewer_title=reviewer_title,
             review_domain=review_domain,
             iteration_context=iteration_context,
@@ -90,6 +106,7 @@ class PromptBuilder:
             format_instructions=format_instructions,
             filter_instructions=filter_instructions,
         )
+        return self._append_reference_repos(prompt, ctx)
 
     def build_verifier_prompt(self, ctx: "PromptContext") -> str:
         """Assemble the DevEnvironmentVerifier prompt."""
@@ -100,7 +117,7 @@ class PromptBuilder:
         # commands and Python snippets reference the correct project.
         verification_task = verification_task_raw.replace("{project_name}", project_name)
 
-        return self._loader.workflow_template("verification/prompt").format(
+        prompt = self._loader.workflow_template("verification/prompt").format(
             project_name=project_name,
             iteration_context=iteration_context,
             issue_title=ctx.issue.title,
@@ -108,6 +125,7 @@ class PromptBuilder:
             previous_stage=ctx.previous_stage,
             verification_task=verification_task,
         )
+        return self._append_reference_repos(prompt, ctx)
 
     def build_from_template(self, ctx: "PromptContext") -> str:
         """
@@ -127,11 +145,12 @@ class PromptBuilder:
         check_content = ctx.check_content
         if len(check_content) > 15000:
             check_content = check_content[:15000] + "\n\n[... truncated ...]"
-        return template.format(
+        prompt = template.format(
             pr_url=ctx.pr_url,
             check_name=ctx.check_name,
             check_content=check_content,
         )
+        return self._append_reference_repos(prompt, ctx)
 
     # ── Mode-specific builders ─────────────────────────────────────────────
 

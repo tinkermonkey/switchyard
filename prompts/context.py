@@ -19,8 +19,11 @@ Usage:
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -111,6 +114,11 @@ class PromptContext:
 
     # ── Dev environment verifier ──────────────────────────────────────────────
     project_name: str = ""   # explicit project name (verifier needs it expanded)
+
+    # ── Reference repositories ────────────────────────────────────────────────
+    # Pre-rendered section injected into every prompt when the project has reference_repos configured.
+    # Empty string when no reference repos are configured (section is omitted).
+    reference_repos_section: str = ""
 
     # ─────────────────────────────────────────────────────────────────────────
     # Factory
@@ -219,4 +227,29 @@ class PromptContext:
             pr_url=task_context.get("pr_url", ""),
             check_name=task_context.get("check_name", ""),
             check_content=task_context.get("check_content", ""),
+            reference_repos_section=cls._build_reference_repos_section(
+                task_context.get("project", "")
+            ),
         )
+
+    @staticmethod
+    def _build_reference_repos_section(project: str) -> str:
+        """Return a rendered reference repos section for the project, or empty string."""
+        if not project:
+            return ""
+        try:
+            from config.manager import config_manager
+            project_config = config_manager.get_project_config(project)
+            repos = project_config.reference_repos or []
+            if not repos:
+                return ""
+            entries = "\n".join(
+                f"- **{r.mount_path or f'/reference/{r.name}'}** — {r.description.strip()}"
+                for r in repos
+            )
+            from prompts.loader import default_loader
+            template = default_loader.workflow_template("context/reference_repos")
+            return template.format(entries=entries) if template else ""
+        except Exception:
+            logger.debug("Could not build reference_repos_section for project %r", project, exc_info=True)
+            return ""
