@@ -6828,6 +6828,7 @@ _Repair cycle initiated by Switchyard_
                             # GitHub column. If the card moved while the orchestrator was offline,
                             # the first poll will see a genuine status_changed diff and route
                             # through trigger_agent_for_status exactly as normal.
+                            from services.work_execution_state import work_execution_tracker
                             for issue_number, item in list(current_by_issue.items()):
                                 try:
                                     run = self.pipeline_run_manager.get_active_pipeline_run(
