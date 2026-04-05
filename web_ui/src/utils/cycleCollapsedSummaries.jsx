@@ -249,7 +249,9 @@ export function renderConversationalLoopSummary(data, isDark) {
   const s = data.summary
   if (!s) return null
 
-  const statusColor  = '#ec4899'
+  const statusColor  = s.status === 'paused'
+    ? (isDark ? '#f59e0b' : '#d97706')
+    : '#ec4899'
   const secondary    = isDark ? '#9ca3af' : '#57606a'
   const exchangeColor = isDark ? '#ec4899' : '#be185d'
   const pausedColor  = isDark ? '#f59e0b' : '#d97706'

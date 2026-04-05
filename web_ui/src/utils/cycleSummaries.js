@@ -279,7 +279,9 @@ export function extractStatusProgressionSummary(cycle) {
 export function extractConversationalLoopSummary(cycle) {
   try {
     const endEvent = cycle.endEvent
-    const status = endEvent && !endEvent._inferred ? 'paused' : 'running'
+    const events = cycle.events ?? []
+    const hasStop = events.some(e => e.event_type === 'feedback_listening_stopped')
+    const status = (endEvent && !endEvent._inferred) || hasStop ? 'paused' : 'running'
     const exchangeCount = (cycle.events ?? []).filter(e => e.event_type === 'agent_initialized').length
 
     let durationSeconds = null

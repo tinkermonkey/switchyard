@@ -2,7 +2,6 @@ import { useState, useEffect, useMemo, useRef } from 'react'
 import { scaleTime, scaleBand, scaleSqrt } from 'd3-scale'
 import { max } from 'd3-array'
 import { timeFormat } from 'd3-time-format'
-import { useSocket } from '../contexts/SocketContext'
 
 const WINDOW_MS = 30_000
 const RIGHT_MARGIN_MS = 2_000
@@ -43,101 +42,17 @@ function toolColor(name) {
   return OVERFLOW_PALETTE[h % OVERFLOW_PALETTE.length]
 }
 
-function parseToolEvents(rawEvent, ts, idPrefix) {
-  if (!rawEvent || rawEvent.type !== 'assistant') return []
-  const content = rawEvent.message?.content
-  if (!Array.isArray(content)) return []
-  const outputTokens = rawEvent.message?.usage?.output_tokens || 0
-  return content
-    .filter(item => item.type === 'tool_use' && item.name)
-    .map((item, i) => {
-      const toolName = item.name === 'Task' && item.input?.subagent_type
-        ? item.input.subagent_type
-        : item.name === 'Skill' && item.input?.skill
-          ? item.input.skill
-          : item.name
-      return { id: `${idPrefix}-${i}`, ts, toolName, outputTokens }
-    })
-}
-
 /**
  * Rolling 30-second scatter plot of tool calls.
  *
  * Props:
- *   run       - pipeline run object (needs run.id)
- *   allEvents - mergedEvents from useDashboardRunData — reuses the already-fetched
- *               pipeline-run-events data rather than making a duplicate API call.
- *               claude_log entries within this array are parsed for tool_use content.
+ *   toolEvents - array of { id, ts, toolName, outputTokens } parsed and merged by the
+ *                parent (DashboardRunGraph). Historical + live socket events combined.
  */
-export default function ToolUseTimeline({ run, allEvents = [] }) {
+export default function ToolUseTimeline({ toolEvents = [] }) {
   const [currentTime, setCurrentTime] = useState(() => new Date())
   const [tooltip, setTooltip] = useState(null)
-  // Live tool events collected directly from the socket for this run.
-  // Stored as state (not derived from the shared logs buffer) so events
-  // accumulate per-run without being crowded out by other runs' events.
-  const [liveToolEvents, setLiveToolEvents] = useState([])
   const svgRef = useRef(null)
-  const { socket } = useSocket()
-
-  // Reset live events when the run changes
-  useEffect(() => {
-    setLiveToolEvents([])
-  }, [run?.id])
-
-  // Subscribe directly to claude_stream_event for this run.
-  // Bypasses useSocket().logs (a shared 200-item buffer across all runs,
-  // pre-populated with flat ES records that lack the `event` field).
-  useEffect(() => {
-    if (!socket || !run?.id) return
-
-    const handleEvent = (data) => {
-      if (data.pipeline_run_id !== run.id) return
-      const ts = new Date(typeof data.timestamp === 'number'
-        ? data.timestamp * 1000
-        : data.timestamp)
-      const idPrefix = `live-${data.timestamp}-${data.agent || ''}`
-      const parsed = parseToolEvents(data.event, ts, idPrefix)
-      if (parsed.length === 0) return
-      setLiveToolEvents(prev => {
-        // Dedup by id before adding
-        const existingIds = new Set(prev.map(e => e.id))
-        const fresh = parsed.filter(e => !existingIds.has(e.id))
-        if (fresh.length === 0) return prev
-        return [...prev, ...fresh]
-      })
-    }
-
-    socket.on('claude_stream_event', handleEvent)
-    return () => socket.off('claude_stream_event', handleEvent)
-  }, [socket, run?.id])
-
-  // Parse historical tool events from the already-fetched allEvents prop
-  const historicalEvents = useMemo(() => {
-    const events = []
-    for (const evt of allEvents) {
-      if (evt.event_category !== 'claude_log') continue
-      events.push(...parseToolEvents(
-        evt.raw_event?.event,
-        new Date(evt.timestamp),
-        evt.id || evt.timestamp,
-      ))
-    }
-    return events
-  }, [allEvents])
-
-  // Merge historical + live, dedup by id (historical first so live events
-  // win on duplicates when the API poll catches up to what the socket already saw)
-  const toolEvents = useMemo(() => {
-    const seen = new Set()
-    const merged = []
-    for (const e of [...historicalEvents, ...liveToolEvents]) {
-      if (!seen.has(e.id)) {
-        seen.add(e.id)
-        merged.push(e)
-      }
-    }
-    return merged
-  }, [historicalEvents, liveToolEvents])
 
   // Rolling clock — requestAnimationFrame for continuous smooth scrolling
   useEffect(() => {

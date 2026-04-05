@@ -4,6 +4,46 @@ import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { CheckCircle2, Circle, PlayCircle, ChevronDown, ChevronUp } from 'lucide-react'
 
+/**
+ * Renders a list of todo items with status icons.
+ *
+ * Props:
+ *   todos   - array of { content, status } where status is 'completed' | 'in_progress' | 'pending'
+ *   compact - true for the lightweight overlay variant (smaller icons, tighter spacing, no bg fill)
+ */
+export function TodoList({ todos, compact = false }) {
+  if (!todos?.length) return null
+  return (
+    <div className={compact ? 'space-y-0.5' : 'space-y-2'}>
+      {todos.map((todo, idx) => {
+        const isCompleted = todo.status === 'completed'
+        const isInProgress = todo.status === 'in_progress'
+        return (
+          <div
+            key={idx}
+            className={`flex items-start rounded ${compact ? 'gap-1.5 py-0.5' : `gap-2 p-2 ${isInProgress ? 'bg-gh-warning-subtle border border-gh-warning' : ''}`}`}
+          >
+            {isCompleted ? (
+              <CheckCircle2 className={`${compact ? 'w-3 h-3' : 'w-4 h-4'} mt-0.5 text-gh-success flex-shrink-0`} />
+            ) : isInProgress ? (
+              <PlayCircle className={`${compact ? 'w-3 h-3' : 'w-4 h-4'} mt-0.5 text-gh-warning flex-shrink-0`} />
+            ) : (
+              <Circle className={`${compact ? 'w-3 h-3' : 'w-4 h-4'} mt-0.5 text-gh-fg-muted flex-shrink-0`} />
+            )}
+            <span className={`leading-tight ${compact ? 'text-xs' : 'text-sm'} ${
+              isCompleted ? 'line-through text-gh-fg-muted' :
+              isInProgress ? 'text-gh-fg font-medium' :
+              'text-gh-fg'
+            }`}>
+              {todo.content}
+            </span>
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
 // Unified timestamp normalization function
 // Accepts: Unix epoch (seconds), Unix epoch (milliseconds), or ISO 8601 string
 // Returns: Unix epoch in seconds, or null if invalid
@@ -555,40 +595,7 @@ export default function AgentState() {
                 </div>
               </div>
               {lastTodoWrite && lastTodoWrite.todos.length > 0 ? (
-                <div className="space-y-2">
-                  {lastTodoWrite.todos.map((todo, idx) => {
-                    const isCompleted = todo.status === 'completed'
-                    const isInProgress = todo.status === 'in_progress'
-
-                    return (
-                      <div
-                        key={idx}
-                        className={`flex items-start gap-2 p-2 rounded ${
-                          isInProgress ? 'bg-gh-warning-subtle border border-gh-warning' : ''
-                        }`}
-                      >
-                        {isCompleted ? (
-                          <CheckCircle2 className="w-4 h-4 mt-0.5 text-gh-success flex-shrink-0" />
-                        ) : isInProgress ? (
-                          <PlayCircle className="w-4 h-4 mt-0.5 text-gh-warning flex-shrink-0" />
-                        ) : (
-                          <Circle className="w-4 h-4 mt-0.5 text-gh-fg-muted flex-shrink-0" />
-                        )}
-                        <span
-                          className={`text-sm ${
-                            isCompleted
-                              ? 'line-through text-gh-fg-muted'
-                              : isInProgress
-                              ? 'text-gh-fg font-medium'
-                              : 'text-gh-fg'
-                          }`}
-                        >
-                          {todo.content}
-                        </span>
-                      </div>
-                    )
-                  })}
-                </div>
+                <TodoList todos={lastTodoWrite.todos} />
               ) : (
                 <div className="text-center text-gh-fg-muted text-sm py-4">
                   No current task list
