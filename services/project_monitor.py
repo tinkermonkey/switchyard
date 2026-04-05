@@ -6821,6 +6821,47 @@ _Repair cycle initiated by Switchyard_
                         if current_items:
                             board_key = f"{project_name}_{pipeline.board_name}"
                             current_by_issue = {item.issue_number: item for item in current_items}
+
+                            # For issues with a feedback_listening pipeline run, seed last_state
+                            # with the orchestrator's last known column rather than the current
+                            # GitHub column. If the card moved while the orchestrator was offline,
+                            # the first poll will see a genuine status_changed diff and route
+                            # through trigger_agent_for_status exactly as normal.
+                            from services.pipeline_run import get_pipeline_run_manager
+                            from services.work_execution_state import work_execution_tracker
+                            pipeline_run_manager = get_pipeline_run_manager()
+                            import copy
+                            for issue_number, item in list(current_by_issue.items()):
+                                try:
+                                    run = pipeline_run_manager.get_active_pipeline_run(
+                                        project_name, issue_number
+                                    )
+                                    if not run or run.status != 'feedback_listening':
+                                        continue
+                                    history = work_execution_tracker.get_execution_history(
+                                        project_name, issue_number
+                                    )
+                                    completed = [e for e in history if e.get('outcome') == 'success']
+                                    if not completed:
+                                        continue
+                                    last_known_column = completed[-1]['column']
+                                    if last_known_column != item.status:
+                                        # Substitute the last known position so the first poll
+                                        # detects the transition that happened while offline.
+                                        ghost = copy.copy(item)
+                                        ghost.status = last_known_column
+                                        current_by_issue[issue_number] = ghost
+                                        logger.info(
+                                            f"Startup: seeding last_state for #{issue_number} "
+                                            f"with last known column '{last_known_column}' "
+                                            f"(GitHub reports '{item.status}') — "
+                                            f"first poll will emit status_changed"
+                                        )
+                                except Exception as seed_err:
+                                    logger.warning(
+                                        f"Error seeding last_state for #{issue_number}: {seed_err}"
+                                    )
+
                             self.last_state[board_key] = current_by_issue
                             logger.info(f"Initialized state for {project_name}/{pipeline.board_name}: {len(current_items)} items")
             except Exception as e:
