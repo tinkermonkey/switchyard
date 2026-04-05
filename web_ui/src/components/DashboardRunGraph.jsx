@@ -38,13 +38,6 @@ function formatToolInput(name, input) {
   }
 }
 
-function fmtEventTime(date) {
-  if (!date) return ''
-  const m = date.getMinutes()
-  const s = String(date.getSeconds()).padStart(2, '0')
-  return `${m}:${s}`
-}
-
 /**
  * Parse tool_use items from a raw assistant stream event.
  * Returns [{ id, ts, toolName, input, outputTokens }, ...]
@@ -73,10 +66,13 @@ export default function DashboardRunGraph({ run }) {
 
   // Live tool events collected directly from the socket for this run.
   const [liveToolEvents, setLiveToolEvents] = useState([])
+  // Agent identifier of the most recent live execution — resets todos when the active agent changes.
+  const [currentLiveAgent, setCurrentLiveAgent] = useState(null)
 
-  // Reset live events when the run changes
+  // Reset live state when the run changes
   useEffect(() => {
     setLiveToolEvents([])
+    setCurrentLiveAgent(null)
   }, [run?.id])
 
   // Subscribe directly to claude_stream_event for this run.
@@ -92,9 +88,11 @@ export default function DashboardRunGraph({ run }) {
       const idPrefix = `live-${data.timestamp}-${data.agent || ''}`
       const parsed = parseToolEvents(data.event, ts, idPrefix)
       if (parsed.length === 0) return
+      const agent = data.agent ?? null
+      setCurrentLiveAgent(agent)
       setLiveToolEvents(prev => {
         const existingIds = new Set(prev.map(e => e.id))
-        const fresh = parsed.filter(e => !existingIds.has(e.id))
+        const fresh = parsed.filter(e => !existingIds.has(e.id)).map(e => ({ ...e, agent }))
         if (fresh.length === 0) return prev
         return [...prev, ...fresh]
       })
@@ -139,14 +137,15 @@ export default function DashboardRunGraph({ run }) {
   }, [toolEvents, run?.status])
 
   // Most recent TodoWrite input — drives the compact todo overlay.
-  // Derived from the same toolEvents so it stays in sync with the timeline.
+  // Scoped to the current live agent execution so todos clear when the active agent changes.
   const latestTodos = useMemo(() => {
-    const writes = toolEvents.filter(e => e.toolName === 'TodoWrite')
+    if (run?.status !== 'active') return null
+    const writes = liveToolEvents.filter(e => e.toolName === 'TodoWrite' && e.agent === currentLiveAgent)
     if (writes.length === 0) return null
     const latest = writes.reduce((a, b) => (a.ts > b.ts ? a : b))
     const todos = latest.input?.todos
     return todos?.length ? todos : null
-  }, [toolEvents])
+  }, [liveToolEvents, currentLiveAgent, run?.status])
 
   const handleClick = useCallback(() => {
     navigate({ to: '/pipeline-run', search: { runId: run.id } })
@@ -154,17 +153,17 @@ export default function DashboardRunGraph({ run }) {
 
   return (
     <div
-      className="bg-gh-canvas-subtle border border-gh-border rounded-md overflow-hidden hover:border-gh-accent-primary transition-colors flex flex-col min-h-[400px] md:min-h-0"
+      className="bg-gh-canvas-subtle border border-gh-border rounded-md overflow-hidden hover:border-gh-accent-primary transition-colors flex flex-col min-h-[500px] md:min-h-0"
     >
       {/* Compact header */}
-      <div className="flex items-center gap-3 px-3 py-2 border-b border-gh-border min-w-0 flex-shrink-0">
-        <div className="min-w-0 flex-1 truncate">
-          <div className="text-xs text-gh-fg-muted font-normal leading-tight truncate">
+      <div className="flex flex-wrap md:flex-nowrap items-center gap-x-3 gap-y-1 px-3 py-2 border-b border-gh-border min-w-0 flex-shrink-0">
+        <div className="min-w-0 w-full md:w-auto md:flex-1">
+          <div className="text-xs text-gh-fg-muted font-normal leading-tight md:truncate">
             {run.project}
           </div>
           <h3
             onClick={handleClick}
-            className="text-sm font-semibold truncate cursor-pointer">
+            className="text-sm font-semibold md:truncate cursor-pointer">
             {run.issue_title}
           </h3>
         </div>
@@ -220,9 +219,10 @@ export default function DashboardRunGraph({ run }) {
             className="absolute z-10 top-2 flex items-center gap-1.5 bg-gh-canvas rounded px-2 py-1 pointer-events-none overflow-hidden"
             style={{ left: 52, right: 8, opacity: 0.75 }}
           >
-            <span className="text-xs text-gh-fg-muted font-mono flex-shrink-0">
-              {fmtEventTime(latestToolEvent.ts)}
-            </span>
+            <RunDuration
+              startedAt={latestToolEvent.ts.getTime()}
+              className="text-xs text-gh-fg-muted font-mono flex-shrink-0"
+            />
             <span
               className="px-1.5 py-0.5 rounded text-xs font-semibold flex-shrink-0"
               style={{ backgroundColor: toolColor(latestToolEvent.toolName), color: '#fff' }}
