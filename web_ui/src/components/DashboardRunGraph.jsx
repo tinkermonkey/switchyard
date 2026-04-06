@@ -17,6 +17,12 @@ function fmtTok(n) {
   return String(n)
 }
 
+function fmtCost(usd) {
+  if (!usd) return null
+  if (usd < 0.01) return `$${usd.toFixed(4)}`
+  return `$${usd.toFixed(2)}`
+}
+
 // Same palette as ToolUseTimeline — keeps badge colors in sync across both components
 const TOOL_COLORS = {
   Read: '#4493f8', Edit: '#3fb950', Write: '#56d364', Bash: '#f0883e',
@@ -80,12 +86,16 @@ export default function DashboardRunGraph({ run }) {
   // Token summary fetched from /api/pipeline-run/<id>/token-usage (otel-collector rollup).
   // Lags live streaming slightly but gives accurate per-type totals for the full run.
   const [tokenSummary, setTokenSummary] = useState(null)
+  // Running token totals accumulated live from socket events.
+  // Used as last-resort fallback when neither the otel summary nor historical mergedEvents have data yet.
+  const [liveTokens, setLiveTokens] = useState(null)
 
   // Reset live state when the run changes
   useEffect(() => {
     setLiveToolEvents([])
     setCurrentLiveAgent(null)
     setTokenSummary(null)
+    setLiveTokens(null)
   }, [run?.id])
 
   // Fetch token summary on mount and poll every 30s (mirrors useDashboardRunData poll cadence)
@@ -113,6 +123,18 @@ export default function DashboardRunGraph({ run }) {
       const ts = new Date(typeof data.timestamp === 'number'
         ? data.timestamp * 1000
         : data.timestamp)
+
+      // Accumulate token usage from every assistant event, regardless of tool calls.
+      const usage = data.event?.message?.usage
+      if (usage) {
+        setLiveTokens(prev => ({
+          total_direct_input:   (prev?.total_direct_input   || 0) + (usage.input_tokens                  || 0),
+          total_output_tokens:  (prev?.total_output_tokens  || 0) + (usage.output_tokens                 || 0),
+          total_cache_read:     (prev?.total_cache_read     || 0) + (usage.cache_read_input_tokens        || 0),
+          total_cache_creation: (prev?.total_cache_creation || 0) + (usage.cache_creation_input_tokens   || 0),
+        }))
+      }
+
       const idPrefix = `live-${data.timestamp}-${data.agent || ''}`
       const parsed = parseToolEvents(data.event, ts, idPrefix)
       if (parsed.length === 0) return
@@ -240,32 +262,37 @@ export default function DashboardRunGraph({ run }) {
         <div className="flex-1 min-w-0">
           <ToolUseTimeline toolEvents={toolEvents} />
         </div>
-        {(tokenSummary ?? derivedTokens) && (
-          {(() => {
-            const tok = tokenSummary ?? derivedTokens
-            return (
-              <div className="flex-shrink-0 border-l border-gh-border px-3 py-2 flex flex-col justify-center gap-1 min-w-[90px]">
-                <div className="text-xs text-gh-fg-muted font-semibold uppercase tracking-wide leading-none mb-1">Tokens</div>
-                <div className="flex items-baseline justify-between gap-2">
-                  <span className="text-xs text-gh-fg-muted">input</span>
-                  <span className="text-xs font-mono text-gh-fg">{fmtTok(tok.total_direct_input || 0)}</span>
-                </div>
-                <div className="flex items-baseline justify-between gap-2">
-                  <span className="text-xs text-gh-fg-muted">output</span>
-                  <span className="text-xs font-mono text-gh-fg">{fmtTok(tok.total_output_tokens || 0)}</span>
-                </div>
-                <div className="flex items-baseline justify-between gap-2">
-                  <span className="text-xs text-gh-fg-muted">c.read</span>
-                  <span className="text-xs font-mono text-gh-fg">{fmtTok(tok.total_cache_read || 0)}</span>
-                </div>
-                <div className="flex items-baseline justify-between gap-2">
-                  <span className="text-xs text-gh-fg-muted">c.write</span>
-                  <span className="text-xs font-mono text-gh-fg">{fmtTok(tok.total_cache_creation || 0)}</span>
-                </div>
+        {(tokenSummary ?? derivedTokens ?? liveTokens) && (() => {
+          const tok = tokenSummary ?? derivedTokens ?? liveTokens
+          const cost = fmtCost(tok.total_cost_usd)
+          return (
+            <div className="flex-shrink-0 border-l border-gh-border px-3 py-2 flex flex-col justify-center gap-1 min-w-[90px]">
+              {cost && (
+                <>
+                  <div className="text-xs text-gh-fg-muted font-semibold uppercase tracking-wide leading-none">Cost</div>
+                  <div className="text-xs font-mono font-semibold text-gh-fg mb-1">{cost}</div>
+                </>
+              )}
+              <div className="text-xs text-gh-fg-muted font-semibold uppercase tracking-wide leading-none mb-1">Tokens</div>
+              <div className="flex items-baseline justify-between gap-2">
+                <span className="text-xs text-gh-fg-muted">input</span>
+                <span className="text-xs font-mono text-gh-fg">{fmtTok(tok.total_direct_input || 0)}</span>
               </div>
-            )
-          })()}
-        )}
+              <div className="flex items-baseline justify-between gap-2">
+                <span className="text-xs text-gh-fg-muted">output</span>
+                <span className="text-xs font-mono text-gh-fg">{fmtTok(tok.total_output_tokens || 0)}</span>
+              </div>
+              <div className="flex items-baseline justify-between gap-2">
+                <span className="text-xs text-gh-fg-muted">c.read</span>
+                <span className="text-xs font-mono text-gh-fg">{fmtTok(tok.total_cache_read || 0)}</span>
+              </div>
+              <div className="flex items-baseline justify-between gap-2">
+                <span className="text-xs text-gh-fg-muted">c.write</span>
+                <span className="text-xs font-mono text-gh-fg">{fmtTok(tok.total_cache_creation || 0)}</span>
+              </div>
+            </div>
+          )
+        })()}
       </div>
 
       {/* Graph body */}
