@@ -546,7 +546,7 @@ class GitWorkflowManager:
 
                 # Stash changes including untracked files
                 stash_result = subprocess.run(
-                    ['git', 'stash', 'push', '--include-untracked', '-m', f'Auto-stash before checkout {branch_name}'],
+                    ['git', 'stash', 'push', '-m', f'Auto-stash before checkout {branch_name}'],
                     cwd=project_dir,
                     capture_output=True,
                     text=True,

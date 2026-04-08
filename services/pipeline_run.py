@@ -364,92 +364,96 @@ class PipelineRunManager:
         issue_key = self._get_issue_key(project, issue_number)
         pipeline_run_id = self.redis.hget(self.redis_issue_mapping, issue_key)
 
-        if not pipeline_run_id:
-            # FALLBACK: Check Elasticsearch for active runs that aged out of Redis
-            # This handles cases where pipeline runs are older than Redis TTL.
-            # Include "feedback_listening" so human-feedback loops survive restarts
-            # without being recreated (they legitimately have no Docker container).
-            if self.es:
+        if pipeline_run_id:
+            # Fast path: mapping exists, try Redis first
+            redis_key = self._get_redis_key(pipeline_run_id)
+            data = self.redis.get(redis_key)
+
+            if data:
                 try:
-                    result = self.es.search(
-                        index=f"{self.es_index_pattern}-*",
-                        body={
-                            "query": {
-                                "bool": {
-                                    "must": [
-                                        {"term": {"project": project}},
-                                        {"term": {"issue_number": issue_number}},
-                                        {"terms": {"status": ["active", "feedback_listening"]}}
-                                    ]
-                                }
-                            },
-                            "size": 1,
-                            "sort": [{"started_at": {"order": "desc"}}]
-                        }
-                    )
-                    
-                    if result['hits']['total']['value'] > 0:
-                        pipeline_run = PipelineRun.from_dict(result['hits']['hits'][0]['_source'])
-                        logger.debug(f"Found active pipeline run {pipeline_run.id} in Elasticsearch (not in Redis)")
-
-                        # Guard against ES near-real-time stale reads.
-                        # end_pipeline_run() stores completed data in Redis (setex) and deletes
-                        # the issue mapping (hdel) BEFORE persisting to ES.  If the ES search
-                        # index hasn't refreshed yet, this query can return a stale "active"
-                        # document for a run that was just completed.  Restoring that stale
-                        # data would overwrite the correct completed state in Redis and cause
-                        # subsequent callers to reuse the old pipeline_run_id.
-                        redis_key = self._get_redis_key(pipeline_run.id)
-                        existing_data = self.redis.get(redis_key)
-                        if existing_data:
-                            try:
-                                existing = json.loads(existing_data)
-                                if existing.get('status') == 'completed':
-                                    logger.info(
-                                        f"Skipping ES fallback restore for {pipeline_run.id} — "
-                                        f"already completed in Redis (stale ES read)"
-                                    )
-                                    return None
-                            except (json.JSONDecodeError, TypeError):
-                                pass
-
-                        # Restore to Redis for future lookups
-                        self.redis.setex(
-                            redis_key,
-                            3600,  # 1 hour TTL
-                            json.dumps(pipeline_run.to_dict())
-                        )
-                        self.redis.hset(self.redis_issue_mapping, issue_key, pipeline_run.id)
-
+                    pipeline_run = PipelineRun.from_dict(json.loads(data))
+                    if pipeline_run.is_active():
                         return pipeline_run
+                    else:
+                        # Run has completed — clean up stale mapping
+                        self.redis.hdel(self.redis_issue_mapping, issue_key)
+                        return None
                 except Exception as e:
-                    logger.debug(f"Error searching Elasticsearch for active pipeline run: {e}")
-            
-            return None
-        
-        # Get pipeline run data
-        redis_key = self._get_redis_key(pipeline_run_id)
-        data = self.redis.get(redis_key)
-        
-        if not data:
-            # Mapping exists but data is gone - clean up
-            self.redis.hdel(self.redis_issue_mapping, issue_key)
-            return None
-        
-        try:
-            pipeline_run = PipelineRun.from_dict(json.loads(data))
-            
-            # Verify it's still active
-            if pipeline_run.is_active():
-                return pipeline_run
+                    logger.error(f"Error deserializing pipeline run: {e}")
+                    return None
             else:
-                # Not active anymore, clean up
+                # Redis data has expired (TTL) while the issue mapping survived.
+                # This can happen if the orchestrator was restarted and the initial
+                # 2-hour creation TTL expired before the run was restored/updated.
+                # Clean up the stale mapping and fall through to the ES lookup.
+                logger.debug(
+                    f"Pipeline run data for {project} issue #{issue_number} expired from Redis "
+                    f"(run_id: {pipeline_run_id[:8]}...), falling back to Elasticsearch"
+                )
                 self.redis.hdel(self.redis_issue_mapping, issue_key)
-                return None
-                
-        except Exception as e:
-            logger.error(f"Error deserializing pipeline run: {e}")
-            return None
+                # Fall through to ES lookup below
+
+        # ES fallback: mapping was absent OR Redis data expired.
+        # Include "feedback_listening" so human-feedback loops survive restarts
+        # without being recreated (they legitimately have no Docker container).
+        if self.es:
+            try:
+                result = self.es.search(
+                    index=f"{self.es_index_pattern}-*",
+                    body={
+                        "query": {
+                            "bool": {
+                                "must": [
+                                    {"term": {"project": project}},
+                                    {"term": {"issue_number": issue_number}},
+                                    {"terms": {"status": ["active", "feedback_listening"]}}
+                                ]
+                            }
+                        },
+                        "size": 1,
+                        "sort": [{"started_at": {"order": "desc"}}]
+                    }
+                )
+
+                if result['hits']['total']['value'] > 0:
+                    pipeline_run = PipelineRun.from_dict(result['hits']['hits'][0]['_source'])
+                    logger.debug(f"Found active pipeline run {pipeline_run.id} in Elasticsearch (not in Redis)")
+
+                    # Guard against ES near-real-time stale reads.
+                    # end_pipeline_run() stores completed data in Redis (setex) and deletes
+                    # the issue mapping (hdel) BEFORE persisting to ES.  If the ES search
+                    # index hasn't refreshed yet, this query can return a stale "active"
+                    # document for a run that was just completed.  Restoring that stale
+                    # data would overwrite the correct completed state in Redis and cause
+                    # subsequent callers to reuse the old pipeline_run_id.
+                    check_key = self._get_redis_key(pipeline_run.id)
+                    existing_data = self.redis.get(check_key)
+                    if existing_data:
+                        try:
+                            existing = json.loads(existing_data)
+                            if existing.get('status') == 'completed':
+                                logger.info(
+                                    f"Skipping ES fallback restore for {pipeline_run.id} — "
+                                    f"already completed in Redis (stale ES read)"
+                                )
+                                return None
+                        except (json.JSONDecodeError, TypeError):
+                            pass
+
+                    # Restore to Redis. feedback_listening runs get a 7-day TTL to cover
+                    # any realistic human review window; active runs get a 1-hour refresh.
+                    restore_key = self._get_redis_key(pipeline_run.id)
+                    if pipeline_run.status == 'feedback_listening':
+                        self.redis.setex(restore_key, 604800, json.dumps(pipeline_run.to_dict()))
+                    else:
+                        self.redis.setex(restore_key, 3600, json.dumps(pipeline_run.to_dict()))
+                    self.redis.hset(self.redis_issue_mapping, issue_key, pipeline_run.id)
+
+                    return pipeline_run
+            except Exception as e:
+                logger.debug(f"Error searching Elasticsearch for active pipeline run: {e}")
+
+        return None
     
     def get_or_create_pipeline_run(
         self,
@@ -763,7 +767,12 @@ class PipelineRunManager:
         # Persist to Redis
         try:
             redis_key = self._get_redis_key(pipeline_run.id)
-            self.redis.setex(redis_key, 3600, json.dumps(pipeline_run.to_dict()))
+            if new_status == 'feedback_listening':
+                # 7-day TTL — long enough for any realistic human review window.
+                # Prevents indefinite accumulation if the run is abandoned without being ended.
+                self.redis.setex(redis_key, 604800, json.dumps(pipeline_run.to_dict()))
+            else:
+                self.redis.setex(redis_key, 3600, json.dumps(pipeline_run.to_dict()))
         except Exception as e:
             logger.warning(f"Failed to update pipeline run status in Redis: {e}")
 
@@ -794,7 +803,7 @@ class PipelineRunManager:
         project: str,
         issue_number: int,
         reason: Optional[str] = None,
-        retain_lock: bool = False,
+        retain_lock: Optional[bool] = None,
         outcome: Optional[str] = None
     ) -> bool:
         """
@@ -804,9 +813,10 @@ class PipelineRunManager:
             project: Project name
             issue_number: Issue number
             reason: Optional reason for ending (for logging)
-            retain_lock: If True, do not release the pipeline lock. Use this when the
-                         caller intends to keep the lock held after the run ends (e.g.,
-                         repair cycle failure awaiting manual intervention).
+            retain_lock: Lock policy after the run ends.
+                - None (default): auto — retain if outcome="failed", release otherwise.
+                - True: always retain regardless of outcome.
+                - False: always release regardless of outcome (use for intentional kills).
 
         Returns:
             True if run was ended, False if no active run found
@@ -884,14 +894,25 @@ class PipelineRunManager:
         # Update in Elasticsearch
         self._persist_to_elasticsearch(pipeline_run)
 
-        # Release pipeline lock if this issue holds it
-        # This prevents stale locks from blocking other issues when runs end due to errors.
-        # Skip when retain_lock=True (e.g. repair cycle failure — lock held for manual intervention).
-        if retain_lock:
-            logger.info(
-                f"Retaining pipeline lock for {project} issue #{issue_number} after ending run "
-                f"(retain_lock=True, reason: {reason or 'unspecified'})"
-            )
+        # Release pipeline lock if this issue holds it.
+        # retain_lock=True  → always retain (caller wants manual intervention)
+        # retain_lock=False → always release (intentional kill / cleanup)
+        # retain_lock=None  → auto: retain on failure, release on success/other
+        should_retain = (
+            retain_lock is True
+            or (retain_lock is None and outcome == "failed")
+        )
+        if should_retain:
+            if outcome == "failed":
+                logger.warning(
+                    f"Retaining pipeline lock for {project} issue #{issue_number} — "
+                    f"run ended with outcome=failed. Manual intervention required to release."
+                )
+            else:
+                logger.info(
+                    f"Retaining pipeline lock for {project} issue #{issue_number} after ending run "
+                    f"(retain_lock=True, reason: {reason or 'unspecified'})"
+                )
             return True
         try:
             from services.pipeline_lock_manager import get_pipeline_lock_manager

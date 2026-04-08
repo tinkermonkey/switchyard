@@ -337,21 +337,6 @@ class PipelineWatchdog:
             else:
                 logger.warning(f"Failed to end zombie pipeline run {pipeline_run_id[:8]}...")
 
-        # Release the pipeline lock
-        if self.lock_manager:
-            released = self.lock_manager.release_lock(project, board, issue_number)
-
-            if released:
-                logger.info(
-                    f"Released pipeline lock for {project} issue #{issue_number} "
-                    f"after zombie cleanup"
-                )
-            else:
-                logger.warning(
-                    f"Lock was not held for {project} issue #{issue_number} "
-                    f"during zombie cleanup (may have already been released)"
-                )
-
         # Remove any stale review cycle state so it doesn't block future runs
         try:
             from services.review_cycle import review_cycle_executor

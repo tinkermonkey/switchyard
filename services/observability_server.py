@@ -989,7 +989,8 @@ def kill_pipeline_run(pipeline_run_id):
             project=project,
             issue_number=issue_number,
             reason="Killed by user via Web UI",
-            outcome="failed"
+            outcome="failed",
+            retain_lock=False  # Intentional kill: release the lock so the pipeline can continue
         )
 
         if not success:
@@ -1898,6 +1899,69 @@ def get_pipeline_run_token_usage(pipeline_run_id):
         logger.error(f"Error fetching pipeline run token usage: {e}")
         return jsonify({'success': False, 'error': str(e)}), 500
 
+@app.route('/api/pipeline-run/<pipeline_run_id>/latest-comment')
+def get_pipeline_run_latest_comment(pipeline_run_id):
+    """Return the URL of the most recent GitHub comment posted for this pipeline run.
+
+    Queries decision-events-* for the latest GITHUB_COMMENT_POSTED event and
+    returns its stored comment_url. Falls back to constructing the URL from
+    object_type/object_number/comment_id fields when comment_url is absent
+    (older events pre-dating the comment_url field).
+    """
+    try:
+        result = es_client.search(
+            index='decision-events-*',
+            body={
+                'query': {
+                    'bool': {
+                        'must': [
+                            {'bool': {'should': [
+                                {'term': {'pipeline_run_id': pipeline_run_id}},
+                                {'term': {'pipeline_run_id.keyword': pipeline_run_id}},
+                            ], 'minimum_should_match': 1}},
+                            {'bool': {'should': [
+                                {'term': {'event_type': 'github_comment_posted'}},
+                                {'term': {'event_type.keyword': 'github_comment_posted'}},
+                            ], 'minimum_should_match': 1}},
+                        ]
+                    }
+                },
+                'sort': [{'timestamp': 'desc'}],
+                'size': 1,
+                '_source': ['data'],
+            }
+        )
+        hits = result.get('hits', {}).get('hits', [])
+        if not hits:
+            return jsonify({'success': True, 'comment_url': None})
+
+        data = hits[0]['_source'].get('data', {})
+        comment_url = data.get('comment_url')
+
+        # Fall back to constructing the URL from available fields for older events.
+        if not comment_url:
+            repo = data.get('repo', '')
+            object_type = data.get('object_type', '')
+            object_number = data.get('object_number', 0)
+            comment_id = data.get('comment_id', '')
+            if repo and object_number and comment_id:
+                if object_type == 'pull_request_review':
+                    comment_url = f"https://github.com/{repo}/pull/{object_number}#pullrequestreview-{comment_id}"
+                elif object_type == 'pull_request':
+                    comment_url = f"https://github.com/{repo}/pull/{object_number}#issuecomment-{comment_id}"
+                elif object_type == 'issue':
+                    comment_url = f"https://github.com/{repo}/issues/{object_number}#issuecomment-{comment_id}"
+                # Discussions without a stored URL can't be reconstructed reliably.
+
+        return jsonify({'success': True, 'comment_url': comment_url})
+    except Exception as e:
+        err_str = str(e).lower()
+        if 'index_not_found' in err_str or 'no such index' in err_str:
+            return jsonify({'success': True, 'comment_url': None})
+        logger.error(f"Error fetching latest comment for pipeline run {pipeline_run_id}: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
 @app.route('/api/pipeline-run/<pipeline_run_id>/analyze', methods=['POST'])
 def trigger_pipeline_run_analysis(pipeline_run_id):
     try:
@@ -2445,6 +2509,105 @@ def trigger_project_metrics():
     return jsonify({'success': True, 'message': 'Project metrics backfill triggered (7-day lookback)'})
 
 
+@app.route('/api/metrics/test-cycle-stats', methods=['GET'])
+def get_test_cycle_stats():
+    """Return test-cycle duration stats from orchestrator-test-cycle-stats, grouped by project.
+
+    Query params:
+        project  (str, optional) — restrict to a single project
+    """
+    import os
+    from elasticsearch import Elasticsearch, NotFoundError
+
+    project_filter = request.args.get('project')
+    es_url = os.environ.get('ELASTICSEARCH_URL', 'http://elasticsearch:9200')
+    es = Elasticsearch([es_url])
+
+    try:
+        must_filters = []
+        if project_filter:
+            must_filters.append({'term': {'project': project_filter}})
+
+        query = {'match_all': {}} if not must_filters else {'bool': {'filter': must_filters}}
+        resp = es.search(
+            index='orchestrator-test-cycle-stats',
+            body={'size': 1000, 'query': query, 'sort': [{'project': 'asc'}, {'test_type': 'asc'}]},
+        )
+        hits = resp.get('hits', {}).get('hits', [])
+        docs = [h['_source'] for h in hits]
+    except NotFoundError:
+        docs = []
+    except Exception as exc:
+        logger.error(f"Failed to query orchestrator-test-cycle-stats: {exc}")
+        return jsonify({'success': False, 'error': str(exc)}), 500
+
+    # Group by project
+    by_project: dict = {}
+    for doc in docs:
+        proj = doc.get('project', 'unknown')
+        by_project.setdefault(proj, []).append(doc)
+
+    return jsonify({'success': True, 'by_project': by_project, 'total_docs': len(docs)})
+
+
+_test_cycle_stats_lock = __import__('threading').Lock()
+
+
+@app.route('/api/metrics/test-cycle-stats/run-now', methods=['POST'])
+def trigger_test_cycle_stats():
+    """Compute test-cycle duration rollup stats on demand.
+
+    Reads per-iteration records from orchestrator-test-cycle-records-* and
+    upserts min/max/avg/median/p90 stats into orchestrator-test-cycle-stats.
+
+    Request body (all optional):
+        project       (str) — restrict to a single project name
+        lookback_days (int) — records window in days (default 180)
+
+    Returns 202 immediately; work runs in background.
+    Returns 409 if a stats job is already running.
+    """
+    import threading
+
+    if not _test_cycle_stats_lock.acquire(blocking=False):
+        return jsonify({
+            'success': False,
+            'message': 'A test-cycle stats job is already running',
+        }), 409
+
+    body = request.get_json(silent=True) or {}
+    project_filter = body.get('project') or None
+    lookback_days  = int(body.get('lookback_days', 180))
+
+    def _run():
+        try:
+            import os
+            from elasticsearch import Elasticsearch
+            from scripts.calculate_test_cycle_stats import calculate_stats
+            es = Elasticsearch([os.environ.get('ELASTICSEARCH_URL', 'http://elasticsearch:9200')])
+            count = calculate_stats(
+                es=es,
+                project_filter=project_filter,
+                lookback_days=lookback_days,
+            )
+            logger.info(f"Test-cycle stats rollup complete: {count} group(s) updated")
+        except Exception as exc:
+            logger.error(f"Test-cycle stats rollup failed: {exc}", exc_info=True)
+        finally:
+            _test_cycle_stats_lock.release()
+
+    threading.Thread(target=_run, daemon=True, name='test-cycle-stats-now').start()
+
+    return jsonify({
+        'success': True,
+        'message': 'Test-cycle stats rollup triggered',
+        'params': {
+            'project':      project_filter,
+            'lookback_days': lookback_days,
+        },
+    }), 202
+
+
 @app.route('/api/metrics/run-full-history', methods=['POST'])
 def trigger_token_metrics_full_history():
     """Backfill token metrics across all available event history.
@@ -2467,6 +2630,75 @@ def trigger_token_metrics_full_history():
 
     threading.Thread(target=_run, daemon=True, name='token-metrics-full-history').start()
     return jsonify({'success': True, 'message': 'Full-history token metrics backfill triggered'})
+
+
+_test_cycle_backfill_lock = __import__('threading').Lock()
+
+
+@app.route('/api/backfill/test-cycle-records', methods=['POST'])
+def trigger_test_cycle_backfill():
+    """Backfill test-cycle iteration records from decision-events-* history.
+
+    Discovers all completed repair cycles in the decision-events index (capped at
+    7-day ILM retention window), writes per-iteration records for any that are not
+    yet in orchestrator-test-cycle-records-*, then optionally recomputes stats.
+
+    Request body (all optional):
+        project         (str)  — restrict to a single project name
+        lookback_days   (int)  — how many days back to search (default 7, max 7)
+        run_stats_after (bool) — run weekly stats rollup after backfill (default true)
+
+    Returns 202 immediately; work runs in background.  Check server logs for progress.
+    Returns 409 if a backfill is already running.
+    """
+    import threading
+
+    if not _test_cycle_backfill_lock.acquire(blocking=False):
+        return jsonify({
+            'success': False,
+            'message': 'A test-cycle backfill is already running',
+        }), 409
+
+    body = request.get_json(silent=True) or {}
+    project_filter  = body.get('project') or None
+    lookback_days   = min(int(body.get('lookback_days', 7)), 7)
+    run_stats_after = bool(body.get('run_stats_after', True))
+
+    def _run():
+        try:
+            from monitoring.test_cycle_recorder import get_test_cycle_recorder
+            result = get_test_cycle_recorder().backfill_from_decision_events(
+                project_filter=project_filter,
+                run_stats_after=run_stats_after,
+                lookback_days=lookback_days,
+            )
+            logger.info(
+                f"Test-cycle backfill complete: "
+                f"discovered={result['discovered']} "
+                f"already_recorded={result['already_recorded']} "
+                f"newly_recorded={result['newly_recorded']} "
+                f"failed={result['failed']}"
+            )
+        except Exception as exc:
+            logger.error(f"Test-cycle backfill job failed: {exc}", exc_info=True)
+        finally:
+            _test_cycle_backfill_lock.release()
+
+    threading.Thread(
+        target=_run,
+        daemon=True,
+        name='test-cycle-backfill',
+    ).start()
+
+    return jsonify({
+        'success': True,
+        'message': 'Test-cycle backfill triggered',
+        'params': {
+            'project':         project_filter,
+            'lookback_days':   lookback_days,
+            'run_stats_after': run_stats_after,
+        },
+    }), 202
 
 
 def _merge_canonical_breakdown(target: dict, source: dict) -> None:
