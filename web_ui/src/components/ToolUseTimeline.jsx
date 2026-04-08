@@ -109,7 +109,7 @@ export default function ToolUseTimeline({ toolEvents = [] }) {
       <svg
         viewBox={`0 0 ${VW} ${chartHeight}`}
         className="w-full"
-        style={{ height: `${chartHeight}px`, display: 'block' }}
+        style={{ display: 'block', aspectRatio: `${VW} / ${chartHeight}` }}
         onMouseLeave={() => setTooltip(null)}
       >
         {/* Y-axis row guides + labels */}
