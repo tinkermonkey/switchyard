@@ -23,6 +23,30 @@ function fmtCost(usd) {
   return `$${usd.toFixed(2)}`
 }
 
+// Claude model pricing (USD per million tokens).
+// Used to estimate cost from live token counts before the metrics job runs.
+const MODEL_PRICING = {
+  'claude-opus-4-6':            { input: 5,    output: 25,  cacheRead: 0.50,  cacheWrite: 6.25  },
+  'claude-opus-4-5':            { input: 5,    output: 25,  cacheRead: 0.50,  cacheWrite: 6.25  },
+  'claude-sonnet-4-6':          { input: 3,    output: 15,  cacheRead: 0.30,  cacheWrite: 3.75  },
+  'claude-sonnet-4-5':          { input: 3,    output: 15,  cacheRead: 0.30,  cacheWrite: 3.75  },
+  'claude-haiku-4-5-20251001':  { input: 1,    output: 5,   cacheRead: 0.10,  cacheWrite: 1.25  },
+  'claude-haiku-4-5':           { input: 1,    output: 5,   cacheRead: 0.10,  cacheWrite: 1.25  },
+}
+const DEFAULT_PRICING = MODEL_PRICING['claude-sonnet-4-6']
+
+function estimateCostFromUsage(usage, model) {
+  if (!usage) return 0
+  const p = MODEL_PRICING[model] || DEFAULT_PRICING
+  const M = 1_000_000
+  return (
+    (usage.input_tokens                || 0) * p.input       / M +
+    (usage.output_tokens               || 0) * p.output      / M +
+    (usage.cache_read_input_tokens     || 0) * p.cacheRead   / M +
+    (usage.cache_creation_input_tokens || 0) * p.cacheWrite  / M
+  )
+}
+
 // Same palette as ToolUseTimeline — keeps badge colors in sync across both components
 const TOOL_COLORS = {
   Read: '#4493f8', Edit: '#3fb950', Write: '#56d364', Bash: '#f0883e',
@@ -102,20 +126,28 @@ export default function DashboardRunGraph({ run }) {
     setLatestCommentUrl(null)
   }, [run?.id])
 
-  // Fetch token summary on mount and poll every 30s (mirrors useDashboardRunData poll cadence)
+  // Stable fetch function so the agent-completion listener can trigger an immediate refresh.
+  // Accepts an optional AbortSignal so the polling effect can cancel in-flight requests
+  // when the run changes, preventing a stale response from overwriting the reset state.
+  const fetchTokenSummary = useCallback((signal) => {
+    if (!run?.id) return
+    fetch(`/api/pipeline-run/${run.id}/token-usage`, signal ? { signal } : undefined)
+      .then(r => r.json())
+      .then(data => { if (data.success) setTokenSummary(data.summary || null) })
+      .catch(() => {})
+  }, [run?.id])
+
+  // Fetch token summary on mount and poll.
+  // Active runs poll every 5s so the display catches up quickly after each stage completes.
+  // Completed/other runs poll every 30s (data rarely changes).
   useEffect(() => {
     if (!run?.id) return
-    let cancelled = false
-    const fetchTokens = () => {
-      fetch(`/api/pipeline-run/${run.id}/token-usage`)
-        .then(r => r.json())
-        .then(data => { if (!cancelled && data.success) setTokenSummary(data.summary || null) })
-        .catch(() => {})
-    }
-    fetchTokens()
-    const id = setInterval(fetchTokens, 30000)
-    return () => { cancelled = true; clearInterval(id) }
-  }, [run?.id])
+    const controller = new AbortController()
+    fetchTokenSummary(controller.signal)
+    const interval = run.status === 'active' ? 5000 : 30000
+    const id = setInterval(() => fetchTokenSummary(controller.signal), interval)
+    return () => { controller.abort(); clearInterval(id) }
+  }, [run?.id, run?.status, fetchTokenSummary])
 
   // Fetch the URL of the most recent GitHub comment so we can deep-link to it
   // when the run is in feedback_listening state (conversational loops post a
@@ -149,11 +181,14 @@ export default function DashboardRunGraph({ run }) {
       // Accumulate token usage from every assistant event, regardless of tool calls.
       const usage = data.event?.message?.usage
       if (usage) {
+        const model = data.event?.message?.model
+        const costEstimate = estimateCostFromUsage(usage, model)
         setLiveTokens(prev => ({
           total_direct_input:   (prev?.total_direct_input   || 0) + (usage.input_tokens                  || 0),
           total_output_tokens:  (prev?.total_output_tokens  || 0) + (usage.output_tokens                 || 0),
           total_cache_read:     (prev?.total_cache_read     || 0) + (usage.cache_read_input_tokens        || 0),
           total_cache_creation: (prev?.total_cache_creation || 0) + (usage.cache_creation_input_tokens   || 0),
+          total_cost_usd:       (prev?.total_cost_usd       || 0) + costEstimate,
         }))
       }
 
@@ -172,6 +207,20 @@ export default function DashboardRunGraph({ run }) {
     socket.on('claude_stream_event', handleEvent)
     return () => socket.off('claude_stream_event', handleEvent)
   }, [socket, run?.id])
+
+  // Refresh token summary immediately when an agent finishes so cost updates without
+  // waiting for the next 5s poll cycle.
+  useEffect(() => {
+    if (!socket || !run?.id) return
+    const handleAgentEvent = (data) => {
+      if (data.pipeline_run_id !== run.id) return
+      if (data.event_type === 'agent_completed' || data.event_type === 'agent_failed') {
+        fetchTokenSummary()
+      }
+    }
+    socket.on('agent_event', handleAgentEvent)
+    return () => socket.off('agent_event', handleAgentEvent)
+  }, [socket, run?.id, fetchTokenSummary])
 
   // Parse historical tool events from the already-fetched mergedEvents
   const historicalToolEvents = useMemo(() => {
@@ -204,20 +253,29 @@ export default function DashboardRunGraph({ run }) {
   // Fallback token totals derived from mergedEvents when the otel summary isn't available yet.
   // Output tokens are accurate (always additive); input/cache totals overcount within a single
   // context window (each turn includes prior context) but are a reasonable approximation.
+  // Cost is estimated from per-turn model pricing, not from the OTEL cost_usd attribute.
   const derivedTokens = useMemo(() => {
-    let totalInput = 0, totalOutput = 0, totalCacheRead = 0, totalCacheWrite = 0
+    let totalInput = 0, totalOutput = 0, totalCacheRead = 0, totalCacheWrite = 0, totalCost = 0
     let hasData = false
     for (const evt of mergedEvents) {
-      const usage = evt.raw_event?.event?.message?.usage
+      const msg = evt.raw_event?.event?.message
+      const usage = msg?.usage
       if (!usage) continue
       totalInput     += usage.input_tokens || 0
       totalOutput    += usage.output_tokens || 0
       totalCacheRead += usage.cache_read_input_tokens || 0
       totalCacheWrite += usage.cache_creation_input_tokens || 0
+      totalCost      += estimateCostFromUsage(usage, msg?.model)
       hasData = true
     }
     if (!hasData) return null
-    return { total_direct_input: totalInput, total_output_tokens: totalOutput, total_cache_read: totalCacheRead, total_cache_creation: totalCacheWrite }
+    return {
+      total_direct_input:   totalInput,
+      total_output_tokens:  totalOutput,
+      total_cache_read:     totalCacheRead,
+      total_cache_creation: totalCacheWrite,
+      total_cost_usd:       totalCost,
+    }
   }, [mergedEvents])
 
   // Most recent tool event — drives the overlay badge.
@@ -286,13 +344,16 @@ export default function DashboardRunGraph({ run }) {
         </div>
         {(tokenSummary ?? derivedTokens ?? liveTokens) && (() => {
           const tok = tokenSummary ?? derivedTokens ?? liveTokens
+          const isCostEstimate = !tokenSummary && tok.total_cost_usd > 0
           const cost = fmtCost(tok.total_cost_usd)
           return (
             <div className="flex-shrink-0 border-l border-gh-border px-3 py-2 flex flex-col justify-center gap-1 min-w-[90px]">
               {cost && (
                 <>
-                  <div className="text-xs text-gh-fg-muted font-semibold uppercase tracking-wide leading-none">Cost</div>
-                  <div className="text-xs font-mono font-semibold text-gh-fg mb-1">{cost}</div>
+                  <div className="text-xs text-gh-fg-muted font-semibold uppercase tracking-wide leading-none">
+                    Cost{isCostEstimate && <span className="font-normal normal-case tracking-normal"> (est)</span>}
+                  </div>
+                  <div className="text-xs font-mono font-semibold text-gh-fg mb-1">{isCostEstimate ? '~' : ''}{cost}</div>
                 </>
               )}
               <div className="text-xs text-gh-fg-muted font-semibold uppercase tracking-wide leading-none mb-1">Tokens</div>
