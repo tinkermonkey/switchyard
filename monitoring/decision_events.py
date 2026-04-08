@@ -1479,6 +1479,7 @@ class DecisionEventEmitter:
         project: str = "unknown",
         repo: str = "unknown",
         comment_id: Optional[str] = None,
+        comment_url: Optional[str] = None,
         pipeline_run_id: Optional[str] = None
     ):
         """
@@ -1492,6 +1493,7 @@ class DecisionEventEmitter:
             project: Project name
             repo: Repository name (e.g. "org/repo")
             comment_id: GitHub comment ID if available
+            comment_url: Direct URL to the comment (e.g. for deep-linking from the web UI)
             pipeline_run_id: Pipeline run ID for traceability
         """
         task_id = f"github_post_{project}_{object_type}_{object_number}"
@@ -1512,6 +1514,7 @@ class DecisionEventEmitter:
                 'body': truncated_body,
                 'body_length': len(body),
                 'comment_id': comment_id,
+                'comment_url': comment_url,
             },
             pipeline_run_id=pipeline_run_id
         )

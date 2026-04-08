@@ -142,6 +142,15 @@ class ScheduledTasksService:
             replace_existing=True
         )
 
+        # Schedule test-cycle stats rollup - weekly on Sunday at 4 AM
+        self.scheduler.add_job(
+            self._run_test_cycle_stats,
+            trigger=CronTrigger(day_of_week='sun', hour=4, minute=0),
+            id='test_cycle_stats_weekly',
+            name='Compute per-project test-cycle duration rollup stats',
+            replace_existing=True
+        )
+
         self.scheduler.start()
         self.running = True
         logger.info("Scheduled tasks service started")
@@ -157,6 +166,7 @@ class ScheduledTasksService:
         logger.info(f"- Project metrics backfill: Once at startup in ~{jitter_seconds:.0f}s")
         logger.info("- Zombie pipeline run cleanup: Every 30 minutes")
         logger.info("- Docker disk cleanup: Weekly on Sunday at 3 AM")
+        logger.info("- Test-cycle stats rollup: Weekly on Sunday at 4 AM")
 
     def stop(self):
         """Stop the scheduler"""
@@ -549,6 +559,27 @@ class ScheduledTasksService:
             logger.info("Docker disk cleanup complete")
         except Exception as e:
             logger.error(f"Error in Docker disk cleanup: {e}", exc_info=True)
+
+    def _run_test_cycle_stats(self):
+        """Run weekly test-cycle duration stats rollup."""
+        logger.info("Starting test-cycle stats rollup job")
+        try:
+            import os
+            import sys
+            sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+            from elasticsearch import Elasticsearch
+            from scripts.calculate_test_cycle_stats import calculate_stats
+            es_url = os.environ.get("ELASTICSEARCH_URL", "http://elasticsearch:9200")
+            es = Elasticsearch([es_url])
+            count = calculate_stats(es=es)
+            logger.info(f"Test-cycle stats rollup complete: {count} groups updated")
+        except Exception as e:
+            logger.error(f"Fatal error in test-cycle stats rollup: {e}", exc_info=True)
+
+    def run_test_cycle_stats_now(self):
+        """Run test-cycle stats rollup immediately (for testing/manual trigger)."""
+        logger.info("Manually triggering test-cycle stats rollup")
+        self._run_test_cycle_stats()
 
     def run_cleanup_now(self):
         """Run cleanup task immediately (for testing/manual trigger)"""

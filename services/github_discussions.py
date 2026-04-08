@@ -221,7 +221,9 @@ class GitHubDiscussions:
         })
 
         if result and 'addDiscussionComment' in result:
-            comment_id = result['addDiscussionComment']['comment']['id']
+            comment_data = result['addDiscussionComment']['comment']
+            comment_id = comment_data['id']
+            comment_url = comment_data.get('url')
             logger.info(f"Added comment to discussion {discussion_id} (reply_to: {reply_to_id})")
 
             try:
@@ -234,6 +236,7 @@ class GitHubDiscussions:
                     body=body,
                     repo=repo,
                     comment_id=comment_id,
+                    comment_url=comment_url,
                     pipeline_run_id=pipeline_run_id,
                 )
             except Exception:

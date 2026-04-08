@@ -366,6 +366,14 @@ class RepairCycleStage(PipelineStage):
                     output="Cycle completed successfully" if overall_success else "Cycle completed with failures",
                 )
 
+            # Record per-iteration data for analytics (non-fatal if it fails)
+            if pipeline_run_id and project:
+                try:
+                    from monitoring.test_cycle_recorder import get_test_cycle_recorder
+                    get_test_cycle_recorder().record_repair_cycle(pipeline_run_id, project)
+                except Exception as _rec_exc:
+                    logger.warning(f"Test-cycle recording failed (non-fatal): {_rec_exc}")
+
             return {
                 "stage": self.name,
                 "test_results": [r.to_dict() for r in results],
@@ -397,6 +405,16 @@ class RepairCycleStage(PipelineStage):
                 obs.emit_agent_completed(
                     "repair_cycle", task_id, project, duration_ms, False, error=str(e), pipeline_run_id=pipeline_run_id, output="Cycle failed due to exception"
                 )
+
+            # Best-effort: record any iterations that completed before the crash.
+            # Events are in decision-events with 7-day retention; without this call
+            # they would be permanently lost when ILM deletes them.
+            if pipeline_run_id and project:
+                try:
+                    from monitoring.test_cycle_recorder import get_test_cycle_recorder
+                    get_test_cycle_recorder().record_repair_cycle(pipeline_run_id, project)
+                except Exception as _rec_exc:
+                    logger.warning(f"Test-cycle recording failed in exception path (non-fatal): {_rec_exc}")
 
             raise
 

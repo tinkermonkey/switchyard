@@ -89,6 +89,9 @@ export default function DashboardRunGraph({ run }) {
   // Running token totals accumulated live from socket events.
   // Used as last-resort fallback when neither the otel summary nor historical mergedEvents have data yet.
   const [liveTokens, setLiveTokens] = useState(null)
+  // URL of the most recent GitHub comment posted for this run — used to deep-link to the
+  // actual comment in feedback_listening state instead of just the issue/discussion root.
+  const [latestCommentUrl, setLatestCommentUrl] = useState(null)
 
   // Reset live state when the run changes
   useEffect(() => {
@@ -96,6 +99,7 @@ export default function DashboardRunGraph({ run }) {
     setCurrentLiveAgent(null)
     setTokenSummary(null)
     setLiveTokens(null)
+    setLatestCommentUrl(null)
   }, [run?.id])
 
   // Fetch token summary on mount and poll every 30s (mirrors useDashboardRunData poll cadence)
@@ -112,6 +116,24 @@ export default function DashboardRunGraph({ run }) {
     const id = setInterval(fetchTokens, 30000)
     return () => { cancelled = true; clearInterval(id) }
   }, [run?.id])
+
+  // Fetch the URL of the most recent GitHub comment so we can deep-link to it
+  // when the run is in feedback_listening state (conversational loops post a
+  // comment on a discussion or issue; linking to the issue root isn't helpful).
+  useEffect(() => {
+    if (!run?.id || run.status !== 'feedback_listening') return
+    let cancelled = false
+    const fetchComment = () => {
+      fetch(`/api/pipeline-run/${run.id}/latest-comment`)
+        .then(r => r.json())
+        .then(data => { if (!cancelled && data.success && data.comment_url) setLatestCommentUrl(data.comment_url) })
+        .catch(() => {})
+    }
+    fetchComment()
+    // Poll in case there's a brief ES indexing lag after the comment was posted.
+    const id = setInterval(fetchComment, 10000)
+    return () => { cancelled = true; clearInterval(id) }
+  }, [run?.id, run?.status])
 
   // Subscribe directly to claude_stream_event for this run.
   // Bypasses useSocket().logs (a shared 200-item buffer across all runs,
@@ -344,14 +366,14 @@ export default function DashboardRunGraph({ run }) {
             <TodoList todos={latestTodos} compact />
           </div>
         )}
-        {run.status === 'feedback_listening' && run.issue_url && (
+        {run.status === 'feedback_listening' && (latestCommentUrl || run.issue_url) && (
           <a
-            href={run.issue_url}
+            href={latestCommentUrl ?? run.issue_url}
             target="_blank"
             rel="noopener noreferrer"
             className="absolute top-2 right-2 z-20 animate-pulse hover:opacity-100"
             style={{ color: '#f0883e' }}
-            title="Awaiting feedback — click to open issue"
+            title={latestCommentUrl ? "Awaiting feedback — click to view comment" : "Awaiting feedback — click to open issue"}
             onClick={e => e.stopPropagation()}
           >
             <MessageCircle size={24} />

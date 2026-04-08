@@ -18,6 +18,18 @@ const fmtDur = (ms) => {
   return `${Math.round(ms)}ms`
 }
 
+const fmtSec = (s) => {
+  if (s == null) return '—'
+  if (s >= 3600) return `${(s / 3600).toFixed(1)}h`
+  if (s >= 60) return `${(s / 60).toFixed(1)}m`
+  return `${s.toFixed(1)}s`
+}
+
+const fmtPct = (rate) => {
+  if (rate == null) return '—'
+  return `${(rate * 100).toFixed(0)}%`
+}
+
 function TokenRow({ label, avg, note }) {
   return (
     <div className="flex items-center justify-between py-1 border-b border-gh-border last:border-0">
@@ -38,7 +50,60 @@ function SectionHeader({ title }) {
   )
 }
 
-function ProjectCard({ project: p }) {
+function TestCycleStatsSection({ stats }) {
+  if (!stats || stats.length === 0) return null
+
+  // Sort by test_type for stable order
+  const sorted = [...stats].sort((a, b) => (a.test_type || '').localeCompare(b.test_type || ''))
+
+  return (
+    <div>
+      <SectionHeader title="Test Cycle Timing" />
+      <div className="overflow-x-auto">
+        <table className="w-full text-xs">
+          <thead>
+            <tr className="text-gh-fg-muted border-b border-gh-border">
+              <th className="text-left font-normal pb-1 pr-3">Type</th>
+              <th className="text-right font-normal pb-1 pr-2" title="Pipeline runs recorded">Runs</th>
+              <th className="text-right font-normal pb-1 pr-2" title="Pass rate (all executions)">Pass</th>
+              <th className="text-right font-normal pb-1 pr-2" title="Clean pass avg — iteration 1, test passed">Clean avg</th>
+              <th className="text-right font-normal pb-1 pr-2" title="Clean pass p90">p90</th>
+              <th className="text-right font-normal pb-1 pr-2" title="All executions avg (incl. retries)">All avg</th>
+              <th className="text-right font-normal pb-1 pr-2" title="All executions min / max">Min / Max</th>
+              <th className="text-right font-normal pb-1 pr-2" title="Avg number of test failures when tests fail">Avg fails</th>
+              <th className="text-right font-normal pb-1" title="Avg fix cycle duration when a fix cycle ran">Fix avg</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-gh-border">
+            {sorted.map((s) => {
+              const passRate = s.all_exec_pass_rate
+              const passColor = passRate == null ? '' : passRate >= 0.8 ? 'text-gh-success' : passRate >= 0.5 ? 'text-gh-attention' : 'text-gh-danger'
+              return (
+                <tr key={s.test_type}>
+                  <td className="font-mono py-1 pr-3 font-semibold">{s.test_type}</td>
+                  <td className="text-right py-1 pr-2">{s.total_pipeline_runs ?? '—'}</td>
+                  <td className={`text-right py-1 pr-2 font-mono font-semibold ${passColor}`}>{fmtPct(passRate)}</td>
+                  <td className="text-right py-1 pr-2 font-mono">{fmtSec(s.clean_pass_duration_avg_s)}</td>
+                  <td className="text-right py-1 pr-2 font-mono text-gh-fg-muted">{fmtSec(s.clean_pass_duration_p90_s)}</td>
+                  <td className="text-right py-1 pr-2 font-mono">{fmtSec(s.all_exec_duration_avg_s)}</td>
+                  <td className="text-right py-1 pr-2 font-mono text-gh-fg-muted">
+                    {fmtSec(s.all_exec_duration_min_s)} / {fmtSec(s.all_exec_duration_max_s)}
+                  </td>
+                  <td className="text-right py-1 pr-2 font-mono">
+                    {s.avg_failure_count_when_failing != null ? s.avg_failure_count_when_failing.toFixed(1) : '—'}
+                  </td>
+                  <td className="text-right py-1 font-mono text-gh-fg-muted">{fmtSec(s.avg_fix_cycle_duration_s)}</td>
+                </tr>
+              )
+            })}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  )
+}
+
+function ProjectCard({ project: p, cycleStats }) {
   const outcomes = p.pipeline_outcomes || {}
   const tokens = p.tokens || {}
   const context = p.context || {}
@@ -301,6 +366,13 @@ function ProjectCard({ project: p }) {
           </div>
         </div>
 
+        {/* Test cycle timing stats */}
+        {cycleStats && cycleStats.length > 0 && (
+          <div className="bg-gh-canvas-subtle border border-gh-border rounded p-3">
+            <TestCycleStatsSection stats={cycleStats} />
+          </div>
+        )}
+
         {/* Pipeline outcomes */}
         <div>
           <SectionHeader title="Pipeline Outcomes" />
@@ -331,6 +403,7 @@ function ProjectCard({ project: p }) {
 export default function ProjectMetrics({ days, onDaysChange }) {
   const [projects, setProjects] = useState([])
   const [hourlySeries, setHourlySeries] = useState({})
+  const [cycleStatsByProject, setCycleStatsByProject] = useState({})
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
 
@@ -338,13 +411,22 @@ export default function ProjectMetrics({ days, onDaysChange }) {
     setLoading(true)
     setError(null)
     try {
-      const res = await fetch(`/api/metrics/projects?days=${days}`)
-      const data = await res.json()
-      if (data.success) {
-        setProjects(data.projects || [])
-        setHourlySeries(data.hourly_series || {})
+      const [projectsRes, cycleStatsRes] = await Promise.all([
+        fetch(`/api/metrics/projects?days=${days}`),
+        fetch('/api/metrics/test-cycle-stats'),
+      ])
+      const [projectsData, cycleStatsData] = await Promise.all([
+        projectsRes.json(),
+        cycleStatsRes.json(),
+      ])
+      if (projectsData.success) {
+        setProjects(projectsData.projects || [])
+        setHourlySeries(projectsData.hourly_series || {})
       } else {
-        setError(data.error || 'Failed to load project metrics')
+        setError(projectsData.error || 'Failed to load project metrics')
+      }
+      if (cycleStatsData.success) {
+        setCycleStatsByProject(cycleStatsData.by_project || {})
       }
     } catch {
       setError('Failed to load project metrics')
@@ -421,7 +503,7 @@ export default function ProjectMetrics({ days, onDaysChange }) {
       {!loading && projects.length > 0 && (
         <div className="grid grid-cols-1 gap-4">
           {projects.map(p => (
-            <ProjectCard key={p.project} project={p} />
+            <ProjectCard key={p.project} project={p} cycleStats={cycleStatsByProject[p.project]} />
           ))}
         </div>
       )}

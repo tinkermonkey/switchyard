@@ -178,6 +178,7 @@ class GitHubIntegration:
                     project=repo_name,
                     repo=f"{self.github_org}/{repo_name}",
                     comment_id=str(first_result.get('id', '')),
+                    comment_url=first_result.get('html_url'),
                     pipeline_run_id=pipeline_run_id,
                 )
             except Exception:
@@ -241,6 +242,7 @@ class GitHubIntegration:
                     project=repo_name,
                     repo=f"{self.github_org}/{repo_name}",
                     comment_id=str(first_result.get('id', '')),
+                    comment_url=first_result.get('html_url'),
                     pipeline_run_id=pipeline_run_id,
                 )
             except Exception:
@@ -289,13 +291,14 @@ class GitHubIntegration:
             try:
                 from monitoring.decision_events import get_decision_event_emitter
                 get_decision_event_emitter().emit_github_comment_posted(
-                    object_type="pull_request",
+                    object_type="pull_request_review",
                     object_number=pr_number,
                     title=f"PR Review ({review_type}): {_extract_comment_title(body)}",
                     body=body,
                     project=repo_name,
                     repo=f"{self.github_org}/{repo_name}",
                     comment_id=str(response.get('id', '')),
+                    comment_url=response.get('html_url'),
                     pipeline_run_id=pipeline_run_id,
                 )
             except Exception:

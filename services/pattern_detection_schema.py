@@ -698,3 +698,110 @@ PROJECT_METRICS_ILM_POLICY = {
         }
     }
 }
+
+
+# ─── Test Cycle Analytics ────────────────────────────────────────────────────
+
+# Per-iteration records written after each repair cycle completes.
+# Monthly rotation (YYYY.MM), 180-day retention.
+TEST_CYCLE_RECORDS_MAPPING = {
+    "mappings": {
+        "properties": {
+            # Identity
+            "pipeline_run_id":           {"type": "keyword"},
+            "project":                   {"type": "keyword"},
+            "test_type":                 {"type": "keyword"},
+            "test_type_index":           {"type": "integer"},
+            "iteration_number":          {"type": "integer"},
+            "sub_run_index":             {"type": "integer"},
+            # Test execution result
+            "test_execution_passed":     {"type": "boolean"},
+            "test_failure_count":        {"type": "integer"},
+            "test_warning_count":        {"type": "integer"},
+            "test_execution_duration_s": {"type": "float"},
+            # Fix cycle result (null if no fix cycle on this sub-run)
+            "had_fix_cycle":             {"type": "boolean"},
+            "fix_cycle_files_fixed":     {"type": "integer"},
+            "fix_cycle_duration_s":      {"type": "float"},
+            # Metadata
+            "@timestamp":                {"type": "date"},
+            "recorded_at":               {"type": "date"},
+        }
+    },
+    "settings": {
+        "index": {
+            "number_of_shards": 1,
+            "number_of_replicas": 0,
+            "refresh_interval": "30s",
+            "lifecycle": {"name": "test-cycle-records-ilm-policy"},
+        }
+    },
+}
+
+TEST_CYCLE_RECORDS_TEMPLATE = {
+    "index_patterns": ["orchestrator-test-cycle-records-*"],
+    "priority": 100,
+    "template": TEST_CYCLE_RECORDS_MAPPING,
+}
+
+# ILM policy: 180-day retention (long enough for meaningful weekly stats)
+TEST_CYCLE_RECORDS_ILM_POLICY = {
+    "policy": {
+        "phases": {
+            "hot": {
+                "min_age": "0ms",
+                "actions": {"set_priority": {"priority": 100}},
+            },
+            "warm": {
+                "min_age": "90d",
+                "actions": {"set_priority": {"priority": 50}},
+            },
+            "delete": {
+                "min_age": "180d",
+                "actions": {"delete": {}},
+            },
+        }
+    }
+}
+
+# Rolled-up per-project/test-type stats; single index, updated weekly.
+TEST_CYCLE_STATS_MAPPING = {
+    "mappings": {
+        "properties": {
+            "project":                          {"type": "keyword"},
+            "test_type":                        {"type": "keyword"},
+            "calculated_at":                    {"type": "date"},
+            # Coverage
+            "total_iterations":                 {"type": "integer"},
+            "total_pipeline_runs":              {"type": "integer"},
+            "data_from":                        {"type": "date"},
+            "data_to":                          {"type": "date"},
+            # All test executions
+            "all_exec_sample_count":            {"type": "integer"},
+            "all_exec_duration_min_s":          {"type": "float"},
+            "all_exec_duration_max_s":          {"type": "float"},
+            "all_exec_duration_avg_s":          {"type": "float"},
+            "all_exec_duration_median_s":       {"type": "float"},
+            "all_exec_duration_p90_s":          {"type": "float"},
+            "all_exec_pass_rate":               {"type": "float"},
+            # Clean baseline: iteration_number=1, sub_run_index=1, test_execution_passed=True
+            "clean_pass_sample_count":          {"type": "integer"},
+            "clean_pass_duration_min_s":        {"type": "float"},
+            "clean_pass_duration_max_s":        {"type": "float"},
+            "clean_pass_duration_avg_s":        {"type": "float"},
+            "clean_pass_duration_median_s":     {"type": "float"},
+            "clean_pass_duration_p90_s":        {"type": "float"},
+            # Failure / fix profile
+            "avg_failure_count_when_failing":   {"type": "float"},
+            "avg_fix_cycle_duration_s":         {"type": "float"},
+            "avg_iterations_per_repair_cycle":  {"type": "float"},
+        }
+    },
+    "settings": {
+        "index": {
+            "number_of_shards": 1,
+            "number_of_replicas": 0,
+            "refresh_interval": "60s",
+        }
+    },
+}
