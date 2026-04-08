@@ -35,6 +35,7 @@ All context for this review cycle is at `/pipeline_context/`:
 
 1. **Read `{feedback_file}` thoroughly** — identify every distinct issue raised
 2. **Use your tools to implement each fix** — run bash commands, edit files, execute git operations
+   - When committing: use `git add` + `git commit -m "..."` — **never** `git commit --amend` or `git reset HEAD~1`. Each revision must produce a new commit on top of the branch; amending rewrites history and the push will be rejected.
 3. **Verify each fix** — confirm the change is in place (run tests, check git log, etc.)
 4. **Writing about a change is not the same as making it** — if the reviewer asked you to restructure a branch, run the git commands; if they asked for a code fix, edit the file
 
@@ -55,3 +56,4 @@ The revision notes are a summary of work already done, not a plan for future wor
 - ❌ Write "I reset the branch" without running the git command
 - ❌ Assume the reviewer will be satisfied with an explanation instead of the actual change
 - ❌ Make changes to areas that weren't mentioned in feedback
+- ❌ Use `git commit --amend` or `git reset HEAD~1` — always create a new commit

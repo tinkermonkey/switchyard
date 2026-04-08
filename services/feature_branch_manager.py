@@ -775,9 +775,7 @@ class FeatureBranchManager:
             if check_tracking.returncode != 0:
                 # No tracking configured - push to set it up
                 logger.warning(f"Existing branch {branch_name} has no tracking, pushing to remote")
-                push_success = await git_workflow_manager.push_branch(project_dir, branch_name)
-                if not push_success:
-                    raise Exception(f"Failed to push existing branch {branch_name} to set up tracking")
+                await git_workflow_manager.push_branch(project_dir, branch_name)
                 logger.info(f"Pushed existing branch {branch_name} and configured tracking")
         else:
             await git_workflow_manager.checkout_branch(project_dir, branch_name)
@@ -785,9 +783,7 @@ class FeatureBranchManager:
 
             # Push branch to remote with -u to set up tracking
             # This is critical - without it, git pull will fail with "no tracking information"
-            push_success = await git_workflow_manager.push_branch(project_dir, branch_name)
-            if not push_success:
-                raise Exception(f"Failed to push branch {branch_name} to remote")
+            await git_workflow_manager.push_branch(project_dir, branch_name)
             logger.info(f"Pushed branch {branch_name} to remote with upstream tracking")
 
     async def git_checkout(self, project_dir: str, branch_name: str):
@@ -1000,10 +996,10 @@ class FeatureBranchManager:
         from services.git_workflow_manager import git_workflow_manager
         return await git_workflow_manager.commit(project_dir, message)
 
-    async def git_push(self, project_dir: str, branch_name: str):
-        """Push branch to remote"""
+    async def git_push(self, project_dir: str, branch_name: str) -> None:
+        """Push branch to remote. Raises PushFailedError on failure."""
         from services.git_workflow_manager import git_workflow_manager
-        return await git_workflow_manager.push_branch(project_dir, branch_name)
+        await git_workflow_manager.push_branch(project_dir, branch_name)
 
     async def escalate_merge_conflict(
         self,
@@ -1621,6 +1617,9 @@ Waiting for human decision...
                     "standalone": True
                 }
             except Exception as e:
+                from services.git_workflow_manager import PushFailedError
+                if isinstance(e, PushFailedError):
+                    raise  # Let PushFailedError propagate — agent_executor handles it
                 logger.error(f"Failed to finalize standalone branch for issue #{issue_number}: {e}")
                 return {"success": False, "error": str(e)}
 
@@ -1666,13 +1665,8 @@ Waiting for human decision...
             logger.error(error_msg)
             return {"success": False, "error": error_msg}
 
-        # Step 4: Push to remote
-        push_success = await self.git_push(project_dir, feature_branch.branch_name)
-        
-        if not push_success:
-            error_msg = f"Failed to push branch {feature_branch.branch_name}"
-            logger.error(error_msg)
-            return {"success": False, "error": error_msg}
+        # Step 4: Push to remote — raises PushFailedError on failure
+        await self.git_push(project_dir, feature_branch.branch_name)
 
         logger.info(f"Pushed changes for issue #{issue_number} to {feature_branch.branch_name}")
 

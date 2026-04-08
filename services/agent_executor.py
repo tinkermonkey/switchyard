@@ -622,6 +622,56 @@ class AgentExecutor:
                             )
 
                 except Exception as e:
+                    from services.git_workflow_manager import PushFailedError
+                    if isinstance(e, PushFailedError):
+                        # Push was rejected — agent did real work but it cannot reach origin.
+                        # Block the pipeline: retain the lock and fail visibly so a human
+                        # can inspect, force-push or reset, and re-queue the issue.
+                        issue_number = task_context.get('issue_number')
+                        logger.error(
+                            f"❌ PUSH FAILURE for {project_name} issue #{issue_number}: {e}"
+                        )
+
+                        if issue_number:
+                            try:
+                                from services.github_integration import GitHubIntegration
+                                project_config = config_manager.get_project_config(project_name)
+                                github = GitHubIntegration(
+                                    repo_owner=project_config.github['org'],
+                                    repo_name=project_config.github['repo']
+                                )
+                                await github.post_comment(
+                                    issue_number,
+                                    f"## ❌ Push Failed — Pipeline Blocked\n\n"
+                                    f"The agent completed its work and committed changes locally, "
+                                    f"but the push to `origin` was rejected.\n\n"
+                                    f"**Reason:** {e}\n\n"
+                                    f"**To recover:**\n"
+                                    f"1. Inspect the local commits: `git log origin/{task_context.get('branch_name', '<branch>')}..HEAD`\n"
+                                    f"2. Force-push if the changes are correct: `git push --force-with-lease`\n"
+                                    f"3. Or reset and let the pipeline retry: `git reset --hard origin/<branch>`\n"
+                                    f"4. Move the card back to Development to re-trigger the pipeline.\n\n"
+                                    f"_Pipeline lock retained — no further automated work will run on this issue._",
+                                    pipeline_run_id=pipeline_run_id
+                                )
+                            except Exception as comment_err:
+                                logger.error(f"Failed to post push-failure comment: {comment_err}")
+
+                            try:
+                                from services.pipeline_run import get_pipeline_run_manager
+                                get_pipeline_run_manager().end_pipeline_run(
+                                    project=project_name,
+                                    issue_number=issue_number,
+                                    reason=str(e),
+                                    retain_lock=True,
+                                    outcome="failed"
+                                )
+                            except Exception as end_err:
+                                logger.error(f"Failed to end pipeline run after push failure: {end_err}")
+
+                        from agents.non_retryable import NonRetryableAgentError
+                        raise NonRetryableAgentError(str(e)) from e
+
                     logger.error(
                         f"❌ FINALIZATION DEBUG: Exception during workspace finalization: {e}\n"
                         f"  Exception type: {type(e).__name__}",
@@ -639,6 +689,9 @@ class AgentExecutor:
                                 task_id=task_id
                             )
                         except Exception as failsafe_error:
+                            from services.git_workflow_manager import PushFailedError
+                            if isinstance(failsafe_error, PushFailedError):
+                                raise  # Re-raise into outer PushFailedError handler
                             logger.error(
                                 f"❌ Failsafe commit check also failed: {failsafe_error}",
                                 exc_info=True
@@ -1250,6 +1303,9 @@ class AgentExecutor:
                 # Don't commit untracked files automatically - might be build artifacts
 
         except Exception as e:
+            from services.git_workflow_manager import PushFailedError
+            if isinstance(e, PushFailedError):
+                raise  # Propagate — finalization exception handler will block the pipeline
             logger.error(f"❌ FAILSAFE: Exception during commit check: {e}", exc_info=True)
 
     async def _failsafe_commit_staged(
@@ -1294,6 +1350,9 @@ class AgentExecutor:
                 logger.error(f"❌ FAILSAFE: Commit failed: {commit_result.stderr}")
 
         except Exception as e:
+            from services.git_workflow_manager import PushFailedError
+            if isinstance(e, PushFailedError):
+                raise  # Propagate — finalization exception handler will block the pipeline
             logger.error(f"❌ FAILSAFE: Exception during commit: {e}", exc_info=True)
 
     async def _failsafe_stage_and_commit(
@@ -1354,6 +1413,9 @@ class AgentExecutor:
                 logger.error(f"❌ FAILSAFE: Commit failed: {commit_result.stderr}")
 
         except Exception as e:
+            from services.git_workflow_manager import PushFailedError
+            if isinstance(e, PushFailedError):
+                raise  # Propagate — finalization exception handler will block the pipeline
             logger.error(f"❌ FAILSAFE: Exception during stage and commit: {e}", exc_info=True)
 
     async def _failsafe_push(
@@ -1362,7 +1424,7 @@ class AgentExecutor:
         project_name: str,
         issue_number: int
     ):
-        """Try to push committed changes"""
+        """Try to push committed changes. Raises PushFailedError on failure."""
         import subprocess
 
         try:
@@ -1384,21 +1446,15 @@ class AgentExecutor:
             branch_name = branch_result.stdout.strip()
             logger.info(f"🔍 FAILSAFE: Pushing to branch: {branch_name}")
 
-            # Push
-            push_result = subprocess.run(
-                ['git', 'push', 'origin', branch_name],
-                cwd=project_dir,
-                capture_output=True,
-                text=True,
-                timeout=60
-            )
-
-            if push_result.returncode == 0:
-                logger.info(f"✅ FAILSAFE: Successfully pushed to origin/{branch_name}")
-            else:
-                logger.warning(f"⚠️ FAILSAFE: Push failed (non-critical): {push_result.stderr}")
+            # Delegates to push_branch which retries transient failures and raises
+            # PushFailedError for permanent failures (non-fast-forward etc.)
+            await git_workflow_manager.push_branch(project_dir, branch_name)
+            logger.info(f"✅ FAILSAFE: Successfully pushed to origin/{branch_name}")
 
         except Exception as e:
+            from services.git_workflow_manager import PushFailedError
+            if isinstance(e, PushFailedError):
+                raise  # Propagate — finalization exception handler will block the pipeline
             logger.warning(f"⚠️ FAILSAFE: Exception during push (non-critical): {e}")
 
     async def _queue_environment_verifier(

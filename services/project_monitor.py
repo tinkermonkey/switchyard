@@ -7022,6 +7022,12 @@ _Repair cycle initiated by Switchyard_
                                 project_config.github['repo']
                             )
 
+                        # Monitor escalated review cycles on issue-based workspaces.
+                        # Runs unconditionally: the escalated issue may no longer be on the
+                        # board (e.g. removed by force-sync), but its cycle state persists
+                        # in-memory and on disk and still needs a feedback listener.
+                        self.monitor_escalated_issue_cycles(project_name, pipeline.board_name)
+
                 # FAILSAFE: Check for waiting issues that haven't been processed
                 # This catches edge cases where pipeline lock is released but next issue isn't triggered
                 logger.debug("Running queue processing failsafe check...")
@@ -8060,6 +8066,146 @@ Moving to implementation phase.
                 break
 
         return thread_history
+
+    def monitor_escalated_issue_cycles(self, project_name: str, board_name: str):
+        """Check all in-memory review cycles that are awaiting human feedback on
+        issue-based workspaces and poll for new human comments.
+
+        Discussion-based cycles are handled by monitor_discussions() instead.
+        This method is called every poll cycle regardless of whether the issue
+        is currently on the board — the cycle state persists after board removal.
+        """
+        try:
+            from services.review_cycle import review_cycle_executor
+
+            for (proj, issue_number), cycle_state in list(review_cycle_executor.active_cycles.items()):
+                if proj != project_name:
+                    continue
+                if cycle_state.workspace_type == 'discussions':
+                    continue  # Handled by monitor_discussions()
+                if cycle_state.status != 'awaiting_human_feedback':
+                    continue
+                self.check_for_feedback_in_issue(
+                    project_name, board_name, issue_number, cycle_state.repository
+                )
+        except Exception as e:
+            logger.error(f"Error in monitor_escalated_issue_cycles for {project_name}: {e}", exc_info=True)
+
+    def check_for_feedback_in_issue(self, project_name: str, board_name: str,
+                                     issue_number: int, repository: str):
+        """Check if a human has commented on an escalated issue since escalation time.
+
+        If so, resume the review cycle in a background thread (same pattern as
+        check_for_feedback_in_discussion for discussion-based workspaces).
+
+        Stop conditions:
+        - User comments → resume sets cycle status to 'reviewer_working'; next poll skips
+        - Cycle approved/rejected → removed from active_cycles; next poll skips
+        - Pipeline killed / restart → cycle reloaded from YAML, polling resumes automatically
+        """
+        try:
+            from services.review_cycle import review_cycle_executor
+            from services.human_feedback_loop import is_bot_user
+            from dateutil import parser as date_parser
+            from datetime import datetime
+
+            ck = review_cycle_executor._cycle_key(project_name, issue_number)
+            if ck not in review_cycle_executor.active_cycles:
+                return
+            cycle_state = review_cycle_executor.active_cycles[ck]
+            if cycle_state.status != 'awaiting_human_feedback':
+                return
+
+            logger.debug(f"Checking for human feedback on escalated issue #{issue_number}")
+
+            escalation_time = datetime.fromisoformat(cycle_state.escalation_time)
+            if escalation_time.tzinfo:
+                escalation_time = escalation_time.replace(tzinfo=None)
+
+            # Query issue comments via GitHub CLI
+            project_config = self.config_manager.get_project_config(project_name)
+            org = project_config.github['org']
+
+            import subprocess as _sp
+            result = _sp.run(
+                ['gh', 'issue', 'view', str(issue_number),
+                 '--repo', f'{org}/{repository}', '--json', 'comments'],
+                capture_output=True, text=True, timeout=30
+            )
+            if result.returncode != 0:
+                logger.warning(
+                    f"Failed to fetch comments for escalated issue #{issue_number}: {result.stderr}"
+                )
+                return
+
+            comments = json.loads(result.stdout).get('comments', [])
+
+            human_feedback = None
+            for comment in reversed(comments):  # Most recent first
+                author = comment.get('author', {}).get('login', '')
+                if is_bot_user(author):
+                    continue
+                created_at_str = comment.get('createdAt', '')
+                if not created_at_str:
+                    continue
+                created_at = date_parser.parse(created_at_str)
+                if created_at.tzinfo:
+                    created_at = created_at.replace(tzinfo=None)
+                if created_at > escalation_time:
+                    human_feedback = comment['body']
+                    logger.info(
+                        f"Human feedback detected on escalated issue #{issue_number} "
+                        f"from '{author}', resuming review cycle..."
+                    )
+                    break
+
+            if not human_feedback:
+                return
+
+            # Set transitional status before spawning the thread so the next poll cycle
+            # skips this issue — prevents duplicate resume threads if polling runs again
+            # before the thread has a chance to update the status itself.
+            cycle_state.status = 'resuming'
+            try:
+                from services.review_cycle import review_cycle_executor as _rce
+                _rce._save_cycle_state(cycle_state)
+            except Exception as save_err:
+                logger.warning(f"Could not persist 'resuming' status for issue #{issue_number}: {save_err}")
+
+            # Resume cycle in background thread — same pattern as check_for_feedback_in_discussion
+            import asyncio
+            import threading
+
+            def resume_cycle_in_thread():
+                try:
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    loop.run_until_complete(
+                        review_cycle_executor.resume_review_cycle_with_feedback(
+                            cycle_state=cycle_state,
+                            human_feedback=human_feedback,
+                            org=org
+                        )
+                    )
+                    loop.close()
+                    logger.info(f"Review cycle #{issue_number} resumed from issue comment")
+                except Exception as exc:
+                    # Restore status so a subsequent poll can retry
+                    cycle_state.status = 'awaiting_human_feedback'
+                    logger.error(
+                        f"Error resuming review cycle #{issue_number} from issue comment: {exc}",
+                        exc_info=True
+                    )
+
+            thread = threading.Thread(target=resume_cycle_in_thread, daemon=True)
+            thread.start()
+            logger.info(f"Review cycle resume thread started for issue #{issue_number}")
+
+        except Exception as e:
+            logger.error(
+                f"Error checking feedback for escalated issue #{issue_number}: {e}",
+                exc_info=True
+            )
 
     def check_for_feedback_in_discussion(self, project_name: str, board_name: str,
                                          discussion_id: str, issue_number: int, repository: str):

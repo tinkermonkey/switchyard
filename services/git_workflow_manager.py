@@ -22,6 +22,14 @@ from services.github_api_client import get_github_client
 logger = logging.getLogger(__name__)
 
 
+class PushFailedError(Exception):
+    """Raised when a git push to origin fails and cannot be automatically recovered.
+
+    Callers should treat this as a non-retryable blocking failure: end the pipeline
+    run with retain_lock=True so the issue stays locked until a human intervenes.
+    """
+
+
 @dataclass
 class BranchInfo:
     """Information about a feature branch"""
@@ -993,9 +1001,19 @@ class GitWorkflowManager:
             logger.error(f"Failed to commit: {e}")
             return False
 
-    async def push_branch(self, project_dir: str, branch_name: str) -> bool:
-        """Push branch to remote"""
-        try:
+    async def push_branch(self, project_dir: str, branch_name: str) -> None:
+        """Push branch to remote.
+
+        Retries transient failures (network, auth expiry) up to 3 times.
+        Raises PushFailedError immediately for non-fast-forward rejections — these
+        are permanent until the branch is manually reset or force-pushed.
+        """
+        import asyncio
+
+        _NON_FF_MARKERS = ("non-fast-forward", "Updates were rejected", "[rejected]")
+        max_attempts = 3
+
+        for attempt in range(1, max_attempts + 1):
             result = subprocess.run(
                 ['git', 'push', '-u', 'origin', branch_name],
                 cwd=project_dir,
@@ -1006,14 +1024,30 @@ class GitWorkflowManager:
 
             if result.returncode == 0:
                 logger.info(f"Pushed branch {branch_name}")
-                return True
-            else:
-                logger.error(f"Failed to push branch: {result.stderr}")
-                return False
+                return
 
-        except Exception as e:
-            logger.error(f"Failed to push branch: {e}")
-            return False
+            stderr = result.stderr.strip()
+
+            if any(m in stderr for m in _NON_FF_MARKERS):
+                raise PushFailedError(
+                    f"Push rejected (non-fast-forward) for branch '{branch_name}'. "
+                    f"Local commits diverge from origin — the agent likely amended or "
+                    f"rewrote history. Cannot auto-recover; manual force-push or branch "
+                    f"reset required.\nstderr: {stderr}"
+                )
+
+            if attempt < max_attempts:
+                delay = attempt * 5
+                logger.warning(
+                    f"Push attempt {attempt}/{max_attempts} failed for '{branch_name}': "
+                    f"{stderr}. Retrying in {delay}s..."
+                )
+                await asyncio.sleep(delay)
+            else:
+                raise PushFailedError(
+                    f"Push failed after {max_attempts} attempts for branch '{branch_name}'.\n"
+                    f"stderr: {stderr}"
+                )
 
     async def get_commits_behind(self, project_dir: str, branch_name: str, base_branch: str) -> int:
         """Get number of commits a branch is behind base branch"""
