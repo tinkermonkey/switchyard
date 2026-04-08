@@ -1539,7 +1539,8 @@ class DockerAgentRunner:
                             exit_code=exit_code,
                             output=result_text,
                             column=column,
-                            reply_to_comment_id=reply_to_comment_id
+                            reply_to_comment_id=reply_to_comment_id,
+                            pipeline_run_id=task_context.get('pipeline_run_id'),
                         )
                         output_posted = True
                     except Exception as completion_error:
@@ -1970,7 +1971,8 @@ class DockerAgentRunner:
         issue_number: int,
         agent: str,
         task_id: str,
-        column: str = 'unknown'
+        column: str = 'unknown',
+        pipeline_run_id: str = None
     ):
         """
         Reconnect to a running container after orchestrator restart.
@@ -1985,13 +1987,14 @@ class DockerAgentRunner:
             agent: Agent name
             task_id: Task ID
             column: Column name from execution history for proper state matching (default: 'unknown')
+            pipeline_run_id: Pipeline run ID for traceability (default: None)
         """
         logger.info(f"Reconnecting to container {container_name}")
 
         # Spawn daemon thread to monitor container until exit
         monitoring_thread = threading.Thread(
             target=self._monitor_recovered_container,
-            args=(container_name, project, issue_number, agent, task_id, column),
+            args=(container_name, project, issue_number, agent, task_id, column, pipeline_run_id),
             daemon=True
         )
         monitoring_thread.start()
@@ -2054,7 +2057,8 @@ class DockerAgentRunner:
         issue_number: int,
         agent: str,
         task_id: str,
-        column: str = 'unknown'
+        column: str = 'unknown',
+        pipeline_run_id: str = None
     ):
         """
         Monitor a recovered container until it exits.
@@ -2069,6 +2073,7 @@ class DockerAgentRunner:
             agent: Agent name
             task_id: Task ID
             column: Column name for proper execution state matching (default: 'unknown')
+            pipeline_run_id: Pipeline run ID for traceability (default: None)
         """
         try:
             logger.info(
@@ -2191,7 +2196,8 @@ class DockerAgentRunner:
                     task_id=task_id,
                     exit_code=exit_code,
                     output=output,
-                    column=column
+                    column=column,
+                    pipeline_run_id=pipeline_run_id,
                 )
             else:
                 logger.error(
@@ -2278,7 +2284,8 @@ class DockerAgentRunner:
         exit_code: int,
         output: str,
         column: str = 'unknown',
-        reply_to_comment_id: str = None
+        reply_to_comment_id: str = None,
+        pipeline_run_id: str = None
     ) -> None:
         """
         Unified completion handler for both fresh and recovered container executions.
@@ -2298,6 +2305,7 @@ class DockerAgentRunner:
             reply_to_comment_id: Optional discussion comment ID to reply to in-thread.
                 Provided for fresh human-feedback-loop responses; None for initial runs
                 and recovered executions (which post top-level as an acceptable fallback).
+            pipeline_run_id: Pipeline run ID for traceability (included in github_comment_posted event).
         """
         outcome = 'success' if exit_code == 0 else 'failed'
         error = None if exit_code == 0 else f"Container exited with code {exit_code}"
@@ -2332,6 +2340,8 @@ class DockerAgentRunner:
                 context = self._build_completion_context(project, issue_number, workspace_type)
                 if reply_to_comment_id:
                     context['reply_to_comment_id'] = reply_to_comment_id
+                if pipeline_run_id:
+                    context['pipeline_run_id'] = pipeline_run_id
 
                 post_result = await github.post_agent_output(context, comment, reply_to_id=reply_to_comment_id)
 
@@ -2379,7 +2389,8 @@ class DockerAgentRunner:
         task_id: str,
         exit_code: int,
         output: str,
-        column: str = 'unknown'
+        column: str = 'unknown',
+        pipeline_run_id: str = None
     ):
         """
         Process completion of a recovered container.
@@ -2396,6 +2407,7 @@ class DockerAgentRunner:
             exit_code: Container exit code
             output: Agent output
             column: Column name for proper execution state matching (default: 'unknown')
+            pipeline_run_id: Pipeline run ID for traceability (default: None)
         """
         try:
             import asyncio
@@ -2412,7 +2424,8 @@ class DockerAgentRunner:
                     task_id=task_id,
                     exit_code=exit_code,
                     output=output,
-                    column=column
+                    column=column,
+                    pipeline_run_id=pipeline_run_id,
                 )
             )
 

@@ -607,13 +607,15 @@ class AgentContainerRecovery:
                 docker_runner = DockerAgentRunner()
 
                 if issue_number:
+                    pipeline_run_id_label = labels.get('org.switchyard.pipeline_run_id')
                     docker_runner.reconnect_to_container(
                         container_name=container_name,
                         project=project,
                         issue_number=issue_number,
                         agent=agent,
                         task_id=task_id,
-                        column=column  # Pass column for proper execution state matching
+                        column=column,  # Pass column for proper execution state matching
+                        pipeline_run_id=pipeline_run_id_label,
                     )
                     logger.info(f"✓ Recovered container with monitoring: {container_name}")
                 else:
