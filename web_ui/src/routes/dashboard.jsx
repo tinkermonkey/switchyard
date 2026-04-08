@@ -12,6 +12,7 @@ const MAX_DISPLAYED = 9
 function getGridLayout(count) {
   if (count <= 1) return { cols: 1, rows: 1 }
   if (count <= 2) return { cols: 2, rows: 1 }
+  if (count <= 3) return { cols: 3, rows: 1 }
   if (count <= 4) return { cols: 2, rows: 2 }
   if (count <= 6) return { cols: 3, rows: 2 }
   return { cols: 3, rows: 3 }
@@ -62,7 +63,7 @@ function DashboardView() {
 
       <NavigationTabs />
 
-      <div className={`flex-1 `}>
+      <div className="flex-1 min-h-0 overflow-y-auto">
         {loading && activeRuns.length === 0 ? (
           <div className="flex items-center justify-center h-full">
             <RefreshCw className="w-8 h-8 animate-spin text-gh-accent-primary" />
@@ -73,14 +74,14 @@ function DashboardView() {
           </div>
         ) : (
           <div
-            className={`gap-2 ${isMobile ? '' : 'h-full'}`}
+            className="gap-2"
             style={isMobile ? {
               display: 'grid',
               gridTemplateColumns: '1fr',
             } : {
               display: 'grid',
               gridTemplateColumns: `repeat(${cols}, 1fr)`,
-              gridTemplateRows: `repeat(${rows}, 1fr)`,
+              gridAutoRows: `max(280px, min(calc((100vw - 3rem) / ${cols} * 2), calc((100vh - 8rem) / ${rows})))`,
             }}
           >
             {displayedRuns.map(run => (
