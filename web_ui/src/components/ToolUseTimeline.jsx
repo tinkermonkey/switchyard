@@ -10,6 +10,8 @@ const RIGHT_PAD = 10
 const TOP_PAD = 8
 const BOTTOM_PAD = 20
 const ROW_HEIGHT = 22
+const BAR_MAX_WIDTH = 52
+const BAR_LEFT = 2
 
 const fmtTime = timeFormat('%-M:%S')
 
@@ -75,6 +77,19 @@ export default function ToolUseTimeline({ toolEvents = [] }) {
   // D3 scales
   const now = currentTime
   const xDomain = [new Date(now.getTime() - WINDOW_MS - RIGHT_MARGIN_MS), new Date(now.getTime() + RIGHT_MARGIN_MS)]
+
+  // Cumulative tokens per tool — only events that have already scrolled off the left edge.
+  // xDomain[0] is the exact cutoff: events older than this are no longer visible, so their
+  // tokens "contribute" to the bar chart as they pass that boundary.
+  const cumulativeTokensByTool = {}
+  toolNames.forEach(n => { cumulativeTokensByTool[n] = 0 })
+  toolEvents.forEach(e => {
+    if (e.ts < xDomain[0]) {
+      cumulativeTokensByTool[e.toolName] = (cumulativeTokensByTool[e.toolName] || 0) + (e.outputTokens || 0)
+    }
+  })
+  const maxCumTokens = Math.max(1, ...toolNames.map(n => cumulativeTokensByTool[n]))
+
   const VW = 800
   const xScale = scaleTime().domain(xDomain).range([LEFT_PAD, VW - RIGHT_PAD])
   const yScale = scaleBand().domain(toolNames).range([TOP_PAD, chartHeight - BOTTOM_PAD]).padding(0.3)
@@ -112,12 +127,26 @@ export default function ToolUseTimeline({ toolEvents = [] }) {
         style={{ display: 'block', aspectRatio: `${VW} / ${chartHeight}` }}
         onMouseLeave={() => setTooltip(null)}
       >
-        {/* Y-axis row guides + labels */}
+        {/* Y-axis row guides + labels + cumulative token bars */}
         {toolNames.map(name => {
           const y = yScale(name)
           const bw = yScale.bandwidth()
+          const cumTokens = cumulativeTokensByTool[name] || 0
+          const barW = (cumTokens / maxCumTokens) * BAR_MAX_WIDTH
           return (
             <g key={name}>
+              {/* Cumulative token bar (left of y-axis) */}
+              {barW >= 0.5 && (
+                <rect
+                  x={BAR_LEFT}
+                  y={y + bw * 0.15}
+                  width={barW}
+                  height={bw * 0.7}
+                  fill={toolColor(name)}
+                  opacity={0.55}
+                  rx={1}
+                />
+              )}
               <line
                 x1={LEFT_PAD} y1={y + bw / 2}
                 x2={VW - RIGHT_PAD} y2={y + bw / 2}
