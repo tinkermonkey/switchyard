@@ -20,7 +20,7 @@ from elasticsearch import Elasticsearch
 from services.logging_config import setup_service_logging
 import subprocess
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 import time
 
 # Setup logging with reduced verbosity
@@ -1899,6 +1899,128 @@ def get_pipeline_run_token_usage(pipeline_run_id):
         logger.error(f"Error fetching pipeline run token usage: {e}")
         return jsonify({'success': False, 'error': str(e)}), 500
 
+# Model pricing (USD per million tokens) — kept in sync with MODEL_PRICING in DashboardRunGraph.jsx
+_STREAM_MODEL_PRICING = {
+    'claude-opus-4-6':            {'input': 5,   'output': 25,  'cache_read': 0.50,  'cache_write': 6.25},
+    'claude-opus-4-5':            {'input': 5,   'output': 25,  'cache_read': 0.50,  'cache_write': 6.25},
+    'claude-sonnet-4-6':          {'input': 3,   'output': 15,  'cache_read': 0.30,  'cache_write': 3.75},
+    'claude-sonnet-4-5':          {'input': 3,   'output': 15,  'cache_read': 0.30,  'cache_write': 3.75},
+    'claude-haiku-4-5-20251001':  {'input': 1,   'output': 5,   'cache_read': 0.10,  'cache_write': 1.25},
+    'claude-haiku-4-5':           {'input': 1,   'output': 5,   'cache_read': 0.10,  'cache_write': 1.25},
+}
+_STREAM_DEFAULT_PRICING = _STREAM_MODEL_PRICING['claude-sonnet-4-6']
+
+
+@app.route('/api/pipeline-run/<pipeline_run_id>/token-usage-live')
+def get_pipeline_run_token_usage_live(pipeline_run_id):
+    """
+    Aggregate token usage directly from claude-streams-* for a pipeline run.
+
+    Uses the pre-indexed flattened token fields (token_input, token_output,
+    token_cache_read, token_cache_creation, token_model) written at index time
+    by the enrichment pipeline in pattern_detection_schema.py.
+
+    Returns data as fresh as the ES refresh interval (~10s) without waiting
+    for the scheduled token-metrics job. Also returns latest_event_timestamp
+    so the frontend can supplement with real-time socket events received after
+    the ES snapshot — bridging the ~10s indexing gap with live data.
+    """
+    try:
+        result = es_client.search(
+            index='claude-streams-*',
+            body={
+                'size': 0,
+                'query': {
+                    'bool': {
+                        'must': [
+                            {'bool': {'should': [
+                                {'term': {'pipeline_run_id': pipeline_run_id}},
+                                {'term': {'pipeline_run_id.keyword': pipeline_run_id}},
+                            ], 'minimum_should_match': 1}},
+                            {'exists': {'field': 'token_output'}},
+                        ]
+                    }
+                },
+                'aggs': {
+                    'total_input':        {'sum': {'field': 'token_input'}},
+                    'total_output':       {'sum': {'field': 'token_output'}},
+                    'total_cache_read':   {'sum': {'field': 'token_cache_read'}},
+                    'total_cache_create': {'sum': {'field': 'token_cache_creation'}},
+                    'latest_ts':          {'max': {'field': 'timestamp'}},
+                    'by_model': {
+                        'terms': {'field': 'token_model', 'size': 20},
+                        'aggs': {
+                            'mi':  {'sum': {'field': 'token_input'}},
+                            'mo':  {'sum': {'field': 'token_output'}},
+                            'mcr': {'sum': {'field': 'token_cache_read'}},
+                            'mcc': {'sum': {'field': 'token_cache_creation'}},
+                        }
+                    }
+                }
+            }
+        )
+
+        aggs = result.get('aggregations', {})
+        total_input        = int(aggs.get('total_input',        {}).get('value') or 0)
+        total_output       = int(aggs.get('total_output',       {}).get('value') or 0)
+        total_cache_read   = int(aggs.get('total_cache_read',   {}).get('value') or 0)
+        total_cache_create = int(aggs.get('total_cache_create', {}).get('value') or 0)
+        latest_ts_ms       = aggs.get('latest_ts', {}).get('value')
+
+        if total_input + total_output == 0:
+            return jsonify({'success': True, 'summary': None, 'latest_event_timestamp': None})
+
+        # Compute cost from per-model breakdown; apply default pricing to any
+        # tokens whose model field wasn't captured (missing token_model).
+        M = 1_000_000
+        model_input_sum = model_output_sum = model_cr_sum = model_cc_sum = 0
+        total_cost_usd = 0.0
+
+        for bucket in aggs.get('by_model', {}).get('buckets', []):
+            p   = _STREAM_MODEL_PRICING.get(bucket['key'], _STREAM_DEFAULT_PRICING)
+            mi  = int(bucket['mi']['value']  or 0)
+            mo  = int(bucket['mo']['value']  or 0)
+            mcr = int(bucket['mcr']['value'] or 0)
+            mcc = int(bucket['mcc']['value'] or 0)
+            model_input_sum += mi
+            model_output_sum += mo
+            model_cr_sum    += mcr
+            model_cc_sum    += mcc
+            total_cost_usd  += (mi * p['input'] + mo * p['output'] + mcr * p['cache_read'] + mcc * p['cache_write']) / M
+
+        # Tokens without a captured model — apply default pricing
+        p = _STREAM_DEFAULT_PRICING
+        ui  = total_input        - model_input_sum
+        uo  = total_output       - model_output_sum
+        ucr = total_cache_read   - model_cr_sum
+        ucc = total_cache_create - model_cc_sum
+        if ui > 0 or uo > 0:
+            total_cost_usd += (ui * p['input'] + uo * p['output'] + ucr * p['cache_read'] + ucc * p['cache_write']) / M
+
+        latest_ts_iso = (
+            datetime.fromtimestamp(latest_ts_ms / 1000, tz=timezone.utc).isoformat()
+            if latest_ts_ms is not None else None
+        )
+
+        return jsonify({
+            'success': True,
+            'summary': {
+                'total_direct_input':   total_input,
+                'total_output_tokens':  total_output,
+                'total_cache_read':     total_cache_read,
+                'total_cache_creation': total_cache_create,
+                'total_cost_usd':       round(total_cost_usd, 6),
+            },
+            'latest_event_timestamp': latest_ts_iso,
+        })
+
+    except Exception as e:
+        err_str = str(e).lower()
+        if 'index_not_found' not in err_str and 'no such index' not in err_str:
+            logger.warning(f"Error in token-usage-live for {pipeline_run_id}: {e}")
+        return jsonify({'success': True, 'summary': None, 'latest_event_timestamp': None})
+
+
 @app.route('/api/pipeline-run/<pipeline_run_id>/latest-comment')
 def get_pipeline_run_latest_comment(pipeline_run_id):
     """Return the URL of the most recent GitHub comment posted for this pipeline run.
@@ -2157,6 +2279,199 @@ def get_cycle_metrics():
     except Exception as e:
         logger.error(f"Error fetching cycle metrics: {e}", exc_info=True)
         return jsonify({'success': False, 'error': str(e), 'metrics': []}), 500
+
+
+@app.route('/api/metrics/tokens', methods=['GET'])
+def get_token_metrics():
+    """
+    Get per-model token/cost metrics plus pipeline-run and agent-execution activity
+    series, all aggregated over the requested time window.
+
+    Token/cost data comes from token-metrics-agents-hourly-* (model_breakdown).
+    Agent execution counts come from the same hourly docs (task_count per agent).
+    Pipeline run counts come from agent-events-* (agent_initialized events), which are
+    written in real-time — not from execution summaries which only exist after the rollup
+    job runs.
+    """
+    try:
+        try:
+            days = int(request.args.get('days', 7))
+        except (ValueError, TypeError):
+            return jsonify({'success': False, 'error': 'Invalid days parameter'}), 400
+        days = max(1, min(days, 365))
+
+        # --- Query 1: agent hourly metrics (tokens + agent execution counts) ---
+        try:
+            requested_size = days * 24 * 20
+            query_size = min(requested_size, 10000)
+            result = es_client.search(
+                index='token-metrics-agents-hourly-*',
+                body={
+                    'size': query_size,
+                    'query': {'range': {'hour_bucket': {'gte': f'now-{days}d'}}},
+                    'sort': [{'hour_bucket': {'order': 'asc'}}],
+                    '_source': ['hour_bucket', 'agent_name', 'task_count', 'model_breakdown'],
+                }
+            )
+            hourly_docs = [hit['_source'] for hit in result['hits']['hits']]
+        except Exception as e:
+            if 'index_not_found' in str(e).lower() or 'no such index' in str(e).lower():
+                hourly_docs = []
+            else:
+                raise
+
+        # --- Query 2: agent_initialized events for real-time pipeline run counts ---
+        # agent-events-* is written live (not a rollup), so it reflects runs that
+        # happened since the last cron job. One event per agent execution; we deduplicate
+        # on pipeline_run_id per project per hour to count distinct runs.
+        try:
+            agent_event_size = min(days * 1000, 10000)
+            agent_event_result = es_client.search(
+                index='agent-events-*',
+                body={
+                    'size': agent_event_size,
+                    'query': {
+                        'bool': {
+                            'must': [
+                                {'term': {'event_type': 'agent_initialized'}},
+                                {'range': {'timestamp': {'gte': f'now-{days}d'}}},
+                            ]
+                        }
+                    },
+                    'sort': [{'timestamp': {'order': 'asc'}}],
+                    '_source': ['timestamp', 'project', 'pipeline_run_id'],
+                }
+            )
+            exec_docs = [hit['_source'] for hit in agent_event_result['hits']['hits']]
+            total_agent_events = agent_event_result['hits'].get('total', {})
+            if isinstance(total_agent_events, dict):
+                total_agent_events = total_agent_events.get('value', len(exec_docs))
+            if total_agent_events > len(exec_docs):
+                logger.warning(
+                    f"pipeline run series: agent_initialized query capped at {len(exec_docs)} "
+                    f"of {total_agent_events} events for {days}d window — some runs may be missing"
+                )
+        except Exception as e:
+            if 'index_not_found' in str(e).lower() or 'no such index' in str(e).lower():
+                exec_docs = []
+            else:
+                raise
+
+        # --- Build model token/cost aggregates from hourly docs ---
+        by_model: dict = {}
+        model_hours: dict = {}
+
+        for doc in hourly_docs:
+            h = doc.get('hour_bucket')
+            for model, mb in (doc.get('model_breakdown') or {}).items():
+                if model not in by_model:
+                    by_model[model] = {
+                        'task_count': 0,
+                        'sum_direct_input': 0,
+                        'sum_cache_read': 0,
+                        'sum_cache_creation': 0,
+                        'sum_output': 0,
+                        'sum_cost_usd': 0.0,
+                    }
+                m = by_model[model]
+                m['task_count'] += mb.get('task_count', 0)
+                m['sum_direct_input'] += mb.get('sum_direct_input', 0)
+                m['sum_cache_read'] += mb.get('sum_cache_read', 0)
+                m['sum_cache_creation'] += mb.get('sum_cache_creation', 0)
+                m['sum_output'] += mb.get('sum_output', 0)
+                m['sum_cost_usd'] += mb.get('sum_cost_usd', 0.0)
+
+                if h:
+                    model_hours.setdefault(model, {})
+                    if h not in model_hours[model]:
+                        model_hours[model][h] = {'sum_tokens': 0, 'sum_cost': 0.0, 'tc': 0}
+                    bucket = model_hours[model][h]
+                    bucket['sum_tokens'] += (
+                        mb.get('sum_direct_input', 0)
+                        + mb.get('sum_cache_read', 0)
+                        + mb.get('sum_cache_creation', 0)
+                        + mb.get('sum_output', 0)
+                    )
+                    bucket['sum_cost'] += mb.get('sum_cost_usd', 0.0)
+                    bucket['tc'] += mb.get('task_count', 0)
+
+        # --- Build agent execution series from hourly docs (task_count per agent/hour) ---
+        # agent_name → hour_bucket → count
+        agent_exec_hours: dict = {}
+        for doc in hourly_docs:
+            an = doc.get('agent_name')
+            h = doc.get('hour_bucket')
+            tc = doc.get('task_count', 0)
+            if an and h and tc:
+                agent_exec_hours.setdefault(an, {})
+                agent_exec_hours[an][h] = agent_exec_hours[an].get(h, 0) + tc
+
+        # --- Build pipeline run series from agent_initialized events ---
+        # Each pipeline run is counted exactly once, in the hour it LAUNCHED.
+        # exec_docs is sorted ascending by timestamp, so the first time we see a
+        # pipeline_run_id is its earliest (launch) agent_initialized event.
+        # project → hour_bucket → set of pipeline_run_ids
+        run_launch_hour: dict = {}  # pipeline_run_id → (project, hour_bucket)
+        for doc in exec_docs:
+            project = doc.get('project')
+            run_id = doc.get('pipeline_run_id')
+            timestamp = doc.get('timestamp')
+            if not (project and run_id and timestamp):
+                continue
+            if run_id not in run_launch_hour:
+                try:
+                    dt = timestamp[:13] + ':00:00Z'
+                except Exception:
+                    continue
+                run_launch_hour[run_id] = (project, dt)
+
+        project_run_hours: dict = {}
+        for run_id, (project, dt) in run_launch_hour.items():
+            project_run_hours.setdefault(project, {})
+            project_run_hours[project].setdefault(dt, set()).add(run_id)
+
+        # --- Flatten all series into sorted lists ---
+        token_series = {
+            model: [
+                {'h': h, 'sum_tokens': v['sum_tokens'], 'tc': v['tc']}
+                for h, v in sorted(hours.items())
+            ]
+            for model, hours in model_hours.items()
+        }
+        cost_series = {
+            model: [
+                {'h': h, 'sum_cost': v['sum_cost'], 'tc': v['tc']}
+                for h, v in sorted(hours.items())
+            ]
+            for model, hours in model_hours.items()
+        }
+        agent_exec_series = {
+            agent: [
+                {'h': h, 'count': count}
+                for h, count in sorted(hours.items())
+            ]
+            for agent, hours in agent_exec_hours.items()
+        }
+        pipeline_run_series = {
+            project: [
+                {'h': h, 'count': len(run_ids)}
+                for h, run_ids in sorted(hours.items())
+            ]
+            for project, hours in project_run_hours.items()
+        }
+
+        return jsonify({
+            'success': True,
+            'by_model': by_model,
+            'token_series': token_series,
+            'cost_series': cost_series,
+            'agent_exec_series': agent_exec_series,
+            'pipeline_run_series': pipeline_run_series,
+        })
+
+    except Exception as e:
+        logger.error(f"Error fetching token metrics: {e}", exc_info=True)
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 
 @app.route('/api/metrics/projects', methods=['GET'])
@@ -2712,6 +3027,7 @@ def _merge_canonical_breakdown(target: dict, source: dict) -> None:
     sum_fields = [
         'task_count', 'sum_direct_input', 'sum_cache_read', 'sum_cache_creation',
         'sum_output', 'sum_initial_input', 'sum_max_context', 'sum_context_growth',
+        'sum_cost_usd',
     ]
     minmax_fields_min = ['min_max_context', 'min_output']
     minmax_fields_max = ['max_max_context', 'max_output']

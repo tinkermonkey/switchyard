@@ -1,5 +1,5 @@
 import { Link } from '@tanstack/react-router'
-import { FolderGit2, Workflow, BarChart2, TrendingUp, FileBarChart2, ClipboardList, LayoutDashboard } from 'lucide-react'
+import { FolderGit2, Workflow, BarChart2, FileBarChart2, ClipboardList, LayoutDashboard } from 'lucide-react'
 
 export default function NavigationTabs() {
   return (
@@ -44,7 +44,8 @@ export default function NavigationTabs() {
         <div className="flex-shrink-0"> | </div>
 
       <Link
-        to="/agent-metrics"
+        to="/metrics"
+        activeOptions={{ exact: false }}
         activeProps={{
           className: "px-3 py-1.5 text-xs md:px-4 md:py-2 md:text-sm whitespace-nowrap bg-gh-accent-emphasis border border-gh-accent-primary rounded-md hover:bg-gh-accent-primary transition-colors text-white"
         }}
@@ -53,31 +54,7 @@ export default function NavigationTabs() {
         }}
       >
         <BarChart2 className="inline w-4 h-4 mr-2" />
-        Agent Metrics
-      </Link>
-      <Link
-        to="/cycle-metrics"
-        activeProps={{
-          className: "px-3 py-1.5 text-xs md:px-4 md:py-2 md:text-sm whitespace-nowrap bg-gh-accent-emphasis border border-gh-accent-primary rounded-md hover:bg-gh-accent-primary transition-colors text-white"
-        }}
-        inactiveProps={{
-          className: "px-3 py-1.5 text-xs md:px-4 md:py-2 md:text-sm whitespace-nowrap bg-gh-canvas-subtle border border-gh-border rounded-md hover:bg-gh-border-muted transition-colors"
-        }}
-      >
-        <BarChart2 className="inline w-4 h-4 mr-2" />
-        Cycle Metrics
-      </Link>
-      <Link
-        to="/project-metrics"
-        activeProps={{
-          className: "px-3 py-1.5 text-xs md:px-4 md:py-2 md:text-sm whitespace-nowrap bg-gh-accent-emphasis border border-gh-accent-primary rounded-md hover:bg-gh-accent-primary transition-colors text-white"
-        }}
-        inactiveProps={{
-          className: "px-3 py-1.5 text-xs md:px-4 md:py-2 md:text-sm whitespace-nowrap bg-gh-canvas-subtle border border-gh-border rounded-md hover:bg-gh-border-muted transition-colors"
-        }}
-      >
-        <TrendingUp className="inline w-4 h-4 mr-2" />
-        Project Metrics
+        Metrics
       </Link>
 
         <div className="flex-shrink-0"> | </div>

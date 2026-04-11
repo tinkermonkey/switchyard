@@ -107,12 +107,15 @@ export default function DashboardRunGraph({ run }) {
   // Agent identifier of the most recent live execution — resets todos when the active agent changes.
   const [currentLiveAgent, setCurrentLiveAgent] = useState(null)
 
-  // Token summary fetched from /api/pipeline-run/<id>/token-usage (otel-collector rollup).
-  // Lags live streaming slightly but gives accurate per-type totals for the full run.
+  // Token summary fetched from /api/pipeline-run/<id>/token-usage-live.
+  // Aggregates claude-streams-* directly — as fresh as the ES refresh interval (~10s).
   const [tokenSummary, setTokenSummary] = useState(null)
-  // Running token totals accumulated live from socket events.
-  // Used as last-resort fallback when neither the otel summary nor historical mergedEvents have data yet.
-  const [liveTokens, setLiveTokens] = useState(null)
+  // Timestamp of the most recent event included in tokenSummary (ISO string from ES).
+  // Used to filter liveTokenAccum so the socket delta only covers events after the ES snapshot.
+  const [streamSummaryTs, setStreamSummaryTs] = useState(null)
+  // Individual token events accumulated live from socket — each entry has { ts, input, output, cacheRead, cacheCreation, cost }.
+  // Kept as a list (not a running total) so we can filter by timestamp against streamSummaryTs.
+  const [liveTokenAccum, setLiveTokenAccum] = useState([])
   // URL of the most recent GitHub comment posted for this run — used to deep-link to the
   // actual comment in feedback_listening state instead of just the issue/discussion root.
   const [latestCommentUrl, setLatestCommentUrl] = useState(null)
@@ -122,7 +125,8 @@ export default function DashboardRunGraph({ run }) {
     setLiveToolEvents([])
     setCurrentLiveAgent(null)
     setTokenSummary(null)
-    setLiveTokens(null)
+    setStreamSummaryTs(null)
+    setLiveTokenAccum([])
     setLatestCommentUrl(null)
   }, [run?.id])
 
@@ -131,23 +135,27 @@ export default function DashboardRunGraph({ run }) {
   // when the run changes, preventing a stale response from overwriting the reset state.
   const fetchTokenSummary = useCallback((signal) => {
     if (!run?.id) return
-    fetch(`/api/pipeline-run/${run.id}/token-usage`, signal ? { signal } : undefined)
+    fetch(`/api/pipeline-run/${run.id}/token-usage-live`, signal ? { signal } : undefined)
       .then(r => r.json())
-      .then(data => { if (data.success) setTokenSummary(data.summary || null) })
+      .then(data => {
+        if (data.success) {
+          setTokenSummary(data.summary || null)
+          setStreamSummaryTs(data.latest_event_timestamp ? new Date(data.latest_event_timestamp) : null)
+        }
+      })
       .catch(() => {})
   }, [run?.id])
 
-  // Fetch token summary on mount and poll.
-  // Active runs poll every 5s so the display catches up quickly after each stage completes.
-  // Completed/other runs poll every 30s (data rarely changes).
+  // Poll the live stream aggregation every 30s.
+  // The endpoint queries claude-streams-* directly so data is at most ~10s stale
+  // (ES refresh interval). Socket events newer than streamSummaryTs fill the gap.
   useEffect(() => {
     if (!run?.id) return
     const controller = new AbortController()
     fetchTokenSummary(controller.signal)
-    const interval = run.status === 'active' ? 5000 : 30000
-    const id = setInterval(() => fetchTokenSummary(controller.signal), interval)
+    const id = setInterval(() => fetchTokenSummary(controller.signal), 30000)
     return () => { controller.abort(); clearInterval(id) }
-  }, [run?.id, run?.status, fetchTokenSummary])
+  }, [run?.id, fetchTokenSummary])
 
   // Fetch the URL of the most recent GitHub comment so we can deep-link to it
   // when the run is in feedback_listening state (conversational loops post a
@@ -178,18 +186,18 @@ export default function DashboardRunGraph({ run }) {
         ? data.timestamp * 1000
         : data.timestamp)
 
-      // Accumulate token usage from every assistant event, regardless of tool calls.
+      // Collect per-event token data so the display can filter by timestamp against the ES snapshot.
       const usage = data.event?.message?.usage
       if (usage) {
         const model = data.event?.message?.model
-        const costEstimate = estimateCostFromUsage(usage, model)
-        setLiveTokens(prev => ({
-          total_direct_input:   (prev?.total_direct_input   || 0) + (usage.input_tokens                  || 0),
-          total_output_tokens:  (prev?.total_output_tokens  || 0) + (usage.output_tokens                 || 0),
-          total_cache_read:     (prev?.total_cache_read     || 0) + (usage.cache_read_input_tokens        || 0),
-          total_cache_creation: (prev?.total_cache_creation || 0) + (usage.cache_creation_input_tokens   || 0),
-          total_cost_usd:       (prev?.total_cost_usd       || 0) + costEstimate,
-        }))
+        setLiveTokenAccum(prev => [...prev, {
+          ts,
+          input:         usage.input_tokens                  || 0,
+          output:        usage.output_tokens                 || 0,
+          cacheRead:     usage.cache_read_input_tokens       || 0,
+          cacheCreation: usage.cache_creation_input_tokens   || 0,
+          cost:          estimateCostFromUsage(usage, model),
+        }])
       }
 
       const idPrefix = `live-${data.timestamp}-${data.agent || ''}`
@@ -209,7 +217,7 @@ export default function DashboardRunGraph({ run }) {
   }, [socket, run?.id])
 
   // Refresh token summary immediately when an agent finishes so cost updates without
-  // waiting for the next 5s poll cycle.
+  // waiting for the next 30s poll cycle.
   useEffect(() => {
     if (!socket || !run?.id) return
     const handleAgentEvent = (data) => {
@@ -250,33 +258,31 @@ export default function DashboardRunGraph({ run }) {
     return merged
   }, [historicalToolEvents, liveToolEvents])
 
-  // Fallback token totals derived from mergedEvents when the otel summary isn't available yet.
-  // Output tokens are accurate (always additive); input/cache totals overcount within a single
-  // context window (each turn includes prior context) but are a reasonable approximation.
-  // Cost is estimated from per-turn model pricing, not from the OTEL cost_usd attribute.
-  const derivedTokens = useMemo(() => {
-    let totalInput = 0, totalOutput = 0, totalCacheRead = 0, totalCacheWrite = 0, totalCost = 0
-    let hasData = false
-    for (const evt of mergedEvents) {
-      const msg = evt.raw_event?.event?.message
-      const usage = msg?.usage
-      if (!usage) continue
-      totalInput     += usage.input_tokens || 0
-      totalOutput    += usage.output_tokens || 0
-      totalCacheRead += usage.cache_read_input_tokens || 0
-      totalCacheWrite += usage.cache_creation_input_tokens || 0
-      totalCost      += estimateCostFromUsage(usage, msg?.model)
-      hasData = true
+  // Combined token display value: ES snapshot (tokenSummary, ~10s stale) plus socket
+  // events newer than the snapshot timestamp (liveTokenAccum delta).
+  // This gives a near-real-time view without double-counting events already indexed in ES.
+  const displayTokens = useMemo(() => {
+    const cutoffMs = streamSummaryTs ? streamSummaryTs.getTime() : 0
+    let di = 0, dout = 0, dcr = 0, dcc = 0, dcost = 0
+    for (const ev of liveTokenAccum) {
+      if (ev.ts.getTime() > cutoffMs) {
+        di    += ev.input
+        dout  += ev.output
+        dcr   += ev.cacheRead
+        dcc   += ev.cacheCreation
+        dcost += ev.cost
+      }
     }
-    if (!hasData) return null
+    if (!tokenSummary && di + dout === 0) return null
+    const base = tokenSummary || { total_direct_input: 0, total_output_tokens: 0, total_cache_read: 0, total_cache_creation: 0, total_cost_usd: 0 }
     return {
-      total_direct_input:   totalInput,
-      total_output_tokens:  totalOutput,
-      total_cache_read:     totalCacheRead,
-      total_cache_creation: totalCacheWrite,
-      total_cost_usd:       totalCost,
+      total_direct_input:   base.total_direct_input   + di,
+      total_output_tokens:  base.total_output_tokens  + dout,
+      total_cache_read:     base.total_cache_read      + dcr,
+      total_cache_creation: base.total_cache_creation  + dcc,
+      total_cost_usd:       base.total_cost_usd        + dcost,
     }
-  }, [mergedEvents])
+  }, [tokenSummary, streamSummaryTs, liveTokenAccum])
 
   // Most recent tool event — drives the overlay badge.
   // Same source as ToolUseTimeline so both always reflect the same event.
@@ -342,18 +348,17 @@ export default function DashboardRunGraph({ run }) {
         <div className="flex-1 min-w-0">
           <ToolUseTimeline toolEvents={toolEvents} />
         </div>
-        {(tokenSummary ?? derivedTokens ?? liveTokens) && (() => {
-          const tok = tokenSummary ?? derivedTokens ?? liveTokens
-          const isCostEstimate = !tokenSummary && tok.total_cost_usd > 0
+        {displayTokens && (() => {
+          const tok = displayTokens
           const cost = fmtCost(tok.total_cost_usd)
           return (
             <div className="flex-shrink-0 border-l border-gh-border px-3 py-2 flex flex-col justify-center gap-1 min-w-[90px]">
               {cost && (
                 <>
                   <div className="text-xs text-gh-fg-muted font-semibold uppercase tracking-wide leading-none">
-                    Cost{isCostEstimate && <span className="font-normal normal-case tracking-normal"> (est)</span>}
+                    Cost <span className="font-normal normal-case tracking-normal">(est)</span>
                   </div>
-                  <div className="text-xs font-mono font-semibold text-gh-fg mb-1">{isCostEstimate ? '~' : ''}{cost}</div>
+                  <div className="text-xs font-mono font-semibold text-gh-fg mb-1">~{cost}</div>
                 </>
               )}
               <div className="text-xs text-gh-fg-muted font-semibold uppercase tracking-wide leading-none mb-1">Tokens</div>

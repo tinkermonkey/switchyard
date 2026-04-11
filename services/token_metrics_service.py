@@ -634,6 +634,7 @@ class TokenMetricsService:
             sum_cache_read = 0
             sum_cache_creation = 0
             sum_output = 0
+            sum_cost_usd = 0.0
             first_input: Optional[int] = None
             peak_input = 0
             task_model: Optional[str] = None
@@ -685,6 +686,11 @@ class TokenMetricsService:
                                 td = tool_breakdown_raw.setdefault(tool_name, _empty_tool_entry())
                                 td['sum_context_growth'] += delta / k
 
+                        try:
+                            sum_cost_usd += float(pending_attrs.get('cost_usd') or 0)
+                        except (ValueError, TypeError):
+                            pass
+
                         if pending_attrs.get('model'):
                             task_model = pending_attrs['model']
 
@@ -718,6 +724,11 @@ class TokenMetricsService:
                 if pending_effective_input > peak_input:
                     peak_input = pending_effective_input
 
+                try:
+                    sum_cost_usd += float(pending_attrs.get('cost_usd') or 0)
+                except (ValueError, TypeError):
+                    pass
+
                 if pending_attrs.get('model'):
                     task_model = pending_attrs['model']
 
@@ -737,6 +748,7 @@ class TokenMetricsService:
                         'sum_output': sum_output,
                         'initial_input': first_input,
                         'max_context': peak_input,
+                        'sum_cost': sum_cost_usd,
                     })
 
         if not per_task_sum_output:
@@ -809,6 +821,7 @@ class TokenMetricsService:
                 'max_max_context': max(max_contexts),
                 'min_output': min(sum_outputs),
                 'max_output': max(sum_outputs),
+                'sum_cost_usd': round(sum(t.get('sum_cost', 0.0) for t in tasks), 6),
             }
 
         return {
