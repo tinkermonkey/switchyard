@@ -15,8 +15,14 @@ RUN apt update -y && apt install curl git redis-tools gnupg2 procps jq -y \
     && tar -xzvf node.tar.gz && rm node.tar.gz \
     && cp -r node-$NODE_VERSION-linux-$NODE_ARCH/* /usr/local/ \
     && rm -rf node-$NODE_VERSION-linux-$NODE_ARCH \
-    && npm install -g @anthropic-ai/claude-code @playwright/mcp \
+    && npm install -g @playwright/mcp \
     && rm -rf /var/lib/apt/lists/*
+
+# Install Claude Code via official installer
+RUN curl -fsSL https://claude.ai/install.sh | bash && \
+    cp -r /root/.local/share/claude /usr/local/share/claude && \
+    ln -sf /usr/local/share/claude/versions/$(ls /usr/local/share/claude/versions/ | head -1) /usr/local/bin/claude && \
+    chmod 755 /usr/local/bin/claude
 
 # Install Playwright dependencies for MCP server (minimal - we'll use Browserless instead of local browsers)
 RUN apt update -y && apt install -y \
