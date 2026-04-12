@@ -61,6 +61,9 @@ RUN git config --system user.name "Orchestrator Bot" && \
 # Ensure Python path includes the app directory
 ENV PYTHONPATH=/app
 
+# Add Claude's native install location to PATH (installer puts it in /root/.local/bin)
+ENV PATH="/root/.local/bin:${PATH}"
+
 # Create docker group with host's docker GID and add orchestrator user to it
 # This enables docker socket access for dev_environment_setup agent
 # On macOS, DOCKER_GID=0 (root group), so we add user to root group
