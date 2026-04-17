@@ -1101,7 +1101,7 @@ class DockerAgentRunner:
         # We use 'cat file | wrapper | claude -' pattern
         # NEW: Use wrapper to enable container-side Redis writes
         wrapper_cmd = [
-            'python3', '/app/scripts/docker-claude-wrapper.py',
+            '/usr/local/bin/python3', '/app/scripts/docker-claude-wrapper.py',
             '--print', '--verbose', '--output-format', 'stream-json',
             '--model', claude_model,
         ]

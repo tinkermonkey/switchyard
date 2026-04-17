@@ -26,7 +26,7 @@ if [ ! -f /home/orchestrator/.ssh/config ]; then
 Host github.com
   StrictHostKeyChecking accept-new
   UserKnownHostsFile /home/orchestrator/.ssh/known_hosts
-  IdentityFile /home/orchestrator/.ssh/id_ed25519
+  IdentityFile /home/orchestrator/.ssh/id_github
 EOF
         chmod 600 /home/orchestrator/.ssh/config 2>/dev/null || true
     fi

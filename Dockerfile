@@ -75,6 +75,8 @@ RUN if [ "${DOCKER_GID}" = "0" ]; then \
         useradd -m -u 1000 -G docker orchestrator; \
     fi && \
     mkdir -p /home/orchestrator/.ssh /home/orchestrator/.config && \
+    touch /home/orchestrator/.ssh/id_github && \
+    chmod 600 /home/orchestrator/.ssh/id_github && \
     chown -R orchestrator:orchestrator /home/orchestrator && \
     chmod 700 /home/orchestrator/.ssh /home/orchestrator/.config && \
     rm -rf /home/orchestrator/.gitconfig /home/orchestrator/.orchestrator
