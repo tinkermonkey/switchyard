@@ -255,6 +255,12 @@ class PipelineWatchdog:
         """
         Check if there's an agent container running for the given issue.
 
+        Uses Docker label filters rather than container name matching. All managed
+        containers (agent containers via docker_runner.py and repair cycle containers
+        via project_monitor.py) are labeled with org.switchyard.project and
+        org.switchyard.issue_number, so a single label query covers every container
+        type regardless of naming convention.
+
         Args:
             project: Project name
             issue_number: Issue number
@@ -263,34 +269,21 @@ class PipelineWatchdog:
             True if container exists, False otherwise
         """
         try:
-            # Check for regular agent containers (pattern: claude-agent-{project}-*)
             result = subprocess.run(
-                ['docker', 'ps', '--filter', f'name=claude-agent-{project}',
-                 '--format', '{{.Names}}'],
+                [
+                    'docker', 'ps',
+                    '--filter', f'label=org.switchyard.project={project}',
+                    '--filter', f'label=org.switchyard.issue_number={issue_number}',
+                    '--format', '{{.Names}}',
+                ],
                 capture_output=True,
                 text=True,
-                timeout=5
-            )
-
-            if result.returncode == 0:
-                containers = result.stdout.strip().split('\n')
-                # Check if any container name contains the issue number
-                for container in containers:
-                    if container and str(issue_number) in container:
-                        logger.debug(f"Found agent container for issue #{issue_number}: {container}")
-                        return True
-
-            # Also check for repair cycle containers
-            result = subprocess.run(
-                ['docker', 'ps', '--filter', f'name=repair-cycle-{project}-{issue_number}',
-                 '--format', '{{.Names}}'],
-                capture_output=True,
-                text=True,
-                timeout=5
+                timeout=5,
             )
 
             if result.returncode == 0 and result.stdout.strip():
-                logger.debug(f"Found repair cycle container for issue #{issue_number}")
+                containers = [c for c in result.stdout.strip().split('\n') if c]
+                logger.debug(f"Found {len(containers)} container(s) for issue #{issue_number}: {containers}")
                 return True
 
             return False

@@ -1722,32 +1722,28 @@ class WorkExecutionStateTracker:
                             except Exception as e:
                                 logger.warning(f"Failed to check pipeline queue: {e}")
 
-                            # Method 1: Check if Docker container is running
-                            # Use specific prefix pattern to avoid false positives from other projects
-                            # Agent container naming: claude-agent-{project}-{task_id}
-                            agent_ps_result = subprocess.run(
-                                ['docker', 'ps', '--filter', f'name=claude-agent-{project_name}-',
-                                 '--format', '{{.Names}}'],
+                            # Method 1: Check if Docker container is running.
+                            # Use label filters scoped to this project + issue so agent
+                            # containers, repair cycle containers, and PR review containers
+                            # are all found with one query and without false positives from
+                            # other issues or other projects.
+                            ps_result = subprocess.run(
+                                [
+                                    'docker', 'ps',
+                                    '--filter', f'label=org.switchyard.project={project_name}',
+                                    '--filter', f'label=org.switchyard.issue_number={issue_number}',
+                                    '--format', '{{.Names}}',
+                                ],
                                 capture_output=True,
                                 text=True,
-                                timeout=5
+                                timeout=5,
                             )
-                            agent_container_names = [n for n in agent_ps_result.stdout.strip().split('\n') if n]
-                            has_agent_container = bool(agent_container_names)
-
-                            # Also check for RUNNING repair cycle containers (format: repair-cycle-{project}-{issue}-{run_id})
-                            # Important: Use 'docker ps' not 'docker ps -a' to only find running containers
-                            repair_ps_result = subprocess.run(
-                                ['docker', 'ps', '--filter', f'name=repair-cycle-{project_name}-{issue_number}',
-                                 '--format', '{{.Names}}'],
-                                capture_output=True,
-                                text=True,
-                                timeout=5
+                            container_names = (
+                                [n for n in ps_result.stdout.strip().split('\n') if n]
+                                if ps_result.returncode == 0 else []
                             )
-                            repair_container_names = [n for n in repair_ps_result.stdout.strip().split('\n') if n]
-                            has_repair_cycle_container = bool(repair_container_names)
 
-                            has_docker_container = has_agent_container or has_repair_cycle_container
+                            has_docker_container = bool(container_names)
 
                             # Method 2: Check Redis tracking keys for agents
                             has_redis_tracking = self._check_redis_tracking_for_agent(project_name, agent, issue_number)
@@ -1763,7 +1759,7 @@ class WorkExecutionStateTracker:
                             has_running_container = has_docker_container
 
                             if has_docker_container and not has_redis_tracking:
-                                all_container_names = agent_container_names + repair_container_names
+                                all_container_names = container_names
                                 logger.warning(
                                     f"Container exists in Docker but not in Redis tracking for "
                                     f"{project_name}/#{issue_number} {agent} - attempting repair"

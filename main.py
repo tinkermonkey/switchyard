@@ -315,22 +315,23 @@ async def main():
                         # Use Docker ps as source of truth (not Redis which can have stale data)
                         should_retrigger = True
                         has_agent_container = False
-                        has_repair_container = False
 
                         import subprocess
                         try:
-                            # Check for running agent containers for this issue using Docker labels
-                            # All containers are labeled with org.switchyard.issue_number={issue}
+                            # Check for any running container for this issue using Docker labels.
+                            # All managed containers (agent and repair cycle) carry
+                            # org.switchyard.project and org.switchyard.issue_number labels,
+                            # so one query covers every container type.
                             result = subprocess.run(
                                 [
                                     'docker', 'ps',
-                                    '--filter', f'label=org.switchyard.issue_number={lock.locked_by_issue}',
                                     '--filter', f'label=org.switchyard.project={project_name}',
-                                    '--format', '{{.Names}}'
+                                    '--filter', f'label=org.switchyard.issue_number={lock.locked_by_issue}',
+                                    '--format', '{{.Names}}',
                                 ],
                                 capture_output=True,
                                 text=True,
-                                timeout=5
+                                timeout=5,
                             )
 
                             if result.returncode == 0 and result.stdout.strip():
@@ -342,23 +343,6 @@ async def main():
                                 )
                                 has_agent_container = True
                                 should_retrigger = False
-
-                            # Also check for running repair cycle containers
-                            if should_retrigger:
-                                result = subprocess.run(
-                                    ['docker', 'ps', '--filter', f'name=repair-cycle-{project_name}-{lock.locked_by_issue}', '--format', '{{.Names}}'],
-                                    capture_output=True,
-                                    text=True,
-                                    timeout=5
-                                )
-
-                                if result.returncode == 0 and result.stdout.strip():
-                                    logger.info(
-                                        f"Found running repair cycle container for issue #{lock.locked_by_issue} "
-                                        f"- skipping re-trigger (container still active)"
-                                    )
-                                    has_repair_container = True
-                                    should_retrigger = False
                         except Exception as e:
                             logger.warning(f"Error checking Docker for running containers: {e}")
                             # If we can't check Docker, err on the side of retriggering

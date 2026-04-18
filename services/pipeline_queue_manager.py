@@ -741,16 +741,22 @@ class PipelineQueueManager:
                 last_exec = state['execution_history'][-1]
 
                 if last_exec.get('outcome') in ('failure', 'cancelled'):
-                    # Verify no container is running
+                    # Verify no container is running for this specific issue.
+                    # Use label filters so the check is scoped to this issue, not
+                    # the whole project (a container for another issue must not
+                    # suppress blocked status here).
                     try:
                         result = subprocess.run(
-                            ['docker', 'ps', '--filter',
-                             f'name=claude-agent-{self.project_name}-',
-                             '--format', '{{.Names}}'],
+                            [
+                                'docker', 'ps',
+                                '--filter', f'label=org.switchyard.project={self.project_name}',
+                                '--filter', f'label=org.switchyard.issue_number={issue_number}',
+                                '--format', '{{.Names}}',
+                            ],
                             capture_output=True, text=True, timeout=5
                         )
 
-                        has_container = bool(result.stdout.strip())
+                        has_container = result.returncode == 0 and bool(result.stdout.strip())
 
                         if not has_container:
                             blocked_issues.append({
