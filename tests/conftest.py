@@ -376,3 +376,79 @@ def async_return():
             return value
         return _async_fn
     return _create_async
+
+
+# ============================================================================
+# Test Data Cleanup
+# ============================================================================
+
+# All project names used exclusively in tests — safe to purge completely.
+_TEST_PROJECT_NAMES = ["test-project", "test_project", "test-proj"]
+
+# ES indices that carry a top-level `project` field written by tests.
+_TEST_ES_INDICES = [
+    "pipeline-runs-*",
+    "decision-events-*",
+    "agent-events-*",
+    "orchestrator-test-cycle-records",
+    "orchestrator-task-metrics-*",
+    "orchestrator-quality-metrics-*",
+]
+
+
+@pytest.fixture(scope="session", autouse=True)
+def cleanup_test_data():
+    """
+    Purge Elasticsearch and Redis data belonging to test-only projects.
+
+    Runs once before and once after the entire test session so leftover data
+    from a previous crashed run is also removed. Unit tests that mock ES/Redis
+    are unaffected — both cleanup calls are no-ops when the services are
+    unreachable.
+    """
+    _purge_test_data()
+    yield
+    _purge_test_data()
+
+
+def _purge_test_data():
+    _purge_elasticsearch()
+    _purge_redis()
+
+
+def _purge_elasticsearch():
+    try:
+        from elasticsearch import Elasticsearch
+        es = Elasticsearch("http://localhost:9200", request_timeout=5)
+        if not es.ping():
+            return
+        query = {"query": {"terms": {"project": _TEST_PROJECT_NAMES}}}
+        for index in _TEST_ES_INDICES:
+            try:
+                es.delete_by_query(
+                    index=index,
+                    body=query,
+                    ignore_unavailable=True,
+                    refresh=True,
+                )
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def _purge_redis():
+    try:
+        import redis as redis_lib
+        r = redis_lib.Redis(host="localhost", port=6379, socket_timeout=2)
+        r.ping()
+        for project in _TEST_PROJECT_NAMES:
+            cursor = 0
+            while True:
+                cursor, keys = r.scan(cursor, match=f"*{project}*", count=100)
+                if keys:
+                    r.delete(*keys)
+                if cursor == 0:
+                    break
+    except Exception:
+        pass
