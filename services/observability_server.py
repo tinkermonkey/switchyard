@@ -2050,14 +2050,14 @@ def get_pipeline_run_latest_comment(pipeline_run_id):
                 },
                 'sort': [{'timestamp': 'desc'}],
                 'size': 1,
-                '_source': ['data'],
+                '_source': ['comment_url', 'object_type', 'object_number', 'repo', 'comment_id'],
             }
         )
         hits = result.get('hits', {}).get('hits', [])
         if not hits:
             return jsonify({'success': True, 'comment_url': None})
 
-        data = hits[0]['_source'].get('data', {})
+        data = hits[0]['_source']
         comment_url = data.get('comment_url')
 
         # Fall back to constructing the URL from available fields for older events.
