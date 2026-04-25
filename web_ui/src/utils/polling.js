@@ -29,7 +29,7 @@ export function startPolling(fetchFn, intervalMs, { immediate = true } = {}) {
  */
 export const POLLING_INTERVALS = {
   HEALTH_CHECK: 10000,        // 10 seconds
-  CIRCUIT_BREAKERS: 5000,     // 5 seconds
+  CIRCUIT_BREAKERS: 30000,    // 30 seconds
   PROJECTS: 30000,            // 30 seconds
   SYSTEM_STATUS: 15000,       // 15 seconds
 }

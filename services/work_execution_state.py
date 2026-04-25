@@ -245,8 +245,24 @@ class WorkExecutionStateTracker:
             )
             return
 
-        # If we get here, no in_progress execution was found
-        # Create a new record (edge case where start wasn't recorded)
+        # If we get here, no in_progress execution was found.
+        # Distinguish between a benign cleanup race and a genuine missing start.
+        # When cleanup_stuck_in_progress_states() beats the monitoring thread's
+        # finally: block, it already finalized the record with the same outcome —
+        # a duplicate write would be wrong and the ERROR log is misleading.
+        already_finalized = any(
+            e.get('column') == column and e.get('agent') == agent and e.get('outcome') == outcome
+            for e in state['execution_history']
+        )
+        if already_finalized:
+            logger.debug(
+                f"record_execution_outcome race (benign): {project_name}/#{issue_number} "
+                f"{agent} in {column} already finalized with outcome={outcome} — "
+                f"cleanup_stuck_in_progress_states won the race"
+            )
+            return
+
+        # Genuine missing start (restart/crash scenario)
         logger.error(
             f"No in_progress execution found for {agent} in {column}, "
             f"creating new record with outcome {outcome}. "

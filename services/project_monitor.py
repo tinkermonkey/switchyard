@@ -1775,7 +1775,8 @@ class ProjectMonitor:
                     logger.info(f"Releasing pipeline lock for closed issue #{issue_number}")
                     self._release_pipeline_lock_and_process_next(
                         project_name, board_name, issue_number, status,
-                        repository, workflow_template
+                        repository, workflow_template,
+                        keep_cancelled=True
                     )
                 
                 return None
@@ -2769,7 +2770,8 @@ class ProjectMonitor:
         issue_number: int,
         exit_column: str,
         repository: str,
-        workflow_template
+        workflow_template,
+        keep_cancelled: bool = False
     ):
         """
         Release pipeline lock when issue reaches exit column and process next waiting issue.
@@ -2856,8 +2858,11 @@ class ProjectMonitor:
             except Exception as e:
                 logger.warning(f"Failed to clean up feedback loop for issue #{issue_number} during exit-column handling: {e}")
 
-            # Clear signal so issue can be re-triggered if moved back
-            signal.clear(project_name, issue_number)
+            # Clear signal so issue can be re-triggered if moved back.
+            # Skip for closed-issue cleanup (keep_cancelled=True): the signal
+            # prevents the FAILSAFE from re-detecting the closed issue every 40s.
+            if not keep_cancelled:
+                signal.clear(project_name, issue_number)
 
             # Process next waiting issue
             next_issue = pipeline_queue.get_next_waiting_issue()
@@ -3141,7 +3146,8 @@ class ProjectMonitor:
 
             # Step 10: Advance parent on Planning board for PR review
             await self._advance_parent_for_pr_review(
-                project_name, parent_issue_number, project_config
+                project_name, parent_issue_number, project_config,
+                triggering_issue=issue_number
             )
 
         except Exception as e:
@@ -3153,7 +3159,8 @@ class ProjectMonitor:
         self,
         project_name: str,
         parent_issue_number: int,
-        project_config
+        project_config,
+        triggering_issue: Optional[int] = None
     ):
         """
         Advance parent issue on Planning board for PR review.
@@ -3317,7 +3324,7 @@ class ProjectMonitor:
                             project_name=project_name,
                             workflow_template=workflow_template,
                             project_monitor=self,
-                            triggering_issue=None  # No triggering issue in this context
+                            triggering_issue=triggering_issue
                         )
 
                         if not all_complete:

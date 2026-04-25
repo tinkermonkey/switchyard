@@ -86,6 +86,15 @@ subscriber_health = {
 git_branch_cache = {}
 git_branch_cache_lock = threading.Lock()
 
+# Simple TTL caches for expensive polling endpoints
+_circuit_breakers_cache = {'data': None, 'ts': 0}
+_circuit_breakers_cache_lock = threading.Lock()
+_CIRCUIT_BREAKERS_TTL = 10  # seconds
+
+_active_agents_pipeline_cache = {'data': None, 'ts': 0}
+_active_agents_pipeline_cache_lock = threading.Lock()
+_ACTIVE_AGENTS_PIPELINE_TTL = 5  # seconds
+
 @socketio.on('connect')
 def handle_connect():
     """Handle client connection"""
@@ -836,7 +845,9 @@ def get_pipeline_run_events():
     """
     try:
         pipeline_run_id = request.args.get('pipeline_run_id')
-        
+        claude_logs_offset = max(0, int(request.args.get('claude_logs_offset', 0)))
+        claude_logs_limit = max(1, min(int(request.args.get('claude_logs_limit', 200)), 1000))
+
         if not pipeline_run_id:
             return jsonify({
                 'success': False,
@@ -907,7 +918,8 @@ def get_pipeline_run_events():
         except Exception as e:
             logger.warning(f"Error fetching agent events: {e}")
         
-        # 3. Get Claude streaming logs for detailed execution
+        # 3. Get Claude streaming logs for detailed execution (paginated)
+        claude_logs_total = 0
         try:
             claude_logs_query = {
                 "query": {
@@ -916,13 +928,18 @@ def get_pipeline_run_events():
                     }
                 },
                 "sort": [{"timestamp": "asc"}],
-                "size": 10000
+                "from": claude_logs_offset,
+                "size": claude_logs_limit,
+                "track_total_hits": True
             }
 
             claude_result = es_client.search(
                 index="claude-streams-*",
                 body=claude_logs_query
             )
+
+            total_hits = claude_result['hits']['total']
+            claude_logs_total = total_hits['value'] if isinstance(total_hits, dict) else total_hits
 
             for hit in claude_result['hits']['hits']:
                 event_data = hit['_source']
@@ -933,14 +950,19 @@ def get_pipeline_run_events():
             logger.warning(f"Error fetching Claude logs: {e}")
 
         # Sort all events by timestamp
-
         all_events.sort(key=lambda x: x.get('timestamp') or '')
-        
+
         return jsonify({
             'success': True,
             'pipeline_run': pipeline_run.to_dict(),
             'events': all_events,
-            'event_count': len(all_events)
+            'event_count': len(all_events),
+            'claude_logs_pagination': {
+                'offset': claude_logs_offset,
+                'limit': claude_logs_limit,
+                'total': claude_logs_total,
+                'has_more': (claude_logs_offset + claude_logs_limit) < claude_logs_total
+            }
         })
         
     except Exception as e:
@@ -1168,6 +1190,10 @@ def get_active_agents_from_pipelines():
     Returns agents that have been initialized but not completed/failed
     This is the source of truth for active agent tracking in the UI
     """
+    with _active_agents_pipeline_cache_lock:
+        if _active_agents_pipeline_cache['data'] is not None and (time.time() - _active_agents_pipeline_cache['ts']) < _ACTIVE_AGENTS_PIPELINE_TTL:
+            return jsonify(_active_agents_pipeline_cache['data'])
+
     try:
         # Get all active pipeline runs AND recently completed ones (within last 2 hours)
         # This catches edge cases where agents start after pipeline is marked complete
@@ -1296,11 +1322,15 @@ def get_active_agents_from_pipelines():
 
         logger.debug(f"Active agents endpoint returning {len(active_agents)} agents ({len([a for a in active_agents if a.get('source') != 'redis'])} from pipelines, {len([a for a in active_agents if a.get('source') == 'redis'])} from Redis)")
 
-        return jsonify({
+        result = {
             'success': True,
             'agents': active_agents,
             'count': len(active_agents)
-        })
+        }
+        with _active_agents_pipeline_cache_lock:
+            _active_agents_pipeline_cache['data'] = result
+            _active_agents_pipeline_cache['ts'] = time.time()
+        return jsonify(result)
 
     except Exception as e:
         logger.error(f"Error fetching active agents: {e}")
@@ -3252,6 +3282,10 @@ def _aggregate_hourly_cycle_docs(cycle_type: str, docs: list) -> dict:
 @app.route('/api/circuit-breakers', methods=['GET'])
 def get_circuit_breakers():
     """Get circuit breaker status from pattern ingestion service and Claude Code"""
+    with _circuit_breakers_cache_lock:
+        if _circuit_breakers_cache['data'] is not None and (time.time() - _circuit_breakers_cache['ts']) < _CIRCUIT_BREAKERS_TTL:
+            return jsonify(_circuit_breakers_cache['data'])
+
     try:
         # Connect to Redis
         redis_client = redis.Redis(
@@ -3395,7 +3429,7 @@ def get_circuit_breakers():
                             'last_failure_time': state.get('last_failure_time'),
                             'time_until_retry': time_until_retry
                         })
-                        logger.info(f"Added agent breaker: {agent_name}, state={state.get('state')}")
+                        logger.debug(f"Added agent breaker: {agent_name}, state={state.get('state')}")
                 except Exception as e:
                     logger.warning(f"Could not parse agent breaker {key}: {e}")
                     
@@ -3403,12 +3437,12 @@ def get_circuit_breakers():
             logger.error(f"Could not get agent circuit breakers: {e}", exc_info=True)
 
         # Calculate summary
-        open_count = sum(1 for cb in circuit_breakers 
+        open_count = sum(1 for cb in circuit_breakers
                         if cb.get('state') == 'open' or cb.get('is_open') == True)
-        half_open_count = sum(1 for cb in circuit_breakers 
+        half_open_count = sum(1 for cb in circuit_breakers
                              if cb.get('state') == 'half_open')
 
-        return jsonify({
+        result = {
             'success': True,
             'circuit_breakers': circuit_breakers,
             'summary': {
@@ -3417,7 +3451,11 @@ def get_circuit_breakers():
                 'half_open': half_open_count,
                 'healthy': len(circuit_breakers) - open_count - half_open_count
             }
-        })
+        }
+        with _circuit_breakers_cache_lock:
+            _circuit_breakers_cache['data'] = result
+            _circuit_breakers_cache['ts'] = time.time()
+        return jsonify(result)
 
     except Exception as e:
         logger.error(f"Error fetching circuit breaker status: {e}")
