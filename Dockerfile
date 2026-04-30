@@ -1,3 +1,19 @@
+# Build DR CLI from local source (until published to npm)
+FROM node:22-slim AS dr-cli-builder
+# python3: needed by download-viewer.sh to check installed version (skips network fetch if current)
+# curl + unzip: fallback if viewer bundle isn't present or version mismatches
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 curl unzip \
+    && rm -rf /var/lib/apt/lists/*
+# Mirror repo layout so sync-spec-schemas.sh resolves $REPO_ROOT correctly:
+# script walks scripts/ → cli/ → repo-root, expects spec/dist/ at repo-root
+COPY documentation_robotics/spec/dist/ /build/spec/dist/
+WORKDIR /build/cli
+COPY documentation_robotics/cli/package*.json ./
+RUN npm ci
+COPY documentation_robotics/cli/ ./
+RUN npm run build
+
 # Main orchestrator Dockerfile
 FROM python:3.11-slim
 
@@ -17,6 +33,12 @@ RUN apt update -y && apt install curl git redis-tools gnupg2 procps jq -y \
     && rm -rf node-$NODE_VERSION-linux-$NODE_ARCH \
     && npm install -g @playwright/mcp \
     && rm -rf /var/lib/apt/lists/*
+
+# Install DR CLI built from local source
+COPY --from=dr-cli-builder /build/cli/dist /opt/dr-cli/dist
+COPY --from=dr-cli-builder /build/cli/node_modules /opt/dr-cli/node_modules
+COPY --from=dr-cli-builder /build/cli/package.json /opt/dr-cli/package.json
+RUN chmod +x /opt/dr-cli/dist/cli.js && ln -sf /opt/dr-cli/dist/cli.js /usr/local/bin/dr
 
 # Install Claude Code via official installer
 RUN curl -fsSL https://claude.ai/install.sh | bash && \
@@ -82,17 +104,17 @@ RUN if [ "${DOCKER_GID}" = "0" ]; then \
     rm -rf /home/orchestrator/.gitconfig /home/orchestrator/.orchestrator
 
 # Install Python dependencies
-COPY requirements.txt .
+COPY switchyard/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
-COPY . .
+COPY switchyard/ .
 
 # NEW: Ensure Claude Code wrapper is executable (for container-side Redis writes)
 RUN chmod +x /app/scripts/docker-claude-wrapper.py
 
 # Copy and set permissions for entrypoint script
-COPY docker-entrypoint.sh /usr/local/bin/
+COPY switchyard/docker-entrypoint.sh /usr/local/bin/
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
 # Create orchestrator data directories (new structure) and set ownership

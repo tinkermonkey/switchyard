@@ -174,7 +174,8 @@ class TestIssuesWorkspaceContext:
         # Verify comment was posted
         mock_gh.post_comment.assert_called_once_with(
             123,
-            '# Test Output'
+            '# Test Output',
+            pipeline_run_id=None,
         )
 
         # Verify result

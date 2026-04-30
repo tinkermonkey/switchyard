@@ -11,7 +11,8 @@ services:
 
   orchestrator:
     build:
-      context: .
+      context: ..
+      dockerfile: switchyard/Dockerfile
       args:
         DOCKER_GID: "${DOCKER_GID:-984}"  # Pass host docker GID to Dockerfile
     # Run as orchestrator user (UID 1000) defined in Dockerfile
@@ -81,7 +82,9 @@ services:
     command: ["python", "main.py"]
 
   observability-server:
-    build: .
+    build:
+      context: ..
+      dockerfile: switchyard/Dockerfile
     volumes:
       - ./:/app
       - ..:/workspace  # Mount workspace read-write for Advisor agent execution
@@ -117,7 +120,9 @@ services:
       - "3000:80"
 
   log-collector:
-    build: .
+    build:
+      context: ..
+      dockerfile: switchyard/Dockerfile
     volumes:
       - ./:/app
     environment:

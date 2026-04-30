@@ -1,0 +1,30 @@
+# Build context is the orchestrator/ workspace root (parent of switchyard/).
+# Exclude all top-level dirs except the two we need — this automatically
+# prevents project checkout directories from bloating the build context.
+*
+!switchyard/
+!documentation_robotics/
+
+# Within documentation_robotics, include cli source and spec/dist (needed by sync-spec-schemas.sh)
+documentation_robotics/*
+!documentation_robotics/cli/
+!documentation_robotics/spec/
+
+# Exclude CLI build artifacts (rebuilt in the dr-cli-builder stage)
+documentation_robotics/cli/node_modules/
+documentation_robotics/cli/dist/
+
+# Switchyard exclusions
+switchyard/**/__pycache__/
+switchyard/**/*.pyc
+switchyard/.git/
+switchyard/orchestrator_data/
+switchyard/state/
+switchyard/.env
+switchyard/.env.*
+switchyard/.pytest_cache/
+switchyard/.coverage
+switchyard/htmlcov/
+switchyard/web_ui/node_modules/
+switchyard/web_ui/dist/
+switchyard/web_ui/.vite/

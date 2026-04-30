@@ -192,7 +192,9 @@ class TestMakerReviewerCycle:
             async def mock_review_loop(*args, **kwargs):
                 return ('approved', 'Development')
             
-            with patch.object(executor, '_execute_review_loop', side_effect=mock_review_loop):
+            with patch.object(executor, '_load_active_cycles', return_value=[]), \
+                 patch.object(executor, '_save_cycle_state'), \
+                 patch.object(executor, '_execute_review_loop', side_effect=mock_review_loop):
                 result = await executor.start_review_cycle(
                     issue_number=2100,
                     repository='test-repo',
@@ -282,7 +284,9 @@ class TestMakerReviewerCycle:
                     # Second call: approval
                     return ('approved', 'Development')
             
-            with patch.object(executor, '_execute_review_loop', side_effect=mock_review_loop):
+            with patch.object(executor, '_load_active_cycles', return_value=[]), \
+                 patch.object(executor, '_save_cycle_state'), \
+                 patch.object(executor, '_execute_review_loop', side_effect=mock_review_loop):
                 # First cycle - rejection
                 result1 = await executor.start_review_cycle(
                     issue_number=2101,
@@ -401,7 +405,9 @@ class TestMultiStagePipeline:
             async def mock_review_loop(*args, **kwargs):
                 return ('approved', 'Design Review')
             
-            with patch.object(executor, '_execute_review_loop', side_effect=mock_review_loop):
+            with patch.object(executor, '_load_active_cycles', return_value=[]), \
+                 patch.object(executor, '_save_cycle_state'), \
+                 patch.object(executor, '_execute_review_loop', side_effect=mock_review_loop):
                 result = await executor.start_review_cycle(
                     issue_number=2200,
                     repository='test-repo',

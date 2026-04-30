@@ -172,9 +172,9 @@ class MockGitHubAPI:
         """Alias for add_issue_comment"""
         return self.add_issue_comment(issue_number, body)
     
-    async def post_issue_comment(self, issue_number: int, body: str, repository: str = None) -> None:
+    async def post_issue_comment(self, issue_number: int, comment: str, repo: str = None, pipeline_run_id: str = None) -> None:
         """Async alias for add_issue_comment (matches GitHubIntegration API)"""
-        self.add_issue_comment(issue_number, body)
+        self.add_issue_comment(issue_number, comment)
     
     def get_comments(self, issue_number: int) -> List[Dict[str, Any]]:
         """Alias for get_issue_comments"""
