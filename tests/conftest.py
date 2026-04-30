@@ -418,8 +418,10 @@ def _purge_test_data():
 
 def _purge_elasticsearch():
     try:
+        import os
         from elasticsearch import Elasticsearch
-        es = Elasticsearch("http://localhost:9200", request_timeout=5)
+        es_url = os.environ.get("ELASTICSEARCH_URL", "http://elasticsearch:9200")
+        es = Elasticsearch(es_url, request_timeout=5)
         if not es.ping():
             return
         query = {"query": {"terms": {"project": _TEST_PROJECT_NAMES}}}
@@ -439,8 +441,12 @@ def _purge_elasticsearch():
 
 def _purge_redis():
     try:
+        import os
         import redis as redis_lib
-        r = redis_lib.Redis(host="localhost", port=6379, socket_timeout=2)
+        from urllib.parse import urlparse
+        redis_url = os.environ.get("REDIS_URL", "redis://redis:6379")
+        parsed = urlparse(redis_url)
+        r = redis_lib.Redis(host=parsed.hostname, port=parsed.port or 6379, socket_timeout=2)
         r.ping()
         for project in _TEST_PROJECT_NAMES:
             cursor = 0

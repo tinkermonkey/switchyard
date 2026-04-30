@@ -1614,6 +1614,28 @@ class DockerAgentRunner:
                             f"🔴 Container exited with code 1 but stderr contains only debug output. "
                             f"This indicates Claude Code failed without logging (likely rate limit)."
                         )
+
+                        # Check if a 529 overloaded_error was captured in the assistant event stream.
+                        # The Claude CLI emits API errors as assistant message text (valid JSON events),
+                        # which lands in result_parts — not in stderr_text — so the keyword checks
+                        # above miss it. Also scan STDOUT-prefixed lines in stderr_parts for the same
+                        # patterns (non-JSON path fallback).
+                        _overload_patterns = ('529', 'overloaded_error', 'authentication service is temporarily unavailable')
+                        _result_check = ''.join(result_parts).lower()
+                        _stdout_lines_check = ' '.join(
+                            line[len('STDOUT:'):].lower()
+                            for line in stderr_text.split('\n')
+                            if line.startswith('STDOUT:')
+                        )
+                        if any(p in _result_check or p in _stdout_lines_check for p in _overload_patterns):
+                            logger.error(
+                                "🔴 Anthropic API 529 overloaded_error detected in container output. "
+                                "Treating as transient API failure — no retries."
+                            )
+                            raise ClaudeCodeRateLimitError(
+                                "Anthropic API temporarily overloaded (529 overloaded_error). Retry the request."
+                            )
+
                         # If breaker is already open, we know it's a rate limit
                         if breaker.state == breaker.OPEN:
                             logger.error("🔴 Claude Code breaker is OPEN - rate limit confirmed")
