@@ -9,6 +9,7 @@ variables:
 All context files are at `/pipeline_context/`:
 - **`{maker_file}`** — what the maker implemented (primary source of truth)
 - **`current_diff.md`** — git changes since before the maker ran; use this to find the relevant files quickly
+- **`preflight_context.md`** (if present) — current `main`-branch state of changed files and selector registry, for drift detection
 - `initial_request.md` — original requirements to verify against
 {prev_feedback_note}- Earlier numbered files show the full iteration history
 

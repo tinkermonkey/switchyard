@@ -93,6 +93,10 @@ class PipelineContextWriter(AgentContextWriter):
         """Write (or overwrite) current_diff.md before each reviewer run."""
         self._write_file('current_diff.md', change_manifest or '')
 
+    def write_preflight_context(self, content: str):
+        """Write preflight_context.md for the code reviewer (current main-branch state)."""
+        self._write_file('preflight_context.md', content or '')
+
     def repopulate_review_cycle_from_state(
         self,
         issue: dict,

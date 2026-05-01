@@ -2057,6 +2057,10 @@ class ReviewCycleExecutor:
         # Ensure context writer is available (handles restart recovery automatically)
         self._ensure_context_writer(cycle_state, issue_data)
 
+        # Tracks lint-only repair turns separately from reviewer iterations (fix #3).
+        # None = no prior lint result; set to violation count on each lint-fail turn.
+        _lint_prev_violation_count = None
+
         while cycle_state.current_iteration < cycle_state.max_iterations:
             # Check cancellation before each iteration
             from services.cancellation import get_cancellation_signal, CancellationError
@@ -2119,6 +2123,131 @@ class ReviewCycleExecutor:
                     )
                 except Exception as e:
                     logger.warning(f"Failed to write current_diff to context dir: {e}")
+
+            # Mechanical lint gate — runs before LLM reviewer if enabled for this column
+            if getattr(column, 'pre_review_lint', False) and cycle_state.workspace_type == 'issues':
+                lint_result = self._run_mechanical_lint(cycle_state, review_task_context)
+                if not lint_result.passed:
+                    lint_comment = lint_result.failure.format_comment()
+                    current_violation_count = len(lint_result.failure.violations)
+
+                    # Stalemate detection: if violation count didn't decrease after a maker
+                    # repair, the maker can't fix these — escalate to human (fix #7).
+                    if _lint_prev_violation_count is not None and current_violation_count >= _lint_prev_violation_count:
+                        logger.warning(
+                            "Lint stalemate for issue #%s: %d violations did not decrease (was %d)",
+                            cycle_state.issue_number, current_violation_count, _lint_prev_violation_count,
+                        )
+                        stalemate_msg = (
+                            lint_comment +
+                            "\n\n---\n**Lint stalemate**: violation count did not decrease after "
+                            "maker revision. Human review required to unblock."
+                        )
+                        github = self._get_github_integration(cycle_state)
+                        await github.post_issue_comment(
+                            cycle_state.issue_number,
+                            stalemate_msg,
+                            cycle_state.repository,
+                            pipeline_run_id=cycle_state.pipeline_run_id,
+                        )
+                        cycle_state.status = 'awaiting_human_feedback'
+                        cycle_state.escalation_time = datetime.now().isoformat()
+                        self._save_cycle_state(cycle_state)
+                        try:
+                            from services.pipeline_run import get_pipeline_run_manager
+                            get_pipeline_run_manager().update_run_status(
+                                cycle_state.project_name, cycle_state.issue_number, "feedback_listening"
+                            )
+                        except Exception as _e:
+                            logger.warning("Failed to set feedback_listening for lint stalemate: %s", _e)
+                        return ReviewStatus.BLOCKED, column.name
+
+                    _lint_prev_violation_count = current_violation_count
+
+                    # Post structured lint failure comment and invoke maker to fix
+                    github = self._get_github_integration(cycle_state)
+                    await github.post_issue_comment(
+                        cycle_state.issue_number,
+                        lint_comment,
+                        cycle_state.repository,
+                        pipeline_run_id=cycle_state.pipeline_run_id,
+                    )
+
+                    # Snapshot HEAD before maker runs
+                    from services.project_workspace import workspace_manager as _wsm
+                    _pd = _wsm.get_project_dir(cycle_state.project_name)
+                    _commit = self._get_git_commit_hash(str(_pd))
+                    if _commit:
+                        cycle_state.pre_maker_commit = _commit
+                    self._save_cycle_state(cycle_state)
+
+                    maker_task_context = self._create_maker_revision_task_context(
+                        cycle_state,
+                        column,
+                        issue_data,
+                        lint_comment,
+                        iteration,
+                        full_discussion_context=fresh_context,
+                    )
+                    await self._execute_agent_directly(
+                        cycle_state.maker_agent,
+                        maker_task_context,
+                        cycle_state.project_name,
+                    )
+
+                    # Auto-commit maker's lint fixes
+                    from services.auto_commit import auto_commit_service
+                    from config.manager import config_manager as _cm
+                    _agent_config = _cm.get_project_agent_config(
+                        cycle_state.project_name, cycle_state.maker_agent
+                    )
+                    if getattr(_agent_config, 'makes_code_changes', False):
+                        await auto_commit_service.commit_agent_changes(
+                            project=cycle_state.project_name,
+                            agent=cycle_state.maker_agent,
+                            task_id=f"lint_fix_iter_{iteration}",
+                            issue_number=cycle_state.issue_number,
+                            custom_message=f"Fix mechanical lint violations (iteration {iteration})\n\nIssue #{cycle_state.issue_number}",
+                        )
+
+                    # Record maker's lint-fix output for audit trail (fix #6)
+                    maker_lint_comment = await self._get_latest_agent_comment(
+                        cycle_state.issue_number,
+                        cycle_state.repository,
+                        cycle_state.maker_agent,
+                        cycle_state.workspace_type,
+                        cycle_state.discussion_id,
+                        org,
+                    )
+                    if maker_lint_comment:
+                        cycle_state.maker_outputs.append({
+                            'iteration': iteration,
+                            'output': maker_lint_comment,
+                            'timestamp': datetime.now().isoformat(),
+                        })
+                        if cycle_state.context_writer:
+                            try:
+                                cycle_state.context_writer.write_maker_output(maker_lint_comment, iteration)
+                            except Exception as e:
+                                logger.warning("Failed to write lint-fix maker output to context dir: %s", e)
+                    self._save_cycle_state(cycle_state)
+
+                    logger.info(
+                        "Lint failed for issue #%s iter %s — maker invoked to fix, skipping LLM review",
+                        cycle_state.issue_number, iteration,
+                    )
+                    # Don't count this as a reviewer iteration (fix #3)
+                    cycle_state.current_iteration -= 1
+                    continue  # back to top of while loop
+
+                # Lint passed — fetch preflight context and attach to review context
+                _lint_prev_violation_count = None  # reset stalemate tracker on pass
+                preflight = self._fetch_preflight_context(cycle_state, review_task_context)
+                if preflight and cycle_state.context_writer:
+                    try:
+                        cycle_state.context_writer.write_preflight_context(preflight)  # fix #5
+                    except Exception as e:
+                        logger.warning("Could not write preflight_context.md: %s", e)
 
             # EMIT DECISION EVENT: Reviewer selected
             self.decision_events.emit_review_cycle_decision(
@@ -2558,6 +2687,130 @@ class ReviewCycleExecutor:
             f"- Full diff: `git diff {base_commit[:8]} HEAD`\n"
             f"- Single file: `git diff {base_commit[:8]} HEAD -- <path/to/file>`"
         )
+
+    def _run_mechanical_lint(
+        self,
+        cycle_state: 'ReviewCycleState',
+        review_task_context: Dict[str, Any],
+    ) -> 'LintResult':
+        """Run the mechanical lint gate before LLM review."""
+        from services.code_review_lint import CodeReviewLintRunner, LintResult
+        from services.code_review_lint.config import LintConfig
+        from config.manager import config_manager
+        from services.project_workspace import workspace_manager
+
+        project_dir = workspace_manager.get_project_dir(cycle_state.project_name)
+        project_config = config_manager.get_project_config(cycle_state.project_name)
+        lint_config_data = getattr(project_config, 'code_review_lint', None) or {}
+        lint_config = LintConfig.from_dict(lint_config_data) if lint_config_data else LintConfig()
+
+        base_commit = cycle_state.pre_maker_commit or 'HEAD~1'
+        change_manifest = review_task_context.get('change_manifest', '')
+
+        runner = CodeReviewLintRunner(lint_config=lint_config, project_dir=str(project_dir))
+        result = runner.run(base_commit=base_commit, change_manifest=change_manifest)
+        if result.passed:
+            logger.info("Lint passed for issue #%s", cycle_state.issue_number)
+        else:
+            logger.warning(
+                "Lint failed for issue #%s: %d violation(s)",
+                cycle_state.issue_number,
+                len(result.failure.violations),
+            )
+        return result
+
+    def _get_default_branch(self, project_dir: str) -> str:
+        """Detect the project's default remote branch via git, falling back to 'main'."""
+        import subprocess
+        try:
+            result = subprocess.run(
+                ['git', 'symbolic-ref', 'refs/remotes/origin/HEAD'],
+                cwd=project_dir, capture_output=True, text=True, check=True,
+            )
+            branch = result.stdout.strip().split('/')[-1]
+            return branch if branch else 'main'
+        except Exception:
+            return 'main'
+
+    def _fetch_preflight_context(
+        self,
+        cycle_state: 'ReviewCycleState',
+        review_task_context: Dict[str, Any],
+    ) -> str:
+        """Fetch current main-branch state of changed files for the LLM reviewer."""
+        import subprocess
+        from pathlib import Path
+        from config.manager import config_manager
+        from services.code_review_lint.config import LintConfig
+        from services.project_workspace import workspace_manager
+
+        project_config = config_manager.get_project_config(cycle_state.project_name)
+        lint_config_data = getattr(project_config, 'code_review_lint', None) or {}
+        lint_config = LintConfig.from_dict(lint_config_data) if lint_config_data else LintConfig()
+
+        if not lint_config.pre_flight_context_fetch:
+            return ""
+
+        project_dir = Path(str(workspace_manager.get_project_dir(cycle_state.project_name)))
+        base_commit = cycle_state.pre_maker_commit or 'HEAD~1'
+
+        try:
+            result = subprocess.run(
+                ['git', 'diff', '--name-only', base_commit, 'HEAD'],
+                cwd=str(project_dir), capture_output=True, text=True, check=True,
+            )
+            changed_files = [f.strip() for f in result.stdout.splitlines() if f.strip()]
+        except Exception as e:
+            logger.warning("Pre-flight context: could not get changed files: %s", e)
+            return ""
+
+        if not changed_files:
+            return ""
+
+        sections = []
+        default_branch = self._get_default_branch(str(project_dir))
+
+        # Current default-branch state of changed files (capped to avoid huge context)
+        elided = max(0, len(changed_files) - 8)
+        for file_path in changed_files[:8]:
+            try:
+                r = subprocess.run(
+                    ['git', 'show', f'{default_branch}:{file_path}'],
+                    cwd=str(project_dir), capture_output=True, text=True,
+                )
+                if r.returncode == 0 and r.stdout.strip():
+                    preview = r.stdout[:2000]
+                    sections.append(f"### `{file_path}` (HEAD on `{default_branch}`)\n```\n{preview}\n```")
+            except Exception:
+                pass
+
+        # Selector registry
+        if lint_config.selector_registry_path:
+            reg_path = project_dir / lint_config.selector_registry_path
+            if reg_path.exists():
+                try:
+                    content = reg_path.read_text(encoding='utf-8', errors='replace')[:4000]
+                    sections.append(
+                        f"### Selector Registry (`{lint_config.selector_registry_path}`)\n```\n{content}\n```"
+                    )
+                except Exception:
+                    pass
+
+        if elided:
+            logger.info(
+                "Pre-flight context: emitting %d of %d changed files (%d elided)",
+                min(8, len(changed_files)), len(changed_files), elided,
+            )
+
+        # Generated types paths (informational)
+        if lint_config.generated_types_paths:
+            paths_list = ', '.join(f'`{p}`' for p in lint_config.generated_types_paths)
+            sections.append(f"### Generated types paths: {paths_list}")
+
+        if not sections:
+            return ""
+
+        return "## Pre-flight Context (current `main` state)\n\n" + "\n\n".join(sections)
 
     def _create_review_task_context(
         self,

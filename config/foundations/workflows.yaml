@@ -166,6 +166,7 @@ workflow_templates:
         max_iterations: 5
         auto_advance_on_approval: true
         escalate_on_blocked: true
+        pre_review_lint: false
         description: "Code quality validation"
         automation_rules:
           - trigger: "item_moved_to_column"

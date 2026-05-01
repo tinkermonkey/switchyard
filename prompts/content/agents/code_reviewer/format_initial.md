@@ -46,4 +46,9 @@ Follow the formatting guidance closely.
 
 #### High Priority (Should Fix)
 - **[Issue Title]**: [Description and recommendation]
+
+### Source Artefact Updates
+If the implementation diverges from the issue body in a correct/intentional way, list proposed edits here:
+- **Issue body**: [Proposed edit to reflect the actual implementation]
+If no updates needed, write "None".
 ```

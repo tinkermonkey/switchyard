@@ -82,6 +82,7 @@ class WorkflowColumn:
     max_iterations: int = 3  # For review columns: max revision cycles
     auto_advance_on_approval: bool = False  # Must be explicitly enabled per-column
     escalate_on_blocked: bool = True  # For review columns: escalate blocking issues
+    pre_review_lint: bool = False  # Run mechanical lint gate before LLM reviewer
 
 
 @dataclass
@@ -139,6 +140,7 @@ class ProjectConfig:
     orchestrator: Dict[str, Any] = None
     hidden: bool = False  # Hide from UI and monitoring
     reference_repos: List[ReferenceRepo] = None  # Read-only repos mounted at agent launch via git worktrees
+    code_review_lint: Optional[Dict[str, Any]] = None  # Pre-review mechanical lint configuration
 
 
 class ConfigurationError(Exception):
@@ -303,7 +305,8 @@ class ConfigManager:
                     maker_agent=column_data.get('maker_agent'),
                     max_iterations=column_data.get('max_iterations', 3),
                     auto_advance_on_approval=column_data.get('auto_advance_on_approval', False),
-                    escalate_on_blocked=column_data.get('escalate_on_blocked', True)
+                    escalate_on_blocked=column_data.get('escalate_on_blocked', True),
+                    pre_review_lint=column_data.get('pre_review_lint', False)
                 ))
 
             templates[name] = WorkflowTemplate(
@@ -386,6 +389,7 @@ class ConfigManager:
             orchestrator=data.get('orchestrator', {}),
             hidden=project_data.get('hidden', False),
             reference_repos=reference_repos,
+            code_review_lint=project_data.get('code_review_lint'),
         )
 
     def get_agents(self) -> Dict[str, AgentConfig]:
