@@ -165,7 +165,7 @@ workflow_templates:
         maker_agent: "senior_software_engineer"
         max_iterations: 5
         auto_advance_on_approval: true
-        escalate_on_blocked: false
+        escalate_on_blocked: true
         pre_review_lint: false
         description: "Code quality validation"
         automation_rules:
