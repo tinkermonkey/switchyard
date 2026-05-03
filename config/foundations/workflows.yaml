@@ -123,6 +123,8 @@ workflow_templates:
             parameters:
               labels: ["status:completed"]
 
+  # SISTER WORKFLOW: codetoreum_sdlc_execution_workflow is a copy of this workflow
+  # with escalate_on_blocked: false on Code Review. Keep columns in sync.
   sdlc_execution_workflow:
     name: "SDLC Execution Workflow"
     description: "Implementation-focused workflow for sub-issues"
@@ -213,10 +215,12 @@ workflow_templates:
             parameters:
               labels: ["status:completed"]
 
-  # Codetoreum variant: escalate_on_blocked disabled so blocking reviewer feedback
-  # cycles through the maker rather than immediately escalating to human.
+  # Codetoreum variant of sdlc_execution_workflow: escalate_on_blocked disabled
+  # so blocking reviewer feedback cycles through the maker rather than escalating.
+  # SISTER WORKFLOW: keep columns in sync with sdlc_execution_workflow above;
+  # only escalate_on_blocked on the Code Review column intentionally differs.
   codetoreum_sdlc_execution_workflow:
-    name: "SDLC Execution Workflow"
+    name: "SDLC Execution Workflow (Codetoreum)"
     description: "Implementation-focused workflow for sub-issues"
     pipeline_mapping: "sdlc_execution"
     pipeline_trigger_columns:
