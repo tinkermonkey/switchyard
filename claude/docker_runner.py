@@ -637,6 +637,7 @@ class DockerAgentRunner:
         # Get agent config to check filesystem write permission
         # Fall back to context-provided agent_config for system-level agents that don't
         # belong to a project config file (raises ConfigurationError for unknown projects).
+        agent_config = None
         try:
             from config.manager import config_manager, ConfigurationError
             agent_config = config_manager.get_project_agent_config(context.get('project', 'unknown'), agent)
@@ -852,8 +853,13 @@ class DockerAgentRunner:
             cmd.extend(['-e', f'{k}={v}'])
 
         # Special handling for dev_environment_setup agent: mount Docker socket for image building
-        if agent == 'dev_environment_setup':
-            logger.info("Mounting Docker socket for dev_environment_setup agent")
+        # Also mount when agent_config.docker_socket_access is set (project-level override)
+        # SECURITY: Docker socket = host root equivalent. Only enable for tightly scoped agents.
+        if agent == 'dev_environment_setup' or getattr(agent_config, 'docker_socket_access', False):
+            if agent != 'dev_environment_setup':
+                logger.warning("Mounting Docker socket for %s agent — host root equivalent access granted", agent)
+            else:
+                logger.info("Mounting Docker socket for %s agent", agent)
             # The orchestrator user is already part of the docker group (see Dockerfile)
             # This allows Docker socket access without requiring root
             cmd.extend([

@@ -35,6 +35,7 @@ class AgentConfig:
     requires_dev_container: bool = False
     requires_docker: bool = True  # CRITICAL: Default to True for security, only dev_environment_setup should be False
     filesystem_write_allowed: bool = True  # Default to True for backward compatibility
+    docker_socket_access: bool = False  # SECURITY: Mounts /var/run/docker.sock — host root equivalent. Never enable for agents that accept untrusted input.
     circuit_breaker_config: Optional[Dict[str, Any]] = None  # Custom circuit breaker settings
 
 
@@ -241,6 +242,7 @@ class ConfigManager:
                 requires_dev_container=config.get('requires_dev_container', False),
                 requires_docker=config.get('requires_docker', True),  # Default True for security
                 filesystem_write_allowed=config.get('filesystem_write_allowed', True),
+                docker_socket_access=config.get('docker_socket_access', False),
                 circuit_breaker_config=config.get('circuit_breaker', None)
             )
 
@@ -326,6 +328,17 @@ class ConfigManager:
         data = self._load_yaml(project_file)
 
         project_data = data['project']
+
+        # Warn on unknown top-level keys — common mistake is placing project-level keys
+        # (like agent_customizations) outside the 'project:' block where the loader won't find them.
+        _known_top_level = {'project', 'orchestrator'}
+        _unknown = set(data.keys()) - _known_top_level
+        if _unknown:
+            logger.warning(
+                "Project config %s has unrecognised top-level keys %s — "
+                "did you mean to nest them under 'project:'?",
+                project_name, sorted(_unknown)
+            )
 
         # Parse pipeline configurations
         pipelines = []
@@ -460,6 +473,7 @@ class ConfigManager:
             requires_dev_container=base_agent.requires_dev_container,
             requires_docker=base_agent.requires_docker,
             filesystem_write_allowed=customizations.get('filesystem_write_allowed', base_agent.filesystem_write_allowed),
+            docker_socket_access=customizations.get('docker_socket_access', base_agent.docker_socket_access),
             circuit_breaker_config=base_agent.circuit_breaker_config
         )
 

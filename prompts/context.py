@@ -120,6 +120,11 @@ class PromptContext:
     # Empty string when no reference repos are configured (section is omitted).
     reference_repos_section: str = ""
 
+    # ── Docker socket access ──────────────────────────────────────────────────
+    # Pre-rendered section injected when the agent has docker_socket_access enabled.
+    # Empty string when not enabled (section is omitted).
+    docker_socket_section: str = ""
+
     # ─────────────────────────────────────────────────────────────────────────
     # Factory
     # ─────────────────────────────────────────────────────────────────────────
@@ -230,6 +235,9 @@ class PromptContext:
             reference_repos_section=cls._build_reference_repos_section(
                 task_context.get("project", "")
             ),
+            docker_socket_section=cls._build_docker_socket_section(
+                task_context.get("project", ""), agent_name
+            ),
         )
 
     @staticmethod
@@ -252,4 +260,20 @@ class PromptContext:
             return template.format(entries=entries) if template else ""
         except Exception:
             logger.debug("Could not build reference_repos_section for project %r", project, exc_info=True)
+            return ""
+
+    @staticmethod
+    def _build_docker_socket_section(project: str, agent_name: str) -> str:
+        """Return the docker socket access section if enabled for this agent, or empty string."""
+        if not project or not agent_name:
+            return ""
+        try:
+            from config.manager import config_manager
+            agent_config = config_manager.get_project_agent_config(project, agent_name)
+            if not getattr(agent_config, 'docker_socket_access', False):
+                return ""
+            from prompts.loader import default_loader
+            return default_loader.workflow_template("context/docker_socket_access") or ""
+        except Exception:
+            logger.debug("Could not build docker_socket_section for project %r agent %r", project, agent_name, exc_info=True)
             return ""

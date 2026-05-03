@@ -60,7 +60,8 @@ class PromptBuilder:
         else:
             prompt = self._build_initial(ctx)
 
-        return self._append_reference_repos(prompt, ctx)
+        prompt = self._append_reference_repos(prompt, ctx)
+        return self._append_docker_socket(prompt, ctx)
 
     # ── Specialised builders used by standalone agents ─────────────────────
 
@@ -73,6 +74,18 @@ class PromptBuilder:
         """
         from prompts.context import PromptContext as _PC
         section = ctx.reference_repos_section or _PC._build_reference_repos_section(ctx.project)
+        if section:
+            return prompt + "\n\n" + section
+        return prompt
+
+    def _append_docker_socket(self, prompt: str, ctx: "PromptContext") -> str:
+        """Append the docker socket access section when the agent has it enabled.
+
+        Uses ctx.docker_socket_section when already populated (agents using from_task_context).
+        Falls back to computing it from ctx.project/agent_name for agents that construct PromptContext directly.
+        """
+        from prompts.context import PromptContext as _PC
+        section = ctx.docker_socket_section or _PC._build_docker_socket_section(ctx.project, ctx.agent_name)
         if section:
             return prompt + "\n\n" + section
         return prompt
