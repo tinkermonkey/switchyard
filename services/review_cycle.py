@@ -1585,13 +1585,15 @@ class ReviewCycleExecutor:
 
                 # Do not increment iteration here - let the review loop handle it
                 # cycle_state.current_iteration += 1
-                cycle_state.status = 'initialized'  # Ready for next review iteration
-                self._save_cycle_state(cycle_state)
 
-                logger.info(f"Maker completed revision, cycle ready for next iteration (now {cycle_state.current_iteration + 1})")
-
-                # The cycle is now ready for the next review iteration
-                # Project monitor will pick it up in the next polling cycle
+                logger.info(
+                    f"Maker completed revision after human feedback for issue "
+                    f"#{cycle_state.issue_number} (iteration {cycle_state.current_iteration}), "
+                    f"continuing review loop directly"
+                )
+                # Continue the loop directly — monitor_escalated_issue_cycles only polls
+                # for 'awaiting_human_feedback' and will never resume an 'initialized' cycle.
+                await self._execute_review_loop(cycle_state, column, issue_data, org)
 
         except Exception as e:
             logger.error(f"Failed to resume review cycle with feedback: {e}")
