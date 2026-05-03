@@ -123,8 +123,6 @@ workflow_templates:
             parameters:
               labels: ["status:completed"]
 
-  # SISTER WORKFLOW: codetoreum_sdlc_execution_workflow is a copy of this workflow
-  # with escalate_on_blocked: false on Code Review. Keep columns in sync.
   sdlc_execution_workflow:
     name: "SDLC Execution Workflow"
     description: "Implementation-focused workflow for sub-issues"
@@ -132,100 +130,6 @@ workflow_templates:
     pipeline_trigger_columns:  # Columns that trigger pipeline start (acquire lock)
       - "Development"
     pipeline_exit_columns:     # Columns that release the pipeline lock
-      - "Staged"
-      - "Done"
-    columns:
-      - name: "Backlog"
-        stage_mapping: null
-        agent: null
-        description: "Phase-specific implementation tasks"
-        automation_rules:
-          - trigger: "item_created"
-            action: "assign_label"
-            parameters:
-              labels: ["pipeline:sdlc-execution"]
-
-      - name: "Development"
-        stage_mapping: "implementation"
-        agent: "senior_software_engineer"
-        auto_advance_on_approval: true
-        description: "Code implementation"
-        automation_rules:
-          - trigger: "item_moved_to_column"
-            action: "assign_label"
-            parameters:
-              labels: ["stage:implementation"]
-          - trigger: "item_moved_to_column"
-            action: "start_pipeline_stage"
-            parameters:
-              stage: "implementation"
-
-      - name: "Code Review"
-        type: "review"
-        stage_mapping: "implementation_review"
-        agent: "code_reviewer"
-        maker_agent: "senior_software_engineer"
-        max_iterations: 5
-        auto_advance_on_approval: true
-        escalate_on_blocked: true
-        pre_review_lint: false
-        description: "Code quality validation"
-        automation_rules:
-          - trigger: "item_moved_to_column"
-            action: "assign_label"
-            parameters:
-              labels: ["stage:code-review"]
-          - trigger: "item_moved_to_column"
-            action: "start_review_cycle"
-            parameters:
-              stage: "implementation"
-
-      - name: "Testing"
-        stage_mapping: "testing"
-        agent: "senior_software_engineer"
-        auto_advance_on_approval: true
-        description: "Automated test-fix-validate repair cycle"
-        automation_rules:
-          - trigger: "item_moved_to_column"
-            action: "assign_label"
-            parameters:
-              labels: ["stage:testing"]
-          - trigger: "item_moved_to_column"
-            action: "start_pipeline_stage"
-            parameters:
-              stage: "testing"
-
-      - name: "Staged"
-        stage_mapping: null
-        agent: null
-        description: "Staged for production - manual human review and approval"
-        automation_rules:
-          - trigger: "item_moved_to_column"
-            action: "assign_label"
-            parameters:
-              labels: ["status:staged"]
-
-      - name: "Done"
-        stage_mapping: null
-        agent: null
-        description: "Completed implementation task"
-        automation_rules:
-          - trigger: "item_moved_to_column"
-            action: "assign_label"
-            parameters:
-              labels: ["status:completed"]
-
-  # Codetoreum variant of sdlc_execution_workflow: escalate_on_blocked disabled
-  # so blocking reviewer feedback cycles through the maker rather than escalating.
-  # SISTER WORKFLOW: keep columns in sync with sdlc_execution_workflow above;
-  # only escalate_on_blocked on the Code Review column intentionally differs.
-  codetoreum_sdlc_execution_workflow:
-    name: "SDLC Execution Workflow (Codetoreum)"
-    description: "Implementation-focused workflow for sub-issues"
-    pipeline_mapping: "sdlc_execution"
-    pipeline_trigger_columns:
-      - "Development"
-    pipeline_exit_columns:
       - "Staged"
       - "Done"
     columns:
