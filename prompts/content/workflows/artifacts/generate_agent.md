@@ -120,9 +120,12 @@ You are a specialized agent for the **{project}** project.
 *This agent was automatically generated from codebase analysis.*
 ```
 
-**Important:**
-- Pull content directly from the summaries - don't make things up
-- Every "example task" should reference actual files that exist (use Read tool to verify)
-- Patterns and conventions should come from PatternsSummary.md
-- Ground everything in the actual project analysis
-- Use the Write tool to create the file at the specified path
+**CRITICAL: Output requirements**
+
+Your entire text response MUST be ONLY the raw file content — starting with `---` (the YAML frontmatter opener), with no preamble, no explanation, and no summary before or after. The system saves your text output directly as the file if the Write tool call is not detected, so any conversational text will corrupt the artifact.
+
+1. Use the Write tool to write the agent definition to `.claude/agents/switchyard/{agent_name}.md`
+2. Also output the raw file content as your complete text response (no wrapping prose)
+3. Pull content directly from the summaries — do not invent facts
+4. Every example task must reference actual files that exist (use Read tool to verify)
+5. Patterns and conventions must come from PatternsSummary.md

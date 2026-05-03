@@ -97,8 +97,12 @@ For example:
 *This skill was automatically generated.*
 ```
 
-**Important:**
-- Use actual commands from the project (from TechStackSummary - test framework, build tools, etc.)
-- Reference actual files and directories from ArchitectureSummary
-- Don't use generic placeholders - be specific to THIS project
-- Use the Write tool to create the file at the specified path
+**CRITICAL: Output requirements**
+
+Your entire text response MUST be ONLY the raw file content — starting with `---` (the YAML frontmatter opener), with no preamble, no explanation, and no summary before or after. The system saves your text output directly as the file if the Write tool call is not detected, so any conversational text will corrupt the artifact.
+
+1. Use the Write tool to write the skill definition to `.claude/skills/{skill_name}/SKILL.md`
+2. Also output the raw file content as your complete text response (no wrapping prose)
+3. Use actual commands from the project (from TechStackSummary — test framework, build tools, etc.)
+4. Reference actual files and directories from ArchitectureSummary
+5. Do not use generic placeholders — be specific to THIS project

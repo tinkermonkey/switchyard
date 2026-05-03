@@ -89,6 +89,108 @@ def validate_artifact_name(name: str, artifact_type: str):
         raise ValueError(f"Invalid {artifact_type} name '{name}': too long (max 200 chars)")
 
 
+
+def _extract_artifact_content(result: str) -> str:
+    """
+    Extract artifact file content from Claude's text response.
+
+    Claude may wrap the file content in a fenced code block with any language tag.
+    Finds the first such block whose content starts with YAML frontmatter (---).
+    Falls back to the raw result so _validate_artifact_content can produce a clear error.
+    """
+    content = result.strip()
+
+    # Match any fenced code block regardless of language tag
+    for block in re.findall(r'```[^\n]*\n(.*?)\n```', content, re.DOTALL):
+        stripped = block.strip()
+        if stripped.startswith('---'):
+            return stripped
+
+    # Content may start directly with frontmatter (no code block)
+    if content.startswith('---'):
+        return content
+
+    # Return as-is so validation produces a clear error
+    return content
+
+
+def _parse_frontmatter(content: str):
+    """
+    Parse YAML frontmatter from a string using PyYAML.
+
+    Returns (frontmatter_dict, body_str). The closing --- must be a line by itself.
+    Raises ValueError on structural or parse errors.
+    """
+    import yaml
+
+    lines = content.split('\n')
+    end_idx = None
+    for i in range(1, len(lines)):
+        if lines[i].strip() == '---':
+            end_idx = i
+            break
+
+    if end_idx is None:
+        raise ValueError("YAML frontmatter is not closed — no closing '---' line found")
+
+    frontmatter_str = '\n'.join(lines[1:end_idx])
+    body = '\n'.join(lines[end_idx + 1:]).strip()
+
+    try:
+        frontmatter = yaml.safe_load(frontmatter_str) or {}
+    except yaml.YAMLError as e:
+        raise ValueError(f"YAML frontmatter is invalid: {e}") from e
+
+    if not isinstance(frontmatter, dict):
+        raise ValueError(
+            f"YAML frontmatter parsed as {type(frontmatter).__name__}, expected a mapping"
+        )
+
+    return frontmatter, body
+
+
+def _validate_artifact_content(content: str, artifact_type: str, name: str) -> None:
+    """
+    Validate that content is a proper agent/skill definition with YAML frontmatter.
+
+    Raises ValueError when content looks like Claude's conversational output
+    rather than a structured file definition.
+    """
+    if not content:
+        raise ValueError(f"{artifact_type} '{name}': empty content")
+
+    if not content.startswith('---'):
+        raise ValueError(
+            f"{artifact_type} '{name}': content does not start with YAML frontmatter (---).\n"
+            f"Claude returned conversational text instead of the file definition.\n"
+            f"Got: {content[:200]!r}"
+        )
+
+    try:
+        frontmatter, body = _parse_frontmatter(content)
+    except ValueError as e:
+        raise ValueError(f"{artifact_type} '{name}': {e}") from e
+
+    for field in ('name', 'description'):
+        if not frontmatter.get(field):
+            raise ValueError(
+                f"{artifact_type} '{name}': frontmatter missing required '{field}' field"
+            )
+
+    actual_name = str(frontmatter['name'])
+    if actual_name != name:
+        raise ValueError(
+            f"{artifact_type} '{name}': frontmatter name '{actual_name}' "
+            f"does not match expected name '{name}'"
+        )
+
+    if len(body) < 200:
+        raise ValueError(
+            f"{artifact_type} '{name}': body too short ({len(body)} chars) — "
+            f"a useful system prompt needs at least 200 characters"
+        )
+
+
 async def generate_agent(
     project: str,
     agent_spec: Dict[str, Any],
@@ -159,11 +261,13 @@ async def generate_agent(
     try:
         result = await run_claude_code(prompt, context)
 
-        # Claude should have created the file, but verify it exists
-        if not agent_file.exists():
-            # If Claude didn't create it, write the returned content
+        if agent_file.exists():
+            _validate_artifact_content(agent_file.read_text(), 'agent', agent_spec['name'])
+        else:
+            content = _extract_artifact_content(result)
+            _validate_artifact_content(content, 'agent', agent_spec['name'])
             agent_file.parent.mkdir(parents=True, exist_ok=True)
-            agent_file.write_text(result)
+            agent_file.write_text(content)
 
         logger.info(f"  ✓ Generated agent: {agent_file.name}")
         return agent_file
@@ -241,11 +345,13 @@ async def generate_skill(
     try:
         result = await run_claude_code(prompt, context)
 
-        # Claude should have created the file, but verify it exists
-        if not skill_file.exists():
-            # If Claude didn't create it, write the returned content
+        if skill_file.exists():
+            _validate_artifact_content(skill_file.read_text(), 'skill', skill_spec['name'])
+        else:
+            content = _extract_artifact_content(result)
+            _validate_artifact_content(content, 'skill', skill_spec['name'])
             skill_file.parent.mkdir(parents=True, exist_ok=True)
-            skill_file.write_text(result)
+            skill_file.write_text(content)
 
         logger.info(f"  ✓ Generated skill: {skill_dir.name}")
         return skill_dir
