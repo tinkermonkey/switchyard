@@ -160,3 +160,32 @@ class TestResetReviewCount:
 
         with pytest.raises(Exception):
             manager.get_review_count("corrupt-project", 42)
+
+
+class TestGetFeedbackIssueIdsByCycle:
+    def test_returns_empty_for_unknown_issue(self, manager):
+        result = manager.get_feedback_issue_ids_by_cycle("my-project", 99)
+        assert result == {}
+
+    def test_returns_empty_when_no_issues_created(self, manager):
+        manager.increment_review_count("my-project", 42, [])
+        result = manager.get_feedback_issue_ids_by_cycle("my-project", 42)
+        assert result == {}
+
+    def test_returns_ids_grouped_by_cycle(self, manager):
+        manager.increment_review_count("my-project", 42, [101, 102])
+        manager.increment_review_count("my-project", 42, [103])
+        result = manager.get_feedback_issue_ids_by_cycle("my-project", 42)
+        assert result == {1: [101, 102], 2: [103]}
+
+    def test_skips_cycles_with_no_issues(self, manager):
+        manager.increment_review_count("my-project", 42, [101])
+        manager.increment_review_count("my-project", 42, [])
+        result = manager.get_feedback_issue_ids_by_cycle("my-project", 42)
+        assert result == {1: [101]}
+
+    def test_isolated_per_issue(self, manager):
+        manager.increment_review_count("my-project", 42, [10])
+        manager.increment_review_count("my-project", 55, [20, 21])
+        assert manager.get_feedback_issue_ids_by_cycle("my-project", 42) == {1: [10]}
+        assert manager.get_feedback_issue_ids_by_cycle("my-project", 55) == {1: [20, 21]}

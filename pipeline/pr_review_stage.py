@@ -617,6 +617,7 @@ class PRReviewStage(PipelineStage):
             else:
                 # Clean pass - advance to Done
                 logger.info(f"Clean pass for #{parent_issue_number}, advancing to Done")
+                self._emit_pr_review_outcome(project_name, parent_issue_number, repo, pipeline_run_id)
                 pr_review_state_manager.increment_review_count(project_name, parent_issue_number, [])
                 self._advance_parent_to_documentation(project_name, parent_issue_number)
                 manual_progression_made = True
@@ -1541,6 +1542,72 @@ class PRReviewStage(PipelineStage):
             })
 
         return issues
+
+    def _query_feedback_issue_states(self, repo: str, issue_numbers: List[int]) -> Dict[int, str]:
+        """Return a map of issue_number → 'open'|'closed'|'unknown' for each issue."""
+        states: Dict[int, str] = {}
+        for num in issue_numbers:
+            try:
+                result = subprocess.run(
+                    ['gh', 'issue', 'view', str(num), '-R', repo, '--json', 'state'],
+                    capture_output=True, text=True, timeout=15
+                )
+                if result.returncode == 0:
+                    states[num] = json.loads(result.stdout).get('state', 'UNKNOWN').lower()
+                else:
+                    states[num] = 'unknown'
+            except Exception as e:
+                logger.warning(f"Failed to query state for issue #{num}: {e}")
+                states[num] = 'unknown'
+        return states
+
+    def _emit_pr_review_outcome(
+        self,
+        project_name: str,
+        parent_issue_number: int,
+        repo: str,
+        pipeline_run_id: Optional[str]
+    ):
+        """Query GitHub state of all prior feedback issues and emit outcome tracking event."""
+        from monitoring.decision_events import get_decision_event_emitter
+
+        issues_by_cycle = pr_review_state_manager.get_feedback_issue_ids_by_cycle(
+            project_name, parent_issue_number
+        )
+        all_issue_ids = [num for ids in issues_by_cycle.values() for num in ids]
+
+        if not all_issue_ids:
+            get_decision_event_emitter().emit_pr_review_outcome_tracking(
+                project=project_name,
+                parent_issue_number=parent_issue_number,
+                total_issues_created=0,
+                issues_closed=0,
+                issues_open=0,
+                issues_per_cycle={},
+                pipeline_run_id=pipeline_run_id
+            )
+            return
+
+        states = self._query_feedback_issue_states(repo, all_issue_ids)
+        issues_closed = sum(1 for s in states.values() if s == 'closed')
+        issues_open = sum(1 for s in states.values() if s == 'open')
+        issues_unknown = sum(1 for s in states.values() if s == 'unknown')
+        issues_per_cycle = {cycle: len(ids) for cycle, ids in issues_by_cycle.items()}
+
+        get_decision_event_emitter().emit_pr_review_outcome_tracking(
+            project=project_name,
+            parent_issue_number=parent_issue_number,
+            total_issues_created=len(all_issue_ids),
+            issues_closed=issues_closed,
+            issues_open=issues_open,
+            issues_unknown=issues_unknown,
+            issues_per_cycle=issues_per_cycle,
+            pipeline_run_id=pipeline_run_id
+        )
+        logger.info(
+            f"PR review outcome: #{parent_issue_number} — "
+            f"{len(all_issue_ids)} total issues, {issues_closed} closed, {issues_open} open"
+        )
 
     def _post_comment_on_issue(self, repo: str, issue_number: int, comment: str, pipeline_run_id: Optional[str] = None):
         """Post a comment on a GitHub issue."""

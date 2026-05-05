@@ -155,6 +155,20 @@ class PRReviewStateManager:
             f"Marked cycle limit as notified for {project_name} #{parent_issue_number}"
         )
 
+    def get_feedback_issue_ids_by_cycle(
+        self, project_name: str, parent_issue_number: int
+    ) -> Dict[int, List[int]]:
+        """Return all feedback issue IDs grouped by review cycle number."""
+        data = self._load_state(project_name)
+        issue_data = data.get("pr_reviews", {}).get(parent_issue_number, {})
+        result: Dict[int, List[int]] = {}
+        for iteration in issue_data.get("iterations", []):
+            cycle = iteration.get("iteration", 0)
+            ids = iteration.get("issues_created", [])
+            if ids:
+                result[cycle] = ids
+        return result
+
 
 # Global instance
 pr_review_state_manager = PRReviewStateManager()

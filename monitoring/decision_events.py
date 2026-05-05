@@ -1519,6 +1519,52 @@ class DecisionEventEmitter:
             pipeline_run_id=pipeline_run_id
         )
 
+    def emit_pr_review_outcome_tracking(
+        self,
+        project: str,
+        parent_issue_number: int,
+        total_issues_created: int,
+        issues_closed: int,
+        issues_open: int,
+        issues_per_cycle: Dict[int, int],
+        issues_unknown: int = 0,
+        pipeline_run_id: Optional[str] = None
+    ):
+        """
+        Emit outcome tracking event when a PR review cycle completes with a clean pass.
+
+        Captures the final state of all [PR Feedback] sub-issues created across all
+        prior review cycles so we can measure whether the review cycle produced
+        meaningful, actionable issues.
+
+        Args:
+            project: Project name
+            parent_issue_number: Parent issue number
+            total_issues_created: Total feedback issues created across all cycles
+            issues_closed: Count of those issues now closed on GitHub
+            issues_open: Count of those issues still open on GitHub
+            issues_per_cycle: Number of issues created per cycle number
+            issues_unknown: Count whose GitHub state could not be determined
+            pipeline_run_id: Pipeline run ID for traceability
+        """
+        task_id = f"pr_review_outcome_{project}_{parent_issue_number}"
+        self.obs.emit(
+            EventType.PR_REVIEW_OUTCOME_TRACKING,
+            agent="orchestrator",
+            task_id=task_id,
+            project=project,
+            data={
+                'decision_category': 'pr_review_outcome',
+                'parent_issue': parent_issue_number,
+                'total_issues_created': total_issues_created,
+                'issues_closed': issues_closed,
+                'issues_open': issues_open,
+                'issues_unknown': issues_unknown,
+                'issues_per_cycle': issues_per_cycle,
+            },
+            pipeline_run_id=pipeline_run_id
+        )
+
 
 # Singleton getter for convenience
 _decision_event_emitter: Optional[DecisionEventEmitter] = None

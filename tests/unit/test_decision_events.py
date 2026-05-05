@@ -871,3 +871,71 @@ class TestGetDecisionEventEmitter:
         emitter2 = get_decision_event_emitter()
         
         assert emitter1 is emitter2
+
+
+class TestEmitPRReviewOutcomeTracking:
+    @pytest.fixture
+    def mock_obs(self):
+        mock = Mock(spec=ObservabilityManager)
+        mock.emit = Mock()
+        return mock
+
+    @pytest.fixture
+    def emitter(self, mock_obs):
+        return DecisionEventEmitter(mock_obs)
+
+    def test_emits_correct_event_type(self, emitter, mock_obs):
+        emitter.emit_pr_review_outcome_tracking(
+            project="my-project",
+            parent_issue_number=42,
+            total_issues_created=5,
+            issues_closed=3,
+            issues_open=2,
+            issues_per_cycle={1: 3, 2: 2},
+        )
+        assert mock_obs.emit.called
+        assert mock_obs.emit.call_args[0][0] == EventType.PR_REVIEW_OUTCOME_TRACKING
+
+    def test_event_data_contains_counts(self, emitter, mock_obs):
+        emitter.emit_pr_review_outcome_tracking(
+            project="my-project",
+            parent_issue_number=42,
+            total_issues_created=5,
+            issues_closed=2,
+            issues_open=2,
+            issues_per_cycle={1: 4},
+            issues_unknown=1,
+        )
+        data = mock_obs.emit.call_args[1]["data"]
+        assert data["total_issues_created"] == 5
+        assert data["issues_closed"] == 2
+        assert data["issues_open"] == 2
+        assert data["issues_unknown"] == 1
+        assert data["issues_per_cycle"] == {1: 4}
+        assert data["parent_issue"] == 42
+
+    def test_zero_issues_emits_cleanly(self, emitter, mock_obs):
+        emitter.emit_pr_review_outcome_tracking(
+            project="my-project",
+            parent_issue_number=7,
+            total_issues_created=0,
+            issues_closed=0,
+            issues_open=0,
+            issues_per_cycle={},
+        )
+        assert mock_obs.emit.called
+        data = mock_obs.emit.call_args[1]["data"]
+        assert data["total_issues_created"] == 0
+        assert data["issues_per_cycle"] == {}
+
+    def test_pipeline_run_id_forwarded(self, emitter, mock_obs):
+        emitter.emit_pr_review_outcome_tracking(
+            project="p",
+            parent_issue_number=1,
+            total_issues_created=0,
+            issues_closed=0,
+            issues_open=0,
+            issues_per_cycle={},
+            pipeline_run_id="run-xyz",
+        )
+        assert mock_obs.emit.call_args[1]["pipeline_run_id"] == "run-xyz"
