@@ -80,6 +80,7 @@ class ClaudeEnvironmentBuilder:
 
         if oauth:
             vars["CLAUDE_CODE_OAUTH_TOKEN"] = oauth
+            vars["ANTHROPIC_API_KEY"] = ""  # clear any image-layer placeholder
             logger.info("Using CLAUDE_CODE_OAUTH_TOKEN (subscription billing)")
         elif api_key:
             vars["ANTHROPIC_API_KEY"] = api_key
