@@ -111,7 +111,9 @@ class RepairTestResult:
 
     def has_failures(self) -> bool:
         """Check if there are any test failures"""
-        return self.failed > 0
+        # Also check failures list because infrastructure sentinels use failed=0
+        # to distinguish from real test failure counts, but are still failures.
+        return self.failed > 0 or len(self.failures) > 0
 
     def has_warnings(self) -> bool:
         """Check if there are actionable warnings to review"""
@@ -1137,7 +1139,7 @@ class RepairCycleStage(PipelineStage):
                         test_type=config.test_type,
                         iteration=test_cycle_iteration,
                         passed=0,
-                        failed=0,  # 0 instead of 999 to indicate infrastructure failure
+                        failed=1,
                         warnings=0,
                         failures=[
                             RepairTestFailure(
@@ -1179,7 +1181,7 @@ class RepairCycleStage(PipelineStage):
                         test_type=config.test_type,
                         iteration=test_cycle_iteration,
                         passed=0,
-                        failed=0,
+                        failed=1,
                         warnings=0,
                         failures=[
                             RepairTestFailure(
@@ -1198,7 +1200,7 @@ class RepairCycleStage(PipelineStage):
             test_type=config.test_type,
             iteration=test_cycle_iteration,
             passed=0,
-            failed=0,
+            failed=1,
             warnings=0,
             failures=[
                 RepairTestFailure(

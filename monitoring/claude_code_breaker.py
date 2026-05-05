@@ -378,16 +378,14 @@ def check_breaker_before_agent_execution(agent_name: str) -> Tuple[bool, Optiona
     """
     Check if agent can be executed given current breaker state.
 
-    TEMPORARILY DISABLED: Always returns True while working on better detection.
+    Returns (False, error_message) if the breaker is open or half-open,
+    blocking execution. Returns (True, None) when the breaker is closed.
 
     Returns:
         Tuple of (can_execute, error_message)
     """
-    # TEMPORARY: Disable circuit breaker while working on better detection
-    # The breaker will still track state and log detections, but won't block execution
     breaker = get_breaker()
 
-    # Log detection but don't block
     if breaker.is_open() or breaker.is_half_open():
         reset_time = breaker.reset_time
         if reset_time:
