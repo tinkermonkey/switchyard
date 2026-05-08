@@ -39,6 +39,10 @@ The following is the original context that should be fully addressed by the PR:
 Apply the authority framing above when deciding what qualifies as a gap. Research suggestions
 and aspirational ideas from the Idea Researcher are NOT gaps unless explicitly committed to.
 
+**Only report high or critical severity gaps** — meaning requirements that are explicitly specified
+and clearly absent or broken in the implementation. Do not report partial implementations, minor
+deviations, or style differences; those are medium or low severity and should be omitted.
+
 ## Output Format
 
 Structure your findings EXACTLY like this:

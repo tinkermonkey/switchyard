@@ -393,16 +393,13 @@ async def test_phase2_skipped_when_no_context(pr_review_stage):
 
 @pytest.mark.asyncio
 async def test_creates_issues_for_ci_failures(pr_review_stage):
-    """Verify CI failures create issues"""
+    """Verify CI failures create issues and skip AI phases"""
     with patch('pipeline.pr_review_stage.get_agent_executor') as mock_get_executor, \
          patch('pipeline.pr_review_stage.pr_review_state_manager') as mock_state, \
          patch.object(pr_review_stage, '_find_pr_url', return_value='https://github.com/o/r/pull/1'), \
-         patch.object(pr_review_stage, '_load_discussion_outputs', return_value={}), \
-         patch.object(pr_review_stage, '_get_parent_issue_body', return_value=''), \
          patch.object(pr_review_stage, '_check_ci_status', return_value=(
              [{'name': 'test', 'state': 'failure', 'bucket': 'fail'}], []
          )), \
-         patch.object(pr_review_stage, '_parse_consolidated_findings', return_value=[]), \
          patch.object(pr_review_stage, '_build_ci_failure_issue', return_value={
              'title': 'CI Failure', 'body': 'CI failed', 'severity': 'high'
          }), \
@@ -426,14 +423,111 @@ async def test_creates_issues_for_ci_failures(pr_review_stage):
             }
         }
 
-        await pr_review_stage.execute(context)
+        result = await pr_review_stage.execute(context)
 
         # Verify issue creation was called for CI failure
-        mock_create.assert_called()
-        call_args = mock_create.call_args_list[-1]  # Last call should be for CI
-        issue_specs = call_args[0][0]
+        mock_create.assert_called_once()
+        issue_specs = mock_create.call_args[0][0]
         assert len(issue_specs) == 1
         assert issue_specs[0]['title'] == 'CI Failure'
+
+        # AI phases (Phase 1/2) must NOT have been called — CI gate returned early
+        assert mock_executor.execute_agent.call_count == 0
+
+        # Parent is returned to development
+        assert result.get('manual_progression_made') is True
+
+
+@pytest.mark.asyncio
+async def test_ci_failure_early_return_skips_ai_phases(pr_review_stage):
+    """CI gate: when CI fails, Phase 1 (pr_code_reviewer) and Phase 2 are never launched"""
+    with patch('pipeline.pr_review_stage.get_agent_executor') as mock_get_executor, \
+         patch('pipeline.pr_review_stage.pr_review_state_manager') as mock_state, \
+         patch.object(pr_review_stage, '_find_pr_url', return_value='https://github.com/o/r/pull/5'), \
+         patch.object(pr_review_stage, '_check_ci_status', return_value=(
+             [{'name': 'build', 'state': 'failure', 'bucket': 'fail'}], []
+         )), \
+         patch.object(pr_review_stage, '_build_ci_failure_issue', return_value={
+             'title': 'CI: build failed', 'body': 'Build failed', 'severity': 'high'
+         }), \
+         patch.object(pr_review_stage, '_create_review_issues', return_value=[
+             {'number': '200', 'url': 'url', 'title': 'CI: build failed', 'severity': 'high'}
+         ]), \
+         patch.object(pr_review_stage, '_move_issues_to_development'), \
+         patch.object(pr_review_stage, '_return_parent_to_development') as mock_return, \
+         patch.object(pr_review_stage, '_post_comment_on_issue') as mock_post_comment:
+
+        mock_executor = AsyncMock()
+        mock_executor.execute_agent = AsyncMock()
+        mock_get_executor.return_value = mock_executor
+        mock_state.get_review_count.return_value = 0
+
+        context = {'context': {'issue_number': 10, 'project': 'test-project'}}
+
+        result = await pr_review_stage.execute(context)
+
+        # No Docker agents launched
+        assert mock_executor.execute_agent.call_count == 0
+        # Parent returned to development
+        mock_return.assert_called_once()
+        assert result.get('manual_progression_made') is True
+        assert 'CI failing' in result.get('agent_output', '')
+        # Not the final cycle — no cycle-limit comment
+        mock_post_comment.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_ci_failure_at_cycle_limit_posts_comment(pr_review_stage):
+    """CI failure on the final review cycle posts the cycle-limit warning comment"""
+    with patch('pipeline.pr_review_stage.get_agent_executor') as mock_get_executor, \
+         patch('pipeline.pr_review_stage.pr_review_state_manager') as mock_state, \
+         patch.object(pr_review_stage, '_find_pr_url', return_value='https://github.com/o/r/pull/7'), \
+         patch.object(pr_review_stage, '_check_ci_status', return_value=(
+             [{'name': 'build', 'state': 'failure', 'bucket': 'fail'}], []
+         )), \
+         patch.object(pr_review_stage, '_build_ci_failure_issue', return_value={
+             'title': 'CI: build failed', 'body': 'Build failed', 'severity': 'high'
+         }), \
+         patch.object(pr_review_stage, '_create_review_issues', return_value=[
+             {'number': '201', 'url': 'url', 'title': 'CI: build failed', 'severity': 'high'}
+         ]), \
+         patch.object(pr_review_stage, '_move_issues_to_development'), \
+         patch.object(pr_review_stage, '_return_parent_to_development'), \
+         patch.object(pr_review_stage, '_post_comment_on_issue') as mock_post_comment:
+
+        mock_executor = AsyncMock()
+        mock_get_executor.return_value = mock_executor
+        # Final allowed cycle: review_count=2 → current_cycle=3=MAX_REVIEW_CYCLES
+        mock_state.get_review_count.return_value = 2
+
+        context = {'context': {'issue_number': 10, 'project': 'test-project'}}
+
+        await pr_review_stage.execute(context)
+
+        # Cycle-limit comment must be posted so the developer knows no more AI reviews remain
+        mock_post_comment.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_ci_check_exception_propagates(pr_review_stage):
+    """CI check exception re-raises instead of silently running AI phases on unknown build state"""
+    with patch('pipeline.pr_review_stage.get_agent_executor') as mock_get_executor, \
+         patch('pipeline.pr_review_stage.pr_review_state_manager') as mock_state, \
+         patch.object(pr_review_stage, '_find_pr_url', return_value='https://github.com/o/r/pull/9'), \
+         patch.object(pr_review_stage, '_check_ci_status', side_effect=RuntimeError('gh CLI timeout')):
+
+        mock_executor = AsyncMock()
+        mock_executor.execute_agent = AsyncMock()
+        mock_get_executor.return_value = mock_executor
+        mock_state.get_review_count.return_value = 0
+
+        context = {'context': {'issue_number': 10, 'project': 'test-project'}}
+
+        with pytest.raises(RuntimeError, match='gh CLI timeout'):
+            await pr_review_stage.execute(context)
+
+        # AI phases must never have been launched
+        assert mock_executor.execute_agent.call_count == 0
 
 
 @pytest.mark.asyncio
@@ -471,3 +565,69 @@ async def test_agent_output_includes_summary(pr_review_stage):
         assert '**Parent Issue**: #42' in analysis
         assert '**Outcome**:' in analysis
         assert '**Issues Created**: 0' in analysis
+
+
+# ---- _parse_consolidated_findings severity gate ----
+
+def test_parse_consolidated_drops_medium_severity(pr_review_stage):
+    """Medium severity groups are skipped — no issues created."""
+    json_output = '''{
+        "groups": [
+            {"name": "Code Style", "severity": "medium", "findings": "- **Formatting**: Indentation inconsistent `src/foo.py:10`"}
+        ],
+        "filtered_out": []
+    }'''
+    with patch('pipeline.pr_review_stage.parse_json_block') as mock_parse, \
+         patch.object(pr_review_stage, '_is_actionable_section', return_value=True):
+        mock_parse.return_value = {
+            "groups": [
+                {"name": "Code Style", "severity": "medium", "findings": "- **Formatting**: Indentation inconsistent `src/foo.py:10`"}
+            ]
+        }
+        result = pr_review_stage._parse_consolidated_findings(json_output)
+    assert result == []
+
+
+def test_parse_consolidated_drops_low_severity(pr_review_stage):
+    """Low severity groups are skipped — no issues created."""
+    with patch('pipeline.pr_review_stage.parse_json_block') as mock_parse, \
+         patch.object(pr_review_stage, '_is_actionable_section', return_value=True):
+        mock_parse.return_value = {
+            "groups": [
+                {"name": "Nice-to-Have", "severity": "low", "findings": "- **Logging**: Add debug log `src/bar.py:5`"}
+            ]
+        }
+        result = pr_review_stage._parse_consolidated_findings("")
+    assert result == []
+
+
+def test_parse_consolidated_keeps_critical_and_high(pr_review_stage):
+    """Critical and high severity groups create issues; medium and low are dropped."""
+    with patch('pipeline.pr_review_stage.parse_json_block') as mock_parse, \
+         patch.object(pr_review_stage, '_is_actionable_section', return_value=True):
+        mock_parse.return_value = {
+            "groups": [
+                {"name": "Auth Bug", "severity": "critical", "findings": "- **Token leak**: `src/auth.py:42`"},
+                {"name": "Missing validation", "severity": "high", "findings": "- **No input check**: `src/api.py:10`"},
+                {"name": "Style", "severity": "medium", "findings": "- **Naming**: `src/util.py:1`"},
+                {"name": "Nitpick", "severity": "low", "findings": "- **Comment**: `src/util.py:2`"},
+            ]
+        }
+        result = pr_review_stage._parse_consolidated_findings("")
+    assert len(result) == 2
+    titles = [i['title'] for i in result]
+    assert '[PR Feedback] Auth Bug' in titles
+    assert '[PR Feedback] Missing validation' in titles
+
+
+def test_parse_consolidated_drops_unknown_severity(pr_review_stage):
+    """Groups with unrecognised severity are dropped rather than defaulting to medium."""
+    with patch('pipeline.pr_review_stage.parse_json_block') as mock_parse, \
+         patch.object(pr_review_stage, '_is_actionable_section', return_value=True):
+        mock_parse.return_value = {
+            "groups": [
+                {"name": "Misc", "severity": "suggestion", "findings": "- **Thing**: `src/x.py:1`"}
+            ]
+        }
+        result = pr_review_stage._parse_consolidated_findings("")
+    assert result == []

@@ -15,6 +15,7 @@ Only include a finding if ALL of the following are true:
 1. It references a specific file and line number (e.g., `src/auth/login.py:42`) OR describes a concretely missing implementation (not a research suggestion or aspirational idea).
 2. It represents a real gap or bug in the committed code — not a style preference, future enhancement, or speculative improvement.
 3. It is explicitly required by the requirements/specifications (for gaps found in Phase 2 verification) — not a nice-to-have or research suggestion from an idea researcher.
+4. Only include findings with severity `critical` or `high`. Do not include any medium or low findings.
 
 **Deduplicate ruthlessly:** if the same underlying problem appears in multiple phases, merge them into a single finding. Keep the most descriptive version.
 
@@ -33,7 +34,7 @@ The JSON must have this exact structure:
   "groups": [
     {{
       "name": "Functional Area Name",
-      "severity": "critical|high|medium|low",
+      "severity": "critical|high",
       "findings": "- **Finding Title**: Description with file:line ref\\n- **Finding 2**: ..."
     }}
   ],
@@ -46,8 +47,7 @@ The JSON must have this exact structure:
 **Rules:**
 - "name": Component or area (e.g. "Authentication Module", "API Layer", "Test Coverage",
   "Error Handling") — NOT a severity level or source phase name.
-- "severity": The highest severity present among findings in this group
-  (critical > high > medium > low).
+- "severity": Must be `critical` or `high` — the highest severity present among findings in this group.
 - "findings": Markdown bullet list; each item formatted as `- **Title**: description`.
   Include file:line references where available.
 - "filtered_out": Brief list of removed or merged findings with a one-line explanation each.

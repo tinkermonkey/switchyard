@@ -40,7 +40,9 @@ The skill will launch specialized agents (code-reviewer, test-analyzer, silent-f
 
 ## STEP 2: Structure Results for Issue Creation
 
-After the review skill completes, you MUST format the findings in this EXACT structure so they can be parsed and converted to GitHub issues:
+After the review skill completes, you MUST format the findings in this EXACT structure so they can be parsed and converted to GitHub issues.
+
+**Do not report medium or low issues.** Only Critical and High Priority findings should appear in this output.
 
 ```
 ## PR Review Findings
@@ -51,19 +53,13 @@ After the review skill completes, you MUST format the findings in this EXACT str
 ### High Priority Issues
 - **[Finding Title]**: [Description with file:line references] (NEW / REGRESSION)
 
-### Medium Priority Issues
-- **[Finding Title]**: [Description with file:line references] (NEW / REGRESSION)
-
-### Low Priority / Nice-to-Have
-- **[Finding Title]**: [Description with file:line references] (NEW / REGRESSION)
-
 ### Clean Areas
 - [Areas that passed review with no issues]
 ```
 
 **IMPORTANT FORMATTING RULES**:
 1. Section must start with `## PR Review Findings`
-2. Use exact heading names: "Critical Issues", "High Priority Issues", "Medium Priority Issues", "Low Priority / Nice-to-Have"
+2. Use exact heading names: "Critical Issues", "High Priority Issues"
 3. Each finding must use format: `- **[Title]**: [Description]`
 4. If no issues at a severity level, write ONLY "None found" - no additional text
 5. Include file:line references where applicable (e.g., `/workspace/file.ts:123`)
