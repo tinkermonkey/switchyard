@@ -859,6 +859,7 @@ class TestEventTypeCompleteness:
             'repair_cycle_systemic_fix_started', 'repair_cycle_systemic_fix_completed',
             'pr_review_stage_started', 'pr_review_phase_started',
             'pr_review_phase_completed', 'pr_review_phase_failed', 'pr_review_stage_completed',
+            'pr_review_outcome_tracking',
             'execution_state_reconciled',
             'sub_issue_created', 'sub_issue_creation_failed',
             'prompt_size_warning', 'agent_output_format_unexpected',

@@ -105,6 +105,7 @@ class TestIssuesWorkspaceContext:
 
             mock_agent_config = MagicMock()
             mock_agent_config.retries = 2
+            mock_agent_config.get.return_value = None
 
             with patch.object(executor, 'factory') as mock_factory, \
                  patch.object(executor, '_build_execution_context') as mock_build, \
