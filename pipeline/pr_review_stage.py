@@ -1188,17 +1188,27 @@ class PRReviewStage(PipelineStage):
                     issue_number, repo, github_config, sdlc_board, backlog_column
                 )
 
-                # Link as sub-issue to parent
+                # Link as sub-issue to parent, with retry on transient failures
+                linked = False
                 if parent_issue_id:
-                    self._link_sub_issue(parent_issue_id, issue_id, issue_number, parent_issue_number)
+                    for _link_attempt in range(3):
+                        if self._link_sub_issue(parent_issue_id, issue_id, issue_number, parent_issue_number):
+                            linked = True
+                            break
+                        if _link_attempt < 2:
+                            delay = 2 ** _link_attempt
+                            logger.warning(
+                                f"Retrying sub-issue link for #{issue_number} "
+                                f"(attempt {_link_attempt + 1}/3, retrying in {delay}s)"
+                            )
+                            await asyncio.sleep(delay)
 
-                    # Emit SUCCESS event
-                    if obs:
-                        decision_emitter = DecisionEventEmitter(obs)
-                        current_review_cycle = pr_review_state_manager.get_review_count(
-                            project_name, parent_issue_number
-                        )
-
+                if obs:
+                    decision_emitter = DecisionEventEmitter(obs)
+                    current_review_cycle = pr_review_state_manager.get_review_count(
+                        project_name, parent_issue_number
+                    )
+                    if linked:
                         decision_emitter.emit_sub_issue_created(
                             project=project_name,
                             parent_issue=parent_issue_number,
@@ -1217,6 +1227,28 @@ class PRReviewStage(PipelineStage):
                             },
                             pipeline_run_id=pipeline_run_id
                         )
+                    elif parent_issue_id:
+                        decision_emitter.emit_sub_issue_creation_failed(
+                            project=project_name,
+                            parent_issue=parent_issue_number,
+                            title=spec['title'],
+                            board="SDLC Execution",
+                            error=Exception("addSubIssue mutation failed after 3 attempts"),
+                            source="pr_review",
+                            context_data={
+                                'severity': spec.get('severity', 'medium'),
+                                'source_phase': spec.get('source', 'unknown'),
+                                'review_cycle': current_review_cycle,
+                                'pr_url': pr_url
+                            },
+                            pipeline_run_id=pipeline_run_id
+                        )
+
+                if parent_issue_id and not linked:
+                    logger.error(
+                        f"Issue #{issue_number} created but failed to link as sub-issue of "
+                        f"#{parent_issue_number} after 3 attempts"
+                    )
 
                 created_issues.append({
                     'number': issue_number,
@@ -1347,8 +1379,8 @@ class PRReviewStage(PipelineStage):
             logger.error(f"Failed to set status for issue #{issue_number}: {e}", exc_info=True)
 
     def _link_sub_issue(self, parent_issue_id: str, child_issue_id: str,
-                        child_number: str, parent_number: int):
-        """Link a child issue as sub-issue of parent."""
+                        child_number: str, parent_number: int) -> bool:
+        """Link a child issue as sub-issue of parent. Returns True on success."""
         try:
             mutation = f"""
             mutation {{
@@ -1368,8 +1400,10 @@ class PRReviewStage(PipelineStage):
                 capture_output=True, text=True, check=True, timeout=30
             )
             logger.info(f"Linked #{child_number} as sub-issue of #{parent_number}")
+            return True
         except Exception as e:
-            logger.error(f"Failed to link #{child_number} as sub-issue: {e}", exc_info=True)
+            logger.warning(f"Failed to link #{child_number} as sub-issue of #{parent_number}: {e}")
+            return False
 
     async def _move_issues_to_development(
         self,
