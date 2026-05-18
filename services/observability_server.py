@@ -3828,12 +3828,12 @@ def git_branch_collector_thread():
                             git_branch_cache[project_name] = branch_data
                         logger.debug(f"Updated git branch cache for {project_name}")
 
-            # Sleep for 30 seconds
-            time.sleep(30)
+            # Sleep for 5 minutes — branch data is cosmetic (web UI project view only)
+            time.sleep(300)
 
         except Exception as e:
             logger.error(f"Error in git branch collector: {e}")
-            time.sleep(30)
+            time.sleep(300)
 
 @app.route('/api/projects', methods=['GET'])
 def get_projects():
