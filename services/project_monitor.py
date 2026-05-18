@@ -5172,7 +5172,9 @@ The automated test-fix-validate cycle has failed and requires manual interventio
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
                 try:
-                    stage = PRReviewStage(name="pr_review")
+                    _ci_config = project_config.ci or {}
+                    _skip_ci = not _ci_config.get('enabled', True)
+                    stage = PRReviewStage(name="pr_review", skip_ci_check=_skip_ci)
                     loop.run_until_complete(stage.execute(stage_context))
 
                     # Record success — must match the 'pr_review_stage' outer wrapper name
