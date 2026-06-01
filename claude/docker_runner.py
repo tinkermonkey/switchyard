@@ -1245,6 +1245,13 @@ class DockerAgentRunner:
             # Read both stdout and stderr using threads
             import threading
 
+            # Shared state between the stream-reader thread and the main wait loop.
+            # Allows the main thread to react to Claude's end_turn event without
+            # polling and without waiting for the container process to exit.
+            claude_done_event = threading.Event()   # set when Claude emits a terminal result event
+            stream_final_result = {}                 # populated alongside claude_done_event
+            _any_done = threading.Event()            # set when EITHER end_turn OR container exits
+
             def read_stream(stream, is_stderr):
                 nonlocal session_id, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, tools_used_tracking
                 for line in iter(stream.readline, ''):
@@ -1354,6 +1361,18 @@ class DockerAgentRunner:
                                 log_text = combined[:500] + '...' if len(combined) > 500 else combined
                                 logger.info(f"[Claude] {log_text}")
 
+                        if event_type == 'result':
+                            stop_reason = event.get('stop_reason', '')
+                            if stop_reason in ('end_turn', 'stop_sequence') and not event.get('is_error', True):
+                                stream_final_result['text'] = event.get('result', '')
+                                stream_final_result['stop_reason'] = stop_reason
+                                claude_done_event.set()
+                                _any_done.set()
+                                logger.info(
+                                    f"[Claude] Session ended: stop_reason={stop_reason}, "
+                                    f"result_length={len(stream_final_result.get('text', ''))}"
+                                )
+
                     except json.JSONDecodeError:
                         # Non-JSON output might be error messages or raw text
                         # In docker logs, stdout and stderr might be mixed if tty is enabled, 
@@ -1370,35 +1389,74 @@ class DockerAgentRunner:
             stdout_thread.start()
             stderr_thread.start()
 
-            # Wait for container to finish, enforcing the agent's hard timeout.
-            # We use 'docker wait' instead of process.wait() because 'docker logs -f' might hang.
-            # The timeout comes from agents.yaml and is always finite — agents must complete
-            # within their allotted time even if they are still actively producing output.
+            # Two-phase wait: react to Claude's end_turn signal first, then enforce a cleanup
+            # grace period before killing. The hard timeout remains the backstop for containers
+            # that never emit end_turn (crash, runaway loop, etc.).
             hard_timeout = context.get('agent_hard_timeout', 10800)  # default 3 hours
-            try:
-                wait_result = subprocess.run(
-                    ['docker', 'wait', container_name],
-                    capture_output=True, text=True,
-                    timeout=hard_timeout,
-                )
-                exit_code = int(wait_result.stdout.strip())
-            except subprocess.TimeoutExpired:
-                logger.error(
-                    f"Container {container_name} exceeded hard timeout of {hard_timeout}s, killing..."
-                )
+            _CLEANUP_GRACE_SECONDS = 30
+
+            exit_codes = {'code': None}
+            container_exited = threading.Event()
+
+            def _do_docker_wait():
                 try:
-                    subprocess.run(['docker', 'kill', container_name], capture_output=True, timeout=30)
-                except Exception as kill_err:
-                    logger.warning(f"docker kill failed for {container_name}: {kill_err}")
-                # Re-wait briefly to collect the exit code after kill
-                try:
-                    wait_result = subprocess.run(
+                    wr = subprocess.run(
                         ['docker', 'wait', container_name],
-                        capture_output=True, text=True, timeout=30,
+                        capture_output=True, text=True,
+                        timeout=hard_timeout,
                     )
-                    exit_code = int(wait_result.stdout.strip() or '-1')
-                except Exception:
-                    exit_code = -1
+                    exit_codes['code'] = int(wr.stdout.strip() or '-1')
+                except subprocess.TimeoutExpired:
+                    logger.error(
+                        f"Container {container_name} exceeded hard timeout of {hard_timeout}s, killing..."
+                    )
+                    try:
+                        subprocess.run(['docker', 'kill', container_name], capture_output=True, timeout=30)
+                    except Exception as kill_err:
+                        logger.warning(f"docker kill failed for {container_name}: {kill_err}")
+                    try:
+                        wr = subprocess.run(
+                            ['docker', 'wait', container_name],
+                            capture_output=True, text=True, timeout=30,
+                        )
+                        exit_codes['code'] = int(wr.stdout.strip() or '-1')
+                    except Exception:
+                        exit_codes['code'] = -1
+                except Exception as wait_err:
+                    logger.warning(f"docker wait error for {container_name}: {wait_err}")
+                    exit_codes['code'] = -1
+                finally:
+                    container_exited.set()
+                    _any_done.set()
+
+            wait_thread = threading.Thread(target=_do_docker_wait, daemon=True)
+            wait_thread.start()
+
+            # Block until Claude signals end_turn OR the container exits on its own.
+            _any_done.wait(timeout=hard_timeout)
+
+            if claude_done_event.is_set() and not container_exited.is_set():
+                # Claude finished its turn but the container is still alive — orphaned background
+                # processes (monitoring loops, until-loops, etc.) are holding it open.
+                # Allow a short cleanup window before stepping in.
+                logger.info(
+                    f"Claude end_turn detected for {container_name}; "
+                    f"waiting up to {_CLEANUP_GRACE_SECONDS}s for clean exit..."
+                )
+                container_exited.wait(timeout=_CLEANUP_GRACE_SECONDS)
+                if not container_exited.is_set():
+                    logger.info(
+                        f"Container {container_name} still alive {_CLEANUP_GRACE_SECONDS}s after "
+                        f"end_turn; killing stalled background processes..."
+                    )
+                    try:
+                        subprocess.run(['docker', 'kill', container_name], capture_output=True, timeout=30)
+                    except Exception as kill_err:
+                        logger.warning(f"docker kill failed for {container_name}: {kill_err}")
+                    container_exited.wait(timeout=10)
+
+            wait_thread.join(timeout=15)
+            exit_code = exit_codes['code'] if exit_codes['code'] is not None else -1
 
             # Allow log streamer to finish naturally
             # 'docker logs -f' should exit when the container stops, but we give it a timeout
@@ -1455,6 +1513,17 @@ class DockerAgentRunner:
                                                cache_creation_tokens=cache_creation_tokens,
                                                success=(exit_code == 0),
                                                pipeline_run_id=pipeline_run_id)
+
+            # If the container was killed (exit_code=137) after Claude's end_turn signal, the
+            # exit code is misleading — the result was already captured from the stream.
+            # Promote to success so the normal validation, persistence, and GitHub-post path runs.
+            if exit_code == 137 and stream_final_result.get('text'):
+                logger.info(
+                    f"Container {container_name} killed after end_turn signal; "
+                    f"treating captured stream result as success (exit_code 137 → 0)"
+                )
+                result_parts = [stream_final_result['text']]
+                exit_code = 0
 
             if exit_code == 0:
                 result_text = ''.join(result_parts)
