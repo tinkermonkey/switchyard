@@ -1250,7 +1250,9 @@ class DockerAgentRunner:
             # polling and without waiting for the container process to exit.
             claude_done_event = threading.Event()   # set when Claude emits a terminal result event
             stream_final_result = {}                 # populated alongside claude_done_event
-            _any_done = threading.Event()            # set when EITHER end_turn OR container exits
+            # True only when the orchestrator itself issues the grace-period kill — NOT set
+            # for external OOM kills or user-initiated kills (also exit_code=137).
+            _orchestrator_killed = False
 
             def read_stream(stream, is_stderr):
                 nonlocal session_id, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, tools_used_tracking
@@ -1367,7 +1369,6 @@ class DockerAgentRunner:
                                 stream_final_result['text'] = event.get('result', '')
                                 stream_final_result['stop_reason'] = stop_reason
                                 claude_done_event.set()
-                                _any_done.set()
                                 logger.info(
                                     f"[Claude] Session ended: stop_reason={stop_reason}, "
                                     f"result_length={len(stream_final_result.get('text', ''))}"
@@ -1427,13 +1428,19 @@ class DockerAgentRunner:
                     exit_codes['code'] = -1
                 finally:
                     container_exited.set()
-                    _any_done.set()
 
             wait_thread = threading.Thread(target=_do_docker_wait, daemon=True)
             wait_thread.start()
 
-            # Block until Claude signals end_turn OR the container exits on its own.
-            _any_done.wait(timeout=hard_timeout)
+            # Poll until Claude signals end_turn OR the container exits on its own.
+            # A loop over the real two-source truth avoids a manually maintained OR-gate
+            # that every future code path would need to remember to signal.
+            _poll_deadline = time.monotonic() + hard_timeout
+            while not (claude_done_event.is_set() or container_exited.is_set()):
+                remaining = _poll_deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                claude_done_event.wait(timeout=min(5.0, remaining))
 
             if claude_done_event.is_set() and not container_exited.is_set():
                 # Claude finished its turn but the container is still alive — orphaned background
@@ -1451,9 +1458,11 @@ class DockerAgentRunner:
                     )
                     try:
                         subprocess.run(['docker', 'kill', container_name], capture_output=True, timeout=30)
+                        _orchestrator_killed = True
                     except Exception as kill_err:
                         logger.warning(f"docker kill failed for {container_name}: {kill_err}")
-                    container_exited.wait(timeout=10)
+                    if not container_exited.wait(timeout=10):
+                        logger.warning(f"Container {container_name} did not exit within 10s of SIGKILL")
 
             wait_thread.join(timeout=15)
             exit_code = exit_codes['code'] if exit_codes['code'] is not None else -1
@@ -1467,8 +1476,11 @@ class DockerAgentRunner:
                 logger.warning(f"Log streamer for {container_name} timed out, terminating...")
                 process.terminate()
 
-            stdout_thread.join(timeout=1)
-            stderr_thread.join(timeout=1)
+            # The pipe is already closed at this point (process exited or was terminated),
+            # so the thread just needs to finish draining the last buffered lines.
+            # 30s is generous but avoids truncating the final result event under load.
+            stdout_thread.join(timeout=30)
+            stderr_thread.join(timeout=5)
 
             # Log stderr summary for failed containers
             if exit_code != 0:
@@ -1499,6 +1511,19 @@ class DockerAgentRunner:
             except Exception as e:
                 logger.warning(f"Failed to cleanup prompt files: {e}")
 
+            # Promote an orchestrator-initiated grace-period kill to success BEFORE emitting
+            # observability so metrics reflect the true outcome. Gated on _orchestrator_killed
+            # (set only in the grace-period path above) to distinguish the orchestrator's own
+            # kill from external SIGKILL sources like OOM or user intervention, which should
+            # remain failures even if stream_final_result happens to be populated.
+            if _orchestrator_killed and stream_final_result.get('text'):
+                logger.info(
+                    f"Container {container_name} killed by orchestrator after end_turn signal; "
+                    f"treating captured stream result as success"
+                )
+                result_parts = [stream_final_result['text']]
+                exit_code = 0
+
             # Emit completion
             if obs:
                 import time
@@ -1513,17 +1538,6 @@ class DockerAgentRunner:
                                                cache_creation_tokens=cache_creation_tokens,
                                                success=(exit_code == 0),
                                                pipeline_run_id=pipeline_run_id)
-
-            # If the container was killed (exit_code=137) after Claude's end_turn signal, the
-            # exit code is misleading — the result was already captured from the stream.
-            # Promote to success so the normal validation, persistence, and GitHub-post path runs.
-            if exit_code == 137 and stream_final_result.get('text'):
-                logger.info(
-                    f"Container {container_name} killed after end_turn signal; "
-                    f"treating captured stream result as success (exit_code 137 → 0)"
-                )
-                result_parts = [stream_final_result['text']]
-                exit_code = 0
 
             if exit_code == 0:
                 result_text = ''.join(result_parts)
