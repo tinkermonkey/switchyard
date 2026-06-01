@@ -21,7 +21,17 @@ Run ONLY unit tests for this project. Do NOT run integration, e2e, or performanc
      (use the configured test script; if a unit/ directory exists, target it directly)
    - **Other**: use the project's configured unit test command
 
-3. Save the full output to /tmp/unit_test_results.txt for reference.
+3. Run the tests in the background and use exactly ONE Monitor to wait for completion:
+   ```
+   pytest <unit_test_dir>/ --tb=short 2>&1 | tee /tmp/unit_test_results.txt &
+   ```
+   Then immediately use the Monitor tool with:
+   `until ! pgrep -f "pytest" > /dev/null; do sleep 5; done`
+
+   CRITICAL rules — violating these causes the container to hang:
+   - Use exactly ONE Monitor. Never create a second Monitor or a background Bash waiter.
+   - When the Monitor fires, read /tmp/unit_test_results.txt and return your final result
+     immediately. Do NOT start any additional commands to re-check or re-wait.
 
 4. Count only ACTUAL test failures in "failures" — not log lines that contain the word ERROR or FAILED.
    - Count only ACTIONABLE warnings in "warning_list" (e.g. deprecation warnings in test code that should be fixed) — not expected log-level WARNING messages from the application under test. Set "warnings" to exactly len(warning_list).

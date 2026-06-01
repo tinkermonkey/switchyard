@@ -147,7 +147,11 @@ def _is_repair_cycle_stalled(pipeline_run_id: str, stall_seconds: int = 3600) ->
         if otel_hits:
             otel_ts_str = otel_hits[0]["_source"].get("@timestamp", "")
             if otel_ts_str:
-                otel_ts = datetime.fromisoformat(otel_ts_str.replace("Z", "+00:00"))
+                try:
+                    otel_ts = datetime.fromisoformat(str(otel_ts_str).replace("Z", "+00:00"))
+                except ValueError:
+                    # @timestamp stored as epoch milliseconds (e.g. "1780296504414.0")
+                    otel_ts = datetime.fromtimestamp(float(otel_ts_str) / 1000, tz=timezone.utc)
                 if last_ts is None or otel_ts > last_ts:
                     last_ts = otel_ts
 

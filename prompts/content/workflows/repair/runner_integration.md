@@ -17,6 +17,16 @@ Run ONLY integration tests for this project. Do NOT run unit, e2e, or performanc
      Always run from the project root so pytest.ini is picked up.
    - **TypeScript/JavaScript**: use the configured integration test script or directory.
 
-3. Save the full output to /tmp/integration_test_results.txt for reference.
+3. Run the tests in the background and use exactly ONE Monitor to wait for completion:
+   ```
+   pytest <integration_test_dir>/ --tb=short 2>&1 | tee /tmp/integration_test_results.txt &
+   ```
+   Then immediately use the Monitor tool with:
+   `until ! pgrep -f "pytest" > /dev/null; do sleep 5; done`
+
+   CRITICAL rules — violating these causes the container to hang:
+   - Use exactly ONE Monitor. Never create a second Monitor or a background Bash waiter.
+   - When the Monitor fires, read /tmp/integration_test_results.txt and return your final result
+     immediately. Do NOT start any additional commands to re-check or re-wait.
 
 4. Count only ACTUAL test failures. Set "warnings" to exactly len(warning_list).
