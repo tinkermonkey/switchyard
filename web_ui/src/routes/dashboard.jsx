@@ -1,7 +1,7 @@
 import { createFileRoute } from '@tanstack/react-router'
 import { useState, useEffect, useCallback } from 'react'
 import { Link } from '@tanstack/react-router'
-import { RefreshCw } from 'lucide-react'
+import { RefreshCw, Maximize2, Minimize2 } from 'lucide-react'
 import Header from '../components/Header'
 import NavigationTabs from '../components/NavigationTabs'
 import DashboardRunGraph from '../components/DashboardRunGraph'
@@ -22,6 +22,9 @@ function DashboardView() {
   const [activeRuns, setActiveRuns] = useState([])
   const [loading, setLoading] = useState(true)
   const [isMobile, setIsMobile] = useState(() => window.innerWidth < 768)
+  const [isFullscreen, setIsFullscreen] = useState(false)
+
+  const toggleFullscreen = useCallback(() => setIsFullscreen(f => !f), [])
 
   useEffect(() => {
     const mq = window.matchMedia('(max-width: 767px)')
@@ -58,10 +61,19 @@ function DashboardView() {
   const { cols, rows } = getGridLayout(totalCells)
 
   return (
-    <div className="min-h-screen md:h-screen flex flex-col p-2 md:p-5 bg-gh-canvas text-gh-fg">
-      <Header />
+    <div className={isFullscreen ? "fixed inset-0 z-50 flex flex-col p-2 bg-gh-canvas text-gh-fg" : "min-h-screen md:h-screen flex flex-col p-2 md:p-5 bg-gh-canvas text-gh-fg"}>
+      {!isFullscreen && <Header />}
 
-      <NavigationTabs />
+      <div className="flex items-center">
+        <NavigationTabs />
+        <button
+          onClick={toggleFullscreen}
+          className="ml-2 flex-shrink-0 text-gh-fg-muted hover:text-gh-fg p-1 rounded transition-colors"
+          title={isFullscreen ? 'Exit full screen' : 'Full screen'}
+        >
+          {isFullscreen ? <Minimize2 size={16} /> : <Maximize2 size={16} />}
+        </button>
+      </div>
 
       <div className="flex-1 min-h-0 overflow-y-auto">
         {loading && activeRuns.length === 0 ? (

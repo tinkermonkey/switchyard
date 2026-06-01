@@ -54,6 +54,7 @@ function toolColor(name) {
 export default function ToolUseTimeline({ toolEvents = [] }) {
   const [currentTime, setCurrentTime] = useState(() => new Date())
   const [tooltip, setTooltip] = useState(null)
+  const [containerWidth, setContainerWidth] = useState(800)
   const svgRef = useRef(null)
 
   // Rolling clock — requestAnimationFrame for continuous smooth scrolling
@@ -65,6 +66,16 @@ export default function ToolUseTimeline({ toolEvents = [] }) {
     }
     rafId = requestAnimationFrame(tick)
     return () => cancelAnimationFrame(rafId)
+  }, [])
+
+  useEffect(() => {
+    const el = svgRef.current
+    if (!el) return
+    const ro = new ResizeObserver(entries => {
+      setContainerWidth(entries[0].contentRect.width || 800)
+    })
+    ro.observe(el)
+    return () => ro.disconnect()
   }, [])
 
   const toolNames = useMemo(() => {
@@ -90,7 +101,7 @@ export default function ToolUseTimeline({ toolEvents = [] }) {
   })
   const maxCumTokens = Math.max(1, ...toolNames.map(n => cumulativeTokensByTool[n]))
 
-  const VW = 800
+  const VW = Math.max(300, containerWidth)
   const xScale = scaleTime().domain(xDomain).range([LEFT_PAD, VW - RIGHT_PAD])
   const yScale = scaleBand().domain(toolNames).range([TOP_PAD, chartHeight - BOTTOM_PAD]).padding(0.3)
   const maxTokens = max(toolEvents, e => e.outputTokens) || 1
@@ -122,11 +133,14 @@ export default function ToolUseTimeline({ toolEvents = [] }) {
   return (
     <div className="relative px-2 py-1" ref={svgRef}>
       <svg
-        viewBox={`0 0 ${VW} ${chartHeight}`}
-        className="w-full"
-        style={{ display: 'block', aspectRatio: `${VW} / ${chartHeight}` }}
+        width={VW}
+        height={chartHeight}
+        style={{ display: 'block' }}
         onMouseLeave={() => setTooltip(null)}
       >
+        {/* Token usage section background */}
+        <rect x={0} y={0} width={LEFT_PAD} height={chartHeight} fill="white" opacity={0.5} />
+
         {/* Y-axis row guides + labels + cumulative token bars */}
         {toolNames.map(name => {
           const y = yScale(name)
