@@ -108,6 +108,36 @@ class ClaudeWrapper:
             self.write_final_result_with_retry(self.exit_code)
             self.cleanup_performed = True
 
+    def _kill_descendant_processes(self, pid: int) -> None:
+        """Kill all descendant processes of pid after Claude exits.
+
+        Prevents container stall from background bash tasks that outlive the
+        Claude session — e.g. monitoring loops whose pgrep pattern self-matches
+        the loop's own command string and therefore never terminate.
+        """
+        try:
+            children = []
+            for entry in os.listdir('/proc'):
+                if not entry.isdigit():
+                    continue
+                try:
+                    with open(f'/proc/{entry}/status') as f:
+                        for line in f:
+                            if line.startswith('PPid:'):
+                                if int(line.split()[1]) == pid:
+                                    children.append(int(entry))
+                                break
+                except OSError:
+                    continue
+            for child_pid in children:
+                self._kill_descendant_processes(child_pid)
+                try:
+                    os.kill(child_pid, signal.SIGTERM)
+                except OSError:
+                    pass
+        except Exception:
+            pass
+
     def write_claude_event(self, event: Dict) -> bool:
         """
         Write Claude event to Redis.
@@ -333,6 +363,9 @@ class ClaudeWrapper:
 
         # Wait for completion
         exit_code = process.wait()
+
+        # Kill any background processes Claude left running to prevent container stall
+        self._kill_descendant_processes(process.pid)
 
         # Store exit code for atexit handler
         self.exit_code = exit_code

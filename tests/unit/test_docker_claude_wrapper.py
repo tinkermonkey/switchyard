@@ -398,3 +398,93 @@ class TestOutputTruncation:
 
             assert 'TRUNCATED' in result_data['output']
             assert len(result_data['output']) > 100  # Truncation message added
+
+
+class TestDescendantProcessCleanup:
+    """Test that background processes left by Claude are killed after session ends"""
+
+    def test_kills_direct_child(self):
+        """Children of Claude's pid are sent SIGTERM"""
+        wrapper = ClaudeWrapper()
+
+        # Simulate /proc with one child of pid 100
+        proc_entries = {
+            '200': {'PPid': '100'},
+            '300': {'PPid': '1'},   # unrelated process
+        }
+
+        def fake_listdir(path):
+            return list(proc_entries.keys())
+
+        def fake_open(path, *a, **kw):
+            pid = path.split('/')[2]
+            ppid = proc_entries.get(pid, {}).get('PPid', '1')
+            content = f'Name:\tfoo\nPPid:\t{ppid}\nState:\tS\n'
+            return mock_open(read_data=content)()
+
+        with patch('os.listdir', side_effect=fake_listdir), \
+             patch('builtins.open', side_effect=fake_open), \
+             patch('os.kill') as mock_kill:
+            wrapper._kill_descendant_processes(100)
+
+        mock_kill.assert_called_once_with(200, signal.SIGTERM)
+
+    def test_kills_grandchildren_before_children(self):
+        """Grandchildren are killed before their parent (depth-first)"""
+        wrapper = ClaudeWrapper()
+
+        proc_entries = {
+            '200': {'PPid': '100'},  # child of Claude
+            '300': {'PPid': '200'},  # grandchild
+        }
+
+        killed_order = []
+
+        def fake_listdir(path):
+            return list(proc_entries.keys())
+
+        def fake_open(path, *a, **kw):
+            pid = path.split('/')[2]
+            ppid = proc_entries.get(pid, {}).get('PPid', '1')
+            content = f'Name:\tfoo\nPPid:\t{ppid}\nState:\tS\n'
+            return mock_open(read_data=content)()
+
+        def record_kill(pid, sig):
+            killed_order.append(pid)
+
+        with patch('os.listdir', side_effect=fake_listdir), \
+             patch('builtins.open', side_effect=fake_open), \
+             patch('os.kill', side_effect=record_kill):
+            wrapper._kill_descendant_processes(100)
+
+        assert killed_order == [300, 200], "Grandchild must be killed before child"
+
+    def test_ignores_already_exited_processes(self):
+        """OSError from os.kill (process already gone) is silently ignored"""
+        wrapper = ClaudeWrapper()
+
+        proc_entries = {'200': {'PPid': '100'}}
+
+        def fake_listdir(path):
+            return list(proc_entries.keys())
+
+        def fake_open(path, *a, **kw):
+            pid = path.split('/')[2]
+            ppid = proc_entries.get(pid, {}).get('PPid', '1')
+            content = f'Name:\tfoo\nPPid:\t{ppid}\nState:\tS\n'
+            return mock_open(read_data=content)()
+
+        with patch('os.listdir', side_effect=fake_listdir), \
+             patch('builtins.open', side_effect=fake_open), \
+             patch('os.kill', side_effect=OSError("no such process")):
+            wrapper._kill_descendant_processes(100)  # must not raise
+
+    def test_no_children_is_noop(self):
+        """Works correctly when Claude had no background processes"""
+        wrapper = ClaudeWrapper()
+
+        with patch('os.listdir', return_value=[]), \
+             patch('os.kill') as mock_kill:
+            wrapper._kill_descendant_processes(100)
+
+        mock_kill.assert_not_called()

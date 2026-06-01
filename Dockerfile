@@ -98,6 +98,7 @@ RUN if [ "${DOCKER_GID}" = "0" ]; then \
     fi && \
     mkdir -p /home/orchestrator/.ssh /home/orchestrator/.config && \
     touch /home/orchestrator/.ssh/id_github && \
+    touch /home/orchestrator/.mcp_config.json && \
     chmod 600 /home/orchestrator/.ssh/id_github && \
     chown -R orchestrator:orchestrator /home/orchestrator && \
     chmod 700 /home/orchestrator/.ssh /home/orchestrator/.config && \
