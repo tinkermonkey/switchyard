@@ -6773,20 +6773,17 @@ _Repair cycle initiated by Switchyard_
         logger.info("Starting GitHub Projects v2 monitor...")
         sys.stdout.flush()
 
-        # Resume any active review cycles from before restart
-        logger.info("Checking for active review cycles to resume...")
-        from services.review_cycle import review_cycle_executor
-
-        for project_name in self.config_manager.list_visible_projects():
-            project_config = self.config_manager.get_project_config(project_name)
-            org = project_config.github['org']
-
-            # Run async resume method
-            asyncio.run(review_cycle_executor.resume_active_cycles(project_name, org))
-
-        logger.info("Review cycle recovery complete")
-        
-        # Check GitHub API circuit breaker before attempting initialization queries
+        # STEP 1: Seed last_state BEFORE running resume_active_cycles.
+        #
+        # resume_active_cycles re-runs saved review cycles to completion, which can take many
+        # minutes (each iteration dispatches a Docker container and waits for it). Any board
+        # transitions that occur during that window — whether from the recovery itself or from
+        # agents started by the worker pool — would be captured as the *baseline* if last_state
+        # were initialized afterward, making detect_changes permanently blind to them.
+        #
+        # By seeding last_state first, every card move that happens during recovery shows up as
+        # a genuine status_changed event on the first poll and routes normally through
+        # trigger_agent_for_status. No column type requires special-casing.
         github_client = get_github_client()
         if github_client.breaker.is_open():
             time_until = (github_client.breaker.reset_time - datetime.now()).total_seconds() if github_client.breaker.reset_time else None
@@ -6879,9 +6876,27 @@ _Repair cycle initiated by Switchyard_
                 logger.warning(f"Error during project state initialization: {e}")
                 logger.info("Will use empty state, may detect false 'item_added' events on first poll")
         
-        logger.info("Project state initialization complete, starting main monitoring loop...")
+        logger.info("Project state initialization complete.")
 
-        # After cleanup and state initialization, reconcile active runs and rescan boards
+        # STEP 2: Resume any active review cycles from before restart.
+        # last_state is now seeded, so card moves made during recovery will be detected
+        # as status_changed events on the first poll rather than silently absorbed.
+        logger.info("Checking for active review cycles to resume...")
+        from services.review_cycle import review_cycle_executor
+
+        for project_name in self.config_manager.list_visible_projects():
+            try:
+                project_config = self.config_manager.get_project_config(project_name)
+                org = project_config.github['org']
+                asyncio.run(review_cycle_executor.resume_active_cycles(project_name, org))
+            except Exception as resume_err:
+                # One project's recovery failure must not prevent rescan_complete from
+                # being set — that would block the worker pool indefinitely.
+                logger.error(f"Error resuming review cycles for {project_name}: {resume_err}", exc_info=True)
+
+        logger.info("Review cycle recovery complete")
+
+        # STEP 3: Reconcile active runs and rescan for stalled items.
         logger.info("Reconciling active runs and rescanning boards after startup...")
         self._reconcile_active_runs()
         self._rescan_boards_for_stalled_items()
