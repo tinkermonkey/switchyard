@@ -55,6 +55,14 @@ logger = logging.getLogger(__name__)
 
 MAX_SYSTEMIC_SUB_CYCLES = 3   # max attempts per special-case sub-cycle
 
+# Inter-phase cooldown: pause between test phases after a long-running phase so the Docker
+# host has time to reclaim cgroups and file descriptors. Observed: a 21-minute unit test run
+# followed immediately by integration tests caused fix-attempt containers to be killed within
+# ~52s (insufficient resources for new containers). Only applied after phases longer than
+# _INTER_PHASE_COOLDOWN_MIN_DURATION_SECONDS to avoid penalising fast phases like compilation.
+_INTER_PHASE_COOLDOWN_SECONDS = 30
+_INTER_PHASE_COOLDOWN_MIN_DURATION_SECONDS = 60
+
 
 @dataclass
 class SystemicAnalysisResult:
@@ -287,8 +295,23 @@ class RepairCycleStage(PipelineStage):
         repair_context = {**context, 'cycle_stack': _repair_stack}
 
         try:
+            prev_cycle_duration_seconds = 0.0
             # Track which test type in sequence (1st, 2nd, 3rd)
             for test_type_index, test_config in enumerate(self.test_configs, start=1):
+                if (
+                    test_type_index > 1
+                    and prev_cycle_duration_seconds >= _INTER_PHASE_COOLDOWN_MIN_DURATION_SECONDS
+                ):
+                    logger.info(
+                        f"Cooldown before {test_config.test_type} test phase "
+                        f"(previous phase ran {prev_cycle_duration_seconds:.0f}s — "
+                        f"allowing host resources to settle)..."
+                    )
+                    try:
+                        await asyncio.sleep(_INTER_PHASE_COOLDOWN_SECONDS)
+                    except CancellationError:
+                        raise
+
                 logger.info(
                     f"Starting {test_config.test_type} test cycle "
                     f"(test type {test_type_index}/{len(self.test_configs)})"
@@ -299,6 +322,7 @@ class RepairCycleStage(PipelineStage):
                 cycle_end = utc_now()
 
                 cycle_result.duration_seconds = (cycle_end - cycle_start).total_seconds()
+                prev_cycle_duration_seconds = cycle_result.duration_seconds
                 results.append(cycle_result)
 
                 # Emit test cycle completed event (always emit, regardless of outcome)
@@ -385,6 +409,8 @@ class RepairCycleStage(PipelineStage):
                 "timestamp": to_utc_isoformat(end_time),
             }
 
+        except CancellationError:
+            raise
         except Exception as e:
             # Emit agent failed event on exception
             end_time = utc_now()
