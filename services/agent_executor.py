@@ -708,8 +708,12 @@ class AgentExecutor:
                     f"but agent completed. Checking for uncommitted changes..."
                 )
 
-                # Check if there are any uncommitted changes in the workspace
-                if 'issue_number' in task_context:
+                # Check if there are any uncommitted changes in the workspace.
+                # Skip for repair_test agents — they run tests and return JSON; any
+                # workspace writes are test artifacts, not code changes to commit.
+                if execution_type == "repair_test":
+                    logger.info("Skipping failsafe commit check for repair_test execution type")
+                elif 'issue_number' in task_context:
                     await self._failsafe_commit_check(
                         project_name=project_name,
                         agent_name=agent_name,
