@@ -17,6 +17,17 @@ Run ONLY integration tests for this project. Do NOT run unit, e2e, or performanc
      Always run from the project root so pytest.ini is picked up.
    - **TypeScript/JavaScript**: use the configured integration test script or directory.
 
+2a. **No integration tests present** — if you AFFIRMATIVELY confirm the project has no integration
+   tests (no integration test directory/files, no test uses an `integration` marker, AND no
+   integration test script is configured — e.g. `npm run test:integration` reports `Missing
+   script`, or `npx playwright test` reports `no tests found`), this is NOT a failure. A configured
+   test type with no tests must not block the pipeline. Return a no-tests result and stop:
+   `{"passed": 0, "failed": 0, "warnings": 0, "failures": [{"file": "__no_tests__",
+   "test": "no_tests_found", "message": "<which checks confirmed no integration tests exist>"}],
+   "warning_list": []}`
+   Emit this ONLY when you have confirmed no tests exist — NOT when a test run merely produced no
+   output (an empty/garbled run is an infrastructure failure, handled in step 3).
+
 3. Run the tests and capture output:
 
    **Python (pytest)** — run as a single Bash call so that `$?` captures pytest's exit code:

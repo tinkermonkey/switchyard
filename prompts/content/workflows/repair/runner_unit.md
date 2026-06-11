@@ -21,6 +21,16 @@ Run ONLY unit tests for this project. Do NOT run integration, e2e, or performanc
      `test:unit`, or a direct `vitest run` / `jest` invocation).
    - **Other**: use the project's configured unit test command.
 
+2a. **No unit tests present** — if you AFFIRMATIVELY confirm the project has no unit tests (no unit
+   test directory/files exist, and no unit test command/script is configured — e.g. `npm test`
+   reports `Missing script`, or the test directory is absent/empty), this is NOT a failure. A
+   configured test type with no tests must not block the pipeline. Return a no-tests result and stop:
+   `{"passed": 0, "failed": 0, "warnings": 0, "failures": [{"file": "__no_tests__",
+   "test": "no_tests_found", "message": "<which checks confirmed no unit tests exist>"}],
+   "warning_list": []}`
+   Emit this ONLY when you have confirmed no tests exist — NOT when a test run merely produced no
+   output (an empty/garbled run is an infrastructure failure, handled in step 3).
+
 3. Run the tests via a single synchronous blocking Bash call and capture results:
 
    **Python (pytest)**:

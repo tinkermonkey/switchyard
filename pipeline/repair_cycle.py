@@ -576,6 +576,29 @@ class RepairCycleStage(PipelineStage):
             test_result = await self._run_tests(config, context, test_cycle_iteration, test_type_index)
             await self._checkpoint(config.test_type, test_cycle_iteration, context)
 
+            # A configured test type with NO tests present is a SKIP, not a failure — it
+            # must never freeze the board. The runner signals this with a dedicated
+            # "__no_tests__" sentinel (distinct from "__infrastructure__", which means a
+            # genuine crash / broken environment and remains a hard failure).
+            no_tests_markers = [
+                f for f in test_result.failures
+                if f.file == "__no_tests__" or (f.test or "") == "no_tests_found"
+            ]
+            if no_tests_markers:
+                logger.info(
+                    f"No {config.test_type} tests present "
+                    f"({no_tests_markers[0].message}) — skipping {config.test_type} phase as passed"
+                )
+                return CycleResult(
+                    test_type=config.test_type,
+                    passed=True,
+                    iterations=test_cycle_iteration,
+                    final_result=test_result,
+                    error=None,
+                    files_fixed=files_fixed,
+                    warnings_reviewed=warnings_reviewed,
+                )
+
             # Check for infrastructure failures (indicated by __infrastructure__ file)
             infrastructure_failures = [f for f in test_result.failures if f.file == "__infrastructure__"]
             if infrastructure_failures:
