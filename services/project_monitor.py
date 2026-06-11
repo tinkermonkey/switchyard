@@ -736,17 +736,36 @@ class ProjectMonitor:
                     )
                     items.append(item)
 
-                # Validate statuses
-                invalid_items = [item for item in items if item.status not in valid_columns]
+                # Validate statuses.
+                # Distinguish two failure modes:
+                #   - "No Status": the Status field is genuinely unset on GitHub (e.g. issues
+                #     cross-added to a board but never given a column). This is a permanent
+                #     condition that will never "recover", so retrying is pointless and only
+                #     produces ERROR-log spam every poll cycle. Drop these silently.
+                #   - Any other out-of-column status: may be transient GraphQL staleness, so
+                #     keep the retry-to-recover behavior below.
+                unstatused_items = [item for item in items if item.status == "No Status"]
+                invalid_items = [
+                    item for item in items
+                    if item.status not in valid_columns and item.status != "No Status"
+                ]
+
+                if unstatused_items:
+                    logger.debug(
+                        f"Ignoring {len(unstatused_items)} untriaged item(s) with no Status on "
+                        f"{project_owner}/project#{project_number}: "
+                        f"{[item.issue_number for item in unstatused_items]}"
+                    )
 
                 if not invalid_items:
-                    # All valid - success
+                    # No transient-invalid statuses. Return only items in a valid column,
+                    # which also drops any unstatused (No Status) items.
                     if attempt > 0:
                         logger.info(
                             f"✅ Status validation recovered: All items now valid for "
                             f"{project_owner}/project#{project_number} after {attempt+1} attempts"
                         )
-                    return items
+                    return [item for item in items if item.status in valid_columns]
 
                 # Have invalid items
                 if attempt < max_retries:
