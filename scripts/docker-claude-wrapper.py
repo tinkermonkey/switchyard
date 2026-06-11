@@ -26,6 +26,7 @@ import json
 import time
 import signal
 import atexit
+import threading
 from typing import Dict, Optional, List
 from datetime import datetime, timezone
 
@@ -310,6 +311,39 @@ class ClaudeWrapper:
             self._log(f"❌ Failed to write fallback result file: {e}", level='ERROR')
             return False
 
+    def _terminate_process_group(self, process) -> None:
+        """Reap Claude and ALL its descendants via its session process group.
+
+        Claude is started with start_new_session=True, so it leads its own
+        session. Background tasks it spawned remain in that session even after
+        being reparented to PID 1 when Claude exits, so a single killpg clears
+        orphans that would otherwise hold the container's stdout open and stall
+        it. No-ops if the group is already gone.
+        """
+        # start_new_session=True makes Claude its own session/group leader, so its
+        # PGID equals its PID. Use that directly: os.getpgid() would fail once the
+        # leader is reaped (which is exactly when we call this), but the group lives
+        # on while orphaned members remain, so killpg still reaches them.
+        pgid = process.pid
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+        except OSError:
+            return  # group already gone
+        try:
+            process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            pass
+        # Escalate: SIGKILL the whole group to clear stragglers that ignored
+        # SIGTERM or were reparented to PID 1 but remain in the session.
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except OSError:
+            pass
+        try:
+            process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            pass
+
     def run_claude(self, claude_args: List[str]) -> int:
         """
         Run Claude Code with streaming output capture.
@@ -319,53 +353,113 @@ class ClaudeWrapper:
 
         Returns Claude Code exit code.
         """
-        # Start Claude Code process
+        # Start Claude Code in its OWN session/process group (start_new_session=True)
+        # so we can reap the entire group — including background tasks Claude leaves
+        # running that get reparented to PID 1 but stay in this session — with a
+        # single killpg, instead of relying on stdout reaching EOF.
         process = subprocess.Popen(
             ['claude'] + claude_args,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            bufsize=1  # Line buffered
+            bufsize=1,  # Line buffered
+            start_new_session=True,
         )
+
+        result_seen = threading.Event()
+        stderr_chunks: List[str] = []
+
+        def _read_stdout():
+            # Reads until stdout EOF. Teardown is NOT gated on this thread finishing:
+            # an orphaned background task can hold stdout open long after the turn ends.
+            try:
+                for line in process.stdout:
+                    self.output_lines.append(line)
+                    print(line, end='', flush=True)
+                    stripped = line.strip()
+                    if not stripped:
+                        continue
+                    try:
+                        event = json.loads(stripped)
+                    except json.JSONDecodeError:
+                        continue
+                    self.write_claude_event(event)
+                    # ANY result event marks the end of Claude's turn (session end),
+                    # whether it ended cleanly or stuck/errored. Teardown keys off this
+                    # so a non-clean end no longer leaves the container hanging.
+                    if isinstance(event, dict) and event.get('type') == 'result':
+                        result_seen.set()
+            except Exception as e:
+                self._log(f"stdout reader error: {e}", level='WARNING')
+
+        def _read_stderr():
+            try:
+                data = process.stderr.read()
+                if data:
+                    stderr_chunks.append(data)
+                    print(data, file=sys.stderr, end='', flush=True)
+            except Exception:
+                pass
 
         # Read stdin and pass to Claude
         stdin_data = sys.stdin.read()
+        try:
+            process.stdin.write(stdin_data)
+            process.stdin.close()
+        except (BrokenPipeError, OSError):
+            pass
 
-        # Start subprocess with stdin
-        process.stdin.write(stdin_data)
-        process.stdin.close()
+        stdout_thread = threading.Thread(target=_read_stdout, daemon=True)
+        stderr_thread = threading.Thread(target=_read_stderr, daemon=True)
+        stdout_thread.start()
+        stderr_thread.start()
 
-        # Stream stdout and parse events
-        for line in process.stdout:
-            # Capture output
-            self.output_lines.append(line)
+        # Wait for Claude's turn to end (result event) OR the claude process to exit.
+        # Deliberately NOT waiting for stdout EOF — that is exactly what an orphaned
+        # background task holds open, causing the container to hang after work is done.
+        _CLEANUP_GRACE_SECONDS = 8
+        while not result_seen.is_set() and process.poll() is None:
+            time.sleep(0.2)
 
-            # Write to stdout (for orchestrator monitoring if available)
-            print(line, end='', flush=True)
-
-            # Try to parse as JSON event
+        if result_seen.is_set():
+            # Turn finished. Give Claude a brief moment to exit on its own, then reap
+            # the whole session group (Claude + any orphaned background tasks).
+            killed_by_us = False
             try:
-                event = json.loads(line.strip())
+                process.wait(timeout=_CLEANUP_GRACE_SECONDS)
+            except subprocess.TimeoutExpired:
+                self._log(
+                    "Claude turn ended but process still alive after grace period; "
+                    "terminating session group"
+                )
+                killed_by_us = True
+            self._terminate_process_group(process)
+            exit_code = process.returncode
+            # The turn produced a result, so it succeeded. Normalize any signal-derived
+            # exit code to 0: negative codes (process killed by an uncaught signal) AND
+            # positive 128+N codes. The `claude` CLI is a shell-wrapped node launcher
+            # that returns 143 (128+SIGTERM) / 137 (128+SIGKILL) when WE reap it after a
+            # clean turn; without this, our own teardown would be misreported as an agent
+            # failure (exit_code=143) and trigger spurious retries.
+            if killed_by_us or exit_code is None or exit_code < 0 or exit_code >= 128:
+                exit_code = 0
+        else:
+            # Claude exited without a result event. Reap any stragglers and surface
+            # its real exit code (downstream validation handles empty output).
+            exit_code = process.poll()
+            self._terminate_process_group(process)
+            if exit_code is None:
+                exit_code = process.returncode
+            if exit_code is None:
+                exit_code = 1
 
-                # Write to Redis
-                self.write_claude_event(event)
-
-            except json.JSONDecodeError:
-                # Not JSON - plain text output
-                pass
-
-        # Capture stderr
-        stderr = process.stderr.read()
-        if stderr:
-            self.output_lines.append(stderr)
-            print(stderr, file=sys.stderr, end='', flush=True)
-
-        # Wait for completion
-        exit_code = process.wait()
-
-        # Kill any background processes Claude left running to prevent container stall
-        self._kill_descendant_processes(process.pid)
+        # Drain remaining buffered output. Once the session group is dead the pipes
+        # close, so these joins return promptly.
+        stdout_thread.join(timeout=10)
+        stderr_thread.join(timeout=5)
+        if stderr_chunks:
+            self.output_lines.extend(stderr_chunks)
 
         # Store exit code for atexit handler
         self.exit_code = exit_code

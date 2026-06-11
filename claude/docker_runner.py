@@ -1365,14 +1365,23 @@ class DockerAgentRunner:
 
                         if event_type == 'result':
                             stop_reason = event.get('stop_reason', '')
-                            if stop_reason in ('end_turn', 'stop_sequence') and not event.get('is_error', True):
-                                stream_final_result['text'] = event.get('result', '')
-                                stream_final_result['stop_reason'] = stop_reason
-                                claude_done_event.set()
-                                logger.info(
-                                    f"[Claude] Session ended: stop_reason={stop_reason}, "
-                                    f"result_length={len(stream_final_result.get('text', ''))}"
-                                )
+                            is_error = bool(event.get('is_error', False))
+                            # A `result` event marks the end of Claude's turn regardless of
+                            # whether it ended cleanly or stuck/errored. Trigger teardown for
+                            # ALL of them so a non-clean end no longer hangs the container until
+                            # the hard timeout. Success vs. failure is decided later from the
+                            # captured stop_reason/is_error (see `clean`).
+                            clean = stop_reason in ('end_turn', 'stop_sequence') and not is_error
+                            stream_final_result['text'] = event.get('result', '')
+                            stream_final_result['stop_reason'] = stop_reason
+                            stream_final_result['is_error'] = is_error
+                            stream_final_result['clean'] = clean
+                            claude_done_event.set()
+                            logger.info(
+                                f"[Claude] Session ended: stop_reason={stop_reason or 'none'}, "
+                                f"is_error={is_error}, clean={clean}, "
+                                f"result_length={len(stream_final_result.get('text', ''))}"
+                            )
 
                     except json.JSONDecodeError:
                         # Non-JSON output might be error messages or raw text
@@ -1516,13 +1525,21 @@ class DockerAgentRunner:
             # (set only in the grace-period path above) to distinguish the orchestrator's own
             # kill from external SIGKILL sources like OOM or user intervention, which should
             # remain failures even if stream_final_result happens to be populated.
-            if _orchestrator_killed and stream_final_result.get('text'):
+            if _orchestrator_killed and stream_final_result.get('clean') and stream_final_result.get('text'):
                 logger.info(
-                    f"Container {container_name} killed by orchestrator after end_turn signal; "
+                    f"Container {container_name} killed by orchestrator after a clean end_turn; "
                     f"treating captured stream result as success"
                 )
                 result_parts = [stream_final_result['text']]
                 exit_code = 0
+            elif _orchestrator_killed:
+                # Killed after a non-clean end (stuck/error result, or no result text):
+                # do NOT promote to success — let the failure stand so the cycle retries.
+                logger.info(
+                    f"Container {container_name} killed by orchestrator after a non-clean turn "
+                    f"(stop_reason={stream_final_result.get('stop_reason') or 'none'}, "
+                    f"is_error={stream_final_result.get('is_error')}); leaving as failure"
+                )
 
             # Emit completion
             if obs:
