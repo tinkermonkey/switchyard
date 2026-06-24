@@ -21,6 +21,9 @@ flask-cors>=4.0.0
 eventlet>=0.35.0  # Async backend for Flask-SocketIO
 requests>=2.31.0
 httpx>=0.25.0  # For MCP server communication
+fastapi>=0.111.0
+uvicorn>=0.30.0
+mcp[cli]>=1.0.0
 
 # YAML processing
 pyyaml>=6.0.1

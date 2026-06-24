@@ -204,6 +204,39 @@ services:
       start_period: 60s
 
 
+  switchyard-mcp:
+    build:
+      context: ..
+      dockerfile: switchyard/Dockerfile
+      args:
+        DOCKER_GID: "${DOCKER_GID:-984}"
+    volumes:
+      - ./:/app
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - GITHUB_TOKEN=${GITHUB_TOKEN}
+      - GITHUB_APP_ID=${GITHUB_APP_ID}
+      - GITHUB_APP_INSTALLATION_ID=${GITHUB_APP_INSTALLATION_ID}
+      - GITHUB_APP_PRIVATE_KEY_PATH=${GITHUB_APP_PRIVATE_KEY_PATH}
+      - SWITCHYARD_MCP_TOKEN=${SWITCHYARD_MCP_TOKEN}
+      - OBSERVABILITY_URL=http://observability-server:5001
+      - LOG_LEVEL=INFO
+      - PYTHONDONTWRITEBYTECODE=1
+    depends_on:
+      redis:
+        condition: service_started
+      elasticsearch:
+        condition: service_healthy
+      observability-server:
+        condition: service_started
+    networks:
+      - orchestrator-net
+    ports:
+      - "5002:5002"
+    working_dir: /app
+    command: ["python", "mcp/server.py"]
+    restart: unless-stopped
+
 volumes:
   redis_data:
   elasticsearch_data:
