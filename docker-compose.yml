@@ -232,7 +232,7 @@ services:
     networks:
       - orchestrator-net
     ports:
-      - "5002:5002"
+      - "100.121.142.32:5002:5002"
     working_dir: /app
     command: ["python", "mcp/server.py"]
     restart: unless-stopped
