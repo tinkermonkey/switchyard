@@ -39,7 +39,7 @@ from auth import BearerAuthMiddleware
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO").upper())
 log = logging.getLogger(__name__)
 
-SERVER_VERSION = "0.1.0"
+SERVER_VERSION = "0.2.0"
 
 # ── Paths & external service URLs ─────────────────────────────────────────────
 
@@ -602,6 +602,33 @@ async def move_issue(
         "from_status": current_status,
         "to_status": to_status,
     }
+
+
+@mcp.tool()
+async def github_graphql(query: str, variables: dict | None = None) -> dict:
+    """
+    Execute an arbitrary GitHub GraphQL query or mutation via the gh CLI.
+
+    The gh CLI is authenticated as the GitHub App inside the switchyard
+    container.  Raises RuntimeError on gh CLI errors or GraphQL error
+    responses.
+
+    Args:
+        query:     GraphQL query or mutation string.
+        variables: Optional dict of query variables.
+    """
+    body = json.dumps({"query": query, "variables": variables or {}})
+    result = subprocess.run(
+        ["gh", "api", "graphql", "--input", "-"],
+        input=body,
+        capture_output=True, text=True, timeout=30,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"gh graphql failed: {result.stderr.strip()}")
+    data = json.loads(result.stdout)
+    if "errors" in data:
+        raise RuntimeError(f"GraphQL errors: {data['errors']}")
+    return data
 
 
 # ── MCP tools: pipeline run diagnostics ───────────────────────────────────────
