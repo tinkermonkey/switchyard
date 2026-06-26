@@ -39,7 +39,7 @@ from auth import BearerAuthMiddleware
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO").upper())
 log = logging.getLogger(__name__)
 
-SERVER_VERSION = "0.2.0"
+SERVER_VERSION = "0.2.1"
 
 # ── Paths & external service URLs ─────────────────────────────────────────────
 
@@ -601,6 +601,196 @@ async def move_issue(
         "board": board_name,
         "from_status": current_status,
         "to_status": to_status,
+    }
+
+
+@mcp.tool()
+async def toggle_project_v2_workflow(
+    project_number: int,
+    workflow_id: str,
+    enabled: bool,
+    owner: str | None = None,
+) -> dict:
+    """
+    Enable or disable a GitHub Projects v2 built-in automation workflow.
+
+    Resolves the project and workflow via GraphQL to get numeric database IDs,
+    then calls the GitHub REST API (PUT /orgs/{owner}/projects/{db_id}/workflows/{wf_id})
+    to toggle the workflow.  The REST endpoint is only available for
+    organization-owned projects; user-owned projects will raise a RuntimeError
+    that explains the GitHub API limitation.
+
+    Args:
+        project_number: The project's number (e.g. 61).
+        workflow_id:    Workflow node ID (PWF_...), numeric workflow number as a
+                        string (e.g. "1"), or a substring of the workflow name
+                        (e.g. "Auto-close").
+        enabled:        True to enable, False to disable.
+        owner:          GitHub org or username that owns the project. If omitted,
+                        defaults to the authenticated user (via `gh api /user`).
+    """
+    # Resolve owner if not supplied.
+    if not owner:
+        res = subprocess.run(
+            ["gh", "api", "/user", "--jq", ".login"],
+            capture_output=True, text=True, timeout=15,
+        )
+        if res.returncode != 0:
+            raise RuntimeError(f"Could not resolve authenticated user: {res.stderr.strip()}")
+        owner = res.stdout.strip()
+
+    # GraphQL fragments reused for both org and user queries.
+    _wf_fragment = """
+      id
+      fullDatabaseId
+      name
+      enabled
+      number
+    """
+    _proj_fragment = f"""
+      id
+      fullDatabaseId
+      title
+      owner {{
+        ... on Organization {{ login __typename }}
+        ... on User {{ login __typename }}
+      }}
+      workflows(first: 20) {{
+        nodes {{ {_wf_fragment} }}
+      }}
+    """
+
+    def _query_project(via: str) -> tuple[dict | None, str | None]:
+        """Try to fetch the project via 'org' or 'user' GraphQL root."""
+        if via == "org":
+            gql = f'{{ organization(login: "{owner}") {{ projectV2(number: {project_number}) {{ {_proj_fragment} }} }} }}'
+            key = "organization"
+        else:
+            gql = f'{{ user(login: "{owner}") {{ projectV2(number: {project_number}) {{ {_proj_fragment} }} }} }}'
+            key = "user"
+        try:
+            data = _gh_graphql(gql)
+            proj = (data.get("data") or {}).get(key, {}).get("projectV2")
+            return proj, via
+        except RuntimeError:
+            return None, None
+
+    # Try org-owned first, then user-owned.
+    project_data, owner_type = _query_project("org")
+    if not project_data:
+        project_data, owner_type = _query_project("user")
+    if not project_data:
+        raise ValueError(
+            f"Project #{project_number} not found for owner '{owner}'."
+        )
+
+    project_db_id = project_data["fullDatabaseId"]
+    workflows = (project_data.get("workflows") or {}).get("nodes", [])
+
+    # Match workflow by node ID, number string, or name substring.
+    target_wf = None
+    for wf in workflows:
+        if (
+            wf.get("id") == workflow_id
+            or str(wf.get("number")) == str(workflow_id)
+            or workflow_id.lower() in (wf.get("name") or "").lower()
+        ):
+            target_wf = wf
+            break
+
+    if not target_wf:
+        available = [
+            f"{wf['id']} / #{wf['number']} / {wf['name']}" for wf in workflows
+        ]
+        raise ValueError(
+            f"Workflow '{workflow_id}' not found in project #{project_number}. "
+            f"Available: {available}"
+        )
+
+    current_enabled = target_wf["enabled"]
+
+    if current_enabled == enabled:
+        return {
+            "success": True,
+            "changed": False,
+            "project_number": project_number,
+            "project_title": project_data.get("title"),
+            "owner": owner,
+            "owner_type": owner_type,
+            "workflow_id": target_wf["id"],
+            "workflow_name": target_wf["name"],
+            "enabled": enabled,
+            "message": f"Workflow is already {'enabled' if enabled else 'disabled'} — no change made.",
+        }
+
+    # Attempt REST toggle: only works for org-owned projects.
+    rest_path = f"/orgs/{owner}/projects/{project_db_id}/workflows/{target_wf['fullDatabaseId']}"
+    rest_result = subprocess.run(
+        ["gh", "api", "--method", "PUT", rest_path, "--input", "-"],
+        input=json.dumps({"enabled": enabled}),
+        capture_output=True, text=True, timeout=30,
+    )
+
+    if rest_result.returncode != 0:
+        try:
+            err_data = json.loads(rest_result.stdout or rest_result.stderr)
+            err_detail = err_data.get("message", rest_result.stderr.strip())
+            status_code = err_data.get("status", "?")
+        except (json.JSONDecodeError, AttributeError):
+            err_detail = rest_result.stderr.strip()
+            status_code = "?"
+
+        if owner_type == "user":
+            raise RuntimeError(
+                f"GitHub's REST API for toggling Projects v2 built-in workflows is only "
+                f"available for organization-owned projects. Project #{project_number} is "
+                f"owned by user '{owner}'. "
+                f"REST path tried: PUT {rest_path} → HTTP {status_code}: {err_detail}. "
+                f"There is currently no public API to toggle built-in workflows on "
+                f"user-owned projects — use the GitHub UI instead."
+            )
+        raise RuntimeError(
+            f"REST toggle failed: PUT {rest_path} → HTTP {status_code}: {err_detail}"
+        )
+
+    # Confirm new state via a fresh GraphQL read.
+    gql_confirm = (
+        f'{{ organization(login: "{owner}") {{ projectV2(number: {project_number}) {{ '
+        f'workflows(first: 20) {{ nodes {{ {_wf_fragment} }} }} }} }} }}'
+        if owner_type == "org"
+        else
+        f'{{ user(login: "{owner}") {{ projectV2(number: {project_number}) {{ '
+        f'workflows(first: 20) {{ nodes {{ {_wf_fragment} }} }} }} }} }}'
+    )
+    confirm_root = "organization" if owner_type == "org" else "user"
+    try:
+        confirm = _gh_graphql(gql_confirm)
+        updated_nodes = (
+            (confirm.get("data") or {})
+            .get(confirm_root, {})
+            .get("projectV2", {})
+            .get("workflows", {})
+            .get("nodes", [])
+        )
+        updated_wf = next(
+            (wf for wf in updated_nodes if wf.get("id") == target_wf["id"]), None
+        )
+        new_enabled = updated_wf["enabled"] if updated_wf else enabled
+    except RuntimeError:
+        new_enabled = enabled  # optimistically assume REST succeeded
+
+    return {
+        "success": True,
+        "changed": True,
+        "project_number": project_number,
+        "project_title": project_data.get("title"),
+        "owner": owner,
+        "owner_type": owner_type,
+        "workflow_id": target_wf["id"],
+        "workflow_name": target_wf["name"],
+        "previous_enabled": current_enabled,
+        "enabled": new_enabled,
+        "rest_path": f"PUT {rest_path}",
     }
 
 
