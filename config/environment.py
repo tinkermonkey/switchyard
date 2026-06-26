@@ -13,6 +13,7 @@ class Environment(BaseSettings):
     github_token: Optional[SecretStr] = None
     openai_api_key: Optional[SecretStr] = None  # For GPT-based reviews
     context7_api_key: Optional[SecretStr] = None  # For Context7 MCP server
+    switchyard_mcp_token: Optional[SecretStr] = None  # For Switchyard MCP server authentication
 
     # Webhook Configuration
     webhook_secret: Optional[SecretStr] = None
