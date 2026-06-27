@@ -272,6 +272,10 @@ def _launch_repair_cycle_container(
             '-v', f'{host_workspace_path}/switchyard:/workspace/switchyard',
             # Mount project workspace at standard path (same as agent containers)
             '-v', f'{host_workspace_path}/{project_name}:/workspace/{project_name}',
+            # Mount .orchestrator dir so MCP config writes and reference worktrees work
+            # (docker_runner writes to /workspace/.orchestrator/tmp; without this mount
+            # the path is absent/unwritable in the repair cycle container)
+            '-v', f'{host_workspace_path}/.orchestrator:/workspace/.orchestrator',
             # Mount Docker socket (for launching agent containers)
             '-v', '/var/run/docker.sock:/var/run/docker.sock',
             # Mount GitHub App private key directory (if it exists)
