@@ -25,13 +25,16 @@ class GitHubDiscussions:
     def _execute_graphql(self, query: str, variables: Dict[str, Any] = None) -> Optional[Dict]:
         """Execute GraphQL query using App or Client fallback"""
         if self.app.enabled:
-            return self.app.graphql_request(query, variables)
-        
+            result = self.app.graphql_request(query, variables)
+            if result is not None:
+                return result
+            # App returned None (e.g. NOT_FOUND, repo not accessible to App) — fall through to PAT
+
         # Fallback to client (PAT)
         success, result = self.client.graphql(query, variables)
         if success:
             return result
-        
+
         logger.error(f"GraphQL execution failed: {result}")
         return None
 

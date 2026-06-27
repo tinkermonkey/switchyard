@@ -7062,6 +7062,20 @@ _Repair cycle initiated by Switchyard_
 
                         # Monitor discussions if pipeline uses discussions workspace
                         if pipeline.workspace in ['discussions', 'hybrid']:
+                            # Retry discussion creation for board items that don't have one yet.
+                            # Covers cases where initial creation failed (e.g. transient App failure).
+                            if current_items:
+                                from config.state_manager import state_manager as _sm
+                                for _item in current_items:
+                                    if not _sm.get_discussion_for_issue(project_name, _item.issue_number):
+                                        self._check_and_create_discussion(
+                                            project_name,
+                                            pipeline.board_name,
+                                            _item.issue_number,
+                                            _item.repository,
+                                            _item.status
+                                        )
+
                             self.monitor_discussions(
                                 project_name,
                                 pipeline.board_name,
@@ -7614,7 +7628,7 @@ _Repair cycle initiated by Switchyard_
             )
 
             if not category_id:
-                logger.warning(f"Could not determine discussion category for {project_name}/{pipeline_config.board_name} (GitHub App not configured)")
+                logger.warning(f"Could not determine discussion category for {project_name}/{pipeline_config.board_name} — no categories returned (App may lack repo access, will retry next poll)")
                 return
 
             # Get repository ID for GraphQL
