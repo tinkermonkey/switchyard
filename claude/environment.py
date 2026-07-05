@@ -91,6 +91,9 @@ class ClaudeEnvironmentBuilder:
         if context7 := os.environ.get("CONTEXT7_API_KEY", "").strip():
             vars["CONTEXT7_API_KEY"] = context7
 
+        if elevenlabs := os.environ.get("ELEVENLABS_API_KEY", "").strip():
+            vars["ELEVENLABS_API_KEY"] = elevenlabs
+
         return vars
 
     def identification_vars(self, ctx: ClaudeRunContext) -> dict:
