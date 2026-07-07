@@ -27,7 +27,7 @@ agents:
 
   dev_environment_verifier:
     description: "Verifies dev environment setup succeeded and marks container as verified"
-    model: "claude-sonnet-4-6"
+    model: "claude-sonnet-5"
     timeout: 3600
     retries: 2
     makes_code_changes: false  # Only verifies and updates state
@@ -68,7 +68,7 @@ agents:
 
   business_analyst:
     description: "Requirements analysis and user story development"
-    model: "claude-sonnet-4-6"
+    model: "claude-sonnet-5"
     timeout: 3600
     retries: 3
     makes_code_changes: false  # Posts to GitHub discussions, doesn't create files
@@ -110,7 +110,7 @@ agents:
 
   work_breakdown_agent:
     description: "Break approved designs into phase-based sub-issues for implementation"
-    model: "claude-sonnet-4-6"
+    model: "claude-sonnet-5"
     timeout: 3600
     retries: 2
     makes_code_changes: false  # Creates GitHub issues, not files
@@ -130,7 +130,7 @@ agents:
 
   senior_software_engineer:
     description: "Software development and implementation"
-    model: "claude-sonnet-4-6"
+    model: "claude-sonnet-5"
     timeout: 10800  # 3-hour hard limit; enforced by docker wait timeout in docker_runner
     retries: 3
     circuit_breaker:
@@ -174,7 +174,7 @@ agents:
 
   technical_writer:
     description: "Technical documentation creation"
-    model: "claude-sonnet-4-6"
+    model: "claude-sonnet-5"
     timeout: 3600
     retries: 2
     makes_code_changes: true  # Creates documentation files
@@ -191,7 +191,7 @@ agents:
 
   documentation_editor:
     description: "Documentation review and editing"
-    model: "claude-sonnet-4-6"
+    model: "claude-sonnet-5"
     timeout: 3600
     retries: 2
     makes_code_changes: false  # Review only, no changes
@@ -227,7 +227,7 @@ agents:
 
   requirements_verifier:
     description: "Verify PR against requirements and context"
-    model: "claude-sonnet-4-6"
+    model: "claude-sonnet-5"
     timeout: 3600
     retries: 2
     makes_code_changes: false
@@ -264,7 +264,7 @@ agents:
 
   claude_advisor:
     description: "Analyzes project failures and recommends improvements"
-    model: "claude-sonnet-4-6"
+    model: "claude-sonnet-5"
     timeout: 3600
     retries: 1
     makes_code_changes: false
@@ -284,7 +284,7 @@ agents:
 
   pipeline_analysis:
     description: "Post-completion analysis of pipeline runs — investigates events, identifies root causes, stores structured results on the ES document"
-    model: "claude-sonnet-4-6"
+    model: "claude-sonnet-5"
     timeout: 300
     retries: 1
     makes_code_changes: false

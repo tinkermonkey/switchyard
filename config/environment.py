@@ -26,7 +26,7 @@ class Environment(BaseSettings):
     redis_password: Optional[SecretStr] = None
 
     # Claude Configuration
-    claude_model: str = "claude-sonnet-4-5-20250929"
+    claude_model: str = "claude-sonnet-5"
     max_tokens: int = 100000
     temperature: float = 0.3
     claude_code_weekly_token_quota: Optional[int] = 630000000  # Weekly token quota (630M tokens, resets Wed 5PM)

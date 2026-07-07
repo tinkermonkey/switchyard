@@ -74,6 +74,6 @@ statistical_analysis:
 llm_analysis:
   enabled: false  # Enable in Phase 4
   schedule: "0 3 * * 0"  # Run weekly on Sunday at 3 AM
-  model: "claude-3-5-sonnet-20241022"
+  model: "claude-sonnet-5"
   max_tokens: 4096
   temperature: 0.3
