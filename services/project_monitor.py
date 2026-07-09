@@ -18,6 +18,13 @@ from services.github_api_client import get_github_client
 
 logger = logging.getLogger(__name__)
 
+# Independent from WATCHDOG_MAX_RETRIES (a different watchdog — 15-minute stuck/empty-output
+# sweep). Caps consecutive DISPATCH failures for the same issue/column/agent before halting
+# auto-redispatch. 3 matches agent_executor.py's own per-dispatch retry count (max_attempts =
+# 1 + retries(2) = 3), so by the time this triggers, up to 9 real container attempts have
+# already happened.
+MAX_CONSECUTIVE_DISPATCH_FAILURES = 3
+
 @dataclass
 class ProjectItem:
     """Represents an item in a GitHub Projects v2 board"""
@@ -1841,9 +1848,26 @@ class ProjectMonitor:
             if is_trigger_column and agent and agent != 'null':
                 from services.pipeline_lock_manager import get_pipeline_lock_manager
                 from services.pipeline_queue_manager import get_pipeline_queue_manager
+                from services.work_execution_state import work_execution_tracker
 
                 lock_manager = get_pipeline_lock_manager()
                 pipeline_queue = get_pipeline_queue_manager(project_name, board_name)
+
+                # Single gate covering BOTH the fresh-lock-acquisition branch below and
+                # the already-holds-lock branch further down: if auto-dispatch was halted
+                # (by the consecutive-failure guard in the already-holds-lock branch, or by
+                # a crashed review-cycle thread in run_cycle_in_thread), skip entirely
+                # regardless of which branch would otherwise run. Placed here, before the
+                # branch point, rather than inside each branch, so releasing the lock can
+                # never let the OTHER branch redispatch unguarded on the next poll.
+                halt_marker = work_execution_tracker.get_halt_marker(project_name, issue_number)
+                if halt_marker:
+                    logger.info(
+                        f"Issue #{issue_number} auto-dispatch halted since {halt_marker['halted_at']} "
+                        f"({halt_marker['reason']}); skipping until explicitly cleared via "
+                        f"scripts/clear_halt_marker.py"
+                    )
+                    return None
 
                 # Always call enqueue_issue to handle re-queueing of completed issues
                 # The enqueue_issue method handles all cases:
@@ -1960,6 +1984,51 @@ class ProjectMonitor:
                                 f"(workflow progression from completed {current_column_agent}), "
                                 f"proceeding with next stage"
                             )
+                        elif last_execution and last_execution.get('outcome') == 'failure':
+                            # Ran and failed - distinguish a persistently-broken dispatch from
+                            # a transient blip before blindly redispatching again. Each dispatch
+                            # already gets its own 3-attempt retry inside agent_executor.py; this
+                            # counts consecutive DISPATCH failures across separate poll cycles.
+                            consecutive_failures = work_execution_tracker.count_consecutive_failures(
+                                project_name=project_name,
+                                issue_number=issue_number,
+                                column=status,
+                                agent=current_column_agent,
+                            )
+                            if consecutive_failures >= MAX_CONSECUTIVE_DISPATCH_FAILURES:
+                                logger.error(
+                                    f"Issue #{issue_number} failed {consecutive_failures} consecutive "
+                                    f"dispatches for {current_column_agent} in '{status}' — halting "
+                                    f"auto-redispatch pending explicit human review."
+                                )
+                                work_execution_tracker.set_halt_marker(
+                                    project_name=project_name,
+                                    issue_number=issue_number,
+                                    column=status,
+                                    agent=current_column_agent,
+                                    reason=f"{consecutive_failures} consecutive dispatch failures",
+                                    consecutive_failures=consecutive_failures,
+                                )
+                                # Plain release, NOT _release_pipeline_lock_and_process_next()
+                                # (which also purges the queue entry — wrong here, this issue
+                                # hasn't exited the workflow).
+                                lock_manager.release_lock(project_name, board_name, issue_number)
+                                # MUST reset queue status back to 'waiting' or
+                                # get_next_waiting_issue() will never select this issue again
+                                # even after the halt is cleared (it filters strictly on
+                                # status=='waiting'; nothing else resets active->waiting).
+                                pipeline_queue.reset_issue_to_waiting(issue_number)
+                                self._post_halt_comment(
+                                    project_name, repository, issue_number,
+                                    current_column_agent, status, consecutive_failures
+                                )
+                                return None
+                            else:
+                                pipeline_queue.mark_issue_active(issue_number)
+                                logger.warning(
+                                    f"Issue #{issue_number} retrying after {consecutive_failures} "
+                                    f"prior failure(s) for {current_column_agent} in '{status}'"
+                                )
                         else:
                             # Issue is queued but never executed - should execute current stage
                             logger.info(
@@ -2789,6 +2858,34 @@ class ProjectMonitor:
             import traceback
             logger.error(traceback.format_exc())
             return None
+
+    def _post_halt_comment(
+        self,
+        project_name: str,
+        repository: str,
+        issue_number: int,
+        agent: str,
+        status: str,
+        consecutive_failures: int
+    ):
+        """Post a GitHub comment explaining an auto-dispatch halt (best-effort)."""
+        try:
+            import asyncio
+            from services.github_integration import GitHubIntegration
+            project_config = self.config_manager.get_project_config(project_name)
+            github = GitHubIntegration(
+                repo_owner=project_config.github['org'], repo_name=repository
+            )
+            comment = (
+                f"## ⚠️ Auto-Dispatch Halted\n\n"
+                f"Agent `{agent}` failed {consecutive_failures} consecutive dispatches "
+                f"in status '{status}' and auto-redispatch has been halted.\n\n"
+                f"Run `scripts/clear_halt_marker.py --project {project_name} "
+                f"--issue {issue_number}` to clear the halt and retry."
+            )
+            asyncio.run(github.post_comment(issue_number, comment))
+        except Exception as comment_err:
+            logger.warning(f"Failed to post halt comment for issue #{issue_number}: {comment_err}")
 
     def _release_pipeline_lock_and_process_next(
         self,
@@ -4109,6 +4206,8 @@ class ProjectMonitor:
 
             def run_cycle_in_thread():
                 """Run the review cycle in a background thread"""
+                exception_occurred = False  # True only for a genuine crash, not CancellationError
+                error_summary = None
                 try:
                     # Create new event loop for this thread
                     loop = asyncio.new_event_loop()
@@ -4218,6 +4317,8 @@ _Review cycle initiated by Switchyard_
                     if isinstance(e, CancellationError):
                         logger.info(f"Review cycle cancelled for issue #{issue_number}")
                     else:
+                        exception_occurred = True
+                        error_summary = str(e)
                         logger.error(f"Error in review cycle thread: {e}")
                         import traceback
                         logger.error(traceback.format_exc())
@@ -4440,6 +4541,45 @@ _Review cycle initiated by Switchyard_
                                 logger.error(f"Error processing next queued issue for {project_name}/{board_name}: {queue_error}")
                                 import traceback
                                 logger.error(traceback.format_exc())
+                        elif exception_occurred:
+                            # Crashed mid-pipeline (not at an exit column). Plain release,
+                            # NOT the "process next queued issue" block above (which also
+                            # purges/reassigns queue state — wrong here since review-type
+                            # columns like "Code Review" are neither trigger nor exit columns,
+                            # so nothing would automatically re-add this issue to the queue).
+                            from services.work_execution_state import work_execution_tracker
+                            lock_mgr.release_lock(project_name, board_name, issue_number)
+                            # MUST reset queue status back to 'waiting' or get_next_waiting_issue()
+                            # will never select this issue again even after the halt is cleared
+                            # (it filters strictly on status=='waiting'; nothing else resets
+                            # active->waiting automatically).
+                            from services.pipeline_queue_manager import get_pipeline_queue_manager
+                            queue_mgr = get_pipeline_queue_manager(project_name, board_name)
+                            queue_mgr.reset_issue_to_waiting(issue_number)
+                            work_execution_tracker.set_halt_marker(
+                                project_name=project_name,
+                                issue_number=issue_number,
+                                column=status,
+                                agent="review_cycle",  # generic — crash could be reviewer or maker agent, ambiguous which
+                                reason=f"Review cycle thread crashed: {error_summary}",
+                            )
+                            logger.error(
+                                f"Released pipeline lock for issue #{issue_number} after review "
+                                f"cycle crash (was mid-pipeline in '{status}') and halted "
+                                f"auto-redispatch pending explicit human review."
+                            )
+                            try:
+                                if 'github' in locals() and 'loop' in locals() and loop is not None:
+                                    loop.run_until_complete(github.post_comment(
+                                        issue_number,
+                                        f"## ⚠️ Review Cycle Halted\n\nThe automated review cycle "
+                                        f"crashed and auto-redispatch has been halted:\n\n```\n"
+                                        f"{error_summary}\n```\n\nRun `scripts/clear_halt_marker.py "
+                                        f"--project {project_name} --issue {issue_number}` to clear "
+                                        f"the halt and retry.",
+                                    ))
+                            except Exception as comment_err:
+                                logger.warning(f"Failed to post halt comment: {comment_err}")
                         else:
                             logger.debug(
                                 f"Keeping pipeline lock for issue #{issue_number} "

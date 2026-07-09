@@ -626,9 +626,14 @@ class PRReviewStage(PipelineStage):
             manual_progression_made = False
 
             if phases_completed == 0:
-                # All phases failed - inconclusive
-                logger.error(f"All review phases failed for #{parent_issue_number}")
+                # All phases failed - this is a real failure, not a benign inconclusive
+                # result. Must raise (not just log) so the caller's failure-handling path
+                # (services/project_monitor.py's run_pr_review()) actually engages instead
+                # of this stage silently reporting success and stranding the issue.
+                msg = f"All review phases failed for #{parent_issue_number}"
+                logger.error(msg)
                 pr_review_state_manager.increment_review_count(project_name, parent_issue_number, [])
+                raise NonRetryableAgentError(msg)
 
             elif phases_completed < phases_attempted and not review_found_issues:
                 # Some phases failed, no issues found - inconclusive

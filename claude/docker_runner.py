@@ -1235,6 +1235,10 @@ class DockerAgentRunner:
             # Collect output
             result_parts = []
             stderr_parts = []
+            # Full raw stdout lines (unlike result_parts, which is cleared/replaced on every
+            # 'assistant' event and only ever holds the latest turn) — kept so a nonzero-exit
+            # failure can be diagnosed after the fact, once the container (and its logs) are gone.
+            stdout_parts = []
             input_tokens = 0
             output_tokens = 0
             cache_read_tokens = 0
@@ -1285,6 +1289,9 @@ class DockerAgentRunner:
                         if is_limit:
                             breaker.trip(reset_time)
                             logger.error(f"🔴 TRIPPED BREAKER: Token limit detected in output: {check_text}")
+
+                    if not is_stderr:
+                        stdout_parts.append(line + '\n')
 
                     if is_stderr:
                         stderr_parts.append(line + '\n')
@@ -1495,6 +1502,30 @@ class DockerAgentRunner:
             if exit_code != 0:
                 stderr_text = ''.join(stderr_parts)
                 logger.info(f"Container {container_name} failed with exit_code={exit_code}, stderr length={len(stderr_text)} bytes")
+
+                # Persist the FULL (untruncated) stdout+stderr to a host-mounted, durable log
+                # file — the container is removed (--rm) shortly after this, and the only other
+                # captures (Redis agent_result, /tmp fallback file) either expire (2h TTL) or die
+                # with the container. Without this, a nonzero exit is only diagnosable via the
+                # 200-char stderr preview below, which is often just entrypoint debug output
+                # (e.g. an `ls -la`), not the actual error.
+                try:
+                    from pathlib import Path
+                    failure_log_dir = Path("orchestrator_data/logs/container-failures")
+                    failure_log_dir.mkdir(parents=True, exist_ok=True)
+                    failure_log_path = failure_log_dir / f"{container_name}.log"
+                    with open(failure_log_path, 'w') as f:
+                        f.write(f"container_name: {container_name}\n")
+                        f.write(f"agent: {agent}\ntask_id: {task_id}\nproject: {project}\n")
+                        f.write(f"exit_code: {exit_code}\n")
+                        f.write(f"failed_at: {datetime.now().isoformat()}\n")
+                        f.write("\n--- STDOUT (full) ---\n")
+                        f.write(''.join(stdout_parts))
+                        f.write("\n--- STDERR (full) ---\n")
+                        f.write(stderr_text)
+                    logger.info(f"Wrote full stdout/stderr for failed container {container_name} to {failure_log_path}")
+                except Exception as log_write_error:
+                    logger.warning(f"Failed to write full failure log for {container_name}: {log_write_error}")
 
                 # Emit container execution failure event
                 if obs:

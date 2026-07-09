@@ -77,7 +77,8 @@ class WorkExecutionStateTracker:
                 'execution_history': [],
                 'status_changes': [],
                 'current_status': None,
-                'last_updated': None
+                'last_updated': None,
+                'halted_for_review': None
             }
 
         try:
@@ -92,6 +93,7 @@ class WorkExecutionStateTracker:
                         # Ensure all expected keys exist
                         state.setdefault('execution_history', [])
                         state.setdefault('status_changes', [])
+                        state.setdefault('halted_for_review', None)
                         return state
             # File doesn't exist inside lock, return default
             return {
@@ -100,7 +102,8 @@ class WorkExecutionStateTracker:
                 'execution_history': [],
                 'status_changes': [],
                 'current_status': None,
-                'last_updated': None
+                'last_updated': None,
+                'halted_for_review': None
             }
         except Exception as e:
             logger.error(f"Failed to load state for {project_name}/#{issue_number}: {e}")
@@ -110,7 +113,8 @@ class WorkExecutionStateTracker:
                 'execution_history': [],
                 'status_changes': [],
                 'current_status': None,
-                'last_updated': None
+                'last_updated': None,
+                'halted_for_review': None
             }
 
     def save_state(self, project_name: str, issue_number: int, state: Dict):
@@ -435,6 +439,73 @@ class WorkExecutionStateTracker:
         ]
 
         return column_executions[-1] if column_executions else None
+
+    def set_halt_marker(
+        self,
+        project_name: str,
+        issue_number: int,
+        column: str,
+        agent: str,
+        reason: str,
+        consecutive_failures: Optional[int] = None
+    ):
+        """Mark an issue as halted from auto-dispatch pending EXPLICIT human clearing.
+
+        Deliberately not an `outcome` value (see should_execute()'s 'blocked' handling,
+        which means the opposite: auto-retry-eligible). Deliberately NOT auto-cleared by
+        board activity: services/pipeline_progression.py's progress_issue() defaults
+        trigger='manual' even on fully-automated calls, so status_changes/trigger fields
+        cannot reliably distinguish real human action from automated progression. Only
+        clear_halt_marker() (invoked explicitly, e.g. via scripts/clear_halt_marker.py)
+        removes this.
+        """
+        state = self.load_state(project_name, issue_number)
+        state['halted_for_review'] = {
+            'halted_at': datetime.now(timezone.utc).isoformat(),
+            'column': column,
+            'agent': agent,
+            'reason': reason,
+            'consecutive_failures': consecutive_failures,
+        }
+        self.save_state(project_name, issue_number, state)
+        logger.error(
+            f"Halted auto-dispatch for {project_name}/#{issue_number} ({agent} in {column}): {reason}"
+        )
+
+    def get_halt_marker(self, project_name: str, issue_number: int) -> Optional[Dict]:
+        """Return the halt marker if set. No auto-clear — see set_halt_marker docstring."""
+        state = self.load_state(project_name, issue_number)
+        return state.get('halted_for_review')
+
+    def clear_halt_marker(self, project_name: str, issue_number: int):
+        """Explicitly clear a halt marker (e.g. via scripts/clear_halt_marker.py)."""
+        state = self.load_state(project_name, issue_number)
+        if state.get('halted_for_review'):
+            state['halted_for_review'] = None
+            self.save_state(project_name, issue_number, state)
+            logger.info(f"Cleared halt marker for {project_name}/#{issue_number}")
+
+    def count_consecutive_failures(
+        self,
+        project_name: str,
+        issue_number: int,
+        column: str,
+        agent: str
+    ) -> int:
+        """Count trailing consecutive 'failure' outcomes for this column/agent —
+        same filter idiom as get_last_execution()."""
+        state = self.load_state(project_name, issue_number)
+        column_executions = [
+            e for e in state['execution_history']
+            if e['column'] == column and e['agent'] == agent
+        ]
+        count = 0
+        for execution in reversed(column_executions):
+            if execution.get('outcome') == 'failure':
+                count += 1
+            else:
+                break
+        return count
 
     def get_execution_history(
         self,
