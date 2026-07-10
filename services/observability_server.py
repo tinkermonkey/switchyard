@@ -251,6 +251,25 @@ def kill_agent(container_name):
             'container_name': container_name
         }), 500
 
+@app.route('/api/projects/<project>/rebuild-image', methods=['POST'])
+def rebuild_image(project):
+    """Trigger a background rebuild of a project's agent Docker image."""
+    from scripts.rebuild_project_images import rebuild_project_image
+    from services.dev_container_state import dev_container_state, DevContainerStatus
+
+    dev_container_state.set_status(project, DevContainerStatus.IN_PROGRESS)
+
+    def _run():
+        try:
+            ok = rebuild_project_image(project, update_state=True)
+            if not ok:
+                dev_container_state.set_status(project, DevContainerStatus.BLOCKED, error_message="build failed (see server logs)")
+        except Exception as e:
+            dev_container_state.set_status(project, DevContainerStatus.BLOCKED, error_message=str(e))
+
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({"success": True, "triggered": True, "project": project})
+
 def get_claude_token_usage():
     """
     Query Elasticsearch for Claude Code token usage metrics.

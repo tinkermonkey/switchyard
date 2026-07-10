@@ -990,6 +990,38 @@ async def analyze_run(pipeline_run_id: str) -> dict:
 
 
 @mcp.tool()
+async def rebuild_agent_image(project: str) -> dict:
+    """
+    Trigger a rebuild of a project's agent Docker image (docker build from
+    <project>/Dockerfile.agent). Fire-and-forget — builds can take up to 30
+    minutes, so this returns as soon as the rebuild is triggered, not when it
+    completes. Poll get_image_build_status(project) to check progress.
+
+    Args:
+        project: Project name (matches the directory name under /workspace).
+    """
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.post(f"{OBSERVABILITY_URL}/api/projects/{project}/rebuild-image")
+        resp.raise_for_status()
+        return resp.json()
+
+
+@mcp.tool()
+def get_image_build_status(project: str) -> dict:
+    """
+    Read a project's agent Docker image build status directly from the shared
+    state file (no HTTP call) — one of unverified/in_progress/verified/blocked.
+
+    Args:
+        project: Project name.
+    """
+    from services.dev_container_state import dev_container_state
+    status = dev_container_state.get_status(project)
+    image_name = dev_container_state.get_image_name(project)
+    return {"project": project, "status": status.value, "image_name": image_name}
+
+
+@mcp.tool()
 async def list_recent_runs(
     project: str | None = None,
     limit: int = 10,
