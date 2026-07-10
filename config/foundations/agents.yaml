@@ -150,7 +150,6 @@ agents:
       - web_search
     mcp_servers:
       - context7
-      - playwright
 
   code_reviewer:
     description: "Code quality review and validation"

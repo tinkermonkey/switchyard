@@ -927,14 +927,27 @@ async def get_run_status(pipeline_run_id: str) -> dict:
     }
 
 
+_ANALYZE_RUN_POLL_INTERVAL_SECONDS = 5
+_ANALYZE_RUN_MAX_WAIT_SECONDS = 120
+
+
 @mcp.tool()
 async def analyze_run(pipeline_run_id: str) -> dict:
     """
     Trigger analysis for a pipeline run and return the diagnostic summary.
 
     POSTs to the existing /api/pipeline-run/<id>/analyze endpoint on the
-    observability server (:5001), waits briefly, then fetches the result from
-    /api/pipeline-run/<id>/analysis.
+    observability server (:5001), then polls /api/pipeline-run/<id>/analysis
+    until a result appears or up to _ANALYZE_RUN_MAX_WAIT_SECONDS elapses.
+
+    The analysis itself is a full Claude Code agent invocation (the
+    `pipeline_analysis` agent, timeout 300s in agents.yaml) run in a background
+    thread on the observability server — it routinely takes well over a minute,
+    so a single short pause before reading the result is not enough; this polls
+    instead. If the wait is exhausted before the analysis finishes, "analysis"
+    is still null but "status" is "pending" rather than silently looking
+    identical to "no analysis exists" — call this tool again later to pick up
+    the result (a pending/finished analysis is not re-triggered).
 
     Args:
         pipeline_run_id: UUID of the pipeline run to analyze.
@@ -953,20 +966,26 @@ async def analyze_run(pipeline_run_id: str) -> dict:
                 "error": trigger_body.get("error", "Trigger returned success=false"),
             }
 
-        # Brief pause to allow the async analysis task to complete.
-        await asyncio.sleep(3)
+        analysis_body: dict = {}
+        elapsed = 0
+        while elapsed < _ANALYZE_RUN_MAX_WAIT_SECONDS:
+            await asyncio.sleep(_ANALYZE_RUN_POLL_INTERVAL_SECONDS)
+            elapsed += _ANALYZE_RUN_POLL_INTERVAL_SECONDS
 
-        analysis = await client.get(
-            f"{OBSERVABILITY_URL}/api/pipeline-run/{pipeline_run_id}/analysis"
-        )
-        analysis.raise_for_status()
-        analysis_body = analysis.json()
+            analysis = await client.get(
+                f"{OBSERVABILITY_URL}/api/pipeline-run/{pipeline_run_id}/analysis"
+            )
+            analysis.raise_for_status()
+            analysis_body = analysis.json()
+            if analysis_body.get("analysis"):
+                break
 
     return {
         "success": True,
         "pipeline_run_id": pipeline_run_id,
         "triggered": True,
         "analysis": analysis_body.get("analysis"),
+        "status": "complete" if analysis_body.get("analysis") else "pending",
     }
 
 

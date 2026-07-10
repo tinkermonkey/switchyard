@@ -31,7 +31,10 @@ services:
       - ..:/workspace
 
       # Mount SSH key for git operations (individual file to preserve container's SSH config)
-      - ~/.ssh/id_ed25519:/home/orchestrator/.ssh/id_github:ro
+      # Source filename must match what the homelab Ansible `github` role actually writes
+      # (~/.ssh/id_github, a copy of ~/.ssh/id_tinkermonkey) — do not rename this to
+      # id_ed25519, that file does not exist on the host.
+      - ~/.ssh/id_github:/home/orchestrator/.ssh/id_github:ro
       # Note: We don't mount ~/.ssh/config or known_hosts to preserve container's SSH setup
 
       # Mount git config
@@ -156,28 +159,6 @@ services:
     networks:
       - orchestrator-net
     restart: unless-stopped
-
-  browserless:
-    image: ghcr.io/browserless/chromium:latest
-    container_name: browserless
-    environment:
-      - CONCURRENT=5
-      - MAX_CONCURRENT_SESSIONS=5
-      - TIMEOUT=30000
-      - ENABLE_DEBUGGER=true
-      # Optional: Add token for authentication
-      # - TOKEN=your-secure-token-here
-    networks:
-      - orchestrator-net
-    ports:
-      - "3080:3000"  # Expose for debugging (web-ui uses 3000)
-    restart: unless-stopped
-    deploy:
-      resources:
-        limits:
-          memory: 2G
-        reservations:
-          memory: 512M
 
   elasticsearch:
     image: docker.elastic.co/elasticsearch/elasticsearch:9.0.0
