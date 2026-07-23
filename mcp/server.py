@@ -108,7 +108,32 @@ def _load_workflows() -> dict:
     return data.get("workflow_templates", {})
 
 
+def _resolve_project_name(project: str) -> str:
+    """
+    Resolve a caller-supplied project name to its canonical on-disk casing.
+
+    Project identity is defined by the config file under
+    config/projects/<name>.yaml; every downstream lookup (config file,
+    state directory, dev-container state, Redis keys, ES documents) is
+    keyed by that canonical name. Callers frequently vary casing (e.g.
+    "Codetoreum" vs "codetoreum"), so every lookup path must funnel
+    through this resolver rather than using the raw argument directly,
+    or an exact case-sensitive match silently reports "not configured"
+    for a project that in fact exists.
+    """
+    if (PROJECTS_CONFIG_DIR / f"{project}.yaml").exists():
+        return project
+    lowered = project.lower()
+    for path in PROJECTS_CONFIG_DIR.glob("*.yaml"):
+        if path.stem.lower() == lowered:
+            return path.stem
+    # No match under any casing — return unchanged so "not found" errors
+    # still echo back exactly what the caller typed.
+    return project
+
+
 def _load_project_config(project: str) -> dict:
+    project = _resolve_project_name(project)
     path = PROJECTS_CONFIG_DIR / f"{project}.yaml"
     if not path.exists():
         raise ValueError(f"Project config not found: '{project}'. "
@@ -118,11 +143,16 @@ def _load_project_config(project: str) -> dict:
 
 
 def _load_project_state(project: str) -> dict | None:
+    project = _resolve_project_name(project)
     state_file = STATE_DIR / project / "github_state.yaml"
     if not state_file.exists():
         return None
     with open(state_file) as f:
-        return yaml.safe_load(f)
+        data = yaml.safe_load(f)
+    # github_state.yaml wraps everything under a top-level `github_state` key
+    # (see config/state_manager.py's own load, which unwraps the same way) —
+    # return that inner dict so callers can access `state["boards"]` directly.
+    return data.get("github_state", {}) if data else data
 
 
 def _project_github(config: dict) -> tuple[str, str]:
@@ -835,6 +865,9 @@ async def list_active_runs(project: str | None = None) -> list[dict]:
         project: If given, restrict to this project name.  None returns runs
                  across all projects.
     """
+    if project:
+        project = _resolve_project_name(project)
+
     r = _get_redis()
     all_mappings: dict[str, str] = r.hgetall(
         "orchestrator:pipeline_run:issue_mapping"
@@ -1000,6 +1033,7 @@ async def rebuild_agent_image(project: str) -> dict:
     Args:
         project: Project name (matches the directory name under /workspace).
     """
+    project = _resolve_project_name(project)
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.post(f"{OBSERVABILITY_URL}/api/projects/{project}/rebuild-image")
         resp.raise_for_status()
@@ -1016,6 +1050,7 @@ def get_image_build_status(project: str) -> dict:
         project: Project name.
     """
     from services.dev_container_state import dev_container_state
+    project = _resolve_project_name(project)
     status = dev_container_state.get_status(project)
     image_name = dev_container_state.get_image_name(project)
     return {"project": project, "status": status.value, "image_name": image_name}
@@ -1040,6 +1075,9 @@ async def list_recent_runs(
         raise RuntimeError(
             "Elasticsearch is not available — cannot query historical runs."
         )
+
+    if project:
+        project = _resolve_project_name(project)
 
     limit = min(limit, 50)
     es_query: dict[str, Any] = (
