@@ -287,6 +287,14 @@ def _launch_repair_cycle_container(
             '-v', '/var/run/docker.sock:/var/run/docker.sock',
             # Mount GitHub App private key directory (if it exists)
             '-v', f'{host_home_path}/.orchestrator:/home/orchestrator/.orchestrator:ro',
+            # Mount SSH directory (whole dir, not a single file — lets docker-entrypoint.sh's
+            # ~/.ssh-runtime staging logic take over, same as docker_runner.py's agent containers).
+            # Without this, the FAILSAFE commit/push path in agent_executor.py falls back to the
+            # 0-byte id_github placeholder baked into the base Dockerfile and fails with
+            # "Load key ... error in libcrypto".
+            '-v', f'{host_home_path}/.ssh:/home/orchestrator/.ssh:ro',
+            # Mount git config (author identity, etc.) for FAILSAFE commits
+            '-v', f'{host_home_path}/.gitconfig:/home/orchestrator/.gitconfig',
 
             # Environment variables
             '-e', f'REDIS_HOST={env.redis_url.split("://")[1].split(":")[0]}',
