@@ -10,6 +10,44 @@ from datetime import datetime, timedelta, timezone
 
 logger = logging.getLogger(__name__)
 
+# Marker pair agents are instructed to wrap their true final deliverable in
+# (see prompts/content/workflows/output/*.md). Lets us recover the intended
+# output even when a session runs extra turns after posting it — e.g. a
+# background subagent (Task tool) completing and prompting a trailing
+# "as I mentioned above..." turn that would otherwise clobber result_parts.
+FINAL_OUTPUT_START = '<<<FINAL_OUTPUT>>>'
+FINAL_OUTPUT_END = '<<<END_FINAL_OUTPUT>>>'
+
+
+def _extract_marked_output(turn_text: str) -> Optional[str]:
+    """Extract a <<<FINAL_OUTPUT>>>...<<<END_FINAL_OUTPUT>>> block from one turn's
+    text. Tolerates a missing closing marker (takes the rest of the turn). Returns
+    None if no start marker is present."""
+    start = turn_text.find(FINAL_OUTPUT_START)
+    if start == -1:
+        return None
+    content_start = start + len(FINAL_OUTPUT_START)
+    end = turn_text.find(FINAL_OUTPUT_END, content_start)
+    content = turn_text[content_start:end if end != -1 else None]
+    return content.strip()
+
+
+def resolve_final_output(turns: list, fallback: str) -> str:
+    """Pick an agent's final output from its sequence of assistant turn texts.
+
+    Prefers the LAST marked block (see FINAL_OUTPUT_START/END) found across all
+    turns, so a legitimate later revision still wins but a trailing wrap-up turn
+    that omits the marker doesn't discard an already-produced deliverable. Falls
+    back to `fallback` (the literal last turn's text) when no turn used the
+    marker, preserving prior behavior for prompts that don't request it."""
+    marked = None
+    for turn_text in turns:
+        extracted = _extract_marked_output(turn_text)
+        if extracted is not None:
+            marked = extracted
+    return marked if marked is not None else fallback
+
+
 # Import Claude Code breaker for token limit detection
 try:
     from monitoring.claude_code_breaker import get_breaker, ClaudeCodeRateLimitError
@@ -1234,6 +1272,7 @@ class DockerAgentRunner:
 
             # Collect output
             result_parts = []
+            all_assistant_turns = []  # every assistant turn's text, in order (see resolve_final_output)
             stderr_parts = []
             # Full raw stdout lines (unlike result_parts, which is cleared/replaced on every
             # 'assistant' event and only ever holds the latest turn) — kept so a nonzero-exit
@@ -1364,9 +1403,10 @@ class DockerAgentRunner:
                             if turn_parts:
                                 result_parts.clear()
                                 result_parts.extend(turn_parts)
+                                combined = ''.join(turn_parts)
+                                all_assistant_turns.append(combined)
                                 # Log Claude output to orchestrator logs for visibility
                                 # Truncate long outputs to avoid log spam
-                                combined = ''.join(turn_parts)
                                 log_text = combined[:500] + '...' if len(combined) > 500 else combined
                                 logger.info(f"[Claude] {log_text}")
 
@@ -1588,7 +1628,13 @@ class DockerAgentRunner:
                                                pipeline_run_id=pipeline_run_id)
 
             if exit_code == 0:
-                result_text = ''.join(result_parts)
+                result_text = resolve_final_output(all_assistant_turns, ''.join(result_parts))
+                if result_text != ''.join(result_parts):
+                    logger.info(
+                        f"Container {container_name}: using <<<FINAL_OUTPUT>>> marked block "
+                        f"({len(result_text)} chars) instead of the literal last turn "
+                        f"({len(''.join(result_parts))} chars)"
+                    )
 
                 # CRITICAL: Validate output before marking as success
                 # Exit code 0 with empty output is a failure (wrapper couldn't persist, or Claude crashed)
@@ -2180,6 +2226,7 @@ class DockerAgentRunner:
         import json as _json
 
         text_parts = []
+        all_assistant_turns = []
         parsed_any = False
 
         for line in raw_output.splitlines():
@@ -2200,11 +2247,12 @@ class DockerAgentRunner:
                                 turn_parts.append(text)
                     if turn_parts:
                         text_parts = turn_parts  # Replace — keep only last assistant turn
+                        all_assistant_turns.append(''.join(turn_parts))
             except (_json.JSONDecodeError, TypeError):
                 pass
 
         if parsed_any and text_parts:
-            return ''.join(text_parts)
+            return resolve_final_output(all_assistant_turns, ''.join(text_parts))
 
         # Not stream-json (already parsed text, or plaintext fallback) — return as-is
         return raw_output

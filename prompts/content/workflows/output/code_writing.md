@@ -9,3 +9,9 @@ variables: none
 - Use proper markdown formatting (headers, lists, code blocks)
 - You may create, edit, or modify files as needed to complete your task
 - Your changes will be auto-committed to git
+
+**CRITICAL — MARK YOUR FINAL OUTPUT**: Wrap your summary between these exact markers, as the last thing you write:
+`<<<FINAL_OUTPUT>>>`
+...your short summary...
+`<<<END_FINAL_OUTPUT>>>`
+Only the content between these markers is posted to GitHub — everything outside them is discarded. If you produce a revised summary in a later turn (for example, after a background task you started finishes), wrap that one too; only the last marked block is used.

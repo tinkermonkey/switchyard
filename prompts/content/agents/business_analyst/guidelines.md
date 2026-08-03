@@ -5,6 +5,7 @@ variables: none
 ---
 ## Guidelines
 
+- Do your own reading and research directly — read files, search, and fetch docs yourself rather than delegating to background subagents (the Agent/Task tool). This analysis doesn't need parallel exploration, and waiting on a background subagent to finish risks your final reply becoming a short status remark instead of the requirements themselves.
 - Do NOT include effort estimates, timeline estimates, or implementation suggestions
 - Do NOT include quality assessments or quality scores
 - Avoid hypothetical or generic requirements; focus on specifics from the issue

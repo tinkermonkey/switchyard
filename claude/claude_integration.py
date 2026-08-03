@@ -6,7 +6,7 @@ import threading
 import time
 from typing import Dict, Any
 from pathlib import Path
-from claude.docker_runner import docker_runner
+from claude.docker_runner import docker_runner, resolve_final_output
 from services.project_workspace import workspace_manager
 
 try:
@@ -281,6 +281,7 @@ Files: {context.get('files', [])}
 
             # Collect all output for final result
             result_parts = []
+            all_assistant_turns = []  # every assistant turn's text, in order (see resolve_final_output)
             input_tokens = 0
             output_tokens = 0
             cache_read_tokens = 0
@@ -387,6 +388,7 @@ Files: {context.get('files', [])}
                             if turn_parts:
                                 result_parts.clear()
                                 result_parts.extend(turn_parts)
+                                all_assistant_turns.append(''.join(turn_parts))
                                 logger.debug(f"Captured assistant turn, length: {sum(len(p) for p in result_parts)}")
 
                     except json.JSONDecodeError:
@@ -414,7 +416,7 @@ Files: {context.get('files', [])}
                                                    pipeline_run_id=_local_pipeline_run_id or None)
 
                 if process.returncode == 0:
-                    result_text = ''.join(result_parts)
+                    result_text = resolve_final_output(all_assistant_turns, ''.join(result_parts))
                     logger.info(f"Claude CLI completed successfully, result length: {len(result_text)}, session_id: {session_id}")
 
                     # Store session_id in context for session continuity

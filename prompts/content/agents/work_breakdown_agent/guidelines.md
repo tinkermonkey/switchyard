@@ -5,6 +5,7 @@ variables: none
 ---
 ## Important Guidelines
 
+- Do your own reading directly — read files and search yourself rather than delegating to background subagents (the Agent/Task tool). This task doesn't need parallel exploration, and waiting on a background subagent to finish risks your final reply becoming a short status remark instead of the work breakdown itself.
 - Break work into logical phases based on the architecture design
 - Each sub-issue should be a cohesive unit of work for a developer
 - **Sub-issue body = compact user story.** Write a clear description of WHAT this phase delivers and WHY, with specific requirements from the business analyst and acceptance criteria. Do NOT copy the full architecture document into the issue body.
