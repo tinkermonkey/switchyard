@@ -8,7 +8,7 @@ import subprocess
 import logging
 import uuid
 import inspect
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional
 from dataclasses import dataclass
 from monitoring.timestamp_utils import utc_isoformat
@@ -24,6 +24,12 @@ logger = logging.getLogger(__name__)
 # 1 + retries(2) = 3), so by the time this triggers, up to 9 real container attempts have
 # already happened.
 MAX_CONSECUTIVE_DISPATCH_FAILURES = 3
+
+# Grace period before trusting a pipeline run's "active" ES flag requires proof
+# of a real container. Covers the normal, fast create-run -> launch-container
+# race without waiting for PipelineWatchdog's 30-minute zombie sweep to notice
+# a launch that silently never happened.
+NO_CONTAINER_GRACE_SECONDS = 60
 
 @dataclass
 class ProjectItem:
@@ -2612,13 +2618,88 @@ class ProjectMonitor:
                             )
 
                             if current_active_run and current_active_run.is_active():
-                                # Work truly in progress - container is still working
-                                logger.info(
-                                    f"Pipeline run {current_active_run.id} is active for issue #{issue_number}. "
-                                    f"Skipping duplicate trigger - container still working (likely during recovery)."
+                                # is_active() only reflects the recorded ES state, not physical
+                                # reality - a run can be marked active before its container is
+                                # ever launched. Past a short grace period (to avoid false
+                                # positives during the normal create-run -> launch-container
+                                # race), verify a container actually exists using the same
+                                # Docker label check PipelineWatchdog uses for its 30-minute
+                                # zombie sweep, just run inline so we don't wait 30 minutes.
+                                container_confirmed = True
+                                try:
+                                    started_at = datetime.fromisoformat(
+                                        current_active_run.started_at.replace('Z', '+00:00')
+                                    )
+                                    age_seconds = (datetime.now(timezone.utc) - started_at).total_seconds()
+                                    if age_seconds > NO_CONTAINER_GRACE_SECONDS:
+                                        from services.pipeline_watchdog import get_pipeline_watchdog
+                                        container_confirmed = get_pipeline_watchdog()._check_for_agent_container(
+                                            project_name, issue_number
+                                        )
+                                except Exception as e:
+                                    logger.warning(
+                                        f"Could not verify container existence for pipeline run "
+                                        f"{current_active_run.id} (issue #{issue_number}): {e}"
+                                    )
+
+                                if container_confirmed:
+                                    # Work truly in progress - container is still working
+                                    logger.info(
+                                        f"Pipeline run {current_active_run.id} is active for issue #{issue_number}. "
+                                        f"Skipping duplicate trigger - container still working (likely during recovery)."
+                                    )
+                                    # DON'T end the pipeline run, DON'T release the lock
+                                    # Just return and let the container complete normally
+                                    return None
+
+                                # Marked active but no container found after the grace period -
+                                # the launch silently never happened. Coordinate with the zombie
+                                # watchdog (and any other cleanup mechanism) so only one of them
+                                # acts on this issue.
+                                logger.error(
+                                    f"Pipeline run {current_active_run.id} for issue #{issue_number} is marked "
+                                    f"active but no agent container was found after "
+                                    f"{NO_CONTAINER_GRACE_SECONDS}s - treating as a silently-failed launch "
+                                    f"and releasing the lock instead of waiting for the 30-minute zombie sweep."
                                 )
-                                # DON'T end the pipeline run, DON'T release the lock
-                                # Just return and let the container complete normally
+                                try:
+                                    from services.cleanup_guard import try_claim_cleanup
+                                    claimed = try_claim_cleanup(
+                                        project_name, issue_number, "project_monitor_no_container_check"
+                                    )
+                                except Exception as e:
+                                    logger.warning(f"Cleanup guard unavailable, proceeding without coordination: {e}")
+                                    claimed = True
+
+                                if claimed:
+                                    try:
+                                        self.decision_events.emit_pipeline_run_active_no_container(
+                                            project=project_name,
+                                            issue_number=issue_number,
+                                            pipeline_run_id=current_active_run.id,
+                                            started_at=current_active_run.started_at,
+                                            grace_period_seconds=NO_CONTAINER_GRACE_SECONDS
+                                        )
+                                    except Exception as e:
+                                        logger.debug(f"Could not log no-container event to observability: {e}")
+
+                                    self.pipeline_run_manager.end_pipeline_run(
+                                        project=project_name,
+                                        issue_number=issue_number,
+                                        reason=(
+                                            f"No agent container found {NO_CONTAINER_GRACE_SECONDS}s after "
+                                            f"run creation (silent launch failure)"
+                                        ),
+                                        outcome="failed"
+                                    )
+
+                                    from services.pipeline_lock_manager import get_pipeline_lock_manager
+                                    lock_manager = get_pipeline_lock_manager()
+                                    lock_manager.release_lock(project_name, board_name, issue_number)
+
+                                # Either claimed and cleaned up here, or another mechanism is
+                                # already handling it - don't launch fresh work in this same
+                                # pass. The next FAILSAFE poll will pick up the now-unlocked issue.
                                 return None
                             else:
                                 # No active pipeline run - execution state is stale

@@ -1347,6 +1347,32 @@ class DecisionEventEmitter:
             pipeline_run_id=pipeline_run_id
         )
 
+    def emit_pipeline_run_active_no_container(
+        self,
+        project: str,
+        issue_number: int,
+        pipeline_run_id: str,
+        started_at: str,
+        grace_period_seconds: int
+    ):
+        """Emit event when a pipeline run is marked active in ES but no agent
+        container was found for it after the launch grace period - i.e. the
+        container launch silently never happened."""
+        self.obs.emit(
+            EventType.PIPELINE_RUN_ACTIVE_NO_CONTAINER_DETECTED,
+            agent="project_monitor",
+            task_id=f"no_container_check_{project}_{issue_number}",
+            project=project,
+            data={
+                'decision_category': 'pipeline_run_health',
+                'issue_number': issue_number,
+                'started_at': started_at,
+                'grace_period_seconds': grace_period_seconds,
+                'reason': 'Pipeline run marked active but no agent container found'
+            },
+            pipeline_run_id=pipeline_run_id
+        )
+
     def emit_sub_issue_created(
         self,
         project: str,
