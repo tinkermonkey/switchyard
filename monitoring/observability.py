@@ -140,6 +140,7 @@ class EventType(Enum):
     CONTAINER_EXECUTION_STARTED = "container_execution_started"
     CONTAINER_EXECUTION_COMPLETED = "container_execution_completed"
     CONTAINER_EXECUTION_FAILED = "container_execution_failed"
+    PIPELINE_RUN_ACTIVE_NO_CONTAINER_DETECTED = "pipeline_run_active_no_container_detected"
 
     # Response events
     RESPONSE_CHUNK_RECEIVED = "response_chunk_received"
@@ -459,6 +460,7 @@ class ObservabilityManager:
             EventType.STATUS_PROGRESSION_COMPLETED,
             EventType.STATUS_PROGRESSION_FAILED,
             EventType.PIPELINE_STAGE_TRANSITION,
+            EventType.PIPELINE_RUN_ACTIVE_NO_CONTAINER_DETECTED,
             # Review Cycle Management
             EventType.REVIEW_CYCLE_STARTED,
             EventType.REVIEW_CYCLE_ITERATION,
