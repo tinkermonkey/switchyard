@@ -9,6 +9,15 @@ import { TodoList } from './AgentState'
 import { useDashboardRunData } from '../hooks/useDashboardRunData'
 import { useSocket } from '../contexts/SocketContext'
 
+/**
+ * Format agent name to human-readable format, e.g. "product_manager_agent" -> "Product Manager Agent".
+ * Mirrors the same helper duplicated in ActiveAgents.jsx / AgentExecutionState.jsx / AgentExecutionNavBar.jsx.
+ */
+function formatAgentName(agentName) {
+  if (!agentName) return null
+  return agentName.split('_').map(word => word.charAt(0).toUpperCase() + word.slice(1)).join(' ')
+}
+
 function fmtTok(n) {
   if (!n) return '0'
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
@@ -306,41 +315,85 @@ export default function DashboardRunGraph({ run }) {
     navigate({ to: '/pipeline-run', search: { runId: run.id } })
   }, [navigate, run.id])
 
+  // Status is driven directly off run.status (from the polled /active-pipeline-runs list) —
+  // no local state to go stale. feedback_listening is the *only* state that should pulse;
+  // once the agent resumes or the issue progresses to a new run, status moves to 'active'
+  // (or the run drops out of the active list) and the pulse clears on the next poll.
+  const isAwaitingFeedback = run.status === 'feedback_listening'
+  const isRunning = run.status === 'active'
+
+  // Most recent event carrying an `agent` field (agent_initialized/completed/failed), read
+  // from the same event stream driving the graph — works for both the "running" and
+  // "awaiting feedback" cases without depending on the live active-agents endpoint, which
+  // only tracks status: 'active' runs and wouldn't have an entry while feedback_listening.
+  const currentAgentName = useMemo(() => {
+    for (let i = mergedEvents.length - 1; i >= 0; i--) {
+      const agent = mergedEvents[i]?.agent
+      if (agent) return formatAgentName(agent)
+    }
+    return null
+  }, [mergedEvents])
+
   return (
     <div
       className="bg-gh-canvas-subtle border border-gh-border rounded-md overflow-hidden hover:border-gh-accent-primary transition-colors flex flex-col min-h-[500px] md:min-h-0"
     >
       {/* Compact header */}
-      <div className="flex flex-wrap md:flex-nowrap items-center gap-x-3 gap-y-1 px-3 py-2 border-b border-gh-border min-w-0 flex-shrink-0">
-        <div className="min-w-0 w-full md:w-auto md:flex-1">
-          <div className="text-xs text-gh-fg-muted font-normal leading-tight md:truncate">
-            {run.project}
+      <div className="border-b border-gh-border min-w-0 flex-shrink-0">
+        <div className="flex flex-wrap md:flex-nowrap items-center gap-x-3 gap-y-1 px-3 py-2 min-w-0">
+          <div className="min-w-0 w-full md:w-auto md:flex-1">
+            <div className="text-xs text-gh-fg-muted font-normal leading-tight md:truncate">
+              {run.project}
+            </div>
+            <h3
+              onClick={handleClick}
+              className="text-sm font-semibold md:truncate cursor-pointer">
+              {run.issue_title}
+            </h3>
           </div>
-          <h3
-            onClick={handleClick}
-            className="text-sm font-semibold md:truncate cursor-pointer">
-            {run.issue_title}
-          </h3>
+          {run.issue_url ? (
+            <a
+              href={run.issue_url}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="text-xs text-gh-accent-fg hover:underline flex-shrink-0"
+              onClick={e => e.stopPropagation()}
+            >
+              #{run.issue_number}
+            </a>
+          ) : (
+            <span className="text-xs text-gh-fg-muted flex-shrink-0">#{run.issue_number}</span>
+          )}
+          <CopyableId id={run.id} className="text-xs text-gh-fg-muted flex-shrink-0" />
+          <RunDuration
+            startedAt={run.started_at}
+            endedAt={run.ended_at}
+            className="text-xs text-gh-fg-muted flex-shrink-0"
+          />
         </div>
-        {run.issue_url ? (
-          <a
-            href={run.issue_url}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="text-xs text-gh-accent-fg hover:underline flex-shrink-0"
-            onClick={e => e.stopPropagation()}
-          >
-            #{run.issue_number}
-          </a>
-        ) : (
-          <span className="text-xs text-gh-fg-muted flex-shrink-0">#{run.issue_number}</span>
+        {(isRunning || isAwaitingFeedback) && (
+          <div className="flex items-center gap-1.5 px-3 pb-2 min-w-0 text-xs">
+            <span className="relative flex h-2 w-2 flex-shrink-0">
+              {isAwaitingFeedback && (
+                <span
+                  className="animate-ping absolute inline-flex h-full w-full rounded-full opacity-75"
+                  style={{ backgroundColor: '#f0883e' }}
+                />
+              )}
+              <span
+                className="relative inline-flex rounded-full h-2 w-2"
+                style={{ backgroundColor: isAwaitingFeedback ? '#f0883e' : '#3fb950' }}
+              />
+            </span>
+            <span
+              className="font-medium truncate"
+              style={{ color: isAwaitingFeedback ? '#f0883e' : undefined }}
+            >
+              {isAwaitingFeedback ? 'Awaiting Feedback' : 'Running'}
+              {currentAgentName ? `: ${currentAgentName}` : ''}
+            </span>
+          </div>
         )}
-        <CopyableId id={run.id} className="text-xs text-gh-fg-muted flex-shrink-0" />
-        <RunDuration
-          startedAt={run.started_at}
-          endedAt={run.ended_at}
-          className="text-xs text-gh-fg-muted flex-shrink-0"
-        />
       </div>
 
       {/* Tool use timeline + token counter */}

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useCallback } from 'react'
-import { useNodesInitialized, useReactFlow, useStoreApi } from '@xyflow/react'
+import { useNodesInitialized, useReactFlow, useStore, useStoreApi } from '@xyflow/react'
 import { applyCycleLayout, updateEdgesForCycles } from '../utils/cycleLayout'
 
 /**
@@ -265,11 +265,20 @@ export default function LayoutController({
     runLayout()
   }, [layoutOptions, runLayout])
 
+  // React Flow's own ResizeObserver (useResizeHandler) keeps store.width/height in sync
+  // with the actual DOM container size but does not itself re-trigger fitView. Subscribing
+  // here lets us re-center whenever the *real* container size changes — e.g. the dashboard
+  // grid reflowing on window resize — not just when the `containerHeight` prop changes
+  // (which only happens for callers that pass an explicit numeric height, like the sandbox).
+  const storeWidth = useStore(state => state.width)
+  const storeHeight = useStore(state => state.height)
+
   // Re-fit view when the container is resized after layout.
   useEffect(() => {
     if (!layoutDone.current) return
-    setTimeout(() => applyAlignedFitView(lastFinalNodesRef.current), 50)
-  }, [containerHeight, applyAlignedFitView])
+    const t = setTimeout(() => applyAlignedFitView(lastFinalNodesRef.current), 50)
+    return () => clearTimeout(t)
+  }, [containerHeight, storeWidth, storeHeight, applyAlignedFitView])
 
   return null
 }
