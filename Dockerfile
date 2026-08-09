@@ -17,6 +17,15 @@ RUN npm run build
 # Main orchestrator Dockerfile
 FROM python:3.11-slim
 
+# Identifies every image descended from this one (including every project's
+# <project>-agent:latest, built FROM this image via Dockerfile.agent) as a
+# genuine switchyard-built agent environment. Labels are inherited by child
+# builds, so this survives into every project-agent image without needing to
+# touch each project's Dockerfile.agent. Checked by
+# services/dev_container_state.py before trusting a cached image tag — see
+# SWITCHYARD_AGENT_ENV_LABEL for why (tag-collision protection).
+LABEL io.switchyard.agent-environment="true"
+
 # Accept docker GID as build arg (defaults to 984 for Linux, override for macOS)
 ARG DOCKER_GID=984
 

@@ -451,6 +451,19 @@ class HumanFeedbackLoopExecutor:
         self.active_loops[self._loop_key(project_name, issue_number)] = state
         self.workflow_columns = workflow_columns
 
+        # Restore the pipeline run to "active" before doing any work. pipeline_run_id here
+        # may be inherited from a previous column's loop (project_monitor passes it through
+        # on "column_changed" so the run isn't recreated) and could still carry that column's
+        # "feedback_listening" status — without this, the dashboard shows "Awaiting Feedback"
+        # for the whole duration this agent is actually running, until it finishes and the
+        # loop re-enters listening mode itself.
+        if pipeline_run_id:
+            try:
+                from services.pipeline_run import get_pipeline_run_manager
+                get_pipeline_run_manager().update_run_status(project_name, issue_number, 'active')
+            except Exception as e:
+                logger.warning(f"Failed to restore pipeline run to active status for issue #{issue_number}: {e}")
+
         try:
             # CRITICAL FIX: Load previous agent outputs BEFORE checking for initial user request
             # This ensures state.agent_outputs is populated so we can correctly detect threaded conversations

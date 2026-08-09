@@ -521,7 +521,16 @@ class AgentContainerRecovery:
                     # Check if execution matches the container
                     # Use resolved agent (from labels, metadata, or Redis)
                     exec_agent = execution.get('agent', '')
-                    if agent and exec_agent and agent != exec_agent:
+                    # 'pr_review_stage' is a synthetic wrapper agent name — project_monitor's
+                    # _start_pr_review_for_issue deliberately records it (instead of the real
+                    # phase agent) so the outer in_progress entry survives PRReviewStage's
+                    # multiple internal phases (pr_code_reviewer, requirements_verifier, the
+                    # consolidation phase) without being cleared when an individual phase
+                    # finishes. It never matches any container's own resolved agent by design,
+                    # so comparing it here always looked like a mismatch and killed a
+                    # legitimately-running PR review container on every orchestrator restart.
+                    is_pr_review_stage_wrapper = exec_agent == 'pr_review_stage'
+                    if agent and exec_agent and not is_pr_review_stage_wrapper and agent != exec_agent:
                         logger.warning(
                             f"Container {container_name} agent mismatch (resolved: {agent}, history: {exec_agent}), killing it"
                         )

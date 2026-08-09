@@ -2078,8 +2078,41 @@ def get_pipeline_run_latest_comment(pipeline_run_id):
     returns its stored comment_url. Falls back to constructing the URL from
     object_type/object_number/comment_id fields when comment_url is absent
     (older events pre-dating the comment_url field).
+
+    Searches across every pipeline_run_id for the same project+issue, not just this
+    one: when ProjectMonitor detects an agent already posted (has_agent_processed_*)
+    it skips re-running the agent and starts a *new* pipeline_run purely to track the
+    "waiting for feedback" state — the actual comment lives under the earlier run that
+    did the posting. Without this, the lookup finds nothing for that resumed run.
     """
     try:
+        pipeline_run_ids = [pipeline_run_id]
+        try:
+            from services.pipeline_run import get_pipeline_run_manager
+            this_run = get_pipeline_run_manager().get_pipeline_run_by_id(pipeline_run_id)
+            if this_run and this_run.project and this_run.issue_number is not None:
+                siblings = es_client.search(
+                    index='pipeline-runs-*',
+                    body={
+                        'query': {
+                            'bool': {
+                                'must': [
+                                    {'term': {'project': this_run.project}},
+                                    {'term': {'issue_number': this_run.issue_number}},
+                                ]
+                            }
+                        },
+                        'sort': [{'started_at': 'desc'}],
+                        'size': 50,
+                        '_source': ['id'],
+                    }
+                )
+                sibling_ids = [h['_source']['id'] for h in siblings.get('hits', {}).get('hits', []) if h['_source'].get('id')]
+                if sibling_ids:
+                    pipeline_run_ids = sibling_ids
+        except Exception as e:
+            logger.debug(f"Could not resolve sibling pipeline runs for {pipeline_run_id}: {e}")
+
         result = es_client.search(
             index='decision-events-*',
             body={
@@ -2087,8 +2120,8 @@ def get_pipeline_run_latest_comment(pipeline_run_id):
                     'bool': {
                         'must': [
                             {'bool': {'should': [
-                                {'term': {'pipeline_run_id': pipeline_run_id}},
-                                {'term': {'pipeline_run_id.keyword': pipeline_run_id}},
+                                {'terms': {'pipeline_run_id': pipeline_run_ids}},
+                                {'terms': {'pipeline_run_id.keyword': pipeline_run_ids}},
                             ], 'minimum_should_match': 1}},
                             {'bool': {'should': [
                                 {'term': {'event_type': 'github_comment_posted'}},

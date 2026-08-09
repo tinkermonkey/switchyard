@@ -21,15 +21,23 @@ FINAL_OUTPUT_END = '<<<END_FINAL_OUTPUT>>>'
 
 def _extract_marked_output(turn_text: str) -> Optional[str]:
     """Extract a <<<FINAL_OUTPUT>>>...<<<END_FINAL_OUTPUT>>> block from one turn's
-    text. Tolerates a missing closing marker (takes the rest of the turn). Returns
-    None if no start marker is present."""
+    text. Requires BOTH markers to be present in the same turn — a turn that only
+    contains the start marker (e.g. a later wrap-up turn casually referencing "the
+    `<<<FINAL_OUTPUT>>>` markers" in prose, without actually re-wrapping any content)
+    is not a real block and must not be treated as one. Previously this fell back to
+    "take the rest of the turn" on a missing close, which let exactly that kind of
+    incidental mention clobber a legitimate, fully-marked block from an earlier turn
+    (seen on rounds issue #85's software_architect run: a two-sentence status remark
+    that name-dropped the marker overwrote a 32k-char design). Returns None if either
+    marker is missing."""
     start = turn_text.find(FINAL_OUTPUT_START)
     if start == -1:
         return None
     content_start = start + len(FINAL_OUTPUT_START)
     end = turn_text.find(FINAL_OUTPUT_END, content_start)
-    content = turn_text[content_start:end if end != -1 else None]
-    return content.strip()
+    if end == -1:
+        return None
+    return turn_text[content_start:end].strip()
 
 
 def resolve_final_output(turns: list, fallback: str) -> str:
@@ -39,13 +47,29 @@ def resolve_final_output(turns: list, fallback: str) -> str:
     turns, so a legitimate later revision still wins but a trailing wrap-up turn
     that omits the marker doesn't discard an already-produced deliverable. Falls
     back to `fallback` (the literal last turn's text) when no turn used the
-    marker, preserving prior behavior for prompts that don't request it."""
+    marker, preserving prior behavior for prompts that don't request it.
+
+    If no turn has a fully-closed block but one has an unclosed start marker (the
+    model opened <<<FINAL_OUTPUT>>> and never emitted the closing tag — seen live
+    on a business_analyst run whose only turn ended without it), prefer everything
+    after that marker over the raw fallback text. Otherwise the literal marker and
+    any preamble commentary before it get posted verbatim to GitHub. Only applied
+    when NO turn produced a real closed block, so it can never override one — the
+    exact failure mode _extract_marked_output's strictness guards against."""
     marked = None
     for turn_text in turns:
         extracted = _extract_marked_output(turn_text)
         if extracted is not None:
             marked = extracted
-    return marked if marked is not None else fallback
+    if marked is not None:
+        return marked
+
+    unclosed = None
+    for turn_text in turns:
+        start = turn_text.find(FINAL_OUTPUT_START)
+        if start != -1:
+            unclosed = turn_text[start + len(FINAL_OUTPUT_START):].strip()
+    return unclosed if unclosed is not None else fallback
 
 
 # Import Claude Code breaker for token limit detection
@@ -938,8 +962,12 @@ class DockerAgentRunner:
             requires_dev_container = False
 
         if requires_dev_container:
-            # Check if project's dev container is verified
-            if dev_container_state.is_verified(project):
+            # Check if project's dev container is verified. This re-checks live
+            # (not just the cached status) so a tag hijacked mid-session by an
+            # unrelated build/compose sharing the same name — see
+            # dev_container_state.verify_image_exists — is caught right here at
+            # launch time, instead of only at the next orchestrator restart.
+            if dev_container_state.is_verified(project) and dev_container_state.verify_and_update_status(project):
                 # Use project-specific dev container image
                 image_name = dev_container_state.get_image_name(project)
                 if image_name:

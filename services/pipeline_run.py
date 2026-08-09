@@ -493,8 +493,20 @@ class PipelineRunManager:
             with self.redis.lock(lock_key, timeout=5, blocking_timeout=5):
                 # Check for existing active run in Redis
                 existing = self.get_active_pipeline_run(project, issue_number)
-                
+
                 if existing:
+                    if existing.status == 'feedback_listening':
+                        # A different trigger is reusing this run — the feedback loop that
+                        # set it to feedback_listening is no longer the one driving it (the
+                        # human answered and a new stage/agent picked the issue up). Restore
+                        # to "active" so the dashboard doesn't keep showing "awaiting
+                        # feedback" indefinitely for a run someone else now owns.
+                        logger.info(
+                            f"Reusing feedback_listening pipeline run {existing.id} for "
+                            f"{project} issue #{issue_number} via new trigger — restoring to active"
+                        )
+                        self.update_run_status(project, issue_number, 'active')
+                        existing.status = 'active'
                     logger.debug(
                         f"Using existing pipeline run {existing.id} for "
                         f"{project} issue #{issue_number}"
@@ -567,6 +579,15 @@ class PipelineRunManager:
                                 redis_key = self._get_redis_key(pipeline_run.id)
                                 self.redis.setex(redis_key, 3600, json.dumps(pipeline_run.to_dict()))
                                 self.redis.hset(self.redis_issue_mapping, self._get_issue_key(project, issue_number), pipeline_run.id)
+                                # Same reasoning as the Redis fast-path above — a new trigger
+                                # is reusing a feedback_listening run restored from ES, so
+                                # restore its status to "active" as well.
+                                logger.info(
+                                    f"Reusing feedback_listening pipeline run {pipeline_run.id} for "
+                                    f"{project} issue #{issue_number} via new trigger (ES fallback) — restoring to active"
+                                )
+                                self.update_run_status(project, issue_number, 'active')
+                                pipeline_run.status = 'active'
                                 return pipeline_run, False
                     except Exception as e:
                         logger.error(f"Error checking/ending old pipeline runs in Elasticsearch: {e}")
@@ -597,6 +618,13 @@ class PipelineRunManager:
             # Fallback: try to get existing one last time
             existing = self.get_active_pipeline_run(project, issue_number)
             if existing:
+                if existing.status == 'feedback_listening':
+                    logger.info(
+                        f"Reusing feedback_listening pipeline run {existing.id} for "
+                        f"{project} issue #{issue_number} via new trigger (no-lock fallback) — restoring to active"
+                    )
+                    self.update_run_status(project, issue_number, 'active')
+                    existing.status = 'active'
                 return existing, False
             
             # If we can't get lock and no existing run, proceed with creation anyway
