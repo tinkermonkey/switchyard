@@ -1221,27 +1221,29 @@ git push --force-with-lease
                     )
                     raise
 
-                # Check staleness
+                # Track staleness for visibility, but don't block on it. A shared
+                # epic branch is expected to diverge from main as unrelated work
+                # merges elsewhere in the repo — this is a divergence measurement,
+                # not a conflict signal (real conflicts are caught by
+                # MergeConflictError above). Blocking every reused branch on this
+                # would halt all parallel sub-issue work on an epic any time main
+                # advances by more than a few commits.
                 if parent_issue and feature_branch:
                     commits_behind = await self.get_commits_behind_main(project_dir, branch_name)
                     feature_branch.commits_behind_main = commits_behind
                     if commits_behind > 5:
-                        # EMIT DECISION EVENT: Branch too stale to proceed
+                        logger.info(
+                            f"Branch '{branch_name}' is {commits_behind} commits behind main "
+                            f"(reused branch — not blocking)"
+                        )
                         self.decision_events.emit_branch_stale_detected(
                             project=project,
                             issue_number=issue_number,
                             branch_name=branch_name,
                             commits_behind=commits_behind,
-                            action_taken="block_stale_branch",
+                            action_taken="warn_stale_branch",
                             parent_issue=parent_issue,
                             pipeline_run_id=pipeline_run_id
-                        )
-                        raise StaleBranchError(
-                            f"Branch '{branch_name}' is {commits_behind} commits behind main. "
-                            f"Rebase required before work can continue.",
-                            branch_name=branch_name,
-                            commits_behind=commits_behind,
-                            parent_issue=parent_issue
                         )
 
                     # Mark sub-issue as in progress
@@ -1516,27 +1518,26 @@ Waiting for human decision...
             )
             raise
 
-        # Step 5: Check if branch is stale
+        # Step 5: Track staleness for visibility, but don't block on it. See
+        # note above — a shared epic branch is expected to diverge from main as
+        # unrelated work merges elsewhere; blocking here would halt all parallel
+        # sub-issue work on the epic every time main advances.
         commits_behind = await self.get_commits_behind_main(project_dir, feature_branch.branch_name)
         feature_branch.commits_behind_main = commits_behind
 
         if commits_behind > 5:
-            # EMIT DECISION EVENT: Branch too stale to proceed
+            logger.info(
+                f"Branch '{feature_branch.branch_name}' is {commits_behind} commits behind main "
+                f"(reused branch — not blocking)"
+            )
             self.decision_events.emit_branch_stale_detected(
                 project=project,
                 issue_number=issue_number,
                 branch_name=feature_branch.branch_name,
                 commits_behind=commits_behind,
-                action_taken="block_stale_branch",
+                action_taken="warn_stale_branch",
                 parent_issue=parent_issue,
                 pipeline_run_id=pipeline_run_id
-            )
-            raise StaleBranchError(
-                f"Branch '{feature_branch.branch_name}' is {commits_behind} commits behind main. "
-                f"Rebase required before work can continue.",
-                branch_name=feature_branch.branch_name,
-                commits_behind=commits_behind,
-                parent_issue=parent_issue
             )
 
         # Mark sub-issue as in progress
