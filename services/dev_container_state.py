@@ -19,6 +19,20 @@ from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
+# Label baked into switchyard's base Dockerfile (see repo-root Dockerfile) and
+# inherited by every project's <project>-agent:latest image via `FROM
+# switchyard-orchestrator:latest`. A project's own docker-compose.yml can
+# happen to name one of its own services "agent", which — with no explicit
+# `image:` tag — collides with this exact tag under Docker Compose's default
+# `<compose-project>-<service>` naming. That silently swaps out the agent
+# environment image for something unrelated (see incident: phone-home's own
+# "agent" microservice, unrelated to this environment, overwrote
+# phone-home-agent:latest and caused every senior_software_engineer container
+# launch to boot the wrong entrypoint). Checking for this label — rather than
+# just tag existence — catches that class of collision regardless of which
+# unrelated image ends up holding the tag.
+SWITCHYARD_AGENT_ENV_LABEL = "io.switchyard.agent-environment"
+
 
 class DevContainerStatus(Enum):
     """Status of a project's development container"""
@@ -162,13 +176,23 @@ class DevContainerStateManager:
 
     def verify_image_exists(self, project_name: str) -> bool:
         """
-        Verify that the Docker image for a project actually exists locally
+        Verify that the Docker image for a project actually exists locally AND
+        is genuinely a switchyard-built agent environment (carries
+        SWITCHYARD_AGENT_ENV_LABEL) — not just something else that happens to
+        hold the same tag.
+
+        A same-named-but-foreign image (e.g. a project's own docker-compose
+        service tagged identically via Compose's default naming) fails this
+        check even though `docker image inspect` succeeds, since tag
+        existence alone can't distinguish "our image" from "an unrelated
+        image that overwrote our tag".
 
         Args:
             project_name: Name of the project
 
         Returns:
-            True if image exists locally, False otherwise
+            True if the image exists locally and carries the switchyard
+            agent-environment label, False otherwise
         """
         image_name = self.get_image_name(project_name)
 
@@ -177,22 +201,31 @@ class DevContainerStateManager:
             return False
 
         try:
-            # Use docker image inspect to check if image exists
             result = subprocess.run(
-                ['docker', 'image', 'inspect', image_name],
+                ['docker', 'image', 'inspect',
+                 '--format', '{{ index .Config.Labels "%s" }}' % SWITCHYARD_AGENT_ENV_LABEL,
+                 image_name],
                 capture_output=True,
                 text=True,
                 timeout=10
             )
 
-            exists = result.returncode == 0
-
-            if exists:
-                logger.debug(f"Docker image {image_name} exists locally")
-            else:
+            if result.returncode != 0:
                 logger.warning(f"Docker image {image_name} does not exist locally (state may be stale)")
+                return False
 
-            return exists
+            if result.stdout.strip() != "true":
+                logger.warning(
+                    f"Docker image {image_name} exists but is missing the "
+                    f"{SWITCHYARD_AGENT_ENV_LABEL} label — it was not built from this "
+                    f"project's Dockerfile.agent and has likely overwritten the tag "
+                    f"(e.g. an unrelated docker-compose service sharing the same name). "
+                    f"Treating as not verified; rebuild required."
+                )
+                return False
+
+            logger.debug(f"Docker image {image_name} exists locally and is a genuine agent environment")
+            return True
 
         except subprocess.TimeoutExpired:
             logger.error(f"Timeout checking if Docker image {image_name} exists")
@@ -224,18 +257,23 @@ class DevContainerStateManager:
         if self.verify_image_exists(project_name):
             return True  # Image exists, all good
 
-        # Image doesn't exist - reset status to UNVERIFIED
+        # Image is missing, or the tag now points at something that isn't a
+        # genuine switchyard agent environment (see verify_image_exists) -
+        # reset status to UNVERIFIED either way so a rebuild is forced.
         image_name = self.get_image_name(project_name)
         logger.warning(
-            f"Project {project_name} marked as verified but image {image_name} not found. "
-            f"Resetting status to unverified."
+            f"Project {project_name} marked as verified but image {image_name} is missing "
+            f"or is not a genuine agent-environment image. Resetting status to unverified."
         )
 
         self.set_status(
             project_name,
             DevContainerStatus.UNVERIFIED,
             image_name=image_name,
-            error_message="Image missing after Docker context switch or system restart"
+            error_message=(
+                "Image missing, or tag now points at an unrelated image (e.g. overwritten "
+                "by another docker build/compose using the same name) - rebuild required"
+            )
         )
 
         return False

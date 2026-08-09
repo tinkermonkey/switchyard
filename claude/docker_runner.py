@@ -21,15 +21,23 @@ FINAL_OUTPUT_END = '<<<END_FINAL_OUTPUT>>>'
 
 def _extract_marked_output(turn_text: str) -> Optional[str]:
     """Extract a <<<FINAL_OUTPUT>>>...<<<END_FINAL_OUTPUT>>> block from one turn's
-    text. Tolerates a missing closing marker (takes the rest of the turn). Returns
-    None if no start marker is present."""
+    text. Requires BOTH markers to be present in the same turn — a turn that only
+    contains the start marker (e.g. a later wrap-up turn casually referencing "the
+    `<<<FINAL_OUTPUT>>>` markers" in prose, without actually re-wrapping any content)
+    is not a real block and must not be treated as one. Previously this fell back to
+    "take the rest of the turn" on a missing close, which let exactly that kind of
+    incidental mention clobber a legitimate, fully-marked block from an earlier turn
+    (seen on rounds issue #85's software_architect run: a two-sentence status remark
+    that name-dropped the marker overwrote a 32k-char design). Returns None if either
+    marker is missing."""
     start = turn_text.find(FINAL_OUTPUT_START)
     if start == -1:
         return None
     content_start = start + len(FINAL_OUTPUT_START)
     end = turn_text.find(FINAL_OUTPUT_END, content_start)
-    content = turn_text[content_start:end if end != -1 else None]
-    return content.strip()
+    if end == -1:
+        return None
+    return turn_text[content_start:end].strip()
 
 
 def resolve_final_output(turns: list, fallback: str) -> str:
@@ -938,8 +946,12 @@ class DockerAgentRunner:
             requires_dev_container = False
 
         if requires_dev_container:
-            # Check if project's dev container is verified
-            if dev_container_state.is_verified(project):
+            # Check if project's dev container is verified. This re-checks live
+            # (not just the cached status) so a tag hijacked mid-session by an
+            # unrelated build/compose sharing the same name — see
+            # dev_container_state.verify_image_exists — is caught right here at
+            # launch time, instead of only at the next orchestrator restart.
+            if dev_container_state.is_verified(project) and dev_container_state.verify_and_update_status(project):
                 # Use project-specific dev container image
                 image_name = dev_container_state.get_image_name(project)
                 if image_name:
