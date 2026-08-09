@@ -54,6 +54,41 @@ class TestResolveFinalOutput:
     def test_empty_turns_falls_back(self):
         assert resolve_final_output([], fallback="fallback text") == "fallback text"
 
+    def test_unclosed_marker_strips_preamble_and_marker_literal(self):
+        # Regression test: a business_analyst run (heimdall issue #145) opened
+        # <<<FINAL_OUTPUT>>> and never emitted the closing tag in its only turn.
+        # Previously this fell all the way back to the raw turn text, posting the
+        # preamble commentary AND the literal "<<<FINAL_OUTPUT>>>" marker verbatim
+        # to the GitHub comment. The unclosed marker should still win over the raw
+        # fallback since no turn had a real closed block to protect.
+        turn = (
+            "Confirms repo is `tinkermonkey/heimdall`, no `.github/` workflows exist yet.\n\n"
+            "<<<FINAL_OUTPUT>>>\n## Executive Summary\n\nGitHub Pages has been enabled..."
+        )
+        result = resolve_final_output([turn], fallback=turn)
+        assert result == "## Executive Summary\n\nGitHub Pages has been enabled..."
+        assert "<<<FINAL_OUTPUT>>>" not in result
+        assert "Confirms repo is" not in result
+
+    def test_unclosed_marker_prefers_last_occurrence_across_turns(self):
+        turns = [
+            "<<<FINAL_OUTPUT>>>\ndraft, never closed",
+            "revising...\n<<<FINAL_OUTPUT>>>\nfinal version, also never closed",
+        ]
+        result = resolve_final_output(turns, fallback=turns[-1])
+        assert result == "final version, also never closed"
+
+    def test_closed_block_still_wins_over_later_unclosed_marker(self):
+        # A real closed block anywhere must never be discarded in favor of an
+        # unclosed marker in a later turn — the unclosed-marker fallback only
+        # applies when NO turn produced a closed block at all.
+        turns = [
+            "<<<FINAL_OUTPUT>>>\n# Real Report\n<<<END_FINAL_OUTPUT>>>",
+            "one more thought: <<<FINAL_OUTPUT>>> mentioned without closing it",
+        ]
+        result = resolve_final_output(turns, fallback=turns[-1])
+        assert result == "# Real Report"
+
     def test_incidental_marker_mention_in_later_turn_does_not_override(self):
         # Regression test for rounds issue #85: software_architect posted its full
         # design correctly wrapped in turn 2, then took one more turn confirming a

@@ -47,13 +47,29 @@ def resolve_final_output(turns: list, fallback: str) -> str:
     turns, so a legitimate later revision still wins but a trailing wrap-up turn
     that omits the marker doesn't discard an already-produced deliverable. Falls
     back to `fallback` (the literal last turn's text) when no turn used the
-    marker, preserving prior behavior for prompts that don't request it."""
+    marker, preserving prior behavior for prompts that don't request it.
+
+    If no turn has a fully-closed block but one has an unclosed start marker (the
+    model opened <<<FINAL_OUTPUT>>> and never emitted the closing tag — seen live
+    on a business_analyst run whose only turn ended without it), prefer everything
+    after that marker over the raw fallback text. Otherwise the literal marker and
+    any preamble commentary before it get posted verbatim to GitHub. Only applied
+    when NO turn produced a real closed block, so it can never override one — the
+    exact failure mode _extract_marked_output's strictness guards against."""
     marked = None
     for turn_text in turns:
         extracted = _extract_marked_output(turn_text)
         if extracted is not None:
             marked = extracted
-    return marked if marked is not None else fallback
+    if marked is not None:
+        return marked
+
+    unclosed = None
+    for turn_text in turns:
+        start = turn_text.find(FINAL_OUTPUT_START)
+        if start != -1:
+            unclosed = turn_text[start + len(FINAL_OUTPUT_START):].strip()
+    return unclosed if unclosed is not None else fallback
 
 
 # Import Claude Code breaker for token limit detection
