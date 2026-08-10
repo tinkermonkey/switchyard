@@ -7,12 +7,18 @@ replacing the legacy agent_stages.py with a proper factory-based approach.
 
 import uuid
 from typing import Dict, Any
-from datetime import datetime
+from datetime import datetime, timedelta
 from pipeline.base import PipelineStage
 from pipeline.orchestrator import SequentialPipeline
 from state_management.manager import StateManager
 from agents import AGENT_REGISTRY, get_agent_class
 from services.circuit_breaker import CircuitBreaker
+
+
+# How long a dev container status may sit at IN_PROGRESS before it's treated as stale
+# rather than genuinely still setting up. See the staleness check in
+# validate_task_can_run below.
+STALE_IN_PROGRESS_MINUTES = 20
 
 
 async def validate_task_can_run(task, logger) -> Dict[str, Any]:
@@ -43,6 +49,27 @@ async def validate_task_can_run(task, logger) -> Dict[str, Any]:
     if status == DevContainerStatus.VERIFIED:
         return {'can_run': True, 'reason': 'Dev container verified and ready'}
     elif status == DevContainerStatus.IN_PROGRESS:
+        # Staleness fallback: IN_PROGRESS has no built-in timeout, so a setup/verifier
+        # task that dies without ever reaching a terminal status (crashed, or the
+        # orchestrator restarted mid-run) would otherwise defer every task for this
+        # project every 30s, forever, with no error ever surfaced. 20 minutes is well
+        # above the ~3 minutes setup+verification normally takes, so this only fires
+        # once something has genuinely gone stale, not on a slow-but-healthy build.
+        updated_at = dev_container_state.get_status_updated_at(task.project)
+        if updated_at and (datetime.now() - updated_at) > timedelta(minutes=STALE_IN_PROGRESS_MINUTES):
+            logger.log_warning(
+                f"Dev container for '{task.project}' has been stuck IN_PROGRESS since "
+                f"{updated_at.isoformat()} (over {STALE_IN_PROGRESS_MINUTES} minutes) - "
+                f"treating as unverified so setup gets retried instead of deferring forever"
+            )
+            return {
+                'can_run': False,
+                'reason': (
+                    f"Dev container setup for '{task.project}' appears stuck "
+                    f"(in_progress since {updated_at.isoformat()}) - retrying setup"
+                ),
+                'needs_dev_setup': True,
+            }
         return {
             'can_run': False,
             'reason': f"Dev container setup currently in progress for '{task.project}'",

@@ -5,6 +5,7 @@ Tests the enhanced error messaging for TaskValidationError scenarios
 """
 import pytest
 import os
+from datetime import datetime, timedelta
 from unittest.mock import Mock, AsyncMock, patch
 
 # Skip these tests if not running in Docker (agents module requires Docker)
@@ -135,6 +136,7 @@ async def test_in_progress_message_is_clear(mock_task, mock_logger):
 
         from services.dev_container_state import DevContainerStatus
         mock_dev_state.get_status.return_value = DevContainerStatus.IN_PROGRESS
+        mock_dev_state.get_status_updated_at.return_value = datetime.now()
 
         mock_decision_emitter = Mock()
         mock_decision_emitter.emit_error_decision = Mock()
@@ -218,10 +220,12 @@ async def test_validate_task_can_run_messages():
         assert result['needs_dev_setup'] is True
         assert mock_task.project in result['reason']
 
-        # Test IN_PROGRESS status
+        # Test IN_PROGRESS status (recently updated -- still within the staleness window)
         mock_dev_state.get_status.return_value = DevContainerStatus.IN_PROGRESS
+        mock_dev_state.get_status_updated_at.return_value = datetime.now()
         result = await validate_task_can_run(mock_task, mock_logger)
         assert result['can_run'] is False
+        assert result.get('defer') is True
         assert "in progress" in result['reason'].lower()
         assert mock_task.project in result['reason']
 
@@ -231,3 +235,55 @@ async def test_validate_task_can_run_messages():
         assert result['can_run'] is False
         assert "blocked" in result['reason'].lower()
         assert "state/dev_containers/" in result['reason']
+
+
+@pytest.mark.asyncio
+async def test_validate_task_can_run_stale_in_progress_triggers_resetup():
+    """
+    Covers the fix for a permanent deadlock: IN_PROGRESS has no built-in timeout, so a
+    setup/verifier task that dies without reaching a terminal status (or one whose output
+    couldn't be parsed -- see DevEnvironmentVerifierAgent) used to defer every task for
+    that project every 30s, forever, with no error surfaced. A status stuck IN_PROGRESS
+    well past the time setup+verification normally takes should be treated as stale and
+    trigger a fresh setup, not another silent defer.
+    """
+    with patch('config.manager.config_manager') as mock_config, \
+         patch('services.dev_container_state.dev_container_state') as mock_dev_state:
+
+        from agents.orchestrator_integration import validate_task_can_run, STALE_IN_PROGRESS_MINUTES
+        from services.dev_container_state import DevContainerStatus
+
+        mock_task = Mock()
+        mock_task.project = "test-project"
+        mock_task.agent = "test_agent"
+        mock_logger = Mock()
+
+        mock_agent_config = Mock()
+        mock_agent_config.requires_dev_container = True
+        mock_config.get_project_agent_config.return_value = mock_agent_config
+        mock_dev_state.get_status.return_value = DevContainerStatus.IN_PROGRESS
+
+        # Just under the threshold: still a normal defer.
+        mock_dev_state.get_status_updated_at.return_value = (
+            datetime.now() - timedelta(minutes=STALE_IN_PROGRESS_MINUTES - 1)
+        )
+        result = await validate_task_can_run(mock_task, mock_logger)
+        assert result['can_run'] is False
+        assert result.get('defer') is True
+        assert result.get('needs_dev_setup') is not True
+
+        # Well past the threshold: stale, should trigger a fresh setup instead of deferring.
+        mock_dev_state.get_status_updated_at.return_value = (
+            datetime.now() - timedelta(minutes=STALE_IN_PROGRESS_MINUTES + 5)
+        )
+        result = await validate_task_can_run(mock_task, mock_logger)
+        assert result['can_run'] is False
+        assert result.get('needs_dev_setup') is True
+        assert result.get('defer') is not True
+        assert mock_task.project in result['reason']
+
+        # No updated_at recorded at all: fail safe to the normal defer, not a crash.
+        mock_dev_state.get_status_updated_at.return_value = None
+        result = await validate_task_can_run(mock_task, mock_logger)
+        assert result['can_run'] is False
+        assert result.get('defer') is True

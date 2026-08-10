@@ -141,6 +141,36 @@ class DevContainerStateManager:
         except Exception as e:
             logger.error(f"Failed to save dev container state for {project_name}: {e}")
 
+    def get_status_updated_at(self, project_name: str) -> Optional[datetime]:
+        """
+        Get the timestamp of the last status update for a project's dev container.
+
+        Used to detect a status stuck at IN_PROGRESS with no forward progress (e.g. the
+        setup/verifier task died without ever resolving to a terminal status) -- see
+        validate_task_can_run's staleness check in agents/orchestrator_integration.py.
+
+        Returns:
+            The updated_at timestamp (naive datetime, matching set_status's
+            datetime.now().isoformat() format), or None if unavailable/unparseable.
+        """
+        state_file = self.get_state_file(project_name)
+
+        if not state_file.exists():
+            return None
+
+        try:
+            with open(state_file, 'r') as f:
+                state = yaml.safe_load(f)
+
+            updated_at_str = (state or {}).get('updated_at')
+            if not updated_at_str:
+                return None
+            return datetime.fromisoformat(updated_at_str)
+
+        except Exception as e:
+            logger.error(f"Failed to read dev container updated_at for {project_name}: {e}")
+            return None
+
     def get_image_name(self, project_name: str) -> Optional[str]:
         """
         Get the Docker image name for a project's dev container
