@@ -75,7 +75,16 @@ class DevEnvironmentVerifierAgent(PipelineStage):
 
         context["agent_output"] = review_text
 
-        # Parse status and update dev container state
+        # Parse status and update dev container state.
+        #
+        # CRITICAL: every branch below MUST resolve dev_container_state to a terminal
+        # status (VERIFIED or BLOCKED). Leaving it untouched on a parse failure means it
+        # stays at whatever dev_environment_setup left it (IN_PROGRESS) forever -- nothing
+        # else ever re-checks it, so every task requiring this project's dev container
+        # silently defers itself every 30s, indefinitely, with no error ever surfaced
+        # (see incident: codetoreum and phone-home both stuck IN_PROGRESS for hours/a day
+        # because this exact parse fell through to a silent no-op that still returned
+        # "success").
         status_match = re.search(r"### Status\s*\*\*(\w+)\*\*", review_text, re.IGNORECASE)
         if status_match:
             status = status_match.group(1).upper()
@@ -97,7 +106,31 @@ class DevEnvironmentVerifierAgent(PipelineStage):
                     error_message=error_message[:200],
                 )
                 logger.info("Marked %s dev container as BLOCKED: %s", project_name, error_message[:100])
+            else:
+                # Found the "### Status **WORD**" marker but WORD wasn't one we handle.
+                error_message = f"Verifier returned unrecognized status '{status}' (expected APPROVED or BLOCKED)"
+                dev_container_state.set_status(
+                    project_name=project_name,
+                    status=DevContainerStatus.BLOCKED,
+                    error_message=error_message[:200],
+                )
+                logger.error(
+                    "%s for %s -- marking dev container BLOCKED instead of leaving it stuck",
+                    error_message, project_name
+                )
         else:
-            logger.warning("Could not parse verification status for %s", project_name)
+            snippet = review_text.strip()[:300]
+            error_message = f"Could not parse a status marker from verifier output. Output began: {snippet}"
+            dev_container_state.set_status(
+                project_name=project_name,
+                status=DevContainerStatus.BLOCKED,
+                error_message=error_message[:200],
+            )
+            logger.error(
+                "Could not parse verification status for %s -- marking dev container BLOCKED "
+                "instead of leaving it stuck (see state/dev_containers/%s.yaml for the raw "
+                "output excerpt)",
+                project_name, project_name
+            )
 
         return {"status": "success", "agent_output": review_text}
