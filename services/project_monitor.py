@@ -4286,6 +4286,21 @@ class ProjectMonitor:
 
             if not previous_stage_context:
                 logger.warning(f"No previous stage output found for issue #{issue_number} - cannot start review cycle")
+                # Clean up immediately instead of abandoning the pipeline run/lock for the
+                # zombie watchdog to notice up to an hour later. By this point the caller
+                # (trigger_agent_for_status) has already created a pipeline run and, in the
+                # FAILSAFE path, already holds the pipeline lock for this issue -- neither
+                # gets touched again by this function once it bails out here, so without
+                # this cleanup the board stays locked with zero work in flight until the
+                # next scheduled zombie sweep. retain_lock=False is explicit (not just the
+                # outcome="failed" default) because this is a clean, fully-diagnosed bail-out
+                # that the normal board poll can safely retry, not an ambiguous crash.
+                self.pipeline_run_manager.end_pipeline_run(
+                    project_name, issue_number,
+                    reason="No previous stage output found - cannot start review cycle",
+                    outcome="failed",
+                    retain_lock=False,
+                )
                 return None
 
             # Get or create pipeline run before starting the thread
