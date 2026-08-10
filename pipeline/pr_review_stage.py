@@ -172,6 +172,40 @@ class PRReviewStage(PipelineStage):
             # Find PR for this parent issue
             pr_url = await self._find_pr_url(github_config, parent_issue_number)
             if not pr_url:
+                # No open PR — check whether it was already merged (e.g. outside the
+                # orchestrator's own completion flow). Without this, a merged PR whose
+                # board state never advanced would fail identically on every retry,
+                # retaining the pipeline lock and re-posting the same error comment
+                # on each restart/reconciliation pass forever.
+                merged_pr = await self._find_merged_pr(github_config, parent_issue_number)
+                if merged_pr:
+                    logger.info(
+                        f"No open PR for #{parent_issue_number}, but PR #{merged_pr['number']} "
+                        f"was already merged — treating as clean pass, advancing to Done"
+                    )
+                    self._emit_pr_review_outcome(project_name, parent_issue_number, repo, pipeline_run_id)
+                    pr_review_state_manager.increment_review_count(project_name, parent_issue_number, [])
+                    self._advance_parent_to_documentation(project_name, parent_issue_number)
+                    self._post_comment_on_issue(
+                        repo, parent_issue_number,
+                        f"## PR Review\n\n"
+                        f"PR #{merged_pr['number']} ({merged_pr['url']}) was already merged and no open "
+                        f"PR remains to review. Marking this epic complete and advancing to Done.",
+                        pipeline_run_id=pipeline_run_id,
+                    )
+                    context['agent_output'] = (
+                        f"## PR Review\n\n"
+                        f"**Outcome**: PR #{merged_pr['number']} already merged — advanced to Done."
+                    )
+                    context['manual_progression_made'] = True
+
+                    end_time = utc_now()
+                    duration_ms = (end_time - start_time).total_seconds() * 1000
+                    if obs:
+                        obs.emit_agent_completed("pr_review_stage", task_id, project_name, duration_ms,
+                                               True, pipeline_run_id=pipeline_run_id)
+                    return context
+
                 raise NonRetryableAgentError(
                     f"No PR found for parent issue #{parent_issue_number} in {repo}"
                 )
@@ -766,6 +800,41 @@ class PRReviewStage(PipelineStage):
             return None
         except Exception as e:
             logger.error(f"Failed to find PR for #{parent_issue_number}: {e}", exc_info=True)
+            return None
+
+    async def _find_merged_pr(self, github_config: Dict, parent_issue_number: int) -> Optional[Dict]:
+        """
+        Find a merged PR for a parent issue using gh CLI directly.
+
+        Used when no open PR is found: a merged PR on the expected branch means
+        the epic's code already landed (e.g. merged outside the orchestrator's
+        own completion flow), so the stale "In Review" state can be resolved
+        instead of failing on every retry.
+        """
+        repo = f"{github_config['org']}/{github_config['repo']}"
+        branch_prefix = f'feature/issue-{parent_issue_number}-'
+
+        try:
+            result = subprocess.run(
+                ['gh', 'pr', 'list', '-R', repo,
+                 '--state', 'merged',
+                 '--json', 'number,url,headRefName',
+                 '--limit', '100'],
+                capture_output=True, text=True, timeout=30
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                prs = json.loads(result.stdout)
+                for pr in prs:
+                    if pr.get('headRefName', '').startswith(branch_prefix):
+                        logger.info(
+                            f"Found merged PR #{pr['number']} for parent #{parent_issue_number} "
+                            f"(branch: {pr['headRefName']})"
+                        )
+                        return pr
+
+            return None
+        except Exception as e:
+            logger.error(f"Failed to find merged PR for #{parent_issue_number}: {e}", exc_info=True)
             return None
 
     def _load_discussion_outputs(self, project_name: str, parent_issue_number: int) -> Dict[str, str]:
