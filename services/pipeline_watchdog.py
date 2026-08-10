@@ -23,6 +23,19 @@ from elasticsearch import Elasticsearch
 logger = logging.getLogger(__name__)
 
 
+# Number of times a given (project, issue) may zombie-cleanup and be auto-retried
+# before the watchdog gives up and retains the lock for human intervention. Without
+# this cap, a deterministically-failing stall (e.g. a stage whose context lookup can
+# never succeed) would auto-retry forever, burning zombie_threshold_minutes every
+# cycle; with too low a cap, a single transient blip (e.g. one rate-limited API call)
+# would immediately demand manual intervention instead of self-healing.
+ZOMBIE_AUTO_RETRY_LIMIT = 2
+
+# How long a zombie-retry count is remembered before it decays, so an issue that
+# stalled a couple of times weeks ago doesn't count against a fresh, unrelated stall.
+ZOMBIE_RETRY_COUNT_TTL_SECONDS = 24 * 3600
+
+
 class PipelineWatchdog:
     """
     Monitors pipeline runs for zombie states and automatically cleans them up.
@@ -316,19 +329,47 @@ class PipelineWatchdog:
             f"for {project} issue #{issue_number}"
         )
 
+        # Track how many times this (project, issue) has zombie-cleaned up recently.
+        # The first ZOMBIE_AUTO_RETRY_LIMIT times, release the lock so the issue is
+        # picked back up automatically (via ProjectMonitor's stalled-issue failsafe)
+        # instead of sitting locked and inert until a human notices. Beyond that,
+        # fall back to the original behavior (retain lock, require manual
+        # intervention) — repeated identical failures are a sign the auto-retry
+        # itself can't succeed, so continuing would just burn zombie_threshold_minutes
+        # forever with no chance of self-healing.
+        retry_count = self._increment_zombie_retry_count(project, issue_number)
+        exceeded_auto_retry = retry_count > ZOMBIE_AUTO_RETRY_LIMIT
+        retain_lock = True if exceeded_auto_retry else False
+
+        if exceeded_auto_retry:
+            logger.warning(
+                f"Issue #{issue_number} in {project} has zombie-cleaned up "
+                f"{retry_count} times within {ZOMBIE_RETRY_COUNT_TTL_SECONDS // 3600}h "
+                f"(limit: {ZOMBIE_AUTO_RETRY_LIMIT}) — retaining lock, requires manual intervention"
+            )
+        else:
+            logger.info(
+                f"Issue #{issue_number} in {project} zombie-cleanup attempt "
+                f"{retry_count}/{ZOMBIE_AUTO_RETRY_LIMIT} — releasing lock to allow auto-retry"
+            )
+
         # End the pipeline run
         if self.pipeline_run_manager:
             ended = self.pipeline_run_manager.end_pipeline_run(
                 project=project,
                 issue_number=issue_number,
                 reason=f"Zombie pipeline run cleanup (started: {started_at}, no container found)",
-                outcome="failed"
+                outcome="failed",
+                retain_lock=retain_lock,
             )
 
             if ended:
                 logger.info(f"Ended zombie pipeline run {pipeline_run_id[:8]}...")
             else:
                 logger.warning(f"Failed to end zombie pipeline run {pipeline_run_id[:8]}...")
+
+        if exceeded_auto_retry:
+            self._notify_lock_stuck(project, board, issue_number, pipeline_run_id, retry_count)
 
         # Remove any stale review cycle state so it doesn't block future runs
         try:
@@ -365,6 +406,100 @@ class PipelineWatchdog:
             )
         except Exception as e:
             logger.debug(f"Could not log cleanup event to observability: {e}")
+
+    def _increment_zombie_retry_count(self, project: str, issue_number: int) -> int:
+        """
+        Increment and return the rolling zombie-cleanup count for (project, issue).
+
+        Backed by Redis with a TTL so old counts decay rather than accumulating
+        forever. Falls back to always-exceeded (1 + limit) if Redis isn't reachable,
+        so a Redis outage fails safe toward "require manual intervention" rather than
+        silently permitting unbounded auto-retry.
+        """
+        try:
+            redis_client = getattr(self.pipeline_run_manager, 'redis', None)
+            if not redis_client:
+                return ZOMBIE_AUTO_RETRY_LIMIT + 1
+            key = f"zombie_cleanup_count:{project}:{issue_number}"
+            count = redis_client.incr(key)
+            redis_client.expire(key, ZOMBIE_RETRY_COUNT_TTL_SECONDS)
+            return int(count)
+        except Exception as e:
+            logger.warning(
+                f"Could not track zombie retry count for {project} issue #{issue_number}: {e}"
+            )
+            return ZOMBIE_AUTO_RETRY_LIMIT + 1
+
+    def _notify_lock_stuck(
+        self,
+        project: str,
+        board: str,
+        issue_number: int,
+        pipeline_run_id: str,
+        retry_count: int,
+    ):
+        """
+        Surface a permanently-retained lock somewhere a human will actually see it.
+
+        Previously this state was only visible as a passive Elasticsearch decision
+        event — nobody would notice until they went looking. This posts a comment on
+        the issue itself (where the team already looks) and logs a distinctly-named
+        decision event for dashboard/query visibility.
+        """
+        message = (
+            f"## \N{WARNING SIGN} Pipeline Stuck — Manual Intervention Required\n\n"
+            f"This issue's pipeline has zombie-cleaned up {retry_count} times in a row "
+            f"(no agent container found for over {self.zombie_threshold_minutes} minutes each time) "
+            f"and the `{board}` board lock is now being retained deliberately — auto-retry has "
+            f"been exhausted since repeating the same failure wouldn't self-heal.\n\n"
+            f"This blocks every other issue queued behind it on this board.\n\n"
+            f"Someone needs to diagnose why this issue's pipeline keeps stalling "
+            f"(check `/pipeline-investigate {pipeline_run_id}`) and then release the lock "
+            f"before the board can proceed.\n\n"
+            f"---\n_Reported by the pipeline watchdog_"
+        )
+
+        try:
+            from config.manager import config_manager
+            from services.github_integration import GitHubIntegration
+
+            project_config = config_manager.get_project_config(project)
+            if project_config and hasattr(project_config, 'github'):
+                github = GitHubIntegration(
+                    repo_owner=project_config.github['org'],
+                    repo_name=project_config.github['repo'],
+                )
+                import asyncio
+                try:
+                    loop = asyncio.get_running_loop()
+                    import concurrent.futures
+                    with concurrent.futures.ThreadPoolExecutor() as pool:
+                        pool.submit(asyncio.run, github.post_comment(issue_number, message)).result()
+                except RuntimeError:
+                    asyncio.run(github.post_comment(issue_number, message))
+        except Exception as e:
+            # Best-effort — GitHub may itself be the reason we're stuck (e.g. the same
+            # circuit breaker that caused the original stall). The decision event below
+            # is the durable record either way.
+            logger.warning(f"Could not post lock-stuck notification comment to issue #{issue_number}: {e}")
+
+        try:
+            from monitoring.observability_server import observability_server
+
+            observability_server.index_decision_event(
+                decision_type="pipeline_lock_stuck_requires_intervention",
+                project=project,
+                board=board,
+                issue_number=issue_number,
+                reason=f"Zombie-cleaned up {retry_count} times, auto-retry exhausted",
+                details={
+                    "pipeline_run_id": pipeline_run_id,
+                    "retry_count": retry_count,
+                    "auto_retry_limit": ZOMBIE_AUTO_RETRY_LIMIT,
+                }
+            )
+        except Exception as e:
+            logger.debug(f"Could not log lock-stuck event to observability: {e}")
 
     def start(self):
         """

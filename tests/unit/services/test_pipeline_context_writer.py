@@ -130,3 +130,52 @@ class TestReviewCycleMethods:
 
         content = open(os.path.join(w.context_dir, 'initial_request.md')).read()
         assert 'Original' in content  # Not overwritten
+
+
+class TestFindLatestOutputForIssue:
+    """
+    Covers the durability fallback used when a stage's GitHub completion comment
+    fails to post (e.g. rate-limit circuit breaker open) — see
+    AgentExecutor._post_agent_output_to_github (writer) and
+    ProjectMonitor._get_issue_context (reader).
+    """
+
+    def test_returns_none_when_nothing_written(self, tmp_base):
+        assert PipelineContextWriter.find_latest_output_for_issue(159, 'senior_software_engineer_output.md') is None
+
+    def test_finds_output_written_under_a_run_dir(self, tmp_base):
+        PipelineContextWriter.setup(159, 'aa67fb29-abcd').write_stage_output(
+            'senior_software_engineer', 'Implemented the telemetry changes.'
+        )
+        result = PipelineContextWriter.find_latest_output_for_issue(
+            159, 'senior_software_engineer_output.md'
+        )
+        assert result == 'Implemented the telemetry changes.'
+
+    def test_ignores_other_issues(self, tmp_base):
+        PipelineContextWriter.setup(159, 'run1').write_stage_output('agent', 'for 159')
+        PipelineContextWriter.setup(1590, 'run2').write_stage_output('agent', 'for 1590')
+        assert PipelineContextWriter.find_latest_output_for_issue(159, 'agent_output.md') == 'for 159'
+
+    def test_prefers_most_recently_modified_run_dir(self, tmp_base):
+        # Simulate two retry attempts across different pipeline runs for the same
+        # issue — the newer one's output should win.
+        older = PipelineContextWriter.setup(159, 'run-old')
+        older.write_stage_output('agent', 'old output')
+        newer = PipelineContextWriter.setup(159, 'run-new')
+        newer.write_stage_output('agent', 'new output')
+
+        # Force distinct mtimes regardless of filesystem timestamp resolution.
+        os.utime(older.context_dir, (1000, 1000))
+        os.utime(newer.context_dir, (2000, 2000))
+
+        result = PipelineContextWriter.find_latest_output_for_issue(159, 'agent_output.md')
+        assert result == 'new output'
+
+    def test_returns_none_for_missing_filename(self, tmp_base):
+        PipelineContextWriter.setup(159, 'run1').write_stage_output('agent', 'output')
+        assert PipelineContextWriter.find_latest_output_for_issue(159, 'other_agent_output.md') is None
+
+    def test_ignores_empty_file(self, tmp_base):
+        PipelineContextWriter.setup(159, 'run1').write_stage_output('agent', '')
+        assert PipelineContextWriter.find_latest_output_for_issue(159, 'agent_output.md') is None

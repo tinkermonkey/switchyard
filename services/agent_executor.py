@@ -1023,6 +1023,25 @@ class AgentExecutor:
             logger.warning(f"No markdown output found for {agent_name}, skipping GitHub post")
             return
 
+        # Persist a durable local copy unconditionally, before attempting the GitHub
+        # post. GitHub writes can fail transiently (rate limits, open circuit breaker)
+        # — without this, a failed post here silently strands any downstream stage
+        # that depends on finding this stage's output (see
+        # PipelineContextWriter.find_latest_output_for_issue, used as a fallback by
+        # ProjectMonitor._get_issue_context when the GitHub comment scrape is empty).
+        pipeline_run_id = task_context.get('pipeline_run_id')
+        if pipeline_run_id:
+            try:
+                from services.pipeline_context_writer import PipelineContextWriter
+                PipelineContextWriter.setup(issue_number, pipeline_run_id).write_stage_output(
+                    agent_name, markdown_output
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Could not persist local stage-output fallback for {agent_name} "
+                    f"on issue #{issue_number}: {e}"
+                )
+
         # Format the comment
         comment = AgentCommentFormatter.format_agent_completion(
             agent_name=agent_name,
@@ -1043,12 +1062,36 @@ class AgentExecutor:
             else:
                 logger.info("Posting top-level comment (no reply_to_comment_id found)")
 
-            # Post to GitHub (workspace-aware: issues or discussions)
+            # Post to GitHub (workspace-aware: issues or discussions), with a short
+            # bounded retry for transient failures. Does not retry against an open
+            # rate-limit circuit breaker — its reset window is typically minutes to
+            # an hour away (see GitHubBreaker.trip), so retrying immediately would
+            # just fail again and hold up finalization for no benefit; the durable
+            # local copy written above is the fallback of record for that case.
             post_result = await github.post_agent_output(
                 task_context,
                 comment,
                 reply_to_id=reply_to_id
             )
+
+            attempt = 1
+            while (
+                not post_result.get('success')
+                and attempt < 3
+                and 'circuit breaker open' not in str(post_result.get('error', '')).lower()
+            ):
+                backoff_seconds = 3 * attempt
+                logger.warning(
+                    f"Retrying {agent_name} GitHub post for issue #{issue_number} "
+                    f"in {backoff_seconds}s (attempt {attempt + 1}/3): {post_result.get('error')}"
+                )
+                await asyncio.sleep(backoff_seconds)
+                post_result = await github.post_agent_output(
+                    task_context,
+                    comment,
+                    reply_to_id=reply_to_id
+                )
+                attempt += 1
 
             if post_result.get('success'):
                 logger.info(f"Posted {agent_name} output to GitHub (workspace: {workspace_type}, issue: #{issue_number})")
@@ -1063,7 +1106,12 @@ class AgentExecutor:
                     project=project_name
                 )
             else:
-                logger.error(f"Failed to post {agent_name} output to GitHub: {post_result.get('error')}")
+                logger.error(
+                    f"Failed to post {agent_name} output to GitHub for issue #{issue_number} "
+                    f"after {attempt} attempt(s): {post_result.get('error')}. "
+                    f"A durable local copy was persisted for downstream stages to fall back on "
+                    f"(see PipelineContextWriter.find_latest_output_for_issue)."
+                )
 
         except Exception as e:
             logger.error(f"Error posting {agent_name} output to GitHub: {e}", exc_info=True)
