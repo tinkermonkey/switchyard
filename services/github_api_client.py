@@ -361,7 +361,7 @@ class GitHubAPIClient:
         Execute a REST API call with rate limiting and error handling.
         
         Args:
-            method: HTTP method ('GET', 'POST', 'PATCH', 'DELETE')
+            method: HTTP method ('GET', 'POST', 'PATCH', 'PUT', 'DELETE')
             endpoint: GitHub REST endpoint (e.g., '/repos/owner/repo/issues/1')
             data: Optional request body for POST/PATCH
             retries: Current retry count (internal use)
@@ -393,9 +393,9 @@ class GitHubAPIClient:
         # Apply backoff
         self._apply_backoff()
         
-        # For REST API calls with data (POST/PATCH/DELETE), use http_request instead
+        # For REST API calls with data (POST/PATCH/PUT/DELETE), use http_request instead
         # as gh api doesn't handle JSON bodies well
-        if data and method.upper() in ['POST', 'PATCH', 'DELETE']:
+        if data and method.upper() in ['POST', 'PATCH', 'PUT', 'DELETE']:
             # Use HTTP request instead
             url = f"https://api.github.com{endpoint}"
             return self.http_request(method, url, data, retries=retries)
@@ -482,7 +482,7 @@ class GitHubAPIClient:
         Execute an HTTP request to GitHub API with rate limiting.
         
         Args:
-            method: HTTP method ('GET', 'POST', 'PATCH', 'DELETE')
+            method: HTTP method ('GET', 'POST', 'PATCH', 'PUT', 'DELETE')
             url: Full URL (e.g., 'https://api.github.com/graphql')
             data: Optional request body (will be JSON encoded)
             headers: Optional headers to include
@@ -544,6 +544,8 @@ class GitHubAPIClient:
                 response = requests.post(url, json=data, headers=request_headers, timeout=30)
             elif method.upper() == 'PATCH':
                 response = requests.patch(url, json=data, headers=request_headers, timeout=30)
+            elif method.upper() == 'PUT':
+                response = requests.put(url, json=data, headers=request_headers, timeout=30)
             elif method.upper() == 'DELETE':
                 response = requests.delete(url, headers=request_headers, timeout=30)
             else:

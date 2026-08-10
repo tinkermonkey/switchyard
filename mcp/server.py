@@ -22,6 +22,8 @@ import json
 import logging
 import os
 import subprocess
+import threading
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -161,17 +163,52 @@ def _project_github(config: dict) -> tuple[str, str]:
     return gh.get("org", ""), gh.get("repo", "")
 
 
-def _gh_graphql(query: str) -> dict:
-    """Execute a GraphQL query via the gh CLI and return parsed JSON."""
-    result = subprocess.run(
-        ["gh", "api", "graphql", "-f", f"query={query}"],
-        capture_output=True, text=True, timeout=30
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"gh graphql failed: {result.stderr.strip()}")
-    data = json.loads(result.stdout)
-    if "errors" in data:
-        raise RuntimeError(f"GraphQL errors: {data['errors']}")
+def _gh_graphql(query: str, variables: dict | None = None) -> dict:
+    """
+    Execute a GraphQL query through the orchestrator's hardened GitHub client
+    (services/github_api_client.py's GitHubAPIClient/get_github_client()) —
+    circuit breaker persisted to Redis, proactive usage-based throttling, and
+    exponential backoff on transient failures — instead of shelling out to
+    `gh` directly with none of that.
+
+    Raises RuntimeError on failure (rate limit, GraphQL errors, transport
+    errors), matching this function's previous subprocess-based contract, so
+    existing callers keep working unchanged. Re-wraps the client's already-
+    unwrapped `data` back under a "data" key for the same reason.
+    """
+    from services.github_api_client import get_github_client
+
+    success, data = get_github_client().graphql(query, variables)
+    if not success:
+        raise RuntimeError(f"GitHub GraphQL query failed: {data}")
+    return {"data": data}
+
+
+# Short-TTL cache for list_issues's per-board item query, mirroring the
+# pattern (and TTL) in services/github_owner_utils.py's
+# execute_board_query_cached() — used directly by ProjectMonitor and
+# PipelineQueueManager. That shared function is NOT reused here because its
+# query only fetches id/number/title/state/repository/updatedAt + field
+# values; list_issues also needs url, labels, and assignees, which aren't in
+# that query. Switching to it would silently drop those fields from every
+# list_issues result. This cache wraps list_issues's own (unchanged) query
+# instead, keyed by project_id (the node ID list_issues queries by).
+_board_items_cache: dict[str, tuple[float, dict]] = {}
+_board_items_cache_lock = threading.Lock()
+_BOARD_ITEMS_CACHE_TTL_SECONDS = 15
+
+
+def _cached_board_items_query(project_id: str, query: str) -> dict:
+    now = time.monotonic()
+    with _board_items_cache_lock:
+        cached = _board_items_cache.get(project_id)
+        if cached and now - cached[0] < _BOARD_ITEMS_CACHE_TTL_SECONDS:
+            return cached[1]
+
+    data = _gh_graphql(query)
+
+    with _board_items_cache_lock:
+        _board_items_cache[project_id] = (now, data)
     return data
 
 
@@ -327,7 +364,7 @@ async def list_issues(
         }}'''
 
         try:
-            data = _gh_graphql(query)
+            data = _cached_board_items_query(project_id, query)
         except Exception as exc:
             log.warning("Failed to query board '%s': %s", board_name, exc)
             continue
@@ -374,11 +411,23 @@ async def list_issues(
     return results
 
 
+_GET_ISSUE_STATUS_RETRY_ATTEMPTS = 2
+_GET_ISSUE_STATUS_RETRY_DELAY_SECONDS = 2
+
+
 @mcp.tool()
 async def get_issue(issue_number: int, project: str) -> dict:
     """
     Return metadata for a specific issue: current board column(s), pipeline run
     state, labels, assignees, and the three most recent comments.
+
+    A board's status can come back null immediately after a real move due to
+    GraphQL read staleness, not because the field is genuinely unset (see
+    ProjectMonitor.get_project_items() in services/project_monitor.py, which
+    treats an unrecognized/missing status as possibly transient and retries
+    before giving up rather than trusting the first response). This mirrors
+    that: if any board comes back with a null status, the whole query is
+    retried a couple of times before the result is accepted as final.
 
     Args:
         issue_number: GitHub issue number.
@@ -418,26 +467,39 @@ async def get_issue(issue_number: int, project: str) -> dict:
       }}
     }}'''
 
-    data = _gh_graphql(query)
-    issue = (
-        data.get("data", {})
-            .get("repository", {})
-            .get("issue")
-    )
-    if not issue:
-        raise ValueError(
-            f"Issue #{issue_number} not found in {org}/{repo}"
+    issue = None
+    board_statuses: list[dict] = []
+    for attempt in range(_GET_ISSUE_STATUS_RETRY_ATTEMPTS + 1):
+        data = _gh_graphql(query)
+        issue = (
+            data.get("data", {})
+                .get("repository", {})
+                .get("issue")
         )
+        if not issue:
+            raise ValueError(
+                f"Issue #{issue_number} not found in {org}/{repo}"
+            )
 
-    board_statuses = [
-        {
-            "board_number": item.get("project", {}).get("number"),
-            "board_name": item.get("project", {}).get("title"),
-            "item_id": item.get("id"),
-            "status": (item.get("fieldValueByName") or {}).get("name"),
-        }
-        for item in issue.get("projectItems", {}).get("nodes", [])
-    ]
+        board_statuses = [
+            {
+                "board_number": item.get("project", {}).get("number"),
+                "board_name": item.get("project", {}).get("title"),
+                "item_id": item.get("id"),
+                "status": (item.get("fieldValueByName") or {}).get("name"),
+            }
+            for item in issue.get("projectItems", {}).get("nodes", [])
+        ]
+
+        has_null_status = any(b["status"] is None for b in board_statuses)
+        if not has_null_status or attempt == _GET_ISSUE_STATUS_RETRY_ATTEMPTS:
+            break
+        log.debug(
+            "get_issue: null board status for issue #%d (attempt %d/%d) — "
+            "possible GraphQL read staleness, retrying",
+            issue_number, attempt + 1, _GET_ISSUE_STATUS_RETRY_ATTEMPTS,
+        )
+        await asyncio.sleep(_GET_ISSUE_STATUS_RETRY_DELAY_SECONDS)
 
     r = _get_redis()
     pipeline_run_id = r.hget(
@@ -484,9 +546,9 @@ async def move_issue(
     Move an issue to a named column on its GitHub Projects v2 board.
 
     Wraps updateProjectV2ItemFieldValue using field/option IDs stored in the
-    project's github_state.yaml.  The orchestrator's GitHubAPIClient rate
-    limiting is NOT applied here — this tool is intended for low-frequency
-    manual corrections, not bulk automation.
+    project's github_state.yaml.  Goes through the orchestrator's
+    GitHubAPIClient (circuit breaker + exponential backoff), same as every
+    other GraphQL call in this file.
 
     Args:
         issue_number: GitHub issue number.
@@ -590,7 +652,9 @@ async def move_issue(
             f"'{current_status}', not '{from_status}'."
         )
 
-    # Execute the mutation with up to 3 retries (matching pipeline_progression.py).
+    # _gh_graphql() already retries transient failures with real exponential
+    # backoff and circuit-breaker awareness (services/github_api_client.py) —
+    # no bespoke retry loop needed here; it raises RuntimeError on failure.
     mutation = f'''
       mutation {{
         updateProjectV2ItemFieldValue(
@@ -606,23 +670,7 @@ async def move_issue(
       }}
     '''
 
-    last_err: str = ""
-    for attempt in range(3):
-        result = subprocess.run(
-            ["gh", "api", "graphql", "-f", f"query={mutation}"],
-            capture_output=True, text=True, timeout=30
-        )
-        if result.returncode == 0:
-            resp = json.loads(result.stdout)
-            if "errors" not in resp:
-                break
-            last_err = str(resp["errors"])
-        else:
-            last_err = result.stderr.strip()
-        if attempt < 2:
-            await asyncio.sleep(2 * (attempt + 1))
-    else:
-        raise RuntimeError(f"Move failed after 3 attempts: {last_err}")
+    _gh_graphql(mutation)
 
     return {
         "success": True,
@@ -754,21 +802,16 @@ async def toggle_project_v2_workflow(
         }
 
     # Attempt REST toggle: only works for org-owned projects.
+    from services.github_api_client import get_github_client
+
     rest_path = f"/orgs/{owner}/projects/{project_db_id}/workflows/{target_wf['fullDatabaseId']}"
-    rest_result = subprocess.run(
-        ["gh", "api", "--method", "PUT", rest_path, "--input", "-"],
-        input=json.dumps({"enabled": enabled}),
-        capture_output=True, text=True, timeout=30,
+    rest_success, rest_data = get_github_client().rest(
+        "PUT", rest_path, data={"enabled": enabled}
     )
 
-    if rest_result.returncode != 0:
-        try:
-            err_data = json.loads(rest_result.stdout or rest_result.stderr)
-            err_detail = err_data.get("message", rest_result.stderr.strip())
-            status_code = err_data.get("status", "?")
-        except (json.JSONDecodeError, AttributeError):
-            err_detail = rest_result.stderr.strip()
-            status_code = "?"
+    if not rest_success:
+        err_detail = rest_data.get("error", str(rest_data)) if isinstance(rest_data, dict) else str(rest_data)
+        status_code = rest_data.get("status_code", "?") if isinstance(rest_data, dict) else "?"
 
         if owner_type == "user":
             raise RuntimeError(
@@ -827,28 +870,17 @@ async def toggle_project_v2_workflow(
 @mcp.tool()
 async def github_graphql(query: str, variables: dict | None = None) -> dict:
     """
-    Execute an arbitrary GitHub GraphQL query or mutation via the gh CLI.
+    Execute an arbitrary GitHub GraphQL query or mutation through the
+    orchestrator's hardened GitHub client (circuit breaker, adaptive
+    throttling, exponential backoff — services/github_api_client.py).
 
-    The gh CLI is authenticated as the GitHub App inside the switchyard
-    container.  Raises RuntimeError on gh CLI errors or GraphQL error
-    responses.
+    Raises RuntimeError on failure or GraphQL error responses.
 
     Args:
         query:     GraphQL query or mutation string.
         variables: Optional dict of query variables.
     """
-    body = json.dumps({"query": query, "variables": variables or {}})
-    result = subprocess.run(
-        ["gh", "api", "graphql", "--input", "-"],
-        input=body,
-        capture_output=True, text=True, timeout=30,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"gh graphql failed: {result.stderr.strip()}")
-    data = json.loads(result.stdout)
-    if "errors" in data:
-        raise RuntimeError(f"GraphQL errors: {data['errors']}")
-    return data
+    return _gh_graphql(query, variables)
 
 
 # ── MCP tools: pipeline run diagnostics ───────────────────────────────────────
