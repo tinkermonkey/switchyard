@@ -9,8 +9,10 @@ stages, so agents can read prior outputs from disk instead of receiving large
 embedded text blocks in their prompts.
 """
 
+import glob
 import logging
 import os
+from typing import Optional
 
 from services.agent_context_writer import AgentContextWriter
 
@@ -62,6 +64,50 @@ class PipelineContextWriter(AgentContextWriter):
     def from_existing(cls, context_dir: str) -> 'PipelineContextWriter':
         """Re-attach to an existing context directory after orchestrator restart."""
         return cls(context_dir)
+
+    @classmethod
+    def find_latest_output_for_issue(cls, issue_number: int, filename: str) -> Optional[str]:
+        """
+        Search every context directory ever created for this issue (one per pipeline
+        run — see `setup()`) for `filename`, newest first, and return its contents.
+
+        This is a durability fallback for callers like
+        `ProjectMonitor._get_issue_context`, which normally sources "previous stage
+        output" by scraping GitHub comments. That scrape comes up empty whenever the
+        stage's completion comment failed to post (e.g. GitHub rate-limit circuit
+        breaker open) even though the stage itself finished successfully — see
+        `AgentExecutor._post_agent_output_to_github`, which writes the same output
+        here unconditionally, regardless of whether the GitHub post succeeds. Without
+        this fallback a downstream stage (e.g. a review cycle) has no way to recover
+        that output and stalls indefinitely waiting on a comment that will never post.
+        """
+        pattern = os.path.join(_PIPELINE_CONTEXT_BASE, f'{issue_number}_*')
+        candidate_dirs = [d for d in glob.glob(pattern) if os.path.isdir(d)]
+
+        # setup() falls back to a run-id-less dir name (just the issue number) when
+        # no pipeline_run_id is available — cover that form too.
+        exact_dir = os.path.join(_PIPELINE_CONTEXT_BASE, str(issue_number))
+        if os.path.isdir(exact_dir) and exact_dir not in candidate_dirs:
+            candidate_dirs.append(exact_dir)
+
+        candidate_dirs.sort(key=lambda d: os.path.getmtime(d), reverse=True)
+
+        for context_dir in candidate_dirs:
+            path = os.path.join(context_dir, filename)
+            if os.path.isfile(path):
+                try:
+                    with open(path, 'r') as f:
+                        content = f.read()
+                except Exception as e:
+                    logger.warning(f"Failed to read fallback context file {path}: {e}")
+                    continue
+                if content.strip():
+                    logger.info(
+                        f"Found durable local fallback for issue #{issue_number}: {path}"
+                    )
+                    return content
+
+        return None
 
     # ------------------------------------------------------------------
     # File writes

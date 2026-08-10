@@ -980,13 +980,18 @@ class ProjectMonitor:
                                    pipeline_config=None,
                                    current_stage_config=None,
                                    project_name: Optional[str] = None,
-                                   pipeline_run_id: Optional[str] = None) -> str:
+                                   pipeline_run_id: Optional[str] = None,
+                                   maker_agent_name: Optional[str] = None) -> str:
         """
         Fetch comments from the previous workflow stage agent and user comments since then.
         Works with both issues and discussions workspaces.
 
         If current_stage_config has inputs_from defined, will gather outputs from those
         specific agents instead of just the previous stage.
+
+        maker_agent_name (when known, e.g. a review column's `column.maker_agent`) is
+        passed through to the issue-context fallback so it can recover locally-persisted
+        output if the maker's completion comment never made it to GitHub.
 
         Returns formatted context string.
         """
@@ -1206,7 +1211,10 @@ class ProjectMonitor:
                     )
                 except Exception as e:
                     logger.debug(f"Could not record fallback metric: {e}")
-                return self._get_issue_context(repository, issue_number, org, current_column, workflow_template)
+                return self._get_issue_context(
+                    repository, issue_number, org, current_column, workflow_template,
+                    fallback_agent_name=maker_agent_name
+                )
 
         # For hybrid pipelines, determine if previous stage was in discussions or issues
         should_use_discussion = False
@@ -1233,7 +1241,8 @@ class ProjectMonitor:
             return self._get_issue_context(repository, issue_number, org, current_column, workflow_template)
 
     def _get_issue_context(self, repository: str, issue_number: int, org: str,
-                           current_column: str, workflow_template) -> str:
+                           current_column: str, workflow_template,
+                           fallback_agent_name: Optional[str] = None) -> str:
         """
         Get previous stage context from issue comments.
 
@@ -1241,6 +1250,12 @@ class ProjectMonitor:
         not just the immediately previous column. This ensures that when an issue
         moves backwards in the workflow (e.g., from Testing back to Development),
         the agent receives all relevant context including QA feedback.
+
+        If no agent comments are found (e.g. the maker's completion comment failed
+        to post — see AgentExecutor._post_agent_output_to_github), and
+        fallback_agent_name is given, falls back to the durable local copy of that
+        agent's output written at finalization time. This is what prevents a stalled
+        GitHub write from permanently deadlocking the next stage.
         """
         try:
             # Fetch all comments
@@ -1285,6 +1300,24 @@ class ProjectMonitor:
                     })
 
             if not agent_comments:
+                if fallback_agent_name:
+                    from services.pipeline_context_writer import PipelineContextWriter
+                    local_output = PipelineContextWriter.find_latest_output_for_issue(
+                        issue_number, f'{fallback_agent_name}_output.md'
+                    )
+                    if local_output:
+                        logger.warning(
+                            f"No agent comments found on issue #{issue_number} (GitHub post "
+                            f"likely failed) — using durable local copy of {fallback_agent_name}'s "
+                            f"output instead"
+                        )
+                        return (
+                            "## Previous Work and Feedback\n\n"
+                            f"_Recovered from local storage — the {fallback_agent_name.replace('_', ' ')} "
+                            "agent's completion comment failed to post to GitHub._\n\n"
+                            f"### Output from {fallback_agent_name.replace('_', ' ').title()}\n\n"
+                            f"{local_output}"
+                        )
                 return ""  # No agent comments yet
 
             # Sort agent comments chronologically
@@ -3753,9 +3786,10 @@ class ProjectMonitor:
     ) -> Optional[str]:
         """Query GitHub to find what column an issue is in on a specific board."""
         try:
-            import subprocess
-            import json
-
+            # get_github_client() is already imported at module level — routes
+            # through the circuit breaker + exponential backoff instead of a
+            # bare subprocess call (this was the one place in this module that
+            # still bypassed the hardened client).
             github_org = project_config.github['org']
             github_repo = project_config.github['repo']
 
@@ -3776,13 +3810,12 @@ class ProjectMonitor:
                 }}
             }}'''
 
-            result = subprocess.run(
-                ['gh', 'api', 'graphql', '-f', f'query={query}'],
-                capture_output=True, text=True, check=True, timeout=30
-            )
-            data = json.loads(result.stdout)
+            success, data = get_github_client().graphql(query)
+            if not success:
+                logger.error(f"Failed to get column for issue #{issue_number}: {data}")
+                return None
 
-            items = data.get('data', {}).get('repository', {}).get('issue', {}).get('projectItems', {}).get('nodes', [])
+            items = data.get('repository', {}).get('issue', {}).get('projectItems', {}).get('nodes', [])
 
             for item in items:
                 if item.get('project', {}).get('number') == board.project_number:
@@ -3973,7 +4006,8 @@ class ProjectMonitor:
                 discussion_id=discussion_id,
                 pipeline_config=pipeline_config,
                 current_stage_config=current_stage_config,
-                project_name=project_name
+                project_name=project_name,
+                maker_agent_name=getattr(column, 'maker_agent', None)
             )
 
             # Start conversational loop in background thread
@@ -4246,7 +4280,8 @@ class ProjectMonitor:
                 discussion_id=discussion_id,
                 pipeline_config=pipeline_config,
                 current_stage_config=current_stage_config,
-                project_name=project_name
+                project_name=project_name,
+                maker_agent_name=getattr(column, 'maker_agent', None)
             )
 
             if not previous_stage_context:
