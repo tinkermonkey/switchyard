@@ -170,6 +170,21 @@ class CircuitBreaker:
             return result
 
         except self.expected_exception as e:
+            # A Claude Code usage-limit rejection is a systemic, account-wide issue,
+            # not a failure of whatever this particular stage does — the global
+            # ClaudeCodeBreaker already tracks it and the caller (agent_executor.py's
+            # retry loop) already treats it as non-retryable. Counting it here too
+            # would let repeated rate-limit incidents spuriously trip this stage's
+            # own breaker purely from outage noise, adding an unrelated 600s lockout
+            # on top of the real one. Deferred import avoids a hard dependency from
+            # this low-level module on the Claude-specific breaker.
+            from monitoring.claude_code_breaker import ClaudeCodeRateLimitError
+            if isinstance(e, ClaudeCodeRateLimitError):
+                logger.info(
+                    f"Circuit '{self.name}' saw a Claude Code rate limit error — "
+                    f"not counting against this circuit's failure_count"
+                )
+                raise
             self._on_failure()
             raise
         except Exception as e:

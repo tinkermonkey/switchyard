@@ -24,45 +24,55 @@ class CodeReviewerAgent(PipelineStage):
 
     async def execute(self, context: Dict[str, Any]) -> Dict[str, Any]:
         task_context = context.get("context", {})
-        issue_raw = task_context.get("issue", {})
-        review_cycle_raw = task_context.get("review_cycle", {})
-        change_manifest = task_context.get("change_manifest", "")
+        direct_prompt = task_context.get("direct_prompt")
 
-        # Build ReviewCycleContext
-        review_cycle = None
-        if review_cycle_raw:
-            review_cycle = ReviewCycleContext(
-                iteration=review_cycle_raw.get("iteration", 0),
-                max_iterations=review_cycle_raw.get("max_iterations", 3),
-                maker_agent=review_cycle_raw.get("maker_agent", ""),
-                reviewer_agent=review_cycle_raw.get("reviewer_agent", ""),
-                is_rereviewing=review_cycle_raw.get("is_rereviewing", False),
-                post_human_feedback=review_cycle_raw.get("post_human_feedback", False),
-                previous_review_feedback=review_cycle_raw.get("previous_review_feedback") or "",
-                context_dir=task_context.get("pipeline_context_dir"),
+        if direct_prompt:
+            # Frozen-session resume (see agent_executor.py's
+            # _apply_frozen_session_resume): skip rebuilding the full reviewer
+            # prompt from scratch and use the short continuation prompt
+            # instead — Claude's --resume'd session already has the original
+            # review task in its history.
+            prompt = direct_prompt
+        else:
+            issue_raw = task_context.get("issue", {})
+            review_cycle_raw = task_context.get("review_cycle", {})
+            change_manifest = task_context.get("change_manifest", "")
+
+            # Build ReviewCycleContext
+            review_cycle = None
+            if review_cycle_raw:
+                review_cycle = ReviewCycleContext(
+                    iteration=review_cycle_raw.get("iteration", 0),
+                    max_iterations=review_cycle_raw.get("max_iterations", 3),
+                    maker_agent=review_cycle_raw.get("maker_agent", ""),
+                    reviewer_agent=review_cycle_raw.get("reviewer_agent", ""),
+                    is_rereviewing=review_cycle_raw.get("is_rereviewing", False),
+                    post_human_feedback=review_cycle_raw.get("post_human_feedback", False),
+                    previous_review_feedback=review_cycle_raw.get("previous_review_feedback") or "",
+                    context_dir=task_context.get("pipeline_context_dir"),
+                )
+
+            ctx = PromptContext(
+                mode="initial",
+                agent_name="code_reviewer",
+                agent_display_name="Senior Software Engineer",
+                agent_role_description="",
+                output_sections=[],
+                project=task_context.get("project", ""),
+                issue=IssueContext(
+                    title=issue_raw.get("title", "No title"),
+                    body=issue_raw.get("body", "No description"),
+                ),
+                pipeline_context_dir=task_context.get("pipeline_context_dir"),
+                review_cycle=review_cycle,
+                change_manifest=change_manifest,
             )
 
-        ctx = PromptContext(
-            mode="initial",
-            agent_name="code_reviewer",
-            agent_display_name="Senior Software Engineer",
-            agent_role_description="",
-            output_sections=[],
-            project=task_context.get("project", ""),
-            issue=IssueContext(
-                title=issue_raw.get("title", "No title"),
-                body=issue_raw.get("body", "No description"),
-            ),
-            pipeline_context_dir=task_context.get("pipeline_context_dir"),
-            review_cycle=review_cycle,
-            change_manifest=change_manifest,
-        )
-
-        prompt = self._prompt_builder.build_reviewer_prompt(
-            ctx,
-            reviewer_title="Senior Software Engineer",
-            review_domain="code",
-        )
+            prompt = self._prompt_builder.build_reviewer_prompt(
+                ctx,
+                reviewer_title="Senior Software Engineer",
+                review_domain="code",
+            )
 
         try:
             enhanced_context = context.copy()

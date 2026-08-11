@@ -31,7 +31,7 @@ class ExecutionRecord:
     column: str
     agent: str
     timestamp: str
-    outcome: str  # 'success', 'failure', 'blocked', 'cancelled', 'in_progress'
+    outcome: str  # 'success', 'failure', 'frozen', 'cancelled', 'in_progress'
     trigger_source: str  # 'manual_move', 'pipeline_progression', 'webhook'
     error: Optional[str] = None
 
@@ -210,9 +210,17 @@ class WorkExecutionStateTracker:
         agent: str,
         outcome: str,
         project_name: str,
-        error: Optional[str] = None
+        error: Optional[str] = None,
+        claude_session_id: Optional[str] = None
     ):
-        """Record the outcome of work execution"""
+        """Record the outcome of work execution.
+
+        claude_session_id: piggybacked onto the same write (not a separate
+        persistence mechanism) when outcome=='frozen' and the rejected call had
+        already established a Claude Code session — see docker_runner.py's
+        _rate_limit_signal capture. Used by the active-resume step to decide
+        whether a captured session is worth --resume-ing.
+        """
         state = self.load_state(project_name, issue_number)
 
         # Find the in_progress entry for this agent/column and update it.
@@ -230,6 +238,8 @@ class WorkExecutionStateTracker:
                     # Most recent in_progress: the real execution entry
                     if error:
                         execution['error'] = error
+                    if claude_session_id:
+                        execution['claude_session_id'] = claude_session_id
                     found_primary = True
                 else:
                     # Older in_progress entries are phantom probes (pre-enqueue).
@@ -283,6 +293,8 @@ class WorkExecutionStateTracker:
 
         if error:
             execution['error'] = error
+        if claude_session_id:
+            execution['claude_session_id'] = claude_session_id
 
         state['execution_history'].append(execution)
         self.save_state(project_name, issue_number, state)
@@ -369,8 +381,8 @@ class WorkExecutionStateTracker:
                 )
                 return True, "manual_rework_detected"
 
-        # Case 3: Previous execution failed, was blocked, cancelled, or abandoned
-        if last_execution['outcome'] in ['failure', 'blocked', 'cancelled', 'abandoned']:
+        # Case 3: Previous execution failed, was frozen, cancelled, or abandoned
+        if last_execution['outcome'] in ['failure', 'frozen', 'cancelled', 'abandoned']:
             logger.debug(
                 f"Should execute {agent} on {project_name}/#{issue_number}: "
                 f"retry_after_{last_execution['outcome']}"
@@ -440,6 +452,31 @@ class WorkExecutionStateTracker:
 
         return column_executions[-1] if column_executions else None
 
+    def get_resumable_frozen_session(
+        self,
+        project_name: str,
+        issue_number: int,
+        column: str,
+        agent: str
+    ) -> Optional[str]:
+        """
+        Return the captured Claude Code session_id from the most recent frozen
+        execution for this (project, issue, column, agent), if one exists.
+
+        Used by agent_executor.py's frozen-session resume fork to decide whether
+        to --resume a prior session (with a short continuation prompt) instead of
+        rebuilding the stage's normal prompt from scratch. Only returns a value
+        when the frozen execution actually captured one: agent_executor.py only
+        piggybacks claude_session_id onto the 'frozen' outcome write when the
+        rejected call had positive evidence of prior progress (see
+        ClaudeCodeRateLimitError.prior_progress in docker_runner.py) — a session
+        with zero prior turns has nothing to continue, so it's never stored.
+        """
+        last_execution = self.get_last_execution(project_name, issue_number, column, agent)
+        if not last_execution or last_execution.get('outcome') != 'frozen':
+            return None
+        return last_execution.get('claude_session_id')
+
     def set_halt_marker(
         self,
         project_name: str,
@@ -451,7 +488,7 @@ class WorkExecutionStateTracker:
     ):
         """Mark an issue as halted from auto-dispatch pending EXPLICIT human clearing.
 
-        Deliberately not an `outcome` value (see should_execute()'s 'blocked' handling,
+        Deliberately not an `outcome` value (see should_execute()'s 'frozen' handling,
         which means the opposite: auto-retry-eligible). Deliberately NOT auto-cleared by
         board activity: services/pipeline_progression.py's progress_issue() defaults
         trigger='manual' even on fully-automated calls, so status_changes/trigger fields
@@ -661,19 +698,29 @@ class WorkExecutionStateTracker:
         # No active work found
         return False
 
-    def is_blocked_by_circuit_breaker(
+    def is_frozen_by_circuit_breaker(
         self,
         project_name: str,
         issue_number: int
     ) -> bool:
         """
-        Check if the last execution was blocked by circuit breaker.
+        Check if the last execution was frozen by the Claude Code circuit breaker.
 
-        This allows the project monitor to detect when a previously blocked
+        This allows the project monitor to detect when a previously frozen
         execution can be retried (after circuit breaker closes).
 
+        The 'frozen' outcome value is itself the single, unambiguous marker for
+        this condition — it is written in exactly one place in the codebase
+        (agent_executor.py's is_claude_breaker_failure branch), unlike the old
+        'blocked' value it replaced. Deliberately does NOT also substring-match
+        the human-readable error text: that text varies by which of several
+        detection paths fired (e.g. the new structural detector's "Claude Code
+        rate limit confirmed (source=...)" never contains the literal phrase
+        "circuit breaker" that an older fallback message happened to use), so
+        matching on it would silently miss real frozen runs.
+
         Returns:
-            True if last execution was blocked by circuit breaker, False otherwise
+            True if last execution was frozen by circuit breaker, False otherwise
         """
         state = self.load_state(project_name, issue_number)
         history = state.get('execution_history', [])
@@ -683,21 +730,15 @@ class WorkExecutionStateTracker:
 
         # Check the most recent execution
         last_execution = history[-1]
-        outcome = last_execution.get('outcome')
-        error = last_execution.get('error', '')
+        is_frozen = last_execution.get('outcome') == 'frozen'
 
-        # Check if outcome is 'blocked' and error mentions circuit breaker
-        is_blocked = (
-            outcome == 'blocked' and
-            'circuit breaker' in error.lower()
-        )
-
-        if is_blocked:
+        if is_frozen:
             logger.debug(
-                f"Issue #{issue_number} was blocked by circuit breaker: {error}"
+                f"Issue #{issue_number} was frozen by circuit breaker: "
+                f"{last_execution.get('error', '')}"
             )
 
-        return is_blocked
+        return is_frozen
 
     def was_recent_programmatic_change(
         self,

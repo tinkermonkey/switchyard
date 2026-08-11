@@ -2241,26 +2241,26 @@ class ProjectMonitor:
                             already_handled = True
 
                     if not should_execute:
-                        # Check if this is a circuit breaker block that can now be retried
+                        # Check if this is a circuit breaker freeze that can now be retried
                         if reason == 'work_already_in_progress':
-                            is_blocked = work_execution_tracker.is_blocked_by_circuit_breaker(
+                            is_frozen = work_execution_tracker.is_frozen_by_circuit_breaker(
                                 project_name, issue_number
                             )
 
-                            if is_blocked:
+                            if is_frozen:
                                 # Check if circuit breaker is now closed
-                                from claude.circuit_breaker import claude_circuit_breaker
-                                if not claude_circuit_breaker.is_open():
+                                from monitoring.claude_code_breaker import get_breaker as get_claude_code_breaker
+                                if not get_claude_code_breaker().is_open():
                                     logger.info(
                                         f"Circuit breaker recovered for issue #{issue_number} - "
-                                        f"allowing retry of previously blocked work"
+                                        f"allowing retry of previously frozen work"
                                     )
                                     should_execute = True
                                     reason = "circuit_breaker_recovered"
                                     already_handled = False
                                 else:
                                     logger.debug(
-                                        f"Issue #{issue_number} still blocked by circuit breaker "
+                                        f"Issue #{issue_number} still frozen by circuit breaker "
                                         f"(breaker still open)"
                                     )
                                     already_handled = True
