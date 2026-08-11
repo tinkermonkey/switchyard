@@ -1324,38 +1324,23 @@ class DockerAgentRunner:
             # True only when the orchestrator itself issues the grace-period kill — NOT set
             # for external OOM kills or user-initiated kills (also exit_code=137).
             _orchestrator_killed = False
+            # Populated by read_stream() the moment ClaudeCodeBreaker.detect_from_event()
+            # finds a structural usage-limit signal (not text-matched — see that method's
+            # docstring). Checked after the container exits so a definitive rate-limit
+            # exception can be raised instead of falling through to the older, less
+            # reliable exit-code-1-with-no-stderr heuristic further below.
+            _rate_limit_signal = {}
 
             def read_stream(stream, is_stderr):
                 nonlocal session_id, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, tools_used_tracking
+                breaker = get_breaker()
                 for line in iter(stream.readline, ''):
                     if not line:
                         break
-                    
+
                     line = line.strip()
                     if not line:
                         continue
-
-                    # Check for token limits in both stdout and stderr
-                    breaker = get_breaker()
-                    if breaker:
-                        check_text = line
-                        # Claude Code stdout is structured JSON; extract the inner text content
-                        # before calling detect_session_limit(), which has a MAX_MESSAGE_LENGTH
-                        # guard that would silently skip the full JSON envelope (~500+ chars).
-                        if not is_stderr:
-                            try:
-                                parsed = json.loads(line)
-                                content = parsed.get('message', {}).get('content', [])
-                                for item in (content if isinstance(content, list) else []):
-                                    if isinstance(item, dict) and item.get('type') == 'text':
-                                        check_text = item.get('text', line)
-                                        break
-                            except (json.JSONDecodeError, AttributeError, TypeError):
-                                pass  # Fall back to raw line for non-JSON stdout or stderr
-                        is_limit, reset_time = breaker.detect_session_limit(check_text)
-                        if is_limit:
-                            breaker.trip(reset_time)
-                            logger.error(f"🔴 TRIPPED BREAKER: Token limit detected in output: {check_text}")
 
                     if not is_stderr:
                         stdout_parts.append(line + '\n')
@@ -1372,12 +1357,83 @@ class DockerAgentRunner:
                         else:
                             # Other stderr (warnings, info)
                             logger.info(f"Container stderr: {line}")
+
+                        # Secondary/backup text-match coverage for stderr specifically.
+                        # This is NOT the "blind regex as primary detection" anti-pattern
+                        # the structural stdout detection above replaced: stderr in this
+                        # architecture never carries agent-generated conversational
+                        # output (only our own entrypoint/wrapper debug lines and raw
+                        # CLI crash/error text before any JSON stream starts) — so an
+                        # agent writing code/docs that discuss rate limiting cannot land
+                        # here and cause a false trip the way it could on stdout. Exists
+                        # for the case where Claude Code writes a rate-limit message as
+                        # plain text to stderr instead of (or before) emitting the
+                        # structured stdout JSON stream — e.g. a startup failure prior
+                        # to any JSON output. detect_session_limit() already applies
+                        # MAX_MESSAGE_LENGTH + the (loosened) SESSION_LIMIT_PATTERN.
+                        if breaker and not _rate_limit_signal:
+                            is_limit, stderr_reset_time = breaker.detect_session_limit(line)
+                            if is_limit:
+                                breaker.trip(stderr_reset_time, rate_limit_type=None)
+                                _rate_limit_signal.update({
+                                    'reset_time': stderr_reset_time,
+                                    'rate_limit_type': None,
+                                    'session_id': session_id,
+                                    'source': 'stderr_text_match',
+                                })
+                                logger.error(
+                                    f"🔴 TRIPPED BREAKER: rate limit text matched in stderr: {line}"
+                                )
                         continue
 
                     # Parse stdout (Claude JSON events)
                     try:
                         event = json.loads(line)
                         event_type = event.get('type', 'unknown')
+
+                        # Structural usage-limit detection (primary signal, not text
+                        # matching) — see ClaudeCodeBreaker.detect_from_event() for why
+                        # this is safe against false positives from ordinary assistant
+                        # output discussing rate limits. Checked on every parsed event
+                        # so it naturally covers the standalone 'rate_limit_event' type
+                        # too, which the rest of this loop otherwise never touches.
+                        if breaker:
+                            signal = breaker.detect_from_event(event)
+                            if signal:
+                                reset_time, rate_limit_type = breaker.reset_time_from_signal(signal)
+                                breaker.trip(reset_time, rate_limit_type)
+
+                                # Enrichment only: pull a human-readable string from
+                                # whichever field this event type actually carries it in,
+                                # purely so detect_session_limit() can log a confirming
+                                # message. This is a secondary check on text already
+                                # gated by detect_from_event() above — never an
+                                # independent trigger, and specifically never applied to
+                                # a 'result' event's text without first confirming
+                                # is_error/terminal_reason, since that field holds the
+                                # agent's real (successful) output on non-error turns.
+                                human_text = None
+                                if event_type == 'result':
+                                    human_text = event.get('result')
+                                elif event_type == 'assistant':
+                                    content = event.get('message', {}).get('content', [])
+                                    for item in (content if isinstance(content, list) else []):
+                                        if isinstance(item, dict) and item.get('type') == 'text':
+                                            human_text = item.get('text')
+                                            break
+                                if human_text:
+                                    breaker.detect_session_limit(human_text)
+
+                                _rate_limit_signal.update({
+                                    'reset_time': reset_time,
+                                    'rate_limit_type': rate_limit_type,
+                                    'session_id': event.get('session_id') or session_id,
+                                    'source': signal['source'],
+                                })
+                                logger.error(
+                                    f"🔴 TRIPPED BREAKER: structural usage-limit signal "
+                                    f"(source={signal['source']}, rate_limit_type={rate_limit_type})"
+                                )
 
                         if 'session_id' in event and not session_id:
                             session_id = event['session_id']
@@ -1796,6 +1852,23 @@ class DockerAgentRunner:
                         exit_code=exit_code,
                         output=stderr_text
                     )
+
+                # Definitive structural detection already tripped the breaker live in
+                # read_stream() above (see ClaudeCodeBreaker.detect_from_event()). If it
+                # fired for this run, raise immediately with the captured session/reset
+                # info instead of falling through to the older exit-code-1 heuristic
+                # below, which exists only as a defensive net for cases this misses.
+                if _rate_limit_signal:
+                    rate_limit_err = ClaudeCodeRateLimitError(
+                        f"Claude Code rate limit confirmed (source={_rate_limit_signal.get('source')}, "
+                        f"rate_limit_type={_rate_limit_signal.get('rate_limit_type')}). "
+                        f"Resets at {_rate_limit_signal['reset_time'].strftime('%I:%M %p')}."
+                    )
+                    rate_limit_err.claude_session_id = _rate_limit_signal.get('session_id')
+                    rate_limit_err.reset_time = _rate_limit_signal.get('reset_time')
+                    rate_limit_err.rate_limit_type = _rate_limit_signal.get('rate_limit_type')
+                    rate_limit_err.prior_progress = bool(input_tokens or output_tokens)
+                    raise rate_limit_err
 
                 # Check if this might be a rate limit error
                 # Claude Code exits with code 1 when rate limited, but the "Limit reached" message

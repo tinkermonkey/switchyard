@@ -34,35 +34,45 @@ class DevEnvironmentVerifierAgent(PipelineStage):
             logger.error("No previous_stage_output found. Task context: %s", json.dumps(task_context, indent=2)[:500])
             raise Exception("Dev Environment Verifier needs previous stage output from dev_environment_setup agent")
 
-        review_cycle_raw = task_context.get("review_cycle", {})
-        review_cycle = None
-        if review_cycle_raw:
-            review_cycle = ReviewCycleContext(
-                iteration=review_cycle_raw.get("iteration", 0),
-                max_iterations=review_cycle_raw.get("max_iterations", 3),
-                is_rereviewing=review_cycle_raw.get("is_rereviewing", False),
-                previous_review_feedback=review_cycle_raw.get("previous_review_feedback") or "",
+        direct_prompt = task_context.get("direct_prompt")
+
+        if direct_prompt:
+            # Frozen-session resume (see agent_executor.py's
+            # _apply_frozen_session_resume): skip rebuilding the full verifier
+            # prompt from scratch and use the short continuation prompt
+            # instead — Claude's --resume'd session already has the original
+            # verification task in its history.
+            prompt = direct_prompt
+        else:
+            review_cycle_raw = task_context.get("review_cycle", {})
+            review_cycle = None
+            if review_cycle_raw:
+                review_cycle = ReviewCycleContext(
+                    iteration=review_cycle_raw.get("iteration", 0),
+                    max_iterations=review_cycle_raw.get("max_iterations", 3),
+                    is_rereviewing=review_cycle_raw.get("is_rereviewing", False),
+                    previous_review_feedback=review_cycle_raw.get("previous_review_feedback") or "",
+                )
+
+            ctx = PromptContext(
+                mode="initial",
+                agent_name="dev_environment_verifier",
+                agent_display_name="Dev Environment Verifier",
+                agent_role_description="",
+                output_sections=[],
+                project=project_name,
+                project_name=project_name,
+                issue=IssueContext(
+                    title=issue_raw.get("title", "No title"),
+                    body=issue_raw.get("body", "No description"),
+                ),
+                previous_stage=previous_stage,
+                review_cycle=review_cycle,
             )
 
-        ctx = PromptContext(
-            mode="initial",
-            agent_name="dev_environment_verifier",
-            agent_display_name="Dev Environment Verifier",
-            agent_role_description="",
-            output_sections=[],
-            project=project_name,
-            project_name=project_name,
-            issue=IssueContext(
-                title=issue_raw.get("title", "No title"),
-                body=issue_raw.get("body", "No description"),
-            ),
-            previous_stage=previous_stage,
-            review_cycle=review_cycle,
-        )
-
-        # Expand {project_name} placeholders in the verification task content
-        # by temporarily patching the loader result via build_verifier_prompt
-        prompt = self._prompt_builder.build_verifier_prompt(ctx)
+            # Expand {project_name} placeholders in the verification task content
+            # by temporarily patching the loader result via build_verifier_prompt
+            prompt = self._prompt_builder.build_verifier_prompt(ctx)
 
         result = await run_claude_code(prompt, context)
 

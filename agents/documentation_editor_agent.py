@@ -28,44 +28,54 @@ class DocumentationEditorAgent(PipelineStage):
         if not previous_stage:
             raise Exception("Documentation Editor needs previous stage output from Technical Writer")
 
-        issue_raw = task_context.get("issue", {})
-        review_cycle_raw = task_context.get("review_cycle", {})
+        direct_prompt = task_context.get("direct_prompt")
 
-        review_cycle = None
-        if review_cycle_raw:
-            review_cycle = ReviewCycleContext(
-                iteration=review_cycle_raw.get("iteration", 0),
-                max_iterations=review_cycle_raw.get("max_iterations", 3),
-                maker_agent=review_cycle_raw.get("maker_agent", ""),
-                reviewer_agent=review_cycle_raw.get("reviewer_agent", ""),
-                is_rereviewing=review_cycle_raw.get("is_rereviewing", False),
-                post_human_feedback=review_cycle_raw.get("post_human_feedback", False),
-                previous_review_feedback=review_cycle_raw.get("previous_review_feedback") or "",
-                context_dir=task_context.get("pipeline_context_dir"),
+        if direct_prompt:
+            # Frozen-session resume (see agent_executor.py's
+            # _apply_frozen_session_resume): skip rebuilding the full reviewer
+            # prompt from scratch and use the short continuation prompt
+            # instead — Claude's --resume'd session already has the original
+            # review task in its history.
+            prompt = direct_prompt
+        else:
+            issue_raw = task_context.get("issue", {})
+            review_cycle_raw = task_context.get("review_cycle", {})
+
+            review_cycle = None
+            if review_cycle_raw:
+                review_cycle = ReviewCycleContext(
+                    iteration=review_cycle_raw.get("iteration", 0),
+                    max_iterations=review_cycle_raw.get("max_iterations", 3),
+                    maker_agent=review_cycle_raw.get("maker_agent", ""),
+                    reviewer_agent=review_cycle_raw.get("reviewer_agent", ""),
+                    is_rereviewing=review_cycle_raw.get("is_rereviewing", False),
+                    post_human_feedback=review_cycle_raw.get("post_human_feedback", False),
+                    previous_review_feedback=review_cycle_raw.get("previous_review_feedback") or "",
+                    context_dir=task_context.get("pipeline_context_dir"),
+                )
+
+            ctx = PromptContext(
+                mode="initial",
+                agent_name="documentation_editor",
+                agent_display_name="Senior Documentation Editor",
+                agent_role_description="",
+                output_sections=[],
+                project=task_context.get("project", ""),
+                issue=IssueContext(
+                    title=issue_raw.get("title", "No title"),
+                    body=issue_raw.get("body", "No description"),
+                ),
+                # Embed the documentation to review directly in the context section
+                previous_stage=previous_stage,
+                pipeline_context_dir=task_context.get("pipeline_context_dir"),
+                review_cycle=review_cycle,
             )
 
-        ctx = PromptContext(
-            mode="initial",
-            agent_name="documentation_editor",
-            agent_display_name="Senior Documentation Editor",
-            agent_role_description="",
-            output_sections=[],
-            project=task_context.get("project", ""),
-            issue=IssueContext(
-                title=issue_raw.get("title", "No title"),
-                body=issue_raw.get("body", "No description"),
-            ),
-            # Embed the documentation to review directly in the context section
-            previous_stage=previous_stage,
-            pipeline_context_dir=task_context.get("pipeline_context_dir"),
-            review_cycle=review_cycle,
-        )
-
-        prompt = self._prompt_builder.build_reviewer_prompt(
-            ctx,
-            reviewer_title="Senior Documentation Editor",
-            review_domain="documentation",
-        )
+            prompt = self._prompt_builder.build_reviewer_prompt(
+                ctx,
+                reviewer_title="Senior Documentation Editor",
+                review_domain="documentation",
+            )
 
         try:
             enhanced_context = context.copy()

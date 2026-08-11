@@ -177,6 +177,41 @@ class ScheduledTasksService:
         self.running = False
         logger.info("Scheduled tasks service stopped")
 
+    def schedule_claude_breaker_resume_check(self, reset_time: datetime):
+        """
+        Schedule a one-off check shortly after the Claude Code breaker's reset_time
+        so recovery doesn't have to wait for the next pipeline_watchdog sweep
+        (every 30 minutes — see _cleanup_zombie_pipeline_runs). This is purely a
+        latency optimization: if this job is lost (e.g. orchestrator restart, since
+        the scheduler has no persistent jobstore), the watchdog's own periodic
+        check_for_zombie_runs() pass remains the durable fallback that will
+        eventually notice the breaker closed and actively resume frozen runs.
+
+        A later trip() with a new (possibly extended) reset_time reschedules this
+        job via replace_existing=True rather than stacking duplicate jobs.
+        """
+        self.scheduler.add_job(
+            self._check_claude_breaker_resume,
+            trigger=DateTrigger(run_date=reset_time + timedelta(seconds=5)),
+            id='claude_breaker_resume_check',
+            name='Nudge Claude Code breaker check after rate limit reset',
+            replace_existing=True,
+        )
+
+    async def _check_claude_breaker_resume(self):
+        """Nudge the breaker to re-evaluate state; also proactively resumes any
+        pipeline_runs pipeline_watchdog had frozen while the breaker was open."""
+        try:
+            from monitoring.claude_code_breaker import get_breaker
+            get_breaker().check_and_close()
+        except Exception as e:
+            logger.warning(f"Error in scheduled Claude Code breaker resume check: {e}")
+
+        try:
+            await self._cleanup_zombie_pipeline_runs()
+        except Exception as e:
+            logger.warning(f"Error running zombie sweep from breaker resume check: {e}")
+
     async def _cleanup_orphaned_branches(self):
         """Cleanup orphaned branches for all projects"""
         logger.info("Starting scheduled cleanup of orphaned branches")

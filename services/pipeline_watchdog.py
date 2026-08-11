@@ -83,6 +83,31 @@ class PipelineWatchdog:
                 'details': List[Dict]
             }
         """
+        # Coarse global freeze: while the Claude Code usage-limit breaker is open,
+        # skip this entire pass untouched — every active pipeline_run stays exactly
+        # as it is (lock held, cycle_state undisturbed), rather than being reaped
+        # and restarted from scratch for a known, account-wide, timed pause. This
+        # mirrors the same is_open() gate project_monitor.py's main poll loop
+        # already uses to skip new dispatch. See detect_from_event()/trip() in
+        # monitoring/claude_code_breaker.py for how/when this trips.
+        try:
+            from monitoring.claude_code_breaker import get_breaker
+            if get_breaker().is_open():
+                logger.info(
+                    "Claude Code breaker is OPEN — skipping zombie run check entirely "
+                    "this pass (every active run stays frozen, untouched, until it closes)"
+                )
+                return {
+                    'checked': 0,
+                    'zombies_found': 0,
+                    'zombies_cleaned': 0,
+                    'errors': 0,
+                    'details': [],
+                    'frozen_skip': True,
+                }
+        except Exception as e:
+            logger.warning(f"Could not check Claude Code breaker state, proceeding with zombie check: {e}")
+
         if not self.es:
             logger.warning("Elasticsearch not available, skipping zombie check")
             return {
@@ -142,10 +167,27 @@ class PipelineWatchdog:
                     logger.warning(f"Could not parse started_at for run {pipeline_run_id}: {e}")
                     continue
 
-                # Check if run is old enough to be considered zombie
-                if started_at > threshold:
-                    # Run is still young, skip
-                    continue
+                # A run whose most recent execution outcome is 'frozen' was specifically
+                # paused by the Claude Code breaker (see agent_executor.py's frozen-
+                # outcome recording). This is a precise, per-run signal, distinct from
+                # the coarse is_open() gate above (which only prevents checking at all
+                # while still open) — it identifies, on a normal pass after the breaker
+                # has closed, which SPECIFIC runs are zombie-shaped because of a
+                # resolved freeze rather than genuine staleness. Bypasses the age gate
+                # below entirely: a known-reason pause with a known end time shouldn't
+                # have to wait out zombie_threshold_minutes to be noticed.
+                try:
+                    from services.work_execution_state import work_execution_tracker
+                    was_frozen = work_execution_tracker.is_frozen_by_circuit_breaker(project, issue_number)
+                except Exception as e:
+                    logger.warning(f"Could not check frozen state for issue #{issue_number}: {e}")
+                    was_frozen = False
+
+                if not was_frozen:
+                    # Check if run is old enough to be considered zombie
+                    if started_at > threshold:
+                        # Run is still young, skip
+                        continue
 
                 # Check if there's an agent container running for this issue
                 has_container = self._check_for_agent_container(project, issue_number)
@@ -156,6 +198,50 @@ class PipelineWatchdog:
                         f"Pipeline run {pipeline_run_id[:8]}... for {project} issue #{issue_number} "
                         f"has active container, keeping active"
                     )
+                    continue
+
+                if was_frozen:
+                    # Uniform clean-restart across every pipeline type (review_cycle,
+                    # human_feedback_loop, pr_review_stage alike) — takes priority over
+                    # the feedback-loop/review-cycle exemptions below, since those exist
+                    # to protect genuinely still-active work, not a resolved freeze.
+                    results['zombies_found'] += 1
+                    age_minutes = (datetime.now(timezone.utc) - started_at).total_seconds() / 60
+                    logger.warning(
+                        f"Pipeline run {pipeline_run_id[:8]}... for {project} issue #{issue_number} "
+                        f"was frozen by the Claude Code breaker (now closed, no container, "
+                        f"age: {age_minutes:.1f} minutes) — actively resuming"
+                    )
+                    try:
+                        self._actively_resume_run(
+                            pipeline_run_id=pipeline_run_id,
+                            project=project,
+                            board=board,
+                            issue_number=issue_number,
+                            started_at=started_at_str,
+                        )
+                        results['zombies_cleaned'] += 1
+                        results['details'].append({
+                            'pipeline_run_id': pipeline_run_id,
+                            'project': project,
+                            'issue_number': issue_number,
+                            'age_minutes': age_minutes,
+                            'action': 'actively_resumed',
+                        })
+                    except Exception as resume_error:
+                        results['errors'] += 1
+                        logger.error(
+                            f"Failed to actively resume frozen run {pipeline_run_id}: {resume_error}",
+                            exc_info=True
+                        )
+                        results['details'].append({
+                            'pipeline_run_id': pipeline_run_id,
+                            'project': project,
+                            'issue_number': issue_number,
+                            'age_minutes': age_minutes,
+                            'action': 'resume_failed',
+                            'error': str(resume_error),
+                        })
                     continue
 
                 # NOTE: We intentionally do NOT skip cleanup just because the lock is held.
@@ -406,6 +492,95 @@ class PipelineWatchdog:
             )
         except Exception as e:
             logger.debug(f"Could not log cleanup event to observability: {e}")
+
+    def _actively_resume_run(
+        self,
+        pipeline_run_id: str,
+        project: str,
+        board: str,
+        issue_number: int,
+        started_at: str,
+    ):
+        """
+        Promptly resume a pipeline_run that was frozen by the Claude Code breaker
+        and is now eligible to continue (breaker closed, no container running).
+
+        Uniform clean-restart across every pipeline type (review_cycle,
+        human_feedback_loop, pr_review_stage alike): end this pipeline_run and
+        release its lock so normal dispatch picks the issue back up fresh — the
+        same mechanism _cleanup_zombie_run uses for a genuine zombie's auto-retry,
+        EXCEPT this is deliberately NOT counted against ZOMBIE_AUTO_RETRY_LIMIT (a
+        known-reason pause is not evidence the work itself is broken) and does not
+        wait for the zombie_threshold_minutes age gate (see the was_frozen check in
+        check_for_zombie_runs()).
+
+        If the frozen execution captured a Claude Code session_id with evidence of
+        prior progress, agent_executor.execute_agent() picks it up automatically on
+        the very next dispatch for this (project, issue, column, agent) and resumes
+        that session with a short continuation prompt instead of rebuilding the
+        stage's normal prompt from scratch — see the frozen-session resume fork in
+        agent_executor.py. This method doesn't need to know about that; it always
+        performs the same "release the lock" action regardless.
+        """
+        logger.info(
+            f"Actively resuming pipeline run {pipeline_run_id[:8]}... for {project} "
+            f"issue #{issue_number} (frozen by Claude Code breaker, now closed)"
+        )
+
+        if self.pipeline_run_manager:
+            ended = self.pipeline_run_manager.end_pipeline_run(
+                project=project,
+                issue_number=issue_number,
+                reason=f"Actively resumed after Claude Code breaker closed (started: {started_at})",
+                outcome="failed",
+                retain_lock=False,
+            )
+            if ended:
+                logger.info(f"Ended frozen pipeline run {pipeline_run_id[:8]}... for prompt resume")
+            else:
+                logger.warning(f"Failed to end frozen pipeline run {pipeline_run_id[:8]}...")
+
+        # Remove any stale review cycle in-memory state so the fresh dispatch isn't
+        # mistaken for "still in progress" by review_cycle's own tracker — mirrors
+        # _cleanup_zombie_run's equivalent step, kept for the same uniform-restart
+        # reason (this is a clean restart, not a continuation of that cycle_state).
+        try:
+            from services.review_cycle import review_cycle_executor
+            ck = review_cycle_executor._cycle_key(project, issue_number)
+            cycle_state = review_cycle_executor.active_cycles.get(ck)
+            if cycle_state is None:
+                all_cycles = review_cycle_executor._load_active_cycles(project)
+                cycle_state = next((c for c in all_cycles if c.issue_number == issue_number), None)
+            if cycle_state:
+                review_cycle_executor._remove_cycle_state(cycle_state)
+                if ck in review_cycle_executor.active_cycles:
+                    del review_cycle_executor.active_cycles[ck]
+                logger.info(
+                    f"Removed stale review cycle state for {project} issue #{issue_number} "
+                    f"during active resume"
+                )
+        except Exception as e:
+            logger.warning(
+                f"Failed to clean up review cycle state during active resume for "
+                f"{project} issue #{issue_number}: {e}"
+            )
+
+        try:
+            from monitoring.observability_server import observability_server
+
+            observability_server.index_decision_event(
+                decision_type="frozen_pipeline_run_resumed",
+                project=project,
+                board=board,
+                issue_number=issue_number,
+                reason="Claude Code breaker closed — resumed promptly, not counted against zombie auto-retry limit",
+                details={
+                    "pipeline_run_id": pipeline_run_id,
+                    "started_at": started_at,
+                }
+            )
+        except Exception as e:
+            logger.debug(f"Could not log active-resume event to observability: {e}")
 
     def _increment_zombie_retry_count(self, project: str, issue_number: int) -> int:
         """

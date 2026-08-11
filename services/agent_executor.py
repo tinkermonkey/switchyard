@@ -158,6 +158,8 @@ class AgentExecutor:
             task_context=task_context
         )
 
+        self._apply_frozen_session_resume(execution_context, task_context, project_name, agent_name)
+
         # Create agent instance
         agent_stage = self.factory.create_agent(agent_name, project_name)
 
@@ -756,7 +758,7 @@ class AgentExecutor:
                     if execution.get('outcome') == 'in_progress':
                         # Found our current execution — it hasn't been recorded yet
                         break
-                    if execution.get('outcome') in ['success', 'failure', 'cancelled', 'blocked']:
+                    if execution.get('outcome') in ['success', 'failure', 'cancelled', 'frozen']:
                         # Terminal outcome already recorded for this execution
                         already_recorded = True
                         logger.debug(
@@ -818,13 +820,20 @@ class AgentExecutor:
 
             if is_claude_breaker_failure:
                 # This is a systemic issue (token limits), not an agent failure
-                # Don't emit agent_failed - emit a paused/blocked event instead
+                # Don't emit agent_failed - emit a paused/frozen event instead
                 logger.warning(
-                    f"Agent {agent_name} blocked by Claude Code circuit breaker after {duration_ms:.0f}ms. "
+                    f"Agent {agent_name} frozen by Claude Code circuit breaker after {duration_ms:.0f}ms. "
                     f"Not counting as agent failure. Pipeline will resume when tokens reset."
                 )
 
-                # Record execution outcome as 'blocked' to enable automatic recovery
+                # Piggyback the captured Claude Code session_id (if any) onto this same
+                # write — see docker_runner.py's _rate_limit_signal capture and
+                # ClaudeCodeRateLimitError.claude_session_id. Only meaningful if the
+                # rejected call had already made real progress (prior_progress=True);
+                # the active-resume step decides whether to actually use it.
+                claude_session_id = getattr(e, 'claude_session_id', None) if getattr(e, 'prior_progress', False) else None
+
+                # Record execution outcome as 'frozen' to enable automatic recovery
                 # Bug fix: Previously left in 'in_progress' which caused stuck issues
                 if 'issue_number' in task_context:
                     from services.work_execution_state import work_execution_tracker
@@ -834,17 +843,19 @@ class AgentExecutor:
                         issue_number=task_context['issue_number'],
                         column=column,
                         agent=agent_name,
-                        outcome='blocked',
+                        outcome='frozen',
                         project_name=project_name,
-                        error=error_message
+                        error=error_message,
+                        claude_session_id=claude_session_id
                     )
                     logger.info(
-                        f"Recorded 'blocked' outcome for issue #{task_context['issue_number']} "
+                        f"Recorded 'frozen' outcome for issue #{task_context['issue_number']} "
                         f"to enable automatic retry when circuit breaker closes"
+                        + (f" (captured resumable session {claude_session_id})" if claude_session_id else "")
                     )
                 else:
                     logger.warning(
-                        f"Cannot record blocked outcome for {agent_name}: missing issue_number in task_context"
+                        f"Cannot record frozen outcome for {agent_name}: missing issue_number in task_context"
                     )
             else:
                 # Normal agent failure - emit event and record outcome
@@ -879,7 +890,7 @@ class AgentExecutor:
                             continue
                         if execution.get('outcome') == 'in_progress':
                             break
-                        if execution.get('outcome') in ['success', 'failure', 'cancelled', 'blocked']:
+                        if execution.get('outcome') in ['success', 'failure', 'cancelled', 'frozen']:
                             already_recorded = True
                             logger.debug(
                                 f"Execution outcome already recorded by docker_runner for "
@@ -922,6 +933,54 @@ class AgentExecutor:
                         logger.error(f"Failed to reset dev container state for {project_name}: {state_err}")
 
             raise
+
+    def _apply_frozen_session_resume(
+        self,
+        execution_context: Dict[str, Any],
+        task_context: Dict[str, Any],
+        project_name: str,
+        agent_name: str
+    ):
+        """
+        Frozen-session resume fork: if the immediately-preceding execution for
+        this exact (project, issue, column, agent) was frozen by the Claude Code
+        breaker and captured a session_id with evidence of prior progress,
+        resume that session with a short continuation prompt instead of
+        rebuilding the stage's normal prompt from scratch. The common case —
+        first-turn rejections with nothing accumulated — has no captured
+        session_id and this is a no-op. Respects a caller-supplied direct_prompt
+        (e.g. pr_review_stage's Phase 2 verification calls) by never overriding
+        it. claude_session_id must be set on execution_context itself (not just
+        task_context) — that's the top-level dict docker_runner.py's --resume
+        wiring actually reads.
+
+        Mutates execution_context and task_context in place.
+        """
+        if 'issue_number' not in task_context or task_context.get('direct_prompt'):
+            return
+
+        try:
+            from services.work_execution_state import work_execution_tracker
+            resumable_session_id = work_execution_tracker.get_resumable_frozen_session(
+                project_name,
+                task_context['issue_number'],
+                task_context.get('column', 'unknown'),
+                agent_name
+            )
+            if resumable_session_id:
+                execution_context['claude_session_id'] = resumable_session_id
+                task_context['direct_prompt'] = (
+                    "Please continue exactly where you left off. Your previous turn "
+                    "was interrupted by a Claude Code usage limit before it could "
+                    "finish — pick up the task from where you stopped."
+                )
+                logger.info(
+                    f"Resuming Claude Code session {resumable_session_id} for "
+                    f"{agent_name} on {project_name}/#{task_context['issue_number']} "
+                    f"(captured from a frozen execution with prior progress)"
+                )
+        except Exception as e:
+            logger.warning(f"Could not check for a resumable frozen session: {e}")
 
     def _build_execution_context(
         self,
