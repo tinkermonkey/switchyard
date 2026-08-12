@@ -105,3 +105,89 @@ class TestCleanupZombieRunRetryBudget:
 
         notify.assert_not_called()
         assert watchdog.pipeline_run_manager.end_pipeline_run.call_count == ZOMBIE_AUTO_RETRY_LIMIT * 2
+
+
+class TestCleanupZombieRunBrokenWorkspace:
+    """
+    Regression coverage for the 2026-08-11 documentation_robotics incident:
+    a shared workspace stuck mid-merge (unresolved conflict) caused issues
+    #790-#796 to each sail through with a fresh, independent per-issue retry
+    budget (see test_different_issues_have_independent_budgets above — that
+    behavior is correct for genuinely independent stalls) and get
+    auto-released straight back into the same broken checkout, one after
+    another, all day. A workspace-level git check must override the
+    per-issue budget so this can't happen again, on the very first attempt.
+    """
+
+    def test_retains_lock_on_first_attempt_when_workspace_has_conflicts(self, watchdog):
+        with patch.object(watchdog, "_notify_lock_stuck") as notify, \
+             patch.object(watchdog, "_is_workspace_git_broken", return_value=True):
+            watchdog._cleanup_zombie_run(
+                pipeline_run_id="run-1",
+                project="documentation_robotics",
+                board="SDLC Execution",
+                issue_number=793,
+                started_at="2026-08-11T15:26:40Z",
+            )
+
+        call = watchdog.pipeline_run_manager.end_pipeline_run.call_args
+        assert call.kwargs["retain_lock"] is True
+        notify.assert_called_once()
+
+    def test_does_not_consume_retry_budget_illusion_for_next_issue(self, watchdog):
+        # Even though each issue number gets its own retry counter (by design,
+        # for independent stalls), a broken workspace must retain the lock
+        # for every issue that hits it -- not just the first.
+        with patch.object(watchdog, "_notify_lock_stuck"), \
+             patch.object(watchdog, "_is_workspace_git_broken", return_value=True):
+            for issue in (790, 791, 792, 793):
+                watchdog._cleanup_zombie_run(
+                    pipeline_run_id="run-1",
+                    project="documentation_robotics",
+                    board="SDLC Execution",
+                    issue_number=issue,
+                    started_at="2026-08-11T15:26:40Z",
+                )
+
+        for call in watchdog.pipeline_run_manager.end_pipeline_run.call_args_list:
+            assert call.kwargs["retain_lock"] is True
+
+    def test_healthy_workspace_still_uses_normal_retry_budget(self, watchdog):
+        # Sanity check: the new check must not change behavior for a clean
+        # workspace -- normal transient-stall auto-retry still applies.
+        with patch.object(watchdog, "_notify_lock_stuck") as notify, \
+             patch.object(watchdog, "_is_workspace_git_broken", return_value=False):
+            watchdog._cleanup_zombie_run(
+                pipeline_run_id="run-1",
+                project="proj",
+                board="SDLC Execution",
+                issue_number=42,
+                started_at="2026-08-10T10:07:24Z",
+            )
+
+        call = watchdog.pipeline_run_manager.end_pipeline_run.call_args
+        assert call.kwargs["retain_lock"] is False
+        notify.assert_not_called()
+
+
+class TestIsWorkspaceGitBroken:
+    def test_true_when_unmerged_paths_present(self, watchdog):
+        completed = Mock(returncode=0, stdout=".mcp.json\n")
+        with patch("services.pipeline_watchdog.subprocess.run", return_value=completed) as run:
+            assert watchdog._is_workspace_git_broken("documentation_robotics") is True
+        run.assert_called_once()
+        assert run.call_args.kwargs["cwd"] == "/workspace/documentation_robotics"
+
+    def test_false_when_clean(self, watchdog):
+        completed = Mock(returncode=0, stdout="")
+        with patch("services.pipeline_watchdog.subprocess.run", return_value=completed):
+            assert watchdog._is_workspace_git_broken("proj") is False
+
+    def test_false_when_not_a_git_repo(self, watchdog):
+        completed = Mock(returncode=128, stdout="")
+        with patch("services.pipeline_watchdog.subprocess.run", return_value=completed):
+            assert watchdog._is_workspace_git_broken("proj") is False
+
+    def test_fails_open_on_exception(self, watchdog):
+        with patch("services.pipeline_watchdog.subprocess.run", side_effect=OSError("boom")):
+            assert watchdog._is_workspace_git_broken("proj") is False

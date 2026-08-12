@@ -392,6 +392,38 @@ class PipelineWatchdog:
             # Fail safe: assume container exists to avoid false positives
             return True
 
+    def _is_workspace_git_broken(self, project: str) -> bool:
+        """
+        Check whether the project's shared workspace is stuck in an unresolved
+        git conflict (unmerged/conflicted paths) right now — the kind of state
+        that no amount of retrying can fix on its own; it needs a human to
+        resolve the conflict or hard-reset the checkout. Used to stop the
+        zombie watchdog's auto-retry from releasing the lock into a workspace
+        that will fail identically for the next issue that picks it up too.
+
+        Mirrors GitWorkflowManager.get_conflicting_files(), duplicated here
+        (rather than imported) to keep this a plain, synchronous, best-effort
+        check — it must never block or fail the zombie sweep itself.
+        """
+        project_dir = f"/workspace/{project}"
+        try:
+            result = subprocess.run(
+                ['git', 'diff', '--name-only', '--diff-filter=U'],
+                cwd=project_dir,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if result.returncode != 0:
+                # Not a git repo, missing directory, etc. — not a conflict signal,
+                # and not this check's job to diagnose.
+                return False
+            return bool(result.stdout.strip())
+        except Exception as e:
+            logger.warning(f"Could not check workspace git state for {project}: {e}")
+            # Fail open — an inconclusive check shouldn't itself block auto-retry.
+            return False
+
     def _cleanup_zombie_run(
         self,
         pipeline_run_id: str,
@@ -415,6 +447,16 @@ class PipelineWatchdog:
             f"for {project} issue #{issue_number}"
         )
 
+        # Defense-in-depth: never auto-retry into a workspace that is provably
+        # broken on disk right now. A stall caused by an unresolved git conflict
+        # (unmerged paths, a stash that can't be written) will fail identically
+        # for every other issue that touches this project's shared checkout — it
+        # is not the kind of transient blip the auto-retry budget below exists
+        # for. Check the actual git state directly rather than trusting retry
+        # history, since a first-time occurrence would otherwise sail through
+        # with retry_count=1 and release the lock straight into the same failure.
+        workspace_broken = self._is_workspace_git_broken(project)
+
         # Track how many times this (project, issue) has zombie-cleaned up recently.
         # The first ZOMBIE_AUTO_RETRY_LIMIT times, release the lock so the issue is
         # picked back up automatically (via ProjectMonitor's stalled-issue failsafe)
@@ -425,9 +467,17 @@ class PipelineWatchdog:
         # forever with no chance of self-healing.
         retry_count = self._increment_zombie_retry_count(project, issue_number)
         exceeded_auto_retry = retry_count > ZOMBIE_AUTO_RETRY_LIMIT
-        retain_lock = True if exceeded_auto_retry else False
+        retain_lock = True if (exceeded_auto_retry or workspace_broken) else False
 
-        if exceeded_auto_retry:
+        if workspace_broken:
+            logger.error(
+                f"Project {project}'s shared workspace has unresolved git conflicts "
+                f"(unmerged paths) — retaining lock for issue #{issue_number} "
+                f"regardless of retry count ({retry_count}/{ZOMBIE_AUTO_RETRY_LIMIT}). "
+                f"Auto-retry would just repeat this exact failure for every other "
+                f"issue on this board; the workspace needs manual git repair."
+            )
+        elif exceeded_auto_retry:
             logger.warning(
                 f"Issue #{issue_number} in {project} has zombie-cleaned up "
                 f"{retry_count} times within {ZOMBIE_RETRY_COUNT_TTL_SECONDS // 3600}h "
@@ -454,7 +504,7 @@ class PipelineWatchdog:
             else:
                 logger.warning(f"Failed to end zombie pipeline run {pipeline_run_id[:8]}...")
 
-        if exceeded_auto_retry:
+        if exceeded_auto_retry or workspace_broken:
             self._notify_lock_stuck(project, board, issue_number, pipeline_run_id, retry_count)
 
         # Remove any stale review cycle state so it doesn't block future runs
