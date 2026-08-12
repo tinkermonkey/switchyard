@@ -67,6 +67,36 @@ def _build_branch_error_comment(e) -> str:
         )
 
 
+def _build_workspace_prep_error_comment(e) -> str:
+    """
+    Build a GitHub comment body for the catch-all git-based workspace preparation
+    failure (workspace_preparation_git_failure) — e.g. a stash that can't be
+    written because the shared workspace already has unresolved/unmerged paths.
+
+    Unlike StaleBranchError/BranchPullFailedError, this failure doesn't carry
+    structured detail about which files or branch are involved, so the comment
+    points at the shared checkout in general rather than a specific remediation
+    command.
+    """
+    return (
+        f"## Workspace Preparation Failed\n\n"
+        f"Git workspace preparation failed and the agent was halted before making "
+        f"any changes, to avoid committing to the wrong branch:\n\n"
+        f"```\n{str(e)[:1500]}\n```\n\n"
+        f"This usually means the project's shared git checkout is stuck in an "
+        f"unresolved state (e.g. an incomplete merge or conflicted files) — "
+        f"retrying will fail identically, including for any other issue that "
+        f"touches this workspace.\n\n"
+        f"**To diagnose and repair:**\n"
+        f"1. `docker-compose exec orchestrator bash -c \"cd /workspace/<project> && git status\"`\n"
+        f"2. Resolve or abort any unresolved merge (`git merge --abort`) and/or "
+        f"discard local state (`git reset --hard origin/<branch>`)\n"
+        f"3. Move this issue back to **Development** to retry once the workspace is clean\n\n"
+        f"_Pipeline lock retained — no new work will start on this project's board "
+        f"until this is resolved._"
+    )
+
+
 class AgentExecutor:
     """
     Centralized service for executing agents with guaranteed observability.
@@ -341,14 +371,18 @@ class AgentExecutor:
                 # For non-git workspaces (discussions), we can continue with a warning
                 if workspace_context is not None and hasattr(workspace_context, 'supports_git_operations'):
                     if workspace_context.supports_git_operations:
+                        issue_number = task_context.get('issue_number')
                         logger.error(
                             f"Failed to prepare git-based workspace: {e}. "
-                            f"Halting execution to prevent commits to wrong branch.",
+                            f"Halting execution and retaining the pipeline lock — this is "
+                            f"treated as a broken shared workspace, not a transient agent "
+                            f"failure, because it will fail identically for every other "
+                            f"issue that touches this project's checkout until repaired.",
                             exc_info=True
                         )
 
                         # Emit error event if this is part of a review cycle
-                        if pipeline_run_id and 'issue_number' in task_context:
+                        if pipeline_run_id and issue_number:
                             try:
                                 from monitoring.decision_events import DecisionEventEmitter
                                 decision_emitter = DecisionEventEmitter(self.obs)
@@ -359,11 +393,11 @@ class AgentExecutor:
                                     context={
                                         'agent': agent_name,
                                         'project': project_name,
-                                        'issue_number': task_context.get('issue_number'),
+                                        'issue_number': issue_number,
                                         'branch_name': task_context.get('branch_name'),
                                         'workspace_type': task_context.get('workspace_type', 'issues')
                                     },
-                                    recovery_action="Agent execution halted to prevent commits to wrong branch",
+                                    recovery_action="Agent execution halted; pipeline lock retained pending manual git repair",
                                     success=False,
                                     project=project_name,
                                     pipeline_run_id=pipeline_run_id
@@ -371,7 +405,46 @@ class AgentExecutor:
                             except Exception as emit_error:
                                 logger.error(f"Failed to emit workspace prep error event: {emit_error}", exc_info=True)
 
-                        raise RuntimeError(f"Git workspace preparation failed: {e}") from e
+                        # Same treatment as StaleBranchError/BranchPullFailedError above:
+                        # this is not a per-issue-retryable failure — the underlying git
+                        # workspace is broken and every subsequent issue that touches it
+                        # will hit the exact same error. Post a comment, retain the
+                        # pipeline lock so nothing else is dispatched against this
+                        # project's board, and raise non-retryably so neither the
+                        # in-process retry loop nor the zombie watchdog's auto-retry
+                        # accounting kicks in and silently releases the lock again.
+                        if issue_number:
+                            try:
+                                from services.github_integration import GitHubIntegration
+                                project_config = config_manager.get_project_config(project_name)
+                                github = GitHubIntegration(
+                                    repo_owner=project_config.github['org'],
+                                    repo_name=project_config.github['repo']
+                                )
+                                comment = _build_workspace_prep_error_comment(e)
+                                await github.post_comment(issue_number, comment, pipeline_run_id=pipeline_run_id)
+                            except Exception as comment_err:
+                                logger.error(
+                                    f"Failed to post workspace prep error comment to issue "
+                                    f"#{issue_number}: {comment_err}"
+                                )
+
+                            try:
+                                from services.pipeline_run import get_pipeline_run_manager
+                                get_pipeline_run_manager().end_pipeline_run(
+                                    project=project_name,
+                                    issue_number=issue_number,
+                                    reason=f"Git workspace preparation failed: {e}",
+                                    retain_lock=True,
+                                    outcome="failed"
+                                )
+                            except Exception as end_err:
+                                logger.error(
+                                    f"Failed to end pipeline run after workspace prep error for "
+                                    f"{project_name} issue #{issue_number}: {end_err}"
+                                )
+
+                        raise NonRetryableAgentError(f"Git workspace preparation failed: {e}") from e
 
                 # For other cases (no workspace context yet, or non-git workspace), log warning and continue
                 # This preserves backward compatibility for agents that don't need git operations
