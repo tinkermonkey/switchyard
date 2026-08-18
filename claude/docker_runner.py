@@ -1709,6 +1709,7 @@ class DockerAgentRunner:
                                                cache_read_tokens=cache_read_tokens,
                                                cache_creation_tokens=cache_creation_tokens,
                                                success=(exit_code == 0),
+                                               model=claude_model,
                                                pipeline_run_id=pipeline_run_id)
 
             if exit_code == 0:
@@ -1982,6 +1983,7 @@ class DockerAgentRunner:
                                                 input_tokens=input_tokens, output_tokens=output_tokens,
                                                 cache_read_tokens=cache_read_tokens,
                                                 cache_creation_tokens=cache_creation_tokens,
+                                                model=claude_model,
                                                 pipeline_run_id=pipeline_run_id)
 
                 # CRITICAL: Record failure outcome immediately before raising exception

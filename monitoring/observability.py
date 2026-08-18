@@ -366,6 +366,13 @@ class ObservabilityManager:
         if self.es:
             self.setup_elasticsearch()
 
+        # Setup OTLP metrics export (no-op unless OTEL_EXPORTER_OTLP_ENDPOINT is set)
+        try:
+            from monitoring import telemetry
+            telemetry.setup_telemetry()
+        except Exception as e:
+            logger.warning(f"Failed to initialize OTLP telemetry: {e}")
+
     def setup_elasticsearch(self):
         """Setup Elasticsearch ILM policies and index templates for decision events"""
         if not self.es:
@@ -649,6 +656,22 @@ class ObservabilityManager:
         elif self._is_agent_lifecycle_event(event_type):
             logger.warning(f"Agent lifecycle event {event_type.value} not indexed - ES client is None")
 
+        # OTLP metrics export for Claude token usage (no-op if telemetry isn't configured)
+        if event_type in (EventType.CLAUDE_API_CALL_COMPLETED, EventType.CLAUDE_API_CALL_FAILED):
+            try:
+                from monitoring import telemetry
+                telemetry.record_claude_token_usage(
+                    project=project,
+                    agent=agent,
+                    model=data.get('model'),
+                    input_tokens=data.get('input_tokens') or 0,
+                    output_tokens=data.get('output_tokens') or 0,
+                    cache_read_tokens=data.get('cache_read_tokens') or 0,
+                    cache_creation_tokens=data.get('cache_creation_tokens') or 0,
+                )
+            except Exception as e:
+                logger.debug(f"Failed to record OTLP token usage metric: {e}")
+
         logger.debug(f"Emitted {event_type.value} event for {agent}/{task_id}")
 
     def emit_task_received(self, agent: str, task_id: str, project: str,
@@ -739,6 +762,7 @@ class ObservabilityManager:
                                    duration_ms: float, input_tokens: int,
                                    output_tokens: int, cache_read_tokens: int = 0,
                                    cache_creation_tokens: int = 0, success: bool = True,
+                                   model: Optional[str] = None,
                                    pipeline_run_id: Optional[str] = None):
         """Emit Claude API call completed event"""
         self.emit(EventType.CLAUDE_API_CALL_COMPLETED, agent, task_id, project, {
@@ -748,13 +772,15 @@ class ObservabilityManager:
             'cache_read_tokens': cache_read_tokens,
             'cache_creation_tokens': cache_creation_tokens,
             'total_tokens': input_tokens + output_tokens + cache_read_tokens + cache_creation_tokens,
-            'success': success
+            'success': success,
+            'model': model
         }, pipeline_run_id=pipeline_run_id)
 
     def emit_claude_call_failed(self, agent: str, task_id: str, project: str,
                                 duration_ms: float, error: str, exit_code: Optional[int] = None,
                                 input_tokens: int = 0, output_tokens: int = 0,
                                 cache_read_tokens: int = 0, cache_creation_tokens: int = 0,
+                                model: Optional[str] = None,
                                 pipeline_run_id: Optional[str] = None):
         """Emit Claude API call failed event"""
         self.emit(EventType.CLAUDE_API_CALL_FAILED, agent, task_id, project, {
@@ -765,7 +791,8 @@ class ObservabilityManager:
             'output_tokens': output_tokens,
             'cache_read_tokens': cache_read_tokens,
             'cache_creation_tokens': cache_creation_tokens,
-            'success': False
+            'success': False,
+            'model': model
         }, pipeline_run_id=pipeline_run_id)
 
     def emit_container_launch_started(self, agent: str, task_id: str, project: str,
