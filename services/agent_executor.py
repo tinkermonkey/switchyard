@@ -1045,7 +1045,15 @@ class AgentExecutor:
                 task_context['direct_prompt'] = (
                     "Please continue exactly where you left off. Your previous turn "
                     "was interrupted by a Claude Code usage limit before it could "
-                    "finish — pick up the task from where you stopped."
+                    "finish — pick up the task from where you stopped. "
+                    "IMPORTANT: your original task instructions required your final "
+                    "response to end with a specific status marker section (e.g. a "
+                    "'### Status' heading followed by a bold decision keyword such as "
+                    "'**APPROVED**' or '**BLOCKED**') for automated parsing. That "
+                    "requirement still applies to this continuation — your final "
+                    "response in this turn MUST still include that exact marker "
+                    "section, formatted exactly as your original instructions "
+                    "specified, even though this is a resumed session."
                 )
                 logger.info(
                     f"Resuming Claude Code session {resumable_session_id} for "
