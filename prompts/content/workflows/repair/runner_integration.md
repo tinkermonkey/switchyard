@@ -52,6 +52,14 @@ Run ONLY integration tests for this project. Do NOT run unit, e2e, or performanc
    is unreliable — the process can exit before results are flushed, causing premature fires
    and empty results.
 
+   This suite can legitimately take 10+ minutes on large projects — that is expected and fine.
+   A long-running foreground Bash call is normal; do not treat the run time as a signal to
+   background it. If you find yourself about to write something like "the test suite is
+   running, I'll wait/report once it completes" — stop. That is not a valid response and this
+   task will be scored as a total failure even if the tests you started end up passing, because
+   there is no later turn in which you check back on it. The one Bash call you make to run
+   pytest must be the one you wait on until it returns, then you parse that output and respond.
+
    **TypeScript/JavaScript (Playwright or Jest)** — run as a single Bash call and capture the exit code:
    ```
    CI=1 npx playwright test > /tmp/integration_test_results.txt 2>&1; echo "PLAYWRIGHT_EXIT=$?" >> /tmp/integration_test_results.txt
