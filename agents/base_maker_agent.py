@@ -16,6 +16,8 @@ from abc import ABC, abstractmethod
 from pipeline.base import PipelineStage
 from claude.claude_integration import run_claude_code
 from prompts import PromptBuilder, PromptContext
+from services.cancellation import CancellationError
+from monitoring.claude_code_breaker import ClaudeCodeRateLimitError
 import logging
 
 logger = logging.getLogger(__name__)
@@ -160,5 +162,14 @@ class MakerAgent(PipelineStage, ABC):
             ]
             return context
 
+        except (CancellationError, ClaudeCodeRateLimitError):
+            # Never re-wrap these: agent_executor.py's retry loop does isinstance()
+            # checks on them ("never retry cancellations", "systemic token limit,
+            # not an agent failure — don't retry, don't count against the agent's
+            # own circuit breaker") that only work if the original exception type
+            # survives unchanged. Wrapping in a generic Exception below erases that
+            # type and silently defeats both checks (see repair_cycle.py's
+            # equivalent fix for the same underlying pattern).
+            raise
         except Exception as exc:
             raise Exception(f"{self.agent_display_name} execution failed: {exc}") from exc

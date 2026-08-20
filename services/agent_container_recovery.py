@@ -1539,6 +1539,20 @@ class AgentContainerRecovery:
         # Get success status
         overall_success = result.get('overall_success', False)
 
+        # Frozen: paused by the Claude Code token-limit circuit breaker mid-run, not
+        # a genuine test/infra failure. repair_cycle_runner.py sets 'frozen': True in
+        # the Redis result for this case (see its exit code 5). Handled distinctly
+        # below — no misleading failure comment, no lock retained for manual
+        # intervention — mirroring project_monitor.py's _monitor_repair_cycle_container,
+        # which handles the same signal for the live (non-restart-recovery) path.
+        is_frozen = bool(result.get('frozen'))
+        if is_frozen:
+            logger.warning(
+                f"Repair cycle for {project}/#{issue_number} (recovered after restart) "
+                f"was paused by the Claude Code circuit breaker. Not treating as a "
+                f"failure — will auto-resume once tokens reset."
+            )
+
         # Load project config to get org
         from config.manager import ConfigManager
         config_manager = ConfigManager()
@@ -1591,8 +1605,11 @@ class AgentContainerRecovery:
             except Exception as e:
                 logger.warning(f"Failed to check comment idempotency: {e}")
 
-        # Post comment only if not already posted
-        if not comment_already_posted:
+        # Post comment only if not already posted — and never for a frozen result:
+        # this isn't a failure requiring attention, it's a temporary pause that
+        # resumes automatically, so the failure-shaped summary above would be
+        # actively misleading (matches the silent-pause behavior of the live path).
+        if not comment_already_posted and not is_frozen:
             # Run async code in a new thread to avoid event loop conflicts
             import threading
 
@@ -1720,35 +1737,62 @@ class AgentContainerRecovery:
                         # The current active run matches the container's original run - safe to end
                         logger.info(f"Validated: Current active run {current_run_id} matches container run {pipeline_run_id}")
 
-                # Proceed to end the run (either matched or no active run found).
-                # On failure, retain the lock so the issue blocks the pipeline until
-                # a human moves it out of Testing (same behaviour as the live-run path).
-                ended = pipeline_run_manager.end_pipeline_run(
-                    project=project,
-                    issue_number=issue_number,
-                    reason="Repair cycle completed successfully" if overall_success else "Repair cycle failed",
-                    retain_lock=not overall_success
-                )
-                if ended:
-                    logger.info(
-                        f"Ended pipeline run {pipeline_run_id} for {project}/#{issue_number}"
-                        + (" (lock retained — awaiting manual intervention)" if not overall_success else "")
-                    )
-                else:
-                    logger.warning(f"Pipeline run {pipeline_run_id} was already ended or not found")
-
-                # Set the repair_failed Redis marker so _reconcile_active_runs knows
-                # this lock is intentionally held and the watchdog skips it.
-                if not overall_success:
+                if is_frozen:
+                    # Deliberately do NOT end the pipeline run and do NOT retain a
+                    # manual-intervention lock. Recording outcome='frozen' is what
+                    # pipeline_watchdog's existing frozen-resume path
+                    # (is_frozen_by_circuit_breaker / _actively_resume_run) watches
+                    # for — it ends this same pipeline_run with retain_lock=False and
+                    # lets normal dispatch relaunch a fresh repair-cycle container
+                    # once the breaker closes, which resumes from the checkpoint.
                     try:
-                        if self.redis:
-                            repair_failed_key = (
-                                f"pipeline_lock:repair_failed:"
-                                f"{project}:{board_name}:{issue_number}"
-                            )
-                            self.redis.set(repair_failed_key, "1", ex=172800)  # 48h TTL
-                    except Exception as redis_err:
-                        logger.warning(f"Failed to set repair_failed marker in Redis: {redis_err}")
+                        from services.work_execution_state import work_execution_tracker
+                        agent_name = context.get('agent_name', 'senior_software_engineer')
+                        work_execution_tracker.record_execution_outcome(
+                            issue_number=issue_number,
+                            column=column,
+                            agent=agent_name,
+                            outcome='frozen',
+                            project_name=project,
+                            error=result.get('error')
+                        )
+                        logger.info(
+                            f"Repair cycle for {project}/#{issue_number} (recovered) frozen "
+                            f"by Claude Code breaker — pipeline run left active for "
+                            f"auto-resume, no lock retained, no failure comment posted."
+                        )
+                    except Exception as state_err:
+                        logger.error(f"Failed to record frozen outcome: {state_err}")
+                else:
+                    # Proceed to end the run (either matched or no active run found).
+                    # On failure, retain the lock so the issue blocks the pipeline until
+                    # a human moves it out of Testing (same behaviour as the live-run path).
+                    ended = pipeline_run_manager.end_pipeline_run(
+                        project=project,
+                        issue_number=issue_number,
+                        reason="Repair cycle completed successfully" if overall_success else "Repair cycle failed",
+                        retain_lock=not overall_success
+                    )
+                    if ended:
+                        logger.info(
+                            f"Ended pipeline run {pipeline_run_id} for {project}/#{issue_number}"
+                            + (" (lock retained — awaiting manual intervention)" if not overall_success else "")
+                        )
+                    else:
+                        logger.warning(f"Pipeline run {pipeline_run_id} was already ended or not found")
+
+                    # Set the repair_failed Redis marker so _reconcile_active_runs knows
+                    # this lock is intentionally held and the watchdog skips it.
+                    if not overall_success:
+                        try:
+                            if self.redis:
+                                repair_failed_key = (
+                                    f"pipeline_lock:repair_failed:"
+                                    f"{project}:{board_name}:{issue_number}"
+                                )
+                                self.redis.set(repair_failed_key, "1", ex=172800)  # 48h TTL
+                        except Exception as redis_err:
+                            logger.warning(f"Failed to set repair_failed marker in Redis: {redis_err}")
             except Exception as e:
                 logger.error(f"Failed to end pipeline run {pipeline_run_id}: {e}", exc_info=True)
 

@@ -8,6 +8,8 @@ from typing import Dict, Any
 from pathlib import Path
 from claude.docker_runner import docker_runner, resolve_final_output
 from services.project_workspace import workspace_manager
+from services.cancellation import CancellationError
+from monitoring.claude_code_breaker import ClaudeCodeRateLimitError
 
 try:
     import redis as redis_lib
@@ -501,6 +503,20 @@ Files: {context.get('files', [])}
     except subprocess.TimeoutExpired:
         logger.error("Claude Code execution timed out")
         raise Exception("Claude Code execution timed out")
+    except (CancellationError, ClaudeCodeRateLimitError):
+        # Never re-wrap: agent_executor.py's retry loop (and the agent-level
+        # wrappers above it, e.g. base_maker_agent.py) do isinstance() checks on
+        # these ("never retry cancellations", "systemic token limit, not an agent
+        # failure") that only work if the original exception type survives.
+        # NOTE: this only guards the non-Docker local execution path below (used
+        # only by dev_environment_setup) — the Docker path returns directly above
+        # and is never wrapped here in the first place. The local path also does
+        # not currently run its JSON stream through ClaudeCodeBreaker.detect_from_
+        # event() the way docker_runner.py's containerized path does, so this
+        # exception is not actually raised from here yet; this guard is
+        # forward-looking consistency, not a claim that local-path rate limits
+        # are detected.
+        raise
     except Exception as e:
         logger.error(f"Claude Code integration error: {str(e)}", exc_info=True)
         raise Exception(f"Claude Code integration error: {str(e)}")

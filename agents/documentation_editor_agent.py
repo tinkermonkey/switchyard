@@ -2,6 +2,8 @@ from typing import Dict, Any
 from pipeline.base import PipelineStage
 from claude.claude_integration import run_claude_code
 from prompts import PromptBuilder, PromptContext, IssueContext, ReviewCycleContext
+from services.cancellation import CancellationError
+from monitoring.claude_code_breaker import ClaudeCodeRateLimitError
 import logging
 
 logger = logging.getLogger(__name__)
@@ -97,5 +99,10 @@ class DocumentationEditorAgent(PipelineStage):
             logger.info("Documentation review completed, output length: %d", len(markdown_output))
             return context
 
+        except (CancellationError, ClaudeCodeRateLimitError):
+            # Never re-wrap: agent_executor.py's retry loop does isinstance() checks
+            # on these ("never retry cancellations", "systemic token limit, not an
+            # agent failure") that only work if the original exception type survives.
+            raise
         except Exception as exc:
             raise Exception(f"Documentation review failed: {exc}") from exc
