@@ -48,6 +48,7 @@ from monitoring.timestamp_utils import utc_now, utc_isoformat, to_utc_isoformat
 from monitoring.observability import EventType
 from monitoring.cycle_stack import push_frame, CycleFrame
 from services.cancellation import CancellationError
+from monitoring.claude_code_breaker import ClaudeCodeRateLimitError
 from prompts.loader import default_loader
 
 
@@ -1151,6 +1152,13 @@ class RepairCycleStage(PipelineStage):
 
             except CancellationError:
                 raise  # Never retry cancellations
+            except ClaudeCodeRateLimitError:
+                # Systemic token-limit rejection, not a test/infra failure —
+                # propagate so the top-level run can treat this as "paused, will
+                # auto-resume" instead of burning retries into the same wall and
+                # locking the pipeline for manual intervention. See
+                # repair_cycle_runner.py's execute_repair_cycle().
+                raise
             except ValueError as e:
                 # JSON parsing failure - this is an infrastructure issue, not a test failure
                 error_msg = str(e)
@@ -1441,6 +1449,13 @@ class RepairCycleStage(PipelineStage):
 
             except CancellationError:
                 raise  # Never retry cancellations
+            except ClaudeCodeRateLimitError:
+                # Systemic token-limit rejection, not a test/infra failure —
+                # propagate so the top-level run can treat this as "paused, will
+                # auto-resume" instead of burning retries into the same wall and
+                # locking the pipeline for manual intervention. See
+                # repair_cycle_runner.py's execute_repair_cycle().
+                raise
             except Exception as e:
                 logger.error(f"Failed to fix failures in {test_file}: {e}", exc_info=True)
                 
@@ -1585,6 +1600,13 @@ class RepairCycleStage(PipelineStage):
 
             except CancellationError:
                 raise  # Never retry cancellations
+            except ClaudeCodeRateLimitError:
+                # Systemic token-limit rejection, not a test/infra failure —
+                # propagate so the top-level run can treat this as "paused, will
+                # auto-resume" instead of burning retries into the same wall and
+                # locking the pipeline for manual intervention. See
+                # repair_cycle_runner.py's execute_repair_cycle().
+                raise
             except Exception as e:
                 logger.error(f"Failed to review warnings in {source_file}: {e}", exc_info=True)
                 
@@ -2050,6 +2072,13 @@ class RepairCycleStage(PipelineStage):
 
         except CancellationError:
             raise
+        except ClaudeCodeRateLimitError:
+            # Systemic token-limit rejection, not a test/infra failure —
+            # propagate so the top-level run can treat this as "paused, will
+            # auto-resume" instead of burning retries into the same wall and
+            # locking the pipeline for manual intervention. See
+            # repair_cycle_runner.py's execute_repair_cycle().
+            raise
         except Exception as e:
             logger.warning(
                 f"Systemic failure analysis failed: {e}, falling back to per-file fixes",
@@ -2176,6 +2205,13 @@ class RepairCycleStage(PipelineStage):
                 )
 
             except CancellationError:
+                raise
+            except ClaudeCodeRateLimitError:
+                # Systemic token-limit rejection, not a test/infra failure —
+                # propagate so the top-level run can treat this as "paused, will
+                # auto-resume" instead of burning retries into the same wall and
+                # locking the pipeline for manual intervention. See
+                # repair_cycle_runner.py's execute_repair_cycle().
                 raise
             except Exception as e:
                 logger.error(f"Env rebuild setup failed on attempt {attempts_made}: {e}", exc_info=True)
@@ -2505,6 +2541,13 @@ class RepairCycleStage(PipelineStage):
                 logger.info(f"Systemic fix attempt {attempts_made} completed")
 
             except CancellationError:
+                raise
+            except ClaudeCodeRateLimitError:
+                # Systemic token-limit rejection, not a test/infra failure —
+                # propagate so the top-level run can treat this as "paused, will
+                # auto-resume" instead of burning retries into the same wall and
+                # locking the pipeline for manual intervention. See
+                # repair_cycle_runner.py's execute_repair_cycle().
                 raise
             except (ImportError, AttributeError, TypeError) as e:
                 # Non-retryable: agent executor module is missing, its interface does

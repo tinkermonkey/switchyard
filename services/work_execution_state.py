@@ -709,10 +709,14 @@ class WorkExecutionStateTracker:
         This allows the project monitor to detect when a previously frozen
         execution can be retried (after circuit breaker closes).
 
-        The 'frozen' outcome value is itself the single, unambiguous marker for
-        this condition — it is written in exactly one place in the codebase
-        (agent_executor.py's is_claude_breaker_failure branch), unlike the old
-        'blocked' value it replaced. Deliberately does NOT also substring-match
+        The 'frozen' outcome value is itself the unambiguous marker for this
+        condition, unlike the old 'blocked' value it replaced. Written by
+        agent_executor.py's is_claude_breaker_failure branch (the normal
+        per-agent execution path) and by project_monitor.py's
+        _monitor_repair_cycle_container (the standalone repair-cycle container
+        path, which has its own ClaudeCodeRateLimitError handling since it
+        doesn't route through agent_executor). Deliberately does NOT also
+        substring-match
         the human-readable error text: that text varies by which of several
         detection paths fired (e.g. the new structural detector's "Claude Code
         rate limit confirmed (source=...)" never contains the literal phrase

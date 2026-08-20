@@ -33,6 +33,9 @@ Exit Codes:
     2: Error - execution error, agent failure, or failed to save result
     3: Timeout - repair cycle exceeded timeout
     4: Cancelled - repair cycle cancelled by user
+    5: Frozen - paused by the Claude Code token-limit circuit breaker; not a
+       genuine failure. project_monitor's container-completion handler resumes
+       this automatically (via the checkpoint) once the breaker closes.
 """
 
 import argparse
@@ -46,6 +49,7 @@ from pathlib import Path
 from typing import Dict, Any, Optional
 from datetime import datetime
 from services.cancellation import CancellationError
+from monitoring.claude_code_breaker import ClaudeCodeRateLimitError
 
 # Setup logging (initially just to stdout, file handler added after parsing args)
 logging.basicConfig(
@@ -258,6 +262,15 @@ class RepairCycleRunner:
         except CancellationError:
             logger.warning("Repair cycle cancelled by pipeline run lifecycle")
             return {'overall_success': False, 'error': 'Pipeline run ended externally'}
+        except ClaudeCodeRateLimitError as e:
+            # Systemic Claude Code token-limit rejection, not a test/infra failure.
+            # Distinct from the generic Exception branch below so project_monitor's
+            # container-completion handler can treat this as "paused, will
+            # auto-resume when the breaker closes" instead of a hard failure that
+            # posts a misleading "manual intervention required" comment and
+            # retains the pipeline lock indefinitely.
+            logger.warning(f"Repair cycle paused by Claude Code circuit breaker: {e}")
+            return {'overall_success': False, 'frozen': True, 'error': str(e)}
         except Exception as e:
             logger.error(f"Repair cycle execution failed: {e}", exc_info=True)
             return {'overall_success': False, 'error': str(e)}
@@ -322,7 +335,8 @@ class RepairCycleRunner:
         Main execution flow.
 
         Returns:
-            Exit code (0=success, 1=failure, 2=error, 3=timeout, 4=cancelled)
+            Exit code (0=success, 1=failure, 2=error, 3=timeout, 4=cancelled,
+            5=frozen by Claude Code circuit breaker, will auto-resume)
         """
         try:
             logger.info("=" * 80)
@@ -357,6 +371,11 @@ class RepairCycleRunner:
             if result.get('overall_success'):
                 logger.info("Repair cycle succeeded - all tests passed!")
                 return 0
+            elif result.get('frozen'):
+                logger.warning(
+                    f"Repair cycle paused by Claude Code circuit breaker: {result.get('error')}"
+                )
+                return 5
             elif result.get('error'):
                 logger.error(f"Repair cycle failed with error: {result.get('error')}")
                 return 2

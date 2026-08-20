@@ -4859,6 +4859,7 @@ The automated test-fix-validate cycle has failed and requires manual interventio
         def monitor_thread():
             exit_code = None
             overall_success = False
+            is_frozen = False  # Paused by Claude Code token-limit breaker, not a real failure
             repair_result = None
             error_message = None
             pipeline_run_ended = False
@@ -4960,7 +4961,24 @@ The automated test-fix-validate cycle has failed and requires manual interventio
                 overall_success = (exit_code == 0) and (
                     repair_result.get('overall_success', False) if repair_result else False
                 )
-                
+
+                # Frozen: paused by the Claude Code token-limit circuit breaker mid-run,
+                # not a genuine test/infra failure. Exit code 5 is repair_cycle_runner.py's
+                # dedicated signal for this (see its Exit Codes docstring);
+                # repair_result['frozen'] is a belt-and-suspenders check in case the exit
+                # code didn't make it through cleanly. Handled distinctly below: no
+                # misleading failure comment, no lock retained for manual intervention —
+                # pipeline_watchdog's existing frozen-resume path (which watches for
+                # work_execution_tracker outcome='frozen') picks this back up
+                # automatically once the breaker closes.
+                is_frozen = (exit_code == 5) or bool(repair_result and repair_result.get('frozen'))
+                if is_frozen:
+                    logger.warning(
+                        f"Repair cycle for {project_name}/#{issue_number} was paused by the "
+                        f"Claude Code circuit breaker (exit_code={exit_code}). Not treating as "
+                        f"a failure — will auto-resume once tokens reset."
+                    )
+
                 # Emit container completed event
                 try:
                     from monitoring.observability import get_observability_manager
@@ -5036,14 +5054,19 @@ The automated test-fix-validate cycle has failed and requires manual interventio
                 summary_lines.append("")
                 summary_lines.append("---")
                 summary_lines.append("_Repair cycle executed by Switchyard (containerized)_")
-                
-                loop.run_until_complete(
-                    github.post_agent_output(
-                        comment_context,
-                        "\n".join(summary_lines)
+
+                # Skip posting when frozen: this isn't a failure requiring attention, it's
+                # a temporary pause that resumes automatically — posting the failure-shaped
+                # summary above would be actively misleading (matches the silent-pause
+                # behavior of the non-repair-cycle paths, e.g. requirements_verifier).
+                if not is_frozen:
+                    loop.run_until_complete(
+                        github.post_agent_output(
+                            comment_context,
+                            "\n".join(summary_lines)
+                        )
                     )
-                )
-                
+
                 # NOTE: Execution outcome is recorded in finally block to ensure it happens even on error
                 
                 # Auto-commit changes if repair cycle succeeded (BEFORE auto-advance to ensure code is pushed first)
@@ -5172,12 +5195,12 @@ The automated test-fix-validate cycle has failed and requires manual interventio
                     # agent_name is now passed as a parameter to this function
                     # No need to extract from repair_result
 
-                    outcome = 'success' if overall_success else 'failure'
-                    
+                    outcome = 'frozen' if is_frozen else ('success' if overall_success else 'failure')
+
                     # If we never got an exit code, container failed during launch
                     if exit_code is None:
                         error_message = error_message or "Container failed to start or exited immediately"
-                    
+
                     work_execution_tracker.record_execution_outcome(
                         issue_number=issue_number,
                         column=status,
@@ -5186,17 +5209,31 @@ The automated test-fix-validate cycle has failed and requires manual interventio
                         project_name=project_name,
                         error=error_message
                     )
-                    
+
                     logger.info(
                         f"Execution state updated for {project_name}/#{issue_number}: "
                         f"outcome={outcome}, exit_code={exit_code}"
                     )
 
-                    # End pipeline run if failed (success case is handled in normal flow)
-                    # Only end if not already ended (e.g., in timeout handler).
-                    # Pass retain_lock=True so the pipeline lock is NOT released — the issue
-                    # stays blocked in Testing until a human moves it manually.
-                    if not overall_success and not pipeline_run_ended:
+                    # Frozen: deliberately do NOT end the pipeline run and do NOT retain a
+                    # manual-intervention lock. Recording outcome='frozen' above is what
+                    # pipeline_watchdog's existing frozen-resume path (is_frozen_by_circuit_
+                    # breaker / _actively_resume_run) watches for — it ends this same
+                    # pipeline_run with retain_lock=False and lets normal dispatch relaunch
+                    # a fresh repair-cycle container once the breaker closes, which resumes
+                    # from the checkpoint already written by repair_cycle_checkpoint.
+                    if is_frozen:
+                        logger.info(
+                            f"Repair cycle for {project_name}/#{issue_number} frozen by Claude "
+                            f"Code breaker — pipeline run left active for auto-resume, no lock "
+                            f"retained, no failure comment posted."
+                        )
+
+                    # End pipeline run if genuinely failed (success and frozen cases are
+                    # handled elsewhere). Only end if not already ended (e.g., in timeout
+                    # handler). Pass retain_lock=True so the pipeline lock is NOT released —
+                    # the issue stays blocked in Testing until a human moves it manually.
+                    if not overall_success and not is_frozen and not pipeline_run_ended:
                         try:
                             ended = self.pipeline_run_manager.end_pipeline_run(
                                 project=project_name,
@@ -5210,9 +5247,11 @@ The automated test-fix-validate cycle has failed and requires manual interventio
                             logger.error(f"Failed to end pipeline run in finally block: {e}")
 
                     # On success, the lock will be released when auto-advancing to next column.
-                    # On failure, the lock is intentionally retained — the issue stays in Testing
-                    # and blocks the pipeline until a human intervenes and moves it manually.
-                    if not overall_success:
+                    # On genuine failure, the lock is intentionally retained — the issue stays
+                    # in Testing and blocks the pipeline until a human intervenes. Frozen runs
+                    # are excluded: they're not a failure, and pipeline_watchdog's frozen-resume
+                    # path (triggered by the outcome='frozen' recorded above) handles them.
+                    if not overall_success and not is_frozen:
                         # Post detailed failure summary to GitHub issue
                         try:
                             org = project_config.github.get('org', '')
@@ -5323,8 +5362,44 @@ The automated test-fix-validate cycle has failed and requires manual interventio
         try:
             import asyncio
             import threading
-            from pipeline.pr_review_stage import PRReviewStage
+            from pipeline.pr_review_stage import PRReviewStage, MAX_REVIEW_CYCLES
             from services.work_execution_state import work_execution_tracker
+            from state_management.pr_review_state_manager import pr_review_state_manager
+
+            # Guard: do not launch another PR review cycle once the limit is already
+            # reached. Unlike _advance_parent_for_pr_review (which fires on issue-exit
+            # events and checks this before re-triggering), this method is reached via
+            # the generic per-poll column router — with no guard here, every poll of an
+            # issue sitting in "In Review" after its cycle count is maxed out re-launches
+            # PRReviewStage, which immediately raises NonRetryableAgentError. That's a
+            # silent, indefinitely-repeating no-op loop that never surfaces to a human.
+            review_count = pr_review_state_manager.get_review_count(project_name, issue_number)
+            if review_count >= MAX_REVIEW_CYCLES:
+                logger.info(
+                    f"Review cycle limit ({MAX_REVIEW_CYCLES}) reached for #{issue_number}, "
+                    f"not launching another PR review stage run"
+                )
+                if not pr_review_state_manager.is_cycle_limit_notified(project_name, issue_number):
+                    from services.github_integration import GitHubIntegration
+                    github = GitHubIntegration(
+                        repo_owner=project_config.github['org'],
+                        repo_name=project_config.github['repo']
+                    )
+                    _notify_loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(_notify_loop)
+                    try:
+                        _notify_loop.run_until_complete(github.post_comment(
+                            issue_number,
+                            f"The maximum PR review cycle limit ({MAX_REVIEW_CYCLES}) has already been "
+                            f"reached for this issue.\n\nFurther review should be performed manually. "
+                            f"Move this issue out of 'In Review' and back in to reset the cycle count."
+                        ))
+                    finally:
+                        _notify_loop.close()
+                    pr_review_state_manager.mark_cycle_limit_notified(project_name, issue_number)
+                else:
+                    logger.info(f"Cycle limit notification already sent for #{issue_number}, skipping.")
+                return stage_config.stage
 
             # Check for duplicate execution
             if work_execution_tracker.has_active_execution(project_name, issue_number):
