@@ -527,6 +527,11 @@ class TestClaudeCodeEventStructure:
         assert 'input_tokens' in data
         assert 'output_tokens' in data
         assert 'total_tokens' in data
+        # model must be threaded through to the COMPLETED event too, not just
+        # STARTED (asserted above) - the OTLP telemetry sink (monitoring/telemetry.py)
+        # tags every SigNoz metric point with it.
+        assert 'model' in data
+        assert data['model'] == 'claude-sonnet-4-5-20250929'
         
         assert data['duration_ms'] > 0
         assert data['input_tokens'] > 0

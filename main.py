@@ -103,11 +103,48 @@ def setup_zombie_process_reaper():
     # Register the signal handler
     signal.signal(signal.SIGCHLD, sigchld_handler)
 
+
+def setup_telemetry_shutdown_handler():
+    """
+    Flush the OTLP telemetry exporter (monitoring/telemetry.py) on SIGTERM.
+
+    PeriodicExportingMetricReader batches token-usage metric points on a 60s
+    timer; without this, Python's default SIGTERM action terminates the
+    process immediately (atexit handlers do NOT run on a raw signal), so up
+    to a minute of accumulated switchyard.claude.token.usage data is silently
+    dropped on every `docker-compose stop`/`restart`. This is a no-op if
+    telemetry was never configured (no OTEL_EXPORTER_OTLP_ENDPOINT set).
+
+    The handler flushes (bounded by telemetry.DEFAULT_SHUTDOWN_TIMEOUT_MILLIS
+    so a slow/unreachable collector can't hang shutdown), then restores the
+    default SIGTERM action and re-sends the signal to itself — this changes
+    nothing about the process's actual termination behavior/exit code, it
+    just inserts one bounded flush step ahead of it.
+    """
+    def sigterm_handler(signum, frame):
+        try:
+            from monitoring import telemetry
+            telemetry.shutdown_telemetry()
+        except Exception:
+            # Never let a telemetry flush failure block process shutdown
+            pass
+        finally:
+            signal.signal(signal.SIGTERM, signal.SIG_DFL)
+            os.kill(os.getpid(), signal.SIGTERM)
+
+    signal.signal(signal.SIGTERM, sigterm_handler)
+
+
 async def main():
     # Setup zombie process reaper FIRST before any other initialization
     # This prevents accumulation of defunct child processes from subprocess calls
     setup_zombie_process_reaper()
-    
+
+    # Flush OTLP telemetry (monitoring/telemetry.py) on SIGTERM so a container
+    # stop/restart doesn't silently drop up to a minute of buffered metrics.
+    # No-op if OTLP telemetry was never configured.
+    setup_telemetry_shutdown_handler()
+
     # Load configuration
     env_config = Environment()
 

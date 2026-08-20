@@ -1,20 +1,36 @@
 """
 OpenTelemetry metrics export for the Switchyard orchestrator.
 
-Call setup_telemetry() once at startup before recording any metrics. If
-OTEL_EXPORTER_OTLP_ENDPOINT is not set or OTEL_SDK_DISABLED=true, this is a
-no-op and record_claude_token_usage() silently does nothing.
+Call setup_telemetry() once at startup before recording any metrics, and
+shutdown_telemetry() once at process shutdown to flush anything buffered. If
+OTEL_EXPORTER_OTLP_ENDPOINT is not set or OTEL_SDK_DISABLED=true, both are
+no-ops and record_claude_token_usage() silently does nothing.
 
 This exports orchestrator-side metrics derived from the existing
 ObservabilityManager event stream (CLAUDE_API_CALL_COMPLETED / _FAILED). It is
-distinct from the OTEL_COLLECTOR_HOST pipeline in claude/environment.py, which
-carries Claude Code's own self-reported CLI telemetry from agent containers to
-the local otel-collector -> Elasticsearch pipeline. This module instead points
-at the external OTLP collector (e.g. the one phone-home uses for SigNoz) via
-the standard OTEL_EXPORTER_OTLP_ENDPOINT env var, so the two never collide.
+distinct from the OTEL_COLLECTOR_HOST-derived vars that claude/environment.py's
+ClaudeEnvironmentBuilder injects into each Claude CLI launch, which carry
+Claude Code's own self-reported CLI telemetry from agent containers to the
+local otel-collector -> Elasticsearch pipeline. This module instead points at
+an external OTLP collector (e.g. SigNoz) via the standard
+OTEL_EXPORTER_OTLP_ENDPOINT env var, so the two never collide — see
+.env.example for the distinction and a warning against pointing this at the
+local otel-collector service, which has no SigNoz exporter configured.
+
+Note on delivery failures: setup_telemetry() and record_claude_token_usage()
+only guard against local/in-process errors (bad config, SDK import failure, a
+broken counter). The actual network export to the collector runs on a
+PeriodicExportingMetricReader background thread this module does not
+supervise — a real delivery failure (unreachable collector, auth rejected,
+TLS error) surfaces only via the OpenTelemetry SDK's own internal logging
+(logger namespaces under `opentelemetry.*`), not as a switchyard log line.
+Those loggers are not suppressed by services/logging_config.py, so their
+WARNING/ERROR output does reach the same log stream as everything else, but
+there is currently no switchyard-level health signal (e.g. on /health) for
+export health specifically.
 
 Environment variables (standard OTEL):
-  OTEL_EXPORTER_OTLP_ENDPOINT  — OTLP HTTP base URL (e.g. http://otel-collector:4318)
+  OTEL_EXPORTER_OTLP_ENDPOINT  — OTLP HTTP base URL (e.g. http://your-signoz-collector:4318)
   OTEL_EXPORTER_OTLP_HEADERS   — Comma-separated auth headers (e.g. api-key=secret)
   OTEL_SERVICE_NAME             — Override the default service name passed to setup_telemetry()
   OTEL_RESOURCE_ATTRIBUTES      — Extra resource attrs (key=val,key=val)
@@ -36,6 +52,11 @@ DEFAULT_SERVICE_NAME = "switchyard-claude"
 # count, tag `type` = input/output/cacheRead/cacheCreation) but named distinctly
 # so it is never confused with genuine CLI-side self-reported metrics.
 TOKEN_USAGE_METRIC_NAME = "switchyard.claude.token.usage"
+
+# Bounds how long shutdown_telemetry() can block on a slow/unreachable
+# collector. Kept well under typical container stop grace periods (docker
+# defaults to 10s) so a bad SigNoz endpoint can't hang orchestrator shutdown.
+DEFAULT_SHUTDOWN_TIMEOUT_MILLIS = 5000
 
 
 def setup_telemetry(default_service_name: str = DEFAULT_SERVICE_NAME) -> bool:
@@ -109,3 +130,29 @@ def record_claude_token_usage(project: str, agent: str, model: Optional[str],
     ):
         if value:
             _token_usage_counter.add(value, attributes={**attrs_base, "type": token_type})
+
+
+def shutdown_telemetry(timeout_millis: int = DEFAULT_SHUTDOWN_TIMEOUT_MILLIS) -> None:
+    """
+    Flush any buffered token-usage metrics and shut down the MeterProvider.
+
+    PeriodicExportingMetricReader batches on its own timer (default 60s), so
+    without an explicit flush at shutdown, up to a minute of accumulated
+    counter increments is silently dropped on every process stop/restart —
+    no exception, just data that never gets exported. Call this once from the
+    process's shutdown path (see main.py's SIGTERM handler).
+
+    Safe to call even if setup_telemetry() was never called or no-op'd (e.g.
+    endpoint never configured) — nothing to flush in that case, and this
+    returns immediately without importing the opentelemetry packages.
+    """
+    if not _configured:
+        return
+    try:
+        from opentelemetry import metrics
+        provider = metrics.get_meter_provider()
+        provider.force_flush(timeout_millis=timeout_millis)
+        provider.shutdown(timeout_millis=timeout_millis)
+        log.info("OTEL telemetry flushed and shut down")
+    except Exception as e:
+        log.warning(f"Failed to flush/shutdown OTEL telemetry cleanly: {e}")

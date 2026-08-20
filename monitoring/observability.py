@@ -656,8 +656,20 @@ class ObservabilityManager:
         elif self._is_agent_lifecycle_event(event_type):
             logger.warning(f"Agent lifecycle event {event_type.value} not indexed - ES client is None")
 
-        # OTLP metrics export for Claude token usage (no-op if telemetry isn't configured)
-        if event_type in (EventType.CLAUDE_API_CALL_COMPLETED, EventType.CLAUDE_API_CALL_FAILED):
+        # OTLP metrics export for Claude token usage (no-op if telemetry isn't configured).
+        #
+        # Deliberately CLAUDE_API_CALL_COMPLETED only, not _FAILED too: docker_runner.py
+        # always emits COMPLETED for every call that reaches this point (success determined
+        # by its own `success` flag, independent of exit code), and additionally emits
+        # FAILED as a second, redundant event for the *same* call when it didn't succeed
+        # (see claude/docker_runner.py's "Emit completion" block followed by its exit_code
+        # branch). Recording on both event types double-counts every failed/invalid-output
+        # call's tokens. COMPLETED alone already captures 100% of calls that reach this
+        # stage, success or failure - if a future change adds a FAILED-only emission path
+        # (i.e. one with no preceding COMPLETED for the same call), this condition needs
+        # to grow to cover it, otherwise those tokens are missed entirely rather than
+        # double-counted.
+        if event_type == EventType.CLAUDE_API_CALL_COMPLETED:
             try:
                 from monitoring import telemetry
                 telemetry.record_claude_token_usage(
@@ -670,7 +682,11 @@ class ObservabilityManager:
                     cache_creation_tokens=data.get('cache_creation_tokens') or 0,
                 )
             except Exception as e:
-                logger.debug(f"Failed to record OTLP token usage metric: {e}")
+                # warning, not debug: this is the only sink for switchyard.claude.token.usage,
+                # so a broken recording path here is otherwise completely invisible under the
+                # project's default INFO log level - indistinguishable from the intentional
+                # no-op-when-unset case in record_claude_token_usage(). See monitoring/telemetry.py.
+                logger.warning(f"Failed to record OTLP token usage metric for {agent}/{task_id}: {e}")
 
         logger.debug(f"Emitted {event_type.value} event for {agent}/{task_id}")
 
