@@ -125,6 +125,24 @@ class TestScheduledJobConfiguration:
         # Cleanup
         scheduled_tasks_service.stop()
 
+    @pytest.mark.asyncio
+    async def test_sweep_orphaned_parents_job_schedule(self, scheduled_tasks_service):
+        """Test orphaned-parent sweep job is scheduled every 15 minutes"""
+        scheduled_tasks_service.start()
+
+        sweep_job = scheduled_tasks_service.scheduler.get_job('sweep_orphaned_parents')
+
+        assert sweep_job is not None
+        assert sweep_job.func == scheduled_tasks_service._sweep_orphaned_parents
+
+        # Verify trigger (CronTrigger, minute='*/15')
+        trigger = sweep_job.trigger
+        minute_field = trigger.fields[6]
+        assert str(minute_field) == '*/15'
+
+        # Cleanup
+        scheduled_tasks_service.stop()
+
 
 class TestCleanupTask:
     """Test orphaned branch cleanup task"""
@@ -335,6 +353,272 @@ class TestManualTriggers:
 
             # Verify task creation was called
             mock_create_task.assert_called_once()
+
+
+class TestSweepOrphanedParents:
+    """Test the orphaned-parent sweep (safety net for _check_pr_ready_on_issue_exit misses)"""
+
+    def _make_project_config(self, board_name='Planning & Design', pipeline_name='planning_design',
+                              workflow='planning_design_workflow', active=True):
+        pipeline = MagicMock()
+        pipeline.active = active
+        pipeline.name = pipeline_name
+        pipeline.workflow = workflow
+        pipeline.board_name = board_name
+
+        project_config = MagicMock()
+        project_config.pipelines = [pipeline]
+        project_config.github = {'org': 'test-org', 'repo': 'test-repo'}
+        return project_config
+
+    def _make_item(self, issue_number, status):
+        from services.project_monitor import ProjectItem
+        return ProjectItem(
+            item_id=f'item-{issue_number}',
+            content_id=f'content-{issue_number}',
+            issue_number=issue_number,
+            title=f'Issue #{issue_number}',
+            status=status,
+            repository='test-repo',
+            last_updated='2026-01-01T00:00:00Z'
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_projects(self, scheduled_tasks_service):
+        """Sweep with no visible projects completes without error and touches nothing"""
+        with patch('config.manager.config_manager') as mock_config, \
+             patch('services.project_monitor.ProjectMonitor') as mock_pm_class, \
+             patch('task_queue.task_manager.TaskQueue'):
+            mock_config.list_visible_projects.return_value = []
+
+            await scheduled_tasks_service._sweep_orphaned_parents()
+
+            mock_pm_class.return_value._advance_parent_for_pr_review.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_skips_project_without_planning_pipeline(self, scheduled_tasks_service):
+        """A project whose only active pipeline is SDLC (not planning) is skipped entirely"""
+        sdlc_config = self._make_project_config(
+            board_name='SDLC Execution', pipeline_name='sdlc_execution', workflow='sdlc_execution_workflow'
+        )
+
+        with patch('config.manager.config_manager') as mock_config, \
+             patch('config.state_manager.state_manager') as mock_state, \
+             patch('services.project_monitor.ProjectMonitor') as mock_pm_class, \
+             patch('task_queue.task_manager.TaskQueue'):
+            mock_config.list_visible_projects.return_value = ['test-project']
+            mock_config.get_project_config.return_value = sdlc_config
+
+            await scheduled_tasks_service._sweep_orphaned_parents()
+
+            mock_state.load_project_state.assert_not_called()
+            mock_pm_class.return_value._advance_parent_for_pr_review.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_skips_when_no_board_state(self, scheduled_tasks_service):
+        """A project with a planning pipeline but no GitHub board state is skipped"""
+        project_config = self._make_project_config()
+
+        with patch('config.manager.config_manager') as mock_config, \
+             patch('config.state_manager.state_manager') as mock_state, \
+             patch('services.project_monitor.ProjectMonitor') as mock_pm_class, \
+             patch('task_queue.task_manager.TaskQueue'):
+            mock_config.list_visible_projects.return_value = ['test-project']
+            mock_config.get_project_config.return_value = project_config
+            mock_state.load_project_state.return_value = None
+
+            await scheduled_tasks_service._sweep_orphaned_parents()
+
+            mock_pm_class.return_value._advance_parent_for_pr_review.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_skips_when_no_in_development_items(self, scheduled_tasks_service):
+        """Board items that aren't in 'In Development' are never checked"""
+        project_config = self._make_project_config()
+        mock_project_state = MagicMock()
+        mock_board_state = MagicMock()
+        mock_board_state.project_number = 29
+        mock_project_state.boards = {'Planning & Design': mock_board_state}
+
+        with patch('config.manager.config_manager') as mock_config, \
+             patch('config.state_manager.state_manager') as mock_state, \
+             patch('services.project_monitor.ProjectMonitor') as mock_pm_class, \
+             patch('services.github_integration.GitHubIntegration'), \
+             patch('task_queue.task_manager.TaskQueue'):
+            mock_config.list_visible_projects.return_value = ['test-project']
+            mock_config.get_project_config.return_value = project_config
+            mock_state.load_project_state.return_value = mock_project_state
+
+            mock_pm = mock_pm_class.return_value
+            mock_pm.get_project_items.return_value = [
+                self._make_item(822, 'In Review'),
+                self._make_item(823, 'Done'),
+            ]
+            mock_pm._advance_parent_for_pr_review = AsyncMock()
+
+            await scheduled_tasks_service._sweep_orphaned_parents()
+
+            mock_pm._advance_parent_for_pr_review.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_skips_issue_with_no_sub_issues(self, scheduled_tasks_service):
+        """An 'In Development' issue with zero sub-issues is out of scope for this sweep
+        (it may be a standalone issue that never went through work breakdown, and
+        advancing it to 'In Review' would be premature/unrelated to this bug)."""
+        project_config = self._make_project_config()
+        mock_project_state = MagicMock()
+        mock_board_state = MagicMock()
+        mock_board_state.project_number = 29
+        mock_project_state.boards = {'Planning & Design': mock_board_state}
+
+        with patch('config.manager.config_manager') as mock_config, \
+             patch('config.state_manager.state_manager') as mock_state, \
+             patch('services.project_monitor.ProjectMonitor') as mock_pm_class, \
+             patch('services.feature_branch_manager.feature_branch_manager') as mock_fbm, \
+             patch('services.github_integration.GitHubIntegration') as mock_gh_class, \
+             patch('task_queue.task_manager.TaskQueue'):
+            mock_config.list_visible_projects.return_value = ['test-project']
+            mock_config.get_project_config.return_value = project_config
+            mock_state.load_project_state.return_value = mock_project_state
+
+            mock_pm = mock_pm_class.return_value
+            mock_pm.get_project_items.return_value = [self._make_item(822, 'In Development')]
+            mock_pm._advance_parent_for_pr_review = AsyncMock()
+
+            mock_gh = AsyncMock()
+            mock_gh.get_issue.return_value = {'number': 822}
+            mock_gh_class.return_value = mock_gh
+
+            mock_fbm._get_sub_issues_from_parent = AsyncMock(return_value=[])
+
+            await scheduled_tasks_service._sweep_orphaned_parents()
+
+            mock_pm._advance_parent_for_pr_review.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_advances_parent_with_sub_issues(self, scheduled_tasks_service):
+        """The core case: an 'In Development' parent with real sub-issues gets
+        re-checked via _advance_parent_for_pr_review (this is what recovers a
+        parent stranded by a transient GitHub API failure)."""
+        project_config = self._make_project_config()
+        mock_project_state = MagicMock()
+        mock_board_state = MagicMock()
+        mock_board_state.project_number = 29
+        mock_project_state.boards = {'Planning & Design': mock_board_state}
+
+        with patch('config.manager.config_manager') as mock_config, \
+             patch('config.state_manager.state_manager') as mock_state, \
+             patch('services.project_monitor.ProjectMonitor') as mock_pm_class, \
+             patch('services.feature_branch_manager.feature_branch_manager') as mock_fbm, \
+             patch('services.github_integration.GitHubIntegration') as mock_gh_class, \
+             patch('task_queue.task_manager.TaskQueue'):
+            mock_config.list_visible_projects.return_value = ['test-project']
+            mock_config.get_project_config.return_value = project_config
+            mock_state.load_project_state.return_value = mock_project_state
+
+            mock_pm = mock_pm_class.return_value
+            mock_pm.get_project_items.return_value = [self._make_item(822, 'In Development')]
+            mock_pm._advance_parent_for_pr_review = AsyncMock()
+
+            mock_gh = AsyncMock()
+            mock_gh.get_issue.return_value = {'number': 822}
+            mock_gh_class.return_value = mock_gh
+
+            mock_fbm._get_sub_issues_from_parent = AsyncMock(
+                return_value=[{'number': 824, 'state': 'CLOSED'}]
+            )
+
+            await scheduled_tasks_service._sweep_orphaned_parents()
+
+            mock_pm._advance_parent_for_pr_review.assert_called_once_with(
+                'test-project', 822, project_config
+            )
+
+    @pytest.mark.asyncio
+    async def test_continues_after_per_item_error(self, scheduled_tasks_service):
+        """One item raising an exception doesn't stop the sweep from checking the rest"""
+        project_config = self._make_project_config()
+        mock_project_state = MagicMock()
+        mock_board_state = MagicMock()
+        mock_board_state.project_number = 29
+        mock_project_state.boards = {'Planning & Design': mock_board_state}
+
+        with patch('config.manager.config_manager') as mock_config, \
+             patch('config.state_manager.state_manager') as mock_state, \
+             patch('services.project_monitor.ProjectMonitor') as mock_pm_class, \
+             patch('services.feature_branch_manager.feature_branch_manager') as mock_fbm, \
+             patch('services.github_integration.GitHubIntegration') as mock_gh_class, \
+             patch('task_queue.task_manager.TaskQueue'):
+            mock_config.list_visible_projects.return_value = ['test-project']
+            mock_config.get_project_config.return_value = project_config
+            mock_state.load_project_state.return_value = mock_project_state
+
+            mock_pm = mock_pm_class.return_value
+            mock_pm.get_project_items.return_value = [
+                self._make_item(822, 'In Development'),
+                self._make_item(900, 'In Development'),
+            ]
+            mock_pm._advance_parent_for_pr_review = AsyncMock()
+
+            mock_gh = AsyncMock()
+            mock_gh.get_issue.side_effect = [Exception("GitHub API rate limit"), {'number': 900}]
+            mock_gh_class.return_value = mock_gh
+
+            mock_fbm._get_sub_issues_from_parent = AsyncMock(
+                return_value=[{'number': 901, 'state': 'CLOSED'}]
+            )
+
+            # Should not raise despite the first item's github.get_issue() blowing up
+            await scheduled_tasks_service._sweep_orphaned_parents()
+
+            # The second item still got processed
+            mock_pm._advance_parent_for_pr_review.assert_called_once_with(
+                'test-project', 900, project_config
+            )
+
+    @pytest.mark.asyncio
+    async def test_continues_after_per_project_error(self, scheduled_tasks_service):
+        """One project raising an exception doesn't stop the sweep from checking others"""
+        good_config = self._make_project_config()
+        mock_project_state = MagicMock()
+        mock_board_state = MagicMock()
+        mock_board_state.project_number = 29
+        mock_project_state.boards = {'Planning & Design': mock_board_state}
+
+        def get_project_config(name):
+            if name == 'broken-project':
+                raise Exception("Config load failed")
+            return good_config
+
+        with patch('config.manager.config_manager') as mock_config, \
+             patch('config.state_manager.state_manager') as mock_state, \
+             patch('services.project_monitor.ProjectMonitor') as mock_pm_class, \
+             patch('services.feature_branch_manager.feature_branch_manager') as mock_fbm, \
+             patch('services.github_integration.GitHubIntegration') as mock_gh_class, \
+             patch('task_queue.task_manager.TaskQueue'):
+            mock_config.list_visible_projects.return_value = ['broken-project', 'good-project']
+            mock_config.get_project_config.side_effect = get_project_config
+            mock_state.load_project_state.return_value = mock_project_state
+
+            mock_pm = mock_pm_class.return_value
+            mock_pm.get_project_items.return_value = [self._make_item(822, 'In Development')]
+            mock_pm._advance_parent_for_pr_review = AsyncMock()
+
+            mock_gh = AsyncMock()
+            mock_gh.get_issue.return_value = {'number': 822}
+            mock_gh_class.return_value = mock_gh
+
+            mock_fbm._get_sub_issues_from_parent = AsyncMock(
+                return_value=[{'number': 824, 'state': 'CLOSED'}]
+            )
+
+            # Should not raise despite 'broken-project' failing to load config
+            await scheduled_tasks_service._sweep_orphaned_parents()
+
+            # 'good-project' was still swept
+            mock_pm._advance_parent_for_pr_review.assert_called_once_with(
+                'good-project', 822, good_config
+            )
 
 
 class TestGlobalInstance:

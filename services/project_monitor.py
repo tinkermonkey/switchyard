@@ -3265,10 +3265,35 @@ class ProjectMonitor:
                 f"Checking if all sub-issues complete to mark PR ready..."
             )
 
-            # Step 3: Get parent issue data
-            parent_issue_data = await github.get_issue(parent_issue_number)
+            # Step 3: Get parent issue data.
+            # Retry on transient GitHub API failures (e.g. rate-limit circuit breaker open).
+            # This is a one-shot, event-triggered check with no other retry path — if it's
+            # skipped here, the parent can be stranded permanently since the sub-issue that
+            # triggered this call will never re-exit the pipeline. A short in-process retry
+            # covers brief blips; ScheduledTasksService._sweep_orphaned_parents covers the
+            # case where the circuit breaker stays open longer than these retries wait.
+            import asyncio
+            parent_issue_data = None
+            get_issue_max_retries = 3
+            for get_issue_attempt in range(1, get_issue_max_retries + 1):
+                parent_issue_data = await github.get_issue(parent_issue_number)
+                if parent_issue_data:
+                    break
+                if get_issue_attempt < get_issue_max_retries:
+                    backoff = 5 * (2 ** (get_issue_attempt - 1))  # 5s, 10s
+                    logger.warning(
+                        f"Could not get parent issue #{parent_issue_number} "
+                        f"(attempt {get_issue_attempt}/{get_issue_max_retries}), "
+                        f"retrying in {backoff}s..."
+                    )
+                    await asyncio.sleep(backoff)
+
             if not parent_issue_data:
-                logger.warning(f"Could not get parent issue #{parent_issue_number}, skipping PR ready check")
+                logger.warning(
+                    f"Could not get parent issue #{parent_issue_number} after "
+                    f"{get_issue_max_retries} attempts, skipping PR ready check for this event "
+                    f"(the periodic orphaned-parent sweep will retry this later)"
+                )
                 return
 
             # Step 4: Get all sub-issues from parent (queries GitHub directly)

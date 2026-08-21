@@ -76,6 +76,15 @@ class ScheduledTasksService:
             replace_existing=True
         )
 
+        # Schedule orphaned-parent sweep - every 15 minutes
+        self.scheduler.add_job(
+            self._sweep_orphaned_parents,
+            trigger=CronTrigger(minute='*/15'),
+            id='sweep_orphaned_parents',
+            name='Re-check parents stranded in "In Development" for PR-ready advance',
+            replace_existing=True
+        )
+
         # Token metrics: frequent short-lookback job keeps recent data fresh,
         # full job with longer lookback fills in historical gaps.
         token_metrics_hours = int(os.environ.get('TOKEN_METRICS_INTERVAL_HOURS', '3'))
@@ -160,6 +169,7 @@ class ScheduledTasksService:
         logger.info("- Docker state reconciliation: Every 5 minutes")
         logger.info("- Queue state reconciliation: Every 10 minutes")
         logger.info("- Empty output detection: Every 15 minutes")
+        logger.info("- Orphaned-parent sweep: Every 15 minutes")
         logger.info(f"- Token metrics (recent): Once at startup in ~{token_startup_jitter:.0f}s, then every 15m (1h lookback)")
         logger.info(f"- Token metrics (full): Every {token_metrics_hours}h")
         logger.info("- Project metrics rollup: Daily at 3:30 AM")
@@ -439,6 +449,114 @@ class ScheduledTasksService:
 
         except Exception as e:
             logger.error(f"Error in queue state reconciliation: {e}", exc_info=True)
+
+    async def _sweep_orphaned_parents(self):
+        """
+        Safety-net sweep for parent issues stranded in "In Development" whose sub-issues
+        are all already complete but which never got advanced to "In Review".
+
+        Normally, ProjectMonitor._check_pr_ready_on_issue_exit() advances a parent to
+        "In Review" the instant its last sub-issue exits to Staged/Done. That check is
+        one-shot and event-triggered — if a transient GitHub API failure (e.g. the
+        rate-limit circuit breaker being open) hits it at that exact moment, the parent
+        is stranded permanently, since the sub-issue that would have re-triggered the
+        check will never re-exit the pipeline again.
+
+        This job re-scans every project's planning board every 15 minutes and re-runs
+        ProjectMonitor._advance_parent_for_pr_review() for any "In Development" parent
+        that actually has sub-issues. That method re-verifies completeness itself and
+        has its own cooldown/review-cycle-limit guards, so calling it redundantly here
+        is safe — it no-ops for parents that are genuinely still in progress.
+        """
+        logger.info("Starting orphaned-parent sweep")
+
+        try:
+            from config.manager import config_manager
+            from config.state_manager import state_manager
+            from services.project_monitor import ProjectMonitor
+            from services.feature_branch_manager import feature_branch_manager
+            from services.github_integration import GitHubIntegration
+            from task_queue.task_manager import TaskQueue
+
+            task_queue = TaskQueue(use_redis=True)
+            project_monitor = ProjectMonitor(task_queue, config_manager)
+
+            checked_count = 0
+            error_count = 0
+
+            for project_name in config_manager.list_visible_projects():
+                try:
+                    project_config = config_manager.get_project_config(project_name)
+
+                    planning_pipeline = None
+                    for pipeline in project_config.pipelines:
+                        if not pipeline.active:
+                            continue
+                        if 'planning' in pipeline.name.lower() or 'planning' in pipeline.workflow.lower():
+                            planning_pipeline = pipeline
+                            break
+
+                    if not planning_pipeline:
+                        continue
+
+                    project_state = state_manager.load_project_state(project_name)
+                    if not project_state:
+                        continue
+
+                    board_state = project_state.boards.get(planning_pipeline.board_name)
+                    if not board_state:
+                        continue
+
+                    items = project_monitor.get_project_items(
+                        project_config.github['org'], board_state.project_number
+                    )
+                    in_dev_items = [item for item in items if item.status == "In Development"]
+
+                    if not in_dev_items:
+                        continue
+
+                    github = GitHubIntegration(
+                        repo_owner=project_config.github['org'],
+                        repo_name=project_config.github['repo']
+                    )
+
+                    for item in in_dev_items:
+                        try:
+                            parent_issue_data = await github.get_issue(item.issue_number)
+                            if not parent_issue_data:
+                                continue
+
+                            sub_issues = await feature_branch_manager._get_sub_issues_from_parent(
+                                github, parent_issue_data
+                            )
+                            if not sub_issues:
+                                # Not a sub-issue-bearing parent — out of scope for this sweep
+                                continue
+
+                            checked_count += 1
+                            await project_monitor._advance_parent_for_pr_review(
+                                project_name, item.issue_number, project_config
+                            )
+
+                        except Exception as e:
+                            logger.error(
+                                f"Error sweeping parent #{item.issue_number} in "
+                                f"{project_name}: {e}",
+                                exc_info=True
+                            )
+                            error_count += 1
+
+                except Exception as e:
+                    logger.error(f"Error sweeping project {project_name}: {e}", exc_info=True)
+                    error_count += 1
+
+            logger.info(
+                f"Orphaned-parent sweep complete: {checked_count} sub-issue-bearing "
+                f"'In Development' parents re-checked, {error_count} errors"
+            )
+
+        except Exception as e:
+            logger.error(f"Error in orphaned-parent sweep: {e}", exc_info=True)
 
     async def _detect_empty_outputs(self):
         """
