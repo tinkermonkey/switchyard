@@ -749,6 +749,193 @@ class TestReapOrphanedTestContainers:
         rm_calls = [c for c in mock_run.call_args_list if c.args[0][1] == 'rm']
         assert len(rm_calls) == 1
 
+    @pytest.mark.asyncio
+    async def test_multi_container_sweep_only_reaps_old_ones(self, scheduled_tasks_service):
+        """A batch with old and young containers only removes the old ones, by the right IDs"""
+        old_entry = self._docker_inspect_entry("old111", "gifted_bhaskara", age_minutes=600)
+        young_entry = self._docker_inspect_entry("young222", "boring_wilbur", age_minutes=2)
+
+        with patch('subprocess.run', side_effect=self._mock_subprocess_run({
+            'ps': (0, "old111\nyoung222\n", ""),
+            'inspect': (0, json.dumps([old_entry, young_entry]), ""),
+            'rm': (0, "old111\n", ""),
+        })) as mock_run:
+            await scheduled_tasks_service._reap_orphaned_test_containers()
+
+        rm_calls = [c.args[0] for c in mock_run.call_args_list if c.args[0][1] == 'rm']
+        assert rm_calls == [['docker', 'rm', '-f', 'old111']]
+
+    @pytest.mark.asyncio
+    async def test_rm_failure_on_one_container_does_not_abort_others(self, scheduled_tasks_service, caplog):
+        """One container's docker rm failing must not prevent removing the rest of the batch"""
+        entry_a = self._docker_inspect_entry("failer", "container-a", age_minutes=600)
+        entry_b = self._docker_inspect_entry("succeeder", "container-b", age_minutes=600)
+
+        def _run(cmd, **kwargs):
+            result = MagicMock()
+            if cmd[1] == 'ps':
+                result.returncode, result.stdout, result.stderr = (0, "failer\nsucceeder\n", "")
+            elif cmd[1] == 'inspect':
+                result.returncode, result.stdout, result.stderr = (0, json.dumps([entry_a, entry_b]), "")
+            elif cmd[1] == 'rm':
+                if cmd[-1] == 'failer':
+                    result.returncode, result.stdout, result.stderr = (1, "", "container is restarting")
+                else:
+                    result.returncode, result.stdout, result.stderr = (0, "succeeder\n", "")
+            return result
+
+        with patch('subprocess.run', side_effect=_run) as mock_run:
+            # Should not raise despite one rm failing
+            await scheduled_tasks_service._reap_orphaned_test_containers()
+
+        rm_calls = [c.args[0] for c in mock_run.call_args_list if c.args[0][1] == 'rm']
+        assert ['docker', 'rm', '-f', 'failer'] in rm_calls
+        assert ['docker', 'rm', '-f', 'succeeder'] in rm_calls
+        # Both attempts are logged, including the failure with its error and the successful removal
+        assert "removed=False" in caplog.text
+        assert "container is restarting" in caplog.text
+        assert "removed=True" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_unparseable_created_timestamp_is_skipped_and_logged(self, scheduled_tasks_service, caplog):
+        """A container with a Created value we can't parse is skipped (not crashed on) and reported"""
+        entry = self._docker_inspect_entry("weird1", "mystery-container", age_minutes=600)
+        entry["Created"] = "not-a-timestamp"
+
+        with patch('subprocess.run', side_effect=self._mock_subprocess_run({
+            'ps': (0, "weird1\n", ""),
+            'inspect': (0, json.dumps([entry]), ""),
+        })) as mock_run:
+            # Should not raise
+            await scheduled_tasks_service._reap_orphaned_test_containers()
+
+        rm_calls = [c for c in mock_run.call_args_list if c.args[0][1] == 'rm']
+        assert rm_calls == []
+        assert "could not parse Created" in caplog.text
+        assert "weird1" in caplog.text
+
+    @pytest.mark.parametrize("created_suffix", [
+        "Z",                 # no fractional seconds at all
+        ".1Z",               # 1 fractional digit
+        ".12345Z",           # 5 fractional digits
+        ".123456789Z",       # full 9-digit nanosecond precision
+    ])
+    @pytest.mark.asyncio
+    async def test_handles_variable_length_fractional_seconds(self, scheduled_tasks_service, created_suffix):
+        """Docker strips trailing zeros from fractional seconds -- every valid length must parse"""
+        old_created = (datetime.now(timezone.utc) - timedelta(minutes=600)).strftime("%Y-%m-%dT%H:%M:%S") + created_suffix
+        entry = self._docker_inspect_entry("varfrac1", "container-x", age_minutes=600)
+        entry["Created"] = old_created
+
+        with patch('subprocess.run', side_effect=self._mock_subprocess_run({
+            'ps': (0, "varfrac1\n", ""),
+            'inspect': (0, json.dumps([entry]), ""),
+            'rm': (0, "varfrac1\n", ""),
+        })) as mock_run:
+            await scheduled_tasks_service._reap_orphaned_test_containers()
+
+        rm_calls = [c.args[0] for c in mock_run.call_args_list if c.args[0][1] == 'rm']
+        assert rm_calls == [['docker', 'rm', '-f', 'varfrac1']]
+
+    @pytest.mark.asyncio
+    async def test_docker_inspect_partial_failure_still_processes_returned_containers(
+        self, scheduled_tasks_service, caplog
+    ):
+        """One container vanishing between `docker ps` and `docker inspect` shouldn't
+        discard results for the containers that were still found."""
+        entry = self._docker_inspect_entry("stillhere", "container-y", age_minutes=600)
+
+        with patch('subprocess.run', side_effect=self._mock_subprocess_run({
+            'ps': (0, "stillhere\nvanished\n", ""),
+            # docker inspect exits 1 but still prints the containers it could find
+            'inspect': (1, json.dumps([entry]), "Error: No such object: vanished"),
+            'rm': (0, "stillhere\n", ""),
+        })) as mock_run:
+            await scheduled_tasks_service._reap_orphaned_test_containers()
+
+        rm_calls = [c.args[0] for c in mock_run.call_args_list if c.args[0][1] == 'rm']
+        assert rm_calls == [['docker', 'rm', '-f', 'stillhere']]
+        assert "removed concurrently" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_docker_inspect_total_failure_still_raises(self, scheduled_tasks_service, caplog):
+        """No usable output at all from docker inspect is a real failure, not a partial-results case"""
+        with patch('subprocess.run', side_effect=self._mock_subprocess_run({
+            'ps': (0, "abc\n", ""),
+            'inspect': (1, "", "Cannot connect to the Docker daemon"),
+        })) as mock_run:
+            await scheduled_tasks_service._reap_orphaned_test_containers()
+
+        rm_calls = [c for c in mock_run.call_args_list if c.args[0][1] == 'rm']
+        assert rm_calls == []
+        assert "Error in orphaned testcontainers reaper" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_reaper_exempt_label_is_never_removed(self, scheduled_tasks_service):
+        """A container explicitly opted out via label is skipped regardless of age"""
+        entry = self._docker_inspect_entry("exempt1", "debug-session", age_minutes=600)
+        entry["Config"]["Labels"]["org.testcontainers.reaper-exempt"] = "true"
+
+        with patch('subprocess.run', side_effect=self._mock_subprocess_run({
+            'ps': (0, "exempt1\n", ""),
+            'inspect': (0, json.dumps([entry]), ""),
+        })) as mock_run:
+            await scheduled_tasks_service._reap_orphaned_test_containers()
+
+        rm_calls = [c for c in mock_run.call_args_list if c.args[0][1] == 'rm']
+        assert rm_calls == []
+
+    @pytest.mark.asyncio
+    async def test_age_exactly_at_threshold_is_reaped(self, scheduled_tasks_service, monkeypatch):
+        """Boundary: a container exactly at the threshold counts as reapable, not just strictly older"""
+        monkeypatch.setenv('TESTCONTAINERS_REAP_AGE_MINUTES', '30')
+        entry = self._docker_inspect_entry("boundary1", "container-z", age_minutes=30.01)
+
+        with patch('subprocess.run', side_effect=self._mock_subprocess_run({
+            'ps': (0, "boundary1\n", ""),
+            'inspect': (0, json.dumps([entry]), ""),
+            'rm': (0, "boundary1\n", ""),
+        })) as mock_run:
+            await scheduled_tasks_service._reap_orphaned_test_containers()
+
+        rm_calls = [c for c in mock_run.call_args_list if c.args[0][1] == 'rm']
+        assert len(rm_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_invalid_env_override_falls_back_to_default(self, scheduled_tasks_service, monkeypatch, caplog):
+        """A malformed TESTCONTAINERS_REAP_AGE_MINUTES doesn't crash the job -- it logs and uses the default"""
+        monkeypatch.setenv('TESTCONTAINERS_REAP_AGE_MINUTES', 'not-a-number')
+        entry = self._docker_inspect_entry("badenv1", "container-w", age_minutes=600)
+
+        with patch('subprocess.run', side_effect=self._mock_subprocess_run({
+            'ps': (0, "badenv1\n", ""),
+            'inspect': (0, json.dumps([entry]), ""),
+            'rm': (0, "badenv1\n", ""),
+        })) as mock_run:
+            # Should not raise
+            await scheduled_tasks_service._reap_orphaned_test_containers()
+
+        assert "Invalid TESTCONTAINERS_REAP_AGE_MINUTES" in caplog.text
+        rm_calls = [c for c in mock_run.call_args_list if c.args[0][1] == 'rm']
+        assert len(rm_calls) == 1  # still reaps using the fallback default (600m old container)
+
+    @pytest.mark.asyncio
+    async def test_zero_or_negative_env_override_falls_back_to_default(self, scheduled_tasks_service, monkeypatch, caplog):
+        """A zero/negative threshold would reap everything instantly -- reject it instead"""
+        monkeypatch.setenv('TESTCONTAINERS_REAP_AGE_MINUTES', '0')
+        entry = self._docker_inspect_entry("zeroenv1", "container-v", age_minutes=2)
+
+        with patch('subprocess.run', side_effect=self._mock_subprocess_run({
+            'ps': (0, "zeroenv1\n", ""),
+            'inspect': (0, json.dumps([entry]), ""),
+        })) as mock_run:
+            await scheduled_tasks_service._reap_orphaned_test_containers()
+
+        assert "Invalid TESTCONTAINERS_REAP_AGE_MINUTES" in caplog.text
+        rm_calls = [c for c in mock_run.call_args_list if c.args[0][1] == 'rm']
+        # 2-minute-old container must NOT be reaped once the invalid override is rejected
+        assert rm_calls == []
+
 
 class TestGlobalInstance:
     """Test global singleton instance"""
