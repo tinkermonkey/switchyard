@@ -68,6 +68,13 @@ services:
       - ORCHESTRATOR_WORKERS=${ORCHESTRATOR_WORKERS:-1}
       - PYTHONDONTWRITEBYTECODE=1
       - OTEL_COLLECTOR_HOST=otel-collector
+      # Switchyard's own switchyard.claude.token.usage OTLP metrics export (SigNoz or
+      # any OTLP collector). Distinct from OTEL_COLLECTOR_HOST above. See .env.example.
+      - OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+      - OTEL_EXPORTER_OTLP_HEADERS=${OTEL_EXPORTER_OTLP_HEADERS:-}
+      - OTEL_SERVICE_NAME=${OTEL_SERVICE_NAME:-}
+      - OTEL_RESOURCE_ATTRIBUTES=${OTEL_RESOURCE_ATTRIBUTES:-}
+      - OTEL_SDK_DISABLED=${OTEL_SDK_DISABLED:-}
       # Host home directory for Docker-in-Docker SSH/git mounts.
       # Must be set explicitly in .env — path inference via /proc/self/mountinfo
       # is unreliable under Snap Docker (see .env.example for details).

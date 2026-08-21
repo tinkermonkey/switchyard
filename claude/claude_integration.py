@@ -413,6 +413,7 @@ Files: {context.get('files', [])}
                                                    cache_read_tokens=cache_read_tokens,
                                                    cache_creation_tokens=cache_creation_tokens,
                                                    success=success,
+                                                   model=claude_model,
                                                    pipeline_run_id=_local_pipeline_run_id or None)
 
                 if process.returncode == 0:

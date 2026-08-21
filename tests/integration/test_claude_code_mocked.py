@@ -257,6 +257,12 @@ class TestClaudeCodeEventEmission:
         assert data['output_tokens'] == 25
         assert data['total_tokens'] == 75
         assert data['duration_ms'] > 0
+        # model must be threaded through to the COMPLETED event, not just STARTED
+        # (see test_claude_call_started_event above) - this is the field the new
+        # OTLP telemetry sink (monitoring/telemetry.py) tags every metric point
+        # with, so a regression here would silently collapse per-model
+        # breakdowns in SigNoz to "unknown" without failing anything else.
+        assert data['model'] == 'claude-sonnet-4-5-20250929'
 
 
 class TestClaudeCodeStreamEvents:
