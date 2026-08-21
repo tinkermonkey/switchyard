@@ -58,6 +58,15 @@ class ScheduledTasksService:
             replace_existing=True
         )
 
+        # Schedule orphaned testcontainers reaper - every 15 minutes
+        self.scheduler.add_job(
+            self._reap_orphaned_test_containers,
+            trigger=CronTrigger(minute='*/15'),
+            id='reap_orphaned_test_containers',
+            name='Force-remove orphaned testcontainers-managed containers',
+            replace_existing=True
+        )
+
         # Schedule queue state reconciliation with GitHub - every 10 minutes
         self.scheduler.add_job(
             self._reconcile_queue_state,
@@ -166,6 +175,7 @@ class ScheduledTasksService:
         logger.info("- Orphaned branch cleanup: Daily at 2 AM")
         logger.info("- Stale branch checks: Daily at 9 AM")
         logger.info("- Orphaned container cleanup: Every 20 minutes")
+        logger.info("- Orphaned testcontainers reaper: Every 15 minutes")
         logger.info("- Docker state reconciliation: Every 5 minutes")
         logger.info("- Queue state reconciliation: Every 10 minutes")
         logger.info("- Empty output detection: Every 15 minutes")
@@ -384,6 +394,121 @@ class ScheduledTasksService:
 
         except Exception as e:
             logger.error(f"Error in orphaned container cleanup: {e}", exc_info=True)
+
+    async def _reap_orphaned_test_containers(self):
+        """
+        Force-remove orphaned testcontainers-managed containers.
+
+        Some projects' own test suites (currently: codetoreum) use the Python
+        testcontainers library to spin up real Docker fixtures (Elasticsearch,
+        Redis, etc.) for integration tests. Cleanup normally happens via
+        testcontainers' "Ryuk" reaper sidecar, or barring that, the owning
+        test process's own try/finally blocks and a pytest_sessionfinish
+        hook. All three require the test process to still be alive: Ryuk
+        needs a live reverse connection back to it, and the in-process hooks
+        only run on a graceful exit. codetoreum disables Ryuk entirely
+        (TESTCONTAINERS_RYUK_DISABLED=true in its tests/conftest.py) because
+        it can't reliably reach back to the test process across this host's
+        Docker-outside-of-Docker network topology, so it relies solely on the
+        in-process paths (see codetoreum PRs #957/#958) — which do nothing if
+        the test process itself is killed outright rather than exiting
+        cleanly (e.g. its container gets SIGTERM'd under host memory
+        pressure). Orphaned Elasticsearch fixtures left running for hours
+        have driven host swap to near-total exhaustion this way more than
+        once.
+
+        This is the external safety net for that gap: anything labeled
+        org.testcontainers=true that has been running longer than
+        REAP_AGE_MINUTES has almost certainly outlived its test session (the
+        longest observed legitimate integration test run on this host is
+        ~10 minutes), so it's safe to force-remove regardless of which
+        project or session started it — this doesn't depend on any
+        project-specific knowledge.
+        """
+        logger.info("Starting orphaned testcontainers reaper sweep")
+
+        reap_age_minutes = int(os.environ.get('TESTCONTAINERS_REAP_AGE_MINUTES', '30'))
+
+        def _sweep():
+            import subprocess
+            import json
+            from datetime import datetime, timezone
+
+            result = subprocess.run(
+                ['docker', 'ps', '-a', '--filter', 'label=org.testcontainers=true', '-q'],
+                capture_output=True, text=True, timeout=30
+            )
+            if result.returncode != 0:
+                raise RuntimeError(f"docker ps failed: {result.stderr.strip()}")
+            container_ids = [c for c in result.stdout.strip().splitlines() if c]
+            if not container_ids:
+                return {'found': 0, 'reaped': []}
+
+            inspect = subprocess.run(
+                ['docker', 'inspect'] + container_ids,
+                capture_output=True, text=True, timeout=30
+            )
+            if inspect.returncode != 0:
+                raise RuntimeError(f"docker inspect failed: {inspect.stderr.strip()}")
+            containers = json.loads(inspect.stdout)
+
+            now = datetime.now(timezone.utc)
+            reaped = []
+            for c in containers:
+                created_str = c.get('Created', '')
+                try:
+                    # Docker's Created is RFC3339Nano UTC (e.g. "...Z" with up
+                    # to 9 fractional digits) — truncate to microsecond
+                    # precision so fromisoformat can parse it regardless of
+                    # Python version quirks around fractional-second length.
+                    created = datetime.fromisoformat(created_str[:26] + '+00:00')
+                except Exception:
+                    continue
+                age_minutes = (now - created).total_seconds() / 60
+                if age_minutes < reap_age_minutes:
+                    continue
+
+                labels = (c.get('Config', {}) or {}).get('Labels', {}) or {}
+                info = {
+                    'name': c.get('Name', '').lstrip('/'),
+                    'image': (c.get('Config', {}) or {}).get('Image', 'unknown'),
+                    'session_id': labels.get('org.testcontainers.session-id', 'unknown'),
+                    'age_minutes': round(age_minutes, 1),
+                }
+                rm = subprocess.run(
+                    ['docker', 'rm', '-f', c['Id']],
+                    capture_output=True, text=True, timeout=30
+                )
+                info['removed'] = rm.returncode == 0
+                if rm.returncode != 0:
+                    info['error'] = rm.stderr.strip()
+                reaped.append(info)
+
+            return {'found': len(containers), 'reaped': reaped}
+
+        try:
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(None, _sweep)
+            reaped = result['reaped']
+            if reaped:
+                for d in reaped:
+                    logger.warning(
+                        f"Reaped orphaned testcontainer '{d['name']}' (image={d['image']}, "
+                        f"session={d['session_id']}, age={d['age_minutes']}m, "
+                        f"removed={d['removed']}" + (f", error={d['error']}" if not d['removed'] else "") + ")"
+                    )
+                logger.warning(
+                    f"Orphaned testcontainers reaper: removed {sum(1 for d in reaped if d['removed'])} "
+                    f"of {result['found']} testcontainers-labeled container(s) "
+                    f"older than {reap_age_minutes}m"
+                )
+            else:
+                logger.info(
+                    f"Orphaned testcontainers reaper: {result['found']} testcontainers-labeled "
+                    f"container(s) found, none older than {reap_age_minutes}m"
+                )
+        except Exception as e:
+            logger.error(f"Error in orphaned testcontainers reaper: {e}", exc_info=True)
 
     async def _reconcile_queue_state(self):
         """
@@ -752,6 +877,11 @@ class ScheduledTasksService:
     def run_orphaned_container_cleanup_now(self):
         """Alias for run_container_cleanup_now (replaces removed Docker reconciliation)"""
         self.run_container_cleanup_now()
+
+    def run_test_container_reaper_now(self):
+        """Run orphaned testcontainers reaper immediately (for testing/manual trigger)"""
+        logger.info("Manually triggering orphaned testcontainers reaper")
+        asyncio.create_task(self._reap_orphaned_test_containers())
 
     def run_queue_reconciliation_now(self):
         """Run queue state reconciliation immediately (for testing/manual trigger)"""

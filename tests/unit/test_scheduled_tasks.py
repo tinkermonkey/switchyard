@@ -8,8 +8,9 @@ if not os.path.isdir('/app'):
     pytest.skip("Requires Docker container environment", allow_module_level=True)
 
 import asyncio
+import json
 from unittest.mock import AsyncMock, patch, MagicMock
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 
 from services.scheduled_tasks import ScheduledTasksService
 
@@ -137,6 +138,24 @@ class TestScheduledJobConfiguration:
 
         # Verify trigger (CronTrigger, minute='*/15')
         trigger = sweep_job.trigger
+        minute_field = trigger.fields[6]
+        assert str(minute_field) == '*/15'
+
+        # Cleanup
+        scheduled_tasks_service.stop()
+
+    @pytest.mark.asyncio
+    async def test_reap_orphaned_test_containers_job_schedule(self, scheduled_tasks_service):
+        """Test orphaned testcontainers reaper job is scheduled every 15 minutes"""
+        scheduled_tasks_service.start()
+
+        reaper_job = scheduled_tasks_service.scheduler.get_job('reap_orphaned_test_containers')
+
+        assert reaper_job is not None
+        assert reaper_job.func == scheduled_tasks_service._reap_orphaned_test_containers
+
+        # Verify trigger (CronTrigger, minute='*/15')
+        trigger = reaper_job.trigger
         minute_field = trigger.fields[6]
         assert str(minute_field) == '*/15'
 
@@ -350,6 +369,20 @@ class TestManualTriggers:
 
             # Manually trigger
             scheduled_tasks_service.run_stale_check_now()
+
+            # Verify task creation was called
+            mock_create_task.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_run_test_container_reaper_now(self, scheduled_tasks_service):
+        """Test manual testcontainers reaper trigger"""
+        with patch.object(scheduled_tasks_service, '_reap_orphaned_test_containers') as mock_reap, \
+             patch('asyncio.create_task') as mock_create_task:
+
+            mock_reap = AsyncMock()
+
+            # Manually trigger
+            scheduled_tasks_service.run_test_container_reaper_now()
 
             # Verify task creation was called
             mock_create_task.assert_called_once()
@@ -619,6 +652,102 @@ class TestSweepOrphanedParents:
             mock_pm._advance_parent_for_pr_review.assert_called_once_with(
                 'good-project', 822, good_config
             )
+
+
+class TestReapOrphanedTestContainers:
+    """Test orphaned testcontainers reaper task"""
+
+    @staticmethod
+    def _docker_inspect_entry(container_id: str, name: str, age_minutes: float,
+                              session_id: str = "abc-123", image: str = "elasticsearch:8.17.0") -> dict:
+        created = datetime.now(timezone.utc) - timedelta(minutes=age_minutes)
+        return {
+            "Id": container_id,
+            "Name": f"/{name}",
+            "Created": created.strftime("%Y-%m-%dT%H:%M:%S.%f") + "000Z",
+            "Config": {
+                "Image": image,
+                "Labels": {"org.testcontainers": "true", "org.testcontainers.session-id": session_id},
+            },
+        }
+
+    @staticmethod
+    def _mock_subprocess_run(responses: dict):
+        """Build a subprocess.run side_effect keyed by the docker subcommand (argv[1])."""
+        def _run(cmd, **kwargs):
+            result = MagicMock()
+            subcommand = cmd[1] if len(cmd) > 1 else None
+            result.returncode, result.stdout, result.stderr = responses.get(subcommand, (0, "", ""))
+            return result
+        return _run
+
+    @pytest.mark.asyncio
+    async def test_reaps_container_older_than_threshold(self, scheduled_tasks_service):
+        """A testcontainers-labeled container past the age threshold gets force-removed"""
+        entry = self._docker_inspect_entry("abc111", "gifted_bhaskara", age_minutes=600)
+
+        with patch('subprocess.run', side_effect=self._mock_subprocess_run({
+            'ps': (0, "abc111\n", ""),
+            'inspect': (0, json.dumps([entry]), ""),
+            'rm': (0, "abc111\n", ""),
+        })) as mock_run:
+            await scheduled_tasks_service._reap_orphaned_test_containers()
+
+        rm_calls = [c for c in mock_run.call_args_list if c.args[0][1] == 'rm']
+        assert len(rm_calls) == 1
+        assert rm_calls[0].args[0] == ['docker', 'rm', '-f', 'abc111']
+
+    @pytest.mark.asyncio
+    async def test_skips_container_younger_than_threshold(self, scheduled_tasks_service):
+        """A fresh testcontainers-labeled container (e.g. mid-test) is left alone"""
+        entry = self._docker_inspect_entry("abc222", "boring_wilbur", age_minutes=2)
+
+        with patch('subprocess.run', side_effect=self._mock_subprocess_run({
+            'ps': (0, "abc222\n", ""),
+            'inspect': (0, json.dumps([entry]), ""),
+        })) as mock_run:
+            await scheduled_tasks_service._reap_orphaned_test_containers()
+
+        rm_calls = [c for c in mock_run.call_args_list if c.args[0][1] == 'rm']
+        assert rm_calls == []
+
+    @pytest.mark.asyncio
+    async def test_no_testcontainers_labeled_containers(self, scheduled_tasks_service):
+        """Nothing to do when docker ps finds no matches"""
+        with patch('subprocess.run', side_effect=self._mock_subprocess_run({
+            'ps': (0, "", ""),
+        })) as mock_run:
+            await scheduled_tasks_service._reap_orphaned_test_containers()
+
+        assert all(c.args[0][1] != 'inspect' for c in mock_run.call_args_list)
+        assert all(c.args[0][1] != 'rm' for c in mock_run.call_args_list)
+
+    @pytest.mark.asyncio
+    async def test_handles_docker_ps_failure_gracefully(self, scheduled_tasks_service, caplog):
+        """A docker CLI failure is logged, not raised"""
+        with patch('subprocess.run', side_effect=self._mock_subprocess_run({
+            'ps': (1, "", "Cannot connect to the Docker daemon"),
+        })):
+            # Should not raise
+            await scheduled_tasks_service._reap_orphaned_test_containers()
+
+        assert "Error in orphaned testcontainers reaper" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_respects_reap_age_env_override(self, scheduled_tasks_service, monkeypatch):
+        """TESTCONTAINERS_REAP_AGE_MINUTES lowers/raises the age threshold"""
+        monkeypatch.setenv('TESTCONTAINERS_REAP_AGE_MINUTES', '5')
+        entry = self._docker_inspect_entry("abc333", "quizzical_chatelet", age_minutes=10)
+
+        with patch('subprocess.run', side_effect=self._mock_subprocess_run({
+            'ps': (0, "abc333\n", ""),
+            'inspect': (0, json.dumps([entry]), ""),
+            'rm': (0, "abc333\n", ""),
+        })) as mock_run:
+            await scheduled_tasks_service._reap_orphaned_test_containers()
+
+        rm_calls = [c for c in mock_run.call_args_list if c.args[0][1] == 'rm']
+        assert len(rm_calls) == 1
 
 
 class TestGlobalInstance:
