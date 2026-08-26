@@ -4769,10 +4769,39 @@ _Review cycle initiated by Switchyard_
                                                     f"rolling back lock acquisition to prevent deadlock"
                                                 )
                                                 try:
-                                                    lock_mgr.release_lock(project_name, board_name, next_issue['issue_number'])
-                                                    logger.info(f"Rolled back lock for issue #{next_issue['issue_number']}")
+                                                    rolled_back = lock_mgr.release_lock(
+                                                        project_name, board_name, next_issue['issue_number']
+                                                    )
+                                                    if rolled_back:
+                                                        logger.info(f"Rolled back lock for issue #{next_issue['issue_number']}")
+                                                    else:
+                                                        # Unlike most other release_lock() failures in this
+                                                        # file, this one does NOT self-heal via
+                                                        # _reconcile_active_runs' stale-lock watchdog: by
+                                                        # this point ensure_pipeline_run_for_task() has
+                                                        # likely already created an active PipelineRun for
+                                                        # this issue, and the watchdog only reaps a lock
+                                                        # when get_active_pipeline_run() returns None — so
+                                                        # it won't. The lock stays held with no work ever
+                                                        # dispatched: a genuine, permanent deadlock on this
+                                                        # board.
+                                                        logger.critical(
+                                                            f"Could NOT roll back lock for issue "
+                                                            f"#{next_issue['issue_number']} after dispatch "
+                                                            f"failed — this lock will NOT self-heal (an "
+                                                            f"active pipeline run likely already exists for "
+                                                            f"it, so the stale-lock watchdog won't reap it) "
+                                                            f"and no work will be dispatched. This is a "
+                                                            f"permanent deadlock on {project_name}/{board_name} "
+                                                            f"requiring manual intervention "
+                                                            f"(scripts/release_lock.py --force)."
+                                                        )
                                                 except Exception as rollback_error:
-                                                    logger.error(f"Failed to rollback lock: {rollback_error}")
+                                                    logger.critical(
+                                                        f"Failed to rollback lock for issue "
+                                                        f"#{next_issue['issue_number']} (see deadlock risk "
+                                                        f"noted above): {rollback_error}"
+                                                    )
 
                                             logger.error(f"Error dispatching agent for next issue: {dispatch_error}")
                                             import traceback
@@ -5832,7 +5861,15 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
             # Only one repair cycle should run at a time per pipeline
             from services.pipeline_lock_manager import get_pipeline_lock_manager
             lock_manager = get_pipeline_lock_manager()
-            current_lock = lock_manager.get_lock(project_name, board_name)
+            current_lock, lock_reads_healthy = lock_manager.get_lock_fail_closed(project_name, board_name)
+            if not lock_reads_healthy:
+                logger.error(
+                    f"Could not determine lock state for {project_name}/{board_name} "
+                    f"(both Redis and YAML reads failed) — refusing to start a "
+                    f"repair cycle for issue #{issue_number} rather than risk "
+                    f"competing with a repair cycle we can't actually see"
+                )
+                return None
 
             if current_lock and current_lock.locked_by_issue != issue_number:
                 # Another issue holds the lock - check if it's also a repair cycle
@@ -5911,7 +5948,21 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
             from services.pipeline_lock_manager import get_pipeline_lock_manager
             lock_manager = get_pipeline_lock_manager()
 
-            current_lock = lock_manager.get_lock(project_name, board_name)
+            # Fail-closed read: get_lock() alone would return None indistinguishably
+            # for "genuinely unlocked" and "both Redis and YAML reads failed" — the
+            # latter would fall into the `elif not current_lock:` branch below and
+            # call _create_lock() directly, bypassing the retained_reason check just
+            # below entirely (since there'd be no current_lock object to check). This
+            # was the last remaining fail-open read gating a _create_lock() call.
+            current_lock, lock_reads_healthy = lock_manager.get_lock_fail_closed(project_name, board_name)
+            if not lock_reads_healthy:
+                logger.error(
+                    f"Could not determine lock state for {project_name}/{board_name} "
+                    f"(both Redis and YAML reads failed) — refusing to start a "
+                    f"repair cycle for issue #{issue_number} rather than risk "
+                    f"creating a lock while a retained one might actually be held"
+                )
+                return None
 
             if current_lock and current_lock.locked_by_issue != issue_number:
                 # A retained/failed lock must NEVER be stolen — that would silently
@@ -6365,12 +6416,13 @@ _Repair cycle initiated by Switchyard_
                                     f"held by issue #{lock.locked_by_issue} with no active pipeline run. "
                                     f"Releasing lock..."
                                 )
-                                if not lock_manager.release_lock(project_name, pipeline.board_name, lock.locked_by_issue):
+                                if lock_manager.release_lock(project_name, pipeline.board_name, lock.locked_by_issue):
+                                    logger.info(f"Released stale lock for issue #{lock.locked_by_issue}")
+                                else:
                                     logger.error(
                                         f"Failed to release stale lock on {project_name}/"
                                         f"{pipeline.board_name} (issue #{lock.locked_by_issue})"
                                     )
-                                logger.info(f"Released stale lock for issue #{lock.locked_by_issue}")
 
         except Exception as e:
             logger.error(f"Error reconciling active runs: {e}")

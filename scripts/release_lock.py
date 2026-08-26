@@ -54,7 +54,23 @@ def main():
     args = parser.parse_args()
 
     lock_manager = get_pipeline_lock_manager()
-    lock = lock_manager.get_lock(args.project, args.board)
+    # get_lock_fail_closed(), not the plain get_lock() — this is the tool a
+    # human runs specifically to recover from a stuck board, so it's exactly
+    # the wrong place to fold "couldn't determine lock state" into "nothing to
+    # do": an outage severe enough to make Redis AND the YAML file both
+    # unreadable is precisely when an operator most needs an honest "unknown"
+    # rather than false reassurance that there's nothing to release.
+    lock, reads_healthy = lock_manager.get_lock_fail_closed(args.project, args.board)
+
+    if not reads_healthy:
+        print(
+            f"Could not determine lock state for {args.project}/{args.board} — "
+            f"both Redis and the YAML state file failed to read. This does NOT "
+            f"mean the board is unlocked; it means lock state is currently "
+            f"unknown. Check Redis connectivity and the state file at "
+            f"state/pipeline_locks/ before assuming anything, then retry."
+        )
+        sys.exit(1)
 
     if not lock or lock.lock_status != 'locked':
         print(f"{args.project}/{args.board} is not currently locked. Nothing to do.")

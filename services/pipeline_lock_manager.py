@@ -570,15 +570,21 @@ class PipelineLockManager:
                     f"refusing to release without force=True"
                 )
                 return False
-            if (
-                existing_lock
-                and existing_lock.locked_by_issue == issue_number
-                and existing_lock.retained_reason
-            ):
+            if existing_lock and existing_lock.retained_reason:
+                # Deliberately NOT conditioned on
+                # existing_lock.locked_by_issue == issue_number — a retained
+                # lock must refuse release regardless of which issue_number the
+                # caller names. Several automatic call sites release on behalf
+                # of a queue entry or a different issue than the current holder
+                # (e.g. cleanup/failsafe paths); if this guard only fired for
+                # the exact holder, any of those could still delete a retained
+                # lock out from under a different, failed issue.
                 logger.warning(
-                    f"release_lock: refusing to release {project}/{board} lock "
-                    f"for issue #{issue_number} — it is retained due to a "
-                    f"failed run ({existing_lock.retained_reason}). Only "
+                    f"release_lock: refusing to release {project}/{board} "
+                    f"(requested on behalf of issue #{issue_number}) — it is "
+                    f"retained due to a failed run on issue "
+                    f"#{existing_lock.locked_by_issue} "
+                    f"({existing_lock.retained_reason}). Only "
                     f"scripts/release_lock.py's deliberate recovery flow may "
                     f"clear this (pass force=True)."
                 )
@@ -637,9 +643,20 @@ class PipelineLockManager:
                                 )
                                 return False
                             elif result == "not_found":
-                                # Already gone, consider it success (idempotent)
-                                logger.debug(f"Lock for {project}/{board} already gone during release by #{issue_number}")
-                                redis_confirmed_ownership = True
+                                # Already gone from Redis, consider it success
+                                # (idempotent) — but this is NOT an ownership
+                                # confirmation, so redis_confirmed_ownership stays
+                                # False. A retained lock's Redis copy is EXPECTED
+                                # to TTL out (2h) since nothing legitimately
+                                # re-touches a retained lock, so "not_found" is
+                                # actually the normal steady state for a lock
+                                # retained more than two hours — treating it as a
+                                # confirmed release here would skip the YAML
+                                # ownership check below and let the one
+                                # non-expiring copy of a retained lock be deleted
+                                # with no validation. This was a real bug in the
+                                # first version of this fix.
+                                logger.debug(f"Lock for {project}/{board} already gone from Redis during release by #{issue_number}")
                                 # Fall through to clean up YAML just in case
                                 break
                             else:
@@ -680,9 +697,38 @@ class PipelineLockManager:
                                     if lock_data and int(lock_data.get('locked_by_issue', 0)) != issue_number:
                                         should_delete = False
                                         logger.warning(f"YAML lock held by {lock_data.get('locked_by_issue')} != {issue_number}")
-                            except Exception:
-                                pass # If read fails, assume safe to delete or let it be?
-                        
+                                    elif lock_data and lock_data.get('retained_reason') and not force:
+                                        # Same defense-in-depth as the upfront guard —
+                                        # this YAML record is retained; refuse even if
+                                        # locked_by_issue happens to match (shouldn't
+                                        # be reachable given the upfront check, but
+                                        # this is the last line of defense before
+                                        # deleting the only non-expiring copy). Respects
+                                        # force just like the upfront guard does — this
+                                        # is the deliberate-recovery path's own release
+                                        # call, which legitimately needs to delete a
+                                        # retained lock's YAML record.
+                                        should_delete = False
+                                        logger.warning(
+                                            f"YAML lock for {project}/{board} is retained "
+                                            f"due to a failed run — refusing to delete "
+                                            f"(reason: {lock_data.get('retained_reason')})"
+                                        )
+                            except Exception as read_err:
+                                # Fail CLOSED, not open: this read exists specifically
+                                # to verify ownership before deleting the one
+                                # non-expiring copy of a lock. An unreadable file
+                                # (I/O error, corrupt/partial YAML) means that
+                                # verification could not happen — it must not be
+                                # treated as "safe to delete anyway".
+                                should_delete = False
+                                logger.error(
+                                    f"Failed to read YAML lock state for {project}/{board} "
+                                    f"during ownership verification — refusing to delete "
+                                    f"rather than risk removing a lock held by someone "
+                                    f"else: {read_err}"
+                                )
+
                         if should_delete:
                             state_file.unlink()
                             logger.debug(f"Deleted lock YAML file: {state_file}")

@@ -26,9 +26,10 @@ def _make_lock(locked_by_issue=123, retained_reason=None, lock_status='locked'):
 
 
 class TestReleaseLockScript(unittest.TestCase):
-    def _run(self, argv, get_lock_return, release_lock_return=True):
+    def _run(self, argv, get_lock_return, release_lock_return=True, reads_healthy=True):
         mock_lock_manager = MagicMock()
         mock_lock_manager.get_lock.return_value = get_lock_return
+        mock_lock_manager.get_lock_fail_closed.return_value = (get_lock_return, reads_healthy)
         mock_lock_manager.release_lock.return_value = release_lock_return
         mock_queue = MagicMock()
         mock_cancellation = MagicMock()
@@ -52,6 +53,19 @@ class TestReleaseLockScript(unittest.TestCase):
         )
         lock_manager.release_lock.assert_not_called()
         self.assertIsNone(exit_code)
+
+    def test_fails_closed_when_lock_state_cannot_be_determined(self):
+        """This is the deliberate recovery tool a human runs specifically
+        during an outage — it must not fold "both Redis and YAML failed to
+        read" into "nothing to do", which would actively mislead an operator
+        exactly when they most need an honest "state unknown"."""
+        lock_manager, queue, cancellation, exit_code = self._run(
+            ['--project', 'proj', '--board', 'board', '--issue', '123'],
+            get_lock_return=None,
+            reads_healthy=False,
+        )
+        lock_manager.release_lock.assert_not_called()
+        self.assertEqual(exit_code, 1)
 
     def test_refuses_when_held_by_a_different_issue(self):
         lock = _make_lock(locked_by_issue=999, retained_reason='crashed')

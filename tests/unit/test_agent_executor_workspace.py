@@ -375,3 +375,65 @@ class TestAgentExecutorWorkspaceIntegration:
             comment_args, _ = mock_github.post_comment.call_args
             assert comment_args[0] == 793
             assert 'Workspace Preparation Failed' in comment_args[1]
+            # The default MagicMock() return of mark_failed() is truthy, so this
+            # run exercises the "successfully retained" branch — see the
+            # companion test below for the marked_successfully=False branch.
+            assert 'Pipeline lock retained' in comment_args[1]
+            assert 'could NOT be durably marked' not in comment_args[1]
+
+    @pytest.mark.asyncio
+    async def test_git_workspace_prep_failure_comment_warns_when_mark_failed_fails(self, agent_executor):
+        """The other half of test_git_workspace_prep_failure_retains_lock_and_comments:
+        when mark_failed() itself reports it could NOT durably retain the lock
+        (both Redis and YAML writes failed), the posted comment must say so —
+        not unconditionally claim "the lock is retained", which would itself be
+        a silent-failure regression (a human reading it would believe the
+        board is protected when it may not be)."""
+        task_context = {
+            'issue_number': 793,
+            'workspace_type': 'issues',
+        }
+
+        with patch('services.workspace.WorkspaceContextFactory') as mock_factory, \
+             patch('config.manager.config_manager') as mock_config, \
+             patch('services.github_integration.GitHubIntegration') as mock_github_cls, \
+             patch('services.pipeline_run.get_pipeline_run_manager') as mock_get_prm, \
+             patch.object(agent_executor.factory, 'create_agent') as mock_create, \
+             patch.object(agent_executor.obs, 'emit_task_received'), \
+             patch.object(agent_executor.obs, 'emit_agent_initialized'), \
+             patch.object(agent_executor.obs, 'emit_agent_completed'):
+
+            mock_project_config = MagicMock()
+            mock_project_config.github = {'org': 'test-org', 'repo': 'test-repo'}
+            mock_config.get_project_config.return_value = mock_project_config
+
+            mock_workspace = MagicMock()
+            mock_workspace.supports_git_operations = True
+            mock_workspace.prepare_execution = AsyncMock(
+                side_effect=Exception("Failed to stash changes: error: could not write index\n")
+            )
+            mock_factory.create.return_value = mock_workspace
+
+            mock_agent = MagicMock()
+            mock_agent.agent_config = {}
+            mock_create.return_value = mock_agent
+
+            mock_github = MagicMock()
+            mock_github.post_comment = AsyncMock()
+            mock_github_cls.return_value = mock_github
+
+            mock_prm = MagicMock()
+            mock_prm.mark_failed.return_value = False  # both Redis and YAML writes failed
+            mock_get_prm.return_value = mock_prm
+
+            from agents.non_retryable import NonRetryableAgentError
+            with pytest.raises(NonRetryableAgentError):
+                await agent_executor.execute_agent(
+                    agent_name='senior_software_engineer',
+                    project_name='documentation_robotics',
+                    task_context=task_context
+                )
+
+            comment_args, _ = mock_github.post_comment.call_args
+            assert 'could NOT be durably marked retained' in comment_args[1]
+            assert 'Pipeline lock retained' not in comment_args[1]

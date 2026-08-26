@@ -4164,8 +4164,24 @@ def release_pipeline_lock(project, board):
         specified_issue = request_data.get('issue_number')
         force = bool(request_data.get('force'))
 
-        # Check current lock status
-        lock = lock_manager.get_lock(project, board)
+        # Check current lock status — get_lock_fail_closed(), not the plain
+        # get_lock(). This endpoint is a deliberate human recovery action
+        # (the web-UI equivalent of scripts/release_lock.py), so it must not
+        # fold "both Redis and YAML failed to read" into "no active lock" —
+        # an outage severe enough to cause that is exactly when an operator
+        # most needs an honest "state unknown" rather than false reassurance.
+        lock, reads_healthy = lock_manager.get_lock_fail_closed(project, board)
+
+        if not reads_healthy:
+            return jsonify({
+                'success': False,
+                'message': (
+                    f'Could not determine lock state for {project}/{board} — '
+                    f'both Redis and the YAML state file failed to read. This '
+                    f'does not mean the board is unlocked.'
+                ),
+                'lock_status': None
+            }), 500
 
         if not lock or lock.lock_status != 'locked':
             return jsonify({

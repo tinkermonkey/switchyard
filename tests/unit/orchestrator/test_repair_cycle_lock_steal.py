@@ -11,6 +11,21 @@ This test exercises the fix directly: a retained lock held by a different
 issue must cause _start_repair_cycle_for_issue to refuse and return None,
 without ever calling release_lock() or _create_lock() (both of which are
 mocked here specifically so a call to either fails the test immediately).
+
+IMPORTANT — this test previously did NOT reliably exercise the fix at all: in
+any environment without a live Redis reachable at the `redis` hostname (e.g.
+a bare `pytest`/`docker run` invocation, per this repo's own CLAUDE.md
+convention of "No Redis/ES locally: tests handle gracefully via mocks or
+skips"), the unmocked self.pipeline_run_manager.get_or_create_pipeline_run()
+call raised a connection error BEFORE the lock-steal logic ever ran, was
+swallowed by _start_repair_cycle_for_issue's own outer exception handler, and
+returned None regardless of whether the fix was present or reverted — making
+all three assertions pass vacuously. pipeline_run_manager and the `gh` CLI
+subprocess call (also unmocked, also real) are both explicitly mocked below
+so this test is deterministic in any environment, matching the pattern
+already used by every sibling test in this directory
+(test_agent_routing.py, test_retained_lock_gate.py, etc., which all mock
+services.pipeline_run.get_pipeline_run_manager).
 """
 
 import pytest
@@ -30,11 +45,15 @@ class TestRepairCycleLockSteal:
     ):
         """The core regression test: a repair cycle must never steal a
         retained lock out from under a different, failed issue."""
-        # A different issue (999) holds a retained lock.
+        # A different issue (999) holds a retained lock. _start_repair_cycle_for_issue
+        # reads this via get_lock_fail_closed() (fail-closed, returns a
+        # (lock, reads_healthy) tuple) at both of its lock-check points, not
+        # the plain get_lock().
         retained_lock = Mock()
         retained_lock.locked_by_issue = 999
         retained_lock.retained_reason = "Repair cycle failed: simulated"
         mock_pipeline_lock_manager_auto.get_lock.return_value = retained_lock
+        mock_pipeline_lock_manager_auto.get_lock_fail_closed.return_value = (retained_lock, True)
 
         # No existing repair-cycle container for issue 100, and no OTHER
         # repair cycle running for issue 999 either — otherwise the function's
@@ -45,9 +64,23 @@ class TestRepairCycleLockSteal:
 
         create_test_issue(mock_github, 100, 'Testing')
 
+        mock_run = Mock()
+        mock_run.id = 'run-repair-100'
+
         with patch('services.project_monitor.ConfigManager', return_value=mock_config_manager), \
              patch('config.state_manager.state_manager', mock_state_manager), \
-             patch('services.pipeline_lock_manager.get_pipeline_lock_manager', return_value=mock_pipeline_lock_manager_auto):
+             patch('services.pipeline_lock_manager.get_pipeline_lock_manager', return_value=mock_pipeline_lock_manager_auto), \
+             patch('services.pipeline_run.get_pipeline_run_manager') as mock_pipeline_mgr, \
+             patch('services.project_monitor.subprocess.run') as mock_subprocess:
+
+            mock_pipeline_mgr.return_value.get_or_create_pipeline_run.return_value = (mock_run, False)
+            # Real `gh` CLI calls (e.g. fetching issue comments for previous-
+            # stage context) would otherwise actually shell out and take
+            # 15+ seconds to fail against a nonexistent test-org/test-repo —
+            # deterministic failure, matching what the code already handles
+            # gracefully (returns "" and continues).
+            import subprocess as _subprocess
+            mock_subprocess.side_effect = _subprocess.CalledProcessError(1, ['gh'])
 
             from services.project_monitor import ProjectMonitor
             monitor = ProjectMonitor(task_queue=mock_task_queue, config_manager=mock_config_manager)

@@ -289,6 +289,39 @@ class TestMarkLockFailedDurability(unittest.TestCase):
         self.assertIsNotNone(lock_after)
         self.assertEqual(lock_after.locked_by_issue, 999)
 
+    def test_release_lock_still_checks_yaml_ownership_when_redis_reports_not_found(self):
+        """A found-and-fixed bug in the fix above: Redis reporting "not_found"
+        (the key simply isn't there) is NOT an ownership confirmation and must
+        not skip the YAML check either. This is actually the routine, expected
+        state for a retained lock once its 2-hour Redis TTL lapses (nothing
+        legitimately re-touches a retained lock) — so treating "not_found" as
+        "confirmed released" would silently delete the one non-expiring copy
+        of a retained lock the moment its Redis TTL happens to expire, for a
+        release call naming any issue number at all (not just the holder)."""
+        lock = PipelineLock(
+            project="proj", board="board", locked_by_issue=999,
+            lock_acquired_at=(datetime.now(timezone.utc) - timedelta(hours=3)).isoformat(),
+            lock_status="locked", retained_reason="agent crashed", retained_at=datetime.now(timezone.utc).isoformat(),
+        )
+        self.manager._save_lock_to_yaml(lock)
+
+        pipeline = self.mock_redis.pipeline.return_value
+        pipeline.__enter__.return_value = pipeline
+
+        def side_effect_transaction(func, *keys, **kwargs):
+            mock_pipe = MagicMock()
+            mock_pipe.hgetall.return_value = {}  # Redis has no record — TTL'd out
+            return func(mock_pipe)
+        self.mock_redis.transaction.side_effect = side_effect_transaction
+
+        # A caller releasing on behalf of some other issue (not the retained
+        # holder) must still be refused.
+        released = self.manager.release_lock("proj", "board", 456, force=True)
+        self.assertFalse(released)
+        lock_after = self.manager.get_lock("proj", "board")
+        self.assertIsNotNone(lock_after)
+        self.assertEqual(lock_after.retained_reason, "agent crashed")
+
     def test_release_lock_refuses_retained_lock_without_force(self):
         """release_lock() itself must refuse a retained lock unless force=True
         — this is the guard that closes the gap where several ordinary,

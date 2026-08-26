@@ -962,7 +962,14 @@ class ReviewCycleExecutor:
                                 logger.error(f"Failed to end pipeline run {existing_cycle.pipeline_run_id}: {prm_error}", exc_info=True)
 
                         # Post error comment (workspace-aware)
-                        error_message = f"⚠️ **Review Cycle Error**\n\nThe automated review cycle encountered an error:\n```\n{str(e)}\n```\n\nPlease review manually."
+                        error_message = (
+                            f"⚠️ **Review Cycle Error**\n\nThe automated review cycle "
+                            f"encountered an error:\n```\n{str(e)}\n```\n\nPlease review "
+                            f"manually. The pipeline lock is retained — run "
+                            f"`python scripts/release_lock.py --project {project_name} "
+                            f"--board \"{board_name}\" --issue {issue_number}` once ready "
+                            f"to continue."
+                        )
 
                         if workspace_type == 'discussions' and discussion_id:
                             from services.github_discussions import GitHubDiscussions

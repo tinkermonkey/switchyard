@@ -1024,7 +1024,7 @@ Work on this sub-issue cannot proceed due to merge conflicts.
 1. Manually resolve conflicts in the branch
 2. Commit the resolution
 3. Push to remote
-4. Move this issue back to the appropriate column to retry
+4. Run `python scripts/release_lock.py --project <project> --board <board> --issue {issue_number}` to release the pipeline lock (moving the card alone will not re-trigger anything — see `python scripts/list_failed_pipeline_runs.py` for the exact command with your project/board filled in)
 
 **Resolution Command:**
 ```bash
