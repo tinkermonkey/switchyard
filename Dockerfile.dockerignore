@@ -1,18 +1,10 @@
 # Build context is the orchestrator/ workspace root (parent of switchyard/).
-# Exclude all top-level dirs except the two we need — this automatically
+# Exclude all top-level dirs except the one we need — this automatically
 # prevents project checkout directories from bloating the build context.
+# (The DR CLI is installed from npm now, so documentation_robotics/ is no
+# longer part of the build context — see Dockerfile.)
 *
 !switchyard/
-!documentation_robotics/
-
-# Within documentation_robotics, include cli source and spec/dist (needed by sync-spec-schemas.sh)
-documentation_robotics/*
-!documentation_robotics/cli/
-!documentation_robotics/spec/
-
-# Exclude CLI build artifacts (rebuilt in the dr-cli-builder stage)
-documentation_robotics/cli/node_modules/
-documentation_robotics/cli/dist/
 
 # Switchyard exclusions
 switchyard/**/__pycache__/

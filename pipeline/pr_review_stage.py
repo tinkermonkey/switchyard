@@ -317,17 +317,10 @@ class PRReviewStage(PipelineStage):
 
             if ci_failures_found:
                 # CI is broken — skip AI phases and return parent to development immediately
-                created_issue_numbers = [int(i['number']) for i in all_created_issues]
-                pr_review_state_manager.increment_review_count(
-                    project_name, parent_issue_number, created_issue_numbers
+                _moved_to_dev = await self._return_parent_and_surface_failures(
+                    project_name, parent_issue_number, repo, github_config,
+                    all_created_issues, current_cycle, pipeline_run_id,
                 )
-                if all_created_issues:
-                    await self._move_issues_to_development(all_created_issues, project_name, github_config)
-                self._return_parent_to_development(project_name, parent_issue_number)
-
-                if current_cycle >= MAX_REVIEW_CYCLES and all_created_issues:
-                    summary_comment = self._build_cycle_limit_comment(current_cycle, all_created_issues)
-                    self._post_comment_on_issue(repo, parent_issue_number, summary_comment, pipeline_run_id=pipeline_run_id)
 
                 issues_summary = ""
                 if all_created_issues:
@@ -343,7 +336,9 @@ class PRReviewStage(PipelineStage):
                     + "\n\n---\n\n".join(review_summary_parts)
                 )
                 context['created_review_issues'] = all_created_issues
-                context['manual_progression_made'] = True
+                # Only claim manual progression if the move actually succeeded --
+                # see _return_parent_and_surface_failures's docstring.
+                context['manual_progression_made'] = _moved_to_dev
 
                 end_time = utc_now()
                 duration_ms = (end_time - start_time).total_seconds() * 1000
@@ -656,7 +651,6 @@ class PRReviewStage(PipelineStage):
                         }, pipeline_run_id)
 
             # ---- Post-review decision ----
-            created_issue_numbers = [int(i['number']) for i in all_created_issues]
             manual_progression_made = False
 
             if phases_completed == 0:
@@ -679,22 +673,13 @@ class PRReviewStage(PipelineStage):
 
             elif review_found_issues:
                 # Issues found - return to development
-                pr_review_state_manager.increment_review_count(
-                    project_name, parent_issue_number, created_issue_numbers
+                _moved_to_dev = await self._return_parent_and_surface_failures(
+                    project_name, parent_issue_number, repo, github_config,
+                    all_created_issues, current_cycle, pipeline_run_id,
                 )
-
-                if all_created_issues:
-                    await self._move_issues_to_development(
-                        all_created_issues, project_name, github_config
-                    )
-                self._return_parent_to_development(project_name, parent_issue_number)
-                manual_progression_made = True
-
-                if current_cycle >= MAX_REVIEW_CYCLES and all_created_issues:
-                    summary_comment = self._build_cycle_limit_comment(
-                        current_cycle, all_created_issues
-                    )
-                    self._post_comment_on_issue(repo, parent_issue_number, summary_comment, pipeline_run_id=pipeline_run_id)
+                # Only claim manual progression if the move actually succeeded --
+                # see _return_parent_and_surface_failures's docstring.
+                manual_progression_made = _moved_to_dev
 
             else:
                 # Clean pass - advance to Done
@@ -1561,8 +1546,14 @@ class PRReviewStage(PipelineStage):
         except Exception as e:
             logger.error(f"Failed to advance parent to Done: {e}", exc_info=True)
 
-    def _return_parent_to_development(self, project_name: str, parent_issue_number: int):
-        """Move the parent issue from 'In Review' back to 'In Development' on the Planning board."""
+    def _return_parent_to_development(self, project_name: str, parent_issue_number: int) -> bool:
+        """Move the parent issue from 'In Review' back to 'In Development' on the Planning board.
+
+        Returns True only if the column move actually succeeded. Callers must check this —
+        if it fails, the issue remains stranded in "In Review" with no automated path back
+        out (the generic per-poll PR-review trigger will refuse to relaunch once the cycle
+        limit is reached), so the failure needs to be surfaced rather than just logged.
+        """
         try:
             from services.pipeline_progression import PipelineProgression
             from task_queue.task_manager import TaskQueue
@@ -1573,7 +1564,7 @@ class PRReviewStage(PipelineStage):
             github_state = self.state_manager.load_project_state(project_name)
             if not github_state:
                 logger.warning(f"No GitHub state for {project_name}, cannot return parent to In Development")
-                return
+                return False
 
             planning_board = None
             for board_name, board in github_state.boards.items():
@@ -1590,21 +1581,98 @@ class PRReviewStage(PipelineStage):
                     logger.info(f"Returned #{parent_issue_number} to In Development (issues found)")
                 else:
                     logger.error(f"Failed to return #{parent_issue_number} to In Development")
+                return success
             else:
                 logger.warning(f"Planning board not found for {project_name}, cannot return parent to In Development")
+                return False
         except Exception as e:
             logger.error(f"Failed to return parent to In Development: {e}", exc_info=True)
+            return False
 
-    def _build_cycle_limit_comment(self, cycle: int, issues: List[Dict]) -> str:
+    async def _return_parent_and_surface_failures(
+        self,
+        project_name: str,
+        parent_issue_number: int,
+        repo: str,
+        github_config: Dict,
+        all_created_issues: List[Dict],
+        current_cycle: int,
+        pipeline_run_id: Optional[str],
+    ) -> bool:
+        """Record the review outcome, move the parent issue back to 'In Development',
+        and post whatever comment(s) the outcome requires.
+
+        Shared by the CI-failure and issues-found branches of `run()`, which both
+        need to: increment the review cycle count, move any created sub-issues to
+        Development, move the parent back, and surface either the cycle-limit
+        summary or a standalone failure warning.
+
+        Returns whether the move to 'In Development' actually succeeded. Callers
+        must use this (not assume success) when deciding `manual_progression_made` —
+        claiming manual progression happened when the move failed would make the
+        failure look handled when the issue is actually still stranded in
+        'In Review'.
+        """
+        created_issue_numbers = [int(i['number']) for i in all_created_issues]
+        pr_review_state_manager.increment_review_count(
+            project_name, parent_issue_number, created_issue_numbers
+        )
+
+        if all_created_issues:
+            await self._move_issues_to_development(all_created_issues, project_name, github_config)
+        moved_to_dev = self._return_parent_to_development(project_name, parent_issue_number)
+
+        if current_cycle >= MAX_REVIEW_CYCLES and all_created_issues:
+            summary_comment = self._build_cycle_limit_comment(
+                current_cycle, all_created_issues, move_succeeded=moved_to_dev
+            )
+            self._post_comment_on_issue(repo, parent_issue_number, summary_comment, pipeline_run_id=pipeline_run_id)
+        elif not moved_to_dev:
+            # Not at the cycle limit, so no cycle-limit comment will carry the
+            # warning -- surface the failure on its own so the issue isn't
+            # silently stranded in 'In Review' with only a log line to show it.
+            failure_comment = self._build_move_failure_comment()
+            self._post_comment_on_issue(repo, parent_issue_number, failure_comment, pipeline_run_id=pipeline_run_id)
+
+        return moved_to_dev
+
+    def _build_cycle_limit_comment(
+        self, cycle: int, issues: List[Dict], move_succeeded: bool = True
+    ) -> str:
         """Build a comment for when the cycle limit is reached."""
         issues_list = "\n".join(f"- #{i['number']}: {i['title']}" for i in issues)
+        if move_succeeded:
+            next_steps = (
+                f"No further automated reviews will be triggered after these are resolved. "
+                f"Manually move the parent issue to 'In Review' to reset the cycle count."
+            )
+        else:
+            # The parent issue never left "In Review" (the move back to "In Development"
+            # failed), so telling the operator to move it "to In Review" would be
+            # misleading -- it needs to go to "In Development" first.
+            next_steps = (
+                f"\n\n⚠️ **This issue could not be automatically moved back to 'In Development' "
+                f"and remains in 'In Review'.** It will NOT progress on its own from here — "
+                f"the cycle limit means the automated PR review will no longer relaunch. "
+                f"Please move it to 'In Development' manually to work the issues above, then "
+                f"back to 'In Review' once resolved to reset the cycle count."
+            )
         return (
             f"## PR Review - Cycle {cycle}/{MAX_REVIEW_CYCLES} (Final)\n\n"
             f"This is the final automated review cycle. The following issues were identified "
             f"and moved to Development:\n\n"
             f"{issues_list}\n\n"
-            f"No further automated reviews will be triggered after these are resolved. "
-            f"Manually move the parent issue to 'In Review' to reset the cycle count."
+            f"{next_steps}"
+        )
+
+    def _build_move_failure_comment(self) -> str:
+        """Build a standalone warning comment for when the parent issue could not be
+        automatically moved back to 'In Development', outside the cycle-limit path
+        (which folds the same warning into `_build_cycle_limit_comment` instead)."""
+        return (
+            f"⚠️ **Could not automatically move this issue back to 'In Development'.** "
+            f"It remains in 'In Review' and will not progress on its own — please move "
+            f"it to 'In Development' manually."
         )
 
     async def _run_consolidation_phase(
